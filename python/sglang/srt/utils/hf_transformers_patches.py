@@ -1,0 +1,431 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Monkey-patches on transformers internals.
+
+Mix of backward-compat shims (re-add symbols removed in v5), workarounds
+for transformers v5 bugs, fixes for remote-model-code (trust_remote_code)
+that hasn't been updated for v5 yet, and CI-only patches (e.g. neutralize
+HF API calls to avoid rate limits).
+
+Call ``apply_all_hf_patches()`` before any ``from_pretrained`` call; it is
+idempotent.
+"""
+
+import importlib.abc
+import importlib.util
+import inspect
+import logging
+import sys
+
+# Plain logger: importing sglang.srt.utils here would pull torch and triton
+# into every importer of this module.
+logger = logging.getLogger(__name__)
+
+_applied = False
+
+
+# ---------------------------------------------------------------------------
+# Public API: apply_all_hf_patches() -- import-time patches (idempotent)
+# ---------------------------------------------------------------------------
+
+
+def apply_all_hf_patches():
+    """Apply all transformers compatibility patches (idempotent)."""
+    global _applied
+    if _applied:
+        return
+    _applied = True
+
+    _mute_diffusers_torchao_probe()
+
+    # v5.4 patches
+    _patch_rope_parameters_validation()
+    _patch_layer_types_validation()
+    _patch_removed_symbols()
+    _patch_image_processor_kwargs()
+    _patch_image_process_cuda_tensor()
+
+    # v5 general patches
+    _ensure_is_torch_fx_available_compat()
+
+    # CI-only: neutralize HF API calls inside tokenizer from_pretrained
+    patch_is_base_mistral_in_ci()
+
+    logger.debug("transformers compatibility patches applied")
+
+
+def _mute_diffusers_torchao_probe():
+    """Silence diffusers' torchao-Tensor-subclass probe warning.
+
+    diffusers lazily imports its torchao quantizer and warns when the installed
+    torchao has moved the optional Tensor subclasses it probes for. It only
+    affects loading torchao-serialized diffusers checkpoints, which no sglang
+    path does. Set here rather than in ``configure_logger`` because the import
+    can land before logging is configured, and the level sticks whenever the
+    lazy import happens.
+    """
+    import logging
+
+    logging.getLogger("diffusers.quantizers.torchao.torchao_quantizer").setLevel(
+        logging.ERROR
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API: on-demand helpers (called explicitly by other modules)
+# ---------------------------------------------------------------------------
+
+
+def normalize_rope_scaling_compat(config) -> None:
+    """Ensure rope_scaling dicts have ``"type"`` alongside ``"rope_type"``.
+
+    Transformers v5 standardises rope_scaling to use ``"rope_type"`` and may
+    omit the legacy ``"type"`` key.  Remote-code models (e.g. Kimi-VL) still
+    read ``rope_scaling["type"]``, causing a ``KeyError``.  This helper adds
+    ``"type"`` from ``"rope_type"`` whenever it is missing, recursively across
+    the config and all its sub-configs.
+    """
+
+    def _patch(cfg):
+        rs = getattr(cfg, "rope_scaling", None)
+        if isinstance(rs, dict) and "rope_type" in rs and "type" not in rs:
+            rs["type"] = rs["rope_type"]
+        # Recurse into sub-configs
+        for attr in (
+            "text_config",
+            "llm_config",
+            "language_config",
+            "vision_config",
+            "thinker_config",
+        ):
+            sub = getattr(cfg, attr, None)
+            if sub is not None:
+                _patch(sub)
+
+    _patch(config)
+
+
+def _ensure_gguf_version():
+    """Workaround for transformers v5 bug where is_gguf_available() fails
+    when the gguf package lacks __version__ and metadata lookup also fails,
+    resulting in packaging.version.InvalidVersion: Invalid version: 'N/A'."""
+    try:
+        import gguf
+
+        if not hasattr(gguf, "__version__"):
+            import importlib.metadata
+
+            try:
+                gguf.__version__ = importlib.metadata.version("gguf")
+            except importlib.metadata.PackageNotFoundError:
+                gguf.__version__ = "0.0.0"
+            except (ValueError, OSError, TypeError) as e:
+                logger.warning(
+                    "Failed to determine gguf package version: %s. "
+                    "Falling back to '0.0.0'.",
+                    e,
+                )
+                gguf.__version__ = "0.0.0"
+    except ImportError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# v5.4 patches (merged from transformers_v54_compat.py)
+# ---------------------------------------------------------------------------
+
+
+def _patch_rope_parameters_validation():
+    """Guard ``standardize_rope_params()`` against missing
+    ``max_position_embeddings``.
+
+    For ``PretrainedConfig``, ``standardize_rope_params()`` accesses
+    ``self.max_position_embeddings`` during ``__post_init__`` before extra
+    kwargs are set as attributes, causing ``AttributeError``.
+    """
+    from transformers import PretrainedConfig
+
+    if hasattr(PretrainedConfig, "standardize_rope_params"):
+        _orig_standardize = PretrainedConfig.standardize_rope_params
+
+        def _safe_standardize(self):
+            # The call must still run: it resolves `default_rope_type`, which
+            # Pixtral's vision config needs to reach "axial".
+            try:
+                return _orig_standardize(self)
+            except AttributeError as e:
+                if "max_position_embeddings" not in str(e):
+                    raise
+                return None
+
+        PretrainedConfig.standardize_rope_params = _safe_standardize
+
+
+def _patch_layer_types_validation():
+    from transformers import PretrainedConfig
+
+    validators = PretrainedConfig.__class_validators__
+    for index, validator in enumerate(validators):
+        if validator.__name__ != "validate_layer_type":
+            continue
+
+        def validate_layer_type(self, _orig=validator):
+            try:
+                return _orig(self)
+            except ValueError as e:
+                # Step-3.5-Flash lists a `layer_types` entry per main *and*
+                # next-n-predict layer, which `validate_layer_type` rejects.
+                if "must be equal to the number of" not in str(e):
+                    raise
+                num_mtp_layers = getattr(self, "num_nextn_predict_layers", 0) or 0
+                if not num_mtp_layers:
+                    raise
+                # Re-run the original against the wider count, so its other
+                # rules -- per-list vocabularies, legacy remapping -- still hold.
+                num_hidden_layers = self.num_hidden_layers
+                self.num_hidden_layers = num_hidden_layers + num_mtp_layers
+                try:
+                    return _orig(self)
+                finally:
+                    self.num_hidden_layers = num_hidden_layers
+
+        validators[index] = validate_layer_type
+        break
+
+
+def _patch_removed_symbols():
+    """Re-export ``LlamaFlashAttention2``, removed in transformers v5.4.0.
+
+    Remote model code (e.g. DeepSeek-OCR) still imports it.
+    ``check_imports`` in ``dynamic_module_utils.py`` validates imports at
+    config-load time, so it must exist before any ``from_pretrained``.
+    The patch lands when ``modeling_llama`` is imported rather than importing
+    it here: its chain (modeling_utils, quantizers, generation) costs seconds.
+
+    TODO(upstream): DeepSeek-OCR / deepseek_vl_v2 remote code needs update.
+    """
+    module = sys.modules.get(_LLAMA_MODELING)
+    if module is not None:
+        _add_llama_flash_attention_2(module)
+    else:
+        sys.meta_path.insert(0, _PatchLlamaModelingOnImport())
+
+
+_LLAMA_MODELING = "transformers.models.llama.modeling_llama"
+
+
+def _add_llama_flash_attention_2(modeling_llama):
+    if not hasattr(modeling_llama, "LlamaFlashAttention2"):
+        if hasattr(modeling_llama, "LlamaAttention"):
+            modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+
+
+class _PatchLlamaModelingOnImport(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname != _LLAMA_MODELING:
+            return None
+        sys.meta_path.remove(self)
+        spec = importlib.util.find_spec(fullname)
+        if spec is None or spec.loader is None:
+            logger.warning(
+                f"Could not import {_LLAMA_MODELING}; "
+                "LlamaFlashAttention2 compat patch not applied."
+            )
+            return spec
+        exec_module = spec.loader.exec_module
+
+        def exec_and_patch(module):
+            # This import reaches torchao, whose torch-version warning and per-Enum
+            # pytree deprecation logs (once per rank) are not actionable; mute both.
+            muted = [
+                logging.getLogger("torchao"),
+                logging.getLogger("torch.utils._pytree"),
+            ]
+            prev_levels = [lg.level for lg in muted]
+            for lg in muted:
+                lg.setLevel(logging.ERROR)
+            try:
+                exec_module(module)
+            finally:
+                for lg, level in zip(muted, prev_levels):
+                    lg.setLevel(level)
+            _add_llama_flash_attention_2(module)
+
+        spec.loader.exec_module = exec_and_patch
+        return spec
+
+
+def _patch_image_processor_kwargs():
+    """Allow remote image processors that lack ``**kwargs`` in preprocess().
+
+    Transformers v5.4 passes new kwargs (e.g. ``device``) through
+    ``BaseImageProcessor.__call__`` -> ``preprocess()``.  Remote model code
+    (e.g. KimiVL) that defines ``preprocess()`` without ``**kwargs`` will
+    crash with ``TypeError``.
+
+    Fix: wrap ``__call__`` and filter unsupported kwargs before invoking
+    ``preprocess()``.  The accepted-kwargs set is cached per processor class:
+    apart from avoiding the exception/logging slow path, this matters for VLM
+    requests that preprocess many images on the request critical path.
+
+    TODO(upstream): KimiVL image_processing_kimi_vl.py needs ``**kwargs``.
+    """
+    try:
+        from transformers.image_processing_utils import BaseImageProcessor
+
+        original = BaseImageProcessor.__call__
+        accepted_kwargs_cache = {}
+        warned_unsupported_kwargs = set()
+
+        def safe_call(self, images, *args, **kwargs):
+            processor_type = type(self)
+            accepted_kwargs = accepted_kwargs_cache.get(processor_type)
+            if accepted_kwargs is None and processor_type not in accepted_kwargs_cache:
+                sig = inspect.signature(self.preprocess)
+                params = sig.parameters
+                if any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+                ):
+                    accepted_kwargs = None
+                else:
+                    accepted_kwargs = frozenset(params)
+                accepted_kwargs_cache[processor_type] = accepted_kwargs
+
+            if accepted_kwargs is None:
+                return original(self, images, *args, **kwargs)
+
+            dropped = frozenset(kwargs) - accepted_kwargs
+            if dropped:
+                warning_key = (processor_type, dropped)
+                if warning_key not in warned_unsupported_kwargs:
+                    logger.warning(
+                        "Image processor %s.preprocess() does not accept %s; "
+                        "filtering them before preprocessing. Update the model's image "
+                        "processor to accept **kwargs.",
+                        processor_type.__name__,
+                        sorted(dropped),
+                    )
+                    warned_unsupported_kwargs.add(warning_key)
+                kwargs = {k: v for k, v in kwargs.items() if k in accepted_kwargs}
+            return original(self, images, *args, **kwargs)
+
+        BaseImageProcessor.__call__ = safe_call
+    except ImportError:
+        logger.debug(
+            "_patch_image_processor_kwargs: BaseImageProcessor not importable, patch skipped"
+        )
+
+
+def _patch_image_process_cuda_tensor():
+    """Handle CUDA tensors and grayscale tensor RGB conversion in PIL processing.
+
+    Transformers v5.4's PIL image processing backend calls
+    ``image.numpy()`` on torch tensors, which fails for CUDA tensors.
+    Move them to CPU before processing. Its RGB conversion handles PIL images
+    but leaves tensors unchanged: a grayscale JPEG decoded as a [1, H, W]
+    tensor stays single-channel even when ``do_convert_rgb`` is requested.
+    Processors that normalize with three RGB means then fail on that channel.
+
+    TODO(upstream): report to HF transformers.
+    """
+    try:
+        import torch
+        import transformers.image_processing_backends as ipb
+
+        for cls_name in ("PilBackend",):
+            cls = getattr(ipb, cls_name, None)
+            if cls is None or not hasattr(cls, "process_image"):
+                continue
+            original = cls.process_image
+
+            def patched_process_image(
+                self, image, *args, _orig=original, _Tensor=torch.Tensor, **kwargs
+            ):
+                if isinstance(image, _Tensor) and image.is_cuda:
+                    image = image.cpu()
+                result = _orig(self, image, *args, **kwargs)
+                # Check channels after process_image converts the layout to CHW.
+                do_convert_rgb = kwargs.get(
+                    "do_convert_rgb", args[0] if args else False
+                )
+                if (
+                    do_convert_rgb
+                    and isinstance(image, _Tensor)
+                    and result.ndim == 3
+                    and result.shape[0] == 1
+                ):
+                    result = result.repeat(3, axis=0)
+                return result
+
+            cls.process_image = patched_process_image
+    except ImportError:
+        logger.debug(
+            "_patch_image_process_cuda_tensor: required modules not importable, patch skipped"
+        )
+
+
+# ---------------------------------------------------------------------------
+# v5 general patches
+# ---------------------------------------------------------------------------
+
+
+def _ensure_is_torch_fx_available_compat() -> None:
+    """Re-add ``is_torch_fx_available`` removed in transformers v5.
+
+    Remote-code models (e.g. MiniCPM-V) import ``is_torch_fx_available``
+    from ``transformers.utils.import_utils``.  The function was removed
+    in v5.  Patch it back so existing HuggingFace Hub model code keeps
+    working.  torch.fx is always available in PyTorch >= 2.0.
+    """
+    import transformers.utils.import_utils as _import_utils
+
+    if hasattr(_import_utils, "is_torch_fx_available"):
+        return
+
+    _import_utils.is_torch_fx_available = lambda: True
+
+
+# ---------------------------------------------------------------------------
+# CI-only patches
+# ---------------------------------------------------------------------------
+
+
+def patch_is_base_mistral_in_ci():
+    """Patch transformers' _patch_mistral_regex to avoid HF API calls in CI.
+
+    transformers defines is_base_mistral as a local function inside
+    _patch_mistral_regex, so it cannot be patched via module attribute.
+    Instead we replace the entire _patch_mistral_regex classmethod with a
+    version that simply returns the tokenizer unchanged.
+
+    In CI this prevents exhausting the 3000 req/5min HF API rate limit.
+
+    TODO(upstream): remove once transformers stops calling model_info()
+    inside _patch_mistral_regex (or removes the method entirely).
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_IS_IN_CI.get():
+        return
+
+    from transformers import PreTrainedTokenizerFast
+
+    if hasattr(PreTrainedTokenizerFast, "_patch_mistral_regex"):
+
+        @classmethod
+        def _noop_patch_mistral_regex(cls, tokenizer, *args, **kwargs):
+            return tokenizer
+
+        PreTrainedTokenizerFast._patch_mistral_regex = _noop_patch_mistral_regex
+        logger.info("CI: patched _patch_mistral_regex to skip HF API calls")

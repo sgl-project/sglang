@@ -1,0 +1,982 @@
+"""Endpoint-level tests for `/server_info`.
+
+`/server_info` is the introspection surface that external consumers
+(SGLang's own deprecated `/get_server_info` alias, monitoring tools,
+KV-aware routers) scrape to learn about the running server's
+configuration. New `/server_info` behaviours should add their test
+classes to this file as the surface grows.
+
+Current coverage:
+
+* `TestServerInfoKvEventsField` — the `kv_events` publisher descriptor
+  surfaced by `_build_kv_events_block`. Covers the full input matrix
+  end-to-end (happy path / disabled / malformed JSON / inproc endpoint /
+  port edge cases / missing-or-non-positive page_size) because the
+  helper has no separate test target; the handler is its only caller.
+
+* `TestServerInfoExistingFieldsPreserved` — regression guard that no
+  field existing consumers depend on is silently dropped: every
+  `ServerArgs` dataclass field, `internal_states`, `version`, and the
+  pre-existing flat `kv_events_config` string all remain visible.
+"""
+
+import asyncio
+import json
+import unittest
+from types import SimpleNamespace
+from unittest.mock import ANY, MagicMock, patch
+
+import msgspec
+import msgspec.structs
+
+from sglang.srt.arg_groups.validation_hook import check_load_publish_args
+from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
+from sglang.srt.entrypoints import http_server, server_utils
+from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.environ import envs
+from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.rust_server import config as rust_config
+from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class _CustomModelLoader:
+    pass
+
+
+def _stub_tokenizer_manager(
+    server_args: ServerArgs, get_internal_state=None
+) -> TokenizerManager:
+    """A manager carrying the state `/server_info` and its writers read.
+
+    `__new__` skips `__init__`, which would open the ZMQ sockets and start
+    the handle loop.
+    """
+    tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
+    tokenizer_manager.server_args = server_args
+    tokenizer_manager.model_path = server_args.model_path
+    tokenizer_manager.served_model_name = server_args.served_model_name
+    tokenizer_manager.startup_time = None
+    tokenizer_manager.get_internal_state = get_internal_state
+    return tokenizer_manager
+
+
+class TestModelInfoSerialization(CustomTestCase):
+    def test_model_info_serializes_custom_loader_class(self):
+        server_args = ServerArgs(model_path="dummy")
+        values = {
+            "weight_version": None,
+            "load_format": _CustomModelLoader,
+            "reasoning_parser": None,
+            "tool_call_parser": None,
+            "disaggregation_mode": "null",
+        }
+        tokenizer_manager = SimpleNamespace(
+            model_config=SimpleNamespace(
+                is_image_understandable_model=False,
+                is_audio_understandable_model=False,
+                hf_config=SimpleNamespace(
+                    model_type="test", architectures=["TestModel"]
+                ),
+                embedding_model_spec=None,
+            ),
+            model_path="dummy",
+            served_model_name="dummy",
+            server_args=server_args,
+            is_generation=True,
+            config_value=values.__getitem__,
+        )
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(
+            SimpleNamespace(tokenizer_manager=tokenizer_manager)
+        )
+        publish(server_args, role="tokenizer")
+        try:
+            payload = asyncio.run(http_server.model_info())
+        finally:
+            http_server._global_state = prior_state
+            reset_context()
+
+        self.assertEqual(payload["load_format"], f"{__name__}._CustomModelLoader")
+        self.assertEqual(payload["disaggregation_mode"], "null")
+        json.dumps(payload)
+
+
+def _call_server_info_with(
+    server_args: ServerArgs,
+    internal_states: list[dict] | None = None,
+    config_updates: dict | None = None,
+    scheduler_info: dict | None = None,
+) -> dict:
+    """Invoke `http_server.server_info()` against a stub global state.
+
+    Bypasses the FastAPI HTTP layer (no TestClient): the handler is an
+    `async def` that reads module-level `_global_state`, so wiring a
+    `SimpleNamespace` stub via `set_global_state` and awaiting the
+    coroutine directly is enough to exercise the handler logic without
+    booting a model server.
+
+    `config_updates` are applied the way production applies them -- through
+    `record_config_updates`, in a process that has published -- rather than
+    planted on the stub. The endpoint answers the record and does not read that
+    log, so what the real writer buys is that an assertion on the record is not
+    satisfied for free by an update that never landed.
+    """
+
+    async def _fake_internal_state():
+        return internal_states or [{"max_req_input_len": 1024}]
+
+    tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
+    if scheduler_info is None:
+        scheduler_info = {"max_req_input_len": 1024}
+    stub_state = SimpleNamespace(
+        tokenizer_manager=tokenizer_manager,
+        scheduler_info=scheduler_info,
+    )
+    prior_state = http_server.get_global_state()
+    http_server.set_global_state(stub_state)
+    published = False
+    if config_updates:
+        # The writer runs in a published process, as it does in production.
+        publish(server_args, role="tokenizer")
+        published = True
+        tokenizer_manager.record_config_updates("test", **config_updates)
+    try:
+        return asyncio.run(http_server.server_info())
+    finally:
+        # Restore so a later test in the same process isn't surprised.
+        http_server._global_state = prior_state
+        if published:
+            reset_context()
+
+
+class TestServerInfoTransportParity(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # The HTTP and follower gRPC paths under test are the Python server's;
+        # a Rust-server node skips the follower metadata server (covered by
+        # `test_rust_server_followers_skip_runtime_metadata_server`), so pin the
+        # mode against an inherited SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
+
+    def test_rust_launch_info_redacts_the_api_keys(self):
+        # Only the API key (or nothing) guards /server_info, so reporting the
+        # keys would hand the admin key to every API-key holder.
+        args = ServerArgs(
+            model_path="dummy", api_key="sk-api", admin_api_key="sk-api admin"
+        )
+        # The command joins argv: a value may hold spaces or contain the other
+        # key, argparse takes an abbreviated flag, and a later flag overrides.
+        args._launch_command = (
+            "python -m sglang.launch_server --admin-api-key old-admin "
+            "--api-key sk-api --admin-api-ke=sk-api admin"
+        )
+        scheduler = SimpleNamespace(
+            server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+        )
+        info = rust_config._launch_server_info(scheduler)
+        for secret in ("sk-api", 'admin"', "old-admin"):
+            self.assertNotIn(secret, info)
+        launch = json.loads(info)
+        self.assertEqual(launch["api_key"], "<redacted>")
+        self.assertEqual(launch["admin_api_key"], "<redacted>")
+        self.assertEqual(
+            launch["launch_command"],
+            "python -m sglang.launch_server --admin-api-key <redacted> "
+            "--api-key <redacted> --admin-api-ke=<redacted>",
+        )
+
+    def test_http_and_both_grpc_roles_share_startup_metadata(self):
+        secrets = {
+            "api_key": "api-secret",
+            "admin_api_key": "admin-secret",
+            "ssl_keyfile_password": "ssl-secret",
+        }
+        for config in (None, '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'):
+            with self.subTest(kv_events_config=config):
+                args = ServerArgs(
+                    model_path="dummy", kv_events_config=config, page_size=64, **secrets
+                )
+                http_info = _call_server_info_with(args)
+                self.assertEqual(http_info["frontend"], "python")
+                # Every transport below reports the same fields.
+                for name in secrets:
+                    self.assertEqual(http_info[name], "<redacted>")
+                for field in ("startup_time", "internal_states", "version", "frontend"):
+                    self.assertIn(field, http_info)
+                    http_info.pop(field)
+
+                bridge = RuntimeHandle.__new__(RuntimeHandle)
+                bridge.tokenizer_manager = SimpleNamespace(
+                    server_args=args, mm_processor=None
+                )
+                bridge.scheduler_info = {"max_req_input_len": 1024}
+                leader = json.loads(bridge.get_server_info())
+                # Only the leader serves requests, so only it lists media inputs.
+                self.assertEqual(leader.pop("grpc_features"), [])
+                self.assertEqual(leader, json.loads(json.dumps(http_info)))
+
+                # The embedded Rust server's launch-time fields, which stamp
+                # the init info the scheduler handshake carries for Python.
+                scheduler = SimpleNamespace(
+                    server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+                )
+                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                self.assertEqual(rust_launch.pop("status"), "ready")
+                self.assertEqual(rust_launch.pop("max_total_num_tokens"), 2048)
+                self.assertEqual(rust_launch, leader)
+
+                # The Rust listener is HTTP/1 only, so it never advertises h2.
+                scheduler.server_args = ServerArgs(
+                    model_path="dummy", page_size=64, enable_http2=True
+                )
+                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                self.assertIs(rust_launch["enable_http2"], False)
+
+                with (
+                    patch.object(
+                        server_utils,
+                        "get_serving",
+                        return_value=SimpleNamespace(
+                            host="127.0.0.1",
+                            grpc_port=50051,
+                            smg_grpc_mode=False,
+                            grpc_mode=False,
+                        ),
+                    ),
+                    patch("sglang.srt.rust_extensions.load_rust_extension") as load,
+                ):
+                    server_utils.start_follower_grpc_server(args, bridge.scheduler_info)
+                start = load.return_value.start_metadata_server
+                start.assert_called_once_with(
+                    host="127.0.0.1", port=50051, server_info_json=ANY
+                )
+                self.assertEqual(
+                    json.loads(start.call_args.kwargs["server_info_json"]), leader
+                )
+
+    def test_rust_server_followers_skip_runtime_metadata_server(self):
+        """A follower node hosting a Rust listener must not bind grpc_port a
+        second time; that node's KV publishers are served by the listener."""
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            patch.object(
+                server_utils,
+                "get_serving",
+                return_value=SimpleNamespace(
+                    host="127.0.0.1",
+                    grpc_port=50051,
+                    smg_grpc_mode=False,
+                    grpc_mode=False,
+                ),
+            ),
+            patch("sglang.srt.rust_extensions.load_rust_extension") as load,
+        ):
+            self.assertIsNone(
+                server_utils.start_follower_grpc_server(
+                    ServerArgs(model_path="dummy"), {}
+                )
+            )
+        load.return_value.start_metadata_server.assert_not_called()
+
+
+class TestServerInfoInternalStatesRedaction(CustomTestCase):
+    """`internal_states` is the scheduler's readback of the resolved config,
+    which `/server_info` and `Engine.get_server_info` report next to the
+    redacted top-level fields: the credentials must not reach it either."""
+
+    # Every word is distinctive, so a value split at its space cannot hide.
+    SECRETS = {
+        "api_key": "api-secret tail-api",
+        "admin_api_key": "admin-secret tail-admin",
+        "ssl_keyfile_password": "ssl-secret tail-ssl",
+    }
+
+    def setUp(self):
+        super().setUp()
+        # Rust-server mode refuses --ssl-keyfile-password at resolution, so pin
+        # the Python server against an inherited SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
+
+    def _scheduler_readback(self, server_args: ServerArgs) -> dict:
+        from sglang.srt.managers.io_struct import GetInternalStateReq
+        from sglang.srt.managers.scheduler_components.internal_state import (
+            SchedulerInternalStateController,
+        )
+
+        # The contributors read the live scheduler; the config part is under test.
+        contributors = {
+            name: MagicMock()
+            for name in vars(SchedulerInternalStateController)
+            if name.startswith("_add_")
+        }
+        controller = SchedulerInternalStateController(
+            scheduler=SimpleNamespace(), record_step_time=False
+        )
+        publish(server_args, role="scheduler")
+        self.addCleanup(reset_context)
+        with patch.multiple(SchedulerInternalStateController, **contributors):
+            return controller.get_internal_state(GetInternalStateReq()).internal_state
+
+    def _assert_redacted(self, payload: dict) -> None:
+        text = json.dumps(payload, default=str)
+        for secret in self.SECRETS.values():
+            for word in secret.split():
+                self.assertNotIn(word, text)
+        for state in payload["internal_states"]:
+            for name in self.SECRETS:
+                self.assertEqual(state[name], "<redacted>")
+
+    def test_http_and_engine_server_info(self):
+        from sglang.srt.entrypoints.engine import Engine
+
+        server_args = ServerArgs(model_path="dummy", **self.SECRETS)
+        readback = self._scheduler_readback(server_args)
+
+        self._assert_redacted(_call_server_info_with(server_args, [readback]))
+
+        async def _internal_state():
+            return [readback]
+
+        engine = Engine.__new__(Engine)
+        engine.tokenizer_manager = _stub_tokenizer_manager(server_args, _internal_state)
+        engine.loop = asyncio.new_event_loop()
+        self.addCleanup(engine.loop.close)
+        engine._scheduler_init_result = SimpleNamespace(
+            scheduler_infos=[{"max_req_input_len": 1024}]
+        )
+        self._assert_redacted(engine.get_server_info())
+
+
+class TestModelInfoTransportParity(CustomTestCase):
+    def test_rust_launch_config_reproduces_python_model_info(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            served_model_name="served",
+            tokenizer_path="/public-tokenizer",
+            preferred_sampling_params='{"temperature": 0.5}',
+            weight_version="v1",
+            load_format="dummy",
+            reasoning_parser="deepseek-r1",
+            tool_call_parser="qwen25",
+            disaggregation_mode="decode",
+        )
+        architectures = ["TestForCausalLM"]
+        model_config = SimpleNamespace(
+            context_len=2048,
+            vocab_size=1000,
+            is_multimodal=True,
+            is_image_understandable_model=True,
+            is_audio_understandable_model=False,
+            hf_config=SimpleNamespace(model_type="test", architectures=architectures),
+            # Every ModelConfig carries a spec; a generation model's is "none".
+            embedding_model_spec=resolve_embedding_model_spec(
+                architectures, is_embedding_requested=False, is_embedding_gemma=False
+            ),
+            get_default_sampling_params=lambda: {},
+        )
+
+        tokenizer_manager = _stub_tokenizer_manager(server_args)
+        tokenizer_manager.model_config = model_config
+        tokenizer_manager.is_generation = True
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(
+            SimpleNamespace(tokenizer_manager=tokenizer_manager)
+        )
+        publish(server_args, role="tokenizer")
+        try:
+            python_body = json.loads(json.dumps(asyncio.run(http_server.model_info())))
+        finally:
+            http_server._global_state = prior_state
+            reset_context()
+
+        extension = SimpleNamespace(
+            DisaggregationMode=SimpleNamespace(
+                Null="null", Prefill="prefill", Decode="decode"
+            ),
+            ModelConfig=MagicMock(),
+            DefaultSamplingParams=MagicMock(),
+            ServerArgs=MagicMock(),
+        )
+        scheduler = SimpleNamespace(
+            server_args=server_args,
+            model_config=model_config,
+            kv_events_publisher=SimpleNamespace(local_kv_event_sources=lambda _: []),
+            page_size=1,
+            tree_cache=None,
+            # The server loads the scheduler's tokenizer copy but reports the
+            # public path.
+            rust_server_tokenizer_path=lambda: "/loaded-tokenizer",
+            tokenizer=None,
+            max_total_num_tokens=1024,
+            load_snapshot_writer=None,
+            rust_server_endpoints=[
+                {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
+            ],
+        )
+        publish(server_args, role="scheduler")
+        try:
+            with (
+                get_parallel().override(attn_dp_rank=0, dp_rank=None),
+                patch.object(
+                    rust_config, "compute_num_reserved_tokens", return_value=0
+                ),
+                patch.object(rust_config, "_launch_server_info", return_value="{}"),
+            ):
+                rust_config._build_server_args(scheduler, extension=extension)
+        finally:
+            reset_context()
+        launch = extension.ServerArgs.call_args.kwargs
+
+        # The body `CoreHandle::model_info` and `ModelInfo::to_json` render
+        # from these launch fields (rust/sglang-server/src/api_server/core/
+        # handle.rs, message/info.rs). Rust always reports `is_generation`: it
+        # has no embedding routes.
+        rust_body = {
+            "model_path": launch["model_path"],
+            "served_model_name": launch["served_model_name"],
+            "tokenizer_path": launch["public_tokenizer_path"],
+            "is_generation": True,
+            "preferred_sampling_params": json.loads(
+                launch["preferred_sampling_params"]
+            ),
+            "weight_version": launch["weight_version"],
+            "load_format": launch["load_format"],
+            "reasoning_parser": launch["reasoning_parser"],
+            "tool_call_parser": launch["tool_call_parser"],
+            # The serialized `DisaggregationMode`, lowercase like this stub's.
+            "disaggregation_mode": launch["disaggregation_mode"],
+            **json.loads(launch["launch_model_info"]),
+        }
+        self.assertIn("embedding", python_body)
+        self.maxDiff = None
+        self.assertEqual(rust_body, python_body)
+
+
+class TestServerInfoKvEventsField(CustomTestCase):
+    """The new `kv_events` field is wired correctly across the full
+    `_build_kv_events_block` input matrix.
+    """
+
+    # ----- happy path --------------------------------------------------
+
+    def test_kv_events_key_present_when_publishing_enabled(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", "topic": "kv"}'
+            ),
+            load_publish_endpoint="auto",
+            page_size=64,
+            dp_size=2,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIn("kv_events", info)
+        self.assertEqual(
+            info["kv_events"],
+            {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "block_size": 64,
+                "dp_size": 2,
+                # Load range packed immediately after the KV range: 5557 + dp_size.
+                "load_endpoint_port_base": 5559,
+                "load_topic": "load",
+            },
+        )
+
+    def test_load_port_skips_an_overlapping_replay_range(self):
+        # Conventional replay = kv + 1: the load range must be advertised
+        # past the replay ROUTER range (5558 + dp_size), matching where
+        # SchedulerLoadPublisher actually binds — both sides resolve it via
+        # resolve_load_pub_range.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+                '"replay_endpoint": "tcp://*:5558"}'
+            ),
+            load_publish_endpoint="auto",
+            page_size=64,
+            dp_size=2,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["load_endpoint_port_base"], 5560)
+        self.assertEqual(info["kv_events"]["load_topic"], "load")
+
+    def test_explicit_load_publish_endpoint_moves_the_advertised_base(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            load_publish_endpoint="tcp://*:7000",
+            page_size=64,
+            dp_size=2,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["load_endpoint_port_base"], 7000)
+        self.assertEqual(info["kv_events"]["load_topic"], "load")
+
+    def test_load_keys_omitted_for_connect_style_kv_endpoint(self):
+        # A concrete host is connected to rather than bound: the KV-events
+        # descriptor is still valid (KV events work connect-style), but no
+        # load range can be bound there, so the load keys must be omitted
+        # rather than advertising a port nothing listens on.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://10.0.0.5:5557"}'
+            ),
+            load_publish_endpoint="auto",
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertEqual(info["kv_events"]["endpoint_host"], "10.0.0.5")
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+        self.assertNotIn("load_topic", info["kv_events"])
+
+    def test_ipv6_wildcard_endpoint_advertises_bracketed_host_and_load_keys(self):
+        # "[::]" is a bind-all wildcard: the descriptor must keep the
+        # brackets (consumers splice tcp://{host}:{port}) and the load
+        # range resolves right after the KV range.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://[::]:5557"}',
+            load_publish_endpoint="auto",
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["endpoint_host"], "[::]")
+        self.assertEqual(info["kv_events"]["endpoint_port_base"], 5557)
+        self.assertEqual(info["kv_events"]["load_endpoint_port_base"], 5558)
+
+    def test_concrete_ipv6_endpoint_advertises_kv_but_not_load(self):
+        # A concrete IPv6 host works connect-style for KV events (advertised,
+        # brackets kept) but is not bindable for the load range — and "::"
+        # appearing inside the address must not be mistaken for a wildcard.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://[2001:db8::5]:5557"}'
+            ),
+            load_publish_endpoint="auto",
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["endpoint_host"], "[2001:db8::5]")
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+
+    def test_load_keys_omitted_when_explicitly_off(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            load_publish_endpoint="off",
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+        self.assertNotIn("load_topic", info["kv_events"])
+
+    def test_load_keys_omitted_when_no_load_range_fits(self):
+        # kv base 65535 leaves no u16 room for a load range: the kv_events
+        # descriptor must still be served, with only the load keys omitted,
+        # so routers fall back to their in-flight counter for load.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:65535"}',
+            load_publish_endpoint="auto",
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertEqual(info["kv_events"]["endpoint_port_base"], 65535)
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+        self.assertNotIn("load_topic", info["kv_events"])
+
+    def test_kv_events_descriptor_carries_specific_host_and_topic(self):
+        # No --load-publish-endpoint: KV descriptor served, load keys absent.
+        # Upgrade safety rests on this default silence, so pin it here.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://0.0.0.0:7777", "topic": "kv"}'
+            ),
+            page_size=128,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertEqual(info["kv_events"]["endpoint_host"], "0.0.0.0")
+        self.assertEqual(info["kv_events"]["endpoint_port_base"], 7777)
+        self.assertEqual(info["kv_events"]["topic"], "kv")
+        self.assertEqual(info["kv_events"]["block_size"], 128)
+        self.assertEqual(info["kv_events"]["dp_size"], 1)
+        self.assertNotIn("load_endpoint_port_base", info["kv_events"])
+        self.assertNotIn("load_topic", info["kv_events"])
+
+    # ----- disabled / unconfigured -------------------------------------
+
+    def test_kv_events_is_null_when_no_publisher_configured(self):
+        args = ServerArgs(model_path="dummy")  # no --kv-events-config
+
+        info = _call_server_info_with(args)
+
+        # The key must still be present so consumers can detect
+        # "publishing disabled" via a single shape check.
+        self.assertIn("kv_events", info)
+        self.assertIsNone(info["kv_events"])
+
+    def test_kv_events_is_null_when_publisher_explicitly_null(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "null"}',
+            page_size=64,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNone(info["kv_events"])
+
+    # ----- malformed config --------------------------------------------
+
+    def test_kv_events_is_null_for_malformed_json(self):
+        # Not JSON — the publisher would have failed at server startup,
+        # but /server_info must keep working.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config="not-json",
+            page_size=64,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNone(info["kv_events"])
+
+    # ----- unreachable endpoints ---------------------------------------
+
+    def test_kv_events_is_null_for_inproc_endpoint(self):
+        # `inproc://` is not reachable across process boundaries, so the
+        # descriptor must hide it from external routers.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "inproc://cache", "topic": ""}'
+            ),
+            page_size=64,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNone(info["kv_events"])
+
+    def test_kv_events_is_null_when_endpoint_missing_port(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://0.0.0.0", "topic": ""}'
+            ),
+            page_size=64,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNone(info["kv_events"])
+
+    def test_kv_events_is_null_when_port_not_integer(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://0.0.0.0:abc", "topic": ""}'
+            ),
+            page_size=64,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNone(info["kv_events"])
+
+    def test_kv_events_is_null_for_port_out_of_range(self):
+        # TCP ports are 1..65535; values outside the range can't bind, so
+        # the descriptor refuses to advertise them rather than handing
+        # subscribers a non-dialable address.
+        for bad_port in (0, -1, 65536, 1_000_000):
+            with self.subTest(port=bad_port):
+                args = ServerArgs(
+                    model_path="dummy",
+                    kv_events_config=(
+                        f'{{"publisher": "zmq", "endpoint": "tcp://0.0.0.0:{bad_port}", "topic": ""}}'
+                    ),
+                    page_size=64,
+                )
+                info = _call_server_info_with(args)
+                self.assertIsNone(info["kv_events"])
+
+    # ----- bad scheduler context ---------------------------------------
+
+    def test_kv_events_is_null_when_page_size_missing_or_non_positive(self):
+        # Without a real positive `page_size` the descriptor's
+        # `block_size` would be a misleading placeholder; subscribers
+        # would hash prompts at the wrong granularity and miss every
+        # cache entry. Refuse to advertise instead.
+        good_cfg = '{"publisher": "zmq", "endpoint": "tcp://*:5557", "topic": ""}'
+        for bad_page_size in (None, 0, -1):
+            with self.subTest(page_size=bad_page_size):
+                args = ServerArgs(
+                    model_path="dummy",
+                    kv_events_config=good_cfg,
+                    page_size=bad_page_size,
+                )
+                info = _call_server_info_with(args)
+                self.assertIsNone(info["kv_events"])
+
+
+class TestServerInfoControlPlaneUpdates(CustomTestCase):
+    """/server_info answers what was asked for, not what is in effect."""
+
+    def test_the_readback_reports_the_record_not_the_control_plane(self):
+        # A runtime weight-version change is reported by /model_info and its
+        # gRPC / Engine twins; this endpoint reports what the operator supplied.
+        server_args = ServerArgs(model_path="dummy", weight_version="v1")
+        payload = _call_server_info_with(
+            server_args, config_updates={"weight_version": "v2"}
+        )
+        self.assertEqual(payload["weight_version"], "v1")
+        self.assertEqual(server_args.weight_version, "v1")
+
+    def test_the_recorded_update_reaches_the_readback_overlay(self):
+        """The update the case above records is one `/server_info` could see.
+
+        `resolved_config_dict` is the overlay the endpoint dropped; an update
+        that never reached it would satisfy the assertion above for free.
+        """
+        server_args = ServerArgs(model_path="dummy", weight_version="v1")
+        tokenizer_manager = _stub_tokenizer_manager(server_args)
+        publish(server_args, role="tokenizer")
+        try:
+            tokenizer_manager.record_config_updates("test", weight_version="v2")
+            self.assertEqual(tokenizer_manager.config_value("weight_version"), "v2")
+            overlaid = tokenizer_manager.resolved_config_dict(
+                server_args.resolved_dict()
+            )
+            self.assertEqual(overlaid["weight_version"], "v2")
+        finally:
+            reset_context()
+
+
+class TestServerInfoExistingFieldsPreserved(CustomTestCase):
+    """Regression guard: the new `kv_events` field is additive — none of
+    the fields existing consumers depend on may be silently dropped.
+
+    Existing `/server_info` consumers in the wild include:
+      * SGLang's own deprecated `/get_server_info` (forwards to the
+        same handler).
+      * External monitoring tools that scrape the full ServerArgs.
+      * KV-aware routers reading `kv_events_config`, `page_size`,
+        `dp_size` directly to derive subscription info (this is the
+        path the new `kv_events` block enriches but does not replace).
+    """
+
+    def test_every_server_args_field_appears_in_response(self):
+        # `server_args.resolved_dict()` is spread into the response; asserting
+        # every dataclass field surfaces is the strongest backward-compat
+        # guarantee that's still implementation-agnostic.
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(args)
+
+        for field in msgspec.structs.fields(ServerArgs):
+            self.assertIn(
+                field.name,
+                info,
+                f"existing ServerArgs field '{field.name}' missing from "
+                f"/server_info response — kv_events patch must not "
+                f"shadow or drop ServerArgs fields",
+            )
+
+    def test_internal_states_and_version_keys_preserved(self):
+        # These two top-level keys predate the kv_events patch and are
+        # named individually (not spread from a dataclass), so a stray
+        # edit could remove them without breaking syntax. Lock them down.
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(args)
+
+        self.assertIn("internal_states", info)
+        self.assertIn("version", info)
+        self.assertEqual(info["frontend"], "python")
+
+    def test_kv_events_config_raw_field_still_surfaced(self):
+        # The new structured `kv_events` block sits alongside the
+        # pre-existing flat `kv_events_config` field (the raw CLI string
+        # already on ServerArgs). Both must remain visible so
+        # consumers that hand-parse the raw config keep working.
+        raw_cfg = '{"publisher": "zmq", "endpoint": "tcp://*:5557", "topic": ""}'
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=raw_cfg,
+            page_size=64,
+            dp_size=1,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIn("kv_events_config", info)
+        self.assertEqual(info["kv_events_config"], raw_cfg)
+        # And the new structured block is separately present:
+        self.assertIn("kv_events", info)
+        self.assertIsNotNone(info["kv_events"])
+
+    def test_lora_refs_are_json_serializable_dicts(self):
+        lora_ref = LoRARef(
+            lora_id="lora-id",
+            lora_name="adapter",
+            lora_path="/tmp/adapter",
+            pinned=True,
+        )
+        args = ServerArgs(model_path="dummy")
+        args.lora_paths = [lora_ref]
+
+        info = _call_server_info_with(
+            args,
+            internal_states=[{"lora_paths": [lora_ref]}],
+        )
+
+        expected = {
+            "lora_id": "lora-id",
+            "lora_name": "adapter",
+            "lora_path": "/tmp/adapter",
+            "pinned": True,
+        }
+        self.assertEqual(info["lora_paths"], [expected])
+        self.assertEqual(info["internal_states"][0]["lora_paths"], [expected])
+        json.dumps(info)
+
+
+class TestLoadPublishEndpointValidation(CustomTestCase):
+    """--load-publish-endpoint fails fast at the entrypoint, not silently in a
+    scheduler subprocess log."""
+
+    def test_requires_kv_events_config(self):
+        args = ServerArgs(model_path="dummy", load_publish_endpoint="tcp://*:6000")
+        with self.assertRaisesRegex(ValueError, "kv-events"):
+            check_load_publish_args(args)
+
+    def test_rejects_non_bindable_endpoint(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            load_publish_endpoint="tcp://10.0.0.5:6000",
+        )
+        with self.assertRaisesRegex(ValueError, "bindable"):
+            check_load_publish_args(args)
+
+    def test_rejects_endpoint_overlapping_the_kv_range(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            dp_size=4,
+            load_publish_endpoint="tcp://*:5558",
+        )
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            check_load_publish_args(args)
+
+    def test_rejects_null_publisher(self):
+        # publisher='null' disables KV events, so there is nothing to advertise
+        # through — accepting the opt-in would silently do nothing.
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "null"}',
+            load_publish_endpoint="auto",
+        )
+        with self.assertRaisesRegex(ValueError, "null"):
+            check_load_publish_args(args)
+
+    def test_rejects_unparseable_kv_events_config(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config="{not json",
+            load_publish_endpoint="auto",
+        )
+        with self.assertRaisesRegex(ValueError, "not parseable"):
+            check_load_publish_args(args)
+
+    def test_off_and_valid_endpoint_pass(self):
+        for endpoint in (None, "off", "OFF", "auto", "tcp://*:6000"):
+            with self.subTest(endpoint=endpoint):
+                args = ServerArgs(
+                    model_path="dummy",
+                    kv_events_config=(
+                        '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'
+                    ),
+                    load_publish_endpoint=endpoint,
+                )
+                check_load_publish_args(args)  # must not raise
+
+
+class TestServerInfoHicacheLayoutField(CustomTestCase):
+    """The scheduler-reported L3 layout surfaces in `/server_info`."""
+
+    def test_layout_from_scheduler_info_is_surfaced(self):
+        args = ServerArgs(model_path="dummy")
+        layout = {
+            "enabled": True,
+            "backend": "mooncake",
+            "page_size": 256,
+            "hicache_object_layout": {
+                "pools": [],
+                "key_prefix": "deepseek-ai-DeepSeek-V4",
+            },
+        }
+
+        info = _call_server_info_with(
+            args,
+            scheduler_info={
+                "max_req_input_len": 1024,
+                "hicache_object_layout": layout,
+            },
+        )
+
+        self.assertEqual(info["hicache_object_layout"], layout)
+        json.dumps(info)
+
+    def test_legacy_scheduler_without_layout_keeps_field_absent(self):
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(args)
+
+        self.assertNotIn("hicache_object_layout", info)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,1740 @@
+from __future__ import annotations
+
+"""
+Copyright 2023-2025 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+
+import logging
+import threading
+import time
+from dataclasses import dataclass
+from queue import Empty, Queue
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
+
+import torch
+
+from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+    PoolName,
+    PoolTransfer,
+    count_pool_hits,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+    from sglang.srt.mem_cache.pool_host import HostKVCache
+
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.mem_cache.hicache_key_scheme import (
+    UnifiedKVPlan,
+    namespace_digest,
+    normalize_dtype,
+    plan_unified_kv,
+)
+from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
+from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.utils import get_device_module
+
+logger = logging.getLogger(__name__)
+
+device_module = get_device_module()
+
+
+def storage_model_name(
+    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
+) -> Optional[str]:
+    """The model name storage backends key pages on, tagged with the host
+    pool's page format when it has one of its own."""
+    tag = host_pool.storage_format_tag
+    if tag is None:
+        return model_name
+    return f"{model_name}-{tag}" if model_name else tag
+
+
+class LayerLoadingEvent:
+    def __init__(self, num_layers: int):
+        self._num_layers = num_layers
+        self.load_events = [device_module.Event() for _ in range(num_layers)]
+        self.start_event = device_module.Event()  # start event on controller stream
+
+    def complete(self, layer_index: int):
+        assert 0 <= layer_index < self._num_layers
+        self.load_events[layer_index].record()
+
+    def wait(self, layer_index: int):
+        device_module.current_stream().wait_event(self.load_events[layer_index])
+
+    @property
+    def finish_event(self):
+        return self.load_events[-1]
+
+
+class LayerDoneCounter:
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        # extra producer and consumer counters for overlap mode
+        self.num_counters = 3
+        self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
+        self.producer_index = -1
+        self.consumer_index = -1
+
+    def update_producer(self):
+        self.producer_index = (self.producer_index + 1) % self.num_counters
+        assert self.events[self.producer_index].finish_event.query(), (
+            "Producer finish event should be ready before being reused."
+        )
+        return self.producer_index
+
+    def set_consumer(self, index: int):
+        self.consumer_index = index
+
+    def wait_until(self, threshold: int):
+        if self.consumer_index < 0:
+            return
+        self.events[self.consumer_index].wait(threshold)
+
+    def reset(self):
+        self.producer_index = -1
+        self.consumer_index = -1
+
+
+class CacheOperation:
+    counter = 0
+
+    def __init__(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        node_id: int,
+        priority: Optional[int] = None,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ):
+        self.host_indices = host_indices
+        self.device_indices = device_indices
+        self.node_ids = [node_id]
+        self.data = None
+        self.pool_transfers = pool_transfers
+
+        self.id = CacheOperation.counter
+        CacheOperation.counter += 1
+        # default priority is the order of creation
+        self.priority = priority if priority is not None else self.id
+
+    @staticmethod
+    def _merge_pool_transfers(
+        ops: List[CacheOperation],
+    ) -> Optional[List[PoolTransfer]]:
+        grouped: dict[tuple[PoolName, Optional[PoolName]], List[PoolTransfer]] = {}
+        for op in ops:
+            for transfer in op.pool_transfers or []:
+                grouped.setdefault(
+                    (transfer.name, transfer.indices_from_pool), []
+                ).append(transfer)
+        if not grouped:
+            return None
+
+        def cat_or_none(tensors):
+            parts = [tensor for tensor in tensors if tensor is not None]
+            return torch.cat(parts) if parts else None
+
+        return [
+            PoolTransfer(
+                name=transfers[0].name,
+                host_indices=cat_or_none(t.host_indices for t in transfers),
+                device_indices=cat_or_none(t.device_indices for t in transfers),
+                keys=[key for t in transfers if t.keys for key in t.keys] or None,
+                hit_policy=transfers[0].hit_policy,
+                indices_from_pool=transfers[0].indices_from_pool,
+            )
+            for transfers in grouped.values()
+        ]
+
+    @staticmethod
+    def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
+        assert ops
+        if len(ops) == 1:
+            return ops[0]
+        host_indices = torch.cat([op.host_indices for op in ops])
+        device_indices = torch.cat([op.device_indices for op in ops])
+        node_ids = []
+        priority = min(op.priority for op in ops)
+        for op in ops:
+            node_ids.extend(op.node_ids)
+        merged_op = CacheOperation(
+            host_indices,
+            device_indices,
+            -1,
+            priority,
+            pool_transfers=CacheOperation._merge_pool_transfers(ops),
+        )
+        merged_op.node_ids = node_ids
+        return merged_op
+
+    def __lt__(self, other: CacheOperation):
+        return self.priority < other.priority
+
+
+class HiCacheAck(NamedTuple):
+    start_event: device_module.Event
+    finish_event: device_module.Event
+    node_ids: List[int]
+    num_tokens: int = 0
+    timing_enabled: bool = False
+    # Tokens transferred per host pool (PoolName value -> count).
+    num_tokens_by_pool: Optional[dict[str, int]] = None
+    # Total bytes moved by the op across all pools, including draft piggyback
+    # and sidecar transfers that the per-pool token counts exclude.
+    num_bytes: int = 0
+
+
+@dataclass
+class PrefetchAck:
+    """ACK for prefetch operation.
+
+    A sequence of PrefetchAck is sent to the scheduler thread via ack_prefetch_queue,
+    indicating progress or completion of the prefetch operation.
+
+    For example, a prefetch operation may results into the following sequence of PrefetchAck:
+
+    1. PrefetchAck(completed_tokens = 128)
+    2. PrefetchAck(completed_tokens = 256)
+    3. PrefetchAck(pool_hits={INDEXER: 256})
+    4. PrefetchAck(completed_req = True)
+
+    The last PrefetchAck always specifies completed_req = True.
+    """
+
+    rid: str
+    operation: PrefetchOperation
+    # Number of hits in KV pool.
+    completed_tokens: Optional[int] = None
+    # Number of hits in extra pools.
+    pool_hits: Optional[dict[str, int]] = None
+    completed_req: Optional[bool] = None
+
+
+class StorageOperation:
+    counter = 0
+
+    def __init__(
+        self,
+        host_indices: Optional[torch.Tensor],
+        token_ids: List[int],
+        last_hash: Optional[str] = None,
+        hash_value: Optional[List[str]] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ):
+        self.host_indices = host_indices
+        self.token_ids = token_ids
+        self.last_hash = last_hash
+        self.completed_tokens = 0
+        self.hash_value = hash_value if hash_value is not None else []
+        self.prefix_keys = prefix_keys
+        # Full queried page-hash chain, set by _storage_hit_query before
+        # hash_value is truncated to the hit boundary; the tail is the
+        # absence signal that invalidates buffer-mode existence beliefs.
+        self.all_hash_values: Optional[List[str]] = None
+        # Prefetch-outcome accounting, set at enqueue by the tree cache.
+        self.stats_requested_tokens = 0
+        # Absolute token offset at which this storage-prefetched span starts.
+        self.storage_start = 0
+
+        self.id = StorageOperation.counter
+        StorageOperation.counter += 1
+
+    def __lt__(self, other: StorageOperation):
+        return self.id < other.id
+
+
+# Buffer-mode staging budgets. Prefetch staging is latency-critical
+# (wait_complete gates TTFT), so loads may fill the pool up to this fraction
+# before new prefetches are declined.
+HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
+# Write-staging floor: writes are deferrable, so the flush gate grows the
+# write window dynamically into whatever load staging is not using.
+HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
+
+# Bound on waiting for the storage workers to stop. After the stop event a
+# worker finishes only the backend call it is inside (the queued work is
+# answered without touching the backend), so the bound covers one slow call,
+# not a queue.
+STORAGE_STOP_JOIN_S = 60.0
+
+
+class PrefetchOperation(StorageOperation):
+    def __init__(
+        self,
+        request_id: str,
+        token_ids: List[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ):
+        self.request_id = request_id
+
+        self._lock = threading.Lock()
+        self._terminated_flag = False
+        self.storage_hit_count = 0
+        self.start_time = time.monotonic()
+
+        super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
+
+    def mark_terminate(self):
+        with self._lock:
+            self._terminated_flag = True
+
+    def is_terminated(self) -> bool:
+        with self._lock:
+            return self._terminated_flag
+
+
+def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
+    """Reject a host pool that HiCache L3 cannot store under DCP.
+
+    The DCP L3 path stores one physical page per logical page on each rank, so
+    every pool besides the MLA anchor must be either per-slot state or sharded
+    by the same DCP rows as the anchor.
+    """
+    from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+    pool = entry.host_pool
+    if pool is anchor:
+        return
+    if entry.name == PoolName.MAMBA and isinstance(pool, MambaPoolHost):
+        return  # KDA state: one slot per key
+    if (
+        entry.name == PoolName.INDEXER
+        and isinstance(pool, DSAIndexerPoolHost)
+        and dsa_shards_index_k()
+        and pool.dcp_size == anchor.dcp_size
+        and pool.size == anchor.size
+    ):
+        return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
+    if (
+        entry.name == PoolName.DRAFT
+        and isinstance(pool, MLATokenToKVPoolHost)
+        and pool.kv_buffer is not None
+        and pool.dcp_size == anchor.dcp_size
+    ):
+        return
+    raise NotImplementedError(
+        f"HiCache L3 with DCP does not support the {entry.name} host pool "
+        f"({type(pool).__name__})."
+    )
+
+
+class HiCacheController:
+    def __init__(
+        self,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        mem_pool_host: HostKVCache,
+        page_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        load_cache_event: threading.Event,
+        attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
+        write_policy: str = "write_through_selective",
+        io_backend: str = "",
+        storage_backend: Optional[str] = None,
+        prefetch_threshold: int = 256,
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
+        enable_storage_metrics: bool = False,
+        host_memory_mode: str = "cache",
+        kv_storage: Optional[KVStorage] = None,
+    ):
+        self.tp_group = tp_group
+        self.host_memory_mode = host_memory_mode
+        # A unified pool's storage: copies are recorded on it, so a page move
+        # waits for the copies that touch its pages.
+        self.kv_storage = kv_storage
+        self.attn_cp_group = attn_cp_group
+        self.attn_tp_group = attn_tp_group
+        self.pp_group = pp_group
+        self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.mem_pool_device_allocator = token_to_kv_pool_allocator
+        mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        # A pool wrapping one token KV view transfers that view's KV.
+        inner = mem_pool_device.layer_router.wrapped_view()
+        if inner is not None:
+            mem_pool_device = inner
+        self.mem_pool_device = mem_pool_device
+        self.mem_pool_host = mem_pool_host
+        self.storage_host_pool = mem_pool_host
+        self.write_policy = write_policy
+        self.page_size = page_size
+        self.io_backend = io_backend
+        self.enable_storage = False
+        self.storage_backend = None
+        self.storage_backend_type = None
+        self.enable_storage_metrics = enable_storage_metrics
+        # Buffer mode: wired by the tree cache after attach; the load rate
+        # limiter subtracts write staging from actual pool usage.
+        self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
+
+        # Default storage page IO functions (may be overridden by attach).
+        self.page_get_func = self._generic_page_get
+        self.page_set_func = self._generic_page_set
+
+        # Dedicated stop event for storage background threads (prefetch/backup).
+        self.storage_stop_event = threading.Event()
+        # The storage workers this controller started: None until started and
+        # again once stopped. A native controller starts none.
+        self.prefetch_thread: Optional[threading.Thread] = None
+        self.prefetch_io_aux_thread: Optional[threading.Thread] = None
+        self.prefetch_sync_thread: Optional[threading.Thread] = None
+        self.backup_thread: Optional[threading.Thread] = None
+        # Workers that exited on an exception, by thread name (see
+        # _run_storage_worker); reset when the workers start.
+        self._storage_worker_failures: dict[str, str] = {}
+
+        # Storage control queues, (re)created whenever the storage threads start.
+        self.prefetch_buffer: Optional[Queue[PrefetchOperation]] = None
+        self.prefetch_sync_queue: Optional[Queue[PrefetchAck]] = None
+        self.prefetch_hit_queue: Optional[Queue[StorageOperation]] = None
+        self.ack_prefetch_queue = Queue[PrefetchAck]()
+        self.ack_backup_queue: Optional[Queue[StorageOperation]] = None
+        self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
+
+        self.device = self.mem_pool_device.device
+        self.transfer_layer_id_max = self.mem_pool_device.layer_num
+        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+        self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+
+        if write_policy not in [
+            "write_through",
+            "write_through_selective",
+            "write_back",
+        ]:
+            raise ValueError(f"Invalid write policy: {write_policy}")
+
+        # self.write_queue = PriorityQueue[CacheOperation]()
+        self.load_queue: List[CacheOperation] = []
+        self.write_queue: List[CacheOperation] = []
+        self.ack_load_queue: List[HiCacheAck] = []
+        # Set by the scheduler to the forward stream; gate load-back H2D and
+        # write D2H behind in-flight forwards (see start_loading, start_writing).
+        self.load_fence_stream = None
+        self.write_fence_stream = None
+        self.ack_write_queue: List[HiCacheAck] = []
+
+        self.l2_transfer_engine = L2TransferEngine(io_backend)
+
+        # If a storage backend is provided at startup, treat it as an implicit attach,
+        # so init/runtime share the same lifecycle semantics and code paths.
+        if storage_backend is not None:
+            try:
+                self.attach_storage_backend(
+                    storage_backend=storage_backend,
+                    prefetch_threshold=prefetch_threshold,
+                    model_name=model_name,
+                    storage_backend_extra_config=storage_backend_extra_config,
+                )
+            except ValueError as e:
+                # Preserve the historical error shape on init for unknown backends.
+                raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
+        """Derive CP rank/size from the attn_cp process group."""
+        if self.attn_cp_group is not None:
+            return (
+                torch.distributed.get_rank(group=self.attn_cp_group),
+                torch.distributed.get_world_size(group=self.attn_cp_group),
+            )
+        return 0, 1
+
+    def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+
+        groups: List[torch.distributed.ProcessGroup] = []
+        seen_rank_sets = set()
+
+        if self.attn_cp_group is not None or self.attn_tp_group is not None:
+            base_groups = [self.attn_cp_group, self.attn_tp_group]
+        else:
+            base_groups = [self.tp_group]
+        if self.pp_group is not None:
+            base_groups.append(self.pp_group)
+
+        for group in base_groups:
+            if group is None or torch.distributed.get_world_size(group=group) == 1:
+                continue
+            group_ranks = tuple(torch.distributed.get_process_group_ranks(group))
+            if group_ranks in seen_rank_sets:
+                continue
+            seen_rank_sets.add(group_ranks)
+            groups.append(
+                create_custom_parallel_group(
+                    group_ranks=list(group_ranks), backend="gloo"
+                )
+            )
+        return groups
+
+    def _destroy_sync_groups(
+        self, groups: List[torch.distributed.ProcessGroup]
+    ) -> None:
+        for group in groups:
+            try:
+                torch.distributed.destroy_process_group(group)
+            except Exception:
+                pass
+
+    def _all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op,
+        groups: List[torch.distributed.ProcessGroup],
+    ) -> None:
+        for group in groups:
+            torch.distributed.all_reduce(tensor, op=op, group=group)
+
+    def _start_storage_threads(self):
+        """Start storage prefetch/backup threads and their queues.
+
+        This is used by runtime attach, and also by reset when storage is enabled.
+        """
+        assert self.enable_storage
+        assert not self.storage_stop_event.is_set()
+
+        self.prefetch_queue = Queue()
+        self.backup_queue = Queue()
+        self.prefetch_buffer = Queue()
+        self.prefetch_sync_queue = Queue()
+        self.prefetch_hit_queue = Queue()
+        self.ack_prefetch_queue = Queue()
+        self.ack_backup_queue = Queue()
+        self.host_mem_release_queue = Queue()
+        self._start_storage_worker_threads()
+
+    def _start_storage_worker_threads(self) -> None:
+        """Create and start the four storage workers; their queues must exist.
+        The IO worker starts before the sync thread, which reads its handle."""
+        self._storage_worker_failures = {}
+        self.prefetch_thread = self._start_storage_worker(
+            "hicache-prefetch", self.prefetch_thread_func
+        )
+        self.prefetch_io_aux_thread = self._start_storage_worker(
+            "hicache-prefetch-io", self.prefetch_io_aux_func
+        )
+        self.prefetch_sync_thread = self._start_storage_worker(
+            "hicache-prefetch-sync", self.prefetch_sync_thread_func
+        )
+        self.backup_thread = self._start_storage_worker(
+            "hicache-backup", self.backup_thread_func
+        )
+
+    def _start_storage_worker(self, name: str, target: Callable[[], None]):
+        thread = threading.Thread(
+            target=self._run_storage_worker, args=(name, target), name=name, daemon=True
+        )
+        thread.start()
+        return thread
+
+    def _run_storage_worker(self, name: str, target: Callable[[], None]) -> None:
+        """Run a worker loop. An exception that escapes it is recorded by
+        thread name, so dead_storage_workers() reports the death even while a
+        stop is pending, and re-raised: the worker is gone, the rank follows."""
+        try:
+            target()
+        except BaseException as exc:
+            self._storage_worker_failures[name] = repr(exc)
+            logger.exception("HiCache storage worker %s exited on an exception", name)
+            raise
+
+    def _storage_worker_threads(self) -> List[threading.Thread]:
+        """The storage workers started and not yet stopped (a handle that was
+        created but never started is not one)."""
+        return [
+            thread
+            for thread in (
+                self.prefetch_thread,
+                self.prefetch_io_aux_thread,
+                self.prefetch_sync_thread,
+                self.backup_thread,
+            )
+            if thread is not None and thread.ident is not None
+        ]
+
+    def dead_storage_workers(self) -> List[str]:
+        """Names of started workers that are gone and were not told to stop,
+        plus any worker that exited on an exception.
+
+        A worker leaves its loop only on an exception or on the stop event.
+        While the event is set a worker that finished did what it was asked:
+        a stop that hit its bound leaves the threads in the started set, and
+        the retried stop joins them. A worker that raised is dead either way
+        (_run_storage_worker records it), so a crash during a pending stop is
+        reported too."""
+        failed = list(self._storage_worker_failures)
+        if self.storage_stop_event.is_set():
+            return failed
+        exited = [t.name for t in self._storage_worker_threads() if not t.is_alive()]
+        return failed + [name for name in exited if name not in failed]
+
+    def _join_storage_threads(self, threads: List[threading.Thread]) -> None:
+        """Wait up to STORAGE_STOP_JOIN_S, in total, for the threads to exit."""
+        deadline = time.monotonic() + STORAGE_STOP_JOIN_S
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def _stop_storage_threads(self):
+        """Stop storage prefetch/backup threads and drain internal queues.
+
+        Caller should ensure no in-flight requests.
+        """
+        # Always request stop. This is safe even when storage is already disabled,
+        # and makes detach truly idempotent (previous partial detach may have left
+        # threads alive).
+        # NOTE: do NOT clear storage_stop_event unless threads have fully stopped; otherwise
+        # a still-alive thread may resume and touch released state.
+        self.storage_stop_event.set()
+
+        # Best-effort wakeups so threads exit promptly even if blocked on queues.
+        try:
+            if hasattr(self, "prefetch_queue"):
+                self.prefetch_queue.put_nowait(None)
+            if hasattr(self, "backup_queue"):
+                self.backup_queue.put_nowait(None)
+            if hasattr(self, "prefetch_buffer"):
+                self.prefetch_buffer.put_nowait(None)
+            if hasattr(self, "prefetch_sync_queue"):
+                self.prefetch_sync_queue.put_nowait(None)
+        except Exception:
+            pass
+
+        # Bounded joins (threads are daemon, but join keeps state clean).
+        threads = self._storage_worker_threads()
+        self._join_storage_threads(threads)
+
+        alive = [t.name for t in threads if t.is_alive()]
+        if alive:
+            logger.error(
+                "Failed to stop HiCache storage threads cleanly within %.0fs: %s",
+                STORAGE_STOP_JOIN_S,
+                alive,
+            )
+            raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+        if self._storage_worker_failures:
+            # The workers are joined, but one of them died: a flush fails the
+            # rank here, a detach returns the error and the next tick raises.
+            raise RuntimeError(
+                "HiCache storage worker thread(s) exited on an exception: "
+                + ", ".join(
+                    f"{name} ({error})"
+                    for name, error in self._storage_worker_failures.items()
+                )
+            )
+        # Stopped workers leave the started set: liveness is over started threads.
+        self.prefetch_thread = None
+        self.prefetch_io_aux_thread = None
+        self.prefetch_sync_thread = None
+        self.backup_thread = None
+
+    # A subclass whose attach continues registering host pools after super()
+    # returns fires on_host_pools_registered() itself, once.
+    _registers_host_pools_after_super_attach = False
+
+    def attach_storage_backend(
+        self,
+        storage_backend: str,
+        prefetch_threshold: int = 256,
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
+    ):
+        """Attach (enable) storage backend at runtime.
+
+        Requirement: no in-flight requests. This call is expected to run on the scheduler
+        thread (control path), not concurrently with prefetch/backup.
+        """
+        if self.enable_storage:
+            raise RuntimeError("Storage backend already attached.")
+        key_scheme = get_memory().hicache_storage_key_scheme
+        if key_scheme != "unified" and self.storage_host_pool.layout == "page_unified":
+            raise ValueError(
+                "The page_unified host layout requires unified storage keys "
+                "to distinguish its byte order."
+            )
+        if key_scheme == "unified" and storage_backend != "file":
+            raise NotImplementedError(
+                "The unified key scheme supports only the file storage backend."
+            )
+        if get_parallel().attn_dcp_size > 1:
+            if self.host_memory_mode == "buffer_only":
+                # Buffer-mode write staging still budgets physical host rows.
+                raise NotImplementedError(
+                    "HiCache L3 with DCP does not support buffer_only host memory."
+                )
+            from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+            if storage_backend not in ("file", "mooncake"):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP requires file or Mooncake storage."
+                )
+            if (
+                not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)
+                or self.storage_host_pool.kv_buffer is None
+            ):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP requires a materialized MLA host pool."
+                )
+            if self.mem_pool_host is not self.storage_host_pool:
+                for entry in self.mem_pool_host.entries:
+                    check_dcp_l3_extra_pool(entry, self.storage_host_pool)
+            if self.storage_host_pool.layout not in (
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+            ):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP requires a generic MLA page layout."
+                )
+
+        # Defensive: a previous partial detach may have flipped `enable_storage` but
+        # left background threads alive. Attaching on top of them is unsafe.
+        try:
+            self._stop_storage_threads()
+        except Exception as e:
+            raise RuntimeError(
+                "Cannot attach storage backend: previous detach did not stop storage threads cleanly."
+            ) from e
+
+        # Rollback-safe init: if creation fails, keep controller state consistent
+        # for future attach attempts.
+        self.storage_backend_type = storage_backend
+        from sglang.srt.mem_cache.utils import get_hash_str
+
+        self.get_hash_str = get_hash_str
+        self.storage_config = self._generate_storage_config(
+            model_name, storage_backend_extra_config
+        )
+
+        # Use storage backend factory for dynamic backend creation
+        from sglang.srt.mem_cache.storage import StorageBackendFactory
+
+        try:
+            self.storage_backend = StorageBackendFactory.create_backend(
+                storage_backend, self.storage_config, self.storage_host_pool
+            )
+            self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+            if not self._registers_host_pools_after_super_attach:
+                self.storage_backend.on_host_pools_registered()
+
+            self.enable_storage = True
+            # todo: threshold policy for prefetching
+            self.prefetch_threshold = max(prefetch_threshold, self.page_size)
+            if self.host_memory_mode == "buffer_only":
+                # The whole pool is transient staging; loads may fill it up
+                # to this fraction, and the tree's write flush gate yields
+                # to live fetch demand (the write fraction is a floor).
+                self.prefetch_capacity_limit = int(
+                    HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.size
+                )
+            else:
+                # Leave half the pool for write-back. Prefetch occupancy counts
+                # logical tokens, not physical rows on each DCP rank.
+                self.prefetch_capacity_limit = int(
+                    0.5 * self.mem_pool_host.logical_size
+                )
+            # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
+            self.prefetch_tokens_occupied = 0
+
+            # Use dedicated gloo groups so storage prefetch sync is isolated
+            # from other collectives and consistent across CPxTP participants.
+            self.prefetch_hits_sync_groups = self._create_sync_groups()
+            self.prefetch_completion_sync_groups = self._create_sync_groups()
+
+            # Select the get and set functions
+            self.page_get_func = self._generic_page_get
+            self.page_set_func = self._generic_page_set
+
+            if (
+                self.storage_backend_type
+                in [
+                    "hf3fs",
+                    "mooncake",
+                    "npu_memcache",
+                    "eic",
+                    "nixl",
+                    "simm",
+                    "mori",
+                    "tensorcast",
+                    "seaweedfs",
+                    "fast_file",
+                ]
+            ) or (
+                self.storage_backend_type == "dynamic"
+                and bool(self.storage_config.extra_config.get("interface_v1", 0))
+            ):
+                self.page_get_func = self._page_get_zero_copy
+                self.page_set_func = self._page_set_zero_copy
+
+            # Ensure stop_event is clear before starting threads.
+            self.storage_stop_event.clear()
+            self._start_storage_threads()
+        except Exception:
+            # Best-effort cleanup for partial init.
+            try:
+                self._stop_storage_threads()
+            except Exception:
+                pass
+            self._destroy_sync_groups(self.prefetch_hits_sync_groups)
+            self._destroy_sync_groups(self.prefetch_completion_sync_groups)
+            self.prefetch_hits_sync_groups = []
+            self.prefetch_completion_sync_groups = []
+            try:
+                if (
+                    hasattr(self, "storage_backend")
+                    and self.storage_backend is not None
+                ):
+                    if hasattr(self.storage_backend, "close"):
+                        self.storage_backend.close()
+            except Exception:
+                pass
+            self.storage_backend = None
+            self.storage_backend_type = None
+            self.enable_storage = False
+            self.page_get_func = self._generic_page_get
+            self.page_set_func = self._generic_page_set
+            raise
+
+    def detach_storage_backend(self):
+        """Detach (disable) storage backend at runtime.
+
+        Requirement: no in-flight requests. This will stop storage threads and release
+        the backend instance (best-effort close).
+        """
+        # Idempotent cleanup: even if `enable_storage` is already False,
+        # we may still have leftover resources (threads/backend/process group) from a
+        # previous partial detach. We attempt cleanup whenever possible.
+        try:
+            self._stop_storage_threads()
+        except Exception as e:
+            # Do not proceed tearing down backend/process group if threads are not
+            # fully stopped; otherwise still-alive threads may touch released state.
+            # Caller can retry detach.
+            logger.exception("Stop storage threads failed: %s", e)
+            # IMPORTANT: Do not silently succeed. Upper layers rely on exceptions here
+            # to avoid flipping `enable_storage` flags while threads are still alive.
+            raise RuntimeError("Stop storage threads failed; detach aborted.") from e
+
+        # Best-effort destroy process groups created for storage ops.
+        self._destroy_sync_groups(
+            self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
+        )
+        self.prefetch_hits_sync_groups = []
+        self.prefetch_completion_sync_groups = []
+
+        # Best-effort close (some backends rely on GC/destructor).
+        try:
+            if (
+                hasattr(self, "storage_backend")
+                and self.storage_backend is not None
+                and hasattr(self.storage_backend, "close")
+            ):
+                self.storage_backend.close()
+        except Exception:
+            logger.exception("Failed to close storage backend cleanly.")
+
+        self.storage_backend = None
+        self.storage_backend_type = None
+        self.enable_storage = False
+        self.page_get_func = self._generic_page_get
+        self.page_set_func = self._generic_page_set
+        # Now it's safe to clear the stop event for future re-attach.
+        self.storage_stop_event.clear()
+
+    @property
+    def backup_skip(self) -> bool:
+        return not self.storage_config.is_storage_writer
+
+    def _generate_storage_config(
+        self,
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
+    ):
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
+
+        parallel = get_parallel()
+        if is_dp_attention_enabled():
+            tp_rank = parallel.attn_tp_rank
+            tp_size = parallel.attn_tp_size
+            dp_rank = parallel.attn_dp_rank
+        else:
+            tp_rank = parallel.tp_rank
+            tp_size = parallel.tp_size
+            dp_rank = 0
+
+        # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
+        # data. storage only needs rank 0 to write it back.
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        device = self.mem_pool_device
+        router = getattr(device, "layer_router", None)
+        if router is None or isinstance(device, KVLayoutView):
+            # A static pool, or a view handed over directly, is its own layout.
+            token_views = [device]
+        else:
+            token_views = [router.view(p.name) for p in router.sub_pools()]
+        anchor = token_views[0] if token_views else device
+        is_mla_model = isinstance(anchor, MLAKVView)
+        is_compressed_mla_model = isinstance(
+            self.mem_pool_device, DeepSeekV4TokenToKVPool
+        )
+        is_rank_replicated = (
+            is_mla_model
+            and all(
+                isinstance(view, MLAKVView) and view.storage_rank_replicated
+                for view in token_views
+            )
+        ) or is_compressed_mla_model
+        # Least Common Multiple among heterogeneous tp size
+        tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
+        should_split_heads = False
+
+        if tp_lcm_size:
+            assert tp_lcm_size % tp_size == 0, (
+                "tp_lcm_size must be divisible by tp_size."
+            )
+            should_split_heads = (
+                not is_rank_replicated
+                and self.mem_pool_host.layout == "page_head"
+                and tp_lcm_size > tp_size
+            )
+
+        attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        dcp_size = get_parallel().attn_dcp_size
+        model_name = storage_model_name(model_name, self.storage_host_pool)
+        unified_plan = self._build_unified_plan(model_name, attn_cp_size)
+        unified_chunk_spans = None
+        if unified_plan is not None:
+            # Keys are layer-major/head-minor; the physical page is head-major.
+            # Keep each key paired with its byte span instead of slicing pages
+            # consecutively in key order.
+            layout = self.storage_host_pool.page_unified_layout
+            unified_chunk_spans = [
+                layout.chunk_span(layer_range, head_group)
+                for layer_range in unified_plan.layer_ranges
+                for head_group in range(unified_plan.head_group_num)
+            ]
+
+        return HiCacheStorageConfig(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
+            is_mla_model=is_mla_model or is_compressed_mla_model,
+            rank_replicated=is_rank_replicated,
+            enable_storage_metrics=self.enable_storage_metrics,
+            is_page_first_layout=self.mem_pool_host.layout == "page_first",
+            model_name=model_name,
+            tp_lcm_size=tp_lcm_size,
+            should_split_heads=should_split_heads,
+            dp_rank=dp_rank,
+            extra_config=storage_backend_extra_config,
+            unified_suffixes=(unified_plan.suffixes if unified_plan else None),
+            unified_chunk_spans=unified_chunk_spans,
+            dcp_size=dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
+            logical_page_size=self.page_size if dcp_size > 1 else None,
+        )
+
+    def _build_unified_plan(
+        self, model_name: Optional[str], attn_cp_size: int
+    ) -> Optional[UnifiedKVPlan]:
+        """Pair topology-free chunk coordinates with local page ranges."""
+        memory = get_memory()
+        if memory.hicache_storage_key_scheme != "unified":
+            return None
+        parallel = get_parallel()
+        host_pool = self.storage_host_pool
+        if (
+            len(getattr(self.mem_pool_host, "entries", [])) > 1
+            or getattr(host_pool, "page_unified_layout", None) is None
+        ):
+            raise NotImplementedError(
+                "The unified key scheme requires a single page_unified KV pool; "
+                "composite and sidecar pools are not supported."
+            )
+        if host_pool.layer_num != host_pool.end_layer - host_pool.start_layer:
+            raise NotImplementedError(
+                "The unified key scheme requires contiguous model layers "
+                "without packed draft layers."
+            )
+        # Host pools retain physical buffer descriptors, not the device pool.
+        # A hybrid controller can wrap a different pool than its storage anchor.
+        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+        device_pool = (
+            anchor_entry.device_pool
+            if anchor_entry is not None
+            else self.mem_pool_device
+        )
+        if getattr(host_pool, "dcp_size", 1) > 1:
+            raise NotImplementedError(
+                "The unified key scheme does not support decode context "
+                "parallelism: storage objects must contain full pages."
+            )
+        plan = plan_unified_kv(
+            model_id=model_name or "",
+            # Logical KV dtype, not the storage view: fp8 variants all store as
+            # uint8 but must land in distinct keyspaces.
+            dtype=normalize_dtype(device_pool.dtype),
+            page_size=self.page_size,
+            rank_replicated=isinstance(device_pool, MLAKVView),
+            local_kv_heads=getattr(host_pool, "head_num", 0),
+            attn_tp_rank=parallel.attn_tp_rank,
+            attn_tp_size=parallel.attn_tp_size,
+            attn_cp_size=attn_cp_size,
+            start_layer=host_pool.start_layer,
+            end_layer=host_pool.end_layer,
+            is_final_stage=parallel.pp_rank == parallel.pp_size - 1,
+            head_group=memory.hicache_storage_head_partition,
+            layer_partition=memory.hicache_storage_layer_partition,
+        )
+        # The pool was sized from the same server arg before any backend
+        # attached; if the two disagree the objects would not match their keys.
+        pool_groups = getattr(host_pool, "head_group_num", 1)
+        if plan.head_group_num != pool_groups:
+            raise ValueError(
+                f"the unified plan cuts {plan.head_group_num} head groups but "
+                f"the host pool was allocated with {pool_groups}."
+            )
+        logger.info(
+            "HiCache unified L3 keys: namespace=%s chunks=%s",
+            namespace_digest(plan.namespace),
+            plan.suffixes,
+        )
+        return plan
+
+    def reset(self):
+        # Reuse detach's queue wakeups and bounded joins, and fail if any
+        # storage thread remains alive before clearing shared state.
+        self._stop_storage_threads()
+
+        self.write_queue.clear()
+        self.load_queue.clear()
+        self.ack_write_queue.clear()
+        self.ack_load_queue.clear()
+        if self.enable_storage:
+            self.prefetch_queue.queue.clear()
+            self.backup_queue.queue.clear()
+            self.prefetch_buffer.queue.clear()
+            self.prefetch_sync_queue.queue.clear()
+            self.prefetch_hit_queue.queue.clear()
+            self.ack_prefetch_queue.queue.clear()
+            self.ack_backup_queue.queue.clear()
+            self.host_mem_release_queue.queue.clear()
+            self.prefetch_tokens_occupied = 0
+
+        self.storage_stop_event.clear()
+
+        if self.enable_storage:
+            self._start_storage_worker_threads()
+
+    def write(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+        extra_pools: Optional[List[PoolTransfer]] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Back up KV caches from device memory to host memory.
+        """
+        if extra_pools:
+            raise ValueError("Side-pool transfers require HybridCacheController.")
+        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        if host_indices is None:
+            return None
+        self.write_queue.append(
+            CacheOperation(host_indices, device_indices, node_id, priority)
+        )
+        self.start_writing()
+        return host_indices
+
+    def start_writing(self) -> None:
+        if len(self.write_queue) == 0:
+            return
+
+        op = CacheOperation.merge_ops(self.write_queue)
+        host_indices, device_indices, pool_transfers = self._move_write_operation(op)
+        self.write_queue.clear()
+
+        if self.write_fence_stream is not None:
+            # The copy may read KV a forward is still writing: under overlap
+            # scheduling a finished request is cached while the next forward
+            # writes its last token, and an evicted SWA page can belong to an
+            # unfinished checkpoint. Later forwards still overlap with the copy.
+            self.l2_transfer_engine.device_to_host_stream.wait_stream(
+                self.write_fence_stream
+            )
+
+        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        completion = self.l2_transfer_engine.submit_device_to_host(transfers)
+
+        if self.kv_storage is not None:
+            self.kv_storage.record_host_transfer(
+                completion.finish_event, transfers, writes=False
+            )
+
+        self.ack_write_queue.append(
+            HiCacheAck(
+                start_event=completion.start_event,
+                finish_event=completion.finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=completion.timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
+            )
+        )
+
+    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+        return len(op.device_indices) * self.mem_pool_host.size_per_token
+
+    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+        return {PoolName.KV.value: len(op.device_indices)}
+
+    def load(
+        self,
+        host_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> Optional[torch.Tensor]:
+        """
+        Load KV caches from host memory to device memory.
+        """
+        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+        if device_indices is None:
+            return None
+        self.load_queue.append(
+            CacheOperation(host_indices, device_indices, node_id, priority)
+        )
+        return device_indices
+
+    def move_indices(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # move indices to GPU if using kernels, to host if using direct indexing
+        if self.io_backend == "kernel":
+            if not host_indices.is_cuda:
+                host_indices = host_indices.to(self.device, non_blocking=True)
+            return host_indices, device_indices
+        elif self.io_backend == "direct":
+            if self.mem_pool_host.layout == "layer_first":
+                device_indices = device_indices.cpu()
+                host_indices, idx = host_indices.sort()
+                return host_indices, device_indices.index_select(0, idx)
+            elif self.mem_pool_host.layout == "page_first_direct":
+                return host_indices, device_indices.cpu()
+            else:
+                raise ValueError(
+                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
+                )
+        elif self.io_backend == "kernel_ascend":
+            from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+                ascendc_io_enabled,
+                to_device_no_sync,
+            )
+
+            if ascendc_io_enabled():
+                # The fused acc_offload kv_exchange kernel reads the token
+                # indices directly on the device; keeping them there avoids
+                # the D2H sync that would serialize the layer-group pipeline.
+                # (The legacy memcpy2d exchange op still wants CPU indices and
+                # converts them itself.)
+                # Upload through pinned memory: host_indices comes from the
+                # radix-tree match as a pageable CPU tensor, and a pageable
+                # .to(device) completes with a stream synchronize that drains
+                # all compute queued on the current (default) stream.
+                if host_indices.device != self.device:
+                    host_indices = to_device_no_sync(host_indices, self.device)
+                return host_indices, device_indices
+            return host_indices, device_indices.cpu()
+        else:
+            raise ValueError(f"Unsupported io backend")
+
+    def _move_write_operation(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
+        """Keep CPU host indices only for the staged write-back paths."""
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout in ("page_first", "page_unified")
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
+            return op.host_indices, op.device_indices, op.pool_transfers
+        return self._move_op_indices(op)
+
+    def _move_op_indices(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
+        return (*self.move_indices(op.host_indices, op.device_indices), None)
+
+    def _l2_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        transfers = [
+            L2Transfer(
+                host_pool=self.mem_pool_host,
+                device_pool=self.mem_pool_device,
+                host_indices=host_indices,
+                device_indices=device_indices,
+            )
+        ]
+        return transfers
+
+    def _l2_load_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        return self._l2_transfers(host_indices, device_indices, pool_transfers)
+
+    def start_loading(self) -> int:
+        if len(self.load_queue) == 0:
+            return -1
+
+        producer_id = self.layer_done_counter.update_producer()
+        op = CacheOperation.merge_ops(self.load_queue)
+        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        self.load_queue.clear()
+        producer_event = self.layer_done_counter.events[producer_id]
+        producer_event.start_event.record()
+
+        if self.load_fence_stream is not None:
+            # in overlap scheduling, reclaimed pages might still be written by the forward thread
+            # therefore a fence is needed for loading thread to prevent memory corruption
+            # todo: it's possible to use a finer-grained fence
+            self.l2_transfer_engine.host_to_device_stream.wait_stream(
+                self.load_fence_stream
+            )
+
+        transfers = self._l2_load_transfers(
+            host_indices, device_indices, pool_transfers
+        )
+        completion = self.l2_transfer_engine.submit_host_to_device(
+            transfers,
+            start_event=producer_event.start_event,
+            on_layer_done=producer_event.complete,
+            transfer_layer_id_max=self.transfer_layer_id_max,
+        )
+
+        if self.kv_storage is not None:
+            self.kv_storage.record_host_transfer(
+                completion.finish_event, transfers, writes=True
+            )
+            # The submitted copy now orders moves of the rows it loads into.
+            self.kv_storage.end_load_reservations()
+
+        self.ack_load_queue.append(
+            HiCacheAck(
+                start_event=completion.start_event,
+                finish_event=completion.finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=completion.timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
+            )
+        )
+        return producer_id
+
+    def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
+        if not backup_only:
+            raise ValueError("Other eviction policies are not supported yet.")
+
+        self.mem_pool_host.free(host_indices)
+        return len(host_indices)
+
+    def prefetch(
+        self,
+        request_id: str,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ) -> PrefetchOperation:
+        """
+        Prefetch KV caches from storage backend to host memory.
+        """
+        operation = PrefetchOperation(
+            request_id, new_input_tokens, last_hash, prefix_keys
+        )
+        self.prefetch_queue.put(operation)
+        return operation
+
+    def terminate_prefetch(self, operation):
+        """
+        Request to terminate a prefetch operation.
+
+        Must be called in the scheduler thread.
+
+        Asynchronous prefetch tasks may be running in background threads.  When all prefetch
+        tasks are terminated, a PrefetchAck with completed_req=True will be sent to ack_prefetch_queue.
+        """
+        operation.mark_terminate()
+        return operation.completed_tokens, operation.hash_value
+
+    def append_host_mem_release(self, host_indices: torch.Tensor):
+        if host_indices.numel() == 0:
+            return
+        pages = host_indices.split(self.mem_pool_host.page_size)
+        for page in pages:
+            self.host_mem_release_queue.put(page)
+
+    def _page_get_zero_copy(
+        self, operation, hash_values, host_indices, extra_info=None
+    ) -> int:
+        results = self.storage_backend.batch_get_v1(
+            hash_values, host_indices, extra_info
+        )
+        inc = 0
+        for i in range(len(hash_values)):
+            if not results[i]:
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                )
+                break
+            inc += 1
+        return inc
+
+    # todo: deprecate
+    def _generic_page_get(
+        self, operation, hash_values, host_indices, extra_info=None
+    ) -> int:
+        dummy_page_dst = [
+            self.storage_host_pool.get_dummy_flat_data_page() for _ in hash_values
+        ]
+        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
+        if page_data is None:
+            return 0
+        count = 0
+        for i in range(len(hash_values)):
+            if page_data[i] is None:
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                )
+                break
+            if operation.is_terminated():
+                break
+            self.storage_host_pool.set_from_flat_data_page(
+                host_indices[i * self.page_size],
+                page_data[i],
+            )
+            count += 1
+        return count
+
+    def _page_transfer(self, operation: PrefetchOperation) -> int:
+        # Transfer batch by batch
+        prefix_keys = operation.prefix_keys
+        kv_derived_transfers = [
+            transfer
+            for transfer in getattr(operation, "pool_transfers", None) or []
+            if transfer.indices_from_pool == PoolName.KV
+        ]
+        all_success = True
+        completed_pages = 0
+        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            # When an error is occurred, we should keep looping and produce the same number of
+            # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
+            # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
+            # The stop event ends the backend reads the same way: the remaining
+            # acks still go out, carrying what completed.
+            if all_success and (
+                operation.is_terminated() or self.storage_stop_event.is_set()
+            ):
+                all_success = False
+            if all_success:
+                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+                batch_host_indices = operation.host_indices[
+                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                ]
+
+                # Get one batch token, and update the completed_tokens if succeed
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+
+                try:
+                    hit_pages = self._page_transfer_kv_batch(
+                        operation,
+                        batch_hashes,
+                        batch_host_indices,
+                        extra_info,
+                        kv_derived_transfers,
+                    )
+                except Exception:
+                    logger.exception(
+                        "HiCache prefetch transfer failed for request %s",
+                        operation.request_id,
+                    )
+                    hit_pages = 0
+                # Check termination
+                if hit_pages != len(batch_hashes):
+                    all_success = False
+                if prefix_keys is not None:
+                    prefix_keys = prefix_keys + batch_hashes
+                completed_pages += hit_pages
+            ack = PrefetchAck(
+                rid=operation.request_id,
+                completed_tokens=completed_pages * self.page_size,
+                operation=operation,
+            )
+            self.prefetch_sync_queue.put(ack)
+        return completed_pages
+
+    def _page_transfer_kv_batch(
+        self,
+        operation: PrefetchOperation,
+        batch_hashes: List[str],
+        batch_host_indices: torch.Tensor,
+        extra_info: HiCacheStorageExtraInfo,
+        kv_derived_transfers: List[PoolTransfer],
+    ) -> int:
+        """Read a single batch from KV and KV-derived pools (e.g. indexer pool).
+
+        Return the number of hit pages.  If the hits from KV and KV-derived pools differ,
+        clamp to the minimal number of hits.
+
+        Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
+        """
+        # Read from KV pool.
+        kv_hits = self.page_get_func(
+            operation, batch_hashes, batch_host_indices, extra_info
+        )
+
+        # Read from KV-derived sidecar pools, if any.
+        sidecar_hits: dict[str, int] = {}
+        if len(kv_derived_transfers) > 0:
+            current_kv_derived_transfers = [
+                PoolTransfer(
+                    name=transfer.name,
+                    host_indices=batch_host_indices,
+                    keys=batch_hashes,
+                )
+                for transfer in kv_derived_transfers
+            ]
+            sidecar_results = self.storage_backend.batch_get_v2(
+                current_kv_derived_transfers, extra_info=extra_info
+            )
+            sidecar_hits = count_pool_hits(sidecar_results)
+
+        # Clamp to minimal number of hits.
+        return min([kv_hits, *sidecar_hits.values()])
+
+    def _prefetch_producers_alive(self) -> bool:
+        """Whether a thread other than the scheduler may still put operations
+        into prefetch_buffer (the hybrid controller's PP ticket thread)."""
+        return False
+
+    def _io_thread_should_run(self) -> bool:
+        """The IO worker runs until the stop event is set AND nothing more can
+        arrive: the buffer is empty and no producer is alive (producer first,
+        so an operation put just before its exit is still taken)."""
+        if not self.storage_stop_event.is_set():
+            return True
+        return self._prefetch_producers_alive() or not self.prefetch_buffer.empty()
+
+    def prefetch_io_aux_func(self):
+        """
+        Auxiliary function conducting IO operations for prefetching.
+        """
+        # After the stop event the queued operations are still taken, and the
+        # worker waits for any producer still alive, so every rank publishes the
+        # acks of the same lockstep-dispatched operations (_page_transfer issues
+        # no backend read once the event is set).
+        while self._io_thread_should_run():
+            try:
+                operation = self.prefetch_buffer.get(block=True, timeout=1)
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            try:
+                self._page_transfer(operation)
+            except Exception:
+                # An exception escaping the transfer ends this worker; the
+                # tick's dead-worker check then fails the rank loudly.
+                logger.error(
+                    "HiCache prefetch transfer failed for request %s; the "
+                    "prefetch IO worker exits",
+                    operation.request_id,
+                )
+                raise
+            finally:
+                self.prefetch_sync_queue.put(
+                    PrefetchAck(
+                        rid=operation.request_id,
+                        completed_req=True,
+                        operation=operation,
+                    )
+                )
+
+    def prefetch_rate_limited(self) -> bool:
+        """
+        Rate limit the prefetching operations to avoid overwhelming the storage backend.
+        """
+        if self.host_memory_mode == "buffer_only":
+            # Gate on real pool usage: buffer mode allocates hit-sized, so
+            # prefetch_tokens_occupied's requested spans overstate it. Pool
+            # state mutates only at scheduler-thread lockstep points, so this
+            # stays TP-deterministic. Write staging is the write budget's
+            # usage; charging it here would park hits behind its storage drain.
+            used = self.mem_pool_host.size - self.mem_pool_host.available_size()
+            if self.host_write_staged_tokens_fn is not None:
+                used -= self.host_write_staged_tokens_fn()
+            return max(0, used) >= self.prefetch_capacity_limit
+        # cancel prefetch if too much memory is occupied
+        if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+            return True
+        # todo: more sophisticated rate limiting based on storage backend performance
+        return False
+
+    def alloc_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int
+    ) -> Optional[torch.Tensor]:
+        """Allocate the host bounce for a storage hit."""
+        return self.mem_pool_host.alloc(need_size)
+
+    def can_fit_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int
+    ) -> bool:
+        """Whether a prefetch bounce can fit when its host pools are empty."""
+        # need_size is in logical tokens; under DCP each row holds dcp_size.
+        return need_size <= self.mem_pool_host.logical_size
+
+    def free_prefetch_host_buffers(
+        self, operation: StorageOperation, host_indices: torch.Tensor
+    ) -> None:
+        """Roll back a hit-sized host bounce before transfer ownership moves."""
+        self.mem_pool_host.free(host_indices)
+
+    def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        last_hash = operation.last_hash
+        tokens_to_fetch = operation.token_ids
+        prefix_keys = operation.prefix_keys
+
+        storage_query_count = 0
+        hash_value = []
+        page_hashes = get_storage_hash_str(
+            tokens_to_fetch, last_hash, page_size=self.page_size
+        )
+        operation.all_hash_values = page_hashes
+
+        for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
+            batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            hash_value.extend(batch_hashes[:hit_page_num])
+            storage_query_count += hit_page_num * self.page_size
+            if hit_page_num < len(batch_hashes):
+                break
+            if prefix_keys is not None:
+                prefix_keys = prefix_keys + batch_hashes
+
+        return hash_value, storage_query_count
+
+    def _on_prefetch_dequeue(self, operation: PrefetchOperation) -> None:
+        """Prepare an op after dequeue on the prefetch storage thread.
+
+        The default controller does no extra preparation. Subclasses can use
+        this hook to initialize backreferences or observability state while
+        keeping the work out of the scheduler thread.
+        """
+
+    def prefetch_thread_func(self):
+        """
+        Manage prefetching operations from storage backend to host memory.
+        """
+        while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
+            try:
+                operation = self.prefetch_queue.get(block=True, timeout=1)
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            self._on_prefetch_dequeue(operation)
+            # Everything before the reduce is guarded: the peers are inside
+            # that collective, so a failure here answers with 0 hits and still
+            # joins it. After the stop event every queued query is answered
+            # as a miss without a backend call (MIN agrees on 0 even when a
+            # peer's worker queried before it saw the stop).
+            try:
+                if operation.is_terminated() or self.storage_stop_event.is_set():
+                    hash_value, storage_hit_count = [], 0
+                else:
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+            except Exception:
+                logger.exception(
+                    "HiCache storage query failed for request %s",
+                    operation.request_id,
+                )
+                hash_value, storage_hit_count = [], 0
+
+            storage_hit_count = self._sync_prefetch_hit_query(
+                operation, storage_hit_count
+            )
+
+            # Record the TP-synced hit count; the scheduler thread decides
+            # at drain time whether to revoke (below threshold) or allocate.
+            operation.hash_value = hash_value[: (storage_hit_count // self.page_size)]
+            operation.storage_hit_count = storage_hit_count
+            self.prefetch_hit_queue.put(operation)
+
+    def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
+        """Rank-reduce a hit query (MIN) so every rank agrees on the usable
+        prefix. Runs for every operation, hit or miss."""
+        hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce(
+            hit_count,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        return int(hit_count.item())
+
+    def extend_storage_prefix(self, prefix_keys: Any, hash_values: List[str]) -> Any:
+        """Advance the backend's prefix context past omitted pages."""
+        return prefix_keys + hash_values if prefix_keys is not None else None
+
+    def write_storage(
+        self,
+        host_indices: torch.Tensor,
+        token_ids: List[int],
+        hash_value: Optional[List[str]] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ) -> int:
+        """
+        Write KV caches from host memory to storage backend.
+        """
+        operation = StorageOperation(
+            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+        )
+        self.backup_queue.put(operation)
+        return operation.id
+
+    # todo: deprecate
+    def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
+        data = [
+            self.storage_host_pool.get_data_page(host_indices[i * self.page_size])
+            for i in range(len(hash_values))
+        ]
+        return self.storage_backend.batch_set(hash_values, data)
+
+    def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
+        return all(
+            self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+        )
+
+    # Backup batch by batch
+    def _page_backup(self, operation):
+        # Backup batch by batch
+        prefix_keys = operation.prefix_keys
+        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            if self.storage_stop_event.is_set():
+                # Stopping: no new backend writes; the ack carries what completed.
+                break
+            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+            batch_host_indices = operation.host_indices[
+                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+            ]
+            # Set one batch token, and record if success.
+            # todo: allow partial success
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            if not success:
+                logger.warning(
+                    f"Write page to storage: {len(batch_hashes)} pages failed."
+                )
+                break
+
+            if prefix_keys is not None:
+                prefix_keys = prefix_keys + batch_hashes
+            operation.completed_tokens += self.page_size * len(batch_hashes)
+
+    def _page_backup_or_log(self, operation):
+        try:
+            self._page_backup(operation)
+        except Exception:
+            logger.exception(
+                "HiCache backup failed after %d tokens", operation.completed_tokens
+            )
+
+    def backup_thread_func(self):
+        """
+        Manage backup operations from host memory to storage backend.
+        """
+        while not self.storage_stop_event.is_set():
+            try:
+                operation = self.backup_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+
+                if not self.backup_skip:
+                    self._page_backup_or_log(operation)
+                self.ack_backup_queue.put(operation)
+
+            except Empty:
+                continue
+
+    def _sync_thread_should_run(self) -> bool:
+        """The sync thread reduces until the stop event is set AND this rank's
+        IO worker has exited with its acks consumed: an ack it still owes is
+        one the peers' sync threads reduce too. The liveness check comes
+        first, so an ack published just before the exit is still seen."""
+        if not self.storage_stop_event.is_set():
+            return True
+        io_thread = self.prefetch_io_aux_thread
+        io_alive = io_thread is not None and io_thread.is_alive()
+        return io_alive or not self.prefetch_sync_queue.empty()
+
+    def prefetch_sync_thread_func(self):
+        """Synchronize prefetch results across all PP and TP ranks."""
+        while self._sync_thread_should_run():
+            try:
+                ack = self.prefetch_sync_queue.get(block=True, timeout=1)
+                if ack is None:
+                    continue
+                self._reduce_prefetch_ack(ack)
+                self.ack_prefetch_queue.put(ack)
+            except Empty:
+                continue
+
+    def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
+        """Synchronize all ranks to agree on a PrefetchAck."""
+        if ack.completed_tokens is not None:
+            # Determine the minimal successful prefix of tokens.
+            completed_tokens_tensor = torch.tensor(
+                ack.completed_tokens, dtype=torch.int
+            )
+            self._all_reduce(
+                completed_tokens_tensor,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_completion_sync_groups,
+            )
+            ack.completed_tokens = completed_tokens_tensor.item()

@@ -1,0 +1,854 @@
+"""SGLang's post-verify graphs (SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH).
+
+On CPU: the switch alone turns them on for every verify of a setup they can run,
+only batches a graph can reproduce take them, a KV pool with c128 draft states never
+reaches them, and with them on the graphs and the eager verify draw the forced
+acceptance lengths from one rank-identical stream; without them the eager verify
+draws from the global CPU RNG as before. On a GPU, at batch sizes up to 64:
+every round's outputs, eager warm-ups and graph replays alike, must equal bitwise
+what SGLang's eager sampling gives on the same inputs, greedy and with forced
+acceptance, and stay unchanged through the next round; rounds that run eagerly in
+between draw from the same forced-length generator onto the device, so they take
+the fused chain a replay takes and accept the forced lengths. With the NVIDIA
+megakernel's fused chain acceptance, eagle_sample's tail (greedy check, injected
+acceptance, accept lengths) must leave every output bitwise as the unfused tail does,
+greedy, compact top-k and dense sampled, at batch sizes up to 64, and the graphs must
+still match eager sampling."""
+
+import unittest
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import torch
+
+from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import (
+    eagle_post_verify_graphs,
+    eagle_utils,
+    eagle_worker_common,
+    eagle_worker_v2,
+    spec_utils,
+)
+from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
+from sglang.srt.speculative.eagle_utils import compact_verify_max_top_k, eagle_sample
+from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+
+TOKENS = 7
+VOCAB = 257
+BATCH_SIZES = (1, 3, 16, 64)
+# FlashInfer's top-k reads each logits row in 16-byte vectors
+SAMPLED_VOCAB = 512
+TOP_K = 20
+# eager warm-ups, the capture of each slot, then replays of both slots
+ROUNDS = 2 * eagle_post_verify_graphs._NUM_WARMUP + 4
+
+
+def _target_worker():
+    return SimpleNamespace(
+        model_runner=SimpleNamespace(watermark_state=None),
+        random_seed=11,
+        device="cpu",
+    )
+
+
+def _worker(*, switch, cuda=True, topk=1, dp_attention=False):
+    """An EAGLE worker after init_attention_backends, with
+    SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH set to switch, on a CUDA host with a
+    chain draft and no DP attention unless the arguments say otherwise."""
+    worker = eagle_worker_v2.EAGLEWorkerV2.__new__(eagle_worker_v2.EAGLEWorkerV2)
+    worker.__dict__.update(
+        topk=topk,
+        _target_worker=_target_worker(),
+        _draft_worker=SimpleNamespace(init_attention_backends=lambda: None),
+        # the rest of what verify hands run_eagle_verify
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+        plan_stream=None,
+        plan_stream_ctx=None,
+        speculative_num_draft_tokens=7,
+        device="cpu",
+    )
+    parallel = SimpleNamespace(attn_dp_enabled=dp_attention)
+    with (
+        envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(switch),
+        patch.object(eagle_worker_v2, "_is_cuda", cuda),
+        patch.object(eagle_worker_v2, "get_parallel", return_value=parallel),
+    ):
+        worker.init_attention_backends()
+    return worker
+
+
+def _verify_kwargs(worker):
+    """What the worker's verify hands run_eagle_verify."""
+    with patch.object(eagle_worker_v2, "run_eagle_verify") as run_eagle_verify:
+        worker.verify(batch=None)
+    return run_eagle_verify.call_args.kwargs
+
+
+def _eager_length(generator):
+    """The forced acceptance length SGLang's eager verify draws for one round."""
+    correct = torch.zeros(1, dtype=torch.int32)
+    spec_utils.generate_simulated_accept_index(
+        accept_index=torch.zeros((1, 7), dtype=torch.int32),
+        predict=torch.zeros(7, dtype=torch.int32),
+        num_correct_drafts=correct,
+        candidates=None,
+        target_predict=None,
+        bs=1,
+        spec_steps=6,
+        simulate_acc_len=4.8,
+        simulate_acc_method="match-expected",
+        simulate_acc_token_mode="fixed",
+        generator=generator,
+    )
+    return int(correct) + 1
+
+
+@contextmanager
+def _graph_capture(stream):
+    # one rank: nothing collective to set up for the capture
+    yield SimpleNamespace(stream=stream)
+
+
+def _round(bs, generator, vocab=VOCAB):
+    """A chain verify round whose drafts follow the target's argmax for a random
+    prefix of each request."""
+    logits = torch.randn(bs * TOKENS, vocab, device="cuda", generator=generator)
+    target = logits.argmax(-1).view(bs, TOKENS)
+    drafts = torch.randint(0, vocab, (bs, TOKENS), device="cuda", generator=generator)
+    keep = torch.randint(0, TOKENS, (bs, 1), device="cuda", generator=generator)
+    cols = torch.arange(TOKENS - 1, device="cuda")
+    drafts[:, 1:] = torch.where(cols < keep, target[:, :-1], drafts[:, 1:])
+    next_token = torch.arange(1, TOKENS + 1, device="cuda")
+    next_token[-1] = -1
+    verify_input = SimpleNamespace(
+        topk=1,
+        tree_topk=1,
+        draft_probs=None,
+        draft_token=drafts.flatten(),
+        draft_token_num=TOKENS,
+        max_tree_depth=TOKENS,
+        retrieve_index=torch.arange(bs * TOKENS, device="cuda").view(bs, TOKENS),
+        retrieve_next_token=next_token.expand(bs, TOKENS).contiguous(),
+        retrieve_next_sibling=torch.full((bs, TOKENS), -1, device="cuda"),
+    )
+    batch = SimpleNamespace(
+        device="cuda",
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        seq_lens=torch.randint(16, 512, (bs,), device="cuda", generator=generator),
+        req_pool_indices=torch.randperm(bs, device="cuda", generator=generator),
+        sampling_info=SimpleNamespace(
+            is_all_greedy=True,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+            acc_additive_penalties=None,
+            acc_scaling_penalties=None,
+            logit_bias=None,
+            sampling_seed=None,
+            has_watermark_candidates=False,
+            temperatures=None,
+            top_ks=None,
+            top_ps=None,
+        ),
+        has_grammar=False,
+        hisparse_coordinator=None,
+        mamba_track_indices=None,
+        tree_cache=SimpleNamespace(page_size=64),
+        return_logprob=False,
+    )
+    return batch, verify_input, logits
+
+
+def _eager(batch, verify_input, logits, sim_rng, graphs=None):
+    """SGLang's eager verify of one round; with graphs, as run_eagle_verify gives a
+    round they do not replay its forced length."""
+    sim_len = (
+        None
+        if graphs is None
+        else graphs.eager_simulated_accept_length(
+            max_tree_depth=verify_input.max_tree_depth, device=logits.device
+        )
+    )
+    predict, accept_lens, accept_index = eagle_sample(
+        verify_input,
+        batch,
+        SimpleNamespace(
+            next_token_logits=logits.clone(), next_token_logits_vocab_shard=None
+        ),
+        simulated_acc_len=sim_len,
+        simulated_acc_len_rng=sim_rng,
+    )
+    new_seq_lens, bonus_tokens, _, _ = prepare_verify_commit_outputs(
+        predict, accept_index, accept_lens, batch.seq_lens, num_draft_tokens=TOKENS
+    )
+    return predict, accept_lens, accept_index, new_seq_lens, bonus_tokens
+
+
+def _declining_graphs(sim_len=None):
+    """Post-verify graphs that replay no round and stage sim_len for an eager one."""
+    return SimpleNamespace(
+        run=MagicMock(return_value=None),
+        eager_simulated_accept_length=MagicMock(return_value=sim_len),
+    )
+
+
+def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
+    """run_eagle_verify of a one-request chain round on a CPU host, up to sampling."""
+    batch = SimpleNamespace(
+        spec_info=SimpleNamespace(max_tree_depth=7),
+        seq_lens=torch.zeros(1),
+        req_pool_indices=torch.zeros(1),
+        input_ids=None,
+        out_cache_loc=None,
+        has_grammar=False,
+        device="cpu",
+        forward_mode=ForwardMode.IDLE if idle else ForwardMode.TARGET_VERIFY,
+        sampling_info=None,
+        return_logprob=False,
+    )
+    target_worker = SimpleNamespace(
+        forward_batch_generation=lambda **_: SimpleNamespace(
+            logits_output=SimpleNamespace(
+                next_token_logits=torch.zeros(7, 8),
+                next_token_logits_vocab_shard=None,
+            )
+        ),
+        model_runner=SimpleNamespace(
+            watermark_state=None,
+            attn_backend=SimpleNamespace(verify_mask=None),
+        ),
+    )
+    with (
+        patch.object(eagle_worker_common, "record_stream_for_v2_verify"),
+        patch.object(eagle_worker_common, "record_stream_each"),
+        patch.object(
+            eagle_worker_common,
+            "eagle_prepare_for_verify",
+            return_value=(SimpleNamespace(), True),
+        ),
+    ):
+        eagle_worker_common.run_eagle_verify(
+            batch,
+            speculative_runtime_hooks=hooks,
+            target_worker=target_worker,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: SimpleNamespace() if kvcache is None else kvcache
+            ),
+            plan_stream=None,
+            plan_stream_ctx=nullcontext(),
+            topk=1,
+            num_draft_tokens=7,
+            device="cpu",
+            metadata_ready_pre_pad=False,
+            finalize_tree_path=True,
+            post_verify_graphs=graphs,
+        )
+
+
+class TestPostVerifyGraphs(CustomTestCase):
+    def test_the_switch_turns_the_post_verify_graphs_on_for_every_verify(self):
+        """Off, the default, the verify samples and commits eagerly as before; on,
+        every verify hands its batch to SGLang's post-verify graphs. A setup they
+        cannot run keeps them off, and the forced lengths on the global RNG: no CUDA,
+        a tree draft, or DP attention, whose ranks would capture at different times."""
+        off = _worker(switch=False)
+        self.assertIsNone(off._post_verify_graphs)
+        self.assertIsNone(_verify_kwargs(off)["post_verify_graphs"])
+        on = _worker(switch=True)
+        self.assertIsInstance(on._post_verify_graphs, EaglePostVerifyGraphs)
+        self.assertIs(_verify_kwargs(on)["post_verify_graphs"], on._post_verify_graphs)
+        for setup in (dict(cuda=False), dict(topk=2), dict(dp_attention=True)):
+            with self.subTest(**setup):
+                worker = _worker(switch=True, **setup)
+                self.assertIsNone(worker._post_verify_graphs)
+                self.assertIsNone(worker._simulated_acc_len_rng)
+
+    def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
+        """The post-verify graphs skip the eager verify's cleanup of rejected c128
+        draft states (DeepSeek-V4), so a KV pool that has one never reaches them;
+        any other pool hands the round to them."""
+
+        class _EagerSample(Exception):
+            pass
+
+        class _EagerHooks:
+            @property
+            def post_verify(self):
+                raise _EagerSample
+
+        for clears_c128 in (False, True):
+            kvcache = (
+                object.__new__(DeepSeekV4TokenToKVPool)
+                if clears_c128
+                else SimpleNamespace()
+            )
+            graphs = _declining_graphs()
+            with (
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                self.subTest(clears_c128=clears_c128),
+                self.assertRaises(_EagerSample),
+            ):
+                _run_eagle_verify(_EagerHooks(), graphs, kvcache=kvcache)
+            self.assertEqual(graphs.run.called, not clears_c128)
+
+    def test_only_batches_a_graph_can_replay_take_the_post_verify_graphs(self):
+        """A batch whose sampling a captured graph cannot reproduce (grammar, penalties,
+        seeds, ...) or whose verify ran eagerly must take SGLang's eager path."""
+        graphs = EaglePostVerifyGraphs(
+            target_worker=_target_worker(),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.zeros((7, 8)),
+            next_token_logits_vocab_shard=None,
+        )
+
+        def key(can_run_cuda_graph=True, topk=1, **changes):
+            info = dict(
+                acc_additive_penalties=None,
+                acc_scaling_penalties=None,
+                logit_bias=None,
+                sampling_seed=None,
+                need_min_p_sampling=False,
+                has_watermark_candidates=False,
+                is_all_greedy=False,
+                need_top_k_sampling=True,
+                need_top_p_sampling=True,
+            )
+            fields = dict(
+                has_grammar=False,
+                hisparse_coordinator=None,
+                return_logprob=False,
+            )
+            for name, value in changes.items():
+                (info if name in info else fields)[name] = value
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                seq_lens=torch.zeros(1),
+                sampling_info=SimpleNamespace(**info),
+                mamba_track_indices=None,
+                **fields,
+            )
+            verify_input = SimpleNamespace(
+                topk=topk, draft_probs=None, draft_token_num=7, max_tree_depth=7
+            )
+            return graphs._key(batch, verify_input, logits_output, can_run_cuda_graph)
+
+        self.assertIsNotNone(key())
+        for change in (
+            dict(can_run_cuda_graph=False),
+            dict(topk=2),
+            dict(has_grammar=True),
+            dict(hisparse_coordinator=object()),
+            dict(acc_additive_penalties=torch.zeros(1)),
+            dict(acc_scaling_penalties=torch.zeros(1)),
+            dict(logit_bias=torch.zeros(1)),
+            dict(sampling_seed=torch.zeros(1)),
+            dict(need_min_p_sampling=True),
+        ):
+            with self.subTest(change=sorted(change)):
+                self.assertIsNone(key(**change))
+
+    def test_forced_lengths_are_one_stream_with_the_graphs_and_unchanged_without(self):
+        """With the post-verify graphs on, they and the eager verify draw each round's
+        forced length from the worker's one generator, seeded from the server seed:
+        every rank forces the same lengths, whichever path each round took and
+        whatever else used its global RNG. Without them the eager verify draws from
+        the global CPU RNG exactly as before."""
+
+        def lengths(paths, global_seed):
+            worker = _worker(switch=True)
+            rng = worker._simulated_acc_len_rng
+            self.assertIs(_verify_kwargs(worker)["simulated_acc_len_rng"], rng)
+            graphs = worker._post_verify_graphs._graphs
+            # the draw a graph round makes, without its pinned ring on a CPU host
+            graphs._sim_host = [torch.zeros(1, dtype=torch.int64) for _ in range(4)]
+            graphs._sim_done = [None] * 4
+            torch.manual_seed(global_seed)  # this rank's global RNG
+            drawn = []
+            for path in paths:
+                torch.rand(3)  # other uses of the global RNG
+                if path == "graph":
+                    drawn.append(int(graphs._draw_sim_len(7)[0][0]))
+                else:
+                    drawn.append(_eager_length(rng))
+            return drawn
+
+        with (
+            patch.object(spec_utils, "SIMULATE_ACC_LEN", 4.8),
+            patch.object(spec_utils, "SIMULATE_ACC_METHOD", "match-expected"),
+        ):
+            all_graph = lengths(["graph"] * 48, global_seed=1)
+            all_eager = lengths(["eager"] * 48, global_seed=2)
+            mixed = lengths(["graph", "eager", "eager"] * 16, global_seed=3)
+        self.assertEqual(set(all_graph), {4, 5})
+        self.assertEqual(all_eager, all_graph)
+        self.assertEqual(mixed, all_graph)
+        server_seeded = simulated_acc_len_generator(11)
+        self.assertEqual(all_graph, [_eager_length(server_seeded) for _ in range(48)])
+
+        self.assertIsNone(
+            _verify_kwargs(_worker(switch=False))["simulated_acc_len_rng"]
+        )
+        torch.manual_seed(3)
+        drawn = [_eager_length(None) for _ in range(32)]
+        state = torch.get_rng_state()
+        torch.manual_seed(3)
+        weight = 4.8 - 4
+        probs = torch.tensor([1.0 - weight, weight])
+        before = [4 + int(torch.multinomial(probs, num_samples=1)) for _ in range(32)]
+        self.assertEqual(drawn, before)
+        self.assertTrue(torch.equal(torch.get_rng_state(), state))
+
+    def test_compact_top_k_sampling_takes_only_batches_of_finite_top_k(self):
+        """With SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING a verify samples on the
+        top-k support when every request has a finite top-k within the compact
+        limit, in the post-verify graphs (keyed apart from the dense branch, whose
+        sampling differs) and the eager verify alike; without it nothing changes."""
+
+        def batch(*top_ks):
+            reqs = [
+                SimpleNamespace(sampling_params=SimpleNamespace(top_k=k))
+                for k in top_ks
+            ]
+            return SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY, reqs=reqs)
+
+        def verify_kwargs(verify_batch):
+            worker = _worker(switch=True)
+            with patch.object(eagle_worker_v2, "run_eagle_verify") as run:
+                worker.verify(batch=verify_batch)
+            kwargs = run.call_args.kwargs
+            return kwargs["uno_target_max_top_k"], kwargs["sparse_bonus_argmax"]
+
+        limit = SimpleNamespace(_SPARSE_TOP_K_LIMIT=128)
+        with patch.dict("sys.modules", {"sglang.srt.speculative.uno_utils": limit}):
+            with patch.object(eagle_utils, "_COMPACT_VERIFY_SAMPLING", True):
+                self.assertEqual(compact_verify_max_top_k(batch(20, 64)), 64)
+                for dense in ((20, 1 << 30), (20, 1), (129,), ()):
+                    with self.subTest(top_ks=dense):
+                        self.assertIsNone(compact_verify_max_top_k(batch(*dense)))
+                self.assertEqual(verify_kwargs(batch(20)), (20, True))
+            self.assertIsNone(compact_verify_max_top_k(batch(20, 64)))
+            self.assertEqual(verify_kwargs(batch(20)), (None, False))
+
+        graphs = EaglePostVerifyGraphs(
+            target_worker=_target_worker(),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+        verify_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            seq_lens=torch.zeros(1),
+            sampling_info=SimpleNamespace(
+                acc_additive_penalties=None,
+                acc_scaling_penalties=None,
+                logit_bias=None,
+                sampling_seed=None,
+                need_min_p_sampling=False,
+                has_watermark_candidates=False,
+                is_all_greedy=False,
+                need_top_k_sampling=True,
+                need_top_p_sampling=False,
+            ),
+            mamba_track_indices=None,
+            has_grammar=False,
+            hisparse_coordinator=None,
+            return_logprob=False,
+        )
+        verify_input = SimpleNamespace(
+            topk=1, draft_probs=None, draft_token_num=7, max_tree_depth=7
+        )
+        logits = SimpleNamespace(
+            next_token_logits=torch.zeros((7, 8)),
+            next_token_logits_vocab_shard=None,
+        )
+        keys = {
+            graphs._key(verify_batch, verify_input, logits, True, max_top_k)
+            for max_top_k in (20, None)
+        }
+        self.assertEqual(len(keys), 2)
+
+        # a per-batch logits format: shards reuse the full logits' storage
+        shards = SimpleNamespace(
+            next_token_logits=logits.next_token_logits,
+            next_token_logits_vocab_shard=object(),
+        )
+        self.assertNotEqual(
+            graphs._key(verify_batch, verify_input, logits, True, 20),
+            graphs._key(verify_batch, verify_input, shards, True, 20),
+        )
+
+    def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
+        """With SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST a sampled verify result goes to
+        the TP group in one broadcast: predict, accept_index and num_correct_drafts
+        must be views of one buffer, in order, starting from the values the
+        unpacked tensors start from."""
+        kw = dict(rows=14, bs=2, depth=7, device="cpu")
+        stock = eagle_utils._verify_outputs(packed=False, **kw)
+        *views, buffer = eagle_utils._verify_outputs(packed=True, **kw)
+        self.assertIsNone(stock[3])
+        for got, want in zip(views[:2], stock[:2]):
+            self.assertTrue(torch.equal(got, want))
+        offset = 0
+        for view in views:
+            self.assertEqual(view.data_ptr(), buffer.data_ptr() + 4 * offset)
+            offset += view.numel()
+        self.assertEqual(offset, buffer.numel())
+
+    def test_one_launch_load_stages_what_the_per_dtype_copies_stage(self):
+        """With SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD a round's inputs and its forced length go to
+        one copy plan; without it, or when the plan refuses the layout, the
+        per-dtype copies stage the same values."""
+        inputs = {
+            "draft_tokens": torch.arange(14),
+            "seq_lens": torch.tensor([17, 40]),
+            "temperatures": torch.rand(2, 1),
+        }
+        sim_len = torch.tensor([3])
+        for plan_mode in ("off", "accepts", "refuses"):
+            calls = []
+
+            def plan(dsts, srcs, accepts=plan_mode == "accepts"):
+                calls.append(len(dsts))
+                for dst, src in zip(dsts, srcs) if accepts else ():
+                    dst.copy_(src)
+                return accepts
+
+            staged = {name: torch.zeros_like(src) for name, src in inputs.items()}
+            staged["sim_accept_len"] = torch.zeros(1, dtype=torch.int64)
+            slot = SimpleNamespace(
+                staged=staged, load_plan=None if plan_mode == "off" else plan
+            )
+            eagle_post_verify_graphs._PostVerifyGraphs._load(slot, inputs, sim_len)
+            with self.subTest(plan=plan_mode):
+                self.assertEqual(calls, [] if plan_mode == "off" else [4])
+                for name, src in inputs.items():
+                    self.assertTrue(torch.equal(staged[name], src), name)
+                self.assertEqual(int(staged["sim_accept_len"]), 3)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestPostVerifyGraphsMatchEager(CustomTestCase):
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
+    def _check(self, *, sim_acc_len, fused=False):
+        # the worker's forced lengths, drawn by its graphs and its eager rounds alike;
+        # the all-eager reference draws the same stream from its own generator
+        worker_rng = simulated_acc_len_generator(0)
+        reference_rng = simulated_acc_len_generator(0)
+        graphs = EaglePostVerifyGraphs(
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(watermark_state=None, model_config=None)
+            ),
+            simulated_acc_len_rng=worker_rng,
+        )
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        stream = torch.cuda.Stream()
+        forced = []
+        with (
+            torch.cuda.stream(stream),
+            patch.object(spec_utils, "SIMULATE_ACC_LEN", sim_acc_len),
+            patch.object(spec_utils, "SIMULATE_ACC_METHOD", "match-expected"),
+            patch.object(spec_utils, "SIMULATE_ACC_TOKEN_MODE", "real-draft-token"),
+            patch.object(spec_utils, "commit_mamba_states_after_verify"),
+            # a model without recurrent state stages no state slots
+            patch.object(
+                eagle_post_verify_graphs, "mambaish_config", return_value=None
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+            patch.object(eagle_utils, "_fused_accept_enabled", return_value=fused),
+            patch.object(
+                eagle_utils,
+                "verify_tree_greedy_func",
+                wraps=eagle_utils.verify_tree_greedy_func,
+            ) as tree_kernel,
+        ):
+            for bs in BATCH_SIZES:
+                # the verify graph's logits buffer: one per batch size, refilled
+                logits_buf = torch.empty(bs * TOKENS, VOCAB, device="cuda")
+                previous = None
+                # every third round runs eagerly, as when its verify ran without a graph
+                for i in range(ROUNDS * 3 // 2):
+                    batch, verify_input, logits = _round(bs, generator)
+                    logits_buf.copy_(logits)
+                    with patch.object(
+                        eagle_utils, "_fused_accept_enabled", return_value=False
+                    ):
+                        want = _eager(batch, verify_input, logits, reference_rng)
+                    graphed = i % 3 != 2
+                    tree_kernel.reset_mock()
+                    got = graphs.run(
+                        batch=batch,
+                        verify_input=verify_input,
+                        logits_output=SimpleNamespace(
+                            next_token_logits=logits_buf,
+                            next_token_logits_vocab_shard=None,
+                        ),
+                        can_run_cuda_graph=graphed,
+                    )
+                    graphs.join()
+                    if graphed:
+                        self.assertIsNotNone(got)
+                    else:
+                        self.assertIsNone(got)
+                        got = _eager(batch, verify_input, logits, worker_rng, graphs)
+                    rows = want[2].clamp(min=0).long()
+                    with self.subTest(bs=bs, round=i):
+                        if not graphed:
+                            # the chain a replay takes, forced or not, not the tree
+                            self.assertEqual(tree_kernel.called, not fused)
+                        if sim_acc_len > 0:
+                            # every request accepts the round's one forced length
+                            self.assertTrue(torch.all(got[1] == got[1][0]))
+                            forced.append(int(got[1][0]))
+                        self.assertTrue(torch.equal(got[0][rows], want[0][rows]))
+                        for name, g, w in zip(
+                            ("accept_lens", "accept_index", "new_seq_lens", "bonus"),
+                            got[1:5],
+                            want[1:5],
+                        ):
+                            self.assertTrue(torch.equal(g, w), name)
+                        # the host may still read a round's outputs in the next round
+                        if previous is not None:
+                            for kept, snapshot in zip(*previous):
+                                self.assertTrue(torch.equal(kept, snapshot))
+                    previous = (got[:5], [t.clone() for t in got[:5]])
+        if sim_acc_len > 0:
+            # match-expected: only the target's floor and ceiling, near it on average
+            self.assertEqual(set(forced), {4, 5})
+            self.assertAlmostEqual(sum(forced) / len(forced), sim_acc_len, delta=0.25)
+
+    def test_greedy(self):
+        self._check(sim_acc_len=-1.0)
+
+    def test_forced_acceptance(self):
+        self._check(sim_acc_len=4.8)
+
+    def test_forced_acceptance_with_one_launch_load(self):
+        # SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: inputs and the pinned forced length in one launch
+        with patch.object(eagle_post_verify_graphs, "_ONE_LAUNCH_LOAD", True):
+            self._check(sim_acc_len=4.8)
+
+    def test_fused_accept_greedy(self):
+        self._check(sim_acc_len=-1.0, fused=True)
+
+
+def _sampled(batch, *, generator):
+    """The round's batch with T0.6 / top-k / top-p sampling on every request."""
+    bs = len(batch.seq_lens)
+    info = SimpleNamespace(**vars(batch.sampling_info))
+    info.is_all_greedy = False
+    info.need_top_k_sampling = True
+    info.need_top_p_sampling = True
+    info.temperatures = torch.full((bs, 1), 0.6, device="cuda")
+    info.top_ks = torch.randint(2, TOP_K + 1, (bs,), device="cuda", generator=generator)
+    info.top_ps = torch.full((bs,), 0.95, device="cuda")
+    return SimpleNamespace(**{**vars(batch), "sampling_info": info})
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestSideStreamCommitWritesTheForwardSlots(CustomTestCase):
+    """The side-stream mamba commit writes the verify forward's slots even when the
+    request table is rewritten before it runs, eagerly and on graph replay."""
+
+    ROWS, SLOTS, STEPS, WIDTH = 2, 12, 2, 4
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
+    def _backend(self, mapping, caches):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+            MambaAttnBackendBase,
+        )
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+
+        linear = MambaAttnBackendBase.__new__(MambaAttnBackendBase)
+        linear.req_to_token_pool = SimpleNamespace(
+            get_mamba_indices=lambda rows: mapping[rows]
+        )
+        linear._state_ids = IdSpace(key=("mamba", None))
+        linear.state_pool = SimpleNamespace(
+            replayssm_is_kda=False,
+            get_speculative_mamba2_params_all_layers=lambda: caches,
+        )
+        linear.accept_lens_pool = None
+        linear.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(part_view=lambda part: None)
+        )
+        hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        hybrid.linear_attn_backend = linear
+        return hybrid, linear
+
+    def test_held_back_commit_after_row_reuse(self):
+        from sglang.srt.speculative.eagle_post_verify_graphs import _PostVerifyGraphs
+
+        rows, slots, steps, width = self.ROWS, self.SLOTS, self.STEPS, self.WIDTH
+        device = "cuda"
+        caches = SimpleNamespace(
+            temporal=torch.zeros((1, slots, width), device=device),
+            intermediate_ssm=torch.zeros((1, slots, steps, width), device=device),
+            conv=[torch.empty(0, device=device)],
+            intermediate_conv_window=[torch.empty(0, device=device)],
+        )
+        mapping = torch.zeros(slots, dtype=torch.int32, device=device)
+        hybrid, linear = self._backend(mapping, caches)
+        # The verify forward's metadata: a per-forward buffer it refills.
+        forward_slots = torch.zeros(rows, dtype=torch.int32, device=device)
+        linear.forward_metadata = SimpleNamespace(
+            mamba_cache_indices=forward_slots, mamba_track_indices=None
+        )
+        graphs = EaglePostVerifyGraphs(
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    model_config=None,
+                    model=None,
+                    attn_backend=hybrid,
+                    token_to_kv_pool=SimpleNamespace(
+                        layer_router=SimpleNamespace(
+                            part_view=lambda part: SimpleNamespace(
+                                replayssm_spec_fold=False, replayssm_cache_base=None
+                            )
+                        )
+                    ),
+                )
+            ),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+
+        def body(slot):
+            # Hold the side-stream commit back well past the table rewrite.
+            torch.cuda._sleep(50_000_000)
+            last = torch.full((rows,), steps - 1, dtype=torch.int64, device=device)
+            accept_lens = last + 1
+            accept_index = torch.zeros((rows, steps), dtype=torch.int64, device=device)
+            return (None, accept_lens, accept_index, None, None, None, (last, None))
+
+        post = _PostVerifyGraphs(body=body, commit=graphs._commit, sim_rng=None)
+        schedule = torch.cuda.Stream()
+        request_rows = torch.tensor([3, 7], device=device)
+        stream = torch.cuda.Stream()
+        with (
+            torch.cuda.stream(stream),
+            patch.object(eagle_post_verify_graphs, "mambaish_config", return_value=1),
+            patch.object(spec_utils, "mambaish_config", return_value=1),
+            # The request rows index the verify scratch, as pipeline stages do.
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "pp_spec_stable_rows_enabled",
+                return_value=True,
+            ),
+            patch.object(spec_utils, "pp_spec_stable_rows_enabled", return_value=True),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            for i in range(ROUNDS):
+                with self.subTest(round=i):
+                    owner = torch.tensor([1 + i % 5, 6 + i % 5], device=device)
+                    successor = owner + 1
+                    # The verify forward: its rows name `owner`, its metadata
+                    # resolves them, and its scratch holds this round's states.
+                    mapping[request_rows] = owner.int()
+                    forward_slots.copy_(owner)
+                    caches.temporal.zero_()
+                    caches.intermediate_ssm.normal_()
+                    read_done = torch.cuda.Event()
+                    read_done.record()
+                    batch = SimpleNamespace(
+                        forward_mode=ForwardMode.TARGET_VERIFY,
+                        req_pool_indices=request_rows,
+                        seq_lens=torch.tensor([9, 9], device=device),
+                        mamba_track_indices=None,
+                        sampling_info=SimpleNamespace(is_all_greedy=True),
+                        tree_cache=SimpleNamespace(page_size=4),
+                    )
+                    verify_input = SimpleNamespace(
+                        draft_token=torch.zeros(4, dtype=torch.int64, device=device),
+                        retrieve_index=torch.zeros((2, 2), device=device),
+                        retrieve_next_token=torch.zeros((2, 2), device=device),
+                        retrieve_next_sibling=torch.zeros((2, 2), device=device),
+                    )
+                    post.run(
+                        key="round",
+                        inputs=eagle_post_verify_graphs._post_verify_inputs(
+                            batch, verify_input, graphs._verify_state_slots(batch)
+                        ),
+                        make_slot=lambda staged: SimpleNamespace(
+                            num_requests=rows,
+                            staged=staged,
+                            forward_mode=batch.forward_mode,
+                            tree_cache=batch.tree_cache,
+                            tokens_per_request=steps,
+                        ),
+                        sim_max_len=steps,
+                    )
+                    # The scheduler, released at the forward's read end: the
+                    # requests finish and their rows go to new requests.
+                    schedule.wait_event(read_done)
+                    with torch.cuda.stream(schedule):
+                        mapping[request_rows] = successor.int()
+                    post.join()
+                    torch.cuda.synchronize()
+                    expected = torch.zeros_like(caches.temporal)
+                    expected[:, owner] = caches.intermediate_ssm[
+                        :, request_rows, steps - 1
+                    ]
+                    torch.testing.assert_close(
+                        caches.temporal, expected, rtol=0, atol=0
+                    )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestFusedAcceptMatchesUnfused(CustomTestCase):
+    def test_fused_tail_matches_stock(self):
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+        generator = torch.Generator(device="cuda").manual_seed(1)
+        parallel = SimpleNamespace(
+            tp_group=SimpleNamespace(world_size=1),
+            attn_tp_group=SimpleNamespace(world_size=1),
+        )
+        with patch("sglang.srt.runtime_context.get_parallel", return_value=parallel):
+            for sampled in (False, True):
+                batch, verify_input, logits = _round(3, generator, vocab=SAMPLED_VOCAB)
+                if sampled:
+                    batch = _sampled(batch, generator=generator)
+                outputs = []
+                for fused in (False, True):
+                    torch.manual_seed(7)
+                    torch.cuda.manual_seed_all(7)
+                    with patch.object(
+                        eagle_utils, "_fused_accept_enabled", return_value=fused
+                    ):
+                        outputs.append(
+                            _eager(
+                                batch,
+                                verify_input,
+                                logits,
+                                simulated_acc_len_generator(7),
+                            )
+                        )
+                for stock, optimized in zip(*outputs):
+                    self.assertTrue(torch.equal(stock, optimized))
+
+
+if __name__ == "__main__":
+    unittest.main()

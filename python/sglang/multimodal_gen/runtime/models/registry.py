@@ -1,0 +1,328 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/models/registry.py
+
+import ast
+import importlib
+import os
+from abc import ABC, abstractmethod
+from collections import deque
+from collections.abc import Set
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import NoReturn, cast
+
+from torch import nn
+
+from sglang.multimodal_gen.runtime.utils.external_model_package import (
+    load_external_model_package,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+MODELS_PATH = os.path.dirname(__file__)
+COMPONENT_DIRS = [
+    d
+    for d in os.listdir(MODELS_PATH)
+    if os.path.isdir(os.path.join(MODELS_PATH, d))
+    and not d.startswith("__")
+    and not d.startswith(".")
+]
+
+_IMAGE_ENCODER_MODELS: dict[str, tuple] = {
+    # "HunyuanVideoTransformer3DModel": ("image_encoder", "hunyuanvideo", "HunyuanVideoImageEncoder"),
+    "CLIPVisionModelWithProjection": ("encoders", "clip", "CLIPVisionModel"),
+}
+
+# Global alias mapping: external_path -> canonical_class_name
+_ALIAS_TO_MODEL: dict[str, str] = {}
+
+
+def _parse_aliases_from_ast(value_node: ast.expr) -> list[str]:
+    """Parse _aliases list from AST node."""
+    aliases = []
+    if isinstance(value_node, (ast.List, ast.Tuple)):
+        for elt in value_node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                aliases.append(elt.value)
+    return aliases
+
+
+@lru_cache(maxsize=None)
+def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
+    discovered_models = dict(_IMAGE_ENCODER_MODELS)
+
+    # Collect class definitions with their _aliases
+    class_aliases: dict[str, list[str]] = {}
+
+    for component in COMPONENT_DIRS:
+        component_path = os.path.join(MODELS_PATH, component)
+        for filename in os.listdir(component_path):
+            if not filename.endswith(".py"):
+                continue
+
+            mod_relname = filename[:-3]
+            filepath = os.path.join(component_path, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    source = f.read()
+                if "EntryClass" not in source:
+                    continue
+                tree = ast.parse(source, filename=filename)
+
+                entry_class_node = None
+                first_class_def = None
+
+                # Collect all class definitions and their _aliases
+                file_class_aliases: dict[str, list[str]] = {}
+                # expressions cannot contain class/assignment statements; skip
+                # tensor computations while preserving breadth-first discovery
+                nodes = deque([tree])
+                while nodes:
+                    node = nodes.popleft()
+                    if isinstance(node, ast.expr):
+                        continue
+                    nodes.extend(ast.iter_child_nodes(node))
+                    if isinstance(node, ast.ClassDef):
+                        if first_class_def is None:
+                            first_class_def = node
+                        # Look for _aliases in the class body
+                        for class_body_node in node.body:
+                            if isinstance(class_body_node, ast.Assign) and any(
+                                isinstance(target, ast.Name) and target.id == "_aliases"
+                                for target in class_body_node.targets
+                            ):
+                                aliases = _parse_aliases_from_ast(class_body_node.value)
+                                if aliases:
+                                    file_class_aliases[node.name] = aliases
+                    elif isinstance(node, ast.Assign) and any(
+                        isinstance(target, ast.Name) and target.id == "EntryClass"
+                        for target in node.targets
+                    ):
+                        entry_class_node = node
+
+                if entry_class_node is None or first_class_def is None:
+                    continue
+                value_node = entry_class_node.value
+                if isinstance(value_node, ast.Name):
+                    entries = [value_node]
+                elif isinstance(value_node, (ast.List, ast.Tuple)):
+                    entries = value_node.elts
+                else:
+                    continue
+
+                for entry in entries:
+                    if not isinstance(entry, (ast.Name, ast.Constant)):
+                        continue
+                    model_arch = (
+                        entry.id if isinstance(entry, ast.Name) else entry.value
+                    )
+                    if model_arch in discovered_models:
+                        logger.warning(
+                            f"Duplicate architecture found: {model_arch}. It will be overwritten."
+                        )
+                    discovered_models[model_arch] = (
+                        component,
+                        mod_relname,
+                        model_arch,
+                    )
+                    if model_arch in file_class_aliases:
+                        class_aliases[model_arch] = file_class_aliases[model_arch]
+
+            except Exception as e:
+                logger.warning(f"Could not parse {filepath} to find models: {e}")
+
+    # Build alias -> canonical class name mapping
+    for class_name, aliases in class_aliases.items():
+        for alias in aliases:
+            if alias in _ALIAS_TO_MODEL:
+                logger.warning(
+                    f"Alias '{alias}' already registered for '{_ALIAS_TO_MODEL[alias]}', "
+                    f"will be overwritten by '{class_name}'"
+                )
+            _ALIAS_TO_MODEL[alias] = class_name
+
+    return discovered_models
+
+
+_SGLANG_DIFFUSION_MODELS = _discover_and_register_models()
+
+
+class _BaseRegisteredModel(ABC):
+    @abstractmethod
+    def load_model_cls(self) -> type[nn.Module]:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class _RegisteredModel(_BaseRegisteredModel):
+    """
+    Represents a model that has already been imported in the main process.
+    """
+
+    model_cls: type[nn.Module]
+
+    def load_model_cls(self) -> type[nn.Module]:
+        return self.model_cls
+
+
+@dataclass(frozen=True)
+class _LazyRegisteredModel(_BaseRegisteredModel):
+    """
+    Represents a model that has not been imported in the main process.
+    """
+
+    module_name: str
+    class_name: str
+
+    def load_model_cls(self) -> type[nn.Module]:
+        mod = importlib.import_module(self.module_name)
+        return cast(type[nn.Module], getattr(mod, self.class_name))
+
+
+@lru_cache(maxsize=128)
+def _try_load_model_cls(
+    model_arch: str,
+    model: _BaseRegisteredModel,
+) -> type[nn.Module] | None:
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    current_platform.verify_model_arch(model_arch)
+    try:
+        return model.load_model_cls()
+    except Exception:
+        logger.exception("Ignore import error when loading '%s'", model_arch)
+        return None
+
+
+@dataclass
+class _ModelRegistry:
+    # Keyed by model_arch
+    registered_models: dict[str, _BaseRegisteredModel] = field(default_factory=dict)
+
+    def get_supported_archs(self) -> Set[str]:
+        load_external_model_package()
+        return self.registered_models.keys()
+
+    def resolve_by_alias(self, alias: str) -> type[nn.Module] | None:
+        """Resolve a model class by its alias (external module path)."""
+        load_external_model_package()
+        if alias in _ALIAS_TO_MODEL:
+            canonical_name = _ALIAS_TO_MODEL[alias]
+            return self._try_load_model_cls(canonical_name)
+        return None
+
+    def register_model(
+        self,
+        model_arch: str,
+        model_cls: type[nn.Module] | str,
+    ) -> None:
+        """
+        Register an external model to be used in SGLang-Diffusion.
+
+        :code:`model_cls` can be either:
+
+        - A :class:`torch.nn.Module` class directly referencing the model.
+        - A string in the format :code:`<module>:<class>` which can be used to
+          lazily import the model. This is useful to avoid initializing CUDA
+          when importing the model and thus the related error
+          :code:`RuntimeError: Cannot re-initialize CUDA in forked subprocess`.
+        """
+        if model_arch in self.registered_models:
+            logger.warning(
+                "Model architecture %s is already registered, and will be "
+                "overwritten by the new model class %s.",
+                model_arch,
+                model_cls,
+            )
+
+        if isinstance(model_cls, str):
+            split_str = model_cls.split(":")
+            if len(split_str) != 2:
+                msg = "Expected a string in the format `<module>:<class>`"
+                raise ValueError(msg)
+
+            model = _LazyRegisteredModel(
+                module_name=split_str[0], class_name=split_str[1]
+            )
+        else:
+            model = _RegisteredModel(model_cls=model_cls)
+
+        self.registered_models[model_arch] = model
+
+    def _raise_for_unsupported(self, architectures: list[str]) -> NoReturn:
+        all_supported_archs = self.get_supported_archs()
+
+        if any(arch in all_supported_archs for arch in architectures):
+            raise ValueError(
+                f"Model architectures {architectures} failed "
+                "to be inspected. Please check the logs for more details."
+            )
+
+        raise ValueError(
+            f"Model architectures {architectures} are not supported for now. "
+            f"Supported architectures: {all_supported_archs}"
+        )
+
+    def _try_load_model_cls(self, model_arch: str) -> type[nn.Module] | None:
+        if model_arch not in self.registered_models:
+            return None
+
+        return _try_load_model_cls(model_arch, self.registered_models[model_arch])
+
+    def _normalize_archs(
+        self,
+        architectures: str | list[str],
+    ) -> list[str]:
+        load_external_model_package()
+        if isinstance(architectures, str):
+            architectures = [architectures]
+        if not architectures:
+            logger.warning("No model architectures are specified")
+
+        normalized_arch = []
+        for arch in architectures:
+            if arch not in self.registered_models:
+                # A checkpoint may name a class that is only a rename of one we
+                # already implement (e.g. LTX-2.5's `LTX2VocoderWithBWE` is
+                # `LTX2Vocoder`); `_aliases` declares those equivalences.
+                canonical = _ALIAS_TO_MODEL.get(arch)
+                if canonical is not None and canonical in self.registered_models:
+                    normalized_arch.append(canonical)
+                    continue
+                registered_models = list(self.registered_models.keys())
+                raise Exception(
+                    f"Unsupported model architecture: {arch}. Registered architectures: {registered_models}"
+                )
+            normalized_arch.append(arch)
+        return normalized_arch
+
+    def resolve_model_cls(
+        self,
+        architectures: str | list[str],
+    ) -> tuple[type[nn.Module], str]:
+        architectures = self._normalize_archs(architectures)
+
+        for arch in architectures:
+            model_cls = self._try_load_model_cls(arch)
+            if model_cls is not None:
+                return (model_cls, arch)
+
+        return self._raise_for_unsupported(architectures)
+
+
+ModelRegistry = _ModelRegistry(
+    {
+        model_arch: _LazyRegisteredModel(
+            module_name=f"sglang.multimodal_gen.runtime.models.{component_name}.{mod_relname}",
+            class_name=cls_name,
+        )
+        for model_arch, (
+            component_name,
+            mod_relname,
+            cls_name,
+        ) in _SGLANG_DIFFUSION_MODELS.items()
+    }
+)

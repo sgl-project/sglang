@@ -1,0 +1,241 @@
+name: Nightly Benchmark (AMD)
+
+# InferenceX AgentX curves on MI35x against sglang main, reported rather than
+# gated. Each point holds a whole perf-bench node so nothing shares it while it
+# is measured. A curve is one InferenceX row: its test under
+# test/registered/amd/perf/mi35x/test_<model>_agentx_mi35x.py (harness in
+# sglang.test.agentx_common), one `<curve>-agentx-mi35x` job, one summary job
+# and one dispatch input here. Adding or dropping a curve touches only those.
+# The points must be the matrix row of the harness's INFERENCEX_COMMIT. The
+# ROCm/sglang-ci dashboard finds the curves by the `<curve>-agentx-mi35x` job
+# ids and reads the `agentx-<curve without dashes>-<point>` artifacts.
+#
+# Time limits: the launcher waits for a node while another point holds it, and
+# a GitHub step timeout counts that wait too. So the run itself is bounded by the
+# Slurm TIME_LIMIT (counted from the job's start: --timeout-per-file plus 30 min
+# for the container, dependencies and the InferenceX checkout), and the step
+# timeout is TIME_LIMIT plus up to 6 h in the Slurm queue.
+on:
+  schedule:
+    # The rocm10 MI35x image lands about 12:00 UTC.
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+    inputs:
+      dsv41_flash_point:
+        description: 'DeepSeek-V4.1-Flash point to run (none: skip the curve)'
+        required: false
+        default: 'none'
+        type: choice
+        options: [none, all, tp2-c1, tp2-c2, tp2-c4, tp2-c8, tp2-c16, tp2-c32, tp4-c1, tp4-c2, tp4-c4, tp4-c8, tp4-c16, tp2-dpa-c32, tp2-dpa-c64]
+      qwen35_mxfp4_point:
+        description: 'Qwen3.5 MXFP4 MTP point to run (none: skip the curve)'
+        required: false
+        default: 'none'
+        type: choice
+        options: [none, all, tp2-c1, tp2-c4, tp2-c8, tp2-c12, tp2-c16, tp2-c20, tp2-c24, tp2-c28, tp2-c32, tp2-c36, tp2-c40]
+
+# sbatch exports the launcher's environment to the cluster job, where
+# amd_ci_start_container.sh logs in to Docker Hub. HF_TOKEN comes from the
+# runner's .env; do not set it here, since even an empty value overrides it.
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  # Never cancel a run in flight: a cancelled point leaves no number behind.
+  group: nightly-benchmark-amd-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================================
+  # DeepSeek-V4.1-Flash: the whole row, 13 points of 1.5-2 h each.
+  # ============================================================================
+  dsv41-flash-agentx-mi35x:
+    name: dsv41-flash-agentx-mi35x ${{ matrix.point }}
+    if: github.repository == 'sgl-project/sglang' && (github.event_name == 'schedule' || inputs.dsv41_flash_point != 'none')
+    strategy:
+      fail-fast: false
+      matrix:
+        point: ${{ fromJson(inputs.dsv41_flash_point && inputs.dsv41_flash_point != 'all' && format('["{0}"]', inputs.dsv41_flash_point) || '["tp2-c1", "tp2-c2", "tp2-c4", "tp2-c8", "tp2-c16", "tp2-c32", "tp4-c1", "tp4-c2", "tp4-c4", "tp4-c8", "tp4-c16", "tp2-dpa-c32", "tp2-dpa-c64"]') }}
+    runs-on: linux-sglang-mi35x-perf-bench
+    timeout-minutes: 680
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Model load, up to an hour of AgentX warmup and the one-hour window.
+      - name: Run point on a cluster node
+        timeout-minutes: 670
+        env:
+          AGENTX_POINT: ${{ matrix.point }}
+          MATRIX_CONFIG_NAME: ${{ matrix.point }}
+          TIME_LIMIT: '05:10:00'
+        run: |
+          bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
+            --suite nightly-perf-8-gpu-mi35x-dsv41-flash-agentx \
+            --env "AGENTX_POINT=$AGENTX_POINT" \
+            -- --nightly --timeout-per-file 16800
+
+      - name: Summarize
+        if: always()
+        run: cat ci_artifacts/*.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentx-dsv41flash-${{ matrix.point }}
+          path: ci_artifacts/*.json
+          if-no-files-found: ignore
+          retention-days: 90
+          # A re-run attempt replaces the earlier attempt's result.
+          overwrite: true
+
+      - name: Cancel cluster jobs on failure/cancel
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          # Same prefix launch_amd_ci_mi35x.sh names its jobs with. %200j widens
+          # the name column; Spur's squeue does not accept --me.
+          PREFIX="amd-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-"
+          JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$PREFIX" | awk '{print $1}' || true)
+          if [ -n "$JOBS" ]; then
+            echo "Cancelling: $JOBS"
+            scancel $JOBS
+          fi
+
+  # One JSON list of the points' records per run. (The ROCm/sglang-ci dashboard
+  # reads the per-point artifacts, not this list.)
+  dsv41-flash-agentx-summary:
+    needs: dsv41-flash-agentx-mi35x
+    if: always() && github.repository == 'sgl-project/sglang' && (github.event_name == 'schedule' || inputs.dsv41_flash_point != 'none')
+    runs-on: ubuntu-latest
+    steps:
+      # A night on which no point got as far as a result still writes an empty
+      # list. The pattern stops at the point so the summary itself is not merged
+      # back in on a re-run.
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: agentx-dsv41flash-tp*
+          path: points
+          merge-multiple: true
+
+      - name: Merge points
+        run: |
+          shopt -s nullglob
+          files=(points/*.json)
+          if (( ${#files[@]} )); then
+            jq -s 'sort_by(.point)' "${files[@]}" > agentx-dsv41flash-summary.json
+          else
+            echo '[]' > agentx-dsv41flash-summary.json
+          fi
+          echo "Merged ${#files[@]} points"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentx-dsv41flash-summary
+          path: agentx-dsv41flash-summary.json
+          retention-days: 90
+          overwrite: true
+
+  # ============================================================================
+  # Qwen3.5-397B-A17B MXFP4 with EAGLE MTP: the row's TP2 curve, served from GPU
+  # KV up to c12 and with HiCache host-DRAM offload from c16, 11 points of about
+  # 1.5 h each. The row's TP4 points are left out to keep the nightly within the
+  # partition's day. SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D only changes how
+  # MoE weights are loaded, as every MI35x nightly model load sets it.
+  # ============================================================================
+  qwen35-mxfp4-agentx-mi35x:
+    name: qwen35-mxfp4-agentx-mi35x ${{ matrix.point }}
+    if: github.repository == 'sgl-project/sglang' && (github.event_name == 'schedule' || inputs.qwen35_mxfp4_point != 'none')
+    strategy:
+      fail-fast: false
+      matrix:
+        point: ${{ fromJson(inputs.qwen35_mxfp4_point && inputs.qwen35_mxfp4_point != 'all' && format('["{0}"]', inputs.qwen35_mxfp4_point) || '["tp2-c1", "tp2-c4", "tp2-c8", "tp2-c12", "tp2-c16", "tp2-c20", "tp2-c24", "tp2-c28", "tp2-c32", "tp2-c36", "tp2-c40"]') }}
+    runs-on: linux-sglang-mi35x-perf-bench
+    timeout-minutes: 610
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Model load and the one-hour window; this row has no warmup grace.
+      - name: Run point on a cluster node
+        timeout-minutes: 600
+        env:
+          AGENTX_POINT: ${{ matrix.point }}
+          MATRIX_CONFIG_NAME: ${{ matrix.point }}
+          TIME_LIMIT: '04:00:00'
+        run: |
+          bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
+            --suite nightly-perf-8-gpu-mi35x-qwen35-mxfp4-agentx \
+            --env "AGENTX_POINT=$AGENTX_POINT" \
+            --env SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -- --nightly --timeout-per-file 12600
+
+      - name: Summarize
+        if: always()
+        run: cat ci_artifacts/*.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentx-qwen35mxfp4-${{ matrix.point }}
+          path: ci_artifacts/*.json
+          if-no-files-found: ignore
+          retention-days: 90
+          # A re-run attempt replaces the earlier attempt's result.
+          overwrite: true
+
+      - name: Cancel cluster jobs on failure/cancel
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          # Same prefix launch_amd_ci_mi35x.sh names its jobs with. %200j widens
+          # the name column; Spur's squeue does not accept --me.
+          PREFIX="amd-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-"
+          JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$PREFIX" | awk '{print $1}' || true)
+          if [ -n "$JOBS" ]; then
+            echo "Cancelling: $JOBS"
+            scancel $JOBS
+          fi
+
+  # One JSON list of the points' records per run. (The ROCm/sglang-ci dashboard
+  # reads the per-point artifacts, not this list.)
+  qwen35-mxfp4-agentx-summary:
+    needs: qwen35-mxfp4-agentx-mi35x
+    if: always() && github.repository == 'sgl-project/sglang' && (github.event_name == 'schedule' || inputs.qwen35_mxfp4_point != 'none')
+    runs-on: ubuntu-latest
+    steps:
+      # A night on which no point got as far as a result still writes an empty
+      # list. The pattern stops at the point so the summary itself is not merged
+      # back in on a re-run.
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: agentx-qwen35mxfp4-tp*
+          path: points
+          merge-multiple: true
+
+      - name: Merge points
+        run: |
+          shopt -s nullglob
+          files=(points/*.json)
+          if (( ${#files[@]} )); then
+            jq -s 'sort_by(.point)' "${files[@]}" > agentx-qwen35mxfp4-summary.json
+          else
+            echo '[]' > agentx-qwen35mxfp4-summary.json
+          fi
+          echo "Merged ${#files[@]} points"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentx-qwen35mxfp4-summary
+          path: agentx-qwen35mxfp4-summary.json
+          retention-days: 90
+          overwrite: true

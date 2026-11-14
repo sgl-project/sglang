@@ -1,0 +1,774 @@
+"""HiCache under decode context parallelism (DCP): host-pool index math.
+
+Under DCP the radix/controller layer works in a widened logical index space
+(page_size * dcp_size wide pages, dcp_size * physical capacity), while each
+rank's device and host buffers only materialize the owned 1/dcp_size token
+shard (owner rule: index % dcp_size == dcp_rank, physical row = index //
+dcp_size — the same rule the device-side KV write and page-table kernels
+use). These tests cover the translation helper, the logical/physical host
+pool sizing, and that the transfer entry points hand *physical* rows to the
+kernels.
+"""
+
+import threading
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import torch
+
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    check_dcp_l3_extra_pool,
+)
+from sglang.srt.mem_cache.hicache_storage import PoolName, l3_page_span
+from sglang.srt.mem_cache.kv.layout.mha import MHAView
+from sglang.srt.mem_cache.kv.layout.mla import MLAView
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+DCP_SIZE = 8
+PHYSICAL_PAGE = 64
+WIDENED_PAGE = PHYSICAL_PAGE * DCP_SIZE
+
+
+def _fake_mla_device_pool(
+    size: int = 1024, dtype: torch.dtype = torch.float16
+) -> MLATokenToKVPool:
+    return MLATokenToKVPool(
+        size=size,
+        page_size=PHYSICAL_PAGE,
+        dtype=dtype,
+        kv_lora_rank=8,
+        qk_rope_head_dim=4,
+        layer_num=2,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+
+
+def _make_host_pool(
+    dcp_rank: int,
+    device_size: int = 1024,
+    dcp_size: int = DCP_SIZE,
+    layout: str = "layer_first",
+    dtype: torch.dtype = torch.float16,
+) -> MLATokenToKVPoolHost:
+    device_pool = _fake_mla_device_pool(device_size, dtype)
+    return MLATokenToKVPoolHost(
+        device_pool.get_device_pool_infos()[0].buffer_info,
+        host_to_device_ratio=2.0,
+        host_size=0,
+        page_size=PHYSICAL_PAGE * dcp_size,
+        layout=layout,
+        pin_memory=False,
+        device="cpu",
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        device_capacity_tokens=(
+            device_pool.size
+            if device_pool.host_capacity_tokens is None
+            else device_pool.host_capacity_tokens
+        ),
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        target_layer_num=(
+            (device_pool.layer_num + device_pool.layer_shard_size - 1)
+            // device_pool.layer_shard_size
+            if device_pool.layer_shard_enabled
+            else device_pool.layer_num
+        ),
+        layer_shard_enabled=device_pool.layer_shard_enabled,
+    )
+
+
+class TestDcpKernelIndices(CustomTestCase):
+    def test_identity_without_dcp(self):
+        indices = torch.arange(37)
+        self.assertIs(maybe_dcp_kernel_indices(indices, 1, 0), indices)
+
+    def test_aligned_page_translates_to_full_physical_page(self):
+        # One widened page starting at logical 512 covers physical rows
+        # 64..127 on every rank.
+        indices = torch.arange(WIDENED_PAGE, 2 * WIDENED_PAGE)
+        for rank in range(DCP_SIZE):
+            out = maybe_dcp_kernel_indices(indices, DCP_SIZE, rank)
+            torch.testing.assert_close(
+                out, torch.arange(PHYSICAL_PAGE, 2 * PHYSICAL_PAGE)
+            )
+
+    def test_matches_owner_rule_on_merged_unordered_pages(self):
+        # Concatenation of non-adjacent widened pages in arbitrary order, as
+        # produced by merged CacheOperations after allocator churn.
+        pages = [3, 0, 5]
+        indices = torch.cat(
+            [torch.arange(p * WIDENED_PAGE, (p + 1) * WIDENED_PAGE) for p in pages]
+        )
+        for rank in range(DCP_SIZE):
+            out = maybe_dcp_kernel_indices(indices, DCP_SIZE, rank)
+            expected = (
+                indices[indices % DCP_SIZE == rank] // DCP_SIZE
+            )  # owner rule, same as filter_dcp_local_kv_indices
+            torch.testing.assert_close(out, expected)
+            self.assertEqual(out.numel() * DCP_SIZE, indices.numel())
+
+    def test_positional_residue_pairing_survives_host_sort(self):
+        # move_indices (direct/layer_first) sorts host indices and permutes
+        # device indices to match. Independent residue filtering of both
+        # tensors must keep the same token positions on every rank.
+        g = torch.Generator().manual_seed(0)
+        host_pages = [7, 2]
+        device_pages = [1, 4]
+        host = torch.cat(
+            [torch.arange(p * WIDENED_PAGE, (p + 1) * WIDENED_PAGE) for p in host_pages]
+        )
+        device = torch.cat(
+            [
+                torch.arange(p * WIDENED_PAGE, (p + 1) * WIDENED_PAGE)
+                for p in device_pages
+            ]
+        )
+        # token identity: position i pairs host[i] <-> device[i]
+        perm = torch.randperm(host.numel(), generator=g)
+        # sort host as move_indices does, permuting device alongside
+        host_sorted, order = host[perm].sort()
+        device_matched = device[perm][order]
+        for rank in range(DCP_SIZE):
+            host_mask = host_sorted % DCP_SIZE == rank
+            device_mask = device_matched % DCP_SIZE == rank
+            # same positions selected on both sides -> pairing preserved
+            torch.testing.assert_close(host_mask, device_mask)
+            self.assertEqual(
+                maybe_dcp_kernel_indices(host_sorted, DCP_SIZE, rank).numel(),
+                host.numel() // DCP_SIZE,
+            )
+
+
+class TestHostPoolSizingUnderDcp(CustomTestCase):
+    def test_storage_shard_identity_follows_mla_layout(self):
+        """Unified and static MLA keep one storage writer per DCP shard."""
+        for view_type, is_mla in (
+            (MLATokenToKVPool, True),
+            (MLAView, True),
+            (MHAView, False),
+        ):
+            for dcp_size in (1, 2):
+                for tp_rank in range(4):
+                    with self.subTest(
+                        view=view_type.__name__, dcp_size=dcp_size, tp_rank=tp_rank
+                    ):
+                        controller = HiCacheController.__new__(HiCacheController)
+                        controller.mem_pool_device = view_type.__new__(view_type)
+                        controller.mem_pool_host = SimpleNamespace(
+                            layout="page_first", storage_format_tag=None
+                        )
+                        controller.storage_host_pool = controller.mem_pool_host
+                        controller.enable_storage_metrics = False
+                        controller.page_size = PHYSICAL_PAGE * dcp_size
+                        controller.get_attn_cp_rank_and_size = lambda: (0, 1)
+                        with (
+                            mock.patch(
+                                "sglang.srt.managers.cache_controller.get_memory",
+                                return_value=SimpleNamespace(
+                                    hicache_storage_key_scheme="rank-suffix"
+                                ),
+                            ),
+                            mock.patch(
+                                "sglang.srt.managers.cache_controller.get_parallel",
+                                return_value=SimpleNamespace(
+                                    tp_rank=tp_rank,
+                                    tp_size=4,
+                                    pp_rank=0,
+                                    pp_size=1,
+                                    attn_dcp_size=dcp_size,
+                                    attn_dcp_rank=tp_rank % dcp_size,
+                                ),
+                            ),
+                            mock.patch(
+                                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                                return_value=False,
+                            ),
+                        ):
+                            if dcp_size > 1 and not is_mla:
+                                with self.assertRaisesRegex(ValueError, "requires MLA"):
+                                    controller._generate_storage_config()
+                                continue
+                            config = controller._generate_storage_config()
+                        self.assertEqual(config.is_mla_model, is_mla)
+                        self.assertEqual(
+                            config.is_storage_writer, not is_mla or tp_rank < dcp_size
+                        )
+                        if dcp_size > 1:
+                            self.assertEqual(
+                                config.logical_page_size, PHYSICAL_PAGE * dcp_size
+                            )
+
+    @staticmethod
+    def _attach_storage(pool, mode="cache"):
+        cc = HiCacheController.__new__(HiCacheController)
+        cc.mem_pool_host = cc.storage_host_pool = pool
+        cc.page_size = pool.logical_page_size
+        cc.enable_storage = False
+        cc.host_memory_mode = mode
+        cc.storage_stop_event = threading.Event()
+        cc._stop_storage_threads = mock.Mock()
+        cc._start_storage_threads = mock.Mock()
+        cc._create_sync_groups = mock.Mock(return_value=[])
+        cc._generate_storage_config = mock.Mock()
+        with (
+            mock.patch(
+                "sglang.srt.managers.cache_controller.get_memory",
+                return_value=SimpleNamespace(hicache_storage_key_scheme="rank-suffix"),
+            ),
+            mock.patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=pool.dcp_size),
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend"
+            ),
+        ):
+            cc.attach_storage_backend("file")
+        return cc
+
+    def test_unified_mla_dcp_keeps_native_l3_host_layout(self):
+        """Plain unified MLA must retain DCP-aware host IO for File and Mooncake."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
+        from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
+        from sglang.srt.runtime_context import get_memory, get_parallel
+        from sglang.test.unified_allocator_fixtures import (
+            build_mamba_pool,
+            setup_allocator_context,
+        )
+
+        setup_allocator_context()
+        for factor in (2, 4):
+            for rank in range(factor):
+                for layout in ("page_first", "page_first_direct"):
+                    with (
+                        self.subTest(dcp=factor, rank=rank, layout=layout),
+                        get_parallel().override(
+                            attn_dcp_size=factor, attn_dcp_rank=rank, dcp_enabled=True
+                        ),
+                        get_memory().override(hicache_storage_key_scheme="rank-suffix"),
+                    ):
+                        bundle, allocator = build_mamba_pool(page_size=64, mla=True)
+                        storage = bundle.storage
+                        entries = []
+                        for name, pool_name in (
+                            ("full", PoolName.KV),
+                            ("mamba", PoolName.MAMBA),
+                        ):
+                            host = storage.host_layout(name).build(
+                                HostPoolOptions(
+                                    ratio=1,
+                                    size=0,
+                                    page_size=allocator.page_size,
+                                    layout=layout,
+                                    allocator_type="default",
+                                    pool_label=name,
+                                    dcp_size=factor,
+                                    dcp_rank=rank,
+                                    pin_memory=False,
+                                )
+                            )
+                            self.addCleanup(host.destroy)
+                            entries.append(
+                                PoolEntry(
+                                    name=pool_name,
+                                    host_pool=host,
+                                    device_pool=storage.view(name),
+                                    layer_mapper=lambda layer: layer,
+                                    is_primary_index_anchor=name == "full",
+                                )
+                            )
+                        group = HostPoolGroup(entries)
+                        host = entries[0].host_pool
+                        for backend in ("file", "mooncake"):
+                            with self.subTest(backend=backend):
+                                cc = HybridCacheController.__new__(
+                                    HybridCacheController
+                                )
+                                cc.mem_pool_host = group
+                                cc.storage_host_pool = host
+                                cc.page_size = allocator.page_size
+                                cc.enable_storage = False
+                                cc.host_memory_mode = "cache"
+                                cc.pp_group = cc.pp_prefetch_command_group = None
+                                cc.storage_stop_event = threading.Event()
+                                cc._stop_storage_threads = mock.Mock()
+                                cc._start_storage_threads = mock.Mock()
+                                cc._create_sync_groups = mock.Mock(return_value=[])
+                                cc._generate_storage_config = mock.Mock()
+                                with mock.patch(
+                                    "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend"
+                                ) as factory:
+                                    cc.attach_storage_backend(
+                                        backend, host_pools=entries
+                                    )
+                                self.assertTrue(cc.enable_storage)
+                                self.assertIs(factory.call_args.args[2], host)
+                        self.assertIsInstance(host, MLATokenToKVPoolHost)
+                        self.assertEqual(host.dcp_size, factor)
+                        self.assertEqual(host.dcp_rank, rank)
+                        ids = allocator.alloc(allocator.page_size)
+                        physical = maybe_dcp_kernel_indices(
+                            storage.host_ids("full")(ids), factor, rank
+                        )
+                        torch.testing.assert_close(
+                            physical.long(),
+                            allocator.full_attn_allocator.ids.translate_write(ids)[
+                                rank::factor
+                            ].long(),
+                        )
+                        allocator.free(ids)
+
+    def test_prefetch_throttles_at_half_the_logical_capacity(self):
+        for dcp_size in (1, 2, 8):
+            with self.subTest(dcp_size=dcp_size):
+                pool = _make_host_pool(0, dcp_size=dcp_size)
+                cc = self._attach_storage(pool)
+
+                # The pool has an odd number of pages. Fill just below half,
+                # then cross the threshold with one more logical page.
+                half_pages = pool.logical_size // pool.logical_page_size // 2
+                indices = pool.alloc(half_pages * pool.logical_page_size)
+                self.assertIsNotNone(indices)
+                cc.prefetch_tokens_occupied = len(indices)
+                self.assertFalse(cc.prefetch_rate_limited())
+                next_page = pool.alloc(pool.logical_page_size)
+                self.assertIsNotNone(next_page)
+                cc.prefetch_tokens_occupied += len(next_page)
+                self.assertTrue(cc.prefetch_rate_limited())
+
+    def test_prefetch_fit_uses_logical_capacity(self):
+        """A logical-token bounce up to the full logical pool must fit under DCP."""
+        for dcp_size in (1, 2, 8):
+            with self.subTest(dcp_size=dcp_size):
+                pool = _make_host_pool(0, dcp_size=dcp_size)
+                cc = self._attach_storage(pool)
+                operation = mock.Mock()
+                self.assertTrue(
+                    cc.can_fit_prefetch_host_buffers(operation, pool.logical_size)
+                )
+                self.assertFalse(
+                    cc.can_fit_prefetch_host_buffers(
+                        operation, pool.logical_size + pool.logical_page_size
+                    )
+                )
+
+    def test_runtime_attach_rejects_dcp_buffer_only(self):
+        for dcp_size in (2, 8):
+            with self.subTest(dcp_size=dcp_size):
+                pool = _make_host_pool(0, dcp_size=dcp_size)
+                with self.assertRaisesRegex(NotImplementedError, "buffer_only"):
+                    self._attach_storage(pool, mode="buffer_only")
+
+    def test_logical_and_physical_sizing(self):
+        pool = _make_host_pool(dcp_rank=3)
+        # kernel-facing page is physical
+        self.assertEqual(pool.page_size, PHYSICAL_PAGE)
+        self.assertEqual(pool.logical_page_size, WIDENED_PAGE)
+        # physical rows = ratio * device physical size, page aligned
+        self.assertEqual(pool.size, pool.page_num * PHYSICAL_PAGE)
+        self.assertEqual(pool.logical_size, pool.size * DCP_SIZE)
+        # buffers materialize physical rows only
+        self.assertEqual(pool.kv_buffer.shape[1], pool.size)
+        # allocator surface is logical
+        self.assertEqual(pool.free_slots.numel(), pool.logical_size)
+        self.assertEqual(pool.mem_state.numel(), pool.logical_size)
+
+    def test_alloc_is_widened_page_granular(self):
+        pool = _make_host_pool(dcp_rank=0)
+        out = pool.alloc(WIDENED_PAGE)
+        self.assertEqual(out.numel(), WIDENED_PAGE)
+        with self.assertRaises(AssertionError):
+            pool.alloc(PHYSICAL_PAGE)  # not a multiple of the widened page
+
+    def test_non_dcp_pool_unchanged(self):
+        device_pool = _fake_mla_device_pool()
+        pool = MLATokenToKVPoolHost(
+            device_pool.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=PHYSICAL_PAGE,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            device_capacity_tokens=(
+                device_pool.size
+                if device_pool.host_capacity_tokens is None
+                else device_pool.host_capacity_tokens
+            ),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            target_layer_num=(
+                (device_pool.layer_num + device_pool.layer_shard_size - 1)
+                // device_pool.layer_shard_size
+                if device_pool.layer_shard_enabled
+                else device_pool.layer_num
+            ),
+            layer_shard_enabled=device_pool.layer_shard_enabled,
+        )
+        self.assertEqual(pool.page_size, PHYSICAL_PAGE)
+        self.assertEqual(pool.logical_size, pool.size)
+        self.assertEqual(pool.logical_page_size, PHYSICAL_PAGE)
+
+
+class TestTransferEntryPointsTranslate(CustomTestCase):
+    def _run_backup(self, pool, host_indices, device_indices):
+        device_pool = None
+        # create=True: mla.py imports the kernel only under `if _is_cuda or
+        # _is_hip`, so the name is absent on the CPU runner this test targets.
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.mla.transfer_kv_all_layer_mla",
+            create=True,
+        ) as kernel:
+            pool.can_use_jit = False
+            pool.can_use_write_back_jit = False
+            with mock.patch.object(
+                MLATokenToKVPoolHost, "_is_device_layer_sharded", return_value=False
+            ):
+                pool.backup_from_device_all_layer(
+                    device_pool, host_indices, device_indices, io_backend="kernel"
+                )
+            return kernel.call_args.kwargs
+
+    def test_backup_receives_physical_rows(self):
+        pool = _make_host_pool(dcp_rank=5)
+        logical = torch.arange(2 * WIDENED_PAGE)
+        kwargs = self._run_backup(pool, logical, logical.clone())
+        expected = torch.arange(2 * PHYSICAL_PAGE)
+        torch.testing.assert_close(kwargs["src_indices"], expected)
+        torch.testing.assert_close(kwargs["dst_indices"], expected)
+
+
+class TestDcpStoragePages(CustomTestCase):
+    def test_logical_pages_map_to_physical_rows(self):
+        cases = (
+            (2, "layer_first", torch.bfloat16),
+            (2, "page_first", torch.bfloat16),
+            (2, "page_first_direct", torch.bfloat16),
+            (4, "page_first", torch.bfloat16),
+            (2, "page_first", torch.uint8),
+        )
+        for dcp, layout, dtype in cases:
+            with self.subTest(dcp=dcp, layout=layout, dtype=dtype):
+                source = _make_host_pool(1, dcp_size=dcp, layout=layout, dtype=dtype)
+                target = _make_host_pool(1, dcp_size=dcp, layout=layout, dtype=dtype)
+                values = torch.arange(source.kv_buffer.numel()) % 251
+                source.kv_buffer.copy_(values.reshape(source.kv_buffer.shape))
+                target.kv_buffer.zero_()
+                expected = target.kv_buffer.clone()
+
+                def physical_page(buffer, page, layout=layout):
+                    if layout == "layer_first":
+                        return buffer[:, page * 64 : (page + 1) * 64]
+                    if layout == "page_first":
+                        return buffer[page * 64 : (page + 1) * 64]
+                    return buffer[page : page + 1]
+
+                payload = source.get_data_page(3 * 64 * dcp)
+                torch.testing.assert_close(
+                    payload, physical_page(source.kv_buffer, 3).flatten()
+                )
+                target.set_from_flat_data_page(5 * 64 * dcp, payload)
+                physical_page(expected, 5).copy_(physical_page(source.kv_buffer, 3))
+                torch.testing.assert_close(target.kv_buffer, expected, rtol=0, atol=0)
+
+    def test_invalid_logical_starts_are_rejected(self):
+        pool = _make_host_pool(1, dcp_size=2, layout="page_first")
+        for index in (-128, 1, 64):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pool.get_data_page(index)
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pool.set_from_flat_data_page(index, pool.get_dummy_flat_data_page())
+        with self.assertRaises(IndexError):
+            pool.get_data_page(pool.logical_size)
+
+    def test_zero_copy_uses_physical_pages(self):
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                pool = _make_host_pool(
+                    1, dcp_size=2, layout=layout, dtype=torch.bfloat16
+                )
+                indices = torch.cat(
+                    [torch.arange(p * 128, (p + 1) * 128) for p in (3, 0)]
+                )
+                pointers, sizes = pool.get_page_buffer_meta(indices)
+                views = []
+                for page in (3, 0):
+                    if layout == "layer_first":
+                        views.extend(
+                            pool.kv_buffer[layer, page * 64 : (page + 1) * 64]
+                            for layer in range(2)
+                        )
+                    elif layout == "page_first":
+                        views.append(pool.kv_buffer[page * 64 : (page + 1) * 64])
+                    else:
+                        views.append(pool.kv_buffer[page])
+                self.assertEqual(pointers, [view.data_ptr() for view in views])
+                self.assertEqual(
+                    sizes, [view.numel() * view.element_size() for view in views]
+                )
+                self.assertEqual(sum(sizes), 2 * 64 * 2 * 12 * 2)
+
+    def test_zero_copy_rejects_invalid_pages_and_split_buffers(self):
+        pool = _make_host_pool(1, dcp_size=2, layout="page_first")
+        with self.assertRaises(AssertionError):
+            pool.get_page_buffer_meta(torch.arange(64))
+        for start in (-128, 1, 64, pool.logical_size):
+            with self.subTest(start=start), self.assertRaises((ValueError, IndexError)):
+                pool.get_page_buffer_meta(torch.arange(start, start + 128))
+        pool.layout = "page_first_kv_split"
+        with self.assertRaises(NotImplementedError):
+            pool.get_page_buffer_meta(torch.arange(128))
+
+
+def _make_indexer_host(anchor: MLATokenToKVPoolHost, stride: int = 6):
+    """CPU DSAIndexerPoolHost carrying only the storage-page state (the real
+    constructor needs a CUDA DSA device pool)."""
+    pool = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
+    pool.page_size = anchor.page_size
+    pool.dcp_size = anchor.dcp_size
+    pool.dcp_rank = anchor.dcp_rank
+    pool.layout = anchor.layout
+    pool.size = anchor.size
+    pool.page_num = anchor.page_num
+    pool.layer_num = 2
+    pool.indexer_dtype = torch.uint8
+    pool.indexer_page_stride_size = stride
+    pool.indexer_page_num = (pool.size + pool.page_size + 1) // pool.page_size
+    shape = (
+        (pool.layer_num, pool.indexer_page_num, stride)
+        if pool.layout == "layer_first"
+        else (pool.indexer_page_num, pool.layer_num, 1, stride)
+    )
+    pool.index_k_with_scale_buffer = (
+        (torch.arange(torch.Size(shape).numel()) % 251).to(torch.uint8).reshape(shape)
+    )
+    return pool
+
+
+class TestDcpIndexerStoragePages(CustomTestCase):
+    """L3 keys address widened pages; the row-sharded indexer stores one
+    physical page per logical page, the same row the L2 transfer uses."""
+
+    @staticmethod
+    def _page(pool, page):
+        if pool.layout == "layer_first":
+            return pool.index_k_with_scale_buffer[:, page]
+        return pool.index_k_with_scale_buffer[page]
+
+    def test_logical_pages_map_to_physical_pages(self):
+        for dcp in (1, 2, 8):
+            for layout in ("layer_first", "page_first", "page_first_direct"):
+                with self.subTest(dcp=dcp, layout=layout):
+                    anchor = _make_host_pool(1, dcp_size=dcp, layout=layout)
+                    source = _make_indexer_host(anchor)
+                    target = _make_indexer_host(anchor)
+                    target.index_k_with_scale_buffer.zero_()
+                    span = l3_page_span(source)
+                    self.assertEqual(span, PHYSICAL_PAGE * dcp)
+                    self.assertEqual(span, anchor.logical_page_size)
+                    payload = source.get_data_page(3 * span)
+                    torch.testing.assert_close(payload, self._page(source, 3).flatten())
+                    target.set_from_flat_data_page(5 * span, payload)
+                    torch.testing.assert_close(
+                        self._page(target, 5), self._page(source, 3)
+                    )
+                    self.assertEqual(
+                        int(target.index_k_with_scale_buffer.count_nonzero()),
+                        int(self._page(source, 3).count_nonzero()),
+                    )
+
+    def test_zero_copy_uses_physical_pages(self):
+        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
+        pool = _make_indexer_host(anchor)
+        indices = torch.cat([torch.arange(p * 128, (p + 1) * 128) for p in (3, 0)])
+        pointers, sizes = pool.get_page_buffer_meta(indices)
+        self.assertEqual(
+            pointers,
+            [pool.index_k_with_scale_buffer[p].data_ptr() for p in (3, 0)],
+        )
+        self.assertEqual(sizes, [2 * 6] * 2)
+
+    def test_zero_copy_pointers_are_ints_without_dcp(self):
+        anchor = _make_host_pool(0, dcp_size=1, layout="page_first")
+        pool = _make_indexer_host(anchor)
+        pointers, _ = pool.get_page_buffer_meta(torch.arange(128))
+        self.assertEqual([type(p) for p in pointers], [int, int])
+
+    def test_invalid_logical_starts_are_rejected(self):
+        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
+        pool = _make_indexer_host(anchor)
+        for index in (-128, 1, 64):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pool.get_data_page(index)
+        with self.assertRaises(IndexError):
+            pool.get_data_page(anchor.logical_size)
+        with self.assertRaises(AssertionError):
+            pool.get_page_buffer_meta(torch.arange(64))
+
+
+class TestDcpL3PoolCheck(CustomTestCase):
+    def _check(self, name, pool, anchor, shards_index_k=True):
+        with mock.patch(
+            "sglang.srt.layers.dcp.layout.dsa_shards_index_k",
+            return_value=shards_index_k,
+        ):
+            check_dcp_l3_extra_pool(SimpleNamespace(name=name, host_pool=pool), anchor)
+
+    def test_allowed_pools(self):
+        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
+        for name, pool in (
+            (PoolName.KV, anchor),
+            (PoolName.MAMBA, MambaPoolHost.__new__(MambaPoolHost)),
+            (PoolName.INDEXER, _make_indexer_host(anchor)),
+            (PoolName.DRAFT, _make_host_pool(1, dcp_size=2, layout="page_first")),
+        ):
+            with self.subTest(name=name, pool=type(pool).__name__):
+                self._check(name, pool, anchor)
+
+    def test_rejected_pools(self):
+        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
+        indexer = _make_indexer_host(anchor)
+        resized = _make_indexer_host(_make_host_pool(1, 512, 2, "page_first"))
+        dummy_draft = _make_host_pool(1, dcp_size=2, layout="page_first")
+        dummy_draft.kv_buffer = None
+        replicated_draft = _make_host_pool(0, dcp_size=1, layout="page_first")
+        for label, name, pool, shards in (
+            ("replicated index-K", PoolName.INDEXER, indexer, False),
+            ("indexer size", PoolName.INDEXER, resized, True),
+            ("draft indexer", PoolName.DRAFT_INDEXER, indexer, True),
+            ("dummy draft", PoolName.DRAFT, dummy_draft, True),
+            ("replicated draft", PoolName.DRAFT, replicated_draft, True),
+            ("swa", PoolName.SWA, indexer, True),
+            ("mamba name", PoolName.MAMBA, indexer, True),
+        ):
+            with self.subTest(label), self.assertRaises(NotImplementedError):
+                self._check(name, pool, anchor, shards)
+
+
+class TestLayerShardedHostTransfers(CustomTestCase):
+    def test_layer_sharded_ascend_reports_unsupported_backend(self):
+        """Unsupported Ascend backup must report the backend, not a buffer error."""
+        pool = _fake_mla_device_pool(size=128)
+        pool.layer_shard_enabled = True
+        pool.layer_shard_size = 2
+        pool._owned_local_layer_range = lambda: (0, 1)
+        host = MLATokenToKVPoolHost(
+            pool.get_device_pool_infos()[0].buffer_info,
+            2,
+            0,
+            PHYSICAL_PAGE,
+            "layer_first",
+            pin_memory=False,
+            device_capacity_tokens=(
+                pool.size
+                if pool.host_capacity_tokens is None
+                else pool.host_capacity_tokens
+            ),
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=(
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+            ),
+            layer_shard_enabled=pool.layer_shard_enabled,
+        )
+        self.addCleanup(host.destroy)
+        # Ascend has no CUDA-style per-layer KV buffers.
+        host.device_kv_buffers = ()
+        indices = torch.arange(PHYSICAL_PAGE)
+        with self.assertRaisesRegex(
+            ValueError,
+            "Layer-sharded HiCache backup does not support IO backend: kernel_ascend",
+        ):
+            host.backup_from_device_all_layer(
+                pool, indices, indices, io_backend="kernel_ascend"
+            )
+
+    def test_owned_device_layers_keep_their_original_positions(self):
+        # Rank 1 owns device layers 2/3, which occupy host layers 0/1.
+        pool = _fake_mla_device_pool(size=128)
+        pool.layer_num = 4
+        pool.end_layer = 4
+        pool.model_layer_ids = tuple(range(4))
+        pool.layer_shard_enabled = True
+        pool.layer_shard_size = 2
+        pool._owned_local_layer_range = lambda: (2, 4)
+        owned = [
+            torch.full((192, 1, 12), value, dtype=torch.float16) for value in (2, 3)
+        ]
+        pool.kv_buffer = [
+            torch.empty(0, 1, 12, dtype=torch.float16) for _ in range(2)
+        ] + owned
+        pool.data_ptrs = torch.tensor(
+            [b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64
+        )
+        host = MLATokenToKVPoolHost(
+            pool.get_device_pool_infos()[0].buffer_info,
+            2,
+            0,
+            PHYSICAL_PAGE,
+            "layer_first",
+            pin_memory=False,
+            device_capacity_tokens=(
+                pool.size
+                if pool.host_capacity_tokens is None
+                else pool.host_capacity_tokens
+            ),
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=(
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+            ),
+            layer_shard_enabled=pool.layer_shard_enabled,
+        )
+        self.addCleanup(host.destroy)
+        self.assertEqual(host.layer_num, 2)
+        source = torch.arange(64, 128)
+        destination = torch.arange(64)
+        host_indices = torch.arange(128, 192)
+
+        def copy_pages(*, src_layers, dst_layers, src_indices, dst_indices, page_size):
+            for src, dst in zip(src_layers, dst_layers, strict=True):
+                dst[dst_indices] = src[src_indices]
+
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.mla.transfer_kv_direct",
+            side_effect=copy_pages,
+            create=True,
+        ) as transfer:
+            host.backup_from_device_all_layer(pool, host_indices, source, "direct")
+            for buffer in owned:
+                buffer.zero_()
+            for layer in range(4):
+                host.load_to_device_per_layer(
+                    pool, host_indices, destination, layer, "direct"
+                )
+        self.assertEqual(transfer.call_count, 4)
+        for buffer, value in zip(owned, (2, 3), strict=True):
+            torch.testing.assert_close(
+                buffer[destination], torch.full((64, 1, 12), value, dtype=torch.float16)
+            )
+            self.assertEqual(torch.count_nonzero(buffer[64:]).item(), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,176 @@
+---
+title: "OpenAI APIs - Vision"
+metatags:
+    description: "This tutorial covers the vision APIs for vision language models."
+---
+SGLang provides OpenAI-compatible APIs to enable a smooth transition from OpenAI services to self-hosted local models.
+A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/guides/vision).
+This tutorial covers the vision APIs for vision language models.
+
+SGLang supports various vision language models such as Llama 3.2, LLaVA-OneVision, Qwen2.5-VL, Gemma3 and [more](../supported-models/multimodal_language_models).
+
+As an alternative to the OpenAI API, you can also use the [SGLang offline engine](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/offline_batch_inference_vlm.py).
+
+## Launch A Server
+
+Launch the server in your terminal and wait for it to initialize.
+
+```python Example
+from sglang.test.doc_patch import launch_server_cmd
+from sglang.utils import wait_for_server, print_highlight, terminate_process
+
+example_image_url = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
+logo_image_url = (
+    "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
+)
+
+vision_process, port = launch_server_cmd("""
+python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-7B-Instruct --log-level warning
+""")
+
+wait_for_server(f"http://localhost:{port}", process=vision_process)
+```
+
+## Using cURL
+
+Once the server is up, you can send test requests using curl or requests.
+
+```python Example
+import subprocess
+
+curl_command = f"""
+curl -s http://localhost:{port}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{{
+    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "messages": [
+      {{
+        "role": "user",
+        "content": [
+          {{
+            "type": "text",
+            "text": "What’s in this image?"
+          }},
+          {{
+            "type": "image_url",
+            "image_url": {{
+              "url": "{example_image_url}"
+            }}
+          }}
+        ]
+      }}
+    ],
+    "max_tokens": 300
+  }}'
+"""
+
+response = subprocess.check_output(curl_command, shell=True).decode()
+print_highlight(response)
+
+
+response = subprocess.check_output(curl_command, shell=True).decode()
+print_highlight(response)
+```
+
+## Using Python Requests
+
+```python Example
+import requests
+
+url = f"http://localhost:{port}/v1/chat/completions"
+
+data = {
+    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What’s in this image?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": example_image_url},
+                },
+            ],
+        }
+    ],
+    "max_tokens": 300,
+}
+
+response = requests.post(url, json=data)
+print_highlight(response.text)
+```
+
+## Using OpenAI Python Client
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url=f"http://localhost:{port}/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-VL-7B-Instruct",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "What is in this image?",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": example_image_url},
+                },
+            ],
+        }
+    ],
+    max_tokens=300,
+)
+
+print_highlight(response.choices[0].message.content)
+```
+
+## Multiple-Image Inputs
+
+The server also supports multiple images and interleaved text and images if the model supports it.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url=f"http://localhost:{port}/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-VL-7B-Instruct",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": example_image_url,
+                    },
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": logo_image_url,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": "I have two very different images. They are not related at all. "
+                    "Please describe the first image in one sentence, and then describe the second image in another sentence.",
+                },
+            ],
+        }
+    ],
+    temperature=0,
+)
+
+print_highlight(response.choices[0].message.content)
+```
+
+```python Example
+terminate_process(vision_process)
+```

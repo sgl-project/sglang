@@ -1,0 +1,39 @@
+name: PR Check Comment
+# Comments on a PR when its lint or PR title check fails. Uses workflow_run
+# because a fork PR's pull_request run only gets a read-only token. Safe: this
+# runs main's code and reads only API metadata, never PR code or artifacts.
+
+on:
+  workflow_run:
+    workflows: ["Lint", "PR Title"]
+    types: [completed]
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  # Serialize per commit so the two checks finishing together post one comment.
+  group: pr-check-comment-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Comment on failed checks
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { run } = require(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/pr-check-comment.cjs`
+            );
+            await run({ github, context, core });

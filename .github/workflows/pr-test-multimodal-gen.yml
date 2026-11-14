@@ -1,0 +1,232 @@
+name: PR Test - Multimodal Gen
+
+on:
+  workflow_call:
+    inputs:
+      multimodal_gen:
+        required: true
+        type: string
+      sgl_kernel:
+        required: true
+        type: string
+      runs_on_map:
+        required: true
+        type: string
+      continue_on_error:
+        required: false
+        type: string
+        default: 'false'
+      git_ref:
+        required: false
+        type: string
+        default: ''
+      test_parallel_dispatch:
+        required: false
+        type: string
+        default: 'false'
+      caller_needs_failure:
+        required: false
+        type: string
+        default: 'false'
+      skip_pr_test_health_check:
+        required: false
+        type: string
+        default: 'false'
+
+jobs:
+  compute-diffusion-partitions:
+    if: inputs.multimodal_gen == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
+      plan-2gpu: ${{ steps.compute.outputs.plan-2gpu }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compute partitions
+        id: compute
+        run: |
+          python scripts/ci/utils/diffusion/compute_diffusion_partitions.py --min-time 1200 --target-time 1800 --max-time 2400 --max-partitions 10
+
+  multimodal-gen-test-1-gpu:
+    needs: compute-diffusion-partitions
+    if: |
+      always() &&
+      needs.compute-diffusion-partitions.result == 'success' &&
+      fromJson(needs.compute-diffusion-partitions.outputs.plan-1gpu).partition_count > 0 &&
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
+    with:
+      runner_config: diffusion-1-gpu-h100
+      caller_inputs: ${{ toJson(inputs) }}
+      job_timeout_minutes: 240
+      run_timeout_minutes: 240
+      partition_plan: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
+    secrets: inherit
+
+  multimodal-gen-test-1-5090:
+    if: |
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
+    with:
+      runner_config: diffusion-1-gpu-5090
+      caller_inputs: ${{ toJson(inputs) }}
+      job_timeout_minutes: 180
+      run_timeout_minutes: 120
+      pre_suite_commands: |
+        # SM120-only diffusion unit tests
+        (cd python && python3 -m pytest -v -rs \
+          sglang/multimodal_gen/test/unit/test_fp8_fa_sm120_attn.py \
+          sglang/multimodal_gen/test/unit/test_subblock_sparse_attention.py::TestSubBlockNumerics)
+    secrets: inherit
+
+  bcg-diffusion:
+    if: |
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
+    with:
+      runner_config: diffusion-bcg-1-gpu-h100
+      caller_inputs: ${{ toJson(inputs) }}
+      job_timeout_minutes: 90
+      run_timeout_minutes: 60
+    secrets: inherit
+
+  multimodal-gen-test-2-gpu:
+    needs: compute-diffusion-partitions
+    if: |
+      always() &&
+      needs.compute-diffusion-partitions.result == 'success' &&
+      fromJson(needs.compute-diffusion-partitions.outputs.plan-2gpu).partition_count > 0 &&
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
+    with:
+      runner_config: diffusion-2-gpu-h100
+      caller_inputs: ${{ toJson(inputs) }}
+      job_timeout_minutes: 55
+      run_timeout_minutes: 55
+      retry_deadline_seconds: 3000
+      partition_plan: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
+    secrets: inherit
+
+  multimodal-gen-component-accuracy:
+    if: |
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
+    with:
+      runner_config: diffusion-component-2-gpu-h100
+      caller_inputs: ${{ toJson(inputs) }}
+      job_timeout_minutes: 240
+      run_timeout_minutes: 240
+    secrets: inherit
+
+  multimodal-gen-test-4-gpu-b200:
+    if: |
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
+    with:
+      runner_config: diffusion-1-gpu-b200
+      caller_inputs: ${{ toJson(inputs) }}
+      job_timeout_minutes: 240
+      run_timeout_minutes: 240
+      pre_suite_timeout_minutes: 55
+      pre_suite_commands: |
+        python3 -m pytest -v python/sglang/multimodal_gen/test/single_test_file/test_wan_vae_parallel_groups_4_gpu.py
+
+        uv pip install --no-deps comfy-kitchen==0.2.36
+
+        # Blackwell-only diffusion unit tests
+        (cd python && python3 -m pytest -v -rs \
+          sglang/multimodal_gen/test/unit/test_mxfp8_online_gemm.py \
+          sglang/multimodal_gen/test/unit/test_wan_gelu_mlp.py \
+          sglang/multimodal_gen/test/unit/test_cuda_attention_backend.py::TestFlashAttentionForwardInto \
+          sglang/multimodal_gen/test/unit/test_subblock_sparse_attention.py::TestSubBlockNumerics \
+          sglang/multimodal_gen/test/unit/test_text_encoder_loader.py::test_comfy_nvfp4_dynamic_matmul)
+
+        # 4-GPU diffusion unit tests
+        (cd python && python3 -m pytest -v \
+          sglang/multimodal_gen/test/unit/test_kandinsky6_sequence_parallel.py::test_joint_video_audio_tensor_sequence_parallel \
+          sglang/multimodal_gen/test/unit/test_kandinsky6_sr_sequence_parallel.py::test_sr_four_gpus \
+          "sglang/multimodal_gen/test/unit/test_kandinsky6_sr_decode_parallel.py::test_sr_parallel_decode[tiles-4-2-1]" \
+          "sglang/multimodal_gen/test/unit/test_kandinsky6_sr_decode_parallel.py::test_sr_parallel_decode[tiles-4-1-2]" \
+          "sglang/multimodal_gen/test/unit/test_kandinsky6_sr_decode_parallel.py::test_sr_parallel_decode[spatial-4-2-1]" \
+          "sglang/multimodal_gen/test/unit/test_kandinsky6_sr_decode_parallel.py::test_sr_parallel_decode[spatial-4-1-2]" \
+          sglang/multimodal_gen/test/single_test_file/test_ipc_a2a_multi_gpu.py::TestIpcA2AMultiGpu::test_four_ranks_match_sequential_bitwise \
+          sglang/multimodal_gen/test/single_test_file/test_usp_pipelined_attention_multi_gpu.py::TestUspPipelinedAttentionMultiGpu::test_four_ranks_match_sequential_bitwise)
+    secrets: inherit
+
+  multimodal-gen-unit-test:
+    if: |
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
+    with:
+      runner_config: diffusion-unit-1-gpu-h100
+      caller_inputs: ${{ toJson(inputs) }}
+      job_timeout_minutes: 120
+      run_timeout_minutes: 60
+      pre_suite_commands: |
+        # quant-videogen pins an incompatible torch, so install it without deps
+        # plus the import-time deps of the diffusion-qvg extra.
+        uv pip install --no-deps quant-videogen==0.1.0 "loguru>=0.7" "termcolor>=2.3"
+        uv pip install --no-deps comfy-kitchen==0.2.36
+    secrets: inherit
+
+  multimodal-gen-unit-test-b300:
+    if: |
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
+    with:
+      runner_config: diffusion-unit-1-gpu-b300
+      caller_inputs: ${{ toJson(inputs) }}
+      job_timeout_minutes: 120
+      run_timeout_minutes: 60
+    secrets: inherit
+
+  diffusion-coverage-check:
+    needs: [multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
+    if: |
+      always() &&
+      inputs.multimodal_gen == 'true' &&
+      (
+        needs.multimodal-gen-test-1-gpu.result == 'success' ||
+        needs.multimodal-gen-test-1-gpu.result == 'failure' ||
+        needs.multimodal-gen-test-2-gpu.result == 'success' ||
+        needs.multimodal-gen-test-2-gpu.result == 'failure'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download all execution reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports/
+          pattern: diffusion-report-diffusion-?-gpu-h100-*
+          merge-multiple: false
+
+      - name: Verify coverage
+        run: |
+          python scripts/ci/utils/diffusion/verify_diffusion_coverage.py --reports-dir reports/

@@ -1,0 +1,441 @@
+"""Benchmark for HiCache JIT kernel performance.
+
+This benchmark tests the performance of KV cache transfer operations
+between GPU and CPU (host pinned memory), comparing:
+- SGL AOT Kernel: Pre-compiled transfer_kv kernels from sgl_kernel
+- SGL JIT Kernel: JIT-compiled hicache kernels
+- PyTorch Indexing: Plain PyTorch index copy
+- PyTorch 2 Stream: PyTorch implementation using 2 CUDA streams
+
+Tests cover:
+- One Layer: CPU->GPU
+- All Layer: GPU->CPU
+
+Note: Uses do_bench instead of do_bench_cudagraph since CUDA graph
+capture doesn't support CPU-GPU memory transfers.
+"""
+
+import os
+from dataclasses import dataclass
+
+import torch
+from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
+
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import get_benchmark_range
+from sglang.kernels.ops.kvcache.hicache import (
+    DEFAULT_BLOCK_QUOTA,
+    TMA_BLOCK_QUOTA,
+    _default_unroll,
+    _jit_hicache_module,
+    _jit_hicache_tma_module,
+)
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(
+    est_time=29, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
+register_amd_ci(est_time=29, stage="jit-kernel-benchmark", runner_config="amd")
+
+DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "1"))
+ENABLE_SORT = True
+GPU_CACHE_SIZE = 256 * 1024  # 256K tokens on GPU
+HOST_CACHE_SIZE = 512 * 1024  # 512K tokens on CPU
+NUM_LAYERS = 8
+
+
+@dataclass(frozen=True)
+class HiCacheCache:
+    k_cache_cuda: torch.Tensor
+    v_cache_cuda: torch.Tensor
+    k_cache_host: torch.Tensor
+    v_cache_host: torch.Tensor
+
+    def get_slice(self, num_layers: int, element_size: int) -> "HiCacheCache":
+        def slice_cuda(t: torch.Tensor) -> torch.Tensor:
+            needed_cuda = num_layers * GPU_CACHE_SIZE
+            return t.view(-1, element_size)[:needed_cuda].unflatten(0, (num_layers, -1))
+
+        def slice_host(t: torch.Tensor) -> torch.Tensor:
+            needed_host = num_layers * HOST_CACHE_SIZE
+            return t.view(-1, element_size)[:needed_host].unflatten(0, (num_layers, -1))
+
+        return HiCacheCache(
+            k_cache_cuda=slice_cuda(self.k_cache_cuda),
+            v_cache_cuda=slice_cuda(self.v_cache_cuda),
+            k_cache_host=slice_host(self.k_cache_host),
+            v_cache_host=slice_host(self.v_cache_host),
+        )
+
+
+def gen_indices(
+    size: int, max_size: int, *, page_size: int = PAGE_SIZE
+) -> torch.Tensor:
+    def align(x: int) -> int:
+        return (x + page_size - 1) // page_size
+
+    assert size <= max_size and max_size % page_size == 0
+    indices = torch.randperm(align(max_size))[: align(size)]
+    offsets = torch.arange(page_size)
+    return (indices[:, None] * page_size + offsets).flatten().cuda()[:size]
+
+
+def sglang_aot_transfer_one(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    item_size: int,
+) -> None:
+    """SGL AOT Kernel for single layer transfer."""
+    transfer_kv_per_layer(
+        k_cache_src,
+        k_cache_dst,
+        v_cache_src,
+        v_cache_dst,
+        indices_src,
+        indices_dst,
+        item_size,
+    )
+
+
+def sglang_jit_transfer_one(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    element_dim: int,
+) -> None:
+    """SGL JIT register kernel for single layer transfer (bypasses TMA routing)."""
+    element_size = element_dim * k_cache_dst.element_size()
+    _jit_hicache_module(
+        element_size=element_size,
+        unroll=_default_unroll(element_size),
+        block_quota=DEFAULT_BLOCK_QUOTA,
+    ).launch_one(
+        k_cache_dst.view(-1, element_dim),
+        v_cache_dst.view(-1, element_dim),
+        indices_dst,
+        k_cache_src.view(-1, element_dim),
+        v_cache_src.view(-1, element_dim),
+        indices_src,
+    )
+
+
+def sglang_aot_transfer_all(
+    k_ptrs_dst: torch.Tensor,
+    v_ptrs_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_ptrs_src: torch.Tensor,
+    v_ptrs_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+) -> None:
+    """SGL AOT Kernel for all layer transfer."""
+    transfer_kv_all_layer(
+        k_ptrs_src,
+        k_ptrs_dst,
+        v_ptrs_src,
+        v_ptrs_dst,
+        indices_src,
+        indices_dst,
+        item_size,
+        num_layers,
+    )
+
+
+def sglang_jit_transfer_all(
+    k_ptrs_dst: torch.Tensor,
+    v_ptrs_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_ptrs_src: torch.Tensor,
+    v_ptrs_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    stride_bytes: int,
+    element_size: int,
+) -> None:
+    """SGL JIT register kernel for all layer transfer (bypasses TMA routing)."""
+    _jit_hicache_module(
+        element_size=element_size,
+        unroll=_default_unroll(element_size),
+        block_quota=DEFAULT_BLOCK_QUOTA,
+    ).launch_all(
+        k_ptrs_dst,
+        v_ptrs_dst,
+        indices_dst,
+        k_ptrs_src,
+        v_ptrs_src,
+        indices_src,
+        stride_bytes,
+        stride_bytes,
+    )
+
+
+def sglang_tma_transfer_one(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    indices_src: torch.Tensor,
+) -> None:
+    """SGL TMA staging kernel for single layer transfer."""
+    _jit_hicache_tma_module(block_quota=TMA_BLOCK_QUOTA).launch_one(
+        k_cache_dst, v_cache_dst, indices_dst, k_cache_src, v_cache_src, indices_src
+    )
+
+
+def sglang_tma_transfer_all(
+    k_ptrs_dst: torch.Tensor,
+    v_ptrs_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_ptrs_src: torch.Tensor,
+    v_ptrs_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    stride_bytes: int,
+    element_size: int,
+) -> None:
+    """SGL TMA staging kernel for all layer transfer."""
+    _jit_hicache_tma_module(block_quota=TMA_BLOCK_QUOTA).launch_all(
+        k_ptrs_dst,
+        v_ptrs_dst,
+        indices_dst,
+        k_ptrs_src,
+        v_ptrs_src,
+        indices_src,
+        stride_bytes,
+        stride_bytes,
+        element_size,
+    )
+
+
+def pytorch_transfer(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst_on_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    indices_src_on_src: torch.Tensor,
+) -> None:
+    """PyTorch indexing baseline."""
+    dst_device = k_cache_dst.device
+    k_cache_dst[indices_dst_on_dst] = k_cache_src[indices_src_on_src].to(dst_device)
+    v_cache_dst[indices_dst_on_dst] = v_cache_src[indices_src_on_src].to(dst_device)
+
+
+# Benchmark configuration
+
+ELEMENT_SIZE_RANGE = get_benchmark_range(
+    full_range=[64, 128, 256, 512, 1024],
+    ci_range=[1024],
+)
+
+LINE_VALS = ["aot", "jit", "torch"]
+if DISABLE_TORCH:
+    LINE_VALS.remove("torch")
+# The TMA staging kernel needs sm_90+ (cp.async.bulk); skip the line elsewhere.
+if (
+    torch.cuda.is_available()
+    and torch.version.hip is None
+    and torch.cuda.get_device_capability()[0] >= 9
+):
+    LINE_VALS.insert(2, "tma")
+
+
+# =============================================================================
+# One Layer Benchmarks
+# =============================================================================
+
+
+@marker.parametrize("element_size", ELEMENT_SIZE_RANGE)
+@marker.parametrize("batch_size", marker.range(14, pattern="pow2"), [16])
+@marker.benchmark("provider", LINE_VALS, unit="ms")
+def benchmark_one_layer_h2d(element_size: int, batch_size: int, provider: str):
+    """One Layer: Host (CPU) -> Device (GPU)."""
+    global cache
+    cache_local = cache.get_slice(num_layers=NUM_LAYERS, element_size=element_size)
+    k_cache_src = cache_local.k_cache_host
+    v_cache_src = cache_local.v_cache_host
+    k_cache_dst = cache_local.k_cache_cuda
+    v_cache_dst = cache_local.v_cache_cuda
+    torch.manual_seed(batch_size * 65536 + element_size)
+    indices_src_gpu = gen_indices(batch_size, HOST_CACHE_SIZE)
+    indices_dst_gpu = gen_indices(batch_size, GPU_CACHE_SIZE)
+
+    if ENABLE_SORT:
+        indices_src_gpu, mapping = indices_src_gpu.sort()
+        indices_dst_gpu = indices_dst_gpu[mapping]
+    indices_src_cpu = indices_src_gpu.cpu()
+    torch.cuda.synchronize()
+
+    element_bytes = element_size * k_cache_src.element_size()
+
+    FN_MAP = {
+        "aot": lambda: [
+            sglang_aot_transfer_one(
+                k_cache_dst[i],
+                v_cache_dst[i],
+                indices_dst_gpu,
+                k_cache_src[i],
+                v_cache_src[i],
+                indices_src_gpu,
+                element_bytes,
+            )
+            for i in range(NUM_LAYERS)
+        ],
+        "jit": lambda: [
+            sglang_jit_transfer_one(
+                k_cache_dst[i],
+                v_cache_dst[i],
+                indices_dst_gpu,
+                k_cache_src[i],
+                v_cache_src[i],
+                indices_src_gpu,
+                element_size,
+            )
+            for i in range(NUM_LAYERS)
+        ],
+        "tma": lambda: [
+            sglang_tma_transfer_one(
+                k_cache_dst[i],
+                v_cache_dst[i],
+                indices_dst_gpu,
+                k_cache_src[i],
+                v_cache_src[i],
+                indices_src_gpu,
+            )
+            for i in range(NUM_LAYERS)
+        ],
+        "torch": lambda: [
+            pytorch_transfer(
+                k_cache_dst[i],
+                v_cache_dst[i],
+                indices_dst_gpu,
+                k_cache_src[i],
+                v_cache_src[i],
+                indices_src_cpu,
+            )
+            for i in range(NUM_LAYERS)
+        ],
+    }
+
+    return marker.do_bench(
+        FN_MAP[provider],
+        use_cuda_graph=False,
+        extra_memory_footprint=NUM_LAYERS * batch_size * (2 * element_bytes),
+    )
+
+
+# =============================================================================
+# All Layer Benchmarks
+# =============================================================================
+
+
+def _create_ptr_tensor(tensors, device="cuda"):
+    """Create a tensor of data pointers."""
+    return torch.tensor(
+        [t.data_ptr() for t in tensors],
+        dtype=torch.uint64,
+        device=device,
+    )
+
+
+@marker.parametrize("element_size", ELEMENT_SIZE_RANGE)
+@marker.parametrize("batch_size", marker.range(14, pattern="pow2"), [16])
+@marker.benchmark("provider", LINE_VALS, unit="ms")
+def benchmark_all_layer_d2h(element_size: int, batch_size: int, provider: str):
+    """All Layer: Device (GPU) -> Host (CPU)."""
+    global cache
+    cache_local = cache.get_slice(num_layers=NUM_LAYERS, element_size=element_size)
+    k_caches_src = cache_local.k_cache_cuda
+    v_caches_src = cache_local.v_cache_cuda
+    k_caches_dst = cache_local.k_cache_host
+    v_caches_dst = cache_local.v_cache_host
+    torch.manual_seed(batch_size * 65536 + element_size)
+
+    indices_src_gpu = gen_indices(batch_size, GPU_CACHE_SIZE)
+    indices_dst_gpu = gen_indices(batch_size, HOST_CACHE_SIZE)
+    if ENABLE_SORT:
+        indices_dst_gpu, mapping = indices_dst_gpu.sort()
+        indices_src_gpu = indices_src_gpu[mapping]
+    indices_dst_cpu = indices_dst_gpu.cpu()
+    torch.cuda.synchronize()
+
+    element_bytes = element_size * k_caches_src.element_size()
+
+    k_ptrs_src = _create_ptr_tensor([k_caches_src[i] for i in range(NUM_LAYERS)])
+    v_ptrs_src = _create_ptr_tensor([v_caches_src[i] for i in range(NUM_LAYERS)])
+    k_ptrs_dst = _create_ptr_tensor([k_caches_dst[i] for i in range(NUM_LAYERS)])
+    v_ptrs_dst = _create_ptr_tensor([v_caches_dst[i] for i in range(NUM_LAYERS)])
+
+    FN_MAP = {
+        "aot": lambda: sglang_aot_transfer_all(
+            k_ptrs_dst,
+            v_ptrs_dst,
+            indices_dst_gpu,
+            k_ptrs_src,
+            v_ptrs_src,
+            indices_src_gpu,
+            element_bytes,
+            NUM_LAYERS,
+        ),
+        "jit": lambda: sglang_jit_transfer_all(
+            k_ptrs_dst,
+            v_ptrs_dst,
+            indices_dst_gpu,
+            k_ptrs_src,
+            v_ptrs_src,
+            indices_src_gpu,
+            element_bytes,
+            element_bytes,
+        ),
+        "tma": lambda: sglang_tma_transfer_all(
+            k_ptrs_dst,
+            v_ptrs_dst,
+            indices_dst_gpu,
+            k_ptrs_src,
+            v_ptrs_src,
+            indices_src_gpu,
+            element_bytes,
+            element_bytes,
+        ),
+        "torch": lambda: [
+            pytorch_transfer(
+                k_caches_dst[i],
+                v_caches_dst[i],
+                indices_dst_cpu,
+                k_caches_src[i],
+                v_caches_src[i],
+                indices_src_gpu,
+            )
+            for i in range(NUM_LAYERS)
+        ],
+    }
+
+    return marker.do_bench(
+        FN_MAP[provider],
+        use_cuda_graph=False,
+        extra_memory_footprint=NUM_LAYERS * batch_size * (2 * element_bytes),
+    )
+
+
+if __name__ == "__main__":
+    MAX_SIZE = max(ELEMENT_SIZE_RANGE)
+    DEVICE_SHAPE = (NUM_LAYERS * GPU_CACHE_SIZE, MAX_SIZE)
+    HOST_SHAPE = (NUM_LAYERS * HOST_CACHE_SIZE, MAX_SIZE)
+
+    cache = HiCacheCache(
+        k_cache_cuda=torch.empty(DEVICE_SHAPE, dtype=torch.bfloat16, device="cuda"),
+        v_cache_cuda=torch.empty(DEVICE_SHAPE, dtype=torch.bfloat16, device="cuda"),
+        k_cache_host=torch.empty(HOST_SHAPE, dtype=torch.bfloat16, pin_memory=True),
+        v_cache_host=torch.empty(HOST_SHAPE, dtype=torch.bfloat16, pin_memory=True),
+    )
+
+    benchmark_one_layer_h2d.run(print_prefix="Per Layer: Host -> Device (CPU -> GPU)")
+    benchmark_all_layer_d2h.run(print_prefix="All Layer: Device -> Host (GPU -> CPU)")

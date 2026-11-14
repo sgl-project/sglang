@@ -1,0 +1,361 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import os
+import shutil
+from dataclasses import replace
+
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_image import (
+    MiniMaxH3ImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3_image import (
+    MiniMaxH3ImageSamplingParams,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    MiniMaxH3AudioEncodingStage,
+    MiniMaxH3DecodingStage,
+    MiniMaxH3DenoisingStage,
+    MiniMaxH3LatentPreparationStage,
+    MiniMaxH3TextEncodingStage,
+    MiniMaxH3TimestepPreparationStage,
+    MiniMaxH3VisualEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
+    minimax_h3_cleanup_temp_dirs,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
+    MINIMAX_H3_PREPARED_REFERENCE_IMAGE_EXTRA_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
+    MiniMaxH3PartitionAdmissionStage,
+    MiniMaxH3ReleaseMetadata,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+    MINIMAX_H3_TASK_PARTITIONS,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "MiniMaxH3Pipeline"
+    default_model_subfolder = "FL2VA"
+    is_video_pipeline = True
+    pipeline_config_cls = MiniMaxH3PipelineConfig
+    sampling_params_cls = MiniMaxH3SamplingParams
+    _required_config_modules = [
+        "processor",
+        "text_encoder",
+        "tokenizer",
+        "video_vae",
+        "audio_vae",
+        # scheduler intentionally absent: model_index carries scheduler=null;
+        # per-modality sigma schedules are generated in TimestepPreparation
+        # from the task profile, and the loop scheduler math lives in
+        # minimax_h3/denoise_loop.py (stages accept scheduler=None).
+        "transformer",
+    ]
+
+    def __init__(self, *args, **kwargs):
+        # TODO: Enable this check on ROCm after adding ffmpeg to the AMD Docker
+        # image and CI dependency installer.
+        if self.is_video_pipeline and not current_platform.is_rocm():
+            missing_media_tools = [
+                executable
+                for executable in ("ffmpeg", "ffprobe")
+                if shutil.which(executable) is None
+            ]
+            if missing_media_tools:
+                raise RuntimeError(
+                    "MiniMax H3 requires ffmpeg and ffprobe for media processing "
+                    "and validated output delivery; missing executables: "
+                    f"{', '.join(missing_media_tools)}. Install the ffmpeg system "
+                    "package before starting SGLang."
+                )
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def model_subfolder_for_variant(variant: str) -> str:
+        if not isinstance(variant, str) or not variant.strip():
+            raise ValueError("MiniMax H3 model variant must be a non-empty string")
+        normalized = variant.strip().lower()
+        subfolders = {
+            "fl2va": "FL2VA",
+            "ref2va": "Ref2VA",
+            "hybrid": "Ref2VA",
+        }
+        try:
+            return subfolders[normalized]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported MiniMax H3 model variant {variant!r}; "
+                f"supported: {sorted(subfolders)!r}"
+            ) from exc
+
+    def _load_config(self):
+        model_variant = self.server_args.model_variant
+        if model_variant is not None:
+            semantic_subfolder = self.model_subfolder_for_variant(model_variant)
+            if model_variant.strip().lower() == "hybrid" and not (
+                self.server_args.component_weights_paths.get("transformer")
+                or self.server_args.transformer_weights_path
+            ):
+                raise ValueError(
+                    "MiniMax H3 --model-variant hybrid requires explicit merged "
+                    "weights via --component-weights-paths.transformer"
+                )
+            explicit_subfolder = self.server_args.model_subfolder
+            if (
+                explicit_subfolder is not None
+                and explicit_subfolder.strip().lower() != semantic_subfolder.lower()
+            ):
+                raise ValueError(
+                    "MiniMax H3 --model-variant and --model-subfolder select "
+                    f"different weight partitions: variant={model_variant!r} maps to "
+                    f"{semantic_subfolder!r}, model_subfolder="
+                    f"{explicit_subfolder!r}"
+                )
+            self.server_args.model_subfolder = semantic_subfolder
+        model_index = super()._load_config()
+        self.release_metadata = MiniMaxH3ReleaseMetadata.from_model_index(model_index)
+        if self.release_metadata.is_image == self.is_video_pipeline:
+            raise ValueError(
+                f"{self.pipeline_name} cannot serve the "
+                f"{self.release_metadata.partition!r} release partition"
+            )
+        if (
+            model_variant is not None
+            and self.release_metadata.partition != semantic_subfolder.lower()
+        ):
+            raise ValueError(
+                "MiniMax H3 loaded checkpoint partition does not match "
+                f"--model-variant {model_variant!r}"
+            )
+        if model_variant is not None and model_variant.strip().lower() == "hybrid":
+            # merged checkpoints share the native graph across all three tasks
+            # keep the base partition contract strict unless explicitly selected
+            self.release_metadata = replace(
+                self.release_metadata,
+                partition="hybrid",
+                tasks=tuple(MINIMAX_H3_TASK_PARTITIONS),
+            )
+        self._apply_release_lora_adapter()
+        return model_index
+
+    def _apply_release_lora_adapter(self) -> None:
+        """Load a release's bundled LoRA adapter as the startup adapter."""
+        adapter = self.release_metadata.lora_adapter
+        if adapter is None:
+            return
+        adapter_path = os.path.join(self.model_path, adapter)
+        if not os.path.isfile(adapter_path):
+            raise ValueError(
+                f"{self.pipeline_name} release adapter not found: {adapter_path}"
+            )
+        if self.server_args.lora_path not in (None, adapter_path):
+            raise ValueError(
+                f"{self.pipeline_name} applies its own release adapter "
+                f"({adapter}); --lora-path cannot replace it"
+            )
+        # LoRAPipeline reads server_args.lora_path once the modules are loaded
+        self.server_args.lora_path = adapter_path
+
+    def validate_disagg_role(self, role: RoleType) -> None:
+        if role != RoleType.MONOLITHIC:
+            raise ValueError(
+                "MiniMaxH3Pipeline only supports monolithic deployment; "
+                f"disaggregation role {role.value!r} is not supported"
+            )
+
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        self.pdd_heads = self._resolve_pdd_heads()
+        transformer = self.get_module("transformer")
+        if (
+            self.pdd_heads
+            and transformer is not None
+            and transformer.final_layer._pdd_heads is None
+        ):
+            transformer.final_layer.load_pdd_fused_heads(self.pdd_heads)
+
+    def _resolve_pdd_heads(self) -> str | None:
+        """The env override, else a PDD release's own fused heads."""
+        if envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS:
+            return envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
+        release_metadata = getattr(self, "release_metadata", None)
+        if release_metadata is None or release_metadata.pdd_fused_heads is None:
+            return None
+        return os.path.join(self.model_path, release_metadata.pdd_fused_heads)
+
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        # Per-model sigma override from model_index.json; contract tests
+        # construct the pipeline without model_path, hence the guard.
+        release_metadata = getattr(self, "release_metadata", None)
+        sigma_shift_scales = (
+            release_metadata.sigma_shift_scales
+            if release_metadata is not None
+            else None
+        )
+        dit_arch = server_args.pipeline_config.dit_config.arch_config
+        if self.is_video_pipeline and not dit_arch.audio_enabled:
+            raise ValueError(
+                f"{self.pipeline_name} generates audio; its DiT checkpoint cannot "
+                "be audio-free (audio_enabled: false in transformer/config.json)"
+            )
+        if self.is_video_pipeline:
+            # Video only: image releases skip the generic image_path load/resize;
+            # Qwen and the VAE apply their own reference preprocessing.
+            self.add_stage(InputValidationStage())
+        if release_metadata is not None:
+            self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
+        text_encoder = self.get_module("text_encoder")
+        visual = getattr(getattr(text_encoder, "model", None), "visual", None)
+        if not self.is_video_pipeline and visual is not None:
+            # CPU initialization computes pow differently from CUDA. Image
+            # releases rebuild the small vision frequency table after offload
+            # transfers so conditioning matches the GPU-resident encoder, as in
+            # the native Qwen-Image path. Video releases keep the table their
+            # consistency references were generated with.
+            visual.rotary_pos_emb.recompute_on_device_change = True
+        self.add_stage(
+            MiniMaxH3TextEncodingStage(
+                text_encoder=self.get_module("text_encoder"),
+                tokenizer=self.get_module("tokenizer"),
+                processor=self.get_module("processor"),
+            )
+        )
+        self.add_stage(
+            MiniMaxH3VisualEncodingStage(
+                video_vae=self.get_module("video_vae"),
+                vae_arch_config=server_args.pipeline_config.vae_config.arch_config,
+            )
+        )
+        if self.is_video_pipeline:
+            self.add_stage(
+                MiniMaxH3AudioEncodingStage(
+                    audio_vae=self.get_module("audio_vae"),
+                    vae_arch_config=server_args.pipeline_config.audio_vae_config.arch_config,
+                )
+            )
+        self.add_stage(MiniMaxH3LatentPreparationStage())
+        self.add_stage(
+            MiniMaxH3TimestepPreparationStage(
+                sigma_shift_scales=sigma_shift_scales,
+                dmd_denoising_steps=(
+                    release_metadata.dmd_denoising_steps
+                    if release_metadata is not None
+                    else None
+                ),
+                pdd_heads=getattr(self, "pdd_heads", None),
+            )
+        )
+        self.add_stage(
+            MiniMaxH3DenoisingStage(
+                transformer=self.get_module("transformer"),
+                pipeline=self,
+                stochastic_sampling=(
+                    release_metadata is not None
+                    and release_metadata.stochastic_sampling
+                ),
+            )
+        )
+        self.add_stage(
+            MiniMaxH3DecodingStage(
+                video_vae=self.get_module("video_vae"),
+                audio_vae=self.get_module("audio_vae"),
+            )
+        )
+
+    def create_comfyui_stages(self, server_args: ServerArgs) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+            MiniMaxH3ComfyUIStepStage,
+        )
+
+        self.add_stage(
+            MiniMaxH3ComfyUIStepStage(transformer=self.get_module("transformer"))
+        )
+
+
+class FastH3Pipeline(MiniMaxH3Pipeline):
+    """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only), and the
+    FastH3 Omni Ref2VA PDD student.
+
+    The flat single-partition repo is materialized into the base-H3 layout by
+    its registered model overlay (see runtime/utils/model_overlay.py), so every stage, loader,
+    and admission path below is exactly the MiniMax-H3 one. There is no
+    FL2VA/Ref2VA partition layout to default into.
+    """
+
+    pipeline_name = "FastH3Pipeline"
+    default_model_subfolder = None
+
+
+class PikaH3FlexPipeline(MiniMaxH3Pipeline):
+    """Pika H3 Flex: MiniMax-H3 plus Pika's six-step LoRA adapters.
+
+    The release's model overlay links the pinned MiniMax-H3 base into the
+    base-H3 layout (root and ``FL2VA/`` for t2va/fl2va, ``Ref2VA/`` for
+    ref2va) with the matching adapter next to each partition. Its
+    ``_minimax_h3`` block carries the sampling contract (knots
+    1000/750/500/250/100/40, video shift 12, audio shift 3, re-noising) and
+    the adapter, which loads at startup.
+    """
+
+    pipeline_name = "PikaH3FlexPipeline"
+
+
+class MiniMaxH3ImagePipeline(MiniMaxH3Pipeline):
+    """One image checkpoint for its declared t2i/edit tasks: H3 stages without audio."""
+
+    pipeline_name = "MiniMaxH3ImagePipeline"
+    default_model_subfolder = None
+    is_video_pipeline = False
+    pipeline_config_cls = MiniMaxH3ImagePipelineConfig
+    sampling_params_cls = MiniMaxH3ImageSamplingParams
+    _required_config_modules = [
+        "processor",
+        "text_encoder",
+        "tokenizer",
+        "video_vae",
+        "transformer",
+    ]
+    # The image release names its one VAE `vae` (model_index.json key and
+    # directory), as diffusers does; the shared H3 stages call the module
+    # `video_vae`, so the pipeline loads that module from `vae/`.
+    _extra_config_module_map = {"video_vae": "vae"}
+
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        # Image releases are PDD checkpoints; there is no image sampler for a
+        # checkpoint without its fused per-step output heads.
+        if self._resolve_pdd_heads() is None:
+            raise ValueError(
+                f"{self.pipeline_name} serves PDD releases only: model_index.json "
+                "must name the fused heads in _minimax_h3.pdd_fused_heads"
+            )
+        super().initialize_pipeline(server_args)
+
+    def forward(self, batch, server_args):
+        try:
+            return super().forward(batch, server_args)
+        finally:
+            # Never retain request images or downloaded references.
+            batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_IMAGE_EXTRA_KEY, None)
+            minimax_h3_cleanup_temp_dirs(batch)
+
+
+EntryClass = [
+    MiniMaxH3Pipeline,
+    FastH3Pipeline,
+    PikaH3FlexPipeline,
+    MiniMaxH3ImagePipeline,
+]

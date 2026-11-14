@@ -1,0 +1,464 @@
+from __future__ import annotations
+
+import logging
+from array import array
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
+
+import numpy as np
+import torch
+
+from sglang.kernels.ops.memory.common import (
+    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
+)
+from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
+    get_cp_sharded_padded,
+    get_cp_sharded_padded_cache_indices,
+)
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    EvictResult,
+    MatchPrefixParams,
+    MatchResult,
+    zero_match_result,
+)
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+from sglang.srt.runtime_context import get_serving, get_spec
+from sglang.srt.utils.common import ceil_align
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+logger = logging.getLogger(__name__)
+
+
+def get_cp_sharded_padded_kv_segments(value):
+    """Return physical page segments for release for sharded CP storage."""
+    return [
+        (
+            get_cp_sharded_padded_cache_indices(indices),
+            get_cp_sharded_padded(start_pos),
+        )
+        for indices, start_pos in value
+    ]
+
+
+class RetractionBackup(NamedTuple):
+    cpu_tensors: Any = None
+    host_indices: Optional[torch.Tensor] = None
+    pool_transfers: Optional[list[PoolTransfer]] = None
+    # Set when the KV pool leaves the recurrent state to the caller.
+    mamba_cpu: Any = None
+
+
+def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
+    return (kv_indices[::page_size] // page_size).cpu().numpy()
+
+
+def suffix_page_indices(
+    req_to_token: torch.Tensor,
+    req_pool_idx: int,
+    prefix_len: int,
+    seq_len: int,
+    page_size: int,
+) -> np.ndarray:
+    """Pages of a request's tokens [prefix_len, seq_len).
+
+    PD prefill and decode both call this with the same page-aligned prefix
+    (decode_prefix_len), so their lists pair up page by page even though their
+    rows point at different physical pages.
+    """
+    return kv_to_page_indices(req_to_token[req_pool_idx, prefix_len:seq_len], page_size)
+
+
+def kv_to_page_num(num_kv_indices: int, page_size: int):
+    return (num_kv_indices + page_size - 1) // page_size
+
+
+def page_align_floor(length: int, page_size: int) -> int:
+    return (length // page_size) * page_size
+
+
+def free_kv_row_segments(
+    allocator: BaseTokenToKVPoolAllocator,
+    segments: list[tuple[torch.Tensor, int]],
+    *,
+    window_evicted_seqlen: int,
+    window_dead_lo: int = 0,
+) -> None:
+    """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
+    request's kv row; ``[window_dead_lo, window_evicted_seqlen)`` goes back full-side only."""
+    dead_lo, dead_hi = window_dead_lo, max(window_evicted_seqlen, window_dead_lo)
+    swa_dead: list[tuple[torch.Tensor, int]] = []
+    swa_alive: list[tuple[torch.Tensor, int]] = []
+    for kv_indices, start_pos in segments:
+        end_pos = start_pos + kv_indices.numel()
+        lo = min(max(dead_lo, start_pos), end_pos)
+        hi = min(max(dead_hi, start_pos), end_pos)
+        # start_pos <= lo <= hi <= end_pos
+        # inside [lo, hi) is the swa dead segment
+        if hi <= lo:
+            swa_alive.append((kv_indices, start_pos))
+            continue
+        swa_dead.append((kv_indices[lo - start_pos : hi - start_pos], lo))
+
+        if lo > start_pos:
+            swa_alive.append((kv_indices[: lo - start_pos], start_pos))
+        if end_pos > hi:
+            swa_alive.append((kv_indices[hi - start_pos :], hi))
+
+    if swa_dead and swa_alive:
+        # The two sides are separate calls, so neither one's page-disjointness
+        # check sees a boundary that splits a page between them.
+        assert window_evicted_seqlen % allocator.page_size == 0, (
+            f"SWA eviction cursor {window_evicted_seqlen} splits a page "
+            f"(page_size {allocator.page_size})"
+        )
+    if swa_dead:
+        if is_cp_sharded_padded():
+            swa_dead = get_cp_sharded_padded_kv_segments(swa_dead)
+        allocator.free_full_segments(swa_dead)
+    if swa_alive:
+        if is_cp_sharded_padded():
+            swa_alive = get_cp_sharded_padded_kv_segments(swa_alive)
+        allocator.free_segments(swa_alive)
+
+
+def _req_radix_key(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: array[int],
+    max_prefix_len: Optional[int] = None,
+) -> RadixKey:
+    # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
+    # bounded replay); cap the match so the window is re-prefilled.
+    reprefill_tail = tree_cache.window_reprefill_tail_tokens(req)
+    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if max_prefix_len is not None:
+        key_limit = (
+            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
+        )
+    return RadixKey(
+        token_ids=token_ids,
+        extra_key=req.extra_key,
+        limit=key_limit,
+        cache_salt=req.cache_salt,
+    )
+
+
+def storage_prefetch_end(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    max_prefix_len: int,
+) -> int:
+    """Raw-token end of the L3 prefetch span for ``req`` (before page alignment).
+
+    The span must stop where the match key stops. :func:`_req_radix_key` caps
+    the key at ``len - swa_reprefill_tail_tokens()``: a prefetch commits its
+    only SWA host window to the span's last page, so a span reaching past that
+    cap puts the window beyond the boundary the matcher may consume. The
+    boundary node then carries no SWA host value and admission drops the whole
+    transfer, after the L3 read has already been paid for.
+
+    ``prefetch_from_storage`` still floors the result to ``page_size``.
+    """
+    token_ids = req.full_untruncated_fill_ids
+    return len(_req_radix_key(tree_cache, req, token_ids, max_prefix_len))
+
+
+def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
+    tree_cache.touch_prefix(
+        _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)
+    )
+
+
+def match_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    token_ids: Optional[array] = None,
+    *,
+    cow_mamba: bool = False,
+    defer_cow_slot: bool = False,
+    max_prefix_len: Optional[int] = None,
+) -> MatchResult:
+    """Match token_ids against tree_cache and adopt the hit as req's prefix."""
+    if token_ids is None:
+        token_ids = req.origin_input_ids + req.output_ids
+
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
+            cow_mamba=cow_mamba,
+            defer_cow_slot=defer_cow_slot,
+            req=req,
+        )
+    )
+    if envs.SGLANG_RADIX_FORCE_MISS.get():
+        match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )
+    req.prefix_len = match_result.device_prefix_len
+    (
+        req.last_node,
+        req.last_host_node,
+        req.best_match_node,
+        req.host_hit_length,
+        req.mamba_host_hit_length,
+    ) = (
+        match_result.last_device_node,
+        match_result.last_host_node,
+        match_result.best_match_node,
+        match_result.host_hit_length,
+        match_result.mamba_host_hit_length,
+    )
+    req.matched_window_host_hit_lengths = dict(match_result.window_host_hit_lengths)
+    max_len = req._compute_max_prefix_len(len(token_ids))
+    req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
+    req.swa_branching_seqlen = match_result.swa_branching_seqlen
+    # A probe match keeps what it did not report; a new round resets both.
+    if match_result.mamba_branching_seqlen is not None:
+        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+    if match_result.cache_protected_len is not None:
+        req.kv.protect_prefix(match_result.cache_protected_len)
+    return match_result
+
+
+def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Publish what the running request has computed so far, unless it is
+    barred from the tree."""
+    # The tree reads req.finished() to tell a checkpoint from the final
+    # insert; a finished request belongs in release_kv_cache.
+    assert not req.finished(), f"checkpointing finished request {req.rid}"
+    if not req.skip_radix_cache_insert:
+        tree_cache.checkpoint(req, up_to=req.extend_end)
+    # The next extend resumes after this one, published or not.
+    req.prefix_len = req.extend_end
+
+
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None, num_tokens: int
+) -> bool | None:
+    if tree_cache is not None and tree_cache.supports_prefix_sharing():
+        from sglang.srt.mem_cache.capacity import evict_to_free_tokens
+
+        return evict_to_free_tokens(
+            tree_cache, tree_cache.token_to_kv_pool_allocator, num_tokens
+        )
+
+
+def _evict_until_allocatable(
+    tree_cache: BasePrefixCache, allocator, num_tokens: int
+) -> EvictResult:
+    """Keep evicting until `num_tokens` are allocatable; return all evicted counts.
+
+    Under classed page sharding available_size() reports the MIN-CLASS
+    capacity floor, so a single evict() sized in tokens can raise that floor by
+    less than the number of tokens it freed: the evicted pages spread across
+    all owner classes. Looping is deterministic, so it stays mirrored across
+    the ranks of a shard group. Stock allocators need no extra pass.
+    """
+    total = EvictResult()
+    if page_interleave_shard_size(allocator) <= 1:
+        return total
+    while True:
+        available_size = allocator.available_size()
+        if available_size >= num_tokens:
+            return total
+        shortfall = num_tokens - available_size
+        result = tree_cache.evict(
+            EvictParams(num_tokens=max(shortfall, allocator.page_size))
+        )
+        total.add(result)
+        if result.num_tokens_evicted == 0:
+            return total
+
+
+def dsv4_needs_rebootstrap(
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> bool:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    pool = token_to_kv_pool_allocator.get_kvcache()
+    # No DeepSeek-V4 pool keeps a host copy of a request's KV; the prefill recomputes it.
+    return isinstance(pool, DeepSeekV4TokenToKVPool)
+
+
+def backup_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    backend: str,
+) -> bool:
+    """Returns False when the request can be neither backed up nor recomputed;
+    the caller aborts it."""
+    if backend == "none":
+        return False
+    if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
+        if not req.resumable_by_rebootstrap:
+            return False
+        # Drain the in-flight forward before its slots can receive recomputed KV.
+        device = token_to_kv_pool_allocator.get_kvcache().device
+        torch.get_device_module(device).synchronize(device)
+        return True
+    if backend == "cpu_tensor":
+        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        return True
+    if backend != "host_pool":
+        raise ValueError(f"Unknown retraction backup backend: {backend}")
+    if req.seqlen <= 1:
+        return True
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    req.kv.retraction_backup = unified_cache.backup_kv_cache(req)
+    return req.kv.retraction_backup is not None
+
+
+def restore_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    backend: str,
+) -> None:
+    if backend == "cpu_tensor":
+        req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        return
+    if backend != "host_pool":
+        raise ValueError(f"Unknown retraction backup backend: {backend}")
+    if req.seqlen <= 1:
+        return
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    assert req.kv.retraction_backup is not None
+    unified_cache.restore_kv_cache(req, req.kv.retraction_backup)
+    req.kv.retraction_backup = None
+
+
+def start_restore_kv_cache(
+    req: Req, tree_cache: BasePrefixCache, *, copy_stream=None
+) -> None:
+    """``restore_kv_cache`` from the host pool without ordering later work after
+    the copy: ``req`` may run once ``req.kv.restore_done_event`` has completed.
+    The copy alone runs on ``copy_stream`` when given (see
+    `UnifiedRadixCache.start_restore_kv_cache`)."""
+    if req.seqlen <= 1:
+        return
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    assert req.kv.retraction_backup is not None
+    unified_cache.start_restore_kv_cache(
+        req, req.kv.retraction_backup, copy_stream=copy_stream
+    )
+    req.kv.retraction_backup = None
+
+
+def finish_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Return the host slots of ``req``'s restore once its copy has finished."""
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    unified_cache.finish_restore_kv_cache(req)
+
+
+def discard_kv_cache_backup(req: Req, tree_cache: BasePrefixCache) -> None:
+    backup = req.kv.retraction_backup
+    if backup is None:
+        return
+    # A host-pool backup holds host pages; a cpu_tensor one only CPU tensors.
+    if backup.host_indices is not None:
+        cast("UnifiedRadixCache", tree_cache).discard_kv_cache_backup(backup)
+    req.kv.retraction_backup = None
+
+
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
+    """Give the request's kv row back; with ``checkpoint`` the tree first keeps
+    what it can key."""
+    assert (not req.kv.holds_kv) == req.kv.is_kv_released
+    # A mamba-capable cache may alloc mamba state before alloc KV cache
+    if not req.kv.holds_kv:
+        assert tree_cache.supports_mamba(), (
+            "Only a mamba-capable tree cache allows freeing before alloc"
+        )
+        # TODO (csy, hanming): clean up this early allocation logic
+        if req.kv.holds_mamba:
+            kv_storage_of(
+                tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+            ).release_state_slot(req)
+        return
+    if tree_cache.claim_kv_row(req):
+        # A streaming session detached the kv record to keep the row; the
+        # request's network transfers end here as they would with the row.
+        assert not req.kv.holds_kv
+        kv_storage_of(
+            tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+        ).end_network_transfer(req)
+        return
+
+    owned_kv_len = req.owned_kv_len()
+    checkpoint = checkpoint and not req.skip_radix_cache_insert
+    if checkpoint:
+        # A tree that takes over component state (mamba) must see the request
+        # finished, or the insert forks the state and the slot leaks.
+        assert req.finished() or not tree_cache.supports_mamba(), (
+            f"releasing unfinished request {req.rid} into a mamba tree"
+        )
+        # The fill-id array lags output_ids until the next prepare_for_decode.
+        req.refresh_fill_ids()
+        tree_cache.checkpoint(req, up_to=owned_kv_len)
+    # The protected prefix is not this req's to free.
+    tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+    tree_cache.unlock(req.lock)
+    req.lock = None
+    _release_overallocated_kv_indices(
+        req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
+    )
+    tree_cache.on_release(req, checkpointed=checkpoint)
+
+    kv_storage_of(
+        tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+    ).release_row(req)
+    req.kv.mark_kv_released()
+
+
+def _release_overallocated_kv_indices(
+    req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
+) -> None:
+    # Logical token alignment width: one allocator page, or a full CP group.
+    page_size = tree_cache.logical_page_size
+    spec_algo = get_spec().speculative_algorithm
+
+    # strip_thinking_cache intentionally reports output tokens as overallocated
+    # so they fall into the free path below (#22373).
+    if spec_algo is None and not get_serving().strip_thinking_cache:
+        # A stop landing before the last committed token does the same, via
+        # effective_kv_committed_len().
+        assert start_p == end_p or (
+            req.finished_len is not None
+            and len(req.origin_input_ids) + req.finished_len < req.kv.kv_committed_len
+        ), (
+            f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+        )
+
+    # Align to the ALLOCATOR's page, which under DCP is wider than the kernel
+    # page: paged free() releases the whole page containing any freed index, so
+    # a boundary aligned only to the kernel page could free a widened page whose
+    # head rows are still live.
+    if page_size > 1:
+        start_p = ceil_align(start_p, page_size)
+
+    if start_p < end_p:
+        # start_p is aligned to the allocator's page above, so it never shares a
+        # page with the tail free_kv_row in this group.
+        tree_cache.free_kv_row(req.kv, [(start_p, end_p)])
+
+
+def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
+    return tree_cache.available_and_evictable_str()

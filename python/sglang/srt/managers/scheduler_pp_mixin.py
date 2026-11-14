@@ -1,0 +1,2040 @@
+from __future__ import annotations
+
+import logging
+from collections import defaultdict, deque
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+import torch
+import torch.distributed
+
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
+from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.environ import InvariantCheckLevel, envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
+from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    allocate_distinct_stream,
+    get_logprob_dict_from_result,
+    get_logprob_from_pp_outputs,
+)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.invariants import STAGE_CAPACITY_AGREEMENT
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.sampling.sampling_observer_pp import (
+    add_auxiliary_output_to_pp_tensors,
+    pop_auxiliary_output_from_pp_tensors,
+)
+from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
+from sglang.srt.utils.device import is_npu
+from sglang.srt.utils.invariants import expect_host, resolve_level
+
+_is_npu = is_npu()
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
+    from sglang.srt.observability.forward_pass_metrics import FpmTiming
+
+
+def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
+    """Check if output send/recv can be skipped for this batch."""
+    return (
+        envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
+        and batch is not None
+        and batch.forward_mode == ForwardMode.EXTEND
+        and len(batch.reqs) == 1
+        and not batch.contains_last_prefill_chunk
+        and not batch.return_logprob
+    )
+
+
+def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    if batch.spec_algorithm.is_none():
+        return None
+    fwd_batch = batch.copy()
+    fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
+    return fwd_batch
+
+
+def _pp_exchange_outputs_before_forward(
+    cur_batch: Optional[ScheduleBatch],
+    spec_relay: bool,
+    is_last_rank: bool,
+    async_batch_depth: int,
+) -> bool:
+    """Extend microbatches launch first: they need nothing from the relay, and
+    exchanging first caps every stage at (pp_size - 1) / pp_size. A verify round
+    must exchange first or the ring deadlocks on its tree rebuild."""
+    if async_batch_depth > 0:
+        return True
+    if not spec_relay or is_last_rank or cur_batch is None:
+        return False
+    return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
+
+
+@dataclass
+class PPBatchMetadata:
+    can_run_cuda_graph: bool
+    # PP+spec: forward-time snapshot of the microbatch (ScheduleBatch.copy()).
+    # The live mb object can be merged/filtered in place before its relayed
+    # result arrives, so relayed tensors must be applied against the
+    # composition that actually ran the forward.
+    fwd_batch: Optional[ScheduleBatch] = None
+    verify_out_cache_loc: Optional[torch.Tensor] = None
+    # Rank-local; never sent over the wire.
+    fpm_timing: Optional[FpmTiming] = None
+    # The step's launch record, which its processed result carries.
+    forward_launch: Optional[ForwardLaunch] = None
+    # Rank-local: the unified pool's record of this forward, retired when its
+    # result is processed.
+    unified_forward_done: Optional[torch.cuda.Event] = None
+    # Rank-local: recorded on the forward stream after this forward, any pool.
+    forward_done: Optional[torch.cuda.Event] = None
+
+
+class SchedulerPPMixin:
+    # Gated PP+spec relay flow. Class-level default so schedulers that never
+    # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
+    # init_pp_loop_state overwrites it per instance.
+    _pp_spec_relay: bool = False
+    # Side stream of `_pp_result_done_event`; made on first use.
+    _pp_skip_output_stream = None
+    # Unified memory under PP with invariant checks: the allocator whose decisions
+    # the stages compare, and their digest up to this iteration (`init_pp_loop_state`).
+    _pp_checked_allocator: Optional[ChainAllocator] = None
+    _pp_capacity_digest: Optional[bytes] = None
+
+    @DynamicGradMode()
+    def event_loop_pp(self: Scheduler):
+        """
+        A scheduler loop for pipeline parallelism.
+        Notes:
+        1. Each stage runs in the same order and is notified by the previous stage.
+        2. We use async send but sync recv to avoid desynchronization while minimizing the communication overhead.
+        3. We can use async batch depth to buffer the outputs in the last stage for to allow overlapping the GPU computation and CPU processing and avoid last PP rank staggler.
+
+        Unified Schedule:
+        ====================================================================
+        Stage P
+        recv ith req from previous stage
+        recv ith proxy from previous stage
+        run ith batch
+        recv prev (i+1)% mb_size th outputs
+        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
+        send ith req to next stage
+        send ith proxy to next stage
+        send current stage's outputs to next stage(can be stashed and delayed to send later)
+
+        the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
+
+        ====================================================================
+        """
+        self.init_pp_loop_state()
+        while True:
+            server_is_idle = True
+            for mb_id in range(self.pp_loop_size):
+                self.increment_scheduler_iterations()
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = self.last_mbs[mb_id]
+                next_first_rank_mb_id = (
+                    mb_id + get_parallel().pp_size
+                ) % self.pp_loop_size
+                next_mb_id = (mb_id + 1) % self.pp_loop_size
+                self._pp_mark_capacity_digest()
+                with torch.profiler.record_function("recv_requests"):
+                    recv_reqs = self._pp_ingest_requests()
+                self._pp_check_capacity_digest()
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+                    with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_send_capacity_digest()
+                with torch.profiler.record_function("get_next_batch_to_run"):
+                    batch = None
+                    if self.pause_state.may_launch():
+                        plan = self.get_next_batch_to_run(
+                            running_batch=self.running_batch,
+                            last_batch=self.last_batch,
+                        )
+                        self.running_batch = plan.running_batch
+                        batch = plan.batch_to_run
+                    self.mbs[mb_id] = batch
+                self.running_mbs[mb_id] = self.running_batch
+                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch_for_debug = cur_batch
+                if cur_batch:
+                    server_is_idle = False
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                next_pp_outputs = None
+                next_batch_result = None
+                d2h_event = None
+                exchange_outputs_before_forward = _pp_exchange_outputs_before_forward(
+                    cur_batch=cur_batch,
+                    spec_relay=self._pp_spec_relay,
+                    is_last_rank=self.pp_group.is_last_rank,
+                    async_batch_depth=get_parallel().pp_async_batch_depth,
+                )
+                if exchange_outputs_before_forward:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+                self._pp_commit_proxy_send_work()
+                if cur_batch:
+                    result, self.launch_event = self._pp_launch_batch(
+                        mb_id,
+                        cur_batch,
+                        pp_proxy_tensors,
+                        self.mb_metadata,
+                        self.last_rank_comm_queue,
+                    )
+                if not exchange_outputs_before_forward:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+                if self.mbs[next_mb_id] is not None:
+                    d2h_event.synchronize()
+                    process_target = self.mbs[next_mb_id]
+                    next_md = self.mb_metadata[next_mb_id]
+                    if next_md is not None and next_md.fwd_batch is not None:
+                        # PP+spec: process against the forward-time snapshot;
+                        # the live mb may have been recomposed since launch.
+                        process_target = next_md.fwd_batch
+                    with torch.profiler.record_function("process_batch_result"):
+                        self._pp_process_batch_result(
+                            process_target,
+                            next_batch_result,
+                        )
+                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                if not self.pp_group.is_last_rank:
+                    if cur_batch:
+                        self._pp_send_proxy_to_next_stage(result)
+
+                self.pp_outputs = next_pp_outputs
+                if cur_batch:
+                    self._pp_apply_war_barrier()
+
+                # `self.last_batch` is the one reloaded for this micro-batch, so
+                # pass the batch this iteration launched.
+                self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
+
+            # When the server is idle, self-check and re-init some states
+            if server_is_idle:
+                self._sched_idled = True
+                self.on_idle()
+
+    @DynamicGradMode()
+    def event_loop_pp_disagg_prefill(self: Scheduler):
+        """
+        This is the prefill server event loop for pipeline parallelism.
+
+        Notes:
+        1. Following the same rules as the event_loop_pp.
+        2. Adds extra steps for KV transfer process: bootstrap + release.
+
+        Prefill Server Schedule:
+        ====================================================================
+        Stage P
+        recv ith req from previous stage
+        pop bootstrapped reqs (PPConsensusStore + pp_sync polls)
+        recv ith transferred req from previous stage
+        recv ith proxy from previous stage
+        run ith batch
+        recv prev (i+1) % mb_size th release req from previous stage
+        local consensus on release req
+        recv prev (i+1) % mb_size th outputs
+        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
+        send ith req to next stage
+        send ith transferred req to next stage
+        send ith proxy to next stage
+        send current stage's outputs to next stage (can be stashed and delayed to send later)
+
+        the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
+        ====================================================================
+
+        Release Requests still use the two-pass PP consensus. Bootstrap uses
+        PPConsensusStore instead of the legacy two-round RID sync.
+
+        """
+        self.init_pp_loop_state()
+
+        # PD additional state initialization
+        tmbs = [None] * self.pp_loop_size
+        transferred_rids: Dict[str, bool] = {}
+        release_rids: Optional[Dict[str, bool]] = None
+        send_transfer_work = []
+        send_release_work = []
+
+        while True:
+            server_is_idle = True
+            for mb_id in range(self.pp_loop_size):
+                self.increment_scheduler_iterations()
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = self.last_mbs[mb_id]
+                next_first_rank_mb_id = (
+                    mb_id + get_parallel().pp_size
+                ) % self.pp_loop_size
+                next_mb_id = (mb_id + 1) % self.pp_loop_size
+
+                next_pp_outputs = None
+                next_release_rids = None
+                d2h_event = None
+                next_batch_result = None
+
+                self._pp_mark_capacity_digest()
+                recv_reqs = self._pp_ingest_requests()
+                self._pp_check_capacity_digest()
+
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+
+                self.process_bootstrapped_queue()
+
+                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                self._pp_commit_comm_work(send_transfer_work)
+                tmbs[mb_id] = transferred_rids
+
+                self.process_pending_chunked_abort()
+                self.process_prefill_chunk(
+                    last_batch=self.last_batch, running_batch=self.running_batch
+                )
+                self._process_hicache_events()
+                batch = None
+                if self.pause_state.may_launch():
+                    prefill_plan = self.get_new_batch_prefill(self.running_batch)
+                    batch = prefill_plan.batch_to_run
+                    self.running_batch = prefill_plan.running_batch
+                    batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                self.mbs[mb_id] = batch
+                self.running_mbs[mb_id] = self.running_batch
+
+                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch_for_debug = cur_batch
+                if cur_batch:
+                    server_is_idle = False
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+
+                if get_parallel().pp_async_batch_depth > 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+                self._pp_commit_proxy_send_work()
+                if cur_batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(cur_batch)
+                    result, self.launch_event = self._pp_launch_batch(
+                        mb_id,
+                        cur_batch,
+                        pp_proxy_tensors,
+                        self.mb_metadata,
+                        self.last_rank_comm_queue,
+                    )
+                if get_parallel().pp_async_batch_depth == 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+                send_release_work, release_rids = (
+                    self._pp_pd_send_consensus_release_ids(
+                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                    )
+                )
+
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                self._pp_commit_comm_work(send_release_work)
+                # post-process the coming microbatch
+                if self.mbs[next_mb_id] is not None:
+                    d2h_event.synchronize()
+                    self._pp_process_batch_result(
+                        self.mbs[next_mb_id],
+                        next_batch_result,
+                    )
+                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+
+                if tmbs[next_mb_id] is not None:
+                    self.process_disagg_prefill_transfer_queue(next_release_rids)
+                if not self.pp_group.is_last_rank:
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_send_capacity_digest()
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
+                    if cur_batch:
+                        self._pp_send_proxy_to_next_stage(result)
+
+                self.pp_outputs = next_pp_outputs
+                release_rids = next_release_rids
+                if cur_batch:
+                    self._pp_apply_war_barrier()
+
+                self.running_batch.batch_is_full = False
+
+                self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
+
+            # When the server is idle, self-check and re-init some states
+            if server_is_idle:
+                self._sched_idled = True
+                if len(self.disagg_prefill_transfer_queue) == 0:
+                    self.on_idle()
+
+    @DynamicGradMode()
+    def event_loop_pp_disagg_decode(self: Scheduler):
+        self.init_pp_loop_state()
+
+        # PD additional state initialization
+        rmbs = [None] * self.pp_loop_size
+        pmbs = [None] * self.pp_loop_size
+        tmbs = [None] * self.pp_loop_size
+        consensus_retract_rids: Optional[List[str]] = None
+        consensus_prealloc_rids: Optional[List[str]] = None
+        release_rids: Optional[Dict[str, bool]] = None  # consensus {rid: failed}
+        send_retract_work = []
+        send_prealloc_work = []
+        send_transfer_work = []
+        send_consensus_retract_work = []
+        send_consensus_prealloc_work = []
+        send_release_work = []
+
+        while True:
+            server_is_idle = True
+            for mb_id in range(self.pp_loop_size):
+                self.increment_scheduler_iterations()
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = self.last_mbs[mb_id]
+                next_first_rank_mb_id = (
+                    mb_id + get_parallel().pp_size
+                ) % self.pp_loop_size
+                next_mb_id = (mb_id + 1) % self.pp_loop_size
+
+                next_pp_outputs = None
+                next_consensus_retract_rids = None
+                next_consensus_prealloc_rids = None
+                next_release_rids = None
+                d2h_event = None
+                next_batch_result = None
+
+                self._pp_mark_capacity_digest()
+                recv_reqs = self._pp_ingest_requests()
+                self._pp_check_capacity_digest()
+
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+
+                # Paused: open no new queue consensus; every stage skips together.
+                may_launch = self.pause_state.may_launch()
+                retract_rids = prealloc_rids = transferred_rids = None
+                if may_launch:
+                    # reaching consensus through PP ranks
+                    retract_rids = self._pp_pd_get_retract_ids(mb_id)
+                    prealloc_rids = self._pp_pd_get_prealloc_ids()
+                    transferred_rids = self._pp_pd_get_decode_transferred_ids()
+                rmbs[mb_id] = retract_rids
+                self._pp_commit_comm_work(send_retract_work)
+                pmbs[mb_id] = prealloc_rids
+                self._pp_commit_comm_work(send_prealloc_work)
+                tmbs[mb_id] = transferred_rids
+                self._pp_commit_comm_work(send_transfer_work)
+
+                # get batch to run and proxy tensors if needed
+                batch = None
+                if may_launch:
+                    plan = self.get_next_disagg_decode_batch_to_run(
+                        running_batch=self.running_batch
+                    )
+                    self.running_batch = plan.running_batch
+                    batch = plan.batch_to_run
+                self.mbs[mb_id] = batch
+                self.running_mbs[mb_id] = self.running_batch
+
+                cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch_for_debug = cur_batch
+                self._flush_staging_scatters()
+                if cur_batch:
+                    server_is_idle = False
+                    pp_proxy_tensors = None
+                    if not cur_batch.forward_mode.is_prebuilt():
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+
+                # early send output if possible
+                if get_parallel().pp_async_batch_depth > 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+                self._pp_commit_proxy_send_work()
+
+                if cur_batch:
+                    result, self.launch_event = self._pp_launch_batch(
+                        mb_id,
+                        cur_batch,
+                        pp_proxy_tensors,
+                        self.mb_metadata,
+                        self.last_rank_comm_queue,
+                    )
+
+                if get_parallel().pp_async_batch_depth == 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
+
+                # reach consensus on last rank and send to PP=0
+                # otherwise, just pass along previous consensus
+                send_consensus_retract_work, consensus_retract_rids = (
+                    self._pp_pd_send_consensus_bootstrapped_ids(
+                        rmbs,
+                        next_first_rank_mb_id,
+                        consensus_retract_rids,
+                        retract_rids,
+                    )
+                )
+
+                send_consensus_prealloc_work, consensus_prealloc_rids = (
+                    self._pp_pd_send_consensus_bootstrapped_ids(
+                        pmbs,
+                        next_first_rank_mb_id,
+                        consensus_prealloc_rids,
+                        prealloc_rids,
+                    )
+                )
+
+                send_release_work, release_rids = (
+                    self._pp_pd_send_consensus_release_ids(
+                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                    )
+                )
+
+                if get_disagg().disaggregation_decode_enable_offload_kvcache:
+                    self.decode_offload_manager.check_offload_progress()
+
+                if rmbs[next_mb_id] is not None:
+                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_consensus_retract_rids = self.process_retract_queue(
+                        next_consensus_retract_rids
+                    )
+                self._pp_commit_comm_work(send_consensus_retract_work)
+
+                if pmbs[next_mb_id] is not None:
+                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_consensus_prealloc_rids = self.process_prealloc_queue(
+                        next_consensus_prealloc_rids
+                    )
+                self._pp_commit_comm_work(send_consensus_prealloc_work)
+
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_release_rids = self.process_decode_transfer_queue(
+                        next_release_rids
+                    )
+                self._pp_commit_comm_work(send_release_work)
+
+                # post-process the coming microbatch
+                if self.mbs[next_mb_id] is not None:
+                    if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
+                        d2h_event.synchronize()
+                        self._pp_process_batch_result(
+                            self.mbs[next_mb_id],
+                            next_batch_result,
+                        )
+                    else:
+                        # No result to process; it launched no forward.
+                        self._on_step_processed(self.mbs[next_mb_id], None)
+                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+
+                if not self.pp_group.is_last_rank:
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_send_capacity_digest()
+                    if may_launch:
+                        send_retract_work = self._pp_send_pyobj_to_next_stage(
+                            retract_rids, async_send=True
+                        )
+                        send_prealloc_work = self._pp_send_pyobj_to_next_stage(
+                            prealloc_rids, async_send=True
+                        )
+                        send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                            transferred_rids, async_send=True
+                        )
+                    else:
+                        send_retract_work = send_prealloc_work = []
+                        send_transfer_work = []
+                    if cur_batch and not cur_batch.forward_mode.is_prebuilt():
+                        self._pp_send_proxy_to_next_stage(result)
+
+                self.pp_outputs = next_pp_outputs
+                release_rids = next_release_rids
+                consensus_retract_rids = next_consensus_retract_rids
+                consensus_prealloc_rids = next_consensus_prealloc_rids
+                if cur_batch:
+                    self._pp_apply_war_barrier()
+
+                self.running_batch.batch_is_full = False
+
+                self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
+
+            # When the server is idle, self-check and re-init some states
+            queue_size = (
+                len(self.waiting_queue)
+                + len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+            )
+            if get_disagg().disaggregation_decode_enable_offload_kvcache:
+                queue_size += len(self.decode_offload_manager.ongoing_offload)
+
+            if server_is_idle:
+                self._sched_idled = True
+                if queue_size == 0:
+                    self.on_idle()
+
+    def _pp_ingest_requests(self: Scheduler) -> List:
+        """Hold a pause, and the inputs after it, until no micro-batch is
+        unprocessed."""
+        has_unprocessed_mb = any(mb is not None for mb in self.mbs)
+        return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+
+    def _pp_apply_war_barrier(self: Scheduler) -> None:
+        """Order later schedule-stream writes after the launched forward's reads.
+        Result processing may run first: its result is another micro-batch's, and
+        what it releases is only reused at the next schedule, behind this wait."""
+        self._apply_war_barrier()
+
+    def _pp_retract_microbatches(self: Scheduler) -> None:
+        """Retract the requests of every micro-batch, none of them in flight."""
+        self._retract_batches(list(zip(self.running_mbs, self.last_mbs)))
+        for mb_id in range(self.pp_loop_size):
+            self.last_mbs[mb_id] = None
+        self.last_batch = None
+        self.cur_batch_for_debug = None
+
+    def init_pp_loop_state(self: Scheduler):
+        self.pp_loop_size: int = (
+            get_parallel().pp_size + get_parallel().pp_async_batch_depth
+        )
+        self.mbs = [None] * self.pp_loop_size
+        self.last_mbs = [None] * self.pp_loop_size
+        self.running_mbs = [
+            ScheduleBatch(reqs=[], batch_is_full=False)
+            for _ in range(self.pp_loop_size)
+        ]
+        self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
+        self.pp_outputs: Optional[PPProxyTensors] = None
+        self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        self._pp_spec_relay = (
+            pp_spec_stable_rows_enabled()
+            and get_parallel().pp_size > 1
+            and not self.spec_algorithm.is_none()
+        )
+
+        self.send_req_work = []
+        self.send_proxy_work = []
+        self.send_output_work = []
+        self.send_proxy_requires_forward_fence = False
+        self.launch_event = None
+        self.pp_proxy_recv_event = None
+        self.pp_send_done_event = None
+        # With SGLANG_PP_COMM_OVERLAP, PP tensor sends/recvs run on a dedicated
+        # stream so async sends do not fence the next forward through the
+        # scheduler stream. Otherwise they stay on the current stream.
+        self.pp_comm_stream = None
+        self.pp_comm_stream_ctx = nullcontext()
+        if (
+            envs.SGLANG_PP_COMM_OVERLAP.get()
+            and torch.cuda.is_available()
+            and str(self.device).startswith("cuda")
+        ):
+            self.pp_comm_stream = allocate_distinct_stream(
+                self.device_module,
+                (self.schedule_stream, self.forward_stream, self.copy_stream),
+            )
+            self.pp_comm_stream_ctx = self.device_module.stream(self.pp_comm_stream)
+            logger.info(
+                "PP tensor communication overlap enabled on a dedicated CUDA stream"
+            )
+
+        self._pp_tensor_dict_inbox: Dict[
+            str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
+        ] = defaultdict(deque)
+        self._pp_capacity_send_work: List[P2PWork] = []
+        self._pp_init_stage_capacity()
+
+    def _pp_init_stage_capacity(self: Scheduler) -> None:
+        """Under unified memory, share the stages' geometry (sized after capture) so
+        each asks every capacity question of all stages; checks compare digests."""
+        allocator = self.token_to_kv_pool_allocator
+        if get_parallel().pp_size == 1 or not isinstance(allocator, ChainAllocator):
+            return
+        checks = resolve_level() >= InvariantCheckLevel.WARN
+        geometries = [None] * get_parallel().pp_size
+        torch.distributed.all_gather_object(
+            geometries, allocator.stage_geometry(), group=self.pp_group.cpu_group
+        )
+        allocator.install_stage_capacity(
+            get_parallel().pp_rank, geometries, checks=checks
+        )
+        if checks:
+            self._pp_checked_allocator = allocator
+        logger.info(
+            "Unified memory capacity asked of every pipeline stage, with stage "
+            "arenas of %s bytes",
+            [geometry.total_bytes for geometry in geometries],
+        )
+
+    def _pp_mark_capacity_digest(self: Scheduler) -> None:
+        """At the start of an iteration: the digest of every capacity decision
+        made so far, the same point on every stage."""
+        allocator = self._pp_checked_allocator
+        if allocator is not None:
+            self._pp_capacity_digest = allocator.stage_capacity.take_digest(
+                allocator.stage_counts()
+            )
+
+    def _pp_check_capacity_digest(self: Scheduler) -> None:
+        """Right after the iteration's requests arrive: the previous stage's
+        digest, sent right after them, must be this stage's."""
+        if self._pp_capacity_digest is None or self.pp_group.is_first_rank:
+            return
+        (received,) = self._pp_recv_pyobj_from_prev_stage()
+        expect_host(
+            STAGE_CAPACITY_AGREEMENT,
+            received == self._pp_capacity_digest,
+            msg=(
+                f"pipeline stage {get_parallel().pp_rank} made capacity "
+                "decisions, or holds units, unlike the previous stage's by "
+                f"iteration {self.forward_ct}"
+            ),
+        )
+
+    def _pp_send_capacity_digest(self: Scheduler) -> None:
+        """Right after the iteration's requests go to the next stage."""
+        if self._pp_capacity_digest is None:
+            return
+        self._pp_commit_comm_work(self._pp_capacity_send_work)
+        self._pp_capacity_send_work = self._pp_send_pyobj_to_next_stage(
+            [self._pp_capacity_digest], async_send=True
+        )
+
+    def process_bootstrapped_queue(self: Scheduler):
+        self.disagg_prefill_bootstrap_queue.move_bootstrapped(self.waiting_queue)
+
+    def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
+        """Return {rid: failed} for the transfers every stage so far has concluded.
+
+        Each stage sends the KV of its own layers, so the stages can conclude the
+        same request differently: a client abort that lands after the first stage
+        finished sending fails the later stages only. The outcome travels with the
+        consensus (failed on any stage = failed on every stage) so every stage
+        releases the request through the same path and keeps its prefix cache in
+        step with the others.
+        """
+        succeeded, failed = self.get_rids(
+            self.disagg_prefill_transfer_queue,
+            True,
+            [KVPoll.Success],
+            [KVPoll.Failed],
+        )
+        curr_transferred = dict.fromkeys(succeeded, False)
+        curr_transferred.update(dict.fromkeys(failed, True))
+        if self.pp_group.is_first_rank:
+            return curr_transferred
+        # Intersect with the previous stage's consensus; a failure anywhere wins.
+        prev_transferred = self._pp_recv_pyobj_from_prev_stage()
+        return {
+            rid: prev_transferred[rid] or rid_failed
+            for rid, rid_failed in curr_transferred.items()
+            if rid in prev_transferred
+        }
+
+    def _pp_pd_send_consensus_bootstrapped_ids(
+        self: Scheduler,
+        bmbs: List[List[str]],
+        next_first_rank_mb_id: int,
+        consensus_bootstrapped_rids: List[str],
+        bootstrapped_rids: List[str],
+    ):
+        # 3 (Release): send the release rids from last stage to the first stage
+        send_consensus_bootstrapped_work = []
+        if self.pp_group.is_last_rank:
+            if bmbs[next_first_rank_mb_id] is not None:
+                consensus_bootstrapped_rids = bootstrapped_rids
+                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                    consensus_bootstrapped_rids, async_send=True
+                )
+        # 4 (Release): send the release rids from non last rank to the next rank
+        else:
+            if consensus_bootstrapped_rids is not None:
+                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                    consensus_bootstrapped_rids, async_send=True
+                )
+        return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
+
+    def _pp_pd_send_consensus_release_ids(
+        self: Scheduler,
+        tmbs: List[List[str]],
+        next_first_rank_mb_id: int,
+        release_rids: List[str],
+        transferred_rids: List[str],
+    ):
+        send_release_work = []
+        if self.pp_group.is_last_rank:
+            if tmbs[next_first_rank_mb_id] is not None:
+                release_rids = transferred_rids
+                send_release_work = self._pp_send_pyobj_to_next_stage(
+                    release_rids, async_send=True
+                )
+        # 4 (Release): send the release rids from non last rank to the next rank
+        else:
+            if release_rids is not None:
+                send_release_work = self._pp_send_pyobj_to_next_stage(
+                    release_rids, async_send=True
+                )
+        return send_release_work, release_rids
+
+    def _pp_record_comm_event(self: Scheduler) -> Optional[torch.Event]:
+        """Mark the tail of the PP comm stream; None when not overlapping."""
+        if self.pp_comm_stream is None:
+            return None
+        event = self.device_module.Event()
+        event.record(self.pp_comm_stream)
+        return event
+
+    def _pp_commit_comm_work(
+        self: Scheduler,
+        work: List[P2PWork],
+        fence_next_forward: bool = False,
+    ) -> None:
+        with self.pp_comm_stream_ctx:
+            for p2p_work in work:
+                p2p_work.work.wait()
+        if fence_next_forward and work:
+            # CUDA Graph outputs are views of replay-owned static buffers. Do not
+            # replay the next forward until NCCL has stopped reading the previous
+            # proxy tensors. Eager prefill remains overlapped.
+            self.pp_send_done_event = self._pp_record_comm_event()
+        work.clear()
+
+    def _pp_commit_proxy_send_work(self: Scheduler) -> None:
+        self._pp_commit_comm_work(
+            self.send_proxy_work,
+            fence_next_forward=self.send_proxy_requires_forward_fence,
+        )
+        self.send_proxy_requires_forward_fence = False
+
+    def _pp_wait_forward_dependencies(self: Scheduler) -> None:
+        self.forward_stream.wait_stream(self.schedule_stream)
+        if self.pp_send_done_event is not None:
+            self.forward_stream.wait_event(self.pp_send_done_event)
+            self.pp_send_done_event = None
+        if self.pp_proxy_recv_event is not None:
+            self.forward_stream.wait_event(self.pp_proxy_recv_event)
+            self.pp_proxy_recv_event = None
+
+    def _pp_commit_send_output_work_and_preprocess_output_tensors(
+        self: Scheduler,
+        next_first_rank_mb_id: int,
+        next_mb_id: int,
+    ) -> Tuple[
+        Optional[PPProxyTensors],
+        Optional[GenerationBatchResult],
+        Optional[torch.Event],
+    ]:
+        self._pp_commit_comm_work(work=self.send_output_work)
+        (
+            next_pp_outputs,
+            next_batch_result,
+            d2h_event,
+            self.send_output_work,
+        ) = self._pp_send_recv_and_preprocess_output_tensors(
+            next_first_rank_mb_id,
+            next_mb_id,
+            self.mbs,
+            self.mb_metadata,
+            self.last_rank_comm_queue,
+            self.pp_outputs,
+        )
+        return next_pp_outputs, next_batch_result, d2h_event
+
+    def _pp_send_reqs_to_next_stage(self: Scheduler, recv_reqs: List) -> List[P2PWork]:
+        return self._pp_send_pyobj_to_next_stage(
+            strip_mm_features_for_pp_relay(recv_reqs), async_send=True
+        )
+
+    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+        p2p_work = []
+        if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
+            dp_offset = (
+                get_parallel().attn_dp_rank
+                * get_parallel().attn_cp_size
+                * get_parallel().attn_tp_size
+            )
+            p2p_work = point_to_point_pyobj(
+                data,
+                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                self.world_group.cpu_group,
+                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                ((get_parallel().pp_rank + 1) % get_parallel().pp_size)
+                * get_parallel().tp_size
+                + dp_offset,
+                async_send=async_send,
+            )
+        return p2p_work
+
+    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+        if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
+            dp_offset = (
+                get_parallel().attn_dp_rank
+                * get_parallel().attn_cp_size
+                * get_parallel().attn_tp_size
+            )
+            data = point_to_point_pyobj(
+                [],
+                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                self.world_group.cpu_group,
+                ((get_parallel().pp_rank - 1) % get_parallel().pp_size)
+                * get_parallel().tp_size
+                + dp_offset,
+                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+            )
+        else:
+            data = None
+
+        data = attn_cp_tp_broadcast_pyobj(data)
+        return data
+
+    def _pp_prepare_tensor_dict(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> Dict[str, torch.Tensor]:
+        tensor_dict = {
+            "next_token_ids": result.next_token_ids,
+        }
+
+        if self._pp_spec_relay and result.accept_lens is not None:
+            # PP+spec verify round: earlier stages need the accept results to
+            # mirror seq_lens/KV bookkeeping and the bonus token to root the
+            # next round's verify chain.
+            tensor_dict["spec_accept_lens"] = result.accept_lens
+            tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
+            tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
+            if result.accept_index is not None:
+                # Relayed recurrent commits also need chain accept indices.
+                tensor_dict["spec_accept_index"] = result.accept_index
+            if result.next_verify_chain is not None:
+                # Tail-drafted tree for the next verify round (root = bonus),
+                # with the topology its tokens were arranged by.
+                tensor_dict["spec_next_chain"] = result.next_verify_chain
+                tensor_dict["spec_next_parents"] = result.next_verify_parent_list
+                tensor_dict["spec_next_top_scores"] = (
+                    result.next_verify_top_scores_index
+                )
+
+        # Draft extend runs only on the last stage, but every rank needs its relayed
+        # output to fill PD auxiliary buffers.
+        draft_input = result.next_draft_input
+        if (
+            draft_input is not None
+            and not batch.spec_algorithm.is_dspark()
+            and draft_input.topk_p is not None
+        ):
+            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
+            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
+            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+            # Preserve the DSA IndexShare seed when rebuilding spec_info on each rank.
+            if draft_input.dsa_topk_indices is not None:
+                tensor_dict["draft_dsa_topk_indices"] = (
+                    draft_input.dsa_topk_indices.contiguous()
+                )
+
+        has_sampling_mask_output = (
+            result.logits_output is not None
+            and result.logits_output.sampling_mask_output is not None
+        )
+        if batch.return_logprob or has_sampling_mask_output:
+            logits_output_dict = get_logprob_dict_from_result(result)
+            tensor_dict = {
+                **tensor_dict,
+                **logits_output_dict,
+            }
+        auxiliary_output = (
+            result.logits_output.auxiliary_device_output
+            if result.logits_output is not None
+            else None
+        )
+        add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
+        return tensor_dict
+
+    def _pp_send_dict_to_next_stage(
+        self: Scheduler,
+        tensor_dict: Dict[str, torch.Tensor],
+        async_send: bool = True,
+        msg_type: str = "default",
+        ready_event: Optional[torch.Event] = None,
+    ):
+        # Warn once if using default untyped messages
+        if msg_type == "default":
+            logger.warning_once(
+                "PP send: using default untyped message. "
+                "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+            )
+        tensor_dict["__msg_type__"] = msg_type
+        p2p_work = []
+        with self.pp_comm_stream_ctx:
+            if ready_event is not None:
+                self.device_module.current_stream().wait_event(ready_event)
+            p2p_work.extend(
+                self.pp_group.send_tensor_dict(
+                    tensor_dict=tensor_dict,
+                    all_gather_group=(self.attn_tp_group),
+                    async_send=async_send,
+                )
+            )
+        return p2p_work
+
+    def _pp_send_proxy_to_next_stage(
+        self: Scheduler, result: GenerationBatchResult
+    ) -> None:
+        with torch.profiler.record_function("send_proxy_dict_to_next_stage"):
+            self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                result.pp_hidden_states_proxy_tensors.tensors,
+                async_send=True,
+                msg_type="proxy",
+                ready_event=self.launch_event,
+            )
+        self.send_proxy_requires_forward_fence = result.can_run_cuda_graph
+
+    def _pp_recv_typed_dict(
+        self: Scheduler,
+        expected_kind: str = "default",
+        all_gather_group: Optional = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
+        """Receive a typed tensor dict, demultiplexing by msg_type.
+
+        If a message of the wrong kind is received, it's stashed in the queue
+        and we continue receiving until we get the expected kind. The returned
+        event marks receive completion on the PP comm stream (None otherwise).
+        """
+        if expected_kind in self._pp_tensor_dict_inbox:
+            inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
+            if inbox_queue:
+                return inbox_queue.popleft()
+
+        while True:
+            with self.pp_comm_stream_ctx:
+                tensor_dict = self.pp_group.recv_tensor_dict(
+                    all_gather_group=all_gather_group
+                )
+                recv_event = self._pp_record_comm_event()
+            received_kind = tensor_dict.get("__msg_type__", "default")
+            if received_kind == expected_kind:
+                if received_kind == "default":
+                    logger.warning_once(
+                        f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
+                        "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+                    )
+                return tensor_dict, recv_event
+            else:
+                logger.debug(
+                    f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
+                )
+                self._pp_tensor_dict_inbox[received_kind].append(
+                    (tensor_dict, recv_event)
+                )
+
+    def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
+        pp_proxy_tensors = None
+        if not self.pp_group.is_first_rank:
+            tensor_dict, self.pp_proxy_recv_event = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(self.attn_tp_group),
+            )
+            pp_proxy_tensors = PPProxyTensors(tensor_dict)
+        return pp_proxy_tensors
+
+    def _pp_recv_dict_from_prev_stage(
+        self: Scheduler,
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
+        return self._pp_recv_typed_dict(
+            expected_kind="output",
+            all_gather_group=(self.attn_tp_group),
+        )
+
+    def _pp_make_skip_output_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        mb_metadata: Optional[PPBatchMetadata],
+    ):
+        bs = len(batch.reqs)
+        placeholder = torch.zeros(bs, dtype=torch.int64, device=self.device)
+        # next_pp_outputs = None so non-last ranks skip forwarding
+        # (pp_outputs is None gate). Placeholder carried in
+        # batch_result.next_token_ids for process_batch_result_prefill.
+        batch_result = GenerationBatchResult(
+            logits_output=None,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=placeholder,
+            can_run_cuda_graph=(
+                mb_metadata.can_run_cuda_graph if mb_metadata else False
+            ),
+            skipped_output_comm=True,
+            fpm_timing=mb_metadata.fpm_timing if mb_metadata else None,
+            forward_launch=mb_metadata.forward_launch if mb_metadata else None,
+            unified_forward_done=(
+                mb_metadata.unified_forward_done if mb_metadata else None
+            ),
+        )
+        d2h_event = self._pp_result_done_event(mb_metadata, side_stream=True)
+        return None, batch_result, d2h_event
+
+    def _pp_result_done_event(
+        self: Scheduler,
+        mb_metadata: Optional[PPBatchMetadata],
+        *,
+        side_stream: bool = False,
+    ) -> torch.Event:
+        """An event recorded after this rank's forward of the micro-batch, which
+        processing the result retires. ``side_stream`` keeps the current stream
+        from waiting on it."""
+        stream = self.device_module.current_stream()
+        forward_done = mb_metadata.forward_done if mb_metadata else None
+        if forward_done is not None:
+            if side_stream:
+                if self._pp_skip_output_stream is None:
+                    self._pp_skip_output_stream = self.device_module.Stream()
+                stream = self._pp_skip_output_stream
+            stream.wait_event(forward_done)
+        event = self.device_module.Event()
+        event.record(stream)
+        return event
+
+    def _pp_prep_batch_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        mb_metadata: PPBatchMetadata,
+        pp_outputs: PPProxyTensors,
+    ):
+        logits_output = None
+        extend_input_len_per_req = None
+        extend_logprob_start_len_per_req = None
+
+        if (
+            batch.return_logprob
+            or pp_outputs.tensors.get("sampling_mask_token_ids") is not None
+        ):
+            (
+                logits_output,
+                extend_input_len_per_req,
+                extend_logprob_start_len_per_req,
+            ) = get_logprob_from_pp_outputs(pp_outputs)
+        if self.pp_group.is_first_rank:
+            observer = self.tp_worker.model_runner.sampling_observer
+            auxiliary_output = pop_auxiliary_output_from_pp_tensors(
+                pp_outputs.tensors,
+                observer,
+            )
+            if auxiliary_output is not None:
+                if logits_output is None:
+                    logits_output = LogitsProcessorOutput(next_token_logits=None)
+                logits_output.auxiliary_device_output = auxiliary_output
+
+        if self._pp_spec_relay and "spec_accept_lens" in pp_outputs.tensors:
+            # PP+spec verify round. Relayed tensors align with the composition
+            # that ran the forward (mb_metadata.fwd_batch snapshot); the live
+            # mb object may have been merged/filtered in place since. Mirror
+            # the seq state per-rid onto the live batch, stash the bonus
+            # tokens that root the next verify chain, and rebuild a result the
+            # spec output processor can consume (CPU tensors).
+            fwd_batch = (
+                mb_metadata.fwd_batch if mb_metadata.fwd_batch is not None else batch
+            )
+            new_seq_lens = pp_outputs["spec_new_seq_lens"]
+            fwd_rids = [req.rid for req in fwd_batch.reqs]
+            live_rids = [req.rid for req in batch.reqs]
+            self._pp_spec_commit_relayed_accept(
+                batch,
+                fwd_batch,
+                fwd_rids,
+                live_rids,
+                mb_metadata.verify_out_cache_loc,
+                pp_outputs,
+            )
+            if live_rids == fwd_rids:
+                batch.seq_lens = new_seq_lens
+                if batch.seq_lens_cpu is not None:
+                    batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            else:
+                row_by_rid = {rid: i for i, rid in enumerate(fwd_rids)}
+                new_cpu = new_seq_lens.tolist()
+                cur_cpu = batch.seq_lens.tolist()
+                merged = [
+                    new_cpu[row_by_rid[rid]] if rid in row_by_rid else cur_cpu[j]
+                    for j, rid in enumerate(live_rids)
+                ]
+                batch.seq_lens = torch.tensor(
+                    merged, dtype=batch.seq_lens.dtype, device=batch.seq_lens.device
+                )
+                if batch.seq_lens_cpu is not None:
+                    batch.seq_lens_cpu = torch.tensor(
+                        merged, dtype=batch.seq_lens_cpu.dtype
+                    )
+                    batch.seq_lens_sum = int(sum(merged))
+            self._pp_spec_adopt_relayed_tree(batch, fwd_rids, pp_outputs)
+            output_result = GenerationBatchResult(
+                logits_output=logits_output,
+                pp_hidden_states_proxy_tensors=None,
+                next_token_ids=pp_outputs["next_token_ids"].cpu(),
+                accept_lens=pp_outputs["spec_accept_lens"].cpu(),
+                new_seq_lens=new_seq_lens,
+                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                extend_input_len_per_req=extend_input_len_per_req,
+                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+                fpm_timing=mb_metadata.fpm_timing,
+                forward_launch=mb_metadata.forward_launch,
+                unified_forward_done=mb_metadata.unified_forward_done,
+            )
+            return output_result
+
+        next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+
+        # Rebind the last stage's ring proposal as batch.spec_info so the PD result
+        # processor sees the same object on every rank.
+        next_draft_input = None
+        if "draft_topk_p" in pp_outputs.tensors:
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            next_draft_input = EagleDraftInput(
+                topk_p=pp_outputs["draft_topk_p"],
+                topk_index=pp_outputs["draft_topk_index"],
+                hidden_states=pp_outputs["draft_hidden_states"],
+                bonus_tokens=next_token_ids,
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+                dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
+            )
+            batch.spec_info = next_draft_input
+        elif batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
+
+        if self._pp_spec_relay:
+            # Gated single-instance PP+spec: the sampled first token roots
+            # round 1's tree. Only the chunk that finishes the prompt samples
+            # a real token; a middle chunk's next_token_ids is a placeholder
+            # no consumer reads, and storing it would seed the next verify
+            # round with a token the model never emitted. The decode rounds
+            # relay their own state, so the future_map stash is skipped.
+            if batch.contains_last_prefill_chunk:
+                from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+                fwd_batch = (
+                    mb_metadata.fwd_batch
+                    if mb_metadata.fwd_batch is not None
+                    else batch
+                )
+                self._pp_spec_set_relay(
+                    batch,
+                    PPSpecRelayInput.degenerate(
+                        rids=[req.rid for req in fwd_batch.reqs],
+                        bonus_tokens=next_token_ids,
+                        num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                    ),
+                )
+        else:
+            # PP rank 0 also relays into output_tokens_buf so the next iter's
+            # resolve_forward_inputs finds these tokens for the decode portion
+            # of mixed-chunk batches (which gather via mix_running_indices).
+            self.future_map.stash(
+                batch.req_pool_indices,
+                RelayPayload(
+                    bonus_tokens=next_token_ids,
+                    topk_p=(
+                        None if next_draft_input is None else next_draft_input.topk_p
+                    ),
+                    topk_index=(
+                        None
+                        if next_draft_input is None
+                        else next_draft_input.topk_index
+                    ),
+                    hidden_states=(
+                        None
+                        if next_draft_input is None
+                        else next_draft_input.hidden_states
+                    ),
+                ),
+            )
+        batch.input_ids = None
+        output_result = GenerationBatchResult(
+            logits_output=logits_output,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=pp_outputs["next_token_ids"],
+            next_draft_input=next_draft_input,
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            fpm_timing=mb_metadata.fpm_timing,
+            forward_launch=mb_metadata.forward_launch,
+            unified_forward_done=mb_metadata.unified_forward_done,
+        )
+        output_result.copy_auxiliary_output_to_cpu()
+        return output_result
+
+    def _pp_process_batch_result(
+        self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
+    ):
+        self.process_batch_result(batch, output_result)
+
+    def _pp_spec_commit_relayed_accept(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        fwd_batch: ScheduleBatch,
+        fwd_rids: List[str],
+        live_rids: List[str],
+        verify_out_cache_loc: Optional[torch.Tensor],
+        pp_outputs,
+    ) -> None:
+        """Commit relayed recurrent state, then compact tree KV when present.
+
+        Must run before the live batch advances ``seq_lens``.
+        """
+        accept_index = pp_outputs.tensors.get("spec_accept_index")
+        if accept_index is None or fwd_batch.forward_mode.is_idle():
+            return
+        from sglang.srt.speculative.spec_utils import (
+            commit_mamba_states_after_verify,
+            move_accept_tokens_to_target_kvcache,
+            relayed_commit_state_slots,
+        )
+
+        # Preserve the forward batch's row order after live-batch recomposition.
+        device = (
+            verify_out_cache_loc.device
+            if verify_out_cache_loc is not None
+            else batch.seq_lens.device
+        )
+        if fwd_batch.seq_lens_cpu is not None:
+            seq_lens = fwd_batch.seq_lens_cpu.to(device=device, dtype=torch.int64)
+        elif live_rids == fwd_rids:
+            seq_lens = batch.seq_lens
+        else:
+            raise RuntimeError(
+                "PP-spec delayed relay cannot commit a recomposed micro-batch "
+                "without its forward-time seq_lens_cpu snapshot"
+            )
+        fwd_batch.seq_lens = seq_lens
+        # copy() drops tree_cache, which the tracking-grid commit needs.
+        fwd_batch.tree_cache = batch.tree_cache
+        accept_index = accept_index.to(device)
+        accept_lens = pp_outputs["spec_accept_lens"].to(device)
+
+        # The last stage already commits inside run_eagle_verify.
+        if not self.pp_group.is_last_rank:
+            commit_mamba_states_after_verify(
+                self.tp_worker,
+                fwd_batch,
+                accept_lens,
+                accept_index,
+                get_spec().speculative_num_draft_tokens,
+                state_slots=relayed_commit_state_slots(self.tp_worker, fwd_batch),
+            )
+
+        if verify_out_cache_loc is None:
+            return
+        fwd_batch.out_cache_loc = verify_out_cache_loc
+
+        if get_spec().speculative_eagle_topk > 1:
+            move_accept_tokens_to_target_kvcache(
+                fwd_batch,
+                accept_index,
+                accept_lens - 1,
+                self.token_to_kv_pool_allocator,
+            )
+
+    def _pp_spec_adopt_relayed_tree(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        fwd_rids: List[str],
+        pp_outputs: PPProxyTensors,
+    ) -> None:
+        """Fold the tree the last stage drafted into the live batch.
+
+        The relayed rows are labelled with the composition that ran the
+        forward; the live microbatch may have been recomposed since, so they
+        are folded in by rid rather than by position."""
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+        num_draft_tokens = get_spec().speculative_num_draft_tokens
+        chain = pp_outputs.tensors.get("spec_next_chain")
+        if chain is None:
+            # The last stage verified but skipped drafting (num_steps == 0
+            # keeps draft KV warm without proposing). The bonus token it
+            # sampled must still become the next round's root: keeping the
+            # old row would re-verify a token that was already accepted.
+            relayed = PPSpecRelayInput.degenerate(
+                rids=fwd_rids,
+                bonus_tokens=pp_outputs["spec_bonus_tokens"],
+                num_draft_tokens=num_draft_tokens,
+            )
+        else:
+            relayed = PPSpecRelayInput(
+                rids=fwd_rids,
+                tokens=chain.to(torch.int64).reshape(len(fwd_rids), num_draft_tokens),
+                parents=pp_outputs.tensors.get("spec_next_parents"),
+                top_scores=pp_outputs.tensors.get("spec_next_top_scores"),
+            )
+        self._pp_spec_set_relay(batch, relayed)
+
+    def _pp_spec_set_relay(self: Scheduler, batch: ScheduleBatch, relayed) -> None:
+        """Attach rows labelled with the forward-time composition to the live
+        batch: fold them into what the requests already carry, or relabel them
+        into the live order when the batch carries nothing yet."""
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+        if isinstance(batch.spec_info, PPSpecRelayInput):
+            batch.spec_info.adopt(relayed)
+            return
+        live_rids = [req.rid for req in batch.reqs]
+        batch.spec_info = (
+            relayed if live_rids == relayed.rids else relayed.reindex(live_rids)
+        )
+
+    def _pp_spec_chain_topology(
+        self: Scheduler, bs: int, device: str
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build valid fallback topology using the tree kernel's row strides.
+
+        A not-yet-drafted row still uses the configured topk and token count.
+        Consecutive selected indices and earlier parents give an acyclic tree;
+        topk=1 reduces to a chain. Single-step drafts need no parent entries.
+        """
+        spec = get_spec()
+        num_steps = spec.speculative_num_steps
+        parent_width = (
+            spec.speculative_eagle_topk * (num_steps - 1) + 1 if num_steps > 1 else 0
+        )
+        parent_list = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=device
+        ).repeat(bs, 1)
+        top_scores_index = torch.arange(
+            spec.speculative_num_draft_tokens - 1, dtype=torch.long, device=device
+        ).repeat(bs, 1)
+        return parent_list, top_scores_index
+
+    def _pp_spec_rebuild_verify_input(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Rebuild batch.spec_info (EagleVerifyInput) from relayed per-request
+        state, without a draft model.
+
+        Runs on every stage, including the last one, so all stages verify the
+        exact same tree. The tokens and the topology both come from the last
+        stage's tail draft; a request that has not been drafted for yet (its
+        first decode after prefill) carries a degenerate row -- bonus token
+        plus zero drafts over a chain topology -- whose drafts simply get
+        rejected, costing acceptance rate, not correctness."""
+        from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+        from sglang.srt.speculative.eagle_utils import (
+            build_tree_kernel_efficient,
+            default_tree_mask_mode,
+        )
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+        spec = get_spec()
+        steps = spec.speculative_num_steps
+        num_draft_tokens = spec.speculative_num_draft_tokens
+        bs = batch.batch_size()
+        device = self.device
+
+        if batch.forward_mode.is_idle() or bs == 0:
+            batch.spec_info = EagleVerifyInput.create_idle_input(
+                topk=spec.speculative_eagle_topk,
+                spec_steps=steps,
+                num_verify_tokens=num_draft_tokens,
+                device=device,
+            )
+            return
+
+        relay: PPSpecRelayInput = batch.spec_info
+        # The rows track the batch through filter / merge, but a recomposition
+        # that bypasses those hooks would leave them labelled for a different
+        # order, and the rebuild reads them positionally. Relabel rather than
+        # hand the verify kernel another request's bonus token.
+        live_rids = [req.rid for req in batch.reqs]
+        if relay.rids != live_rids:
+            relay = relay.reindex(live_rids)
+            batch.spec_info = relay
+        tree_rows = relay.tokens.to(device=device, dtype=torch.int64)
+        bonus_tokens = tree_rows[:, 0].contiguous()
+        draft_tokens = tree_rows[:, 1:].contiguous()
+        # Topology as drafted on the last stage. It is data-dependent once
+        # topk > 1, so it rides the relay rather than being re-derived here;
+        # requests that have not been drafted for yet fall back to the chain
+        # constants, and their zero drafts get rejected either way.
+        parent_list, top_scores_index = relay.topology(
+            fallback=lambda: self._pp_spec_chain_topology(bs, device)
+        )
+        parent_list = parent_list.to(device=device, dtype=torch.long)
+        top_scores_index = top_scores_index.to(device=device, dtype=torch.long)
+
+        # Mask selection mirrors the last stage's draft() tail
+        # (build_eagle_verify_input) so every stage builds the same mask.
+        verify_mask = self.tp_worker.model_runner.attn_backend.verify_mask
+        if verify_mask is None:
+            tree_mask_buf, mask_mode, fill_mask = None, default_tree_mask_mode(), True
+        else:
+            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
+
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+                seq_lens_sum = 0  # preallocated / bs-sized -> kernel ignores it
+            else:
+                # Conservative upper bound; backend-agnostic (not every
+                # attention backend exposes max_context_len).
+                seq_lens_sum = bs * self.tp_worker.model_runner.model_config.context_len
+
+        (
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            flat_draft_tokens,
+        ) = build_tree_kernel_efficient(
+            bonus_tokens,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            seq_lens_sum,
+            spec.speculative_eagle_topk,
+            steps,
+            num_draft_tokens,
+            mask_mode,
+            tree_mask_buf,
+            fill_prefix_mask=fill_mask,
+        )
+        batch.spec_info = EagleVerifyInput(
+            draft_token=flat_draft_tokens,
+            custom_mask=tree_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=steps,
+            topk=spec.speculative_eagle_topk,
+            draft_token_num=num_draft_tokens,
+            capture_hidden_mode=None,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
+        )
+
+    def _pp_send_output_to_next_stage(
+        self: Scheduler,
+        next_first_rank_mb_id: int,
+        mbs: List[ScheduleBatch],
+        last_rank_comm_queue: deque,
+        pp_outputs: PPProxyTensors | None,
+    ) -> List[P2PWork]:
+        send_output_work = []
+        if self.pp_group.is_last_rank:
+            # send ready PP output to rank 0
+            target = mbs[next_first_rank_mb_id]
+            if target is not None:
+                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                if (
+                    not target.forward_mode.is_prebuilt()
+                    and not _pp_can_skip_output_comm(target)
+                ):
+                    with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                        send_output_work = self._pp_send_dict_to_next_stage(
+                            pp_outputs_to_send.tensors,
+                            async_send=True,
+                            msg_type="output",
+                            ready_event=q_event,
+                        )
+        # send the outputs from the last round to let the next stage worker run post processing
+        if not self.pp_group.is_last_rank:
+            if pp_outputs:
+                with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                    send_output_work = self._pp_send_dict_to_next_stage(
+                        pp_outputs.tensors,
+                        async_send=True,
+                        msg_type="output",
+                    )
+        return send_output_work
+
+    def _pp_send_recv_and_preprocess_output_tensors(
+        self: Scheduler,
+        next_first_rank_mb_id: int,
+        next_mb_id: int,
+        mbs: List[ScheduleBatch],
+        mb_metadata: List[PPBatchMetadata],
+        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
+        pp_outputs: PPProxyTensors | None,
+    ) -> Tuple[
+        Optional[PPProxyTensors],
+        Optional[GenerationBatchResult],
+        Optional[torch.Event],
+        List[P2PWork],
+    ]:
+        next_pp_outputs = None
+        d2h_event = None
+        batch_result = None
+        send_output_work = []
+
+        # On NPU (HCCL), isend/irecv may block until a matching peer op is
+        # posted, so the parity-based send-first/recv-first ordering used
+        # for NPU is replaced by batch_isend_irecv which submits all
+        # send/recv operations atomically.
+        if _is_npu and get_parallel().pp_size == 2:
+            return self._pp2_only_send_recv_output_tensors_npu(
+                next_first_rank_mb_id,
+                next_mb_id,
+                mbs,
+                mb_metadata,
+                last_rank_comm_queue,
+                pp_outputs,
+            )
+
+        # Order send/recv by pp_rank parity (even: send->recv, odd: recv->send)
+        # on every backend. A device send only completes on its own while the
+        # peer's per-connection NCCL buffer has free slots (~8 ops over NVLink,
+        # ~2 over NET/IB, i.e. any cross-node PP); beyond that it waits for the
+        # peer's matching recv, and P2P ops are serialized on one stream per
+        # peer pair. With two microbatches in flight, if every rank sends first
+        # each rank's output sends queue ahead of the recv its peer's sends
+        # need, and the ring deadlocks. Parity gives each adjacent pair one
+        # rank that posts its recv first, which breaks the cycle for any
+        # pp_size > 1 (an odd ring still has at least one recv-first rank).
+        send_first = (get_parallel().pp_rank % 2) == 0
+
+        def _do_send():
+            return self._pp_send_output_to_next_stage(
+                next_first_rank_mb_id,
+                mbs,
+                last_rank_comm_queue,
+                pp_outputs,
+            )
+
+        def _do_recv():
+            nonlocal next_pp_outputs, batch_result, d2h_event
+            target = mbs[next_mb_id]
+            if target is None or target.forward_mode.is_prebuilt():
+                return
+            if _pp_can_skip_output_comm(target):
+                next_pp_outputs, batch_result, d2h_event = (
+                    self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
+                )
+                return
+            with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                # An early recv spins on an SM and can stall or hang kernels that need every SM
+                # (e.g. flashinfer MLA); set SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD=1 then.
+                if (
+                    envs.SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD.get()
+                    and get_parallel().pp_async_batch_depth == 0
+                    and self.pp_group.is_first_rank
+                    and not self._pp_spec_relay
+                    and self.launch_event is not None
+                ):
+                    with self.pp_comm_stream_ctx:
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
+                tensor_dict, output_recv_event = self._pp_recv_dict_from_prev_stage()
+                next_pp_outputs = PPProxyTensors(tensor_dict)
+            with self.copy_stream_ctx:
+                self.copy_stream.wait_stream(self.schedule_stream)
+                if output_recv_event is not None:
+                    self.copy_stream.wait_event(output_recv_event)
+                batch_result = self._pp_prep_batch_result(
+                    target, mb_metadata[next_mb_id], next_pp_outputs
+                )
+                d2h_event = self._pp_result_done_event(mb_metadata[next_mb_id])
+                if (
+                    batch_result.logits_output is not None
+                    and batch_result.logits_output.sampling_mask_output is not None
+                ):
+                    # `copy_to_cpu` records it again behind its copies.
+                    batch_result.copy_done = d2h_event
+                    batch_result.copy_to_cpu(
+                        return_logprob=target.return_logprob,
+                        return_hidden_states=False,
+                    )
+
+        if send_first:
+            send_output_work = _do_send()
+            _do_recv()
+        else:
+            _do_recv()
+            send_output_work = _do_send()
+
+        return next_pp_outputs, batch_result, d2h_event, send_output_work
+
+    def _pp2_only_send_recv_output_tensors_npu(
+        self: Scheduler,
+        next_first_rank_mb_id: int,
+        next_mb_id: int,
+        mbs: List[ScheduleBatch],
+        mb_metadata: List[PPBatchMetadata],
+        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
+        pp_outputs: PPProxyTensors | None,
+    ) -> Tuple[
+        Optional[PPProxyTensors],
+        Optional[GenerationBatchResult],
+        Optional[torch.Event],
+        List[P2PWork],
+    ]:
+        """NPU-specific output tensor send/recv using batch_isend_irecv.
+
+        Pairs the send of output tensors to the next stage with the recv
+        of output tensors from the previous stage in a single
+        ``batch_isend_irecv`` call, avoiding the deadlock that can occur
+        on HCCL when separate isend/irecv calls block waiting for each
+        other.
+        """
+        next_pp_outputs = None
+        d2h_event = None
+        batch_result = None
+        send_output_work = []
+
+        all_gather_group = self.attn_tp_group
+
+        # ---- Prepare send dict ----
+        # On NPU, always send something (full output or a lightweight skip
+        # marker) so the peer's recv in batch_isend_irecv always has a
+        # matching send.  Without this, SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM
+        # would cause asymmetric skip decisions between adjacent ranks
+        # (send target and recv target are different micro-batches), leading
+        # to deadlock or forcing the user to disable the optimisation
+        # entirely (≈10 % throughput loss).
+        send_dict: Optional[Dict[str, torch.Tensor]] = None
+        if self.pp_group.is_last_rank:
+            target_send = mbs[next_first_rank_mb_id]
+            if target_send is not None:
+                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                if not target_send.forward_mode.is_prebuilt():
+                    if _pp_can_skip_output_comm(target_send):
+                        send_dict = {"__msg_type__": "output", "__skip__": True}
+                    else:
+                        self.device_module.current_stream().wait_event(q_event)
+                        send_dict = dict(pp_outputs_to_send.tensors)
+                        send_dict["__msg_type__"] = "output"
+        elif pp_outputs:
+            if pp_outputs.tensors.get("__skip__"):
+                send_dict = {"__msg_type__": "output", "__skip__": True}
+            else:
+                send_dict = dict(pp_outputs.tensors)
+                send_dict["__msg_type__"] = "output"
+
+        # ---- Determine recv conditions ----
+        # NOTE: skip_recv is NOT computed here.  The skip decision is made
+        # by the sender (last rank) and communicated via the __skip__
+        # marker.  The receiver always participates in the
+        # batch_isend_irecv and inspects the marker after recv.
+        target_recv = mbs[next_mb_id]
+        should_recv = (
+            target_recv is not None and not target_recv.forward_mode.is_prebuilt()
+        )
+
+        def _handle_recv_dict(recv_dict):
+            nonlocal next_pp_outputs, batch_result, d2h_event
+            if recv_dict.get("__skip__"):
+                # _pp_make_skip_output_result returns next_pp_outputs=None
+                # (correct for the non-NPU path where the skip propagates
+                # via pp_outputs=None).  On NPU we must propagate the skip
+                # marker through the ring, so override it here.
+                _, batch_result, d2h_event = self._pp_make_skip_output_result(
+                    target_recv, mb_metadata[next_mb_id]
+                )
+                next_pp_outputs = PPProxyTensors(recv_dict)
+            else:
+                next_pp_outputs = PPProxyTensors(recv_dict)
+                with self.copy_stream_ctx:
+                    self.copy_stream.wait_stream(self.schedule_stream)
+                    batch_result = self._pp_prep_batch_result(
+                        target_recv, mb_metadata[next_mb_id], next_pp_outputs
+                    )
+                    d2h_event = self._pp_result_done_event(mb_metadata[next_mb_id])
+
+        # ---- Execute communication ----
+        if send_dict is not None and should_recv:
+            # Paired send + recv via batch_isend_irecv
+            with torch.profiler.record_function("send_recv_res_dict"):
+                recv_dict = self.pp_group.send_recv_tensor_dict(
+                    send_tensor_dict=send_dict,
+                    send_all_gather_group=all_gather_group,
+                    recv_all_gather_group=all_gather_group,
+                )
+            _handle_recv_dict(recv_dict)
+        elif send_dict is not None:
+            # Send only (recv not needed — target is None or prebuilt)
+            send_output_work = self._pp_send_dict_to_next_stage(
+                send_dict, async_send=True, msg_type="output"
+            )
+        elif should_recv:
+            # Recv only (no send needed)
+            with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                recv_dict, _ = self._pp_recv_dict_from_prev_stage()
+            _handle_recv_dict(recv_dict)
+
+        return next_pp_outputs, batch_result, d2h_event, send_output_work
+
+    def _pp_launch_batch(
+        self: Scheduler,
+        mb_id: int,
+        cur_batch: ScheduleBatch,
+        pp_proxy_tensors: PPProxyTensors,
+        mb_metadata: List[Optional[PPBatchMetadata]],
+        last_rank_comm_queue: deque,
+    ):
+        with torch.profiler.record_function("run_batch"):
+            with self.forward_stream_ctx:
+                self._pp_wait_forward_dependencies()
+                set_time_batch(
+                    cur_batch.reqs,
+                    "set_run_batch_cpu_start_time",
+                    trace_only=True,
+                )
+                if pp_proxy_tensors is not None:
+                    # Prevent allocator reuse of received tensors while the forward
+                    # stream is still consuming them.
+                    for tensor in pp_proxy_tensors.tensors.values():
+                        if isinstance(tensor, torch.Tensor) and not tensor.is_cpu:
+                            tensor.record_stream(self.forward_stream)
+                result = self.run_batch(cur_batch, pp_proxy_tensors)
+                set_time_batch(
+                    cur_batch.reqs,
+                    "set_run_batch_cpu_end_time",
+                    trace_only=True,
+                    attrs={"pp_mb_id": mb_id},
+                )
+                event = self.device_module.Event()
+                event.record(self.device_module.current_stream())
+                mb_metadata[mb_id] = PPBatchMetadata(
+                    can_run_cuda_graph=result.can_run_cuda_graph,
+                    fwd_batch=_pp_snapshot_forward_batch(cur_batch),
+                    verify_out_cache_loc=result.spec_verify_out_cache_loc,
+                    fpm_timing=result.fpm_timing,
+                    forward_launch=result.forward_launch,
+                    unified_forward_done=result.unified_forward_done,
+                    forward_done=event,
+                )
+                if self.pp_group.is_last_rank:
+                    # (last rank) buffer the outputs for async batch depth
+                    last_rank_comm_queue.append(
+                        (
+                            event,
+                            PPProxyTensors(
+                                self._pp_prepare_tensor_dict(result, cur_batch)
+                            ),
+                        )
+                    )
+        return result, event
+
+    def get_rids(
+        self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group
+    ):
+        """
+        Used by PP, get the required rids with the given poll statuses.
+        """
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        rids: List = []
+        for poll_statuses in poll_statuses_group:
+            rids.append(
+                [
+                    req.rid if is_send else req.req.rid
+                    for req, poll in zip(req_queue, polls)
+                    if poll in poll_statuses
+                ]
+            )
+        return tuple(rids) if len(rids) > 1 else rids[0]
+
+    def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int):
+        # communicate pre-consensus retracted reqs
+        for req in self.disagg_decode_prealloc_queue.retracted_queue:
+            # assign retracted reqs to the current microbatch
+            if req.retraction_mb_id is None:
+                req.retraction_mb_id = mb_id
+        curr_retract_rids = [
+            req.rid
+            for req in self.disagg_decode_prealloc_queue.retracted_queue
+            if req.retraction_mb_id == mb_id
+        ]
+        if self.pp_group.is_first_rank:
+            # First rank, get all retracted req ids for the microbatch
+            return curr_retract_rids
+        else:
+            # Other ranks, receive the retracted reqs info from the previous rank and ensure the consensus
+            prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
+            return list(set(prev_retract_rids) & set(curr_retract_rids))
+
+    def _pp_pd_get_prealloc_ids(self: Scheduler):
+        # communicate pre-consensus prealloc reqs
+        if self.pp_group.is_first_rank:
+            # First rank, pop the preallocated reqs from the prealloc queue
+            good_prealloc_rids, bad_prealloc_rids = self.get_rids(
+                list(self.disagg_decode_prealloc_queue.queue.items()),
+                False,
+                [KVPoll.WaitingForInput],
+                [KVPoll.Failed],
+            )
+        else:
+            # Other ranks, receive the preallocated reqs info from the previous rank and ensure the consensus
+            prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_good_prealloc_rids, prev_bad_prealloc_rids = prev_prealloc_rids
+            curr_good_prealloc_rids, curr_bad_prealloc_rids = self.get_rids(
+                list(self.disagg_decode_prealloc_queue.queue.items()),
+                False,
+                [KVPoll.WaitingForInput],
+                [KVPoll.Failed],
+            )
+            good_prealloc_rids = list(
+                set(prev_good_prealloc_rids) & set(curr_good_prealloc_rids)
+            )
+            bad_prealloc_rids = list(
+                set(prev_bad_prealloc_rids) | set(curr_bad_prealloc_rids)
+            )
+        # Same abort routing as the prefill bootstrap consensus above.
+        aborted_rids = {
+            req.rid
+            for req in self.disagg_decode_prealloc_queue.queue
+            if isinstance(req.finished_reason, FINISH_ABORT)
+        }
+        good_prealloc_rids, bad_prealloc_rids = self._route_aborts_to_bad(
+            good_prealloc_rids, bad_prealloc_rids, aborted_rids
+        )
+        return [good_prealloc_rids, bad_prealloc_rids]
+
+    @staticmethod
+    def _route_aborts_to_bad(good_rids, bad_rids, aborted_rids):
+        """Move aborted rids out of the good (intersection) set and into the
+        bad (union) set, so PP consensus fails them uniformly on every rank.
+
+        This also flushes aborted reqs that never reached good/bad consensus
+        (e.g. stuck in Bootstrapping with a sender that has no working abort()).
+        """
+        if not aborted_rids:
+            return good_rids, bad_rids
+        good_rids = [rid for rid in good_rids if rid not in aborted_rids]
+        bad_rids = list(set(bad_rids) | set(aborted_rids))
+        return good_rids, bad_rids
+
+    def _pp_pd_get_decode_transferred_ids(self: Scheduler) -> Dict[str, bool]:
+        """Return {rid: failed} for the transfers every stage so far has concluded.
+
+        Each stage receives the KV of its own layers, so the stages can conclude
+        the same request differently: a prefill abort that lands after the first
+        prefill stage finished sending fails only the later decode stages. The
+        outcome travels with the consensus (failed on any stage = failed on every
+        stage) so every stage retires the request through the same path and the
+        waiting queues stay in step with the others.
+        """
+        succeeded, failed = self.get_rids(
+            list(self.disagg_decode_transfer_queue.queue.items()),
+            False,
+            [KVPoll.Success],
+            [KVPoll.Failed],
+        )
+        curr_transferred = dict.fromkeys(succeeded, False)
+        curr_transferred.update(dict.fromkeys(failed, True))
+        if self.pp_group.is_first_rank:
+            return curr_transferred
+        # Intersect with the previous stage's consensus; a failure anywhere wins.
+        prev_transferred = self._pp_recv_pyobj_from_prev_stage()
+        return {
+            rid: prev_transferred[rid] or rid_failed
+            for rid, rid_failed in curr_transferred.items()
+            if rid in prev_transferred
+        }
+
+    def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
+        if retract_rids is not None:
+            # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+            resumed_reqs = self.disagg_decode_prealloc_queue.move_resumed(
+                self.waiting_queue, retract_rids
+            )
+            return [req.rid for req in resumed_reqs]
+        return None
+
+    def process_prealloc_queue(self: Scheduler, prealloc_rids: Optional[List[str]]):
+        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+            # if there are still retracted requests, we do not allocate new requests
+            return [[], []]
+
+        if prealloc_rids is not None:
+            (
+                good_consensus_prealloc_rids,
+                bad_consensus_prealloc_rids,
+            ) = prealloc_rids
+            good_reqs, failed_reqs = (
+                self.disagg_decode_prealloc_queue.move_preallocated(
+                    self.disagg_decode_transfer_queue.queue,
+                    pp_good_rids=good_consensus_prealloc_rids,
+                    pp_bad_rids=bad_consensus_prealloc_rids,
+                )
+            )
+            return [
+                [req.req.rid for req in good_reqs],
+                [req.req.rid for req in failed_reqs],
+            ]
+        return None
+
+    def process_decode_transfer_queue(
+        self: Scheduler, release_rids: Optional[Dict[str, bool]]
+    ) -> Optional[Dict[str, bool]]:
+        """Retire the consensus transfers and return {rid: failed} for the ones
+        this stage concluded; the next stage retires exactly those, failed ones
+        through the failure path whatever its own receiver reports."""
+        # Resolve held deferred releases every call, independent of release_rids,
+        # so ack/timeout-driven releases still fire when no rids are being polled.
+        self.disagg_decode_transfer_queue.resolve_deferred_releases()
+        if release_rids is not None:
+            released_reqs, outcomes = (
+                self.disagg_decode_transfer_queue.move_transferred_with_outcomes(
+                    self.waiting_queue, release_rids
+                )
+            )
+            if self.enable_hisparse:
+                for req in released_reqs:
+                    self.hisparse_coordinator.admit_request_direct(req)
+            return outcomes
+        return None

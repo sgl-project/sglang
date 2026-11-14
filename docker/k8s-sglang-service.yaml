@@ -1,0 +1,117 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llama-31-8b-sglang
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 30Gi
+  storageClassName: default # change this to your preferred storage class
+  volumeMode: Filesystem
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meta-llama-31-8b-instruct-sglang
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: meta-llama-31-8b-instruct-sglang
+  template:
+    metadata:
+      labels:
+        app: meta-llama-31-8b-instruct-sglang
+        model: meta-llama-31-8b-instruct
+        engine: sglang
+    spec:
+      restartPolicy: Always
+      runtimeClassName: nvidia
+      containers:
+        - name: meta-llama-31-8b-instruct-sglang
+          image: docker.io/lmsysorg/sglang:latest
+          imagePullPolicy: Always # IfNotPresent or Never
+          ports:
+            - containerPort: 30000
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            [
+              "--model-path",
+              "meta-llama/Llama-3.1-8B-Instruct",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "30000",
+            ]
+          env:
+            - name: HF_TOKEN
+              value: <secret>
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              cpu: 8
+              memory: 40Gi
+            requests:
+              cpu: 2
+              memory: 16Gi
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+            - name: localtime
+              mountPath: /etc/localtime
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 30000
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health_generate
+              port: 30000
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 10Gi
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: llama-31-8b-sglang
+        - name: localtime
+          hostPath:
+            path: /etc/localtime
+            type: File
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meta-llama-31-8b-instruct-sglang
+spec:
+  selector:
+    app: meta-llama-31-8b-instruct-sglang
+  ports:
+    - protocol: TCP
+      port: 80 # port on host
+      targetPort: 30000 # port in container
+  type: LoadBalancer # change to ClusterIP if needed

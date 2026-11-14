@@ -1,0 +1,2784 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from functools import partial
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+from sglang.srt.mem_cache.device_pool_info import (
+    IndexKeyLayout,
+    MHABufferInfo,
+    MLABufferInfo,
+    PageRowBufferInfo,
+)
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    SidecarPoolSpec,
+)
+from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+    HostPoolConfig,
+    HostPoolGroupConfig,
+    prepare_host_pool_config,
+    with_packed_draft_layer_mapping,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.kv import HostPoolOptions
+from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4PagedHostPool,
+    DeepSeekV4StateHostPool,
+    LogicalHostPool,
+)
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+from sglang.srt.mem_cache.pool_host.mha import (
+    MHATokenToKOnlyPoolHost,
+    get_mha_host_pool_cls,
+)
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.page_interleave import (
+    PageInterleaveHostPool,
+)
+from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
+from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    ComponentType,
+    tree_slot_ids,
+)
+from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
+    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+    from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
+
+
+def _get_allocator_type() -> str:
+    return get_allocator_type()
+
+
+def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
+    """Make room for a host load of ``required_size`` rows of the target
+    window: a demand of the target alone, whose shortfall the cache measures
+    on the target's own room. The load writes no other window."""
+    from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    allocator = cache.token_to_kv_pool_allocator
+    cache.evict_for_alloc(
+        KVDemand(window_tokens={window_sub_pool_of(allocator): required_size})
+    )
+
+
+def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    cache.evict_for_alloc(KVDemand(state_slots=required_size))
+
+
+def _make_layer_mapper(
+    layer_mapping: dict[int, int],
+    transfer_layer_id_max: int,
+) -> Callable[[int], Optional[int]]:
+    # The exclusive transfer-ID bound includes holes for uncached layers;
+    # each pool skips IDs absent from its mapping.
+    def mapper(layer_id: int) -> Optional[int]:
+        if not 0 <= layer_id < transfer_layer_id_max:
+            return None
+        return layer_mapping.get(layer_id)
+
+    return mapper
+
+
+def _stage_local_layer_mapping(
+    layer_mapping: dict[int, int], start_layer: int
+) -> dict[int, int]:
+    return {
+        global_layer - start_layer: pool_layer
+        for global_layer, pool_layer in layer_mapping.items()
+    }
+
+
+def _dsv4_transfer_layer_mapping(
+    layer_ids: tuple[int, ...], start_layer: int
+) -> dict[int, int]:
+    return {layer - start_layer: index for index, layer in enumerate(layer_ids)}
+
+
+def _device_capacity_tokens(pool) -> int:
+    # Unified views size host storage from their configured token cap, not the buffer.
+    if pool.host_capacity_tokens is None:
+        return pool.size
+    return pool.host_capacity_tokens
+
+
+def _mha_host_inputs(pool, info, drafts=()):
+    return (
+        get_mha_host_pool_cls(info),
+        dict(
+            device_capacity_tokens=_device_capacity_tokens(pool),
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            draft_buffer_infos=tuple(
+                draft.get_device_pool_infos()[0].buffer_info for draft in drafts
+            ),
+            write_back_staging=pool.hicache_write_back_staging,
+        ),
+    )
+
+
+def build_kv_host_pool(
+    *,
+    kv_pool: Any,
+    page_size: int,
+    host_size: Optional[float] = None,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+    pool_label: str = "kv",
+):
+    host_input = kv_pool.get_device_pool_infos()[0].buffer_info
+    use_mla = isinstance(host_input, MLABufferInfo)
+    if use_mla:
+        kv_host_pool_cls, mha_kwargs = MLATokenToKVPoolHost, {}
+        # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. NPU bf16
+        # pools report kv_lora_rank here and keep rope rows in a separate buffer.
+        override_kv_cache_dim = kv_pool.kv_cache_dim
+    else:
+        kv_host_pool_cls, mha_kwargs = _mha_host_inputs(
+            kv_pool, host_input, mtp_draft_device_pools
+        )
+        override_kv_cache_dim = None
+    parallel = get_parallel()
+    geometry = resolve_kv_host_geometry(
+        kv_pool,
+        page_size=(
+            page_size // parallel.attn_dcp_size
+            if use_mla and parallel.dcp_enabled
+            else page_size
+        ),
+        layout=get_memory().hicache_mem_layout,
+        use_mla=use_mla,
+        draft_layer_num=len(mtp_draft_device_pools),
+        override_kv_cache_dim=override_kv_cache_dim,
+    )
+    kwargs = {}
+    if geometry.page_unified_layout is not None:
+        kwargs["page_unified_layout"] = geometry.page_unified_layout
+        if not use_mla:
+            kwargs["head_group_num"] = geometry.page_unified_layout.head_group_num
+    if override_kv_cache_dim is not None:
+        kwargs["override_kv_cache_dim"] = override_kv_cache_dim
+    if use_mla:
+        kwargs.update(
+            device_capacity_tokens=_device_capacity_tokens(kv_pool),
+            start_layer=kv_pool.start_layer,
+            end_layer=kv_pool.end_layer,
+            draft_buffer_infos=tuple(
+                pool.get_device_pool_infos()[0].buffer_info
+                for pool in mtp_draft_device_pools
+            ),
+            layer_shard_enabled=kv_pool.layer_shard_enabled,
+            write_back_staging=kv_pool.hicache_write_back_staging,
+            target_layer_num=geometry.target_layer_num,
+        )
+    else:
+        kwargs.update(mha_kwargs)
+    if parallel.dcp_enabled:
+        assert use_mla, (
+            "HiCache + DCP is only wired for the MLA host pool; the MHA host "
+            "pool has no DCP index translation."
+        )
+        kwargs["dcp_size"] = parallel.attn_dcp_size
+        kwargs["dcp_rank"] = parallel.attn_dcp_rank
+    host_pool = kv_host_pool_cls(
+        host_input,
+        get_memory().hicache_ratio,
+        get_memory().hicache_size if host_size is None else host_size,
+        page_size,
+        get_memory().hicache_mem_layout,
+        allocator_type=_get_allocator_type(),
+        pool_label=pool_label,
+        **kwargs,
+    )
+    if isinstance(kv_pool, PageInterleaveKVPoolMixin):
+        return PageInterleaveHostPool(host_pool, kv_pool.placement)
+    return host_pool
+
+
+def _split_hicache_size(
+    hicache_size: int, kv_pools: tuple[Any, ...]
+) -> tuple[float, ...]:
+    device_pool_sizes = []
+    for kv_pool in kv_pools:
+        size_bytes = kv_pool.host_capacity_bytes
+        if size_bytes is None:
+            size_bytes = kv_pool.get_kv_size_bytes()
+        device_pool_sizes.append(
+            sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
+        )
+    total_device_pool_size = sum(device_pool_sizes)
+    return tuple(
+        hicache_size * size_bytes / total_device_pool_size
+        for size_bytes in device_pool_sizes
+    )
+
+
+def build_pool_entry(
+    *,
+    name: PoolName,
+    host_pool: Any,
+    device_pool: Any,
+    layer_mapping: dict[int, int],
+    transfer_layer_id_max: int,
+    is_anchor: bool = False,
+    host_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_alloc_fn: Optional[Callable[[int], Any]] = None,
+    device_free_fn: Optional[Callable[[Any], Any]] = None,
+    packed_draft_device_pools: tuple[Any, ...] = (),
+    device_translate: Optional[Callable[[Any], Any]] = None,
+) -> PoolEntry:
+    return PoolEntry(
+        name=name,
+        host_pool=host_pool,
+        device_pool=device_pool,
+        layer_mapper=_make_layer_mapper(layer_mapping, transfer_layer_id_max),
+        is_primary_index_anchor=is_anchor,
+        host_evict_fn=host_evict_fn,
+        device_evict_fn=device_evict_fn,
+        device_alloc_fn=device_alloc_fn,
+        device_free_fn=device_free_fn,
+        packed_draft_device_pools=packed_draft_device_pools,
+        device_translate=device_translate,
+    )
+
+
+def _build_cache_controller(
+    *,
+    params: CacheInitParams,
+    host_pool_group: HostPoolGroup,
+    transfer_layer_id_max: int,
+    load_cache_event,
+    storage_backend: Optional[str],
+    prefetch_threshold: int,
+    model_name: Optional[str],
+    storage_backend_extra_config: Optional[dict],
+    enable_storage_metrics: bool,
+    kv_storage=None,
+) -> HybridCacheController:
+    memory = get_memory()
+    return HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        params.page_size,
+        params.tp_cache_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=memory.hicache_write_policy,
+        io_backend=memory.hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        transfer_layer_id_max=transfer_layer_id_max,
+        enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=memory.hicache_host_memory_mode,
+        kv_storage=kv_storage,
+    )
+
+
+def _swa_allocation_callbacks(allocator) -> dict:
+    """Keep allocation and rollback in the same ID space for every static SWA
+    stack (a unified pool's loads go through its storage, `host_load_alloc`)."""
+    if allocator is None:
+        return {}
+    return dict(device_alloc_fn=allocator.alloc, device_free_fn=allocator.free)
+
+
+def build_hybrid_swa_group(
+    *,
+    page_size: int,
+    full_kv_pool: Any,
+    swa_kv_pool: Any,
+    full_layer_mapping: dict[int, int],
+    swa_layer_mapping: dict[int, int],
+    kv_host_size: Optional[float] = None,
+    swa_host_size: Optional[float] = None,
+    host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    swa_attn_allocator: Any = None,
+    mtp_full_device_pools: tuple[Any, ...] = (),
+    mtp_swa_device_pools: tuple[Any, ...] = (),
+    mtp_swa_full_device_pools: tuple[Any, ...] = (),
+    transfer_layer_id_max: Optional[int] = None,
+) -> HostPoolGroup:
+    """Anchor (full) + SWA host pool group for a hybrid-SWA device pool that
+    is not unified (a unified pool's stack is `build_unified_host_stack`)."""
+    if transfer_layer_id_max is None:
+        transfer_layer_id_max = (
+            max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
+        )
+    if mtp_swa_full_device_pools and kv_host_size:
+        kv_host_size = _reserve_draft_swa_share(
+            kv_host_size,
+            (full_kv_pool, *mtp_full_device_pools),
+            mtp_swa_full_device_pools,
+        )
+    kv_host_pool = build_kv_host_pool(
+        kv_pool=full_kv_pool,
+        page_size=page_size,
+        host_size=kv_host_size,
+        mtp_draft_device_pools=mtp_full_device_pools,
+        pool_label="full",
+    )
+    swa_host_pool = build_kv_host_pool(
+        kv_pool=swa_kv_pool,
+        page_size=page_size,
+        host_size=swa_host_size,
+        mtp_draft_device_pools=mtp_swa_device_pools,
+        pool_label="swa",
+    )
+    if mtp_full_device_pools:
+        full_layer_mapping = with_packed_draft_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=full_kv_pool.layer_num,
+            draft_layer_num=len(mtp_full_device_pools),
+        )
+    if mtp_swa_device_pools:
+        swa_layer_mapping = with_packed_draft_layer_mapping(
+            swa_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=swa_kv_pool.layer_num,
+            draft_layer_num=len(mtp_swa_device_pools),
+        )
+    group = HostPoolGroup(
+        [
+            build_pool_entry(
+                name=PoolName.KV,
+                host_pool=kv_host_pool,
+                device_pool=full_kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max
+                + len(mtp_full_device_pools),
+                is_anchor=True,
+                packed_draft_device_pools=mtp_full_device_pools,
+            ),
+            build_pool_entry(
+                name=PoolName.SWA,
+                host_pool=swa_host_pool,
+                device_pool=swa_kv_pool,
+                layer_mapping=swa_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max + len(mtp_swa_device_pools),
+                host_evict_fn=host_swa_evict_fn,
+                device_evict_fn=device_swa_evict_fn,
+                **_swa_allocation_callbacks(swa_attn_allocator),
+                packed_draft_device_pools=mtp_swa_device_pools,
+            ),
+        ]
+    )
+    if mtp_swa_full_device_pools:
+        group.add_entry(
+            _draft_swa_entry(
+                drafts=mtp_swa_full_device_pools,
+                kv_host_pool=kv_host_pool,
+                page_size=page_size,
+                transfer_layer_id_max=transfer_layer_id_max,
+            )
+        )
+    return group
+
+
+def _reserve_draft_swa_share(
+    kv_host_size: float, anchor_pools: tuple[Any, ...], drafts: tuple[Any, ...]
+) -> float:
+    # The sidecar has the anchor's token capacity. Reserve its bytes from
+    # the full-KV budget rather than exceeding an explicit --hicache-size.
+    shares = _split_hicache_size(kv_host_size, (*anchor_pools, *drafts))
+    return sum(shares[: len(anchor_pools)])
+
+
+def _draft_swa_entry(
+    *,
+    drafts: tuple[Any, ...],
+    kv_host_pool: Any,
+    page_size: int,
+    transfer_layer_id_max: int,
+) -> PoolEntry:
+    # SWA drafts with full-token addressing may have different head geometry
+    # from full attention. Use a separate host pool with KV indices instead of
+    # packing their bytes into either target pool.
+    first, *rest = drafts
+    host_input = first.get_device_pool_infos()[0].buffer_info
+    host_cls, host_kwargs = _mha_host_inputs(first, host_input, tuple(rest))
+    draft_host_pool = host_cls(
+        host_input,
+        host_to_device_ratio=kv_host_pool.size / first.size,
+        host_size=0,
+        page_size=page_size,
+        layout=get_memory().hicache_mem_layout,
+        allocator_type=_get_allocator_type(),
+        **host_kwargs,
+        pool_label="draft_swa",
+    )
+    return build_pool_entry(
+        name=PoolName.DRAFT_SWA,
+        host_pool=draft_host_pool,
+        device_pool=first,
+        layer_mapping=with_packed_draft_layer_mapping(
+            {0: 0},
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=first.layer_num,
+            draft_layer_num=len(rest),
+        ),
+        transfer_layer_id_max=transfer_layer_id_max + len(rest),
+        packed_draft_device_pools=tuple(rest),
+    )
+
+
+def _mtp_full_device_pools(params: CacheInitParams) -> tuple[Any, ...]:
+    # Each draft depth may use full or sliding-window attention.
+    return tuple(
+        pool.full_kv_pool
+        for pool in params.mtp_draft_device_pools
+        if pool.full_kv_pool.layer_num
+    )
+
+
+def _mtp_swa_device_pools(
+    params: CacheInitParams, *, full_indices: bool
+) -> tuple[Any, ...]:
+    return tuple(
+        pool.swa_kv_pool
+        for pool in params.mtp_draft_device_pools
+        if pool.swa_kv_pool.layer_num and pool.swa_uses_full_indices == full_indices
+    )
+
+
+def _mtp_swa_sidecar_specs(group: HostPoolGroup) -> list[SidecarPoolSpec]:
+    if PoolName.DRAFT_SWA not in group.entry_map:
+        return []
+    return [SidecarPoolSpec(PoolName.DRAFT_SWA, indices_from_pool=PoolName.KV)]
+
+
+def build_hybrid_swa_stack(
+    *,
+    params: CacheInitParams,
+    full_kv_pool: Any,
+    swa_kv_pool: Any,
+    full_layer_mapping: dict[int, int],
+    swa_layer_mapping: dict[int, int],
+    load_cache_event,
+    storage_backend: Optional[str],
+    host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    enable_storage_metrics: bool = False,
+) -> tuple[HostPoolGroup, HybridCacheController]:
+    transfer_layer_id_max = (
+        max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
+    )
+
+    kv_host_size = swa_host_size = None
+    memory = get_memory()
+    if memory.hicache_size > 0:
+        kv_host_size, swa_host_size = _split_hicache_size(
+            memory.hicache_size, (full_kv_pool, swa_kv_pool)
+        )
+
+    host_pool_group = build_hybrid_swa_group(
+        page_size=params.page_size,
+        full_kv_pool=full_kv_pool,
+        swa_kv_pool=swa_kv_pool,
+        full_layer_mapping=full_layer_mapping,
+        swa_layer_mapping=swa_layer_mapping,
+        kv_host_size=kv_host_size,
+        swa_host_size=swa_host_size,
+        host_swa_evict_fn=host_swa_evict_fn,
+        device_swa_evict_fn=device_swa_evict_fn,
+        # For SWA hybrid, device allocation goes through the inner allocator.
+        swa_attn_allocator=params.token_to_kv_pool_allocator.swa_attn_allocator,
+        mtp_full_device_pools=_mtp_full_device_pools(params),
+        mtp_swa_device_pools=_mtp_swa_device_pools(params, full_indices=False),
+        mtp_swa_full_device_pools=_mtp_swa_device_pools(params, full_indices=True),
+    )
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
+        load_cache_event=load_cache_event,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    return host_pool_group, cache_controller
+
+
+def _deepseek_v4_num_host_pages(
+    *,
+    params: CacheInitParams,
+    kvcache: Any,
+    page_size: int,
+    swa_page_size: int,
+    c128_attn_allocator: Any,
+) -> tuple[int, int, int]:
+    device_full_size = params.token_to_kv_pool_allocator.size_full
+    device_full_pages = (device_full_size + page_size - 1) // page_size
+
+    device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
+
+    if get_memory().hicache_size > 0:
+        raise ValueError(
+            "DeepSeek V4 HiCache currently does not support --hicache-size; "
+            "use --hicache-ratio instead."
+        )
+    ratio = get_memory().hicache_ratio
+    full_host_pages = int(device_full_pages * ratio)
+    swa_host_pages = int(device_swa_pages * ratio)
+
+    # NPU sizes the independent C128 host pool from its device page count.
+    # For example, host pages = device pages * hicache_ratio.
+    # GPU keeps the FULL page count because C128 is a KV-derived sidecar.
+    c128_host_pages = full_host_pages
+    if c128_attn_allocator is not None:
+        c128_host_pages = int(c128_attn_allocator.num_pages * ratio)
+    return full_host_pages, swa_host_pages, c128_host_pages
+
+
+def _require_single_row_dsv4_swa_pages(
+    *, logical_page_size: int, physical_page_size: int, consumer: str
+) -> None:
+    """Reject consumers that cannot map one logical SWA page to many rows."""
+    if logical_page_size != physical_page_size:
+        raise ValueError(
+            f"{consumer} does not support the DeepSeek-V4 direct SWA KV layout "
+            f"({logical_page_size}-token logical pages stored as "
+            f"{physical_page_size}-token physical rows). Disable "
+            "SGLANG_OPT_SM120_DIRECT_SWA_KV for this configuration."
+        )
+
+
+def _dsv4_region_page_aligned_only(region: DSV4PagedBufferInfo) -> bool:
+    # Token-granular GPU kernels only support V4 KV and fused index rows.
+    # Ascend handles its native PA_ND geometry in the transfer implementation.
+    return region.layout not in ("v4", "index_fused", "pa_nd")
+
+
+def _dsv4_pool_infos(kvcache: Any) -> dict[PoolName, DevicePoolInfo]:
+    return {info.pool_name: info for info in kvcache.get_device_pool_infos()}
+
+
+def _check_dsv4_indexer_page_size(key: DSV4PagedBufferInfo, page_size: int) -> None:
+    if key.layout == "index_fp4" and page_size % key.page_slots != 0:
+        raise ValueError(
+            f"Tree page size {page_size} must be a multiple of the FP4 indexer "
+            f"slots per page {key.page_slots}"
+        )
+
+
+def _dsv4_low_ratio_regions(
+    kvcache: Any, infos: dict[PoolName, DevicePoolInfo], page_size: int
+) -> list[tuple[PoolName, Any, list, dict[int, int]]]:
+    """(name, device_pool, buffers, layer_mapping) per shared source KV and
+    indexer buffer group, in FULL-page units."""
+    import torch
+
+    regions = []
+    for ratio, names in (
+        (
+            1,
+            (
+                PoolName.DEEPSEEK_V4_C1,
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+            ),
+        ),
+        (
+            2,
+            (
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            ),
+        ),
+    ):
+        kv = infos.get(names[0])
+        if kv is None:
+            continue
+        key = infos[names[1]].buffer_info
+        assert page_size % ratio == 0
+        slots_per_page = page_size // ratio
+        assert slots_per_page % key.page_slots == 0
+        index_pages_per_full_page = slots_per_page // key.page_slots
+        layer_mapping = _dsv4_transfer_layer_mapping(kv.layer_ids, kvcache.start_layer)
+        regions.append(
+            (
+                names[0],
+                kvcache.kv_pools[ratio],
+                list(kv.buffer_info.buffers),
+                layer_mapping,
+            )
+        )
+        for name in names[1:]:
+            index = infos.get(name)
+            if index is None:
+                continue
+            # Drop only the padding rows past the FULL page address space.
+            rows = []
+            for buffer in index.buffer_info.buffers:
+                full_pages = buffer.shape[0] // index_pages_per_full_page
+                rows.append(
+                    buffer[: full_pages * index_pages_per_full_page]
+                    .view(torch.uint8)
+                    .reshape(full_pages, -1)
+                )
+            regions.append((name, kvcache.index_pools[ratio], rows, layer_mapping))
+    return regions
+
+
+def _dsv4_low_ratio_entries(
+    kvcache: Any,
+    infos: dict[PoolName, DevicePoolInfo],
+    page_size: int,
+    num_host_pages: int,
+    transfer_layer_id_max: int,
+):
+    """Mirror shared KV; ratio-2 request state is rebuilt at page boundaries."""
+    entries = []
+    for name, device_pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
+        kvcache, infos, page_size
+    ):
+        entries.append(
+            build_pool_entry(
+                name=name,
+                host_pool=DeepSeekV4PagedHostPool(
+                    pool_name=str(name),
+                    device_buffers=buffers,
+                    item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
+                    num_host_pages=num_host_pages,
+                    slot_page_size=page_size,
+                    layout=get_memory().hicache_mem_layout,
+                    allocator_type=_get_allocator_type(),
+                    page_aligned_only=True,
+                ),
+                device_pool=device_pool,
+                layer_mapping=layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max,
+            )
+        )
+    return entries
+
+
+def _extra_host_region_entries(
+    kvcache: Any,
+    page_size: int,
+    num_host_pages: int,
+    transfer_layer_id_max: int,
+    draft_device_pools: tuple[Any, ...],
+) -> list[PoolEntry]:
+    """FULL-page HiCache entries for the regions a pool keeps beside the
+    compressed-KV layout (``extra_host_regions``); packed draft buffers follow
+    the target's."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
+        return []
+    draft_buffers: dict[PoolName, list[Any]] = {}
+    for pool in draft_device_pools:
+        if isinstance(pool, DeepSeekV4TokenToKVPool):
+            for region in pool.extra_host_regions():
+                draft_buffers.setdefault(region.pool_name, []).extend(
+                    region.device_buffers
+                )
+    target_regions = kvcache.extra_host_regions()
+    orphans = set(draft_buffers) - {region.pool_name for region in target_regions}
+    if orphans:
+        # Packed drafts ride a target host pool; with none, they would be dropped.
+        raise ValueError(
+            f"draft {sorted(orphans)} pages have no target layer on this pipeline "
+            "stage to share a HiCache host pool with"
+        )
+    entries = []
+    for region in target_regions:
+        drafts = draft_buffers.get(region.pool_name, [])
+        if any(buf.shape[1] != region.item_bytes for buf in drafts):
+            raise ValueError(
+                f"draft {region.pool_name} pages must match the target's "
+                f"{region.item_bytes} B pages to share its host pool"
+            )
+        entries.append(
+            build_pool_entry(
+                name=region.pool_name,
+                host_pool=DeepSeekV4PagedHostPool(
+                    pool_name=str(region.pool_name),
+                    device_buffers=[*region.device_buffers, *drafts],
+                    item_bytes=region.item_bytes,
+                    num_host_pages=num_host_pages,
+                    slot_page_size=page_size,
+                    layout=get_memory().hicache_mem_layout,
+                    allocator_type=_get_allocator_type(),
+                    page_aligned_only=True,
+                ),
+                device_pool=region.device_pool,
+                layer_mapping=with_packed_draft_layer_mapping(
+                    region.layer_mapping,
+                    transfer_layer_start=transfer_layer_id_max,
+                    target_device_layer_num=len(region.device_buffers),
+                    draft_layer_num=len(drafts),
+                ),
+                transfer_layer_id_max=transfer_layer_id_max + len(drafts),
+                packed_draft_device_pools=tuple(drafts),
+            )
+        )
+    return entries
+
+
+def _build_dsv4_rope_entry(
+    info: DevicePoolInfo | None,
+    *,
+    device_pool: Any,
+    layer_mapping: dict[int, int],
+    num_host_pages: int,
+    slot_page_size: int,
+    transfer_layer_id_max: int,
+) -> Optional[PoolEntry]:
+    if info is None:
+        return None
+    name = info.pool_name
+    region = info.buffer_info
+    return build_pool_entry(
+        name=name,
+        host_pool=DeepSeekV4PagedHostPool(
+            pool_name=str(name),
+            device_buffers=list(region.buffers),
+            item_bytes=region.page_bytes,
+            num_host_pages=num_host_pages,
+            slot_page_size=slot_page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            page_aligned_only=True,
+        ),
+        device_pool=device_pool,
+        layer_mapping=layer_mapping,
+        transfer_layer_id_max=transfer_layer_id_max,
+    )
+
+
+def build_deepseek_v4_hicache_stack(
+    *,
+    params: CacheInitParams,
+    kvcache: Any,
+    load_cache_event,
+    storage_backend: Optional[str],
+    host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    host_c128_evict_fn: Optional[Callable[[int], Any]] = None,
+    c128_attn_allocator: Any = None,
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    enable_storage_metrics: bool = False,
+) -> tuple[HostPoolGroup, HybridCacheController]:
+    page_size = params.page_size
+    infos = _dsv4_pool_infos(kvcache)
+    transfer_layer_id_max = len(kvcache.stage_layer_ids)
+    full_layer_mapping = _dsv4_transfer_layer_mapping(
+        kvcache.stage_layer_ids, kvcache.start_layer
+    )
+    swa = infos.get(PoolName.SWA)
+    swa_info = swa.buffer_info if swa is not None else None
+    mtp_swa_device_buffers = []
+    swa_layer_mapping = {}
+    if swa_info is not None:
+        _require_single_row_dsv4_swa_pages(
+            logical_page_size=kvcache.swa_page_size,
+            physical_page_size=swa_info.page_slots,
+            consumer="DeepSeek-V4 HiCache",
+        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        # NextN has one layer per pool, while DSpark keeps all stages in one pool.
+        for pool in params.mtp_draft_device_pools:
+            if isinstance(pool, DeepSeekV4TokenToKVPool) and not pool.swa_layer_ids():
+                # A draft with no SWA layer has no SWA buffer to pack.
+                continue
+            draft_swa = _dsv4_pool_infos(pool).get(PoolName.SWA)
+            if draft_swa is None:
+                raise ValueError("Packed DSV4 draft requires paged SWA storage")
+            mtp_swa_device_buffers.extend(draft_swa.buffer_info.buffers)
+        # Map the SWA layers alone; the MLA layers own no SWA buffer.
+        swa_layer_mapping = with_packed_draft_layer_mapping(
+            _dsv4_transfer_layer_mapping(swa.layer_ids, kvcache.start_layer),
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=len(swa.layer_ids),
+            draft_layer_num=len(mtp_swa_device_buffers),
+        )
+
+    c4 = infos.get(PoolName.DEEPSEEK_V4_C4)
+    c128 = infos.get(PoolName.DEEPSEEK_V4_C128)
+    c4_layer_mapping = _dsv4_transfer_layer_mapping(
+        c4.layer_ids if c4 is not None else (), kvcache.start_layer
+    )
+    c128_layer_mapping = _dsv4_transfer_layer_mapping(
+        c128.layer_ids if c128 is not None else (), kvcache.start_layer
+    )
+    (
+        num_host_pages,
+        swa_num_host_pages,
+        c128_num_host_pages,
+    ) = _deepseek_v4_num_host_pages(
+        params=params,
+        kvcache=kvcache,
+        page_size=page_size,
+        swa_page_size=kvcache.swa_page_size,
+        c128_attn_allocator=c128_attn_allocator,
+    )
+
+    logical_host_pool = LogicalHostPool(
+        num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
+    )
+    entries = [
+        build_pool_entry(
+            name=PoolName.KV,
+            host_pool=logical_host_pool,
+            device_pool=kvcache,
+            layer_mapping=full_layer_mapping,
+            transfer_layer_id_max=transfer_layer_id_max,
+            is_anchor=True,
+        ),
+    ]
+
+    if swa_info is not None:
+        swa_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.SWA),
+            device_buffers=[
+                *swa_info.buffers,
+                *mtp_swa_device_buffers,
+            ],
+            item_bytes=swa_info.page_bytes,
+            num_host_pages=swa_num_host_pages,
+            slot_page_size=kvcache.swa_page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_region_page_aligned_only(swa_info),
+        )
+        swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+        entries.append(
+            build_pool_entry(
+                name=PoolName.SWA,
+                host_pool=swa_host_pool,
+                device_pool=kvcache.swa_kv_pool,
+                layer_mapping=swa_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max
+                + len(mtp_swa_device_buffers),
+                host_evict_fn=host_swa_evict_fn,
+                device_evict_fn=device_swa_evict_fn,
+                device_alloc_fn=swa_attn_allocator.alloc,
+                device_free_fn=swa_attn_allocator.free,
+                packed_draft_device_pools=tuple(mtp_swa_device_buffers),
+            )
+        )
+
+    if c4_layer_mapping:
+        c4_info = c4.buffer_info
+        # C4 is KV-derived, so its HiCache indices stay in the FULL logical
+        # coordinate space. NPU transfer code derives the native C4 page size
+        # (for example 32 rather than 128) from the device-buffer shape.
+        c4_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.DEEPSEEK_V4_C4),
+            device_buffers=list(c4_info.buffers),
+            item_bytes=c4_info.page_bytes,
+            num_host_pages=num_host_pages,
+            slot_page_size=page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_region_page_aligned_only(c4_info),
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.DEEPSEEK_V4_C4,
+                host_pool=c4_host_pool,
+                device_pool=kvcache.c4_kv_pool,
+                layer_mapping=c4_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max,
+            )
+        )
+        _check_dsv4_indexer_page_size(
+            infos[PoolName.DEEPSEEK_V4_C4_INDEXER].buffer_info, page_size
+        )
+        for name in (
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+        ):
+            index = infos.get(name)
+            if index is None:
+                continue
+            region = index.buffer_info
+            entries.append(
+                build_pool_entry(
+                    name=name,
+                    host_pool=DeepSeekV4PagedHostPool(
+                        pool_name=str(name),
+                        device_buffers=list(region.buffers),
+                        item_bytes=region.page_bytes,
+                        num_host_pages=num_host_pages,
+                        slot_page_size=page_size,
+                        layout=get_memory().hicache_mem_layout,
+                        allocator_type=_get_allocator_type(),
+                        page_aligned_only=_dsv4_region_page_aligned_only(region),
+                    ),
+                    device_pool=kvcache.c4_indexer_kv_pool,
+                    layer_mapping=c4_layer_mapping,
+                    transfer_layer_id_max=transfer_layer_id_max,
+                )
+            )
+
+        # Build c4 rope buffer when using unified fp8 kv
+        c4_rope_entry = _build_dsv4_rope_entry(
+            infos.get(PoolName.DEEPSEEK_V4_C4_ROPE),
+            device_pool=kvcache.c4_kv_pool,
+            layer_mapping=c4_layer_mapping,
+            num_host_pages=num_host_pages,
+            slot_page_size=page_size,
+            transfer_layer_id_max=transfer_layer_id_max,
+        )
+        if c4_rope_entry is not None:
+            entries.append(c4_rope_entry)
+
+        c4_state = infos.get(PoolName.DEEPSEEK_V4_C4_STATE)
+        if c4_state is not None:
+            c4_indexer_state = infos[PoolName.DEEPSEEK_V4_C4_INDEXER_STATE]
+            c4_state_host_pool = DeepSeekV4StateHostPool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
+                state_infos=list(c4_state.buffer_info.states),
+                num_host_pages=swa_num_host_pages,
+                swa_page_size=kvcache.swa_page_size,
+                layout=get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+            )
+            c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
+                state_infos=list(c4_indexer_state.buffer_info.states),
+                num_host_pages=swa_num_host_pages,
+                swa_page_size=kvcache.swa_page_size,
+                layout=get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+            )
+            entries.extend(
+                [
+                    build_pool_entry(
+                        name=PoolName.DEEPSEEK_V4_C4_STATE,
+                        host_pool=c4_state_host_pool,
+                        device_pool=None,
+                        layer_mapping=c4_layer_mapping,
+                        transfer_layer_id_max=transfer_layer_id_max,
+                    ),
+                    build_pool_entry(
+                        name=PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                        host_pool=c4_indexer_state_host_pool,
+                        device_pool=None,
+                        layer_mapping=c4_layer_mapping,
+                        transfer_layer_id_max=transfer_layer_id_max,
+                    ),
+                ]
+            )
+
+    if c128_layer_mapping:
+        c128_info = c128.buffer_info
+        # NPU C128 host views use kernel_page_size, for example 16 instead of 128.
+        # GPU pools lack this attribute and fall back to the global page_size.
+        c128_slot_page_size = (
+            c128_info.page_slots if c128_info.layout == "pa_nd" else page_size
+        )
+        c128_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.DEEPSEEK_V4_C128),
+            device_buffers=list(c128_info.buffers),
+            item_bytes=c128_info.page_bytes,
+            num_host_pages=c128_num_host_pages,
+            slot_page_size=c128_slot_page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_region_page_aligned_only(c128_info),
+        )
+        # C128 state pool is intentionally not registered with hicache.
+        # page_size=256 % 128 == 0, so state pool is not consumed on load.
+        entries.extend(
+            [
+                build_pool_entry(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    host_pool=c128_host_pool,
+                    device_pool=kvcache.c128_kv_pool,
+                    layer_mapping=c128_layer_mapping,
+                    transfer_layer_id_max=transfer_layer_id_max,
+                    # NPU C128 uses bare allocator callbacks for independent indices.
+                    # FULL leaf eviction also frees each attached C128 host value.
+                    # GPU keeps its KV-derived sidecar callbacks unset.
+                    host_evict_fn=host_c128_evict_fn,
+                    device_alloc_fn=(
+                        c128_attn_allocator.alloc
+                        if c128_attn_allocator is not None
+                        else None
+                    ),
+                    device_free_fn=(
+                        c128_attn_allocator.free
+                        if c128_attn_allocator is not None
+                        else None
+                    ),
+                ),
+            ]
+        )
+        # Build c128 rope buffer when using unified fp8 kv
+        c128_rope_entry = _build_dsv4_rope_entry(
+            infos.get(PoolName.DEEPSEEK_V4_C128_ROPE),
+            device_pool=kvcache.c128_kv_pool,
+            layer_mapping=c128_layer_mapping,
+            num_host_pages=c128_num_host_pages,
+            slot_page_size=c128_slot_page_size,
+            transfer_layer_id_max=transfer_layer_id_max,
+        )
+        if c128_rope_entry is not None:
+            entries.append(c128_rope_entry)
+
+    entries.extend(
+        _dsv4_low_ratio_entries(
+            kvcache, infos, page_size, num_host_pages, transfer_layer_id_max
+        )
+    )
+    entries.extend(
+        _extra_host_region_entries(
+            kvcache,
+            page_size,
+            num_host_pages,
+            transfer_layer_id_max,
+            draft_device_pools=params.mtp_draft_device_pools,
+        )
+    )
+
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
+        load_cache_event=load_cache_event,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    return host_pool_group, cache_controller
+
+
+def _state_host_layout() -> str:
+    # MambaPoolHost only supports page_first_direct; the global layout may be
+    # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
+    # pool has no separate K/V buffers, so kv_split does not apply; override
+    # to page_first_direct.
+    layout = get_memory().hicache_mem_layout
+    return "page_first_direct" if layout == "page_first_kv_split" else layout
+
+
+def build_mamba_host_pool(
+    mamba_pool,
+    pool_info: DevicePoolInfo,
+    *,
+    host_size: float,
+    layout: str,
+    mtp_draft_device_pools=(),
+):
+    draft_buffer_infos = []
+    for draft_pool in mtp_draft_device_pools:
+        (draft_info,) = draft_pool.get_device_pool_infos()
+        draft_info.buffer_info.validate(layer_ids=draft_info.layer_ids)
+        draft_buffer_infos.append(draft_info.buffer_info)
+    return MambaPoolHost(
+        pool_info.buffer_info,
+        get_memory().hicache_ratio,
+        host_size,
+        device_capacity=_device_capacity_tokens(mamba_pool),
+        mtp_draft_buffer_infos=draft_buffer_infos,
+        allocator_type=_get_allocator_type(),
+        layout=layout,
+    )
+
+
+def _mamba_info(mamba_pool) -> DevicePoolInfo:
+    (info,) = mamba_pool.get_device_pool_infos()
+    info.buffer_info.validate(layer_ids=info.layer_ids)
+    return info
+
+
+def _mamba_layer_mapping(info: DevicePoolInfo, start_layer: int) -> dict[int, int]:
+    # Controller IDs are stage-local; Info IDs follow the physical layer axis.
+    return {layer - start_layer: index for index, layer in enumerate(info.layer_ids)}
+
+
+def _mamba_entry(
+    *,
+    params: CacheInitParams,
+    mamba_pool: Any,
+    info: DevicePoolInfo,
+    layer_mapping: dict[int, int],
+    transfer_layer_id_max: int,
+    host_size: float,
+    host_evict_fn: Optional[Callable[[int], Any]],
+    device_evict_fn: Optional[Callable[[int], Any]],
+) -> PoolEntry:
+    drafts = params.mtp_draft_mamba_pools
+    allocator = params.token_to_kv_pool_allocator.state_slots
+    return build_pool_entry(
+        name=PoolName.MAMBA,
+        host_pool=build_mamba_host_pool(
+            mamba_pool,
+            info,
+            host_size=host_size,
+            layout=_state_host_layout(),
+            mtp_draft_device_pools=drafts,
+        ),
+        device_pool=mamba_pool,
+        layer_mapping=with_packed_draft_layer_mapping(
+            layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=len(info.layer_ids),
+            draft_layer_num=len(drafts),
+        ),
+        transfer_layer_id_max=transfer_layer_id_max + len(drafts),
+        host_evict_fn=host_evict_fn,
+        device_evict_fn=device_evict_fn,
+        device_alloc_fn=allocator.alloc,
+        device_free_fn=allocator.free,
+        packed_draft_device_pools=drafts,
+    )
+
+
+def build_hybrid_mamba_stack(
+    *,
+    params: CacheInitParams,
+    kv_pool: Any,
+    mamba_pool: Any,
+    full_layer_mapping: dict[int, int],
+    start_layer: int,
+    load_cache_event,
+    storage_backend: Optional[str],
+    host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    enable_storage_metrics: bool = False,
+) -> tuple[HostPoolGroup, HybridCacheController, HostPoolGroupConfig]:
+    """KV plus every pool the hybrid pool declares (e.g. a sparse indexer),
+    then the Mamba state pool, which keeps its own host path.
+
+    ``kv_pool`` is the hybrid pool or its full-attention KV child."""
+    mamba_info = _mamba_info(mamba_pool)
+    mamba_layer_mapping = _mamba_layer_mapping(mamba_info, start_layer)
+    transfer_layer_id_max = (
+        max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
+    )
+    config = prepare_host_pool_config(
+        root=kv_pool,
+        full_layer_mapping=full_layer_mapping,
+        transfer_layer_id_max=transfer_layer_id_max,
+        transfer_page_size=params.page_size,
+        packed_draft_device_pools=params.mtp_draft_device_pools,
+    )
+    kv_pool = config.root
+    kv_host_size, mamba_host_size = None, 0
+    if get_memory().hicache_size > 0:
+        kv_host_size, mamba_host_size = _split_hicache_size(
+            get_memory().hicache_size, (kv_pool, mamba_pool)
+        )
+    index_bytes = _kv_budget_index_bytes(config)
+    if index_bytes and kv_host_size is not None:
+        kv_bytes = sum(kv_pool.get_kv_size_bytes())
+        kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
+    kv_host_pool = build_kv_host_pool(
+        kv_pool=kv_pool,
+        page_size=params.page_size,
+        host_size=kv_host_size,
+        mtp_draft_device_pools=config.packed_draft_device_pools,
+    )
+    entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
+        _mamba_entry(
+            params=params,
+            mamba_pool=mamba_pool,
+            info=mamba_info,
+            layer_mapping=mamba_layer_mapping,
+            transfer_layer_id_max=transfer_layer_id_max,
+            host_size=mamba_host_size,
+            host_evict_fn=host_mamba_evict_fn,
+            device_evict_fn=device_mamba_evict_fn,
+        ),
+    ]
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
+        load_cache_event=load_cache_event,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    return host_pool_group, cache_controller, config
+
+
+def build_hybrid_mamba_swa_stack(
+    *,
+    params: CacheInitParams,
+    full_kv_pool: Any,
+    swa_kv_pool: Any,
+    mamba_pool: Any,
+    full_layer_mapping: dict[int, int],
+    swa_layer_mapping: dict[int, int],
+    start_layer: int,
+    load_cache_event,
+    storage_backend: Optional[str],
+    host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    enable_storage_metrics: bool = False,
+) -> tuple[HostPoolGroup, HybridCacheController]:
+    mamba_info = _mamba_info(mamba_pool)
+    mamba_layer_mapping = _mamba_layer_mapping(mamba_info, start_layer)
+    transfer_layer_id_max = (
+        max(
+            full_layer_mapping.keys()
+            | swa_layer_mapping.keys()
+            | mamba_layer_mapping.keys()
+        )
+        + 1
+    )
+    swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+    kv_host_size, swa_host_size, mamba_host_size = None, None, 0
+    if get_memory().hicache_size > 0:
+        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
+            get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+        )
+    host_pool_group = build_hybrid_swa_group(
+        page_size=params.page_size,
+        full_kv_pool=full_kv_pool,
+        swa_kv_pool=swa_kv_pool,
+        full_layer_mapping=full_layer_mapping,
+        swa_layer_mapping=swa_layer_mapping,
+        kv_host_size=kv_host_size,
+        swa_host_size=swa_host_size,
+        host_swa_evict_fn=host_swa_evict_fn,
+        device_swa_evict_fn=device_swa_evict_fn,
+        swa_attn_allocator=swa_attn_allocator,
+        mtp_full_device_pools=_mtp_full_device_pools(params),
+        mtp_swa_device_pools=_mtp_swa_device_pools(params, full_indices=False),
+        mtp_swa_full_device_pools=_mtp_swa_device_pools(params, full_indices=True),
+        transfer_layer_id_max=transfer_layer_id_max,
+    )
+    host_pool_group.add_entry(
+        _mamba_entry(
+            params=params,
+            mamba_pool=mamba_pool,
+            info=mamba_info,
+            layer_mapping=mamba_layer_mapping,
+            transfer_layer_id_max=transfer_layer_id_max,
+            host_size=mamba_host_size,
+            host_evict_fn=host_mamba_evict_fn,
+            device_evict_fn=device_mamba_evict_fn,
+        ),
+    )
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
+        load_cache_event=load_cache_event,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    return host_pool_group, cache_controller
+
+
+def _packed_drafts(
+    params: CacheInitParams, sub_pool: str, *, owner: str
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Each packed MTP draft pool's view of a token sub-pool: those packed
+    into the sub-pool's host pool, then the window views that address the
+    owner's token ids and so travel as a sidecar of their own."""
+    packed, by_owner_ids = [], []
+    for pool in params.mtp_draft_device_pools:
+        if not pool.layer_router.routes_to(sub_pool):
+            continue
+        view = pool.layer_router.view(sub_pool)
+        if sub_pool != owner and pool.swa_uses_full_indices:
+            by_owner_ids.append(view)
+        else:
+            packed.append(view)
+    return tuple(packed), tuple(by_owner_ids)
+
+
+def _evict_for_host_load(
+    cache: UnifiedRadixCache,
+    sub_pool: str,
+    component: ComponentType,
+    required_size: int,
+) -> None:
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    if component == ComponentType.MAMBA:
+        demand = KVDemand(state_slots=required_size)
+    else:
+        demand = KVDemand(window_tokens={sub_pool: required_size})
+    cache.evict_for_alloc(demand)
+
+
+def build_unified_host_stack(
+    *,
+    storage: KVStorage,
+    params: CacheInitParams,
+    cache: Optional[UnifiedRadixCache],
+    load_cache_event,
+    storage_backend: Optional[str],
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    enable_storage_metrics: bool = False,
+) -> StackBuildResult:
+    """One host pool per sub-pool of a unified pool, in the sub-pool's layout,
+    with the owner as the anchor; the two ends share a page-envelope backing
+    when their layouts and the storage backend allow. Without a cache (a
+    decode offload stack) no host or device eviction is wired."""
+    memory = get_memory()
+    page_size = params.page_size
+    owner = storage.owner
+    sub_pools = storage.sub_pools()
+    slot_ids = tree_slot_ids(storage.tree_slots())
+    owner_component = slot_ids[sub_pools[0].external.tree_component]
+    layer_maps = {
+        s.name: {
+            layer_id - storage.start_layer: index
+            for layer_id, index in s.layer_indices.items()
+        }
+        for s in sub_pools
+    }
+    transfer_layer_id_max = max(k for m in layer_maps.values() for k in m) + 1
+    for s in sub_pools:
+        if not layer_maps[s.name]:
+            # A draft-only band still needs a transfer completion event before
+            # the draft runs; its whole entry is copied at the first event.
+            layer_maps[s.name] = {0: 0}
+
+    token_drafts, owner_id_drafts = {}, ()
+    for s in sub_pools:
+        if not s.holds_state:
+            token_drafts[s.name], by_owner_ids = _packed_drafts(
+                params, s.name, owner=owner
+            )
+            owner_id_drafts += by_owner_ids
+    envelope = storage.page_envelope_pair()
+    if envelope is not None and (
+        any(token_drafts.values())
+        or owner_id_drafts
+        or not HybridCacheController.supports_page_envelope_host(
+            memory.hicache_storage_backend
+        )
+    ):
+        envelope = None
+
+    host_sizes = {s.name: 0 if s.holds_state else None for s in sub_pools}
+    if memory.hicache_size > 0 and envelope is None:
+        host_sizes = dict(
+            zip(
+                host_sizes,
+                _split_hicache_size(
+                    memory.hicache_size,
+                    tuple(storage.view(s.name) for s in sub_pools),
+                ),
+            )
+        )
+    if owner_id_drafts and host_sizes[owner]:
+        host_sizes[owner] = _reserve_draft_swa_share(
+            host_sizes[owner],
+            (storage.view(owner), *token_drafts[owner]),
+            owner_id_drafts,
+        )
+
+    parallel = get_parallel()
+
+    def build_host(name, drafts):
+        layout = storage.host_layout(name)
+        options = HostPoolOptions(
+            ratio=memory.hicache_ratio,
+            size=memory.hicache_size if host_sizes[name] is None else host_sizes[name],
+            page_size=page_size,
+            layout=memory.hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label=name,
+            dcp_size=parallel.attn_dcp_size if parallel.dcp_enabled else 1,
+            dcp_rank=parallel.attn_dcp_rank if parallel.dcp_enabled else 0,
+        )
+        return layout.build(
+            options,
+            draft_buffer_infos=tuple(
+                draft.get_device_pool_infos()[0].buffer_info for draft in drafts
+            ),
+        )
+
+    host_pools = {}
+    if envelope is not None:
+        pair = UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
+            device_pools=tuple(storage.view(name) for name in envelope),
+            pool_names=envelope,
+            host_to_device_ratio=memory.hicache_ratio,
+            host_size=memory.hicache_size,
+            page_size=page_size,
+            layout=memory.hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+        )
+        host_pools.update(zip(envelope, pair))
+
+    def evict_host(component):
+        return None if cache is None else (lambda n: cache.evict_host(n, component))
+
+    owner_config = prepare_host_pool_config(
+        root=storage.view(owner),
+        full_layer_mapping=layer_maps[owner],
+        transfer_layer_id_max=transfer_layer_id_max,
+        transfer_page_size=page_size,
+        packed_draft_device_pools=token_drafts[owner],
+    )
+    if owner not in host_pools:
+        host_pools[owner] = build_host(owner, owner_config.packed_draft_device_pools)
+    entries = _build_pool_entries(
+        config=owner_config,
+        root_host_pool=host_pools[owner],
+        # The owner's host pool evicts on demand only when it shares a backing.
+        root_host_evict_fn=evict_host(owner_component) if envelope else None,
+        device_translate=storage.host_ids(owner),
+    )
+    component_host_pools = {owner_component: host_pools[owner]}
+    draft_window_entry = False
+    for s in sub_pools:
+        if s.name == owner:
+            continue
+        view = storage.view(s.name)
+        component = slot_ids[s.external.tree_component]
+        if not s.holds_state and s.external.host_pool in PoolName._value2member_map_:
+            raise ValueError(
+                f"window sub-pool {s.name!r} would share a host pool name with a "
+                "well-known host pool"
+            )
+        drafts = params.mtp_draft_mamba_pools if s.holds_state else token_drafts[s.name]
+        if s.name not in host_pools:
+            host_pools[s.name] = build_host(s.name, drafts)
+        device_layer_num = storage.host_layout(s.name).device_layer_num
+        alloc = storage.host_load_alloc(s.name)
+        entries.append(
+            build_pool_entry(
+                name=s.external.host_pool,
+                host_pool=host_pools[s.name],
+                device_pool=view,
+                layer_mapping=with_packed_draft_layer_mapping(
+                    layer_maps[s.name],
+                    transfer_layer_start=transfer_layer_id_max,
+                    target_device_layer_num=device_layer_num,
+                    draft_layer_num=len(drafts),
+                ),
+                transfer_layer_id_max=transfer_layer_id_max + len(drafts),
+                host_evict_fn=evict_host(component),
+                device_evict_fn=(
+                    None
+                    if cache is None
+                    else partial(_evict_for_host_load, cache, s.name, component)
+                ),
+                device_alloc_fn=alloc[0],
+                device_free_fn=alloc[1],
+                packed_draft_device_pools=drafts,
+                device_translate=storage.host_ids(s.name),
+            )
+        )
+        if owner_id_drafts and not s.holds_state and not draft_window_entry:
+            # One sidecar for every draft window that addresses the owner's
+            # ids, whichever of the target's windows it reads beside.
+            draft_window_entry = True
+            entries.append(
+                _draft_swa_entry(
+                    drafts=owner_id_drafts,
+                    kv_host_pool=host_pools[owner],
+                    page_size=page_size,
+                    transfer_layer_id_max=transfer_layer_id_max,
+                )
+            )
+        component_host_pools[component] = host_pools[s.name]
+
+    format_tag = storage.storage_format_tag()
+    if format_tag is not None:
+        host_pools[owner].storage_format_tag = format_tag
+
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
+        load_cache_event=load_cache_event,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        enable_storage_metrics=enable_storage_metrics,
+        kv_storage=storage,
+    )
+    return StackBuildResult(
+        host_pool_group=host_pool_group,
+        cache_controller=cache_controller,
+        component_host_pools=component_host_pools,
+        sidecars=[c.sidecar_spec() for c in owner_config.sidecars]
+        + _mtp_swa_sidecar_specs(host_pool_group),
+        loads_state_layer_wise=any(s.holds_state for s in sub_pools),
+        pools_desc=" + ".join(str(e.name).upper() for e in entries),
+        device_pool_names=owner_config.pool_names,
+    )
+
+
+def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
+    root_host_pool = build_kv_host_pool(
+        kv_pool=config.root,
+        page_size=config.transfer_page_size,
+        mtp_draft_device_pools=config.packed_draft_device_pools,
+    )
+    return HostPoolGroup(
+        _build_pool_entries(config=config, root_host_pool=root_host_pool)
+    )
+
+
+def _build_sidecar_host_pool(
+    *, config: HostPoolConfig, root: Any, root_host_pool: Any
+) -> DSAIndexerPoolHost | QSAIndexerPoolHost:
+    if config.buffer_info.key_layout is IndexKeyLayout.KEY_ROWS:
+        return _build_qsa_indexer_host_pool(
+            config=config, root_host_pool=root_host_pool
+        )
+    host = DSAIndexerPoolHost(
+        config.buffer_info,
+        layer_mapping=config.device_to_host_layer,
+        target_device_layer_num=root.layer_num,
+        num_host_pages=root_host_pool.page_num,
+        transfer_page_size=root_host_pool.page_size,
+        layout=root_host_pool.layout,
+        buffer_device=root.device,
+        dtype=root.store_dtype,
+        layer_sharded=root.layer_shard_enabled,
+        dcp_size=root_host_pool.dcp_size if dsa_shards_index_k() else 1,
+        dcp_rank=root_host_pool.dcp_rank if dsa_shards_index_k() else 0,
+        allocator_type=_get_allocator_type(),
+    )
+    host.start_layer, host.end_layer = root.start_layer, root.end_layer
+    return host
+
+
+def _build_qsa_indexer_host_pool(
+    *, config: HostPoolConfig, root_host_pool: Any
+) -> QSAIndexerPoolHost:
+    info = config.buffer_info
+    # Compressed rows span several tokens, so the host moves whole KV pages
+    # and indexes buffers by device layer.
+    if (
+        info.compress_ratio == 1
+        or info.page_size != root_host_pool.page_size
+        or any(host != device for device, host in config.device_to_host_layer.items())
+    ):
+        raise ValueError(
+            f"{config.pool_name}: QSA indexer host requires compressed keys on "
+            f"{root_host_pool.page_size}-token pages with every device layer, got "
+            f"compress_ratio={info.compress_ratio}, page_size={info.page_size}, "
+            f"device_to_host_layer={config.device_to_host_layer}"
+        )
+    return QSAIndexerPoolHost(
+        info,
+        num_host_pages=root_host_pool.page_num,
+        layout=root_host_pool.layout,
+        device=root_host_pool.device,
+        pin_memory=root_host_pool.pin_memory,
+        allocator_type=_get_allocator_type(),
+    )
+
+
+def _kv_budget_index_bytes(config: HostPoolGroupConfig) -> int:
+    # Compressed key rows share the KV host budget. DSA indexers sit on top of it.
+    return sum(
+        buffer.nbytes
+        for sidecar in config.sidecars
+        if sidecar.buffer_info.key_layout is IndexKeyLayout.KEY_ROWS
+        for buffer in sidecar.buffer_info.buffers
+    )
+
+
+def _build_pool_entries(
+    *,
+    config: HostPoolGroupConfig,
+    root_host_pool: Any,
+    root_host_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_translate: Optional[Callable[[Any], Any]] = None,
+) -> list[PoolEntry]:
+    """``device_translate`` maps controller ids to rows of ``config.root`` (a
+    unified owner's view), which every entry here indexes."""
+    entries = [
+        build_pool_entry(
+            name=PoolName.KV,
+            host_pool=root_host_pool,
+            device_pool=config.root,
+            layer_mapping=config.layer_mapping,
+            transfer_layer_id_max=config.transfer_layer_id_max,
+            is_anchor=True,
+            host_evict_fn=root_host_evict_fn,
+            packed_draft_device_pools=config.packed_draft_device_pools,
+            device_translate=device_translate,
+        )
+    ]
+    for sidecar in config.sidecars:
+        host_pool = _build_sidecar_host_pool(
+            config=sidecar, root=config.root, root_host_pool=root_host_pool
+        )
+        entries.append(
+            build_pool_entry(
+                name=sidecar.pool_name,
+                host_pool=host_pool,
+                device_pool=config.root,
+                layer_mapping=sidecar.layer_mapping,
+                transfer_layer_id_max=config.transfer_layer_id_max,
+                packed_draft_device_pools=config.packed_draft_device_pools,
+                device_translate=device_translate,
+            )
+        )
+    return entries
+
+
+def _build_mha_mla_host_pool(
+    *,
+    pool: Any,
+    buffer_info: MHABufferInfo | MLABufferInfo,
+    host_to_device_ratio: float,
+    page_size: int,
+    layout: str,
+    allocator_type: str,
+    pool_label: str,
+    host_token_capacity: int | None = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+):
+    is_mha = isinstance(buffer_info, MHABufferInfo)
+    # The global layout is page_first_kv_split only when the target model
+    # uses MLA; that layout is MLA-specific, so MHA draft pools must use
+    # the non-MLA layout (NPU default: page_first_direct).
+    if is_mha and layout == "page_first_kv_split":
+        layout = "page_first_direct"
+
+    kwargs = dict(
+        host_to_device_ratio=host_to_device_ratio,
+        host_size=0,
+        page_size=page_size,
+        layout=layout,
+        allocator_type=allocator_type,
+        pool_label=pool_label,
+        host_token_capacity=host_token_capacity,
+    )
+    if is_mha:
+        host_cls, host_kwargs = _mha_host_inputs(pool, buffer_info)
+        return host_cls(buffer_info, **host_kwargs, **kwargs)
+    return MLATokenToKVPoolHost(
+        buffer_info,
+        device_capacity_tokens=_device_capacity_tokens(pool),
+        start_layer=pool.start_layer,
+        end_layer=pool.end_layer,
+        target_layer_num=pool.layer_num,
+        override_kv_cache_dim=pool.kv_cache_dim,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        write_back_staging=pool.hicache_write_back_staging,
+        **kwargs,
+    )
+
+
+def build_full_draft_pools(
+    *,
+    draft_kv_pool: Any,
+    tree_cache: Any,
+) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+    """Build draft KV and its sidecars, whose indices follow target full KV."""
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    pool = draft_kv_pool
+    inner = pool.layer_router.wrapped_view()
+    if inner is not None:
+        # Hybrid draft runners keep their sole attention layer in this sub-pool.
+        pool = inner
+    if pool.layer_num == 0:
+        return [], []
+
+    controller = tree_cache.cache_controller
+    host_pool_group = controller.mem_pool_host
+    if pool.layer_num > controller.transfer_layer_id_max:
+        raise ValueError("Draft HiCache layers exceed the target transfer stages")
+
+    draft_layer_mapping = {i: i for i in range(pool.layer_num)}
+    config = prepare_host_pool_config(
+        root=draft_kv_pool,
+        full_layer_mapping=draft_layer_mapping,
+        transfer_layer_id_max=pool.layer_num,
+        transfer_page_size=controller.page_size,
+    )
+    if config.root is not pool:
+        raise ValueError(
+            f"{type(draft_kv_pool).__name__} draft does not describe its KV sub-pool"
+        )
+    buffer_info = config.pool_infos[PoolName.KV].buffer_info
+
+    if (
+        isinstance(pool, MLATokenToKVPool)
+        and not pool.dcp_replicated
+        and get_parallel().dcp_enabled
+    ):
+        # A DCP-sharded MLA draft holds only its own rows, like the target.
+        parallel = get_parallel()
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            buffer_info=buffer_info,
+            host_to_device_ratio=host_pool_group.size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+        )
+    else:
+        # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the
+        # virtual loc space, so match the target host's logical_size.
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            buffer_info=buffer_info,
+            host_to_device_ratio=host_pool_group.logical_size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            host_token_capacity=host_pool_group.logical_size,
+        )
+
+    specs = [
+        SidecarPoolSpec(
+            pool_name=PoolName.DRAFT,
+            indices_from_pool=PoolName.KV,
+        )
+    ]
+    entries = [
+        build_pool_entry(
+            name=PoolName.DRAFT,
+            host_pool=draft_host_pool,
+            device_pool=pool,
+            layer_mapping=draft_layer_mapping,
+            transfer_layer_id_max=draft_host_pool.layer_num,
+        )
+    ]
+
+    for sidecar in config.sidecars:
+        indexer_host_pool = _build_sidecar_host_pool(
+            config=sidecar, root=pool, root_host_pool=draft_host_pool
+        )
+        specs.append(SidecarPoolSpec(PoolName.DRAFT_INDEXER, PoolName.KV))
+        entries.append(
+            build_pool_entry(
+                name=PoolName.DRAFT_INDEXER,
+                host_pool=indexer_host_pool,
+                device_pool=pool,
+                layer_mapping=sidecar.layer_mapping,
+                transfer_layer_id_max=pool.layer_num,
+            )
+        )
+
+    return specs, entries
+
+
+def build_swa_draft_pools(
+    *,
+    draft_kv_pool: Any,
+    tree_cache: Any,
+    target_window_host: str,
+) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+    """Build a draft SWA sidecar whose indices follow the target's window,
+    backed up to host pool ``target_window_host`` (`target_window_host_pool`)."""
+    # A pool already on the target's SWA ids is the SWA component itself.
+    draft_swa_pool = (
+        draft_kv_pool
+        if draft_kv_pool.follows_target_swa_ids
+        else draft_kv_pool.swa_kv_pool
+    )
+    if draft_swa_pool is None:
+        raise NotImplementedError(
+            "HiCache draft SWA sidecar requires a non-unified draft SWA pool."
+        )
+    if draft_swa_pool.layer_num == 0:
+        return [], []
+    controller = tree_cache.cache_controller
+    host_pool_group = controller.mem_pool_host
+    target_swa_host_pool = host_pool_group.entry_map[target_window_host].host_pool
+
+    if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
+        _require_single_row_dsv4_swa_pages(
+            logical_page_size=target_swa_host_pool.slot_page_size,
+            physical_page_size=draft_swa_pool.page_size,
+            consumer="DeepSeek-V4 MTP SWA HiCache sidecar",
+        )
+        draft_swa_info = draft_swa_pool.paged_buffer_info()
+        host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.DRAFT_SWA),
+            device_buffers=list(draft_swa_info.buffers),
+            item_bytes=draft_swa_info.page_bytes,
+            num_host_pages=target_swa_host_pool.num_host_pages,
+            slot_page_size=draft_swa_pool.page_size,
+            layout=target_swa_host_pool.layout,
+            allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_region_page_aligned_only(draft_swa_info),
+        )
+    else:
+        host_pool = _build_mha_mla_host_pool(
+            pool=draft_swa_pool,
+            buffer_info=draft_swa_pool.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=target_swa_host_pool.size / draft_swa_pool.size,
+            page_size=target_swa_host_pool.page_size,
+            layout=target_swa_host_pool.layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft_swa",
+        )
+
+    layer_mapping = {i: i for i in range(draft_swa_pool.layer_num)}
+    spec = SidecarPoolSpec(
+        pool_name=PoolName.DRAFT_SWA,
+        indices_from_pool=target_window_host,
+        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+    )
+    entry = build_pool_entry(
+        name=PoolName.DRAFT_SWA,
+        host_pool=host_pool,
+        device_pool=draft_swa_pool,
+        layer_mapping=layer_mapping,
+        transfer_layer_id_max=host_pool.layer_num,
+    )
+    return [spec], [entry]
+
+
+def validate_fused_hicache_draft(
+    *,
+    target_config: Optional[KVCacheConfigurator] = None,
+    draft_device_pools: Optional[tuple[Any, ...]] = None,
+    tree_cache: Any = None,
+) -> None:
+    """Validate fusion at sizing, draft binding, and host registration.
+
+    Sizing supplies only the target config. Draft binding also supplies the
+    device pools; registration supplies the pools and the completed cache so
+    its page envelopes and shared buffer can be checked.
+    """
+    if tree_cache is None:
+        return
+    storage = tree_cache.kv_storage()
+    for pool in draft_device_pools or ():
+        if not storage.holds_view(pool):
+            raise ValueError("fused draft views must share the target storage arena")
+    entries = tree_cache.cache_controller.mem_pool_host.entry_map
+    for name in storage.draft_hosting_sub_pools():
+        entry = entries[storage.host_pool_name(name)]
+        if not isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool):
+            raise ValueError(
+                f"host pool {name!r} must preserve the complete declared entry"
+            )
+
+
+def target_window_host_pool(tree_cache: Any) -> str:
+    """The host pool the target's window backs up to: the static pools'
+    ``swa``, or a unified window sub-pool's own name."""
+    from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    storage = kv_storage_of(tree_cache.req_to_token_pool, allocator)
+    return storage.host_pool_name(window_sub_pool_of(allocator))
+
+
+def build_hicache_draft_sidecars(
+    *,
+    draft_device_pools: tuple[Any, ...],
+    tree_cache: Any,
+) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+    """Compose the full and SWA draft-sidecar paths."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+
+    assert len(draft_device_pools) == 1
+    draft_kv_pool = draft_device_pools[0]
+    if (
+        draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
+        or draft_kv_pool.follows_target_swa_ids
+    ):
+        return build_swa_draft_pools(
+            draft_kv_pool=draft_kv_pool,
+            tree_cache=tree_cache,
+            target_window_host=target_window_host_pool(tree_cache),
+        )
+    return build_full_draft_pools(
+        draft_kv_pool=draft_kv_pool,
+        tree_cache=tree_cache,
+    )
+
+
+_COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
+    ComponentType.FULL: ("full_kv_pool_host", "_full_kv_pool_host"),
+    ComponentType.SWA: ("swa_kv_pool_host", "_swa_kv_pool_host"),
+    ComponentType.MAMBA: ("mamba_pool_host", "_mamba_pool_host"),
+    ComponentType.C128: ("c128_kv_pool_host", "_c128_kv_pool_host"),
+}
+
+
+@dataclass
+class StackBuildResult:
+    host_pool_group: HostPoolGroup
+    cache_controller: HybridCacheController
+    component_host_pools: dict[ComponentType, Any]
+    sidecars: list[SidecarPoolSpec] = field(default_factory=list)
+    # The stack restores Mamba state layer by layer too, so state reads wait
+    # on the KV pool's load-back counter as KV reads do.
+    loads_state_layer_wise: bool = False
+    pools_desc: str = ""
+    device_pool_names: Optional[tuple[PoolName, ...]] = None
+
+
+class StackStrategy:
+    def owns(self, kvcache: Any) -> bool:
+        """Whether this strategy alone assembles the pool's family."""
+        return False
+
+    def matches(self, kvcache: Any, components: set[ComponentType]) -> bool:
+        raise NotImplementedError
+
+    def build_direct_linker_pool_group(
+        self,
+        *,
+        kvcache: Any,
+        params: CacheInitParams,
+        page_size: int,
+    ):
+        raise ValueError(
+            "The selected hybrid pool strategy does not support the direct "
+            f"external linker: {type(self).__name__}."
+        )
+
+    def build(
+        self,
+        *,
+        cache: UnifiedRadixCache,
+        kvcache: Any,
+        params: CacheInitParams,
+        server_args: ServerArgs,
+        load_cache_event,
+        storage_backend: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
+        prefetch_threshold: int = 256,
+        model_name: Optional[str] = None,
+        enable_storage_metrics: bool = False,
+    ) -> StackBuildResult:
+        raise NotImplementedError
+
+
+def _delegate_c128_host_evict(cache, n: int) -> int:
+    """Delegate C128 host pressure to FULL leaf eviction.
+
+    For example, ``n`` C128 slots request ``n * 128`` FULL tokens."""
+    return cache.evict_host(n * 128, ComponentType.FULL)
+
+
+class _DeepSeekV4Strategy(StackStrategy):
+    def owns(self, kvcache):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        return isinstance(kvcache, DeepSeekV4TokenToKVPool)
+
+    def matches(self, kvcache, components):
+        if not self.owns(kvcache):
+            return False
+        return components in (
+            {ComponentType.FULL, ComponentType.SWA},
+            {ComponentType.FULL, ComponentType.SWA, ComponentType.C128},
+        ) or (components == {ComponentType.FULL} and kvcache.swa_kv_pool is None)
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_deepseek_v4_device_pool_group,
+        )
+
+        return _build_deepseek_v4_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        # NPU drives C128 as an independent tree component with its own allocator.
+        independent_c128 = ComponentType.C128 in cache.components
+        host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
+            params=params,
+            kvcache=kvcache,
+            load_cache_event=load_cache_event,
+            storage_backend=storage_backend,
+            host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
+            # _delegate_c128_host_evict converts C128 slots to FULL tokens.
+            host_c128_evict_fn=(
+                (lambda n: _delegate_c128_host_evict(cache, n))
+                if independent_c128
+                else None
+            ),
+            c128_attn_allocator=(
+                params.token_to_kv_pool_allocator.c128_attn_allocator
+                if independent_c128
+                else None
+            ),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        # NPU drives C128 as an independent tree component, so adding a KV-derived
+        # sidecar would duplicate transfers. Add that sidecar only on GPU.
+        # The *_ROPE entries only resolve under unified fp8 kv; entry_map filters
+        # them out everywhere else.
+        _sidecar_srcs = [
+            (PoolName.DEEPSEEK_V4_C1, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C1_INDEXER, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C2, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C2_INDEXER, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4_ROPE, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
+            (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),
+            *(
+                (region.pool_name, PoolName.KV)
+                for region in kvcache.extra_host_regions()
+            ),
+        ]
+        if ComponentType.C128 not in cache.components:
+            _sidecar_srcs.append((PoolName.DEEPSEEK_V4_C128, PoolName.KV))
+            _sidecar_srcs.append((PoolName.DEEPSEEK_V4_C128_ROPE, PoolName.KV))
+        sidecars = [
+            SidecarPoolSpec(
+                pool_name=name,
+                indices_from_pool=src,
+                hit_policy=(
+                    PoolHitPolicy.TRAILING_PAGES
+                    if src == PoolName.SWA
+                    else PoolHitPolicy.ALL_PAGES
+                ),
+            )
+            for name, src in _sidecar_srcs
+            if name in host_pool_group.entry_map
+        ]
+        component_host_pools = {
+            ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+        }
+        if PoolName.SWA in host_pool_group.entry_map:
+            component_host_pools[ComponentType.SWA] = host_pool_group.get_pool(
+                PoolName.SWA
+            )
+        if (
+            ComponentType.C128 in cache.components
+            and PoolName.DEEPSEEK_V4_C128 in host_pool_group.entry_map
+        ):
+            component_host_pools[ComponentType.C128] = host_pool_group.get_pool(
+                PoolName.DEEPSEEK_V4_C128
+            )
+
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools=component_host_pools,
+            sidecars=sidecars,
+            pools_desc="KV + SWA + DeepSeekV4 sidecars",
+        )
+
+
+class _MambaStrategy(StackStrategy):
+    def matches(self, kvcache, components):
+        return kvcache.layer_router.wrapped_view() is not None and components == {
+            ComponentType.FULL,
+            ComponentType.MAMBA,
+        }
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_mamba_device_pool_group,
+        )
+
+        return _build_mamba_device_pool_group(kvcache, params, page_size)
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        full_layer_mapping = _stage_local_layer_mapping(
+            kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+        )
+        host_pool_group, cache_controller, config = build_hybrid_mamba_stack(
+            params=params,
+            kv_pool=kvcache,
+            mamba_pool=params.token_to_kv_pool_allocator.state.pool,
+            full_layer_mapping=full_layer_mapping,
+            start_layer=kvcache.start_layer,
+            load_cache_event=load_cache_event,
+            storage_backend=storage_backend,
+            host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
+            device_mamba_evict_fn=lambda n: _evict_mamba_for_device_alloc(cache, n),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={
+                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+                ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
+            },
+            sidecars=[c.sidecar_spec() for c in config.sidecars],
+            device_pool_names=config.pool_names,
+            loads_state_layer_wise=True,
+            pools_desc=" + ".join(
+                [name.value.upper() for name in config.pool_names] + ["MAMBA"]
+            ),
+        )
+
+
+def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
+    full = {
+        gid - kvcache.start_layer: lid
+        for gid, (lid, is_swa) in kvcache.layers_mapping.items()
+        if not is_swa
+    }
+    swa = {
+        gid - kvcache.start_layer: lid
+        for gid, (lid, is_swa) in kvcache.layers_mapping.items()
+        if is_swa
+    }
+    return full, swa
+
+
+class _SwaStrategy(StackStrategy):
+    def matches(self, kvcache, components):
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+
+        return kvcache.layer_router.sub_pool(
+            IdSpaceKind.SLIDING_WINDOW
+        ) is not None and components == {ComponentType.FULL, ComponentType.SWA}
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
+        host_pool_group, cache_controller = build_hybrid_swa_stack(
+            params=params,
+            full_kv_pool=kvcache.full_kv_pool,
+            swa_kv_pool=kvcache.swa_kv_pool,
+            full_layer_mapping=full_layer_mapping,
+            swa_layer_mapping=swa_layer_mapping,
+            load_cache_event=load_cache_event,
+            storage_backend=storage_backend,
+            host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={
+                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+                ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
+            },
+            pools_desc="Full + SWA",
+            sidecars=_mtp_swa_sidecar_specs(host_pool_group),
+        )
+
+
+class _MambaSwaStrategy(StackStrategy):
+    def matches(self, kvcache, components):
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+
+        return kvcache.layer_router.sub_pool(
+            IdSpaceKind.SLIDING_WINDOW
+        ) is not None and components == {
+            ComponentType.FULL,
+            ComponentType.SWA,
+            ComponentType.MAMBA,
+        }
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_mamba_swa_device_pool_group,
+        )
+
+        return _build_mamba_swa_device_pool_group(kvcache, params, page_size)
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
+        host_pool_group, cache_controller = build_hybrid_mamba_swa_stack(
+            params=params,
+            full_kv_pool=kvcache.full_kv_pool,
+            swa_kv_pool=kvcache.swa_kv_pool,
+            mamba_pool=params.token_to_kv_pool_allocator.state.pool,
+            full_layer_mapping=full_layer_mapping,
+            swa_layer_mapping=swa_layer_mapping,
+            start_layer=kvcache.start_layer,
+            load_cache_event=load_cache_event,
+            storage_backend=storage_backend,
+            host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
+            host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
+            device_mamba_evict_fn=lambda n: _evict_mamba_for_device_alloc(cache, n),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={
+                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+                ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
+                ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
+            },
+            loads_state_layer_wise=True,
+            pools_desc="KV + SWA + MAMBA",
+            sidecars=_mtp_swa_sidecar_specs(host_pool_group),
+        )
+
+
+class _MiniMaxSparseStrategy(StackStrategy):
+    def owns(self, kvcache):
+        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
+        return isinstance(kvcache, MiniMaxSparseKVPool)
+
+    def matches(self, kvcache, components):
+        return self.owns(kvcache) and components == {ComponentType.FULL}
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_minimax_m3_nvfp4_device_pool_group,
+        )
+
+        return _build_minimax_m3_nvfp4_device_pool_group(kvcache, params, page_size)
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        host_pool_group, cache_controller = build_minimax_sparse_hicache_stack(
+            params=params,
+            sparse_pool=kvcache,
+            load_cache_event=load_cache_event,
+            storage_backend=storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        sidecars = []
+        pools_desc = "KV"
+        if kvcache.index_k_pool is not None:
+            sidecars.append(
+                SidecarPoolSpec(
+                    pool_name=PoolName.INDEXER,
+                    indices_from_pool=PoolName.KV,
+                )
+            )
+            pools_desc = "KV + INDEXER(k-only)"
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={
+                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+            },
+            sidecars=sidecars,
+            pools_desc=pools_desc,
+        )
+
+
+class _KvStrategy(StackStrategy):
+    """One KV pool plus the index sidecars its infos declare."""
+
+    def matches(self, kvcache, components):
+        # A pool wrapping sub-pool views has a strategy of its own.
+        router = kvcache.layer_router
+        if len(router.sub_pools()) > 1 or router.wrapped_view() is not None:
+            return False
+        if any(strategy.owns(kvcache) for strategy in _STRATEGIES):
+            return False
+        return components == {ComponentType.FULL}
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_kv_device_pool_group,
+        )
+
+        return _build_kv_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        config = prepare_host_pool_config(
+            root=kvcache,
+            full_layer_mapping={i: i for i in range(kvcache.layer_num)},
+            transfer_layer_id_max=kvcache.layer_num,
+            transfer_page_size=params.page_size,
+            packed_draft_device_pools=params.mtp_draft_device_pools,
+        )
+        host_pool_group = build_host_pool_group(config=config)
+        cache_controller = _build_cache_controller(
+            params=params,
+            host_pool_group=host_pool_group,
+            # The controller adds packed draft transfers after target layers.
+            transfer_layer_id_max=kvcache.layer_num,
+            load_cache_event=load_cache_event,
+            storage_backend=storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={
+                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+            },
+            sidecars=[c.sidecar_spec() for c in config.sidecars],
+            pools_desc=" + ".join(name.value.upper() for name in config.pool_names),
+            device_pool_names=config.pool_names,
+        )
+
+
+# Resolved first-to-last; _KvStrategy is the catch-all for single KV pools.
+_STRATEGIES: list[StackStrategy] = [
+    _DeepSeekV4Strategy(),
+    _MambaStrategy(),
+    _SwaStrategy(),
+    _MambaSwaStrategy(),
+    _MiniMaxSparseStrategy(),
+    _KvStrategy(),
+]
+
+
+def register_stack_strategy(strategy: StackStrategy) -> None:
+    """Prepend a strategy so downstream forks can plug in (kvcache, components)
+    combinations not in the built-in list."""
+    _STRATEGIES.insert(0, strategy)
+
+
+def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrategy:
+    for strategy in _STRATEGIES:
+        if strategy.matches(kvcache, components):
+            return strategy
+    raise AssertionError(
+        f"No matching HiCache strategy for kvcache={type(kvcache).__name__}, "
+        f"components={sorted(c.name for c in components)}"
+    )
+
+
+def _check_device_pools_present(
+    *, kvcache: Any, result: StackBuildResult, strategy: StackStrategy
+) -> None:
+    if result.device_pool_names is None:
+        return
+    missing = [
+        name.value
+        for name in result.device_pool_names
+        if name not in result.host_pool_group.entry_map
+    ]
+    if missing:
+        raise ValueError(
+            f"{type(kvcache).__name__} exposes device pools {missing} that "
+            f"{type(strategy).__name__} did not assemble"
+        )
+
+
+def _apply_stack_result(
+    cache: UnifiedRadixCache,
+    kvcache: Any,
+    params: CacheInitParams,
+    result: StackBuildResult,
+) -> None:
+    cache.host_pool_group = result.host_pool_group
+    cache.cache_controller = result.cache_controller
+
+    for ct, host_pool in result.component_host_pools.items():
+        if ct in _COMPONENT_HOST_ATTR:
+            cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]
+            setattr(cache, cache_attr, host_pool)
+        else:
+            # A further window slot's host pool lives on its component only.
+            assert ct in cache.window_slots(), ct
+            component_attr = "_swa_kv_pool_host"
+        setattr(cache.components[ct], component_attr, host_pool)
+
+    for sidecar in result.sidecars:
+        cache.register_sidecar_pool(sidecar)
+
+    kvcache.register_layer_transfer_counter(result.cache_controller.layer_done_counter)
+    if isinstance(kvcache, PageInterleaveKVPoolMixin):
+        # Packed draft KV and indexer loads finish before target layer zero is
+        # ready. Their independent gather streams must consume that same event.
+        for draft_pool in params.mtp_draft_device_pools:
+            draft_pool.register_layer_transfer_counter(
+                result.cache_controller.layer_done_counter
+            )
+    if result.loads_state_layer_wise:
+        kvcache.layer_router.load_parts_layer_wise()
+
+    logger.info(
+        "Attached hybrid pool stack to UnifiedRadixCache: pools=%s, transfer_layer_id_max=%s",
+        result.pools_desc,
+        result.cache_controller.transfer_layer_id_max,
+    )
+
+
+def attach_hybrid_pool_to_unified_cache(
+    cache: UnifiedRadixCache,
+    params: CacheInitParams,
+    server_args: ServerArgs,
+    *,
+    load_cache_event,
+    storage_backend: Optional[str] = None,
+    storage_extra_config: Optional[dict] = None,
+    storage_prefetch_threshold: int = 256,
+) -> None:
+    """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+    try:
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        storage = kv_storage_of(
+            params.req_to_token_pool, params.token_to_kv_pool_allocator
+        )
+        if isinstance(storage, KVStorage):
+            # A unified pool: one host pool per sub-pool of its plan.
+            result = build_unified_host_stack(
+                storage=storage,
+                params=params,
+                cache=cache,
+                load_cache_event=load_cache_event,
+                storage_backend=storage_backend,
+                storage_backend_extra_config=storage_extra_config,
+                prefetch_threshold=storage_prefetch_threshold,
+                model_name=get_serving().served_model_name,
+                enable_storage_metrics=cache._enable_metrics_flag,
+            )
+            assert set(result.component_host_pools) == set(cache.components), (
+                f"unified host pools {sorted(result.component_host_pools)} do not "
+                f"match the tree components {sorted(cache.components)}"
+            )
+        else:
+            components = set(cache.components.keys())
+            strategy = _select_strategy(kvcache, components)
+            result = strategy.build(
+                cache=cache,
+                kvcache=kvcache,
+                params=params,
+                server_args=server_args,
+                load_cache_event=load_cache_event,
+                storage_backend=storage_backend,
+                storage_backend_extra_config=storage_extra_config,
+                prefetch_threshold=storage_prefetch_threshold,
+                model_name=get_serving().served_model_name,
+                enable_storage_metrics=cache._enable_metrics_flag,
+            )
+            _check_device_pools_present(
+                kvcache=kvcache, result=result, strategy=strategy
+            )
+        _apply_stack_result(cache, kvcache, params, result)
+    except Exception:
+        logger.exception("attach_hybrid_pool_to_unified_cache failed")
+        raise
+
+
+def _nvfp4_main_host_size(
+    *, params: CacheInitParams, main_pool: Any, index_pool: Any
+) -> float:
+    """The --hicache-size share of NVFP4 main KV once index and drafts are paid."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
+    from sglang.srt.mem_cache.pool_host.common import get_allocator_class_from_storage
+
+    memory = get_memory()
+    if memory.hicache_io_backend not in ("kernel", "direct"):
+        raise ValueError("M3.1 NVFP4 HiCache requires kernel or direct IO")
+    if memory.hicache_mem_layout not in (
+        "layer_first",
+        "page_first",
+        "page_first_direct",
+    ):
+        raise ValueError("Unsupported M3.1 NVFP4 HiCache memory layout")
+    main_bytes = sum(main_pool.get_kv_size_bytes()) / main_pool.total_slots
+    index_bytes = sum(index_pool.get_kv_size_bytes()) / index_pool.total_slots
+    draft_byte_rates = []
+    for draft_pool in params.sidecar_draft_device_pools:
+        if (
+            type(draft_pool) is not MHATokenToKVPool
+            or draft_pool.size != main_pool.size
+            or draft_pool.page_size != params.page_size
+            or draft_pool.start_layer != 0
+            or draft_pool.layer_num > main_pool.layer_num
+        ):
+            raise ValueError(
+                "M3.1 NVFP4 HiCache requires a dense MHA draft with matching "
+                "token capacity/page size and at most as many layers as the target"
+            )
+        draft_byte_rates.append(
+            sum(draft_pool.get_kv_size_bytes())
+            / (draft_pool.size + draft_pool.page_size)
+        )
+    total_bytes = main_bytes + index_bytes + sum(draft_byte_rates)
+    # --hicache-size covers main KV, index payload/scales and draft sidecars.
+    host_size = memory.hicache_size * main_bytes / total_bytes
+    slots = (
+        int(host_size * 1e9 // main_bytes)
+        if host_size > 0
+        else int(main_pool.size * memory.hicache_ratio)
+    )
+    slots = (slots // params.page_size + 1) * params.page_size
+    device = main_pool.get_device_pool_infos()[0].buffer_info.slab.device
+    allocator = get_allocator_class_from_storage(_get_allocator_type())
+    mapping_lengths = [
+        int(slots * rate) for rate in (main_bytes, index_bytes, *draft_byte_rates)
+    ]
+    # Peek only: the pools bill their own mappings at construction, so booking
+    # the aggregate here would charge the shared scope twice.
+    allocation_bytes, available_bytes = host_memory_preflight(
+        mapping_lengths, allocator, device, book=False
+    )
+    if allocation_bytes > available_bytes:
+        raise ValueError(
+            "Not enough host memory for M3.1 NVFP4 KV, index and draft caches"
+        )
+    return host_size
+
+
+def build_minimax_sparse_hicache_stack(
+    *,
+    params: CacheInitParams,
+    sparse_pool: Any,
+    load_cache_event,
+    storage_backend: Optional[str],
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    enable_storage_metrics: bool = False,
+) -> tuple[HostPoolGroup, HybridCacheController]:
+    """KV (main_pool) + INDEXER (index_k_pool) host stack for MiniMax M3 sparse."""
+    from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
+        MiniMaxM3Nvfp4IndexKPoolHost,
+        MiniMaxM3Nvfp4MainKVPoolHost,
+    )
+
+    # PP>1 stays gated pending end-to-end validation of the sparse host path.
+    if params.pp_size > 1:
+        raise NotImplementedError(
+            "MiniMax-M3 sparse HiCache does not support pipeline parallelism "
+            "(pp_size>1) yet."
+        )
+    # The Unified-tree strategy path does not reject value-bearing index layers.
+    if sparse_pool.index_kv_pool is not None:
+        raise ValueError(
+            "MiniMax sparse HiCache currently supports index-k-only sparse layers; "
+            "index_kv_pool (value-bearing) layers are not cached/restored yet."
+        )
+    memory = get_memory()
+    main_pool = sparse_pool.main_pool
+    index_k_pool = sparse_pool.index_k_pool
+    (main_info,) = main_pool.get_device_pool_infos()
+    start_layer = main_pool.start_layer
+    # Stage-local transfer ids; values index the host pool's local layer buffer.
+    transfer_layer_id_max = main_pool.layer_num
+
+    if isinstance(main_info.buffer_info, PageRowBufferInfo):
+        kv_host_pool = MiniMaxM3Nvfp4MainKVPoolHost(
+            main_info.buffer_info,
+            memory.hicache_ratio,
+            _nvfp4_main_host_size(
+                params=params, main_pool=main_pool, index_pool=index_k_pool
+            ),
+            params.page_size,
+            memory.hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            device_capacity_tokens=main_pool.size,
+            start_layer=main_pool.start_layer,
+            end_layer=main_pool.end_layer,
+        )
+    else:
+        kv_host_pool = build_kv_host_pool(kv_pool=main_pool, page_size=params.page_size)
+    entries = [
+        build_pool_entry(
+            name=PoolName.KV,
+            host_pool=kv_host_pool,
+            device_pool=main_pool,
+            layer_mapping={layer: layer for layer in range(transfer_layer_id_max)},
+            transfer_layer_id_max=transfer_layer_id_max,
+            is_anchor=True,
+        ),
+    ]
+
+    if index_k_pool is not None:
+        (index_info,) = index_k_pool.get_device_pool_infos()
+        if isinstance(index_info.buffer_info, PageRowBufferInfo):
+            index_host_pool = MiniMaxM3Nvfp4IndexKPoolHost(
+                index_info.buffer_info,
+                kv_host_pool,
+                memory.hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+                start_layer=index_k_pool.start_layer,
+                end_layer=index_k_pool.end_layer,
+            )
+        else:
+            index_host_pool = MHATokenToKOnlyPoolHost(
+                buffer_info=index_info.buffer_info,
+                anchor_host=kv_host_pool,
+                layout=memory.hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+            )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=index_host_pool,
+                device_pool=index_k_pool,
+                layer_mapping={
+                    layer - start_layer: index
+                    for index, layer in enumerate(index_info.layer_ids)
+                },
+                transfer_layer_id_max=transfer_layer_id_max,
+            )
+        )
+
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
+        load_cache_event=load_cache_event,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    return host_pool_group, cache_controller

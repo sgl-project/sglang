@@ -1,0 +1,508 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""DetokenizerManager is a process that detokenizes the token ids."""
+
+import logging
+import signal
+import traceback
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple, Union
+
+import psutil
+import pybase64
+import setproctitle
+import torch
+import zmq
+
+from sglang.srt.beam_search.output import (
+    decode_beam_search_output,
+    is_beam_search_batch,
+)
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.kv_canary.perturb.detokenizer import (
+    maybe_perturb_batch_token_id_out,
+)
+from sglang.srt.managers.incremental_detokenize import (
+    DETOKENIZER_MAX_STATES,
+    DetokenizeHeader,
+    DetokenizeState,
+    DetokenizeStateTable,
+)
+from sglang.srt.managers.io_struct import (
+    BatchEmbeddingOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
+    ConfigureLoggingReq,
+    DetokenizeReleaseReq,
+    FreezeGCReq,
+    row_output_ids,
+    sock_recv,
+    sock_send,
+)
+from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.parser.response_template import tool_close_token_ids
+from sglang.srt.plugins import load_plugins
+from sglang.srt.runtime_context import (
+    get_device,
+    get_model,
+    get_observability,
+    get_serving,
+    publish,
+)
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
+from sglang.srt.utils.common import TypeBasedDispatcher
+from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
+from sglang.srt.utils.watchdog import Watchdog
+
+logger = logging.getLogger(__name__)
+
+
+class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+    """DetokenizerManager is a process that detokenizes the token ids."""
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+    ):
+        # Init inter-process communication
+        self.init_ipc_channels(port_args, server_args)
+
+        # Init tokenizer
+        self.init_tokenizer(server_args)
+
+        # Init running status
+        self.init_running_status(server_args)
+
+        # Init dispatcher
+        self.init_request_dispatcher()
+
+    def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
+        context = zmq.Context(2)
+        self.recv_from_scheduler = get_zmq_socket(
+            context, zmq.PULL, port_args.detokenizer_ipc_name, True
+        )
+        # In multi-tokenizer mode, results are pushed back to each tokenizer worker
+        # directly via SocketMapping inside multi_http_worker_event_loop, so the
+        # single send_to_tokenizer socket is unused.
+        if get_serving().tokenizer_worker_num == 1:
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
+
+    def init_tokenizer(self, server_args: ServerArgs):
+        if get_serving().skip_tokenizer_init:
+            self.tokenizer = None
+            self.vocab_size = None
+        else:
+            self.tokenizer = get_tokenizer(
+                get_serving().tokenizer_path,
+                tokenizer_mode=get_serving().tokenizer_mode,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=get_model().revision,
+                tokenizer_backend=get_serving().tokenizer_backend,
+            )
+            try:
+                self.vocab_size = len(self.tokenizer)
+            except TypeError:
+                self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
+
+    def init_running_status(self, server_args: ServerArgs):
+        self.detokenize_state_table = DetokenizeStateTable(
+            capacity=DETOKENIZER_MAX_STATES
+        )
+        self.disable_tokenizer_batch_decode = (
+            get_serving().disable_tokenizer_batch_decode
+        )
+        self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
+        self.tool_close_token_ids = tool_close_token_ids(
+            get_serving().tool_call_parser, self.tokenizer
+        )
+
+        self.soft_watchdog = Watchdog.create(
+            debug_name="DetokenizerManager",
+            watchdog_timeout=get_device().soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
+        )
+
+        if get_observability().enable_metrics:
+            start_cpu_monitor_thread("detokenizer")
+
+    def init_request_dispatcher(self):
+        self._request_dispatcher = TypeBasedDispatcher(
+            [
+                (BatchEmbeddingOutput, self.handle_batch_embedding_out),
+                (BatchTokenIDOutput, self.handle_batch_token_id_out),
+                (DetokenizeReleaseReq, self.handle_detokenize_release_req),
+                (FreezeGCReq, self.handle_freeze_gc_req),
+                (ConfigureLoggingReq, self.handle_configure_logging_req),
+            ]
+        )
+
+    def event_loop(self):
+        """The event loop that handles requests"""
+        while True:
+            with self.soft_watchdog.disable():
+                recv_obj = sock_recv(self.recv_from_scheduler)
+            output = self._request_dispatcher(recv_obj)
+            if output is not None:
+                sock_send(self.send_to_tokenizer, output)
+            self.soft_watchdog.feed()
+
+    def trim_matched_stop(
+        self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
+    ):
+        if not finished_reason:
+            return output
+
+        matched = finished_reason.get("matched", None)
+        if matched is None:
+            return output
+
+        # TODO(lmzheng): handle the case where multiple stop strs are hit
+
+        # Trim stop str.
+        if isinstance(matched, str) and isinstance(output, str):
+            pos = output.find(matched)
+            if pos == -1:
+                return output
+            end = pos + len(matched)
+            return output[:end] if no_stop_trim else output[:pos]
+
+        # Trim stop token.
+        if isinstance(matched, int) and isinstance(output, list):
+            if no_stop_trim:
+                return output
+            # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
+            if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
+                return output
+            if output[-1] in self.tool_close_token_ids:
+                return output
+            assert len(output) > 0
+            # NOTE: We can always assume the last token is the matched stop token
+            return output[:-1]
+        return output
+
+    def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOutput):
+        # If it is embedding model, no detokenization is needed.
+        return recv_obj
+
+    def _grouped_batch_decode(
+        self,
+        ids_list: List[List[int]],
+        skip_list: List[bool],
+        space_list: List[bool],
+    ) -> List[str]:
+        """Batch decode with grouping by (skip_special_tokens, spaces_between_special_tokens)."""
+        n = len(ids_list)
+        if n == 0:
+            return []
+
+        # Empty token spans decode to "" but tokenizer.batch_decode (and the
+        # slow per-row decode_without_hf_kwargs path) still pays per-row
+        # overhead; under high-concurrency streaming this adds up. Filter
+        # empties out, decode the rest, then scatter back.
+        keep_idx: Optional[List[int]] = None
+        if not all(ids_list):
+            keep_idx = [i for i, ids in enumerate(ids_list) if ids]
+            if not keep_idx:
+                return [""] * n
+            ids_list = [ids_list[i] for i in keep_idx]
+            skip_list = [skip_list[i] for i in keep_idx]
+            space_list = [space_list[i] for i in keep_idx]
+
+        if not getattr(self.tokenizer, "is_fast", False):
+            decoded = [
+                decode_without_hf_kwargs(self.tokenizer, ids, skip)
+                for ids, skip in zip(ids_list, skip_list)
+            ]
+        else:
+            # fast path: all rows share the same (skip, space) flags.
+            first_skip, first_space = skip_list[0], space_list[0]
+            if all(
+                s == first_skip and sp == first_space
+                for s, sp in zip(skip_list, space_list)
+            ):
+                decoded = self.tokenizer.batch_decode(
+                    ids_list,
+                    skip_special_tokens=first_skip,
+                    spaces_between_special_tokens=first_space,
+                )
+            else:
+                # Group indices by (skip, space) tuple and decode each group.
+                groups: Dict[Tuple[bool, bool], List[int]] = defaultdict(list)
+                for idx, (skip, space) in enumerate(zip(skip_list, space_list)):
+                    groups[(skip, space)].append(idx)
+
+                decoded = [""] * len(ids_list)
+                for (skip, space), indices in groups.items():
+                    group_decoded = self.tokenizer.batch_decode(
+                        [ids_list[idx] for idx in indices],
+                        skip_special_tokens=skip,
+                        spaces_between_special_tokens=space,
+                    )
+                    for idx, text in zip(indices, group_decoded):
+                        decoded[idx] = text
+
+        if keep_idx is None:
+            return decoded
+        results = [""] * n
+        for i, text in zip(keep_idx, decoded):
+            results[i] = text
+        return results
+
+    def _update_detokenize_states(
+        self, recv_obj: BatchTokenIDOutput
+    ) -> List[Optional[DetokenizeState]]:
+        vocab_size = self.vocab_size
+        headers = recv_obj.detokenize_headers
+        beam_outputs = recv_obj.beam_search_output
+        states = []
+        for i, rid in enumerate(recv_obj.rids):
+            header = None if headers is None else headers[i]
+            if header is not None:
+                s = self.detokenize_state_table.start(
+                    rid=rid, header=header, vocab_size=vocab_size
+                )
+            elif (s := self.detokenize_state_table.get(rid)) is None:
+                logger.warning(
+                    f"Dropped the text of an output for {rid=}, which has no detokenize "
+                    "state: it was evicted, or already released when the request "
+                    "ended outside the output stream. The detokenizer keeps at most "
+                    f"SGLANG_DETOKENIZER_MAX_STATES={DETOKENIZER_MAX_STATES} states. "
+                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                )
+            if s is not None:
+                s.append_row(
+                    rid=rid,
+                    output_ids=row_output_ids(recv_obj, i),
+                    completion_tokens=recv_obj.completion_tokens[i],
+                    is_beam=beam_outputs is not None and beam_outputs[i] is not None,
+                    vocab_size=vocab_size,
+                )
+            states.append(s)
+        return states
+
+    def _decode_batch_token_id_output(
+        self, recv_obj: BatchTokenIDOutput, states: List[Optional[DetokenizeState]]
+    ):
+        bs = len(recv_obj.rids)
+
+        read_ids, surr_ids, skip_list, space_list = [], [], [], []
+        for i, s in enumerate(states):
+            if s is None:
+                # Empty ids decode to "", whatever the flags.
+                read_ids.append([])
+                surr_ids.append([])
+                skip_list.append(True)
+                space_list.append(True)
+                continue
+            row_read_ids, row_surr_ids = s.decode_inputs(
+                finished_reason=recv_obj.finished_reasons[i],
+                trim_matched_stop=self.trim_matched_stop,
+            )
+            read_ids.append(row_read_ids)
+            surr_ids.append(row_surr_ids)
+            skip_list.append(s.header.skip_special_tokens)
+            space_list.append(s.header.spaces_between_special_tokens)
+
+        # Decode token ids to strings
+        if not self.disable_tokenizer_batch_decode:
+            surr_texts = self._grouped_batch_decode(surr_ids, skip_list, space_list)
+            read_texts = self._grouped_batch_decode(read_ids, skip_list, space_list)
+        else:
+            # Do not use batch decode to prevent some detokenization edge cases (e.g., gpt-oss).
+            surr_texts = [
+                self.tokenizer.decode(
+                    surr, skip_special_tokens=skip, spaces_between_special_tokens=space
+                )
+                for surr, skip, space in zip(surr_ids, skip_list, space_list)
+            ]
+            read_texts = [
+                self.tokenizer.decode(
+                    read, skip_special_tokens=skip, spaces_between_special_tokens=space
+                )
+                for read, skip, space in zip(read_ids, skip_list, space_list)
+            ]
+
+        # Incremental decoding
+        output_strs = []
+        for i in range(bs):
+            s = states[i]
+            if s is None:
+                output_strs.append("")
+                continue
+            finished_reason = recv_obj.finished_reasons[i]
+            if finished_reason is not None:
+                self.detokenize_state_table.release(recv_obj.rids[i])
+            output_strs.append(
+                s.step(
+                    read_text=read_texts[i],
+                    surr_text=surr_texts[i],
+                    finished_reason=finished_reason,
+                    trim_matched_stop=self.trim_matched_stop,
+                )
+            )
+
+        return output_strs
+
+    @staticmethod
+    def _b64_encode_per_request(
+        data_list: Optional[List[Optional[torch.Tensor]]],
+    ) -> Optional[List[Optional[str]]]:
+        """Encode a per-request list of tensors as base64 strings, off the
+        tokenizer hot path. Returns None when the input is None; per-item None
+        stays None.
+        """
+        if data_list is None:
+            return None
+        return [
+            (
+                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
+                if item is not None
+                else None
+            )
+            for item in data_list
+        ]
+
+    @staticmethod
+    def _route_rows(
+        recv_obj: BatchTokenIDOutput, headers: List[Optional[DetokenizeHeader]]
+    ) -> List[Optional[str]]:
+        ipcs = [
+            None if header is None else header.http_worker_ipc for header in headers
+        ]
+        own_ipcs = recv_obj.http_worker_ipcs
+        if own_ipcs is not None:
+            # A row's own route wins: the stored header may be missing (evicted)
+            # or another request's (one rid in flight on two workers).
+            for i, ipc in enumerate(own_ipcs):
+                if ipc is not None:
+                    ipcs[i] = ipc
+        return ipcs
+
+    def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        maybe_perturb_batch_token_id_out(recv_obj)
+        states = self._update_detokenize_states(recv_obj)
+        headers = [None if s is None else s.header for s in states]
+        # Beam decoding is additive: a batch may mix beam leaders with normal
+        # requests, so every item still goes through the standard decode.
+        if is_beam_search_batch(recv_obj):
+            decode_beam_search_output(
+                recv_obj,
+                headers,
+                tokenizer=self.tokenizer,
+                disable_batch_decode=self.disable_tokenizer_batch_decode,
+                trim_matched_stop=self.trim_matched_stop,
+            )
+        # If handling idle batch, set output_strs to [].
+        output_strs = (
+            self._decode_batch_token_id_output(recv_obj, states)
+            if len(recv_obj.rids) > 0
+            else []
+        )
+        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+        indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
+        return BatchStrOutput(
+            rids=recv_obj.rids,
+            http_worker_ipcs=self._route_rows(recv_obj, headers),
+            finished_reasons=recv_obj.finished_reasons,
+            output_strs=output_strs,
+            output_ids_flat=recv_obj.output_ids_flat,
+            output_ids_offsets=recv_obj.output_ids_offsets,
+            reasoning_tokens=recv_obj.reasoning_tokens,
+            completion_tokens=recv_obj.completion_tokens,
+            request_stats=recv_obj.request_stats,
+            spec_verify_ct=recv_obj.spec_verify_ct,
+            spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
+            spec_num_block_accept_tokens=recv_obj.spec_num_block_accept_tokens,
+            spec_num_cap_tokens=recv_obj.spec_num_cap_tokens,
+            spec_correct_drafts_histogram=recv_obj.spec_correct_drafts_histogram,
+            spec_cap_lens_histogram=recv_obj.spec_cap_lens_histogram,
+            input_token_logprobs_val=recv_obj.input_token_logprobs_val,
+            input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
+            output_token_logprobs_val=recv_obj.output_token_logprobs_val,
+            output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
+            input_top_logprobs_val=recv_obj.input_top_logprobs_val,
+            input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
+            input_top_logprobs_val_flat=recv_obj.input_top_logprobs_val_flat,
+            input_top_logprobs_idx_flat=recv_obj.input_top_logprobs_idx_flat,
+            input_top_logprobs_flat_null_prefix=recv_obj.input_top_logprobs_flat_null_prefix,
+            output_top_logprobs_val=recv_obj.output_top_logprobs_val,
+            output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
+            input_token_ids_logprobs_val=recv_obj.input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=recv_obj.input_token_ids_logprobs_idx,
+            output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
+            output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+            output_token_entropy_val=recv_obj.output_token_entropy_val,
+            output_token_sampling_mask=recv_obj.output_token_sampling_mask,
+            output_hidden_states=recv_obj.output_hidden_states,
+            routed_experts=routed_experts,
+            indexer_topk=indexer_topk,
+            customized_info=recv_obj.customized_info,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
+            weight_versions=recv_obj.weight_versions,
+            prefill_weight_versions=recv_obj.prefill_weight_versions,
+            token_steps=recv_obj.token_steps,
+            beam_search_output=recv_obj.beam_search_output,
+            dp_ranks=recv_obj.dp_ranks,
+        )
+
+    def handle_detokenize_release_req(self, recv_req: DetokenizeReleaseReq):
+        self.detokenize_state_table.release(recv_req.rid)
+
+    def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
+        freeze_gc("Detokenizer Manager", recv_req.gc_threshold)
+        return None
+
+    def handle_configure_logging_req(self, recv_req: ConfigureLoggingReq):
+        if recv_req.log_level is not None:
+            logging.getLogger().setLevel(recv_req.log_level.upper())
+
+
+def is_health_check_request(rid: Optional[str]) -> bool:
+    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+
+
+def run_detokenizer_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    detokenizer_manager_class=DetokenizerManager,
+):
+    kill_itself_when_parent_died()
+    setproctitle.setproctitle("sglang::detokenizer")
+    load_plugins()
+    configure_logger(server_args)
+    publish(server_args, role="detokenizer")
+    parent_process = psutil.Process().parent()
+
+    manager = None
+    try:
+        manager = detokenizer_manager_class(server_args, port_args)
+        if get_serving().tokenizer_worker_num == 1:
+            manager.event_loop()
+        else:
+            manager.multi_http_worker_event_loop()
+    except Exception:
+        logger.error(f"DetokenizerManager hit an exception: {traceback.format_exc()}")
+        if manager is not None:
+            manager.maybe_clear_socket_mapping()
+        parent_process.send_signal(signal.SIGQUIT)

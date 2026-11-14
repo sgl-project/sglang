@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+import dataclasses
+from typing import TYPE_CHECKING, Any, Optional
+
+import torch
+
+from sglang.srt.mem_cache.events import KvEventLoraNames
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.kv.plan import TreeSlot
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components.base import (
+        TreeComponent,
+    )
+
+
+@dataclasses.dataclass
+class CacheInitParams:
+    disable: bool
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    page_size: int
+
+    is_eagle: bool = False
+    tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
+    attn_cp_cache_group: Optional[torch.distributed.ProcessGroup] = None
+    attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
+    pp_cache_group: Optional[torch.distributed.ProcessGroup] = None
+    eviction_policy: str = "lru"
+    # Keyword arguments for the eviction policy's constructor; see the strategy
+    # classes in evict_policy.py for what each policy accepts.
+    eviction_policy_config: Optional[dict[str, Any]] = None
+
+    enable_metrics: bool = False
+    enable_kv_cache_events: bool = False
+    dynamo_kv_event_format: bool = False
+    # LoRA names for KV events; the scheduler registers requests in it.
+    kv_event_lora_names: KvEventLoraNames = dataclasses.field(
+        default_factory=KvEventLoraNames
+    )
+    enable_session_radix_cache: bool = False
+
+    enable_mamba_extra_buffer: bool = False
+    enable_mamba_extra_buffer_lazy: bool = False
+
+    pp_rank: int = 0
+    pp_size: int = 1
+
+    attn_cp_rank: int = 0
+    attn_cp_size: int = 1
+
+    chunked_prefill_size: Optional[int] = None
+
+    sliding_window_size: Optional[int] = None
+    # False when tree nodes do not own the SWA state (a per-request SWA ring, or a
+    # paged SWA pool only a draft uses), so it must not gate prefix matching.
+    swa_gates_prefix_match: bool = True
+    decoder_swa_bounded_replay: bool = False
+
+    # The prefix tree's slots in drive order; the KV storage supplies them.
+    tree_slots: Optional[tuple[TreeSlot, ...]] = None
+    # A family's component class where it is not the default one (a hardware
+    # backend's state, a block sidecar).
+    component_registry_override: Optional[dict[str, type[TreeComponent]]] = None
+    tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
+
+    mtp_draft_device_pools: tuple[object, ...] = ()
+    # Draft KV pools that share the target KV slots but are stored apart from it.
+    sidecar_draft_device_pools: tuple[object, ...] = ()
+    mtp_draft_mamba_pools: tuple[object, ...] = ()
+
+    @property
+    def tree_components(self) -> Optional[tuple[ComponentType, ...]]:
+        """The tree slots' ids, in drive order."""
+        if self.tree_slots is None:
+            return None
+        from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
+
+        slot_ids = tree_slot_ids(self.tree_slots)
+        return tuple(slot_ids[slot.component] for slot in self.tree_slots)
+
+    @property
+    def swa_retain_window(self) -> Optional[int]:
+        # Cache history required by every reader of the SWA sub-pool. Retention,
+        # tree locks, prefix matching and host transfers must use the same span.
+        # The model's attention window remains sliding_window_size.
+        from sglang.srt.mem_cache.base_prefix_cache import retained_target_window
+
+        return retained_target_window(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.sliding_window_size,
+        )

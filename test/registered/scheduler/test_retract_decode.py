@@ -1,0 +1,69 @@
+import time
+import unittest
+from types import SimpleNamespace
+
+from sglang.srt.environ import envs
+from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.sgl_eval_utils import run_sgl_eval
+from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+register_cuda_ci(est_time=297, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=300, suite="extra-a-test-1-gpu-small-amd")
+
+
+class TestRetractDecode(CustomTestCase):
+    """python -m unittest test_retract_decode.TestRetractDecode"""
+
+    other_args = []
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        launch_args = ["--chunked-prefill-size", "128"] + cls.other_args
+        with (
+            envs.SGLANG_TEST_RETRACT.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+        ):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=launch_args,
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=256,
+            num_threads=32,
+        )
+
+        metrics = run_sgl_eval(args)
+        self.assertGreaterEqual(metrics["score"], 0.64)
+        time.sleep(1)  # wait for mem check
+
+        assert self.process.poll() is None, "Server crashed during test"
+
+
+class TestRetractDecodeRadixDisabledPaged(TestRetractDecode):
+    """python -m unittest test_retract_decode.TestRetractDecodeRadixDisabledPaged"""
+
+    other_args = ["--disable-radix-cache", "--page-size", "16"]
+
+
+if __name__ == "__main__":
+    unittest.main()

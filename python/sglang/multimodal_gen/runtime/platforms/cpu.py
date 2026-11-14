@@ -1,0 +1,154 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/cpu.py
+
+import gc
+import platform
+from functools import lru_cache
+from typing import Any
+
+import psutil
+import torch
+
+from sglang.multimodal_gen.runtime.platforms.interface import (
+    AttentionBackendEnum,
+    CpuArchEnum,
+    Platform,
+    PlatformEnum,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import cpu_has_amx_support
+
+logger = init_logger(__name__)
+
+_SDPA_BACKEND = (
+    "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+)
+_AMX_ATTN_BACKEND = (
+    "sglang.multimodal_gen.runtime.layers.attention.backends.amx_attn."
+    "AMXAttentionBackend"
+)
+# flash_attn_varlen_func in sgl-kernel dispatches reduced floating types only
+# and TORCH_CHECKs an even head size.
+_AMX_ATTN_DTYPES = (torch.bfloat16, torch.float16)
+
+
+class CpuPlatform(Platform):
+    _enum = PlatformEnum.CPU
+    device_name = "CPU"
+    device_type = "cpu"
+    dispatch_key = "CPU"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device("cpu")
+
+    @classmethod
+    def synchronize(cls) -> None:
+        torch.cpu.synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        gc.collect()
+
+    @classmethod
+    def get_torch_distributed_backend_str(cls) -> str:
+        return "gloo"
+
+    @classmethod
+    def get_cpu_architecture(cls) -> CpuArchEnum:
+        """Get the CPU architecture."""
+        machine = platform.machine().lower()
+        if machine in ("x86_64", "amd64", "i386", "i686"):
+            return CpuArchEnum.X86
+        elif machine in ("arm64", "aarch64"):
+            return CpuArchEnum.ARM
+        else:
+            return CpuArchEnum.UNSPECIFIED
+
+    @classmethod
+    def get_device_name(cls, device_id: int = 0) -> str:
+        return platform.processor()
+
+    @classmethod
+    def get_device_uuid(cls, device_id: int = 0) -> str:
+        return platform.machine()
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_device_total_memory(cls, device_id: int = 0) -> int:
+
+        return psutil.virtual_memory().total
+
+    @classmethod
+    def get_current_memory_usage(
+        cls, device: torch.types.Device | None = None
+    ) -> float:
+        # For CPU, we can't easily get memory usage without additional libraries
+        return 0.0
+
+    @classmethod
+    def get_available_gpu_memory(
+        cls,
+        device_id: int | None = None,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+
+        total_free_memory = psutil.virtual_memory().available
+        # For simplicity, we assume 1 NUMA node for now in this platform abstraction
+        # as get_cpu_ids_by_node is not available in multimodal_gen.runtime.utils
+        n_numa_node = 1
+        free_memory = total_free_memory / n_numa_node
+
+        if distributed:
+            import torch.distributed as dist
+
+            tensor = torch.tensor(free_memory, dtype=torch.float32)
+            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
+            free_memory = float(tensor.item())
+
+        return free_memory / (1 << 30)
+
+    @classmethod
+    def get_attn_backend_cls_str(
+        cls,
+        selected_backend: AttentionBackendEnum | None,
+        head_size: int,
+        dtype: torch.dtype,
+    ) -> str:
+        amx_attn_usable = (
+            cpu_has_amx_support() and dtype in _AMX_ATTN_DTYPES and head_size % 2 == 0
+        )
+        if selected_backend == AttentionBackendEnum.AMX_ATTN:
+            if not amx_attn_usable:
+                raise ValueError(
+                    "amx_attn needs an AMX CPU, bf16/fp16 and an even head size; "
+                    f"got dtype={dtype}, head_size={head_size}"
+                )
+            return _AMX_ATTN_BACKEND
+        # The selector asks once per candidate; answering torch_sdpa honestly is
+        # what lets a layer whose supported set lacks amx_attn fall back to it.
+        if selected_backend == AttentionBackendEnum.TORCH_SDPA:
+            return _SDPA_BACKEND
+        if selected_backend is not None:
+            logger.warning(
+                "%s is not supported on CPU; falling back to automatic selection.",
+                selected_backend,
+            )
+        if amx_attn_usable:
+            logger.info("Using AMX Attention backend for CPU.")
+            return _AMX_ATTN_BACKEND
+        logger.info("Using Torch SDPA backend for CPU.")
+        return _SDPA_BACKEND
+
+    @classmethod
+    def get_device_communicator_cls(cls) -> str:
+        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator.CpuCommunicator"
+
+    @classmethod
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
+        return False

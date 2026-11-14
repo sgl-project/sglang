@@ -1,0 +1,8 @@
+# Rust formatting configuration
+
+# Enforce grouped imports by crate
+imports_granularity = "Crate"
+# Group std, external crates, and local crate imports separately
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true

@@ -1,0 +1,953 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
+import os
+
+# Copyright 2024 xDiT team.
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
+# Copyright 2023 The vLLM team.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import pickle
+import weakref
+from collections import namedtuple
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from pkgutil import resolve_name
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.distributed
+from torch.distributed import Backend, ProcessGroup
+
+from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator import (
+    DeviceCommunicatorBase,
+)
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    suppress_stdout,
+)
+from sglang.srt.utils import is_shm_available
+from sglang.srt.utils.custom_op import register_custom_op
+
+logger = init_logger(__name__)
+
+TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+# Diffusion image tokens make the output of a TP row-parallel projection much
+# larger than the token batches typically seen by the SRT custom all-reduce.
+# Qwen-Image at 1024x1024, for example, reduces 24 MiB tensors. Keep those on
+# the tuned CUDA kernel instead of falling back to NCCL at the default 16 MiB
+# workspace limit.
+_DIFFUSION_CUSTOM_AR_MAX_SIZE = 32 * 1024 * 1024
+
+
+_group_name_counter: dict[str, int] = {}
+
+
+def get_local_torch_device() -> torch.device:
+    """Return the torch device for the current rank."""
+
+    return current_platform.get_local_torch_device()
+
+
+def _resolve_all_to_all_communicator_cls() -> type[DeviceCommunicatorBase]:
+    qualname = current_platform.get_all_to_all_communicator_cls()
+    communicator_cls = resolve_name(qualname)
+    if not isinstance(communicator_cls, type) or not issubclass(
+        communicator_cls, DeviceCommunicatorBase
+    ):
+        raise TypeError(f"Expected a DeviceCommunicatorBase subclass: {qualname}")
+    return communicator_cls
+
+
+def _get_unique_name(name: str) -> str:
+    """Get a unique name for the group.
+    Example:
+    _get_unique_name("tp") -> "tp:0"
+    _get_unique_name("tp") -> "tp:1"
+    """
+    if name not in _group_name_counter:
+        _group_name_counter[name] = 0
+    newname = f"{name}:{_group_name_counter[name]}"
+    _group_name_counter[name] += 1
+    return newname
+
+
+_groups: dict[str, Callable[[], "GroupCoordinator | None"]] = {}
+
+
+# Opaque to torch.compile: Dynamo cannot trace the custom all-reduce's
+# communicator, so calling it inline breaks the graph at every row-parallel
+# layer. srt routes its all-reduce the same way; ops take the group by name.
+@register_custom_op(out_shape="tensor")
+def diffusion_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    return _groups[group_name]()._all_reduce_out_of_place(tensor)
+
+
+def _split_tensor_dict(
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]], prefix: str = ""
+) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
+    """Split the tensor dictionary into two parts:
+    1. A list of (key, value) pairs. If the value is a tensor, it is replaced
+         by its metadata.
+    2. A list of tensors.
+
+    If the Tensor is nested under `tensor_dict["key1"]["key2"]`, the key of its
+    metadata will be "key1%key2".
+    """
+    metadata_list: List[Tuple[str, Any]] = []
+    tensor_list = []
+    for key, value in tensor_dict.items():
+        assert "%" not in key, (
+            "Avoid having '%' in key as it is used as a separator for nested entries."
+        )
+        if isinstance(value, torch.Tensor):
+            # Note: we cannot use `value.device` here,
+            # because it contains not only the device type but also the device
+            # index (e.g. "cuda:0"). We only need the device type.
+            # receiving side will set the device index.
+            device = value.device.type
+            metadata_list.append(
+                (
+                    prefix + key,
+                    TensorMetadata(device, value.dtype, value.size()),
+                )
+            )
+            tensor_list.append(value)
+        elif isinstance(value, dict):
+            if len(value) == 0:
+                metadata_list.append((prefix + key, value))
+            inner_metadata_list, inner_tensor_list = _split_tensor_dict(
+                value, prefix + key + "%"
+            )
+            metadata_list.extend(inner_metadata_list)
+            tensor_list.extend(inner_tensor_list)
+        else:
+            metadata_list.append((prefix + key, value))
+    return metadata_list, tensor_list
+
+
+def _update_nested_dict(nested_dict, flattened_key, value):
+    key_splits = flattened_key.split("%")
+    cur_dict = nested_dict
+    for k in key_splits[:-1]:
+        if k not in cur_dict:
+            cur_dict[k] = {}
+        cur_dict = cur_dict[k]
+    cur_dict[key_splits[-1]] = value
+
+
+@dataclass
+class GraphCaptureContext:
+    stream: torch.cuda.Stream | None
+
+
+def new_device_group(ranks, backend=None):
+    """Create a process group for device collectives.
+
+    A single-rank group never runs one: every collective short-circuits on
+    world_size == 1. NCCL would still allocate its per-channel device buffers
+    for it, which costs ~390 MiB a group.
+    """
+    return torch.distributed.new_group(
+        ranks, backend="gloo" if len(ranks) == 1 else backend
+    )
+
+
+class GroupCoordinator:
+    """
+    PyTorch ProcessGroup wrapper for a group of processes.
+    PyTorch ProcessGroup is bound to one specific communication backend,
+        e.g. NCCL, Gloo, MPI, etc.
+    GroupCoordinator takes charge of all the communication operations among
+        the processes in the group. It can route the communication to
+        a specific implementation (e.g. switch allreduce implementation
+        based on the tensor size and cuda graph mode).
+    """
+
+    # available attributes:
+    rank: int  # global rank
+    ranks: List[int]  # global ranks in the group
+    world_size: int  # size of the group
+    # difference between `local_rank` and `rank_in_group`:
+    # if we have a group of size 4 across two nodes:
+    # Process | Node | Rank | Local Rank | Rank in Group
+    #   0     |   0  |  0   |     0      |       0
+    #   1     |   0  |  1   |     1      |       1
+    #   2     |   1  |  2   |     0      |       2
+    #   3     |   1  |  3   |     1      |       3
+    local_rank: int  # local rank in the current node, used to assign devices
+    rank_in_group: int  # rank inside the group
+    cpu_group: ProcessGroup  # group for CPU communication
+    device_group: ProcessGroup  # group for device communication
+    device_communicator: DeviceCommunicatorBase  # all_to_all_4D communicator
+
+    def __init__(
+        self,
+        group_ranks: List[List[int]],
+        local_rank: int,
+        torch_distributed_backend: Union[str, Backend],
+        use_device_communicator: bool = True,
+        use_srt_custom_allreduce: bool = False,
+        use_message_queue_broadcaster: bool = False,
+        group_name: str | None = None,
+    ):
+        self.unique_name = _get_unique_name(group_name)
+        _groups[self.unique_name] = weakref.ref(self)
+        self.rank = torch.distributed.get_rank()
+        self.local_rank = local_rank
+        self.device_group = None
+        self.cpu_group = None
+
+        for ranks in group_ranks:
+            device_group = new_device_group(ranks, torch_distributed_backend)
+            # a group with `gloo` backend, to allow direct coordination between
+            # processes through the CPU.
+            with suppress_stdout():
+                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            if self.rank in ranks:
+                self.ranks = ranks
+                self.world_size = len(ranks)
+                self.rank_in_group = ranks.index(self.rank)
+                self.device_group = device_group
+                self.cpu_group = cpu_group
+
+        assert self.cpu_group is not None, f"{group_ranks=}, {local_rank=}"
+        assert self.device_group is not None
+
+        # TODO: fix it for other platforms
+        self.device = get_local_torch_device()
+        self.shm_handle = None
+        global_world_size = torch.distributed.get_world_size()
+        local_size = int(os.environ.get("LOCAL_SIZE", "0"))
+        self.is_single_node = local_size > 0 and global_world_size == local_size
+        if (
+            current_platform.is_cpu()
+            and self.is_single_node
+            and self.world_size > 1
+            and hasattr(torch.ops.sgl_kernel, "shm_group_initialize")
+            and self.unique_name.startswith(("tp", "sp"))
+        ):
+            group_ranks = "-".join(str(rank) for rank in self.ranks)
+            group_name = f"{self.unique_name}-{group_ranks}"
+
+            self.shm_handle = int(
+                torch.ops.sgl_kernel.shm_group_initialize(
+                    group_name,
+                    self.world_size,
+                    self.rank_in_group,
+                )
+            )
+            torch.distributed.barrier(group=self.cpu_group)
+
+        self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
+        if use_device_communicator and self.world_size > 1:
+            communicator_cls = _resolve_all_to_all_communicator_cls()
+            self.device_communicator = communicator_cls(
+                cpu_group=self.cpu_group,
+                device=self.device,
+                device_group=self.device_group,
+                unique_name=self.unique_name,
+            )
+
+        self.mq_broadcaster = None
+        self.srt_custom_allreduce = None
+        if (
+            use_srt_custom_allreduce
+            and current_platform.is_cuda_alike()
+            and self.world_size > 1
+        ):
+            # srt owns topology, dtype, contiguity, and size dispatch for custom ar
+            self._init_srt_custom_allreduce()
+
+    def _init_srt_custom_allreduce(self) -> None:
+        custom_allreduce_kwargs = {
+            "group": self.cpu_group,
+            "device": self.device,
+        }
+        if current_platform.is_cuda():
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                dispatch_custom_allreduce,
+            )
+            from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+                CustomAllReduceV2,
+            )
+
+            custom_allreduce_cls = dispatch_custom_allreduce(
+                group=self.cpu_group,
+                device=self.device,
+            )
+            if custom_allreduce_cls is CustomAllReduceV2:
+                custom_allreduce_kwargs["max_size"] = _DIFFUSION_CUSTOM_AR_MAX_SIZE
+        else:
+            # Preserve the existing ROCm and MUSA implementation selection.
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                CustomAllreduce,
+            )
+
+            custom_allreduce_cls = CustomAllreduce
+
+        self.srt_custom_allreduce = custom_allreduce_cls(**custom_allreduce_kwargs)
+
+    @property
+    def first_rank(self):
+        """Return the global rank of the first process in the group"""
+        return self.ranks[0]
+
+    @property
+    def last_rank(self):
+        """Return the global rank of the last process in the group"""
+        return self.ranks[-1]
+
+    @property
+    def is_first_rank(self):
+        """Return whether the caller is the first process in the group"""
+        return self.rank == self.first_rank
+
+    @property
+    def is_last_rank(self):
+        """Return whether the caller is the last process in the group"""
+        return self.rank == self.last_rank
+
+    @property
+    def next_rank(self):
+        """Return the global rank of the process that follows the caller"""
+        rank_in_group = self.rank_in_group
+        world_size = self.world_size
+        return self.ranks[(rank_in_group + 1) % world_size]
+
+    @property
+    def prev_rank(self):
+        """Return the global rank of the process that precedes the caller"""
+        rank_in_group = self.rank_in_group
+        world_size = self.world_size
+        return self.ranks[(rank_in_group - 1) % world_size]
+
+    @property
+    def group_next_rank(self):
+        """Return the group rank of the process that follows the caller"""
+        rank_in_group = self.rank_in_group
+        world_size = self.world_size
+        return (rank_in_group + 1) % world_size
+
+    @property
+    def group_prev_rank(self):
+        """Return the group rank of the process that precedes the caller"""
+        rank_in_group = self.rank_in_group
+        world_size = self.world_size
+        return (rank_in_group - 1) % world_size
+
+    @contextmanager
+    def graph_capture(self, graph_capture_context: GraphCaptureContext | None = None):
+        if current_platform.is_cuda_alike():
+            if graph_capture_context is None:
+                stream = torch.cuda.Stream()
+                graph_capture_context = GraphCaptureContext(stream)
+            else:
+                stream = graph_capture_context.stream
+
+            # ensure all initialization operations complete before attempting to
+            # capture the graph on another stream
+            curr_stream = torch.cuda.current_stream()
+            if curr_stream != stream:
+                stream.wait_stream(curr_stream)
+
+            # Custom all-reduce has an eager path and a graph path; only inside
+            # capture() does all_reduce pick the graph one, and only capture()
+            # exit registers the graph-pool buffers with the peers. Capturing the
+            # eager path instead faults on replay (unmapped peer IPC address).
+            custom_ar = self.srt_custom_allreduce
+            maybe_ca_context = (
+                nullcontext() if custom_ar is None else custom_ar.capture()
+            )
+
+            with torch.cuda.stream(stream), maybe_ca_context:
+                yield graph_capture_context
+        else:
+            # For non-CUDA platforms (MPS, CPU), just yield the context without stream management
+            if graph_capture_context is None:
+                # Create a dummy context for non-CUDA platforms
+                graph_capture_context = GraphCaptureContext(None)
+            yield graph_capture_context
+
+    def all_to_all_4D(
+        self, input_: torch.Tensor, scatter_dim: int = 2, gather_dim: int = 1
+    ) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        return self.device_communicator.all_to_all_4D(input_, scatter_dim, gather_dim)
+
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        op=torch._C._distributed_c10d.ReduceOp.SUM,
+        async_op: bool = False,
+    ) -> torch.Tensor:
+        """
+        NOTE: This operation will be applied in-place or out-of-place.
+        Always assume this function modifies its input, but use the return
+        value as the output.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return input_
+        elif (
+            torch.compiler.is_compiling()
+            and self.srt_custom_allreduce is not None
+            and not async_op
+            # Compare by identity: Dynamo before torch 2.14 cannot trace
+            # RedOpType.__eq__ and breaks the graph on `==`.
+            and op is torch.distributed.ReduceOp.SUM
+            and not input_.is_cpu
+        ):
+            return diffusion_all_reduce(input_, group_name=self.unique_name)
+        else:
+            custom_ar = self.srt_custom_allreduce
+            if (
+                not async_op
+                and custom_ar is not None
+                and op is torch.distributed.ReduceOp.SUM
+                and not input_.is_cpu
+                and not custom_ar.disabled
+                and custom_ar.should_custom_ar(input_)
+            ):
+                output = custom_ar.custom_all_reduce(input_)
+                if output is not None:
+                    return output
+            if (
+                current_platform.is_cpu()
+                and not async_op
+                and self.shm_handle is not None
+                and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
+                and op is torch.distributed.ReduceOp.SUM
+            ):
+                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
+                torch.ops.sgl_kernel.shm_allreduce(
+                    input_, int(torch.distributed.ReduceOp.SUM), self.shm_handle
+                )
+            else:
+                torch.distributed.all_reduce(
+                    input_, op=op, group=self.device_group, async_op=async_op
+                )
+
+        return input_
+
+    def _all_reduce_out_of_place(self, input_: torch.Tensor) -> torch.Tensor:
+        """Sum over the group into a new tensor; the input is left untouched."""
+        custom_ar = self.srt_custom_allreduce
+        if not custom_ar.disabled and custom_ar.should_custom_ar(input_):
+            output = custom_ar.custom_all_reduce(input_)
+            if output is not None:
+                return output
+        output = input_.clone()
+        torch.distributed.all_reduce(output, group=self.device_group)
+        return output
+
+    def all_gather(
+        self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        world_size = self.world_size
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return input_
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+        # Allocate output tensor.
+        input_size = list(input_.size())
+        input_size[0] *= world_size
+        output_tensor = torch.empty(
+            input_size, dtype=input_.dtype, device=input_.device
+        )
+
+        # Group-aware CPU SHM all-gather.
+        if (
+            current_platform.is_cpu()
+            and self.shm_handle is not None
+            and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
+        ):
+            output_tensor = torch.ops.sgl_kernel.shm_allgather(
+                input_, dim, self.shm_handle
+            )
+
+            if separate_tensors:
+                return list(output_tensor.chunk(world_size, dim=dim))
+            return output_tensor
+
+        # Fallback.
+        if not input_.is_contiguous():
+            input_ = input_.contiguous()
+        all_gather_single(output_tensor, input_, group=self.device_group)
+
+        if dim != 0:
+            input_size[0] //= world_size
+            output_tensor = output_tensor.reshape(
+                [
+                    world_size,
+                ]
+                + input_size
+            )
+            output_tensor = output_tensor.movedim(0, dim)
+
+        if separate_tensors:
+            tensor_list = [
+                output_tensor.reshape(-1)
+                .narrow(0, input_.numel() * i, input_.numel())
+                .view_as(input_)
+                for i in range(world_size)
+            ]
+            return tensor_list
+        else:
+            input_size = list(input_.size())
+            input_size[dim] = input_size[dim] * world_size
+            # Reshape
+            output_tensor = output_tensor.reshape(input_size)
+            return output_tensor
+
+    def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor:
+        """
+        NOTE: We assume that the input tensor is on the same device across
+        all the ranks.
+        NOTE: `dst` is the local rank of the destination rank.
+        """
+        world_size = self.world_size
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return input_
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+        # Allocate output tensor.
+        if self.rank_in_group == dst:
+            gather_list = [torch.empty_like(input_) for _ in range(world_size)]
+        else:
+            gather_list = None
+        # Gather.
+        torch.distributed.gather(
+            input_, gather_list, dst=self.ranks[dst], group=self.device_group
+        )
+        if self.rank_in_group == dst:
+            output_tensor = torch.cat(gather_list, dim=dim)
+        else:
+            output_tensor = None
+        return output_tensor
+
+    def broadcast(self, input_: torch.Tensor, src: int = 0, async_op: bool = False):
+        """Broadcast the input tensor.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return input_
+        # Broadcast.
+        if not input_.is_contiguous():
+            input_ = input_.contiguous()
+        torch.distributed.broadcast(
+            input_,
+            src=self.ranks[src],
+            group=self.device_group,
+            async_op=async_op,
+        )
+        return input_
+
+    def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
+        """Broadcast the input object.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return obj
+        if self.mq_broadcaster is not None:
+            assert src == 0, "Shared memory broadcaster only supports src=0"
+            return self.mq_broadcaster.broadcast_object(obj)
+        if self.rank_in_group == src:
+            torch.distributed.broadcast_object_list(
+                [obj], src=self.ranks[src], group=self.cpu_group
+            )
+            return obj
+        else:
+            recv = [None]
+            torch.distributed.broadcast_object_list(
+                recv, src=self.ranks[src], group=self.cpu_group
+            )
+            return recv[0]
+
+    def broadcast_object_list(
+        self,
+        obj_list: List[Any],
+        src: int = 0,
+        group: Optional[ProcessGroup] = None,
+    ):
+        """Broadcast the input object list.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return obj_list
+        # Broadcast.
+        torch.distributed.broadcast_object_list(
+            obj_list, src=self.ranks[src], group=self.device_group
+        )
+        return obj_list
+
+    def send_object(self, obj: Any, dst: int) -> None:
+        """Send the input object list to the destination rank."""
+        """NOTE: `dst` is the local rank of the destination rank."""
+
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        assert dst != self.rank, (
+            "Invalid destination rank. Destination rank is the same "
+            "as the current rank."
+        )
+
+        # Serialize object to tensor and get the size as well
+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+
+        size_tensor = torch.tensor(
+            [object_tensor.numel()], dtype=torch.long, device="cpu"
+        )
+
+        # Send object size
+
+        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+
+        # Send object
+        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+
+        return None
+
+    def recv_object(self, src: int) -> Any:
+        """Receive the input object list from the source rank."""
+        """NOTE: `src` is the local rank of the source rank."""
+
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        assert src != self.rank, (
+            "Invalid source rank. Source rank is the same as the current rank."
+        )
+
+        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+
+        # Receive object size
+        rank_size = torch.distributed.recv(
+            size_tensor, src=self.ranks[src], group=self.cpu_group
+        )
+
+        # Tensor to receive serialized objects into.
+        object_tensor = torch.empty(  # type: ignore[call-overload]
+            size_tensor.item(),  # type: ignore[arg-type]
+            dtype=torch.uint8,
+            device="cpu",
+        )
+
+        rank_object = torch.distributed.recv(
+            object_tensor, src=self.ranks[src], group=self.cpu_group
+        )
+
+        assert rank_object == rank_size, (
+            "Received object sender rank does not match the size sender rank."
+        )
+
+        obj = pickle.loads(object_tensor.numpy().tobytes())
+
+        return obj
+
+    def broadcast_tensor_dict(
+        self,
+        tensor_dict: Optional[Dict[str, Union[torch.Tensor, Any]]] = None,
+        src: int = 0,
+        group: Optional[ProcessGroup] = None,
+        metadata_group: Optional[ProcessGroup] = None,
+    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        """Broadcast the input tensor dictionary.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return tensor_dict
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+        assert src < self.world_size, f"Invalid src rank ({src})"
+        src_rank_in_group = src
+        src_global_rank = self.ranks[src_rank_in_group]
+
+        rank = self.rank
+        if rank == src_global_rank:
+            metadata_list: List[Tuple[Any, Any]] = []
+            assert isinstance(tensor_dict, dict), (
+                f"Expecting a dictionary, got {type(tensor_dict)}"
+            )
+            metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+            # `metadata_list` lives in CPU memory.
+            # `broadcast_object_list` has serialization & deserialization,
+            # all happening on CPU. Therefore, we can use the CPU group.
+            self.broadcast_object(metadata_list, src=src_rank_in_group)
+            async_handles = []
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    # Skip broadcasting empty tensors.
+                    continue
+                if tensor.is_cpu:
+                    # use metadata_group for CPU tensors
+                    handle = torch.distributed.broadcast(
+                        tensor,
+                        src=src_global_rank,
+                        group=metadata_group,
+                        async_op=True,
+                    )
+                else:
+                    # use group for GPU tensors
+                    handle = torch.distributed.broadcast(
+                        tensor, src=src_global_rank, group=group, async_op=True
+                    )
+                async_handles.append(handle)
+            for async_handle in async_handles:
+                async_handle.wait()
+
+        else:
+            metadata_list = self.broadcast_object(None, src=src_rank_in_group)
+            tensor_dict = {}
+            async_handles = []
+            for key, value in metadata_list:
+                if isinstance(value, TensorMetadata):
+                    tensor = torch.empty(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
+                    if tensor.numel() == 0:
+                        # Skip broadcasting empty tensors.
+                        _update_nested_dict(tensor_dict, key, tensor)
+                        continue
+                    if tensor.is_cpu:
+                        # use metadata_group for CPU tensors
+                        handle = torch.distributed.broadcast(
+                            tensor,
+                            src=src_global_rank,
+                            group=metadata_group,
+                            async_op=True,
+                        )
+                    else:
+                        # use group for GPU tensors
+                        handle = torch.distributed.broadcast(
+                            tensor, src=src_global_rank, group=group, async_op=True
+                        )
+                    async_handles.append(handle)
+                    _update_nested_dict(tensor_dict, key, tensor)
+                else:
+                    _update_nested_dict(tensor_dict, key, value)
+            for async_handle in async_handles:
+                async_handle.wait()
+        return tensor_dict
+
+    def send_tensor_dict(
+        self,
+        tensor_dict: Dict[str, Union[torch.Tensor, Any]],
+        dst: Optional[int] = None,
+    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        """Send the input tensor dictionary.
+        NOTE: `dst` is the local rank of the source rank.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return tensor_dict
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        if dst is None:
+            dst = self.group_next_rank
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        metadata_list: List[Tuple[Any, Any]] = []
+        assert isinstance(tensor_dict, dict), (
+            f"Expecting a dictionary, got {type(tensor_dict)}"
+        )
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        # `metadata_list` lives in CPU memory.
+        # `send_object_list` has serialization & deserialization,
+        # all happening on CPU. Therefore, we can use the CPU group.
+        self.send_object(metadata_list, dst=dst)
+        for tensor in tensor_list:
+            if tensor.numel() == 0:
+                # Skip sending empty tensors.
+                continue
+            if tensor.is_cpu:
+                # use metadata_group for CPU tensors
+                torch.distributed.send(
+                    tensor, dst=self.ranks[dst], group=metadata_group
+                )
+            else:
+                # use group for GPU tensors
+                torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
+        return None
+
+    def recv_tensor_dict(
+        self, src: Optional[int] = None
+    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        """Recv the input tensor dictionary.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        if src is None:
+            src = self.group_prev_rank
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        recv_metadata_list = self.recv_object(src=src)
+        tensor_dict: Dict[str, Any] = {}
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                if tensor.numel() == 0:
+                    # Skip broadcasting empty tensors.
+                    _update_nested_dict(tensor_dict, key, tensor)
+                    continue
+                if tensor.is_cpu:
+                    # use metadata_group for CPU tensors
+                    torch.distributed.recv(
+                        tensor, src=self.ranks[src], group=metadata_group
+                    )
+                else:
+                    # use group for GPU tensors
+                    torch.distributed.recv(tensor, src=self.ranks[src], group=group)
+                _update_nested_dict(tensor_dict, key, tensor)
+            else:
+                _update_nested_dict(tensor_dict, key, value)
+        return tensor_dict
+
+    def barrier(self):
+        """Barrier synchronization among the group.
+        NOTE: don't use `device_group` here! `barrier` in NCCL is
+        terrible because it is internally a broadcast operation with
+        secretly created GPU tensors. It is easy to mess up the current
+        device. Use the CPU group instead.
+        """
+        torch.distributed.barrier(group=self.cpu_group)
+
+    def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
+        """Send a tensor to the destination rank."""
+        """NOTE: `dst` is the rank_in_group of the destination rank."""
+        if dst is None:
+            dst = self.group_next_rank
+
+        torch.distributed.send(
+            tensor,
+            self.ranks[dst],
+            group=self.device_group,
+        )
+
+    def recv(
+        self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
+    ) -> torch.Tensor:
+        """Receives a tensor from the src rank."""
+        """NOTE: `src` is the rank_in_group of the source rank."""
+        if src is None:
+            src = self.group_prev_rank
+
+        tensor = torch.empty(size, dtype=dtype, device=self.device)
+        torch.distributed.recv(
+            tensor,
+            self.ranks[src],
+            group=self.device_group,
+        )
+        return tensor
+
+    def destroy(self) -> None:
+        if self.device_group is not None:
+            torch.distributed.destroy_process_group(self.device_group)
+            self.device_group = None
+        if self.cpu_group is not None:
+            torch.distributed.destroy_process_group(self.cpu_group)
+            self.cpu_group = None
+        if self.device_communicator is not None:
+            self.device_communicator.destroy()
+        if self.srt_custom_allreduce is not None:
+            self.srt_custom_allreduce.close()
+            self.srt_custom_allreduce = None
+        if self.mq_broadcaster is not None:
+            self.mq_broadcaster = None
+
+
+class SequenceParallelGroupCoordinator(GroupCoordinator):
+    def __init__(
+        self,
+        group_ranks: List[List[int]],
+        local_rank: int,
+        torch_distributed_backend: Union[str, Backend],
+        group_name: str | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            group_ranks=group_ranks,
+            local_rank=local_rank,
+            torch_distributed_backend=torch_distributed_backend,
+            group_name=group_name,
+        )
+        ulysses_group = kwargs.get("ulysses_group", None)
+        ring_group = kwargs.get("ring_group", None)
+        if ulysses_group is None:
+            raise RuntimeError(
+                "Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
+            )
+        if ring_group is None:
+            raise RuntimeError(
+                "Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
+            )
+        self._bind_sequence_groups(ulysses_group, ring_group)
+
+    @classmethod
+    def over_group(
+        cls, group: GroupCoordinator, ring_group: ProcessGroup
+    ) -> "SequenceParallelGroupCoordinator":
+        """Pure-Ulysses SP over ``group``'s ranks that reuses its communicators.
+
+        ``ring_group`` is this rank's single-rank group. The result owns no
+        process group: destroying ``group`` releases it, never destroy it itself.
+        """
+        sp_group = cls.__new__(cls)
+        sp_group.__dict__.update(vars(group))
+        sp_group._bind_sequence_groups(group.device_group, ring_group)
+        return sp_group
+
+    def _bind_sequence_groups(
+        self, ulysses_group: ProcessGroup, ring_group: ProcessGroup
+    ) -> None:
+        self.ulysses_group = ulysses_group
+        self.ring_group = ring_group
+
+        self.ulysses_world_size = torch.distributed.get_world_size(self.ulysses_group)
+        self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
+        self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
+        self.ring_rank = torch.distributed.get_rank(self.ring_group)
+        self.ulysses_shm_handle = None
+        if (
+            current_platform.is_cpu()
+            and self.ulysses_world_size > 1
+            and hasattr(torch.ops.sgl_kernel, "shm_group_initialize")
+        ):
+            # TODO: Initialize a dedicated SHM handle for the Ulysses subgroup
+            # when Ring Attention is supported on CPU. The current SP handle
+            # is only valid when ring_degree == 1.
+            self.ulysses_shm_handle = self.shm_handle

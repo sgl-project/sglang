@@ -1,0 +1,1508 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import fnmatch
+import logging
+import re
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
+
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.quantization.base_config import (  # noqa: E501
+    FusedMoEMethodBase,
+    LinearMethodBase,
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+)
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.quark.schemes import (
+    QuarkLinearScheme,
+    QuarkMoEScheme,
+    QuarkW4A4MXFP4,
+    QuarkW4A4MXFp4MoE,
+    QuarkW4A8MXFp4MoE,
+    QuarkW4A16Int4,
+    QuarkW8A8Fp8,
+    QuarkW8A8FP8MoE,
+)
+from sglang.srt.layers.quantization.quark.utils import (
+    Nvfp4SourceConfig,
+    deep_compare,
+    should_ignore_layer,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import (
+    get_device_capability,
+    is_gfx95_supported,
+    is_hip,
+)
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+
+__all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
+
+
+def _parse_nvfp4_excludes(hf_quant_config: Dict[str, Any]) -> List[str]:
+    """Extract NVFP4 producer-declared excludes as `re:` patterns.
+
+    Reads the producer-specific key:
+      - `ignore`          - ModelOpt (config.json)
+      - `exclude_modules` - ModelOpt hf_quant_config.json
+      - `exclude`         - AMD Quark export
+
+    Entries are usually fnmatch-style (literal strings work too), but ModelOpt
+    `ignore` lists may already carry `re:`-prefixed regexes (e.g.
+    `re:.*linear_attn\\.in_proj_a$`); those are passed through untouched.
+    Wrapping an already-`re:` entry with another `re:` + `fnmatch.translate`
+    yields a pattern that never matches, silently un-excluding the layer.
+    Returns [] if no key present.
+    """
+    pats = (
+        hf_quant_config.get("ignore")
+        or hf_quant_config.get("exclude_modules")
+        or hf_quant_config.get("exclude")
+        or []
+    )
+    return [p if p.startswith("re:") else "re:" + fnmatch.translate(p) for p in pats]
+
+
+def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"]:
+    """Return an Nvfp4SourceConfig if `config` (the checkpoint's
+    quantization_config dict) describes a supported NVFP4 source, else None.
+
+    Handles two producers:
+      - ModelOpt:  quant_method in {modelopt, modelopt_fp4, nvfp4}
+                   with quant_algo NVFP4/FP4 (or unspecified).
+      - AMD Quark: quant_method == "quark". global_quant_config.weight is a
+                   2-element list [fp4_per_group_gs16, fp8_e4m3_per_tensor].
+
+    compressed-tensors NVFP4 is not supported at this time.
+    """
+    from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
+
+    quant_method = config.get("quant_method", "")
+    quant_algo = (config.get("quant_algo") or "").upper()
+
+    if quant_method in ("modelopt", "modelopt_fp4", "nvfp4") and quant_algo in (
+        "",
+        "NVFP4",
+        "FP4",
+    ):
+        return Nvfp4SourceConfig()
+    if quant_method == "quark":
+        gqc = config.get("global_quant_config", {})
+        weight = gqc.get("weight")
+        if not (isinstance(weight, list) and len(weight) == 2):
+            return None
+        w0, w1 = weight
+        is_nvfp4_weight = (
+            isinstance(w0, dict)
+            and w0.get("dtype") == "fp4"
+            and w0.get("qscheme") == "per_group"
+            and w0.get("group_size") == 16
+            and not w0.get("is_dynamic")
+        )
+        is_nvfp4_scale_2 = (
+            isinstance(w1, dict)
+            and w1.get("dtype") == "fp8_e4m3"
+            and w1.get("qscheme") == "per_tensor"
+            and not w1.get("is_dynamic")
+        )
+        if is_nvfp4_weight and is_nvfp4_scale_2:
+            return Nvfp4SourceConfig()
+        return None
+    if quant_method in ("compressed-tensors", "compressed_tensors"):
+        raise NotImplementedError(
+            "Online MXFP4 requantization from compressed-tensors NVFP4 "
+            "checkpoints is not supported at this time."
+        )
+    return None
+
+
+# Target quant specs used when synthesizing a per-layer config for a
+# MIXED_PRECISION source. The MXFP4 spec is the online-requant target shape
+# recognized by `_is_mx_fp4`; the FP8 spec is the per-tensor W8A8 shape
+# recognized by `_is_fp8_w8a8` (no requantization).
+_MXFP4_TARGET_SPEC: Dict[str, Any] = {
+    "weight": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": False,
+        "scale_format": "e8m0",
+    },
+    "input_tensors": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": True,
+        "scale_format": "e8m0",
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+
+
+def _fp8_per_tensor_spec(is_dynamic_input: bool) -> Dict[str, Any]:
+    return {
+        "weight": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_tensor",
+            "is_dynamic": False,
+        },
+        "input_tensors": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_tensor",
+            "is_dynamic": is_dynamic_input,
+        },
+        "output_tensors": None,
+        "bias": None,
+    }
+
+
+def _fp8_is_dynamic_from_config_groups(
+    config_groups: Any,
+) -> bool:
+    """Return whether FP8 activation quantization is dynamic, from config_groups.
+
+    Reads the `input_activations.dynamic` field of the first config_group whose
+    `num_bits` is 8, and falls back to True (dynamic) when none exists or the
+    format is not a recognised dict-of-dicts.
+    """
+    if not isinstance(config_groups, dict):
+        return True
+    for group in config_groups.values():
+        if not isinstance(group, dict):
+            continue
+        input_act = group.get("input_activations") or {}
+        if input_act.get("num_bits") == 8:
+            return bool(input_act.get("dynamic", True))
+    return True
+
+
+def _mixed_precision_layer_map(config: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Return {layer_name: quant_algo} for a MIXED_PRECISION source, else None.
+
+    Reads ModelOpt's per-layer `quantized_layers` map (from
+    hf_quant_config.json or config.json's quantization_config). Only the
+    quant_algo string per layer is needed;
+    """
+    if (config.get("quant_algo") or "").upper() != "MIXED_PRECISION":
+        return None
+    quantized_layers = config.get("quantized_layers")
+    if not isinstance(quantized_layers, dict) or not quantized_layers:
+        return None
+    layer_map: Dict[str, str] = {}
+    for name, info in quantized_layers.items():
+        if isinstance(info, dict):
+            layer_map[name] = str(info.get("quant_algo", "")).upper()
+    return layer_map
+
+
+def _build_mixed_precision_layer_quant_config(
+    layer_map: Dict[str, str],
+    config_groups: Optional[Dict[str, Any]] = None,
+) -> tuple[Dict[str, Any], bool]:
+    """Collapse a per-layer {name: quant_algo} map into a compact
+    `layer_quant_config` keyed by fnmatch glob patterns.
+    """
+    # suffix tail -> set of algos seen (to detect inconsistency)
+    tail_algos: Dict[str, set] = {}
+    for name, algo in layer_map.items():
+        # Suffix after the last `.layers.<idx>.` (or the whole name if
+        # unindexed); this is the part shared across all layer indices.
+        tail = re.split(r"\.layers\.\d+\.", name, maxsplit=1)[-1]
+        tail_algos.setdefault(tail, set()).add(algo)
+
+    fp8_is_dynamic = _fp8_is_dynamic_from_config_groups(config_groups or {})
+    fp8_spec = _fp8_per_tensor_spec(is_dynamic_input=fp8_is_dynamic)
+
+    layer_quant_config: Dict[str, Any] = {}
+    has_nvfp4 = False
+    for tail, algos in tail_algos.items():
+        if len(algos) != 1:
+            raise NotImplementedError(
+                f"MIXED_PRECISION layer group {tail!r} has inconsistent "
+                f"quant algos across layers: {sorted(algos)}. SGLang requires "
+                "all layers in a group to share one algo."
+            )
+        algo = next(iter(algos))
+        pattern = "*" + tail
+        if algo in ("NVFP4", "W4A16_NVFP4"):
+            layer_quant_config[pattern] = _MXFP4_TARGET_SPEC
+            has_nvfp4 = True
+        elif algo == "FP8":
+            layer_quant_config[pattern] = fp8_spec
+        else:
+            raise NotImplementedError(
+                f"MIXED_PRECISION layer group {tail!r} uses unsupported "
+                f"quant algo {algo!r}; online requantization supports NVFP4 "
+                "(-> MXFP4) and FP8 (kept as-is) only."
+            )
+    return layer_quant_config, has_nvfp4
+
+
+def _build_excluded_fp8_config(config: Dict[str, Any]) -> Optional["Fp8Config"]:
+    """Build a load-as-is `Fp8Config` for the excluded layers of a
+    mixed-precision NVFP4 source, or None if excluded layers are bf16.
+
+    Two producer conventions are handled:
+
+    - FP8-serialized base (``quant_method == "fp8"``, e.g.
+      DeepSeek-V4-Pro-NVFP4): the routed experts are NVFP4 (requantized to
+      MXFP4) while attn / shared_experts stay FP8 and are listed in the
+      excludes. Those FP8 layers load through `Fp8LinearMethod`;
+      ``weight_block_size`` selects block (e.g. ``[128, 128]``) vs per-tensor
+      (``None``), so a single config covers either granularity - and a
+      checkpoint carrying only per-tensor or only block layers is handled
+      without any per-layer probing.
+
+    - ModelOpt mixed base (``quant_method`` in {modelopt, modelopt_mixed},
+      e.g. Qwen3.5-397B-A17B-NVFP4-V2): FP8 layers are enumerated in the
+      per-layer ``quantized_layers`` map (loaded via `QuarkW8A8Fp8`), not in
+      the excludes, so the excludes are genuinely bf16 -> None.
+    """
+    if config.get("quant_method") != "fp8":
+        return None
+    # Fp8Config.from_config reads quant_method/activation_scheme/
+    # weight_block_size/packed_modules_mapping straight off the checkpoint's
+    # quantization_config dict, which is exactly what `config` carries here.
+    return Fp8Config.from_config(config)
+
+
+logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+
+_MOE_SHARED_EXPERT_QUANT_LAYER0_BASES: tuple[str, ...] = (
+    "model.layers.0",
+    "model.language_model.layers.0",
+)
+
+# A NextN draft builds its block under ``model.decoder``; only the draft's own
+# weight-name mapper renames per-layer specs onto it, so the target never matches.
+_MOE_SHARED_EXPERT_QUANT_DRAFT_BASES: tuple[str, ...] = ("model.decoder",)
+
+_SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
+    "gate_proj",
+    "up_proj",
+    "gate_up_proj",
+    "down_proj",
+)
+
+_NAMED_MOE_LAYER = re.compile(
+    r"((?:.+\.)?layers\.\d+)\.mlp\.(?:experts|shared_experts?)(?:\..+)?"
+)
+
+# Model types the online shared-expert MXFP4 conversion is offered on. Qwen3.5
+# and Qwen3.8 share this architecture and the mlp.shared_expert.* -> fused-slot
+# remap the loader hook depends on; text checkpoints report the "_text"
+# spelling, multimodal ones the bare one.
+#
+# The restriction is deliberate, and it carries more weight now that the opt-in
+# is --enforce-shared-experts-fusion: the DeepSeek-V4 recipes pass that flag as a
+# matter of course. can_fuse_shared_expert() is also reached from
+# quant_blocks_shared_experts_fusion() in models/deepseek_common/utils.py, so
+# without this list a DeepSeek-family Quark MXFP4 checkpoint that excludes its
+# shared-expert body would silently start quantizing it. That combination is
+# unmeasured, and DeepSeek's layer 0 is a dense MLP, so the layer-0 probe below
+# would fall back to the global spec instead of reading a real MoE layer.
+_ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES: tuple[str, ...] = (
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+)
+
+
+class QuarkConfig(QuantizationConfig):
+    def __init__(
+        self,
+        quant_config: dict[str, Any] | None = None,
+        hf_config: "PretrainedConfig | None" = None,
+        kv_cache_group: Optional[list[str]] = None,
+        kv_cache_config: Optional[dict[str, Any]] = None,
+        pack_method: str = "reorder",
+        is_prequantized: bool = False,
+        online_scheme: Optional[str] = None,
+        dequantization_config: Optional[QuantizationConfig] = None,
+        excluded_fp8_config: Optional[Fp8Config] = None,
+    ):
+        super().__init__()
+        if kv_cache_group is None:
+            kv_cache_group = []
+
+        if online_scheme is not None:
+            assert not is_prequantized
+            if online_scheme == "quark_mxfp4":
+                quant_config = self._create_online_mxfp4_config(
+                    model_type=hf_config.model_type
+                )
+            else:
+                raise ValueError(f"Unsupported online_scheme: {online_scheme}")
+
+        if quant_config is None:
+            raise ValueError("Either quant_config or online_scheme must be provided")
+
+        self.online_scheme = online_scheme
+        self.quant_config = quant_config
+        self.kv_cache_group = kv_cache_group
+        self.kv_cache_config = kv_cache_config
+        self.pack_method = pack_method
+        self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
+        # Both are consumed by _is_draft_layer(), which has to tell an appended
+        # MTP/NextN draft layer from a target-model one. "No draft stack" is
+        # spelled None as often as it is spelled absent -- ModelConfig defaults
+        # the same field to None -- so coerce rather than let range() raise.
+        self.num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+        self.num_nextn_predict_layers = int(
+            getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+        )
+        # Gates the online shared-expert MXFP4 conversion to the architectures
+        # it is supported on; see _ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES.
+        self.model_type = getattr(hf_config, "model_type", None)
+        self.is_prequantized = is_prequantized
+        self.dequantization_config = dequantization_config
+        # Load-as-is FP8 config for excluded layers of a mixed-precision source
+        # (e.g. attn / shared_experts kept in FP8 while routed experts are
+        # requantized NVFP4 -> MXFP4). Distinct from `dequantization_config`,
+        # which describes the requantization *source*. `weight_block_size`
+        # selects block vs per-tensor FP8 within `Fp8LinearMethod`.
+        self.excluded_fp8_config = excluded_fp8_config
+        self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
+        self._online_quantized_layers = set()
+
+        if isinstance(self.dequantization_config, Fp8Config):
+            self.weight_block_size = self.dequantization_config.weight_block_size
+
+    @property
+    def quantized_layers(self) -> tuple[list[str], int]:
+        # Consumed by `report_online_quantization` in model_runner. Returns the
+        # unique layer types (last part after ".") and the total layer count.
+        layer_types = sorted(
+            set(name.split(".")[-1] for name in self._online_quantized_layers)
+        )
+        return layer_types, len(self._online_quantized_layers)
+
+    def get_linear_method(self) -> "QuarkLinearMethod":
+        return QuarkLinearMethod(self)
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 70
+
+    def get_name(self) -> str:
+        return "quark"
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper):
+        mapped = hf_to_sglang_mapper.apply_list(self.exclude_layers)
+        expanded = []
+        for name in mapped:
+            expanded.append(name)
+            if name.startswith("language_model."):
+                expanded.append(name.removeprefix("language_model."))
+        self.exclude_layers = list(dict.fromkeys(expanded))
+
+        layer_quant_config = self.quant_config.get("layer_quant_config")
+        if layer_quant_config:
+            layer_quant_config = hf_to_sglang_mapper.apply_dict(layer_quant_config)
+            # DeepSeek-V4 fuses wq_a + wkv into one wqkv_a module that has no spec
+            # of its own; both halves share one, so mirror it.
+            for name in list(layer_quant_config):
+                if name.endswith(".wq_a"):
+                    layer_quant_config.setdefault(
+                        name.removesuffix(".wq_a") + ".wqkv_a", layer_quant_config[name]
+                    )
+            self.quant_config["layer_quant_config"] = layer_quant_config
+
+        if self.kv_cache_group:
+            self.kv_cache_group = hf_to_sglang_mapper.apply_list(self.kv_cache_group)
+
+    @staticmethod
+    def _get_block_fp8_config(
+        layer_quant_config: Optional[dict[str, Any]],
+        packed_modules_mapping: dict[str, list[str]],
+    ) -> Optional[Fp8Config]:
+        if layer_quant_config is None:
+            return None
+
+        weight_config = layer_quant_config.get("weight") or {}
+        input_config = layer_quant_config.get("input_tensors") or {}
+        block_size = weight_config.get("block_size")
+        if not (
+            not layer_quant_config.get("output_tensors")
+            and not layer_quant_config.get("bias")
+            and weight_config.get("dtype") in {"fp8_e4m3", "fp8_e4m3fn"}
+            and weight_config.get("qscheme") == "per_block"
+            and weight_config.get("is_dynamic") is False
+            and isinstance(block_size, list)
+            and len(block_size) == 2
+            and input_config.get("dtype") in {"fp8_e4m3", "fp8_e4m3fn"}
+            and input_config.get("is_dynamic") is True
+        ):
+            return None
+
+        # Quark's [1, 32] float8_e8m0fnu scales are uint8 e8m0, not fp32, so they load as
+        # MXFP8; ROCm only, so CUDA keeps its earlier handling of these checkpoints
+        use_mxfp8 = (
+            _is_hip
+            and block_size == [1, 32]
+            and "e8m0" in str(weight_config.get("scale_type") or "")
+        )
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=block_size,
+            packed_modules_mapping=packed_modules_mapping,
+            use_mxfp8=use_mxfp8,
+        )
+
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        # get_quant_method registers every non-excluded prefix as an
+        # online-quantized layer, so answer from the exclude list instead.
+        return self.excluded_fp8_config is None and should_ignore_layer(
+            prefix,
+            ignore=self.exclude_layers,
+            fused_mapping=self.packed_modules_mapping,
+        )
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional["QuantizeMethodBase"]:
+        # Check if the layer is skipped for quantization.
+        if should_ignore_layer(
+            prefix,
+            ignore=self.exclude_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            if isinstance(layer, LinearBase):
+                # "exclude" means keep the layer in its original precision.
+                # Mixed-precision sources may keep excluded layers in FP8
+                # (block or per-tensor, selected by excluded_fp8_config's
+                # weight_block_size); pure-NVFP4/BF16 sources keep them bf16.
+                if self.excluded_fp8_config is not None:
+                    return Fp8LinearMethod(quant_config=self.excluded_fp8_config)
+                return UnquantizedLinearMethod()
+            elif isinstance(layer, RadixAttention):
+                return QuarkKVCacheMethod(self)
+            return None
+
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        matched_config = self._find_matched_config(prefix, layer)
+
+        # Answered once per layer and handed to get_moe_scheme below, so the
+        # exclude scan and the per-layer lookups behind it run only once.
+        quantize_shared_online = self.shared_expert_online_mxfp4_for_layer(layer)
+        if quantize_shared_online and not self._is_mx_fp4(
+            matched_config.get("weight"), matched_config.get("input_tensors")
+        ):
+            # Checked here rather than in get_moe_scheme because block-FP8 MoE
+            # layers are dispatched to Fp8MoEMethod below and never reach it.
+            raise NotImplementedError(
+                f"{prefix} does not use the W4A4 MXFP4 MoE scheme, which is "
+                "the only one that can quantize a BF16 shared expert into the "
+                "fused slot. Drop --enforce-shared-experts-fusion to run this "
+                "checkpoint with a standalone shared expert."
+            )
+
+        block_fp8_config = self._get_block_fp8_config(
+            matched_config, self.packed_modules_mapping
+        )
+        if block_fp8_config is not None:
+            if isinstance(layer, LinearBase):
+                return Fp8LinearMethod(block_fp8_config)
+            if isinstance(layer, FusedMoE):
+                return Fp8MoEMethod(block_fp8_config)
+
+        if isinstance(layer, LinearBase):
+            scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+            layer.scheme = scheme
+            self._online_quantized_layers.add(prefix)
+            return QuarkLinearMethod(self)
+
+        if isinstance(layer, RadixAttention):
+            self._online_quantized_layers.add(prefix)
+            return QuarkKVCacheMethod(self)
+
+        if isinstance(layer, FusedMoE):
+            self._online_quantized_layers.add(prefix)
+            layer.scheme = self.get_moe_scheme(
+                layer, prefix, quantize_shared_expert_online=quantize_shared_online
+            )
+            return QuarkFusedMoEMethod(self)
+
+        return None
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "QuarkConfig":
+        # Requantization dispatch is gated on requantization_method, NOT on
+        # quant_method. Quark-exported NVFP4 carries quant_method="quark" too
+        if config.get("requantization_method") == "quark_mxfp4":
+            hf_config = config["hf_config"]
+
+            # Mixed-precision source: only the NVFP4 layers are requantized to
+            # MXFP4; layers in other precisions (e.g. FP8) load through their
+            # own scheme
+            layer_map = _mixed_precision_layer_map(config)
+            if layer_map is not None:
+                config_groups = config.get("config_groups")
+                layer_quant_config, has_nvfp4 = (
+                    _build_mixed_precision_layer_quant_config(layer_map, config_groups)
+                )
+                if not has_nvfp4:
+                    raise NotImplementedError(
+                        "MIXED_PRECISION checkpoint has no NVFP4 layers to "
+                        "requantize; load it with its native quantization "
+                        "method instead of --quantization quark_mxfp4."
+                    )
+                source_excludes = _parse_nvfp4_excludes(config)
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type,
+                    source_excludes=source_excludes,
+                    layer_quant_config=layer_quant_config,
+                    packed_modules_mapping=config.get("packed_modules_mapping"),
+                )
+                # Excluded layers are kept as-is. When the base checkpoint is
+                # FP8-serialized (e.g. DeepSeek-V4-Pro-NVFP4: FP8 attn/
+                # shared_experts, NVFP4 routed experts) they load through FP8;
+                # `weight_block_size` selects block vs per-tensor. Pure
+                # NVFP4/ModelOpt-mixed sources keep excluded layers in bf16, and
+                # their FP8 layers (if any) are enumerated in the layer map.
+                excluded_fp8_config = _build_excluded_fp8_config(config)
+                return cls(
+                    quant_config=quant_config,
+                    hf_config=hf_config,
+                    is_prequantized=False,
+                    dequantization_config=Nvfp4SourceConfig(),
+                    excluded_fp8_config=excluded_fp8_config,
+                )
+
+            from sglang.srt.layers.quantization.quark import mxfp8_base
+
+            # ROCm only: CUDA keeps raising for this source below
+            if _is_hip and mxfp8_base.is_mxfp8_base_nvfp4_moe_source(config):
+                return mxfp8_base.QuarkMxfp8BaseConfig.from_source(config, hf_config)
+
+            nvfp4_src = _detect_nvfp4_source(config)
+            if nvfp4_src is not None:
+                source_excludes = _parse_nvfp4_excludes(config)
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type,
+                    source_excludes=source_excludes,
+                )
+                return cls(
+                    quant_config=quant_config,
+                    hf_config=hf_config,
+                    is_prequantized=False,
+                    dequantization_config=nvfp4_src,
+                )
+
+            # Pure FP8 source: every layer is requantized FP8 -> MXFP4.
+            if (
+                config.get("quant_method") == "fp8"
+                and config.get("activation_scheme") == "dynamic"
+            ):
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type
+                )
+                dequantization_config = Fp8Config.from_config(config)
+                return cls(
+                    quant_config=quant_config,
+                    hf_config=hf_config,
+                    is_prequantized=False,
+                    dequantization_config=dequantization_config,
+                    online_scheme=config["requantization_method"],
+                )
+
+            raise NotImplementedError(
+                f"Requantization into {config['requantization_method']} is not supported, "
+                f"from the original quant_method={config['quant_method']} "
+                f"and activation_scheme={config.get('activation_scheme')}."
+            )
+
+        if config["quant_method"] != "quark":
+            raise ValueError(
+                f"QuarkConfig.from_config invoked with non-quark quant_method "
+                f"{config['quant_method']!r} but no requantization_method set."
+            )
+
+        export_config = config.get("export")
+        if export_config is None:
+            raise ValueError(
+                "The export key should be included in "
+                "the configurations of Quark quantized model"
+            )
+
+        kv_cache_group = cast(list[str], export_config.get("kv_cache_group"))
+        pack_method = cast(str, export_config.get("pack_method"))
+
+        # In the export model of quark, the quantization configuration
+        # of kv_cache is stored in layer_quant_config. First, it is
+        # judged whether kv_cache_group exists, and then it is judged
+        # whether layer_quant_config has a quantization configuration
+        # that matches kv_cache.
+        if len(kv_cache_group) == 0:
+            kv_cache_config = None
+        else:
+            kv_cache_set = set(kv_cache_group)
+            layer_quant_config = cast(dict[str, Any], config.get("layer_quant_config"))
+            layer_quant_names = list(layer_quant_config.keys())
+            layer_quant_set = set(layer_quant_names)
+
+            if not kv_cache_set.issubset(layer_quant_set):
+                raise ValueError(
+                    "The Quark quantized model has the "
+                    "kv_cache_group parameter setting, "
+                    "but no kv_cache quantization settings "
+                    "were found in the quantization "
+                    "configuration."
+                )
+
+            q_configs = [
+                cast(dict[str, Any], layer_quant_config.get(name))
+                for name in kv_cache_group
+            ]
+            if not all(deep_compare(q_config, q_configs[0]) for q_config in q_configs):
+                raise ValueError(
+                    "The quantization method used for kv_cache should "
+                    "be the same, but the quantization method for the "
+                    "kv_cache layer in the config is different."
+                )
+            kv_cache_config = q_configs[0].get("output_tensors")
+            if kv_cache_config is None:
+                raise ValueError("The kv_cache quantization configuration is empty.")
+
+            # Since we have already set kv_cache quantization configurations,
+            # we will remove the quantization configuration for the
+            # output_tensors corresponding to the kv_cache layer.
+            for q_config in q_configs:
+                q_config["output_tensors"] = None
+
+            # In case q_proj output is also quantized, remove the configuration
+            # to keep qkv consistency.
+            q_proj_q_config = cast(dict[str, Any], layer_quant_config.get("*q_proj"))
+            if q_proj_q_config is not None:
+                q_proj_q_config["output_tensors"] = None
+
+        return cls(
+            quant_config=config,
+            # The requantization branch above takes hf_config off the same dict;
+            # the prequantized path needs it too, so _is_draft_layer() has the
+            # layer counts it compares against.
+            hf_config=config.get("hf_config"),
+            kv_cache_group=kv_cache_group,
+            kv_cache_config=kv_cache_config,
+            pack_method=pack_method,
+            is_prequantized=True,
+        )
+
+    @classmethod
+    def get_config_filenames(cls) -> list[str]:
+        return []
+
+    @staticmethod
+    def _create_online_mxfp4_config(
+        model_type: str,
+        source_excludes: Optional[list[str]] = None,
+        layer_quant_config: Optional[dict[str, Any]] = None,
+        packed_modules_mapping: Optional[dict[str, list[str]]] = None,
+    ) -> dict[str, Any]:
+        """
+        Create a synthetic quant_config for online MXFP4 quantization.
+
+        When `layer_quant_config` is provided (mixed-precision source), the
+        per-layer map is authoritative about which layers are quantized and in
+        what precision, so the model_type-specific default excludes
+        are skipped: non-NVFP4 layers must load through their own scheme
+        """
+        # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
+        # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
+        exclude = [
+            "re:.*gate$",
+            "re:.*router",
+            "re:.*lm_head",
+            "re:.*embed_tokens",
+        ]
+
+        if source_excludes:
+            exclude.extend(source_excludes)
+        elif layer_quant_config is None:
+            # Exclusion for accuracy adapted from
+            # https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json
+            if model_type in ("deepseek_v3", "deepseek_v32", "deepseek_v4"):
+                exclude.extend(
+                    [
+                        "re:.*model.layers.61.*",
+                        "re:.*self_attn.*",
+                        "re:.*mlp.gate$",
+                    ]
+                )
+            elif model_type == "qwen3_5_moe":
+                # Exclusion for accuracy adapted from
+                # https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4/blob/main/config.json
+                exclude.extend(
+                    [
+                        "re:.*n_proj_a",
+                        "re:.*in_proj_b",
+                        "re:.*in_proj_qkv",
+                        "re:.*in_proj_z",
+                        "re:.*o_proj",
+                        "re:.*out_proj",
+                        "re:.*qkv_proj",
+                        "re:.*shared_expert",
+                    ]
+                )
+
+        return {
+            "packed_modules_mapping": packed_modules_mapping or {},
+            "exclude": exclude,
+            "global_quant_config": {
+                "weight": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": False,
+                    "scale_format": "e8m0",
+                },
+                "input_tensors": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": True,
+                    "scale_format": "e8m0",
+                },
+                "output_tensors": None,
+                "bias": None,
+            },
+            "layer_quant_config": layer_quant_config or {},
+            "layer_type_quant_config": {},
+            "export": {
+                "kv_cache_group": [],
+                "pack_method": "reorder",
+            },
+        }
+
+    def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        capability_tuple = get_device_capability()
+
+        if capability_tuple is not None:
+            assert 0 <= capability_tuple[1] < 10
+            capability = capability_tuple[0] * 10 + capability_tuple[1]
+
+            supported = capability >= min_capability
+            if error and not supported:
+                # Pass a single joined message; RuntimeError stringifies
+                # multiple positional args as a tuple repr.
+                raise RuntimeError(
+                    "Quantization scheme is not supported for "
+                    f"the current GPU. Min capability: {min_capability}. "
+                    f"Current capability: {capability}."
+                )
+            return supported
+        else:
+            return False
+
+    def _is_fp8_w8a8(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        # Confirm weights and input quantized.
+        if weight_quant is None or input_quant is None:
+            return False
+
+        # Confirm weight scheme is supported
+        is_fp8_dtype = (
+            weight_quant.get("dtype") == "fp8_e4m3"
+            and input_quant.get("dtype") == "fp8_e4m3"
+        )
+        is_static_weight = not weight_quant.get("is_dynamic")
+        is_per_tensor_or_channel_weight = weight_quant.get("qscheme") in [
+            "per_tensor",
+            "per_channel",
+        ]
+
+        if not (is_fp8_dtype and is_static_weight and is_per_tensor_or_channel_weight):
+            return False
+
+        # Dynamic quantization is always supported if weights supported.
+        if input_quant.get("is_dynamic"):
+            return True
+
+        # Confirm activation scheme is supported.
+        is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
+        return is_per_tensor_activation
+
+    def _is_int4_w4a16(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        # Weight-only int4 runs on ROCm only (Triton skinny GEMM); activations stay
+        # fp16/bf16.
+        if not is_hip() or weight_quant is None or input_quant is not None:
+            return False
+        if weight_quant.get("dtype") != "int4":
+            return False
+        if weight_quant.get("qscheme") != "per_group":
+            return False
+        if weight_quant.get("group_size") not in (32, 64, 128):
+            logger.debug(
+                "Quark INT4 W4A16 has unsupported group_size %s",
+                weight_quant.get("group_size"),
+            )
+            return False
+        if weight_quant.get("symmetric") is not True:
+            # asymmetric zero points are neither repacked for nor loaded through the fused
+            # GDN projection loader
+            logger.debug("Quark INT4 W4A16 supports symmetric weights only")
+            return False
+        return weight_quant.get("is_dynamic") is not True
+
+    def _is_mx_fp4(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        # Confirm weights and input quantized.
+        if weight_quant is None or input_quant is None:
+            logger.debug(
+                "Quark model is not in MX-FP4 format: "
+                "weight_quant or input_quant not set"
+            )
+            return False
+
+        # Input and weight dtype needs to be fp4.
+        if weight_quant.get("dtype") != "fp4" or input_quant.get("dtype") != "fp4":
+            logger.debug("Quark model is not in MX-FP4 format: dtype not fp4")
+            return False
+
+        # Input and weight qscheme needs to be per group.
+        if (
+            weight_quant.get("qscheme") != "per_group"
+            or input_quant.get("qscheme") != "per_group"
+        ):
+            logger.debug("Quark model is not in MX-FP4 format: not per_group")
+            return False
+
+        # Input and weight group size needs to be 32.
+        if weight_quant.get("group_size") != 32 or input_quant.get("group_size") != 32:
+            logger.debug("Quark model is not in MX-FP4 format: not group_size=32")
+            return False
+
+        # Weights need to use static quantization.
+        if weight_quant.get("is_dynamic") is True:
+            logger.debug("Quark model is not in MX-FP4 format: not weight static")
+            return False
+
+        # Activations need to use dynamic quantization.
+        if input_quant.get("is_dynamic") is False:
+            logger.debug("Quark model is not in MX-FP4 format: not activation dynamic")
+            return False
+
+        # Activations and weight scales need to be in e8m0 format.
+        if (
+            weight_quant.get("scale_format") != "e8m0"
+            or input_quant.get("scale_format") != "e8m0"
+        ):
+            logger.debug("Quark model is not in MX-FP4 format: not scale_format e8m0")
+            return False
+
+        return True
+
+    def _is_mx_w4a8(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_mx_fp4_weight = (
+            weight_quant.get("dtype") == "fp4"
+            and weight_quant.get("qscheme") == "per_group"
+            and weight_quant.get("group_size") == 32
+            and not weight_quant.get("is_dynamic")
+            and weight_quant.get("scale_format") == "e8m0"
+        )
+        is_static_fp8_activation = (
+            input_quant.get("dtype") in ("fp8_e4m3", "fp8_e4m3fn")
+            and input_quant.get("qscheme") == "per_tensor"
+            and not input_quant.get("is_dynamic")
+        )
+        return is_mx_fp4_weight and is_static_fp8_activation
+
+    def _find_matched_config(
+        self, layer_name: str, module: torch.nn.Module
+    ) -> dict[str, Any]:
+
+        proj_name = layer_name.split(".")[-1]
+        if proj_name in self.packed_modules_mapping:
+            shard_proj_names = self.packed_modules_mapping[proj_name]
+
+            # Convert fused_name --> [shard_names]
+            shard_names = [
+                layer_name.replace(proj_name, shard_proj_name)
+                for shard_proj_name in shard_proj_names
+            ]
+            shard_configs = [
+                self._find_matched_config(shard_name, module)
+                for shard_name in shard_names
+            ]
+            if not all(
+                deep_compare(q_config, shard_configs[0]) for q_config in shard_configs
+            ):
+                raise ValueError(
+                    f"Found a different quantization configuration for "
+                    f"{shard_proj_names} in {layer_name}. SGLang "
+                    "requires all to use the same scheme."
+                )
+            return shard_configs[0]
+        else:
+            layer_quant_config = cast(
+                dict[str, Any], self.quant_config.get("layer_quant_config")
+            )
+            for name_pattern in layer_quant_config:
+                if fnmatch.fnmatch(layer_name, name_pattern):
+                    return layer_quant_config[name_pattern]
+
+            # entries may name experts individually, so they resolve the fused module
+            if layer_name.endswith(".experts"):
+                expert_prefix = layer_name + "."
+                expert_entries = {
+                    name[len(expert_prefix) :]: cfg
+                    for name, cfg in layer_quant_config.items()
+                    if name.startswith(expert_prefix)
+                }
+                if expert_entries:
+                    return self._fused_expert_config(layer_name, expert_entries)
+
+            layer_type = type(module).__name__
+            layer_type_quant_config = cast(
+                dict[str, Any], self.quant_config.get("layer_type_quant_config")
+            )
+            if layer_type in layer_type_quant_config:
+                return layer_type_quant_config[layer_type]
+
+            global_quant_config = cast(
+                dict[str, Any], self.quant_config.get("global_quant_config")
+            )
+            return global_quant_config
+
+    @staticmethod
+    def _fused_expert_config(
+        layer_name: str, entries: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        projections_by_expert: dict[int, set[str]] = {}
+        for suffix in entries:
+            index, _, projection = suffix.partition(".")
+            if not index.isdigit() or not projection:
+                raise ValueError(
+                    f"Found a per-expert entry {suffix!r} in {layer_name} that is "
+                    "not <expert index>.<projection>."
+                )
+            projections_by_expert.setdefault(int(index), set()).add(projection)
+
+        # one fused module spans the bank, so a gap below the highest pinned index raises
+        pinned = projections_by_expert.keys()
+        missing = sorted(set(range(max(pinned) + 1)) - pinned)
+        if missing:
+            raise ValueError(
+                f"Found per-expert entries in {layer_name} that skip experts "
+                f"{missing[:4]}. SGLang requires all to use the same scheme."
+            )
+
+        projections = next(iter(projections_by_expert.values()))
+        if any(p != projections for p in projections_by_expert.values()):
+            raise ValueError(
+                f"Found different projections pinned per expert in {layer_name}. "
+                "SGLang requires all to use the same scheme."
+            )
+
+        configs = list(entries.values())
+        if not all(deep_compare(cfg, configs[0]) for cfg in configs):
+            raise ValueError(
+                f"Found different quantization configurations among the experts "
+                f"of {layer_name}. SGLang requires all to use the same scheme."
+            )
+        return configs[0]
+
+    def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkLinearScheme":
+        if config.get("output_tensors") or config.get("bias"):
+            raise NotImplementedError(
+                "Currently, Quark models with output_tensors "
+                "and bias quantized are not supported"
+            )
+        weight_config = cast(dict[str, Any], config.get("weight"))
+        input_config = cast(dict[str, Any], config.get("input_tensors"))
+
+        if self._is_mx_fp4(weight_config, input_config):
+            return QuarkW4A4MXFP4(
+                weight_config,
+                input_config,
+                is_checkpoint_mxfp4_serialized=self.is_prequantized,
+                dequantization_config=self.dequantization_config,
+            )
+        if self._is_int4_w4a16(weight_config, input_config):
+            return QuarkW4A16Int4(weight_config, input_config)
+        if self._is_fp8_w8a8(weight_config, input_config):
+            is_fp8_w8a8_supported = self._check_scheme_supported(
+                QuarkW8A8Fp8.get_min_capability(), error=False
+            )
+            if is_fp8_w8a8_supported:
+                return QuarkW8A8Fp8(weight_config, input_config)
+
+        raise NotImplementedError(
+            "No quark compatible scheme was found. "
+            f"Weight config: {weight_config}, "
+            f"Input config: {input_config}"
+        )
+
+    def get_linear_scheme(
+        self, layer: torch.nn.Module, layer_name: str
+    ) -> "QuarkLinearScheme":
+
+        layer_quant_config = self._find_matched_config(layer_name, layer)
+
+        # Find the quant_scheme
+        scheme = self._get_scheme_from_config(layer_quant_config)
+
+        # Raise error if device does not support the scheme
+        # (e.g. fp8 needs ada lovelace)
+        self._check_scheme_supported(scheme.get_min_capability())
+
+        return scheme
+
+    def get_moe_scheme(
+        self,
+        module: torch.nn.Module,
+        layer_name: str,
+        quantize_shared_expert_online: Optional[bool] = None,
+    ) -> "QuarkMoEScheme":
+        # None means "work it out from the module". get_quant_method passes the
+        # answer it already computed so the scan behind it is not repeated.
+        if quantize_shared_expert_online is None:
+            quantize_shared_expert_online = self.shared_expert_online_mxfp4_for_layer(
+                module
+            )
+
+        layer_quant_config = self._find_matched_config(layer_name, module)
+
+        if layer_quant_config.get("output_tensors") or layer_quant_config.get("bias"):
+            raise NotImplementedError(
+                "Currently, Quark models with "
+                "output_tensors and bias "
+                "quantized are not supported"
+            )
+        weight_config = layer_quant_config.get("weight")
+        input_config = layer_quant_config.get("input_tensors")
+
+        if self._is_mx_fp4(weight_config, input_config):
+            return QuarkW4A4MXFp4MoE(
+                weight_config,
+                input_config,
+                is_checkpoint_mxfp4_serialized=self.is_prequantized,
+                dequantization_config=self.dequantization_config,
+                quantize_shared_expert_online=quantize_shared_expert_online,
+            )
+        elif self._is_mx_w4a8(weight_config, input_config):
+            logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
+            return QuarkW4A8MXFp4MoE(weight_config, input_config)
+        elif self._is_fp8_w8a8(weight_config, input_config):
+            return QuarkW8A8FP8MoE(weight_config, input_config)
+        else:
+            raise RuntimeError("Unsupported FusedMoe scheme")
+
+    def get_scaled_act_names(self) -> List[str]:
+        return []
+
+    def _is_draft_layer(self, layer: str) -> bool:
+        """Whether an excluded layer belongs to the MTP/NextN draft stack.
+
+        A draft layer is excluded from quantization in most checkpoints, and
+        says nothing about how the target model stores its own shared experts,
+        so it must not veto shared-expert fusion for the target model's layers.
+
+        Checkpoints spell it either as "mtp.*" or as extra entries appended to
+        the main decoder, model.layers.[num_hidden_layers ..
+        + num_nextn_predict_layers) -- the same range
+        get_spec_layer_idx_from_weight_name() walks in the MTP models.
+        """
+        if layer.startswith("mtp."):
+            return True
+        if self.num_hidden_layers is None:
+            return False
+        base = self.num_hidden_layers
+        return any(
+            layer.startswith(f"model.layers.{base + i}.")
+            for i in range(self.num_nextn_predict_layers)
+        )
+
+    def shared_expert_excluded_from_quant(self) -> bool:
+        """Whether the target model's shared-expert body is left unquantized.
+
+        The shared_expert_gate is a separate tiny linear that stays BF16 in
+        every checkpoint, and draft-stack entries say nothing about how the
+        target stores its shared experts, so neither counts.
+        """
+        return any(
+            "shared_expert" in layer
+            and "shared_expert_gate" not in layer
+            and not self._is_draft_layer(layer)
+            for layer in self.exclude_layers
+        )
+
+    def shared_expert_online_mxfp4_supported(self) -> bool:
+        """Whether a BF16 shared expert can be quantized into the fused slot.
+
+        Opt-in, because the conversion costs accuracy: --enforce-shared-experts-fusion
+        is what asks for fusion in a case the gate would otherwise refuse, and an
+        excluded shared expert is exactly such a case.
+
+        Only QuarkW4A4MXFp4MoE implements it, and only for a prequantized
+        checkpoint on FP4 hardware and one of the architectures it has been
+        measured on, so every MoE layer has to resolve to that scheme. The
+        global spec is not enough to decide that: layer_quant_config can send
+        individual MoE layers to the W4A8 or FP8 scheme, and those would copy
+        the BF16 shared expert into their own buffers unconverted. Both the
+        layer-0 lookup and the per-layer overrides are therefore checked, and
+        names the checkpoint does not carry fall back to the global spec, so a
+        non-MXFP4 global spec conservatively disables fusion.
+
+        Every refusal warns and answers "unsupported" rather than raising, so an
+        unsupported checkpoint falls back to a standalone shared expert.
+        """
+        if not get_exec().moe.enforce_shared_experts_fusion:
+            return False
+
+        # is_hip() first: on a CUDA build SGLANG_USE_AITER is meaningless, and
+        # naming it would point the user at the wrong fix.
+        if not is_hip():
+            return self._warn_online_mxfp4_unavailable("this is not a ROCm build")
+        if not envs.SGLANG_USE_AITER.get():
+            return self._warn_online_mxfp4_unavailable("SGLANG_USE_AITER is not set")
+        if not is_gfx95_supported():
+            return self._warn_online_mxfp4_unavailable(
+                "the device has no FP4 support (needs gfx95x, e.g. MI355X)"
+            )
+        if not self.is_prequantized:
+            return self._warn_online_mxfp4_unavailable(
+                "the checkpoint is not prequantized"
+            )
+        if self.model_type not in _ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES:
+            return self._warn_online_mxfp4_unavailable(
+                f"model_type {self.model_type!r} is not one of "
+                f"{list(_ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES)}, the "
+                "architectures it is supported on"
+            )
+
+        lookup_stub = torch.nn.Module()
+        try:
+            moe_configs = [
+                self._find_matched_config(f"{base}.mlp.experts", lookup_stub)
+                for base in _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES
+            ]
+        except ValueError:
+            return self._warn_online_mxfp4_unavailable(
+                "the layer-0 MoE quantization config could not be resolved"
+            )
+
+        if not all(
+            self._is_mx_fp4(cfg.get("weight"), cfg.get("input_tensors"))
+            for cfg in moe_configs
+        ):
+            return self._warn_online_mxfp4_unavailable(
+                "the routed experts are not MXFP4"
+            )
+
+        # Layer 0 answers for layer 0 only, but the fused slot lives in every
+        # MoE layer. Rejecting a non-MXFP4 per-layer override here turns what
+        # would otherwise be a NotImplementedError from get_quant_method part
+        # way through startup into the same warning and fallback.
+        elsewhere = self._non_mxfp4_moe_layer_overrides()
+        if elsewhere:
+            return self._warn_online_mxfp4_unavailable(
+                f"layer_quant_config sends {len(elsewhere)} MoE layer(s) to a "
+                f"non-MXFP4 scheme, starting with {elsewhere[0]}"
+            )
+        return True
+
+    def _non_mxfp4_moe_layer_overrides(self) -> list[str]:
+        """Per-layer config entries naming routed experts that are not MXFP4.
+
+        Sorted so every rank names the same layer in its warning. The shared
+        expert is skipped: it is the tensor being converted, and it is excluded
+        from quantization rather than given a spec of its own.
+        """
+        layer_quant_config = self.quant_config.get("layer_quant_config") or {}
+        return sorted(
+            name
+            for name, spec in layer_quant_config.items()
+            if "experts" in name
+            and "shared_expert" not in name
+            and not self._is_mx_fp4(spec.get("weight"), spec.get("input_tensors"))
+        )
+
+    @staticmethod
+    def _warn_online_mxfp4_unavailable(reason: str) -> bool:
+        """Report an opt-in that cannot be honoured, and answer "unsupported".
+
+        Only reached when the checkpoint's shared expert really is excluded
+        from quantization, so the flag was asked for and is being dropped;
+        without this the fallback to a standalone shared expert is silent.
+        """
+        logger.warning_once(
+            "--enforce-shared-experts-fusion was passed but the shared expert "
+            f"will not be quantized or fused because {reason}. The model runs "
+            "with a standalone shared expert instead."
+        )
+        return False
+
+    def shared_expert_needs_online_mxfp4(self) -> bool:
+        """Whether the fused shared slot has to be quantized while loading.
+
+        Quark MXFP4 checkpoints (Qwen3.5, Qwen3.8) ship a BF16 shared expert
+        alongside MXFP4 routed experts, and copying those BF16 weights into the
+        packed FP4 expert buffers unchanged produces garbage.
+        """
+        return (
+            self.shared_expert_excluded_from_quant()
+            and self.shared_expert_online_mxfp4_supported()
+        )
+
+    def shared_expert_online_mxfp4_for_layer(self, layer: torch.nn.Module) -> bool:
+        """Whether this MoE layer's fused shared slot needs converting.
+
+        shared_expert_needs_online_mxfp4() is a model-wide answer and says
+        nothing about whether this layer actually got a fused shared slot.
+        Fusion can still be off for it: --disable-shared-experts-fusion, a
+        DeepEP / DeepEP-v2 / MoRI a2a backend, a shared-expert intermediate
+        size that differs from the routed one, or per-rank shared slots at
+        moe_ep_size > 1 all leave _has_fused_shared False. Nothing is then
+        copied into a fused slot, so neither the guard nor the scheme's warning
+        should fire. FusedMoE.__init__ sets the attribute before it calls
+        get_quant_method(), and create_weights() already gates on it.
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        return (
+            isinstance(layer, FusedMoE)
+            and getattr(layer, "_has_fused_shared", False)
+            and self.shared_expert_needs_online_mxfp4()
+        )
+
+    def can_fuse_shared_expert(self) -> bool:
+        # An excluded shared-expert body cannot match the routed spec, so
+        # fusing it is only possible by quantizing it online.
+        if self.shared_expert_excluded_from_quant():
+            return self.shared_expert_online_mxfp4_supported()
+
+        # No per-layer config -> uniform spec, nothing to compare.
+        layer_quant_config = self.quant_config.get("layer_quant_config") or {}
+        if not layer_quant_config:
+            return True
+
+        # DeepSeek-family modules are "shared_experts"; a misspelled lookup would
+        # fall through to the global spec and hide a mismatch.
+        shared_module = (
+            "shared_experts"
+            if any(".shared_experts." in name for name in layer_quant_config)
+            else "shared_expert"
+        )
+
+        probe_bases = (
+            *_MOE_SHARED_EXPERT_QUANT_LAYER0_BASES,
+            *_MOE_SHARED_EXPERT_QUANT_DRAFT_BASES,
+            *self._named_moe_layers(layer_quant_config),
+        )
+
+        # Compare routed vs shared specs at each probe base (stub module needed by
+        # _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
+        lookup_stub = torch.nn.Module()
+        try:
+            for base in probe_bases:
+                moe_name = f"{base}.mlp.experts"
+                moe_cfg = self._find_matched_config(moe_name, lookup_stub)
+                for suffix in _SHARED_EXPERT_BODY_PROJ_SUFFIXES:
+                    shared_name = f"{base}.mlp.{shared_module}.{suffix}"
+                    shared_cfg = self._find_matched_config(shared_name, lookup_stub)
+                    if not deep_compare(moe_cfg, shared_cfg):
+                        return False
+        except ValueError:
+            return False
+
+        return True
+
+    def _named_moe_layers(self, layer_quant_config: dict[str, Any]) -> list[str]:
+        """Target decoder layers whose routed or shared experts are named.
+
+        Layer 0 is a dense MLP in some architectures (DeepSeek-V3, MiniMax-M3),
+        where both of its lookups fall back to the global spec and agree whatever
+        the MoE layers hold. Each named layer can carry its own spec, so all of
+        them are probed. Draft-stack entries say nothing about the target.
+        """
+        return sorted(
+            {
+                match.group(1)
+                for name in layer_quant_config
+                if (match := _NAMED_MOE_LAYER.fullmatch(name))
+                and not self._is_draft_layer(name)
+            }
+        )
+
+
+class QuarkLinearMethod(LinearMethodBase):
+    def __init__(self, quantization_config: QuarkConfig):
+        self.quantization_config = quantization_config
+        self.quant_config = quantization_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.process_weights_after_loading(layer)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """
+        Use the QuarkLinearScheme associated with the layer to create
+        the necessary parameters for the layer. See LinearMethodBase for param
+        details
+        """
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.scheme.create_weights(
+            layer=layer,
+            input_size=input_size,
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            output_size=output_size,
+            params_dtype=params_dtype,
+            weight_loader=weight_loader,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ):
+        """
+        Use the output of create_weights and the QuarkLinearScheme
+        associated with the layer to apply the forward pass with the
+        layer input.  See LinearMethodBase for param details
+
+        """
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights(layer, x, bias=bias)
+
+
+class QuarkFusedMoEMethod(FusedMoEMethodBase):
+    def __init__(self, quantization_config: QuarkConfig):
+        self.quantization_config = quantization_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.process_weights_after_loading(layer)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """
+        Use the QuarkMoEScheme associated with the layer to create
+        the necessary parameters for the layer. See FusedMoEMethodBase for param
+        details
+        """
+        layer.scheme.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        layer.scheme.create_moe_runner(layer, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ):
+        """
+        Use the output of create_weights and the QuarkMoEScheme
+        associated with the layer to apply the forward pass with the
+        fused MoE layer. See FusedMoEMethodBase for param details
+
+        """
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights(layer, dispatch_output)
+
+
+class QuarkKVCacheMethod(BaseKVCacheMethod):
+    """
+    Supports loading kv-cache scaling factors from quark checkpoints.
+    """
+
+    def __init__(self, quant_config: QuarkConfig):
+        self.validate_kv_cache_config(quant_config.kv_cache_config)
+        super().__init__(quant_config)
+
+    @staticmethod
+    def validate_kv_cache_config(kv_cache_config: Optional[dict[str, Any]]):
+        """
+        Validator for the kv cache configuration. Useful for controlling the
+        kv cache quantization schemes, that are being supported in vLLM
+        :param kv_cache_config: the quark kv cache scheme
+        """
+        if kv_cache_config is None:
+            return
+
+        dtype = kv_cache_config.get("dtype")
+        if dtype != "fp8_e4m3":
+            raise NotImplementedError(
+                "Currently supported kv cache quantization is "
+                f"dtype=fp8_e4m3, however received {dtype}"
+            )
+
+        qscheme = kv_cache_config.get("qscheme")
+        if qscheme != "per_tensor":
+            raise NotImplementedError(
+                "Only support per-tensor scaling factor "
+                "for quark KV cache. "
+                f"Expected qscheme: per_tensor, found qscheme: {qscheme}"
+            )

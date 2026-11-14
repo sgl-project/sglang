@@ -1,0 +1,3658 @@
+from __future__ import annotations
+
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_schedule,
+    get_serving,
+    get_spec,
+    mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
+    mamba_track_grid,
+)
+from sglang.srt.utils.common import ceil_align, flatten_arrays_to_pinned_cpu
+from sglang.srt.utils.device import async_h2d, is_pin_memory_available
+from sglang.srt.utils.weight_versions import (
+    WeightVersionEvent,
+    WeightVersionSpans,
+    truncate_weight_version_events,
+)
+
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""
+Store information about requests and batches.
+
+The following is the flow of data structures for a batch:
+
+ScheduleBatch -> ForwardBatch
+
+- ScheduleBatch is managed by `scheduler.py::Scheduler`.
+  It contains high-level scheduling data. Most of the data is on the CPU.
+- ForwardBatch is managed by `model_runner.py::ModelRunner`.
+  It contains low-level tensor data. Most of the data consists of GPU tensors.
+  It is constructed directly from a ScheduleBatch by `ForwardBatch.init_new`.
+"""
+
+import copy
+import dataclasses
+import logging
+import re
+import sys
+import weakref
+from array import array
+from concurrent.futures import Future
+from functools import lru_cache
+from http import HTTPStatus
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
+
+import msgspec
+import numpy as np
+import torch
+
+from sglang.srt.beam_search.batch_tail import (
+    BeamTail,
+    append_beam_tail,
+    beam_retraction_order,
+    num_beam_member_rows,
+    strip_beam_tail,
+)
+from sglang.srt.beam_search.fork import free_member_rows
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.disaggregation.base import BaseKVSender
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.dllm.mixin.req import ReqDllmMixin
+from sglang.srt.environ import envs
+from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
+from sglang.srt.managers.req_types import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    FINISH_MATCHED_STR,
+    FINISH_MATCHED_TOKEN,
+    FINISHED_MATCHED_REGEX,
+    MM_PAD_SHIFT_VALUE,
+    BaseFinishReason,
+    MultimodalDataItem,
+    MultimodalInputs,
+    ReturnHiddenStatesMode,
+    SamplingLogprobsMode,
+    get_request_return_hidden_states_mode,
+    get_return_hidden_states_mode,
+)
+from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+    NewTokenRatioTracker,
+)
+from sglang.srt.mem_cache.allocation import (
+    alloc_for_decode,
+    alloc_for_extend,
+    alloc_tracking_slots,
+    retire_window,
+)
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    CacheRequestHandle,
+    TreeLock,
+)
+from sglang.srt.mem_cache.capacity import capacity_decision
+from sglang.srt.mem_cache.common import (
+    RetractionBackup,
+    evict_from_tree_cache,
+    match_kv_cache,
+)
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance
+from sglang.srt.mem_cache.kv.alloc.demand import windows_retire_by_forward
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.multimodal.cache.digest import structured_digest
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.observability.metrics_collector import (
+    DPBalanceStats,
+    DPCooperationInfo,
+    SchedulerMetricsCollector,
+)
+from sglang.srt.observability.req_time_stats import (
+    APIServerReqTimeStats,
+    DPControllerReqTimeStats,
+    SchedulerReqTimeStats,
+)
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
+
+if TYPE_CHECKING:
+    from typing import Any, Dict
+
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.dllm.config import DllmConfig
+    from sglang.srt.layers.engram_staging import StagedRows
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.request_list import ReqList
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
+    from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
+    from sglang.srt.sampling.custom_logit_processor import PageGuardState
+    from sglang.srt.session.session_controller import Session
+    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+
+logger = logging.getLogger(__name__)
+
+
+def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
+    mode = CaptureHiddenMode.NULL
+    for req in reqs:
+        mode = max(mode, req.return_hidden_states_mode)
+    return mode
+
+
+def need_return_hidden_states(
+    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
+) -> bool:
+    return get_request_return_hidden_states_mode(return_hidden_states).need_capture()
+
+
+@lru_cache(maxsize=1)
+def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
+    if vocab_size > MM_PAD_SHIFT_VALUE:
+        raise ValueError(
+            f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
+            f"MM pad_values may overlap with valid token IDs. "
+            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+        )
+
+
+def split_cached_prefix_by_tier(
+    prefix_len: int,
+    host_hit_len: int,
+    storage_hit_len: int,
+    storage_hit_start: Optional[int] = None,
+    host_hit_is_storage: bool = False,
+) -> tuple[int, int, int]:
+    """Split a request's cached prefix into (device, host, storage) tokens.
+
+    ``host_hit_len`` is the materialized host hit. An exact L3-loaded span is
+    preserved after H2D promotion, while an evicted tail is clipped by
+    ``prefix_len``. In buffer mode host memory is only L3 staging.
+    """
+    host_hit_len = min(prefix_len, host_hit_len)
+    host_start = prefix_len - host_hit_len
+    if storage_hit_start is None:
+        if host_hit_is_storage:
+            storage = host_hit_len
+            host = 0
+        else:
+            storage = min(host_hit_len, storage_hit_len)
+            host = host_hit_len - storage
+    else:
+        storage_end = storage_hit_start + storage_hit_len
+        storage = max(
+            0,
+            min(prefix_len, storage_end) - max(0, storage_hit_start),
+        )
+        storage_in_host = max(
+            0,
+            min(prefix_len, storage_end) - max(host_start, storage_hit_start),
+        )
+        host = 0 if host_hit_is_storage else host_hit_len - storage_in_host
+    device = prefix_len - host - storage
+    return device, host, storage
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ReqLogprob:
+    top_logprobs_num: int
+    token_ids_logprob: Optional[List[int]]
+    input_token_logprobs_val: Optional[List[float]] = None
+    input_token_logprobs_idx: Optional[List[int]] = None
+    input_top_logprobs_val: Optional[List[List[float]]] = None
+    input_top_logprobs_idx: Optional[List[List[int]]] = None
+    # Flat replacements for the rows above (see
+    # build_flat_top_logprobs_arrays); when set, the nested rows are
+    # emptied and the arrays ship instead.
+    input_top_logprobs_val_flat: Optional[np.ndarray] = None
+    input_top_logprobs_idx_flat: Optional[np.ndarray] = None
+    input_top_logprobs_flat_null_prefix: Optional[int] = None
+    input_token_ids_logprobs_val: Optional[List[List[float]]] = None
+    input_token_ids_logprobs_idx: Optional[List[List[int]]] = None
+    output_token_logprobs_val: Optional[list] = None
+    output_token_logprobs_idx: Optional[list] = None
+    output_top_logprobs_val: Optional[list] = None
+    output_top_logprobs_idx: Optional[list] = None
+    # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
+    output_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
+        None
+    )
+    output_token_ids_logprobs_idx: Optional[list] = None
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ReqKvInfo:
+    # Device KV a request holds outside the prefix cache. Always present on the Req;
+    # whether any KV is held is `holds_kv` (a row is registered).
+    # Match observations and scheduling state stay on the Req itself.
+    req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
+
+    # The request's own KV is [cache_protected_len, kv_allocated_len). Only the
+    # methods below write the lengths.
+    cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
+    # This request already inserted [0, here) into the tree; later inserts count
+    # a hit only on the nodes past it, so a request counts each node once.
+    cache_inserted_len: int = 0
+    kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
+    kv_allocated_len: int = 0
+
+    # Each window's slots in [window_dead_lo(page_size), get_evicted_seqlen(its
+    # sub-pool)) are freed; every window keeps its own cursor, by sub-pool name.
+    window_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
+    window_evicted_seqlens: dict[str, int] = dataclasses.field(default_factory=dict)
+
+    # Host-side KV backup the request holds across a retraction (unified cache).
+    retraction_backup: Optional[RetractionBackup] = None
+    # Finish event of a restore whose host-to-device copy may still be writing
+    # this row's pages (unified cache); a host-received request joins a decode
+    # batch once it has completed on every rank that shares the request (under PP,
+    # admission waits for it), and freeing the row waits for it.
+    restore_done_event: Optional[Any] = None
+
+    # Mamba state: an independent resource; whether it is held is `holds_mamba`.
+    mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+    mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    # Per entry of the ping-pong buffer: True where it holds no slot (-1).
+    mamba_ping_pong_empty: Optional[list[bool]] = None
+    mamba_next_track_idx: Optional[int] = None  # 0 or 1
+    mamba_last_track_idx: Optional[int] = None  # 0 or 1
+    # Seq len of the last cached mamba state
+    mamba_last_track_seqlen: Optional[int] = None
+    # Seq len of the other ping-pong slot's state. None means what is in
+    # that slot cannot be named (never written, donated, freed).
+    mamba_prev_track_seqlen: Optional[int] = None
+    # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
+    mamba_cow_src_index: Optional[torch.Tensor] = None
+    # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
+    mamba_needs_clear: bool = False
+
+    def window_dead_lo(self, page_size: int) -> int:
+        # Lowest position this request may free itself in any window: above the
+        # tree-owned prefix and above the eviction shield, page-aligned upward.
+        lo = max(self.cache_protected_len, self.window_evict_floor)
+        if page_size > 1 and lo > self.cache_protected_len:
+            lo = ceil_align(lo, page_size)
+        return lo
+
+    @property
+    def holds_kv(self) -> bool:
+        return self.req_pool_idx is not None
+
+    @property
+    def holds_mamba(self) -> bool:
+        return self.mamba_pool_idx is not None
+
+    @property
+    def is_kv_released(self) -> bool:
+        return self.kv_allocated_len == 0 and self.max_evicted_seqlen == 0
+
+    @property
+    def max_evicted_seqlen(self) -> int:
+        return max(self.window_evicted_seqlens.values(), default=0)
+
+    def get_evicted_seqlen(self, sub_pool: str) -> int:
+        return self.window_evicted_seqlens.get(sub_pool, 0)
+
+    def set_evicted_seqlen(self, sub_pool: str, length: int) -> None:
+        self.window_evicted_seqlens[sub_pool] = length
+
+    def evicted_seqlens(self) -> dict[str, int]:
+        """Every window's cursor by sub-pool name, as a copy."""
+        return dict(self.window_evicted_seqlens)
+
+    def clamp_evicted_seqlens(self, length: int) -> None:
+        for sub_pool, cursor in self.window_evicted_seqlens.items():
+            self.window_evicted_seqlens[sub_pool] = min(cursor, length)
+
+    def mark_kv_released(self) -> None:
+        self.kv_allocated_len = 0
+        self.window_evicted_seqlens.clear()
+
+    def set_row_len(self, end: int) -> None:
+        """The row holds exactly [0, end), all of it committed."""
+        self.kv_allocated_len = end
+        self.kv_committed_len = end
+
+    def allocate_decode(self, num_tokens: int) -> None:
+        """A decode step holds num_tokens more slots and commits them at
+        allocation, before the step runs."""
+        self.kv_allocated_len += num_tokens
+        self.kv_committed_len += num_tokens
+
+    def allocate_spec_decode(self, end: int) -> None:
+        """A speculative step holds at least [0, end) and commits nothing; a
+        reservation an earlier step left past end stays."""
+        self.kv_allocated_len = max(self.kv_allocated_len, end)
+
+    def allocate_prealloc(self, fill_len: int) -> None:
+        """PD decode: the preallocated row holds [0, fill_len)."""
+        self.kv_allocated_len = fill_len
+
+    def commit_prealloc(self, fill_len: int) -> None:
+        """PD decode: [0, fill_len) counts as committed, since the prefill
+        node computes it and the transfer writes its KV."""
+        self.kv_committed_len = fill_len
+
+    def commit_decode(self, num_tokens: int) -> None:
+        """num_tokens more decode tokens (a verify's accepted run) are committed."""
+        self.kv_committed_len += num_tokens
+
+    def commit_finished(self, end: int) -> None:
+        """A finished turn kept by a streaming session commits up to end,
+        capped at what the row holds."""
+        self.kv_committed_len = min(end, self.kv_allocated_len)
+
+    def truncate_committed(self, end: int) -> None:
+        """Committed drops to end if it is past it; nothing else changes."""
+        self.kv_committed_len = min(self.kv_committed_len, end)
+
+    def truncate(self, end: int) -> None:
+        """The row keeps at most [0, end): every length past end drops to it."""
+        self.kv_allocated_len = min(self.kv_allocated_len, end)
+        self.kv_committed_len = min(self.kv_committed_len, end)
+        self.clamp_evicted_seqlens(end)
+
+    def protect_prefix(self, length: int) -> None:
+        """The tree owns [0, length) of the row; the request frees only past it."""
+        self.cache_protected_len = length
+
+    def record_insert(self, length: int) -> None:
+        """The request inserted [0, length) into the tree; a shorter insert
+        than an earlier one leaves the record as it is."""
+        self.cache_inserted_len = max(self.cache_inserted_len, length)
+
+    def clear_tree_prefix(self) -> None:
+        """The tree owns none of the row and the request inserted none of it."""
+        self.cache_protected_len = 0
+        self.cache_inserted_len = 0
+
+    def shield_window_prefill(self, extend_end: int) -> None:
+        """Prefill-aware windows: no window evicts [0, extend_end)."""
+        self.window_evict_floor = extend_end
+
+    def reset_for_retract(self) -> None:
+        """A retracted request, its row already released, starts over: the tree
+        prefix, the committed length and the mamba state are reset."""
+        assert not self.holds_kv, "expect it is already released"
+        self.clear_tree_prefix()
+        self.mamba_pool_idx = None
+        self.mamba_ping_pong_track_buffer = None
+        self.mamba_ping_pong_empty = None
+        self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
+        self.mamba_last_track_seqlen = None
+        self.mamba_prev_track_seqlen = None
+        self.mamba_cow_src_index = None
+        self.mamba_needs_clear = False
+        self.kv_committed_len = 0
+
+
+class Req(ReqDllmMixin):
+    """The input and output status of a request."""
+
+    # The scheduler list holding the request; `ReqList` keeps it.
+    owner_list: Optional[ReqList] = None
+
+    def __init__(
+        self,
+        rid: str,
+        origin_input_text: str,
+        origin_input_ids: array[int],
+        sampling_params: SamplingParams,
+        return_logprob: bool = False,
+        top_logprobs_num: int = 0,
+        dllm_config: Optional[DllmConfig] = None,
+        token_ids_logprob: List[int] = None,
+        return_sampling_mask: bool = False,
+        sampling_logprobs_mode: SamplingLogprobsMode = "selected",
+        return_flat_raw_top_logprobs: bool = False,
+        stream: bool = False,
+        origin_input_ids_unpadded: Optional[array[int]] = None,
+        lora_id: Optional[str] = None,
+        input_embeds: Optional[List[List[float]]] = None,
+        positional_embed_overrides: Optional[PositionalEmbeds] = None,
+        token_type_ids: List[int] = None,
+        session: Optional[Session] = None,
+        custom_logit_processor: Optional[str] = None,
+        require_reasoning: bool = False,
+        return_hidden_states: ReturnHiddenStatesMode = False,
+        return_routed_experts: bool = False,
+        routed_experts_start_len: int = 0,
+        return_indexer_topk: bool = False,
+        eos_token_ids: Optional[Set[int]] = None,
+        bootstrap_host: Optional[str] = None,
+        bootstrap_port: Optional[int] = None,
+        bootstrap_room: Optional[int] = None,
+        disagg_mode: Optional[DisaggregationMode] = None,
+        routed_dp_rank: Optional[int] = None,
+        disagg_prefill_dp_rank: Optional[int] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
+        vocab_size: Optional[int] = None,
+        priority: Optional[int] = None,
+        metrics_collector: Optional[SchedulerMetricsCollector] = None,
+        extra_key: Optional[str] = None,
+        routing_key: Optional[str] = None,
+        dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
+        http_worker_ipc: Optional[str] = None,
+        time_stats: Optional[
+            Union[APIServerReqTimeStats, DPControllerReqTimeStats]
+        ] = None,
+        return_pooled_hidden_states: bool = False,
+        multi_item_delimiter_indices: Optional[List[int]] = None,
+        token_indices_to_pool: Optional[List[int]] = None,
+        decision_layout: Optional[List[int]] = None,
+        session_id: Optional[str] = None,
+        cache_salt: Optional[str] = None,
+        request_instance_id: Optional[str] = None,
+    ):
+        # Input and output info
+        self.rid = rid
+        self.request_instance_id = request_instance_id
+        self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
+        self.origin_input_ids = origin_input_ids
+        self.origin_input_ids_unpadded = (
+            origin_input_ids_unpadded
+            if origin_input_ids_unpadded
+            else self.origin_input_ids
+        )  # Before image padding
+        # Each decode stage's output ids. Append-only by contract:
+        # refresh_fill_ids infers how many output tokens are already in
+        # full_untruncated_fill_ids from lengths alone, so in-place rewrites
+        # that preserve length would silently corrupt fill_ids.
+        self.output_ids = array("q")
+        # Full untruncated sequence: origin + output (+ DLLM mask block).
+        # Kept in sync by refresh_fill_ids; admission only updates
+        # extend_end, never mutates this array's length.
+        self.full_untruncated_fill_ids = array("q")
+        # This round extends fill ids [prefix_len, extend_end).
+        self.extend_end: Optional[int] = None
+        self.dllm_initialized: bool = False
+
+        self.session = session
+        # media added by this turn, excluding the session's borrowed history
+        self._session_mm_items: List[MultimodalDataItem] = []
+        self.session_id = session_id
+        # Used by the session radix cache to reject registration after a close/reopen.
+        self.session_generation: Optional[int] = None
+        self.input_embeds = input_embeds
+        self.positional_embed_overrides = positional_embed_overrides
+        self.multi_item_delimiter_indices = multi_item_delimiter_indices
+        self.token_indices_to_pool = token_indices_to_pool
+        self.decision_layout = decision_layout
+
+        # For req-level memory management
+        self.kv = ReqKvInfo()
+
+        # Full-KV-derived boundary whose SWA window should be inserted after
+        # the current prefill pass.
+        self.swa_branching_seqlen: Optional[int] = None
+
+        # for cross-encoder model
+        self.token_type_ids = token_type_ids
+
+        # The index of the extend / decode batch
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
+
+        # For multi-http worker
+        self.http_worker_ipc = http_worker_ipc
+
+        # Require reasoning for the request
+        self.require_reasoning = require_reasoning
+
+        # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
+        self._is_reasoning_over = False
+        self.reasoning_tokens = 0
+        self._think_end_matcher: Optional[TokenSequenceMatcher] = None
+        self._think_end_match_len = 0
+        self._think_start_match_len = 0
+
+        # The request clips its limits in place; the incoming params stay as
+        # received, since pipeline stages relay them onward.
+        sampling_params = copy.copy(sampling_params)
+        # Only custom logit processors read "__req__", and the reference is weak
+        # so the request still dies by refcount.
+        if custom_logit_processor is not None and isinstance(
+            sampling_params.custom_params, dict
+        ):
+            sampling_params.custom_params = sampling_params.custom_params | {
+                "__req__": weakref.proxy(self)
+            }
+        self.sampling_params = sampling_params
+        self.custom_logit_processor = custom_logit_processor
+        # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.
+        self.page_guard_state: Optional[PageGuardState] = None
+        # Unlimited-OCR v2 split-document window state; None for other requests.
+        self.uocr_doc: Optional[UocrReqState] = None
+        self.return_hidden_states = return_hidden_states
+        self.return_hidden_states_mode = get_return_hidden_states_mode(
+            return_hidden_states
+        )
+
+        # Extra key for caller-defined request classification.
+        if lora_id is not None:
+            extra_key = (
+                extra_key or ""
+            ) + lora_id  # lora_id is concatenated to the extra key
+
+        self.extra_key = extra_key
+        self.cache_salt = cache_salt or None
+        self._user_cache_salt = self.cache_salt
+        self.lora_id = lora_id
+        self.routing_key = routing_key
+
+        # Lazy extra buffer + spec: False when the finishing verify wrote the
+        # keep slot or had no plan, so the keep slot may not hold the state at
+        # mamba_last_track_seqlen and the radix insert is skipped.
+        self.mamba_lazy_checkpoint: bool = True
+
+        # Check finish
+        self.tokenizer = None
+        self.finished_reason: Optional[BaseFinishReason] = None
+        # finished position (in output_ids), used when checking stop conditions with speculative decoding
+        self.finished_len = None
+        # Whether this request has finished output
+        self.finished_output = None
+        # Set by exit_ledger (CI only).
+        self.exit_via: Optional[str] = None
+        self.send_via: Optional[str] = None
+        # Owned by Scheduler.defer_response until its completion is retired.
+        self.defer_output = False
+        # If we want to abort the request in the middle of the event loop,
+        # call request_finish instead of finish_outside_step.
+        # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
+        self.to_finish: Optional[BaseFinishReason] = None
+        self.stream = stream
+        self.eos_token_ids = eos_token_ids
+        self.vocab_size = vocab_size
+        self.priority = priority
+
+        # For multimodal inputs
+        self.multimodal_inputs: Optional[MultimodalInputs] = None
+        # Pre-computed multimodal prompt token counts; populated on the prefill
+        # node and transferred to decode via the metadata buffer in disagg (PD) mode.
+        self.mm_image_tokens: int = 0
+        self.mm_audio_tokens: int = 0
+        self.mm_video_tokens: int = 0
+        self.mm_token_counts_ready: bool = False
+
+        # Prefix info
+        # Tokens [0, prefix_len) are already in the row, or, before allocation,
+        # on the path to last_node; the next extend starts at prefix_len.
+        self.prefix_len: int = 0
+        # TODO(ispobock): rename to last_device_node
+        self.last_node: Any = None
+        self.last_host_node: Any = None
+        self.best_match_node: Any = None
+        # Per-component host hit lengths split off from host_hit_length:
+        self.host_hit_length = 0
+        # Host-hit tokens per window sub-pool.
+        self.matched_window_host_hit_lengths: Mapping[str, int] = {}
+        self.mamba_host_hit_length = 0
+        # The branching point seqlen to track mamba state. If set, given by prefix
+        # match, it will be the tracked seqlen in the ping pong buffer for the
+        # right prefill pass.
+        self.mamba_branching_seqlen: Optional[int] = None
+        # Total cached prefix length (on-device prefix_len + host_hit_length),
+        # capped at the max allowed prefix. Set during prefix matching at schedule
+        # time and used to estimate uncached tokens / sort by longest prefix for
+        # load reporting.
+        self.num_matched_prefix_tokens = 0
+        # Tokens loaded from storage backend (L3) during prefetch for this request
+        self.storage_hit_length = 0
+        self.storage_hit_start: Optional[int] = None
+        # FULL host-hit tokens actually spliced to device by init_load_back at
+        # admission; less than host_hit_length when the load-back was declined
+        # or the staged splice dropped (that shortfall is re-prefilled).
+        self.host_loaded_length = 0
+        # Buffer-mode host memory is transport staging, not an L2 cache tier.
+        self.host_hit_is_storage = False
+        self.storage_prefetch_retry_attempts = 0
+        self.staged_prefetch_plan: Optional[StagedPrefetchPlan] = None
+        # The tree lock this request holds; None while it runs on a session
+        # slot's record or holds no lock.
+        self.lock: Optional[TreeLock] = None
+        # Device/host prefix used to plan the latest L3 lookup. Admission uses
+        # it to detect newly exposed storage demand after queue-time eviction.
+        self.storage_prefetch_last_match_len: Optional[int] = None
+        # Logical-page KV sharding: rotation base of the chain this request
+        # extends (owner of position-page P is (base + P) % shard_size).
+        # Refreshed at every sharded alloc — read through last_node, or drawn
+        # least-full for a new chain — and consumed by the radix insert to
+        # stamp new tree nodes. Allocation itself must NOT read it back when
+        # a tree node is available (the checkpoint dedup rebind
+        # would make it stale); the only allocation-time reader is the
+        # radix-disabled fallback, which keeps no nodes past the root and has
+        # no rebind.
+        self.kv_rotation_base: Optional[int] = None
+
+        # The launched steps carrying this request whose results are not
+        # processed yet.
+        self.inflight_steps = 0
+
+        # For retraction
+        self.is_retracted = False
+        # Indicates if the req has ever been retracted.
+        self.retracted_stain = False
+
+        self.weight_version_events: List[WeightVersionEvent] = []
+        self.prefill_weight_versions: Optional[WeightVersionSpans] = None
+
+        # Incremental streamining
+        self.send_token_offset: int = 0
+        # Whether the DetokenizeHeader went out, so the detokenizer holds its state.
+        self.detokenize_header_sent = False
+        # TODO (Byron): send_output_token_logprobs_offset and send_token_offset can be different in disaggregation mode
+        # because the decode server does not have the first output token logprobs
+        self.send_output_token_logprobs_offset: int = 0
+
+        # Logprobs (arguments)
+        self.return_logprob = return_logprob
+        # Start index to compute logprob from.
+        self.logprob_start_len = 0
+        self.logprob = ReqLogprob(
+            top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
+        )
+        self.temp_scaled_logprobs = False
+        self.top_p_normalized_logprobs = False
+        self.return_sampling_mask = return_sampling_mask
+        self.sampling_logprobs_mode = sampling_logprobs_mode
+        self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
+
+        # Logprobs (return values)
+        # True means the input logprob has been already sent to detokenizer.
+        self.input_logprob_sent: bool = False
+        # Temporary holder to store input_token_logprobs.
+        self.input_token_logprobs: Optional[List[Tuple[int]]] = None
+        self.temp_input_top_logprobs_val: Optional[List[torch.Tensor]] = None
+        self.temp_input_top_logprobs_idx: Optional[List[int]] = None
+        self.temp_input_token_ids_logprobs_val: Optional[List[float]] = None
+        self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
+
+        if return_logprob:
+            # shape: (bs, 1)
+            self.logprob.output_token_logprobs_val = []
+            self.logprob.output_token_logprobs_idx = []
+            # shape: (bs, k)
+            self.logprob.output_top_logprobs_val = []
+            self.logprob.output_top_logprobs_idx = []
+            # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
+            self.logprob.output_token_ids_logprobs_val = []
+            self.logprob.output_token_ids_logprobs_idx = []
+        self.sampling_mask_rows: Optional[SamplingMaskRows] = (
+            SamplingMaskRows() if return_sampling_mask else None
+        )
+        self.hidden_states: List[List[float]] = []
+        self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
+        self.output_topk_p = None
+        self.output_topk_index = None
+        self.output_dsa_topk_indices = None
+
+        # capture routed experts
+        self.return_routed_experts = return_routed_experts
+        self.routed_experts_start_len = routed_experts_start_len
+        self.routed_experts: Optional[torch.Tensor] = (
+            None  # cpu tensor: shape (seqlen, topk)
+        )
+
+        self.return_indexer_topk = return_indexer_topk
+        self.indexer_topk: Optional[torch.Tensor] = (
+            None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
+        )
+        # Customized info
+        self.customized_info: Optional[Dict[str, List[Any]]] = None
+
+        # Embedding (return values)
+        self.embedding = None
+
+        # Constrained decoding
+        self.grammar_key: Optional[Tuple[str, str]] = None
+        self.grammar: Optional[Union[BaseGrammarObject, Future[BaseGrammarObject]]] = (
+            None
+        )
+        self.grammar_wait_ct = 0
+
+        # The number of cached tokens that were already cached in the KV cache
+        self.cached_tokens = 0
+        self.already_computed = 0
+
+        # Detailed breakdown of cached tokens by source (for HiCache)
+        self.cached_tokens_device = 0  # Tokens from device cache (GPU)
+        self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
+        self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self._cache_breakdown_computed = (
+            False  # Track if breakdown was already computed
+        )
+
+        # Per-request count of verification forward passes.
+        self.spec_verify_ct = 0
+
+        # Per-request count of accepted draft tokens (excludes the bonus token).
+        self.spec_num_correct_drafts = 0
+
+        self.spec_num_block_accept_tokens = 0
+
+        self.spec_num_cap_tokens = 0
+
+        # Acceptance histogram for speculative decoding.
+        # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
+        # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+        self.spec_correct_drafts_histogram: List[int] = []
+
+        self.spec_cap_lens_histogram: List[int] = []
+
+        # The number of times this request has been retracted / preempted.
+        self.retraction_count = 0
+        self.retraction_mb_id = None
+
+        # The retraction_count of the last RequestOutputStats sent; None before
+        # the first output.
+        self.request_stats_retraction_count: Optional[int] = None
+
+        # For observability
+        self.metrics_collector = metrics_collector
+        if time_stats is not None:
+            self.time_stats = SchedulerReqTimeStats.new_from_obj(time_stats)
+        else:
+            self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
+        self.time_stats.set_metrics_collector(metrics_collector)
+        self.time_stats.set_scheduler_recv_time()
+        self.has_log_time_stats: bool = False
+
+        # For disaggregation
+        self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_port: Optional[int] = bootstrap_port
+        self.bootstrap_room: Optional[int] = bootstrap_room
+        # Prefix excluded from linker offload, in raw tokens before bigram/page alignment.
+        self.linker_offload_skip_prefix_len = 0
+        # Override embeds give KV that the token ids alone do not determine.
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or positional_embed_overrides is not None
+        )
+        # Set when the request's in-flight forward ran on KV that never landed:
+        # that forward's output is dropped and the request finishes with it.
+        self.discard_output_reason: Optional[FINISH_ABORT] = None
+        self.disagg_kv_sender: Optional[BaseKVSender] = None
+
+        self.routed_dp_rank: Optional[int] = routed_dp_rank
+        self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        # Orchestrator KV hints, forwarded to the HiCache storage backends.
+        self.kv_hints: Optional[KvHintsEnvelope] = kv_hints
+
+        # the start index of the sent kv cache
+        # We want to send it chunk by chunk for chunked prefill.
+        # After every chunk forward, we do the following:
+        # kv_send(req.input_ids[req.start_send_idx:req.extend_end])
+        # start_send_idx = req.extend_end
+        self.start_send_idx: int = 0
+        self.disagg_decode_prefix_len: int = 0
+
+        # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
+        # This is because kv is not ready in `process_prefill_chunk`.
+        # We use `tmp_end_idx` to store the end index of the kv cache to send.
+        self.tmp_end_idx: int = -1
+        # Decode-side cached-prefix length; base of the staging chunk grid
+        # (start_send_idx starts here but advances with every send).
+        self.disagg_decode_prefix_len: int = 0
+        # At-rest device-resident prefix end, snapshotted on the request's
+        # first prefill batch; the cached-prefix early-send never goes past it.
+        self.early_send_prefix_end: Optional[int] = None
+        self.metadata_buffer_index: int = -1
+        self.expected_kv_checksum: int = 0
+        # Used in overlap sequence to signal that an optimistic request should
+        # abort chunking. Set in create_sender, consumed in process_batch_result.
+        self.pending_bootstrap = False
+        # Number of optimistic prefill forward passes started. preserved across retracts.
+        self.prefill_attempt_count = 0
+
+        # For Matryoshka embeddings
+        self.dimensions = dimensions
+        self.encoding_format = encoding_format
+
+        # Beam search overlay: leader and internal members share one BeamGroup.
+        self.beam_group = None
+
+        # Whether to return pooled hidden states (pre-head transformer output)
+        self.return_pooled_hidden_states = return_pooled_hidden_states
+        self.pooled_hidden_state = None
+
+        # For diffusion LLM
+        self.init_diffusion_llm(dllm_config)
+
+        # For hisparse
+        self.hisparse_staging = False
+
+        # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
+        self.arrival_processed_tokens: int = 0
+
+    def get_mm_token_counts(self) -> Tuple[int, int, int]:
+        """Return per-modality prompt counts, scanning media at most once."""
+        if not self.mm_token_counts_ready and self.multimodal_inputs is not None:
+            (
+                self.mm_image_tokens,
+                self.mm_audio_tokens,
+                self.mm_video_tokens,
+            ) = self.multimodal_inputs.compute_mm_token_counts()
+            self.mm_token_counts_ready = True
+        return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
+
+    def inherit_mm_token_counts(self, other: Req) -> None:
+        """Reuse counts from the request whose media history is shared."""
+        (
+            self.mm_image_tokens,
+            self.mm_audio_tokens,
+            self.mm_video_tokens,
+        ) = other.get_mm_token_counts()
+        self.mm_token_counts_ready = True
+
+    def advance_cache_request_handle(self) -> None:
+        self.cache_request_handle = dataclasses.replace(
+            self.cache_request_handle,
+            attempt_id=self.cache_request_handle.attempt_id + 1,
+        )
+
+    @property
+    def seqlen(self) -> int:
+        """Get the current sequence length of the request."""
+        return len(self.origin_input_ids) + len(self.output_ids)
+
+    @property
+    def resumable_by_rebootstrap(self) -> bool:
+        """A rebootstrap recomputes the KV from token ids alone."""
+        return (
+            self.multimodal_inputs is None
+            and self.input_embeds is None
+            and self.positional_embed_overrides is None
+        )
+
+    @property
+    def resumable_by_reprefill(self) -> bool:
+        """input_embeds cover only the prompt, so a re-prefill restarts the
+        generation; that is invisible until output has been sent."""
+        return self.input_embeds is None or self.send_token_offset == 0
+
+    @property
+    def is_beam_leader(self) -> bool:
+        """The user-visible row of a beam group; the group's other rows are
+        scheduler-internal and never streamed to the user."""
+        return self.beam_group is not None and self.beam_group.leader is self
+
+    @property
+    def is_prefill_only(self) -> bool:
+        """Check if this request is prefill-only (no token generation needed)."""
+        # NOTE: when spec is enabled, prefill_only optimizations are disabled
+
+        spec_alg = get_spec().speculative_algorithm
+        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+
+    @property
+    def output_ids_through_stop(self) -> array[int]:
+        """Get the output ids through the stop condition. Stop position is included."""
+        if self.finished_len is not None:
+            return self.output_ids[: self.finished_len]
+        return self.output_ids
+
+    @property
+    def window_host_hit_lengths(self) -> Mapping[str, int]:
+        """Host hit tokens per window sub-pool."""
+        plan = self.staged_prefetch_plan
+        if plan is None:
+            return self.matched_window_host_hit_lengths
+        return plan.window_host_hit_lengths()
+
+    def needs_host_load_back(self) -> bool:
+        """Whether any cache layer has a host hit that needs L2 H2D load_back."""
+        return (
+            self.host_hit_length > 0
+            or self.mamba_host_hit_length > 0
+            or any(self.window_host_hit_lengths.values())
+        )
+
+    def materialized_host_hit_len(self) -> int:
+        """Host-hit tokens that actually reached the device: the metrics tier
+        split must not credit host/storage for a declined or dropped
+        load-back, whose span was re-prefilled and counted as input."""
+        return min(self.host_hit_length, self.host_loaded_length)
+
+    def fulfilled_storage_hit_len(self, prefix_len: int) -> int:
+        """L3-fetched tokens covered by the admitted cached prefix."""
+        if self.storage_hit_start is None:
+            return min(prefix_len, self.storage_hit_length)
+        return max(
+            0,
+            min(prefix_len, self.storage_hit_start + self.storage_hit_length)
+            - self.storage_hit_start,
+        )
+
+    def detach_kv(self) -> ReqKvInfo:
+        # Hand the KV record to a new holder; the req keeps a fresh empty one.
+        kv, self.kv = self.kv, ReqKvInfo()
+        return kv
+
+    def owned_kv_len(self) -> int:
+        # Report only the prompt prefix so thinking + answer fall into the
+        # overallocated range and are reclaimed by release_kv_cache. #22373.
+        if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
+            return min(self.kv.kv_committed_len, len(self.origin_input_ids))
+        if self.finished_len is None:
+            return self.kv.kv_committed_len
+        # A verify step commits a whole accepted chunk, so output_ids can run
+        # past the stop; the client never sees those tokens, so nothing matches.
+        return min(
+            self.kv.kv_committed_len,
+            len(self.origin_input_ids) + len(self.output_ids_through_stop),
+        )
+
+    def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
+        """Record one step accepted draft count (excludes bonus token) into the histogram."""
+        if len(self.spec_correct_drafts_histogram) <= num_correct_drafts:
+            self.spec_correct_drafts_histogram.extend(
+                [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
+            )
+        self.spec_correct_drafts_histogram[num_correct_drafts] += 1
+
+    def update_spec_cap_lens_histogram(self, cap_len: int):
+        cap_len = int(cap_len)
+        if len(self.spec_cap_lens_histogram) <= cap_len:
+            self.spec_cap_lens_histogram.extend(
+                [0] * (cap_len - len(self.spec_cap_lens_histogram) + 1)
+            )
+        self.spec_cap_lens_histogram[cap_len] += 1
+
+    def extend_image_inputs(self, image_inputs):
+        if self.mm_token_counts_ready:
+            image_tokens, audio_tokens, video_tokens = (
+                image_inputs.compute_mm_token_counts()
+            )
+            self.mm_image_tokens += image_tokens
+            self.mm_audio_tokens += audio_tokens
+            self.mm_video_tokens += video_tokens
+        if self.session is not None:
+            self._extend_session_image_inputs(image_inputs)
+        elif self.multimodal_inputs is None:
+            self.multimodal_inputs = image_inputs
+        else:
+            self.multimodal_inputs.merge(image_inputs)
+        self.bind_multimodal_cache_namespace()
+
+    def bind_multimodal_cache_namespace(self) -> None:
+        """Protect KV lookup with full identities, not partial pad-token matches.
+
+        A media span can contain only one token, so even wide pad sentinels
+        cannot carry its entire digest. Scope both the radix tree and storage
+        to the ordered media identities. This deliberately gives up text-prefix
+        sharing across different media while preserving same-media reuse.
+        """
+        if self.multimodal_inputs is not None and self.multimodal_inputs.mm_items:
+            identities = tuple(
+                item.cache_key for item in self.multimodal_inputs.mm_items
+            )
+            self.cache_salt = (
+                "sglang-mm-v1:"
+                + structured_digest((self._user_cache_salt, identities)).hex()
+            )
+
+    def _extend_session_image_inputs(self, image_inputs):
+        """Append media while preserving the saved session and its position history."""
+        self._session_mm_items.extend(image_inputs.mm_items)
+        # Padding can change token values without changing their count.
+        self.full_untruncated_fill_ids = array("q")
+        if self.multimodal_inputs is not None:
+            # Branches and aborted turns must leave the parent's metadata intact.
+            self.multimodal_inputs = dataclasses.replace(self.multimodal_inputs)
+
+        positions = image_inputs.mrope_positions
+        if positions is not None:
+            prefix_len = len(self.origin_input_ids) - positions.shape[1]
+            prefix = (
+                self.multimodal_inputs.mrope_positions
+                if self.multimodal_inputs is not None
+                else None
+            )
+            if prefix is None:
+                prefix = positions.new_empty((3, 0))
+            prefix = prefix[:, :prefix_len]
+            next_position = prefix.max() + 1 if prefix.numel() else 0
+            text_len = prefix_len - prefix.shape[1]
+            text_positions = (
+                torch.arange(
+                    text_len, dtype=positions.dtype, device=positions.device
+                ).expand(3, -1)
+                + next_position
+            )
+            # Fill the reply/text gap, then shift the new turn's media coordinates.
+            positions = torch.cat(
+                [prefix, text_positions, positions + next_position + text_len], dim=1
+            )
+
+        if self.multimodal_inputs is None:
+            self.multimodal_inputs = image_inputs
+        else:
+            # Use the full table above, or let the scheduler compute missing positions.
+            self.multimodal_inputs.mrope_positions = None
+            self.multimodal_inputs.mrope_position_delta = None
+            self.multimodal_inputs.merge(image_inputs)
+
+        self.multimodal_inputs.mrope_position_delta_repeated_cache = None
+        self.multimodal_inputs.mrope_position_delta_device_cache = None
+        if positions is not None:
+            self.multimodal_inputs.mrope_positions = positions
+            self.multimodal_inputs.mrope_position_delta = (
+                positions.max() + 1 - positions.shape[1]
+            ).reshape(1, 1)
+
+    def release_mm_inputs_on_abort(self) -> None:
+        """Release this turn's media without invalidating session history."""
+        if self.session is None:
+            if self.multimodal_inputs is not None:
+                self.multimodal_inputs.release_features()
+        else:
+            for item in self._session_mm_items:
+                item.release_transport_proxies()
+                item.feature = None
+            self._session_mm_items.clear()
+        self.multimodal_inputs = None
+
+    def finished(self) -> bool:
+        # Whether request reached finished condition
+        return self.finished_reason is not None
+
+    def take_request_stats_due(self) -> bool:
+        """Whether this output row carries the request's stats, recording the
+        send: due on the first output, the first after each retraction, and the
+        finished row."""
+        if (
+            self.request_stats_retraction_count != self.retraction_count
+            or self.finished()
+        ):
+            self.request_stats_retraction_count = self.retraction_count
+            return True
+        return False
+
+    def next_output_finishes_by_length(self) -> bool:
+        # Whether committing one more output token reaches max_new_tokens
+        return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
+
+    @property
+    def extend_len(self) -> int:
+        return self.extend_end - self.prefix_len
+
+    def get_fill_ids(self) -> array:
+        return self.full_untruncated_fill_ids[: self.extend_end]
+
+    def refresh_fill_ids(self) -> None:
+        """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
+        appending only the new output tokens.
+
+        Falls back to a full rebuild when the in-place append is invalid:
+        - aliasing: full_untruncated_fill_ids is origin_input_ids itself, so
+          extending in place would write output tokens into the origin;
+        - lengths disagree: fresh req (array still empty), retraction
+          (output_ids reset to empty), or set_finish_with_abort (origin
+          replaced by a 1-token stub).
+        """
+        n_have_output = len(self.full_untruncated_fill_ids) - len(self.origin_input_ids)
+        if (
+            self.full_untruncated_fill_ids is not self.origin_input_ids
+            and 0 <= n_have_output <= len(self.output_ids)
+        ):
+            self.full_untruncated_fill_ids.extend(self.output_ids[n_have_output:])
+        else:
+            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+
+    def init_next_round_input(
+        self,
+        tree_cache: Optional[BasePrefixCache] = None,
+        cow_mamba: Optional[bool] = None,
+        *,
+        defer_cow_slot: bool = False,
+    ):
+        if self.is_dllm():
+            self._init_fill_ids_for_dllm()
+        else:
+            self.refresh_fill_ids()
+
+        input_len = len(self.full_untruncated_fill_ids)
+
+        # Streaming sessions reuse committed KV from the session slot, so
+        # custom logprob_start_len is not supported — override to -1.
+        if (
+            self.session is not None
+            and self.session.streaming
+            and self.return_logprob
+            and self.logprob_start_len >= 0
+        ):
+            logger.warning(
+                "logprob_start_len=%d is not supported for streaming sessions "
+                "and will be ignored (rid=%s). Only new-token logprobs are returned.",
+                self.logprob_start_len,
+                self.rid,
+            )
+            self.logprob_start_len = -1
+
+        # Pass the full array with a raw-token cap (limit) instead of slicing,
+        # avoiding an O(context) copy per prefill-batch build.
+        token_ids_to_match = self.full_untruncated_fill_ids
+        key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
+
+        # Disable prefix caching when embed overrides are present: same token IDs
+        # with different override vectors must not share cached KV values.
+        if self.positional_embed_overrides is not None:
+            token_ids_to_match = array("q")
+            key_limit = None
+
+        if tree_cache is not None:
+            if cow_mamba is None:
+                cow_mamba = tree_cache.supports_mamba()
+            match_result = match_kv_cache(
+                self,
+                tree_cache,
+                token_ids_to_match,
+                cow_mamba=cow_mamba,
+                defer_cow_slot=defer_cow_slot,
+                max_prefix_len=key_limit,
+            )
+            self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+            if match_result.cache_protected_len is None:
+                self.kv.protect_prefix(self.prefix_len)
+
+            if self.is_dllm():
+                self._update_block_offset_for_dllm()
+
+        if self.is_dllm():
+            self.determine_dllm_phase()
+
+        if (
+            self.is_retracted
+            and self.multimodal_inputs is not None
+            and self.multimodal_inputs.mrope_positions is not None
+        ):
+            from sglang.srt.managers.mm_utils import (
+                extend_mrope_positions_for_retracted_request,
+            )
+
+            self.multimodal_inputs.mrope_positions = (
+                extend_mrope_positions_for_retracted_request(
+                    self.multimodal_inputs.mrope_positions, len(self.output_ids)
+                )
+            )
+
+    def _compute_max_prefix_len(self, input_len: int) -> int:
+        # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
+        max_prefix_len = input_len - 1
+        if (
+            self.dllm_config is not None
+            and self.dllm_config.requires_separate_context_encoding
+        ):
+            max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
+        if self.return_logprob and self.logprob_start_len >= 0:
+            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.is_dllm():
+            # Appended masks and a partial prompt/output block are not reusable
+            # KV: bidirectional attention depends on the rest of that block.
+            # Bound the lookup by real tokens, even if another cached prompt
+            # happens to contain the same token IDs as our synthetic masks.
+            block_size = self.dllm_config.block_size
+            committed_len = len(self.origin_input_ids) + len(self.output_ids)
+            max_prefix_len = min(max_prefix_len, committed_len)
+            max_prefix_len = max_prefix_len // block_size * block_size
+        return max(max_prefix_len, 0)
+
+    def take_detokenize_header_due(self) -> bool:
+        """Whether this output carries the DetokenizeHeader: only the first does."""
+        due = not self.detokenize_header_sent
+        self.detokenize_header_sent = True
+        return due
+
+    def _stop_match_tail_len(self, new_accepted_len: int) -> int:
+        max_len_tail_str = max(
+            self.sampling_params.stop_str_max_len + 1,
+            self.sampling_params.stop_regex_max_len + 1,
+        )
+        # Cover all newly accepted tokens so an early stop string is not missed
+        # when speculative decoding accepts multiple tokens per step.
+        return min(
+            max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
+        )
+
+    def tail_str(self, new_accepted_len: int = 1) -> str:
+        # Check stop strings and stop regex patterns together
+        if (
+            len(self.sampling_params.stop_strs) == 0
+            and len(self.sampling_params.stop_regex_strs) == 0
+        ):
+            return ""
+
+        tail_len = self._stop_match_tail_len(new_accepted_len)
+        return self.tokenizer.decode(self.output_ids[-tail_len:])
+
+    def check_match_stop_str_prefix(self) -> bool:
+        if not self.sampling_params.stop_strs:
+            return False
+
+        tail_str = self.tail_str()
+
+        # Early return if tail_str is empty
+        if not tail_str:
+            return False
+
+        for stop_str in self.sampling_params.stop_strs:
+            if not stop_str:
+                continue
+            # Check if stop_str is contained in tail_str (fastest check first)
+            if stop_str in tail_str:
+                return True
+
+            # Check if tail_str suffix matches stop_str prefix
+            # Only check if stop_str is not empty, it's for stream output
+            min_len = min(len(tail_str), len(stop_str))
+            for i in range(1, min_len + 1):
+                if tail_str[-i:] == stop_str[:i]:
+                    return True
+
+        return False
+
+    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+        if self.sampling_params.ignore_eos:
+            return False
+
+        # Check stop token ids
+        matched_eos = False
+
+        for i, token_id in enumerate(new_accepted_tokens):
+            if self.sampling_params.stop_token_ids:
+                matched_eos |= token_id in self.sampling_params.stop_token_ids
+            if self.eos_token_ids:
+                matched_eos |= token_id in self.eos_token_ids
+            if self.tokenizer is not None:
+                matched_eos |= token_id == self.tokenizer.eos_token_id
+                if self.tokenizer.additional_stop_token_ids:
+                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+            if matched_eos:
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
+                self.finished_len = matched_pos + 1
+                return True
+
+        return False
+
+    def _locate_str_stop_finished_len(
+        self,
+        new_accepted_len: int,
+        *,
+        stop_str: Optional[str] = None,
+        stop_regex: Optional[str] = None,
+        full_window_matched: bool = True,
+    ) -> Optional[int]:
+        """Map a matched stop string/regex to output_ids length (stop included)."""
+
+        def matched(text: str) -> bool:
+            if stop_str is not None:
+                return stop_str in text
+            return re.search(stop_regex, text) is not None
+
+        tail_len = self._stop_match_tail_len(new_accepted_len)
+        start = len(self.output_ids) - tail_len
+        token_window = self.output_ids[start:]
+
+        # Old prefixes were checked in the previous step.
+        for token_count in range(
+            max(1, len(token_window) - new_accepted_len + 1), len(token_window)
+        ):
+            if matched(self.tokenizer.decode(token_window[:token_count])):
+                return start + token_count
+
+        if not full_window_matched:
+            return None
+        # The full tail window is already known to match by the caller.
+        return len(self.output_ids)
+
+    def _check_str_based_finish(self, new_accepted_len: int = 1):
+        if (
+            len(self.sampling_params.stop_strs) > 0
+            or len(self.sampling_params.stop_regex_strs) > 0
+        ):
+            tail_str = self.tail_str(new_accepted_len)
+
+            # Check stop strings
+            if len(self.sampling_params.stop_strs) > 0:
+                for stop_str in self.sampling_params.stop_strs:
+                    if stop_str in tail_str:
+                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                        self.finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_str=stop_str
+                        )
+                        return True
+
+            # Check stop regex
+            if len(self.sampling_params.stop_regex_strs) > 0:
+                for stop_regex_str in self.sampling_params.stop_regex_strs:
+                    # Seatbelt, not validation: patterns are checked at ingress
+                    # (Python's `normalize`, or the rust server's stricter
+                    # `stop_regex_bound`). This runs per decode step on the hot
+                    # path, so an `re.error` escaping here would take the whole
+                    # scheduler down over one malformed request. Fail that request
+                    # instead.
+                    try:
+                        matched = re.search(stop_regex_str, tail_str)
+                    except (re.error, RecursionError) as e:
+                        logger.warning(
+                            "req %s: invalid stop_regex %r (%s); aborting the request",
+                            self.rid,
+                            stop_regex_str,
+                            e,
+                        )
+                        self.finished_reason = FINISH_ABORT(
+                            f"invalid stop_regex {stop_regex_str!r}: {e}",
+                            HTTPStatus.BAD_REQUEST,
+                            "BadRequestError",
+                        )
+                        break
+                    if matched:
+                        finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_regex=stop_regex_str
+                        )
+                    elif new_accepted_len > 1:
+                        # An end-anchored pattern can match after a token
+                        # accepted mid-step but not after the last one.
+                        finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len,
+                            stop_regex=stop_regex_str,
+                            full_window_matched=False,
+                        )
+                    else:
+                        finished_len = None
+                    if finished_len is not None:
+                        self.finished_reason = FINISHED_MATCHED_REGEX(
+                            matched=stop_regex_str
+                        )
+                        self.finished_len = finished_len
+                        return True
+
+        return False
+
+    def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
+        for i, token_id in enumerate(new_accepted_tokens):
+            if token_id < 0 or (
+                self.vocab_size is not None and token_id >= self.vocab_size
+            ):
+                offset = len(self.output_ids) - len(new_accepted_tokens) + i
+                if self.sampling_params.stop_token_ids:
+                    self.output_ids[offset] = next(
+                        iter(self.sampling_params.stop_token_ids)
+                    )
+                if self.eos_token_ids:
+                    self.output_ids[offset] = next(iter(self.eos_token_ids))
+                self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+                self.finished_len = offset + 1
+                return True
+
+        return False
+
+    def _cap_finished_len_at_max_new_tokens(self) -> None:
+        """Demote a stop matched beyond the length budget to a length finish.
+
+        Speculative decoding can accept a run that both crosses
+        ``max_new_tokens`` and contains a stop; a stop located past the cap
+        must not extend the emitted output beyond the cap.
+        """
+        max_new_tokens = self.sampling_params.max_new_tokens
+        if self.finished_len is not None and self.finished_len > max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_len = max_new_tokens
+
+    def request_finish(self, reason: BaseFinishReason) -> None:
+        """Finish with reason at the request's next commit."""
+        self.to_finish = reason
+
+    def request_discard(self, reason: FINISH_ABORT) -> None:
+        """Drop the output of the request's in-flight step and finish with reason."""
+        self.discard_output_reason = reason
+
+    def clear_requested_finish(self) -> None:
+        """Drop the finish requested for the next commit."""
+        self.to_finish = None
+
+    def finish_outside_step(self, reason: BaseFinishReason) -> None:
+        """Finish now, not through update_finish_state: the request is queued
+        or transferring (an abort, a PD handoff), or its result is decided
+        elsewhere (a beam group, the dLLM context limit)."""
+        self.finished_reason = reason
+
+    def update_finish_state(self, new_accepted_len: int = 1):
+        if self.finished():
+            return
+
+        if self.to_finish:
+            self.finished_reason = self.to_finish
+            self.to_finish = None
+            return
+
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+
+        # Sanitize out-of-range / NaN token ids before any decode.
+        if self._check_vocab_boundary_finish(new_accepted_tokens):
+            self._cap_finished_len_at_max_new_tokens()
+            return
+
+        # Stop string beats EOS/stop-token matched in the same step (speculative
+        # decoding can accept >1 token): token-based would trim only the last
+        # token and leak the stop string.
+        if self._check_str_based_finish(new_accepted_len):
+            self._cap_finished_len_at_max_new_tokens()
+            return
+
+        # Stop token/EOS beats the length cap for the same reason: a spec accept
+        # run can cross max_new_tokens in the very step the EOS lands, and a
+        # length-first finish would keep the over-accepted tokens after the EOS
+        # (up to the cap) in the emitted output.
+        if self._check_token_based_finish(new_accepted_tokens):
+            self._cap_finished_len_at_max_new_tokens()
+            return
+
+        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(
+                length=self.sampling_params.max_new_tokens
+            )
+            self.finished_len = self.sampling_params.max_new_tokens
+            return
+
+        if self.grammar is not None and self.grammar.is_terminated():
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+            return
+
+    def reset_for_retract(self):
+        # Increment retraction count before resetting other state. We should not reset this
+        # since we are tracking the total number of retractions for each request.
+        self.retraction_count += 1
+
+        self.prefix_len = 0
+        self.routed_experts = None
+        self.indexer_topk = None
+        self.last_node = None
+        self.kv_rotation_base = None
+        self.num_matched_prefix_tokens = 0
+        self.lock = None
+        self.swa_branching_seqlen = None
+        self.extend_end = None
+        self.is_retracted = True
+        self.retracted_stain = True
+        self.input_token_logprobs = None
+        self.temp_input_top_logprobs_val = None
+        self.temp_input_top_logprobs_idx = None
+        self.temp_input_token_ids_logprobs_val = None
+        self.temp_input_token_ids_logprobs_idx = None
+        self.mamba_branching_seqlen = None
+        self.already_computed = 0
+        self.kv.reset_for_retract()
+        self.prefill_weight_versions = None
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
+
+        # When using input_embeds, we cannot easily mix the original input embeddings
+        # with the newly generated output token IDs during re-prefill of retracted request.
+        # output_ids will have no use, but will lead to wrong size cache indexes.
+        # Therefore, we discard the generated output_ids and restart prefill and generation
+        # to ensure shape consistency in KV cache.
+        if self.input_embeds is not None:
+            self.output_ids = array("q")
+            self.weight_version_events = truncate_weight_version_events(
+                self.weight_version_events, num_kept_tokens=self.send_token_offset
+            )
+        # Reads output_ids, which input_embeds discards above.
+        self.reset_dllm_progress()
+
+    def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
+        if allocator.cpu_copy_carries_mamba:
+            return None
+        if not req_to_token_pool.holds_state_slots:
+            return None
+        return allocator.state.pool
+
+    def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        token_indices = req_to_token_pool.req_to_token[
+            self.kv.req_pool_idx, : self.seqlen - 1
+        ]
+        # Copies over both the kv cache and mamba state if available
+        mamba_pool = self._mamba_pool_needing_backup(
+            req_to_token_pool, token_to_kv_pool_allocator
+        )
+        self.kv.retraction_backup = RetractionBackup(
+            cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
+                token_indices,
+                mamba_indices=self.kv.mamba_pool_idx,
+                req_pool_index=self.kv.req_pool_idx,
+            ),
+            mamba_cpu=(
+                mamba_pool.get_cpu_copy(self.kv.mamba_pool_idx.unsqueeze(0))
+                if mamba_pool is not None and self.kv.holds_mamba
+                else None
+            ),
+        )
+
+    def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        assert self.kv.retraction_backup is not None
+        token_indices = req_to_token_pool.req_to_token[
+            self.kv.req_pool_idx, : self.seqlen - 1
+        ]
+        # Loads both the kv cache and mamba state if exists
+        mamba_cpu = self.kv.retraction_backup.mamba_cpu
+        if mamba_cpu is not None and self.kv.holds_mamba:
+            token_to_kv_pool_allocator.state.pool.load_cpu_copy(
+                mamba_cpu, self.kv.mamba_pool_idx.unsqueeze(0)
+            )
+        token_to_kv_pool_allocator.load_cpu_copy(
+            self.kv.retraction_backup.cpu_tensors,
+            token_indices,
+            mamba_indices=self.kv.mamba_pool_idx,
+            req_pool_index=self.kv.req_pool_idx,
+        )
+        self.kv.retraction_backup = None
+
+    def build_rebootstrap_payload(self) -> dict:
+        """Build the prefill ``/generate`` payload that asks the original prefill
+        worker to recompute this request's prefix KV under the current weights
+        (PD true-retraction rebootstrap).
+
+        ``input_ids`` are coerced to plain ``int`` so the payload is always
+        JSON-serializable even when ``origin_input_ids``/``output_ids`` hold
+        numpy scalars. The sampling-param allow-list forces ``max_new_tokens=1``
+        and drops stop/grammar/min_new_tokens so the recompute only re-derives
+        the prefix KV and samples a single handoff token. The last output id is
+        not sent: like a handoff token it is the pending decode input, so the
+        decode commit keeps it and ignores the token the prefill samples.
+        """
+        # TODO: carry multimodal inputs and embeds; such requests are aborted.
+        sp = self.sampling_params
+        return {
+            "input_ids": [int(x) for x in self.origin_input_ids]
+            + [int(x) for x in self.output_ids[:-1]],
+            "sampling_params": {
+                "max_new_tokens": 1,
+                "temperature": sp.temperature,
+                "top_p": sp.top_p,
+                "top_k": sp.top_k,
+                "min_p": sp.min_p,
+                "frequency_penalty": sp.frequency_penalty,
+                "presence_penalty": sp.presence_penalty,
+                "repetition_penalty": sp.repetition_penalty,
+                "ignore_eos": sp.ignore_eos,
+                "skip_special_tokens": sp.skip_special_tokens,
+                "spaces_between_special_tokens": sp.spaces_between_special_tokens,
+                "no_stop_trim": sp.no_stop_trim,
+            },
+            "return_logprob": False,
+            "stream": False,
+            "rid": self.rid,
+            "bootstrap_host": self.bootstrap_host,
+            "bootstrap_port": self.bootstrap_port,
+            "bootstrap_room": self.bootstrap_room,
+            "priority": self.priority,
+            "extra_key": self.extra_key,
+            "cache_salt": self.cache_salt,
+            "routing_key": self.routing_key,
+            "routed_dp_rank": self.disagg_prefill_dp_rank,
+            "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
+        }
+
+    def log_time_stats(self):
+        # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
+        if self.has_log_time_stats:
+            return
+
+        bootstrap_info = (
+            f", bootstrap_room={self.bootstrap_room}"
+            if self.bootstrap_room is not None
+            else ""
+        )
+        prefix = (
+            f"ReqTimeStats("
+            f"rid={self.rid}{bootstrap_info}, "
+            f"input_len={len(self.origin_input_ids)}, "
+            f"cached_input_len={self.cached_tokens}, "
+            f"output_len={len(self.output_ids)}, "
+            f"attempts={self.prefill_attempt_count}, "
+            f"type={self.time_stats.disagg_mode_str()})"
+        )
+        logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
+        self.has_log_time_stats = True
+
+    def set_finish_with_abort(
+        self,
+        error_msg: str,
+        status_code: int = HTTPStatus.BAD_REQUEST,
+        err_type: str = "BadRequestError",
+    ):
+        if get_parallel().tp_rank == 0:
+            logger.error(f"{error_msg}, {self.rid=}")
+        # Session requests share historical multimodal inputs with their prior
+        # request. The session owns and releases those features when it closes.
+        self.release_mm_inputs_on_abort()
+        self.grammar = None
+        self.origin_input_ids = array(
+            "q", [0]
+        )  # set it to one token to skip the long prefill
+        self.return_logprob = False
+        self.logprob_start_len = -1
+        self.routed_experts_start_len = 0
+        self.request_finish(FINISH_ABORT(error_msg, status_code, err_type))
+
+    def update_reasoning_tokens(self, token_id, think_end_ids):
+        if self._is_reasoning_over:
+            return
+
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        if self._think_end_matcher is None:
+            self._think_end_matcher = TokenSequenceMatcher(think_end_ids)
+
+        matched = self._think_end_match_len
+        for position, token in enumerate(token_id):
+            matched = self._think_end_matcher.advance(matched, token)
+            if matched == len(self._think_end_matcher):
+                self.reasoning_tokens += position + 1
+                self._is_reasoning_over = True
+                return
+
+        self._think_end_match_len = matched
+        self.reasoning_tokens += len(token_id)
+
+    def update_self_opened_reasoning_tokens(
+        self, token_id, think_start_ids, think_end_ids
+    ):
+        """Count reasoning the model opens itself; an output not opening with the start tag has none."""
+        if self._is_reasoning_over:
+            return
+
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        consumed = 0
+        while self._think_start_match_len < len(think_start_ids):
+            if consumed == len(token_id):
+                return
+            if token_id[consumed] != think_start_ids[self._think_start_match_len]:
+                self._is_reasoning_over = True
+                return
+            self._think_start_match_len += 1
+            consumed += 1
+            if self._think_start_match_len == len(think_start_ids):
+                self.reasoning_tokens += len(think_start_ids)
+
+        self.update_reasoning_tokens(token_id[consumed:], think_end_ids)
+
+    def __repr__(self):
+        return (
+            f"Req(rid={self.rid}, "
+            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "
+            f"{self.grammar=}, "
+            f"{self.sampling_params=})"
+        )
+
+
+class _MambaRadixCacheV2TrackEntry(NamedTuple):
+    track_mask: bool
+    track_position: int
+    track_seqlen: int
+
+
+def _gather_mamba_track_indices(
+    ping_pong_mapping: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    track_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Each request's ping-pong slot id at its track position, read on the device.
+    A negative position has no slot and gives the reserved slot 0, which a
+    forward may write but nothing reads."""
+    slots = ping_pong_mapping[req_pool_indices, track_positions.clamp(min=0)]
+    return torch.where(track_positions >= 0, slots, 0)
+
+
+def mamba_lazy_spec_in_window(
+    req, mamba_track_interval: int, max_draft_tokens: int
+) -> bool:
+    """Whether a track-interval crossing is reachable by an in-flight verify.
+
+    kv_committed_len lags device seq_lens by up to one verify under overlap;
+    the 2x window absorbs it.
+    """
+    seq_len = req.kv.kv_committed_len
+    window = 2 * max_draft_tokens
+    return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
+
+
+def set_mamba_track_indices_from_reqs(
+    batch, track_positions: Optional[List[int]] = None
+):
+    """Build mamba_track_indices from req objects (authoritative source).
+
+    track_positions: optional per-req ping-pong position override (the lazy
+    spec track plan, see mamba_lazy_spec_prepare); -1 has no slot.
+    """
+    mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+    if track_positions is None:
+        track_positions = [req.kv.mamba_next_track_idx for req in batch.reqs]
+    batch.mamba_track_buffer_indices = [0 if p is None else p for p in track_positions]
+    # A request with no ping-pong buffer (none given yet in spec v2 verify, or
+    # freed under overlap, when it may already belong to another request) has
+    # no slot.
+    positions = async_h2d(
+        [
+            -1 if req.kv.mamba_next_track_idx is None else position
+            for req, position in zip(batch.reqs, track_positions)
+        ],
+        dtype=torch.int64,
+        device=mapping.device,
+    )
+    batch.mamba_track_indices = _gather_mamba_track_indices(
+        mapping, batch.req_pool_indices, positions
+    )
+
+
+def unresumable_abort_message() -> str:
+    if get_disagg().disaggregation_mode == "decode":
+        return (
+            "Retracted request aborted: the rebootstrap recomputes the KV from "
+            "token ids, which cannot rebuild multimodal inputs or embeds. Retry later."
+        )
+    return (
+        "Retracted request aborted: an input_embeds request that has sent output "
+        "cannot be recomputed. Retry later."
+    )
+
+
+def release_req(
+    *,
+    req: Req,
+    remaing_req_count: int,
+    tree_cache: BasePrefixCache,
+    request_retirer: RequestRetirer,
+    offload_kv: bool = True,
+) -> bool:
+    """Returns whether the request can be resumed."""
+    resumable = request_retirer.retract(req, offload_kv=offload_kv)
+    # NOTE(lsyin): we should use the newly evictable memory instantly.
+    num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    req.reset_for_retract()
+    return resumable
+
+
+def free_beam_member_rows(
+    req: Req, req_to_token_pool, token_to_kv_pool_allocator
+) -> None:
+    """Free a beam leader's member rows. Call before releasing the leader:
+    the member rows are found through its lockstep allocated length."""
+    free_member_rows(
+        req.beam_group, kv_storage_of(req_to_token_pool, token_to_kv_pool_allocator)
+    )
+
+
+def retract_all(
+    *,
+    reqs: List[Req],
+    tree_cache: BasePrefixCache,
+    request_retirer: RequestRetirer,
+    offload_kv: bool = True,
+) -> List[Req]:
+    """Returns the requests to abort, each with its abort reason recorded: those
+    that cannot be resumed, and beam leaders, since beam groups cannot be
+    requeued."""
+    reqs_to_abort = []
+    for idx, req in enumerate(reqs):
+        if req.beam_group is not None:
+            req.request_finish(
+                FINISH_ABORT(
+                    "Beam search group aborted: beam groups cannot be retracted, "
+                    "so they are aborted instead of being requeued.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            )
+            free_beam_member_rows(
+                req, tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+            )
+            release_req(
+                req=req,
+                remaing_req_count=len(reqs) - idx,
+                tree_cache=tree_cache,
+                request_retirer=request_retirer,
+                offload_kv=False,
+            )
+            reqs_to_abort.append(req)
+            continue
+        if not release_req(
+            req=req,
+            remaing_req_count=len(reqs) - idx,
+            tree_cache=tree_cache,
+            request_retirer=request_retirer,
+            offload_kv=offload_kv,
+        ):
+            req.request_finish(
+                FINISH_ABORT(
+                    unresumable_abort_message(),
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            )
+            reqs_to_abort.append(req)
+    return reqs_to_abort
+
+
+def compute_extend_logprob_start_len(
+    *,
+    logprob_start_len: int,
+    prefix_len: int,
+    extend_len: int,
+    full_untruncated_fill_len: int,
+) -> int:
+    # Key variables:
+    # - logprob_start_len: Absolute position in full sequence where logprob computation begins
+    # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
+    # - extend_input_len: Number of tokens that need to be processed in this extend batch
+    if logprob_start_len == -1:
+        resolved_start = full_untruncated_fill_len
+    else:
+        # logprob_start_len should be at least the length of the prefix indices
+        resolved_start = max(logprob_start_len, prefix_len)
+    return min(resolved_start - prefix_len, extend_len)
+
+
+def _compute_chunked_req_next_prompt_token(
+    chunked_req: Optional[Req],
+    vocab_size: int,
+) -> Optional[int]:
+    """Return the next real prompt token after the fill boundary, skipping
+    multimodal placeholder (hash) tokens that lie outside the model vocab."""
+    if chunked_req is None:
+        return None
+    fill_len = chunked_req.extend_end
+    origin_ids = chunked_req.origin_input_ids
+    if fill_len >= len(origin_ids):
+        return None
+    if origin_ids[fill_len] < vocab_size:
+        return int(origin_ids[fill_len])
+    return None
+
+
+def prefill_checkpoint_boundary(
+    prefix_len: int, extend_len: int, checkpoint_grid: int
+) -> Optional[int]:
+    """Depth a prefill extend checkpoints at without DCP: the last whole
+    ``checkpoint_grid`` multiple past the prefix; None (no checkpoint, so no
+    window row retires behind one) for an extend shorter than the grid."""
+    if extend_len < checkpoint_grid:
+        return None
+    return prefix_len + extend_len // checkpoint_grid * checkpoint_grid
+
+
+def branch_checkpoint(
+    prefix_len: int,
+    branching_seqlen: Optional[int],
+    track_seqlen: int,
+    cache_chunk_size: int,
+) -> Optional[int]:
+    """The branch depth (`branching_checkpoint_depth`) an extend tracks instead
+    of its own checkpoint, when it lies inside the extend before ``track_seqlen``
+    on the state-chunk grid past the prefix; else None."""
+    if branching_seqlen is None:
+        return None
+    if (
+        prefix_len < branching_seqlen < track_seqlen
+        and (branching_seqlen - prefix_len) % cache_chunk_size == 0
+    ):
+        return branching_seqlen
+    return None
+
+
+@dataclasses.dataclass
+class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+    """Store all information of a batch on the scheduler."""
+
+    # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
+    reqs: List[Req]
+
+    # === Global config and shared resources (engine-lifetime; identical across batches) ===
+    # Memory pool and cache
+    req_to_token_pool: ReqToTokenPool = None
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
+    tree_cache: BasePrefixCache = None
+
+    # Batch configs
+    model_config: ModelConfig = None
+    enable_overlap: bool = False
+
+    # Device
+    device: str = "cuda"
+
+    # HiSparse (engine-level coordinator ref, same across batches)
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
+    # Tell whether the current running batch is full so that we can skip
+    # the check of whether to prefill new requests.
+    # This is an optimization to reduce the overhead of the prefill check.
+    batch_is_full: bool = False
+
+    # For chunked prefill in PP
+    chunked_req: Optional[Req] = None
+    chunked_req_next_prompt_token: Optional[int] = None
+    contains_last_prefill_chunk: bool = True
+
+    # Tracks process_prefill_chunk() on the original scheduler batch only.
+    prefill_chunk_processed: bool = False
+
+    # The requests this batch was launched with; the in-flight counts are kept
+    # over these.
+    launched_reqs: Optional[Tuple[Req, ...]] = None
+
+    # For DP attention
+    inner_idle_batch: Optional[ScheduleBatch] = None
+    # Decode requests carried alongside a chunked-prefill batch
+    decoding_reqs: List[Req] = None
+
+    req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
+
+    # hicache pointer for synchronizing data loading from CPU to GPU
+    hicache_consumer_index: int = -1
+
+    # Metrics
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
+    dp_balance_stats: Optional[DPBalanceStats] = None
+    prefill_stats: Optional[PrefillStats] = None
+    forward_iter: Optional[int] = None
+    launch_ts: Optional[float] = None
+    after_idle_gap: bool = False
+
+    # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
+    # Batched arguments to model runner
+    input_ids: torch.Tensor = None  # shape: [b], int64
+    # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
+    prefill_input_ids_cpu: Optional[torch.Tensor] = None
+    mix_running_indices: Optional[torch.Tensor] = None
+    # CPU twin of mix_running_indices; lets the overlap tail resolve gather
+    # pinned mirrors without a device sync.
+    mix_running_indices_cpu: Optional[torch.Tensor] = None
+    input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+
+    # Token replacement embeddings and absolute positions (optional).
+    replace_embeds: Optional[torch.Tensor] = None
+    replace_positions: Optional[torch.Tensor] = None
+
+    # Read by ForwardBatch ngram embedding init
+    ne_token_table: torch.Tensor = None
+    # Mask marking chunked (not-yet-finished) prefill requests whose sampled
+    # pseudo next-token must NOT be written into the ngram token table.
+    ne_skip_token_table_update: torch.Tensor = None
+    # DeepSeek-V4.1 engram, extend batches only: [bs, n - 1] int32 predecessors
+    # of each request's first extend token (NgramEmbeddingManager).
+    engram_history: Optional[torch.Tensor] = None
+    # Per engram layer, the rows the scheduler staged (EngramRowStager).
+    engram_staged_rows: Optional[StagedRows] = None
+    encoder_swa_reset: Optional[List[bool]] = None
+
+    req_pool_indices: torch.Tensor = None  # shape: [b], int64
+    seq_lens: torch.Tensor = None  # shape: [b], int64
+
+    # The original sequence lengths, Qwen-1M related
+    orig_seq_lens: torch.Tensor = None  # shape: [b], int32
+
+    # The output locations of the KV cache
+    out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # DSV4-NPU: KV-only per-pool slot bundle from
+    # DSV4NPUTokenToKVPoolAllocator (None elsewhere).
+    out_cache_loc_dsv4: Optional[Any] = None
+
+    # For hybrid GDN prefix cache
+    mamba_track_indices: torch.Tensor = None  # shape: [b], int64
+    # Per-batch snapshot of the logical ping-pong positions selected for this
+    # forward (normally req.kv.mamba_next_track_idx; spec may override it). Result
+    # processing uses it to update req.kv.mamba_last_track_idx, since both req-level
+    # indices may advance under overlap.
+    mamba_track_buffer_indices: Optional[List[int]] = None  # shape: [b], 0 or 1
+    mamba_track_mask: torch.Tensor = None  # shape: [b], bool
+    mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # TBO rejects Mamba tracking; enabling it must also slice these CPU lists.
+    mamba_track_seqlens_cpu: Optional[List[int]] = None
+    mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
+    mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
+    mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
+    mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
+    # Lazy + spec: this iteration's per-req scatter positions, -1 for none
+    # (see mamba_lazy_spec_prepare).
+    mamba_lazy_spec_track_positions_cpu: Optional[List[int]] = None  # shape: [b]
+    # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
+    mamba_cow_src_indices: torch.Tensor = None
+    mamba_cow_dst_indices: torch.Tensor = None
+    mamba_clear_indices: torch.Tensor = None
+
+    # Encoder-decoder device tensors (host fields in the host metadata group)
+    encoder_lens: Optional[torch.Tensor] = None
+    encoder_out_cache_loc: Optional[torch.Tensor] = None
+
+    # It comes empty list if logprob is not required.
+    extend_input_logprob_token_ids: Optional[torch.Tensor] = None
+
+    # === Config / flags crossing to ForwardBatch (by-value) ===
+    forward_mode: ForwardMode = None
+    global_forward_mode: Optional[ForwardMode] = None
+
+    # Full-DP metadata from the existing scheduler gather.
+    dp_spec_prefill_coordination_metadata: Optional[tuple] = None
+    dp_spec_prefill_coordination_applied: bool = False
+
+    # For DP attention
+    is_extend_in_batch: bool = False
+    can_run_decode_cuda_graph: bool = False
+    # Rank-consistent EAGLE draft replay gate. Keep it separate so missing
+    # draft-only state does not disable target verification or draft extend.
+    can_run_dp_draft_cuda_graph: bool = False
+    can_run_dp_prefill_cuda_graph: bool = False
+    dp_prefill_cuda_graph_max_prefix_len: int = 0
+    tbo_split_seq_index: Optional[int] = None
+    # Rank-consistent forward mode for the recv skipper, derived from the MLP
+    # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
+    recv_skipper_forward_mode: Optional[ForwardMode] = None
+    spec_verify_tier_num_tokens: int = -1
+
+    # For processing logprobs
+    return_logprob: bool = False
+
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
+    # Speculative decoding
+    spec_algorithm: SpeculativeAlgorithm = None
+
+    # Whether to return hidden states
+    return_hidden_states: bool = False
+    return_hidden_states_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+
+    # Has grammar
+    has_grammar: bool = False
+
+    # The sum of all sequence lengths
+    seq_lens_sum: int = None
+    extend_num_tokens: Optional[int] = None
+
+    # Diffusion LLM
+    dllm_config: Optional[DllmConfig] = None
+
+    # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
+    seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
+
+    # For multimodal inputs
+    multimodal_inputs: Optional[List] = None
+
+    # For processing logprobs
+    top_logprobs_nums: Optional[List[int]] = None
+    token_ids_logprobs: Optional[List[List[int]]] = None
+
+    # For encoder-decoder architectures
+    encoder_cached: Optional[List[bool]] = None
+    encoder_lens_cpu: Optional[List[int]] = None
+
+    # For extend and mixed chunekd prefill
+    prefix_lens: List[int] = None
+    extend_lens: List[int] = None
+    extend_logprob_start_lens: List[int] = None
+
+    # For DP attention
+    global_num_tokens: Optional[List[int]] = None
+    global_num_tokens_for_logprob: Optional[List[int]] = None
+    # The draft model can use a different MoE A2A backend than the target.
+    draft_global_num_tokens: Optional[List[int]] = None
+    draft_global_num_tokens_for_logprob: Optional[List[int]] = None
+    # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
+    # TP gather path stores only this rank's token count.
+    global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+
+    # Member rows riding one forward; None whenever reqs and rows are 1:1.
+    beam_tail: Optional[BeamTail] = None
+
+    # === Compound crossing to ForwardBatch (carry their own device tensors) ===
+    # Sampling info
+    sampling_info: SamplingBatchInfo = None
+
+    # Speculative decoding
+    # spec_info: Optional[SpecInput] = None
+    spec_info: Optional[SpecInput] = None
+
+    @classmethod
+    def init_new(
+        cls,
+        reqs: List[Req],
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        tree_cache: BasePrefixCache,
+        model_config: ModelConfig,
+        enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm,
+        chunked_req: Optional[Req] = None,
+        dllm_config: Optional[DllmConfig] = None,
+    ):
+        return_logprob = any(req.return_logprob for req in reqs)
+
+        return_hidden_states_mode = get_batch_return_hidden_states_mode(reqs)
+
+        batch = cls(
+            reqs=reqs,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            model_config=model_config,
+            enable_overlap=enable_overlap,
+            return_logprob=return_logprob,
+            has_grammar=any(req.grammar for req in reqs),
+            device=req_to_token_pool.device,
+            spec_algorithm=spec_algorithm,
+            return_hidden_states=return_hidden_states_mode.need_capture(),
+            return_hidden_states_mode=return_hidden_states_mode,
+            is_prefill_only=all(req.is_prefill_only for req in reqs),
+            chunked_req=chunked_req,
+            chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
+                chunked_req,
+                model_config.vocab_size,
+            ),
+            dllm_config=dllm_config,
+        )
+        return batch
+
+    def batch_size(self):
+        return len(self.reqs)
+
+    def is_empty(self):
+        return len(self.reqs) == 0
+
+    def add_inflight_step(self) -> None:
+        self.launched_reqs = tuple(self.reqs)
+        for req in self.launched_reqs:
+            req.inflight_steps += 1
+
+    def drop_inflight_step(self) -> None:
+        for req in self.launched_reqs:
+            req.inflight_steps -= 1
+
+    def is_dllm(self):
+        return self.dllm_config is not None
+
+    def grammar_needs_sync(self) -> bool:
+        """Whether a spec algorithm that cannot advance the grammar FSM inside
+        verify() needs this batch's result processed before the next schedule."""
+        return (
+            self.has_grammar
+            and not self.spec_algorithm.is_none()
+            and not self.spec_algorithm.supports_grammar_overlap()
+        )
+
+    def prepare_encoder_info_extend(
+        self, input_ids: List[array[int]], seq_lens: List[int]
+    ):
+        _pin = is_pin_memory_available(self.device)
+        encoder_lens_cpu = []
+        encoder_cached = []
+
+        for req in self.reqs:
+            im = req.multimodal_inputs
+            if im is None or im.num_image_tokens is None:
+                # No image input
+                encoder_lens_cpu.append(0)
+                encoder_cached.append(True)
+            else:
+                encoder_lens_cpu.append(im.num_image_tokens)
+                encoder_cached.append(
+                    self.forward_mode.is_decode()
+                    or req.prefix_len >= im.num_image_tokens
+                )
+        self.encoder_lens_cpu = encoder_lens_cpu
+        self.encoder_cached = encoder_cached
+
+        self.encoder_lens = torch.tensor(
+            self.encoder_lens_cpu, dtype=torch.int64, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
+
+        # Strip encoder infos
+        pt = 0
+        decoder_out_cache_loc = []
+        encoder_out_cache_loc = []
+        extend_lens = self.extend_lens[:]
+        prefix_lens = self.prefix_lens[:]
+        for i, req in enumerate(self.reqs):
+            encoder_len = self.encoder_lens_cpu[i]
+            seq_lens[i] -= encoder_len
+
+            if req.prefix_len < encoder_len:
+                # NOTE: the encoder part should be considered as a whole
+                assert req.prefix_len == 0
+                input_ids[i] = input_ids[i][encoder_len:]
+                encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
+                decoder_out_cache_loc.append(
+                    self.out_cache_loc[pt + encoder_len : pt + req.extend_len]
+                )
+                extend_lens[i] -= encoder_len
+                self.extend_num_tokens = self.extend_num_tokens - encoder_len
+            else:
+                decoder_out_cache_loc.append(
+                    self.out_cache_loc[pt : pt + req.extend_len]
+                )
+                prefix_lens[i] -= encoder_len
+
+            pt += req.extend_len
+        self.extend_lens = extend_lens
+        self.prefix_lens = prefix_lens
+
+        # Reassign: ED stripping rebuilds prefill_input_ids_cpu (CPU pinned);
+        # resolve_forward_inputs will H2D this on forward stream. self.input_ids
+        # stays None.
+        self.prefill_input_ids_cpu = flatten_arrays_to_pinned_cpu(input_ids, _pin)
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+
+        if not decoder_out_cache_loc:
+            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            )
+        else:
+            self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+
+        if not encoder_out_cache_loc:
+            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            )
+        else:
+            self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
+
+        assert len(self.out_cache_loc) == self.extend_num_tokens, (
+            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        )
+
+        if self.extend_input_logprob_token_ids is not None:
+            new_token_ids_parts = []
+            offset = 0
+            extend_logprob_start_lens = self.extend_logprob_start_lens[:]
+            for i, req in enumerate(self.reqs):
+                encoder_len = self.encoder_lens_cpu[i]
+                old_start_len = extend_logprob_start_lens[i]
+                old_contribution = req.extend_len - old_start_len
+
+                if req.prefix_len < encoder_len:
+                    tokens_to_strip = max(0, encoder_len - old_start_len)
+                    new_token_ids_parts.append(
+                        self.extend_input_logprob_token_ids[
+                            offset + tokens_to_strip : offset + old_contribution
+                        ]
+                    )
+                    extend_logprob_start_lens[i] = max(0, old_start_len - encoder_len)
+                else:
+                    new_token_ids_parts.append(
+                        self.extend_input_logprob_token_ids[
+                            offset : offset + old_contribution
+                        ]
+                    )
+
+                offset += old_contribution
+            self.extend_logprob_start_lens = extend_logprob_start_lens
+
+            if new_token_ids_parts:
+                self.extend_input_logprob_token_ids = torch.cat(new_token_ids_parts)
+            else:
+                self.extend_input_logprob_token_ids = None
+
+        for i, req in enumerate(self.reqs):
+            encoder_len = self.encoder_lens_cpu[i]
+            if encoder_len == 0:
+                continue
+            req.logprob_start_len = max(req.logprob_start_len, encoder_len)
+
+    def prepare_for_extend(self):
+        self.forward_mode = ForwardMode.EXTEND
+
+        if self.is_dllm():
+            # For DLLM, we use a separate forward mode
+            self.forward_mode = ForwardMode.DLLM_EXTEND
+
+        # Init tensors
+        reqs = self.reqs
+        input_ids = [r.get_fill_ids()[r.prefix_len :] for r in reqs]
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        seq_lens = [r.extend_end for r in reqs]
+        orig_seq_lens = [max(r.extend_end, len(r.origin_input_ids)) for r in reqs]
+        prefix_lens = [r.prefix_len for r in reqs]
+        extend_lens = [r.extend_len for r in reqs]
+        extend_logprob_start_lens = [
+            compute_extend_logprob_start_len(
+                logprob_start_len=r.logprob_start_len,
+                prefix_len=prefix_lens[i],
+                extend_len=extend_lens[i],
+                full_untruncated_fill_len=len(r.full_untruncated_fill_ids),
+            )
+            for i, r in enumerate(reqs)
+        ]
+
+        _pin = is_pin_memory_available(self.device)
+        # Stay on pinned CPU; H2D is deferred to forward stream via
+        # resolve_forward_inputs.
+        pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
+            self.device, non_blocking=True
+        )
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        orig_seq_lens_tensor = torch.tensor(
+            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
+
+        # Set batch fields needed by alloc_for_extend
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.seq_lens = seq_lens_tensor
+        self.seq_lens_cpu = seq_lens_cpu
+        self.extend_num_tokens = extend_num_tokens
+
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            for req in reqs:
+                if req.multimodal_inputs is not None and (
+                    not get_platform().is_cuda
+                    or any(
+                        item.modality != Modality.IMAGE
+                        for item in req.multimodal_inputs.mm_items
+                    )
+                ):
+                    raise ValueError(
+                        "encoder SWA replay supports multimodal inputs only for "
+                        "image requests on CUDA"
+                    )
+                if (
+                    req.input_embeds is not None
+                    or req.positional_embed_overrides is not None
+                ):
+                    raise ValueError(
+                        "encoder SWA replay does not support input_embeds or "
+                        "positional_embed_overrides"
+                    )
+            self.encoder_swa_reset = [resets_swa_window(r) for r in reqs]
+        # Allocate memory
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
+            self
+        )
+
+        # Set fields
+        input_embeds = []
+        all_replace_embeds: List[torch.Tensor] = []
+        all_replace_positions: List[int] = []
+        has_replace_embeds = False
+        input_id_pointer = 0
+        input_id_lens = [len(input_id) for input_id in input_ids]
+        extend_input_logprob_token_ids = []
+        multimodal_inputs = []
+        mamba_track_mask_cpu = []
+        mamba_track_positions_cpu = []
+        mamba_track_seqlens_cpu = []
+
+        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+            req.extend_batch_idx += 1
+
+            # If input_embeds are available, store them
+            if req.input_embeds is not None:
+                # Slice to match extend_input_len — PrefillAdder truncates
+                # fill_len/extend_input_len on chunk overflow but not input_embeds.
+                input_embeds.extend(
+                    req.input_embeds[pre_len : pre_len + req.extend_len]
+                )
+
+            if req.positional_embed_overrides is not None:
+                # Override positions are absolute in the full sequence.
+                # Convert to extend-tensor coordinates by subtracting pre_len,
+                # then skip any that fall within the cached prefix.
+                embeds_to_add = []
+                for embed_idx, pos in enumerate(
+                    req.positional_embed_overrides.positions
+                ):
+                    extend_pos = pos - pre_len
+                    if extend_pos < 0 or extend_pos >= req.extend_len:
+                        continue  # Outside current extend chunk, skip
+                    embeds_to_add.append((embed_idx, input_id_pointer + extend_pos))
+                if embeds_to_add:
+                    has_replace_embeds = True
+                    indices, positions = zip(*embeds_to_add)
+                    all_replace_embeds.append(
+                        req.positional_embed_overrides.embeds[list(indices)]
+                    )
+                    all_replace_positions.extend(positions)
+            input_id_pointer += input_id_lens[i]
+
+            multimodal_inputs.append(req.multimodal_inputs)
+
+            # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
+            # flag will always True
+            if not req.retracted_stain:
+                new_cached = pre_len - req.already_computed
+                if req.is_dllm():
+                    # Denoising revisits the current block while only earlier
+                    # blocks are a reusable prefix. Recomputing that block must
+                    # not subtract its size from cross-request cache hits.
+                    new_cached = max(0, new_cached)
+                req.cached_tokens += new_cached
+
+                # Calculate detailed breakdown of cached tokens by source (for HiCache)
+                # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
+                # would incorrectly count previously computed tokens as cache hits.
+                if not req._cache_breakdown_computed:
+                    # storage_hit_length is set after pop_prefetch_loaded_span()
+                    # returns a completed prefetch.
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    ) = split_cached_prefix_by_tier(
+                        prefix_len=req.prefix_len,
+                        host_hit_len=req.materialized_host_hit_len(),
+                        storage_hit_len=req.storage_hit_length,
+                        storage_hit_start=req.storage_hit_start,
+                        host_hit_is_storage=req.host_hit_is_storage,
+                    )
+                    req._cache_breakdown_computed = True
+
+                req.already_computed = seq_len
+            req.is_retracted = False
+
+            if get_exec().mamba.enable_mamba_extra_buffer:
+                track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
+                mamba_track_mask_cpu.append(track_entry.track_mask)
+                mamba_track_positions_cpu.append(track_entry.track_position)
+                mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
+
+            if self.return_logprob:
+                # Find input logprob token ids.
+                # First, find a global index within origin_input_ids and slide it by 1
+                # to compute input logprobs. It is because you need the next token
+                # to compute input logprobs. E.g., (chunk size 2)
+                #
+                # input_logprobs = [1, 2, 3, 4]
+                # get_fill_ids() = [1, 2]
+                # extend_input_logprob_token_id = [2, 3]
+                #
+                # Note that it can also overflow. In this case, we pad it with 0.
+                # input_logprobs = [1, 2, 3, 4]
+                # get_fill_ids() = [3, 4]
+                # extend_input_logprob_token_id = [4, 0]
+                global_start_idx, global_end_idx = (
+                    req.prefix_len,
+                    req.extend_end,
+                )
+                if req.logprob_start_len == -1:
+                    logprob_start_len = len(req.origin_input_ids)
+                else:
+                    logprob_start_len = req.logprob_start_len
+                # Apply logprob_start_len
+                if global_start_idx < logprob_start_len:
+                    global_start_idx = logprob_start_len
+
+                logprob_token_ids = req.origin_input_ids[
+                    global_start_idx + 1 : global_end_idx + 1
+                ]
+                extend_input_logprob_token_ids.extend(logprob_token_ids)
+
+                # We will need req.extend_len - extend_logprob_start_lens[i] number of
+                # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
+                extend_input_logprob_token_ids.extend(
+                    [0]
+                    * (
+                        req.extend_len
+                        - extend_logprob_start_lens[i]
+                        - len(logprob_token_ids)
+                    )
+                )
+
+        if self.return_logprob:
+            # Pin so the non_blocking H2D copy in ForwardBatch.init_new is stream-ordered
+            extend_input_logprob_token_ids = torch.tensor(
+                extend_input_logprob_token_ids,
+                pin_memory=is_pin_memory_available(self.device),
+            )
+            # Clamp placeholder or out-of-range token IDs (e.g., multimodal hashes)
+            # so they stay within the vocab boundary before being sent to GPU.
+            extend_input_logprob_token_ids.clamp_(0, self.model_config.vocab_size - 1)
+        else:
+            extend_input_logprob_token_ids = None
+
+        if has_replace_embeds:
+            replace_embeds_tensor = torch.cat(all_replace_embeds, dim=0).to(
+                self.device, non_blocking=True
+            )
+            replace_positions_tensor = torch.tensor(
+                all_replace_positions, dtype=torch.long, device=self.device
+            )
+        else:
+            replace_embeds_tensor = None
+            replace_positions_tensor = None
+
+        self.input_ids = None
+        self.prefill_input_ids_cpu = pinned_input_ids
+        self.req_pool_indices = req_pool_indices_tensor
+        self.req_pool_indices_cpu = req_pool_indices_cpu
+        self.orig_seq_lens = orig_seq_lens_tensor
+        self.out_cache_loc = out_cache_loc
+        self.input_embeds = (
+            torch.tensor(input_embeds, pin_memory=_pin).to(
+                self.device, non_blocking=True
+            )
+            if input_embeds
+            else None
+        )
+        self.replace_embeds = replace_embeds_tensor
+        self.replace_positions = replace_positions_tensor
+        for mm_input in multimodal_inputs:
+            if mm_input is None:
+                continue
+            if isinstance(mm_input.vision_position_ids, torch.Tensor):
+                mm_input.vision_position_ids = mm_input.vision_position_ids.to(
+                    self.device, non_blocking=True
+                )
+            if isinstance(mm_input.visible_frame_counts, torch.Tensor):
+                mm_input.visible_frame_counts = mm_input.visible_frame_counts.to(
+                    self.device, non_blocking=True
+                )
+        self.multimodal_inputs = multimodal_inputs
+        self.seq_lens_sum = sum(seq_lens)
+
+        if self.return_logprob:
+            self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
+
+        self.extend_logprob_start_lens = extend_logprob_start_lens
+        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+
+        if get_exec().mamba.enable_mamba_extra_buffer:
+            self.mamba_prefill_track_mask_cpu = mamba_track_mask_cpu
+            self.mamba_track_seqlens_cpu = mamba_track_seqlens_cpu
+            # Ping-pong slot ids live on the device; gather them there.
+            track_positions = torch.tensor(
+                mamba_track_positions_cpu, dtype=torch.int64, pin_memory=_pin
+            ).to(self.device, non_blocking=True)
+            self.mamba_track_indices = _gather_mamba_track_indices(
+                self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping,
+                self.req_pool_indices,
+                track_positions,
+            )
+            self.mamba_track_mask = torch.tensor(
+                mamba_track_mask_cpu, dtype=torch.bool, pin_memory=_pin
+            ).to(self.device, non_blocking=True)
+            self.mamba_track_seqlens = torch.tensor(
+                mamba_track_seqlens_cpu, dtype=torch.int64, pin_memory=_pin
+            ).to(self.device, non_blocking=True)
+
+        # Collect mamba init info for deferred ops on forward stream
+        if any(req.kv.holds_mamba for req in reqs):
+            self._collect_deferred_mamba_cow_and_clear(reqs)
+
+        if self.model_config.is_encoder_decoder:
+            self.prepare_encoder_info_extend(input_ids, seq_lens)
+
+        # Build sampling info
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
+
+    def _mamba_radix_cache_v2_req_prepare_for_extend(
+        self,
+        req: Req,
+    ) -> _MambaRadixCacheV2TrackEntry:
+        cache_chunk_size = mamba_cache_chunk_size()
+        state_chunk_size = getattr(
+            self.model_config.hf_text_config, "mamba_chunk_size", 64
+        )
+        # Donated depth must land on the actual DCP-widened radix page, while
+        # kernel snapshots stay on the cache chunk grid.
+        checkpoint_grid = mamba_checkpoint_grid(self.tree_cache.page_size)
+
+        def _force_track_h(i: int) -> int:
+            # h is indexed relative to the extend start, so check that offset.
+            assert (i - req.prefix_len) % cache_chunk_size == 0, (
+                f"The force track calculation only handles last-position or "
+                f"unaligned seqlens, so it needs a chunk-aligned offset to "
+                f"start from. But i={i} prefix_len={req.prefix_len} "
+                f"chunk_size={cache_chunk_size} checkpoint_grid={checkpoint_grid}"
+            )
+            # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
+            # 1) aligned with cache_chunk_size-> retrieve from last_recurrent_state
+            #    a) is the last position -> retrieve from last_recurrent_state
+            #    b) is NOT the last position -> retrieve from h
+            # 2) unaligned with cache_chunk_size -> retrieve from h
+            # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
+            # to force the math calculation to retrieve the correct mamba state from h.
+            return i + 1
+
+        prefix_len = req.prefix_len
+        seq_end = req.extend_end
+        if get_parallel().dcp_enabled:
+            # DCP widens radix pages beyond scheduler chunk boundaries. Pick an
+            # absolute page depth only when the kernel produced an h snapshot.
+            mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
+            mask = (
+                mamba_track_seqlen_aligned > prefix_len
+                and (mamba_track_seqlen_aligned - prefix_len) % cache_chunk_size == 0
+            )
+        else:
+            # Chunked prefill can leave an active request off the absolute
+            # checkpoint grid. Without DCP, keep tracking snapshots relative to
+            # that request prefix so later chunks can continue donating states.
+            boundary = prefill_checkpoint_boundary(
+                prefix_len, req.extend_len, checkpoint_grid
+            )
+            mask = boundary is not None
+            mamba_track_seqlen_aligned = prefix_len if boundary is None else boundary
+        track_position = req.kv.mamba_next_track_idx
+        mamba_track_seqlen = -1
+        if mask:
+            # mamba_track_seqlen is used to calculate the indices to track in
+            # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
+            # fact that the ssm state between aligned and non-aligned are retrieved differently,
+            # if 1) last pos and 2) is aligned, then retrieved from the last_recurrent_state,
+            # otherwise retrieved from h (i.e. unaligned).
+            # We need to pass the non-aligned seqlen to the calculation. Even though
+            # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
+            mamba_track_seqlen = seq_end
+
+            # A coarser checkpoint grid may not be a model-state boundary, so
+            # force retrieval from the intermediate h state in that case.
+            mamba_track_fla_chunk_aligned = (
+                req.prefix_len + (req.extend_len // state_chunk_size) * state_chunk_size
+            )
+            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
+                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
+
+            # Track the branching point instead, if it lies within this extend.
+            branch = branch_checkpoint(
+                req.prefix_len,
+                req.mamba_branching_seqlen,
+                mamba_track_seqlen,
+                cache_chunk_size,
+            )
+            if branch is not None:
+                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                # See _force_track_h() for more details.
+                mamba_track_seqlen = _force_track_h(branch)
+                mamba_track_seqlen_aligned = branch
+            kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            ).advance(
+                req,
+                tracking=TrackingAdvance(
+                    boundary=mamba_track_seqlen_aligned,
+                    last_position=track_position,
+                    next_position=track_position
+                    if get_exec().mamba.enable_mamba_extra_buffer_lazy
+                    else self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        track_position
+                    ),
+                ),
+            )
+
+        return _MambaRadixCacheV2TrackEntry(
+            track_mask=mask,
+            track_position=track_position,
+            track_seqlen=mamba_track_seqlen,
+        )
+
+    def _collect_deferred_mamba_cow_and_clear(self, reqs):
+        """Collect deferred COW/clear info from requests."""
+        cow_src_tensors = []
+        cow_dst_tensors = []
+        clear_tensors = []
+        for req in reqs:
+            if req.kv.mamba_cow_src_index is not None:
+                cow_src_tensors.append(req.kv.mamba_cow_src_index)
+                cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
+                req.kv.mamba_cow_src_index = None
+                req.kv.mamba_needs_clear = False
+            elif req.kv.mamba_needs_clear:
+                clear_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
+                req.kv.mamba_needs_clear = False
+        self.mamba_cow_src_indices = (
+            torch.cat(cow_src_tensors) if cow_src_tensors else None
+        )
+        self.mamba_cow_dst_indices = (
+            torch.cat(cow_dst_tensors) if cow_dst_tensors else None
+        )
+        self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
+
+    def mix_with_running(self, running_batch: ScheduleBatch):
+        self.forward_mode = ForwardMode.MIXED
+        running_bs = running_batch.batch_size()
+
+        # Same invariant as convert_decode_to_extend: the caller ran
+        # prepare_for_decode, so a tail's prefix is its row length - 1.
+        if self.spec_algorithm.is_none():
+            running_prefix_lens = [s - 1 for s in running_batch.seq_lens_cpu.tolist()]
+        else:
+            # Spec rows sit at the committed base; seq_lens is rebuilt below.
+            running_prefix_lens = [r.seqlen - 1 for r in running_batch.reqs]
+        for req, prefix_len in zip(
+            running_batch.reqs, running_prefix_lens, strict=True
+        ):
+            req.refresh_fill_ids()
+            # req.prefix_len still ends at the last prefill, so req.extend_len is
+            # not 1 here; this row's prefix and extend length live on the batch.
+            req.extend_end = prefix_len + 1
+
+        # Decode tokens of the running portion live in future_map.output_tokens_buf.
+        self.input_ids = None
+        self.mix_running_indices = running_batch.req_pool_indices
+        self.mix_running_indices_cpu = running_batch.req_pool_indices_cpu
+        if not self.spec_algorithm.is_none():
+            # Spec keeps no per-step out_cache_loc on the running batch; gather
+            # each tail's bonus slot at the committed length (rebound under overlap).
+            tail_base = torch.tensor(
+                [r.seqlen - 1 for r in running_batch.reqs],
+                dtype=torch.int64,
+                device=self.seq_lens.device,
+            )
+            running_out_cache_loc = self.req_to_token_pool.req_to_token[
+                running_batch.req_pool_indices.long(),
+                tail_base,
+            ].to(self.out_cache_loc.dtype)
+            # The spec relay is unresolved at schedule time, so merge_batch
+            # would null seq_lens_cpu; rebuild the tails from request state.
+            running_seq_lens_cpu = torch.tensor(
+                [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
+            )
+            if self.seq_lens_cpu is None:
+                merged_seq_lens_cpu = running_seq_lens_cpu
+            else:
+                merged_seq_lens_cpu = torch.cat(
+                    [self.seq_lens_cpu, running_seq_lens_cpu]
+                )
+        else:
+            # Non-spec: the running batch carries prepared seq_lens_cpu
+            # (r.seqlen lags it under overlap); merge_batch concats it.
+            tail_base = None
+            running_out_cache_loc = running_batch.out_cache_loc
+            merged_seq_lens_cpu = None
+        out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
+
+        # merge_batch drops the Mamba track fields, but checkpoint_kv_cache still
+        # donates each prefill row's track slot after this forward, so keep the
+        # prefill rows' tracking. Decode tails are not tracked in a mixed step.
+        prefill_track = None
+        if self.mamba_track_indices is not None:
+            if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+                running_batch.mamba_lazy_undo_prealloc_at_boundary()
+            prefill_track = (
+                self.mamba_track_indices,
+                self.mamba_track_mask,
+                self.mamba_track_seqlens,
+                self.mamba_prefill_track_mask_cpu,
+                self.mamba_track_seqlens_cpu,
+            )
+
+        self.merge_batch(running_batch)
+        self.out_cache_loc = out_cache_loc
+        if prefill_track is not None:
+            indices, mask, seqlens, mask_cpu, seqlens_cpu = prefill_track
+            # Decode rows track nothing here; their index is the reserved slot 0.
+            untracked = torch.zeros(
+                running_bs, dtype=torch.int64, device=indices.device
+            )
+            self.mamba_track_indices = torch.cat([indices, untracked])
+            self.mamba_track_mask = torch.cat(
+                [mask, torch.zeros_like(untracked, dtype=torch.bool)]
+            )
+            self.mamba_track_seqlens = torch.cat(
+                [seqlens, torch.full_like(untracked, -1)]
+            )
+            self.mamba_prefill_track_mask_cpu = mask_cpu + [False] * running_bs
+            self.mamba_track_seqlens_cpu = seqlens_cpu + [-1] * running_bs
+        if merged_seq_lens_cpu is not None:
+            self.seq_lens_cpu = merged_seq_lens_cpu
+        if tail_base is not None:
+            # Spec seq_lens sit at the committed base (bonus token pending);
+            # this step commits it, so tails carry base + 1 or attention drops the row.
+            merged = self.seq_lens.clone()
+            merged[-running_bs:] = tail_base + 1
+            self.seq_lens = merged
+
+        # NOTE: prefix_len is what has been cached, but we don't cache each decode step
+        self.prefix_lens = self.prefix_lens + running_prefix_lens
+        self.extend_lens = self.extend_lens + [1] * running_bs
+        self.extend_num_tokens = self.extend_num_tokens + running_bs
+        # TODO (lianmin): Revisit this. It should be seq_len - 1
+        self.extend_logprob_start_lens = (
+            self.extend_logprob_start_lens + [0] * running_bs
+        )
+        self.is_prefill_only = False
+
+    def convert_decode_to_extend(self):
+        """View every decode request as a 1-token extend with its context as
+        prefix, making this a plain extend (prefill) batch. Called after the
+        DP mlp-sync when a peer rank runs extend, so this rank replays the
+        extend graphs; requires prepare_for_decode(); token count unchanged.
+        """
+        bs = self.batch_size()
+        self.forward_mode = ForwardMode.EXTEND
+        # Stale residue from this object's life as a prefill batch; the
+        # extend-merge path would exclude (silently drop) that req otherwise.
+        self.chunked_req = None
+        # Also stale residue; None keeps the prefill result path from
+        # re-reporting old prefill stats for what is decode work.
+        self.prefill_stats = None
+        # Also stale residue: decode rows are never fresh placements, so they
+        # reset no encoder SWA window and fold no replay rows the vote missed.
+        if self.encoder_swa_reset is not None:
+            self.encoder_swa_reset = [False] * bs
+        # A 1-token extend's position is arange(prefix, prefix + 1), so prefix
+        # must be seq_len - 1; output_ids trails the row by one or zero and
+        # cannot stand in for it. Rows past bs are a beam tail, not requests.
+        seq_lens = self.seq_lens_cpu[:bs].tolist()
+        for req, seq_len in zip(self.reqs, seq_lens, strict=True):
+            req.refresh_fill_ids()
+            # end runs one past full_untruncated_fill_ids while output_ids
+            # trails; safe only while decoding_reqs suppresses the checkpoint insert.
+            # As in mix_with_running, read prefix and extend length off the batch.
+            req.extend_end = seq_len
+
+        self.prefix_lens = [seq_len - 1 for seq_len in seq_lens]
+        self.extend_lens = [1] * bs
+        self.extend_num_tokens = bs
+        self.extend_logprob_start_lens = [0] * bs
+        self.decoding_reqs = self.reqs
+        self.is_prefill_only = False
+
+    def new_tokens_required_next_decode(
+        self, selected_indices: Optional[List[int]] = None
+    ):
+        page_size = self.token_to_kv_pool_allocator.page_size
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
+
+        if self.spec_algorithm.is_none():
+            new_pages = sum(
+                1 for r in requests if r.kv.kv_committed_len % page_size == 0
+            )
+            return new_pages * page_size + num_beam_member_rows(requests)
+
+        return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
+
+    def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
+        """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
+        reserve = get_alloc_reserve_per_decode()
+        total = 0
+        for r in requests:
+            x = max(0, r.kv.kv_committed_len + reserve - r.kv.kv_allocated_len)
+            cur = r.kv.kv_allocated_len
+            nxt = cur + x
+            total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
+        return total
+
+    @capacity_decision
+    def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
+        """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
+        the capacity gate (eviction + any per-step reservations of its own) —
+        the retract loop converges on this same check, so allocator-side
+        shortfalls retract gracefully instead of tripping fail-loud alloc
+        errors."""
+        num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
+        from sglang.srt.mem_cache.capacity import check_decode_capacity
+
+        return check_decode_capacity(
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
+            num_tokens=num_tokens,
+            requests=requests,
+            spec_algorithm=self.spec_algorithm,
+        )
+
+    @capacity_decision
+    def retract_decode(
+        self, request_retirer: RequestRetirer
+    ) -> Tuple[List[Req], float, List[Req]]:
+        """Retract the decoding requests when there is not enough memory."""
+        sorted_indices = self._get_decode_retraction_order(self.reqs)
+        sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
+
+        retracted_reqs = []
+        reqs_to_abort: List[Req] = []
+        first_iter = True
+        while first_iter or (
+            not self.check_decode_mem(selected_indices=sorted_indices)
+        ):
+            if len(sorted_indices) == 1:
+                # Always keep at least one request
+                break
+
+            first_iter = False
+            idx = sorted_indices.pop()
+            req = self.reqs[idx]
+            if req.beam_group is not None:
+                req.request_finish(
+                    FINISH_ABORT(
+                        "Beam search group aborted: KV cache pool is full. Beam "
+                        "groups cannot be retracted, so they are aborted instead "
+                        "of being requeued.",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                )
+                reqs_to_abort.append(req)
+                free_beam_member_rows(
+                    req, self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+                # Aborting, so a host backup to resume from would be wasted.
+                self.release_req(
+                    idx, len(sorted_indices), request_retirer, offload_kv=False
+                )
+                continue
+            # release memory and don't insert into the tree because we need the space instantly
+            if self.release_req(idx, len(sorted_indices), request_retirer):
+                retracted_reqs.append(req)
+            else:
+                # No backup or rebuild exists and the device KV is already freed.
+                if get_disagg().disaggregation_mode != "decode":
+                    message = unresumable_abort_message()
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                elif (
+                    get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+                ):
+                    message = "Retraction host KV pool exhausted. Aborting the request."
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                else:
+                    message = (
+                        "Retracted under decode memory pressure without a KV "
+                        "backup. Retry later."
+                    )
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                req.request_finish(FINISH_ABORT(message, status_code=status_code))
+                reqs_to_abort.append(req)
+                logger.warning(
+                    "retract_decode: aborted request %s: %s", req.rid, message
+                )
+
+        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+            selected_indices=sorted_indices
+        ):
+            # Even the last remaining request cannot fit in memory.
+            # Instead of crashing the scheduler, gracefully abort it.
+            last_idx = sorted_indices.pop()
+            last_req = self.reqs[last_idx]
+            last_req.request_finish(
+                FINISH_ABORT(
+                    "Out of memory even after retracting all other requests "
+                    "in the decode batch. Aborting the last request.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            )
+            reqs_to_abort.append(last_req)
+            if last_req.beam_group is not None:
+                free_beam_member_rows(
+                    last_req, self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+            self.release_req(last_idx, 0, request_retirer, offload_kv=False)
+            logger.warning(
+                "retract_decode: aborted last request %s due to OOM", last_req.rid
+            )
+
+        self.filter_batch(keep_indices=sorted_indices)
+
+        # Reqs in batch are filtered
+        new_estimate_ratio = (
+            NewTokenRatioTracker.estimate_new_token_ratio_after_retract(self.reqs)
+        )
+
+        return retracted_reqs, new_estimate_ratio, reqs_to_abort
+
+    @staticmethod
+    def _get_decode_retraction_order(reqs: List[Req]) -> List[int]:
+        """Return indices ordered from most-preferred to least-preferred to keep.
+
+        The retraction loop pops from the end of this list, so the least-preferred
+        request is retracted first.
+        """
+        sorted_indices = list(range(len(reqs)))
+
+        # TODO(lsyin): improve retraction policy for radix cache
+
+        def length_key(req: Req) -> Tuple[int, int]:
+            return (len(req.output_ids), -len(req.origin_input_ids))
+
+        if get_schedule().retraction_policy == "priority":
+            priority_sign = (
+                1 if get_schedule().schedule_low_priority_values_first else -1
+            )
+
+            def retraction_key(req: Req) -> Tuple[int, int, int]:
+                priority = req.priority
+                if priority is None:
+                    priority = (
+                        sys.maxsize
+                        if get_schedule().schedule_low_priority_values_first
+                        else -sys.maxsize - 1
+                    )
+                return (priority * (-priority_sign), *length_key(req))
+
+            sorted_indices.sort(
+                key=lambda i: retraction_key(reqs[i]),
+                reverse=True,
+            )
+            return sorted_indices
+
+        sorted_indices.sort(
+            key=lambda i: length_key(reqs[i]),
+            reverse=True,
+        )
+        return sorted_indices
+
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        request_retirer: RequestRetirer,
+        offload_kv: bool = True,
+    ) -> bool:
+        return release_req(
+            req=self.reqs[idx],
+            remaing_req_count=remaing_req_count,
+            tree_cache=self.tree_cache,
+            request_retirer=request_retirer,
+            offload_kv=offload_kv,
+        )
+
+    def prepare_encoder_info_decode(self):
+        # Reset the encoder cached status
+        self.encoder_cached = [True] * len(self.reqs)
+
+    def prepare_for_idle(self):
+        self.forward_mode = ForwardMode.IDLE
+        self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+        self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
+        self.seq_lens_sum = 0
+        self.extend_num_tokens = 0
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
+
+    def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:
+        return alloc_tracking_slots(
+            kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator),
+            self.token_to_kv_pool_allocator.state,
+            candidates,
+            self.tree_cache,
+        )
+
+    def mamba_lazy_prealloc_at_boundary(
+        self, track_mask_cpu: torch.Tensor
+    ) -> torch.Tensor:
+        """Give each request at a track boundary a second ping-pong slot, so the
+        forward writes the new snapshot there and never into the keep slot;
+        mamba_lazy_post_decode_at_boundary frees the old one after the step.
+
+        A request that gets no slot even after eviction has its bit cleared in
+        the returned track mask: nothing is written, and the keep slot keeps the
+        checkpoint at mamba_last_track_seqlen.
+        """
+        track_mask_cpu = track_mask_cpu.clone()
+        rows = []
+        for i, (req, at_boundary) in enumerate(zip(self.reqs, track_mask_cpu.tolist())):
+            assert req.kv.mamba_ping_pong_track_buffer is not None
+            other_idx = 1 - req.kv.mamba_next_track_idx
+            if at_boundary and req.kv.mamba_ping_pong_empty[other_idx]:
+                rows.append((i, req, other_idx))
+            elif at_boundary:
+                # A held other slot means the previous boundary's
+                # post-processing (which frees it) has not run yet under overlap.
+                track_mask_cpu[i] = False
+        took = self._alloc_tracking_slots([(req, pos) for _, req, pos in rows])
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+        for (i, req, other_idx), ok in zip(rows, took):
+            if ok:
+                storage.advance(req, tracking=TrackingAdvance(next_position=other_idx))
+            else:
+                track_mask_cpu[i] = False
+        return track_mask_cpu
+
+    def mamba_lazy_undo_prealloc_at_boundary(self):
+        """Give back the slots mamba_lazy_prealloc_at_boundary handed this decode
+        batch before it rides a mixed forward, which writes no decode track state
+        and whose result path never frees them."""
+        if self.mamba_track_mask_cpu is None:
+            return
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+        for req, at_boundary in zip(self.reqs, self.mamba_track_mask_cpu):
+            if not at_boundary:
+                continue
+            next_idx = req.kv.mamba_next_track_idx
+            storage.advance(
+                req,
+                tracking=TrackingAdvance(
+                    next_position=1 - next_idx, release_positions=(next_idx,)
+                ),
+            )
+
+    def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
+        """Spec counterpart of mamba_lazy_prealloc_at_boundary.
+
+        The accept length is unknown here, so a request whose next boundary is
+        reachable gets a pending slot without moving mamba_next_track_idx; the
+        verify writes it only on a real crossing, and _mamba_lazy_spec_update
+        promotes it. The per-request positions are stored on the batch, which
+        the result queue copies.
+        """
+        track_positions: List[int] = []
+        rows = []
+        for i, req in enumerate(self.reqs):
+            assert req.kv.mamba_ping_pong_track_buffer is not None
+            if not mamba_lazy_spec_in_window(
+                req, mamba_track_interval, max_draft_tokens
+            ):
+                # No crossing reachable: the scatter mask stays -1, the
+                # position is never written.
+                track_positions.append(req.kv.mamba_next_track_idx)
+                continue
+            other_idx = 1 - req.kv.mamba_next_track_idx
+            if req.kv.mamba_ping_pong_empty[other_idx]:
+                rows.append((i, req, other_idx))
+            track_positions.append(other_idx)
+        took = self._alloc_tracking_slots([(req, pos) for _, req, pos in rows])
+        # On failure the crossing's snapshot has no slot (-1), so the keep slot
+        # still holds the checkpoint at mamba_last_track_seqlen.
+        for (i, _, _), ok in zip(rows, took):
+            if not ok:
+                track_positions[i] = -1
+        self.mamba_lazy_spec_track_positions_cpu = track_positions
+
+    def cumulate_penalty_output_tokens(self):
+        # Under overlap batch.input_ids is just a placeholder here -- the
+        # real token is relayed via future_map and resolved at forward
+        # entry. So take the last output token from Req directly
+        # (origin_input_ids[-1] on the first decode, before any output).
+        last_tokens = [
+            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
+            for req in self.reqs
+        ]
+        # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
+        # pin_memory (matching the prefill-path tensors) keeps the copy async;
+        # is_pin_memory_available falls back to pageable on unsupported devices.
+        latest_output_ids = torch.tensor(
+            last_tokens,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
+        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            latest_output_ids
+        )
+
+    def prepare_for_decode(self):
+        self.forward_mode = ForwardMode.DECODE
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_prefill_track_mask_cpu = None
+        # Decode embeds the last output token via embed_tokens; clear the stale
+        # prefill-time tensors so they don't leak into ForwardBatch.
+        self.input_embeds = None
+        self.replace_embeds = None
+        self.replace_positions = None
+
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
+        self.mamba_clear_indices = None
+
+        # Clear context parallel metadata - CP is only for prefill, not decode
+        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
+            self.attn_cp_metadata = None
+
+        if not self.spec_algorithm.is_none():
+            # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
+            from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
+
+            self.mamba_track_mask_cpu = None
+            self.mamba_track_mask_next_cpu = None
+            self.mamba_decode_batch_idx_cpu = None
+            spec_prepare_for_decode(self)
+            return
+
+        # Beam member rows ride this decode batch: append them to the row
+        # tensors before allocation so alloc_for_decode covers them too.
+        strip_beam_tail(self)
+        append_beam_tail(self)
+
+        if self.sampling_info.penalizer_orchestrator.is_required:
+            self.cumulate_penalty_output_tokens()
+
+        # input_ids is set at end of previous run_batch (placeholder for
+        # overlap; next_token_ids cast for non-overlap).
+
+        if self.model_config.is_encoder_decoder:
+            self.prepare_encoder_info_decode()
+
+        # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
+        # the allocator, triggered from mem_cache/common.py.)
+        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+
+        for req in self.reqs:
+            req.decode_batch_idx += 1
+
+        # New-tensor avoids racing model_worker_batch refs queued for
+        # overlap forward.
+        self.seq_lens = self.seq_lens + 1
+        self.seq_lens_cpu = self.seq_lens_cpu + 1
+        self.orig_seq_lens = self.orig_seq_lens + 1
+        # Sum is recomputed lazily by ForwardBatch.init_new.
+        self.seq_lens_sum = None
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.map_last_loc_to_buffer(
+                self.seq_lens,
+                self.out_cache_loc,
+                self.req_pool_indices,
+                self.seq_lens_cpu,
+                self.req_pool_indices_cpu,
+            )
+
+        if get_exec().mamba.enable_mamba_extra_buffer:
+            mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
+            track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
+            track_mask_cpu = track_remainders_cpu == 0
+
+            if len(self.reqs) == 0:
+                self.mamba_track_indices = torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                )
+                self.mamba_track_buffer_indices = []
+            else:
+                if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+                    track_mask_cpu = self.mamba_lazy_prealloc_at_boundary(
+                        track_mask_cpu
+                    )
+                set_mamba_track_indices_from_reqs(self)
+
+            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+            self.mamba_track_mask_next_cpu = (
+                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+                if self.enable_overlap
+                else None
+            )
+            # ScheduleBatch.copy() snapshots the list of requests, but the Req
+            # objects remain shared. The next overlapped decode can therefore
+            # advance their counters before this batch's result is processed.
+            self.mamba_decode_batch_idx_cpu = [
+                req.decode_batch_idx for req in self.reqs
+            ]
+            # async H2D
+            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
+                device=self.device, non_blocking=True
+            )
+
+    def filter_batch(
+        self,
+        reqs_to_exclude: Optional[Union[Req, List[Req]]] = None,
+        keep_indices: Optional[List[int]] = None,
+    ):
+        strip_beam_tail(self)
+        if keep_indices is None:
+            if isinstance(reqs_to_exclude, Req):
+                reqs_to_exclude = [reqs_to_exclude]
+            elif reqs_to_exclude is None:
+                reqs_to_exclude = []
+            keep_indices = [
+                i
+                for i in range(len(self.reqs))
+                if not self.reqs[i].finished() and self.reqs[i] not in reqs_to_exclude
+            ]
+
+        if keep_indices is None or len(keep_indices) == 0:
+            # Filter out all requests. Stale tensors are left as-is: is_empty()
+            # keys off reqs, so callers drop the batch before a forward reads them.
+            self.reqs = []
+            self.return_hidden_states = False
+            self.return_hidden_states_mode = CaptureHiddenMode.NULL
+            return
+
+        if len(keep_indices) == len(self.reqs):
+            # No need to filter
+            return
+
+        keep_indices_device = torch.tensor(
+            keep_indices,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
+
+        if self.model_config.is_encoder_decoder:
+            self.encoder_lens = self.encoder_lens[keep_indices_device]
+            self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
+
+        self.reqs = [self.reqs[i] for i in keep_indices]
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
+        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+        self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
+        self.seq_lens = self.seq_lens[keep_indices_device]
+        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+        self.out_cache_loc = None
+        # Sum is recomputed lazily by ForwardBatch.init_new.
+        self.seq_lens_sum = None
+
+        if self.input_ids is not None:
+            self.input_ids = self.input_ids[keep_indices_device]
+        # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
+        if self.seq_lens_cpu is not None:
+            self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
+
+        self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
+        self.mamba_track_mask = None
+        self.mamba_track_seqlens = None
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_prefill_track_mask_cpu = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_mask_next_cpu = None
+        self.mamba_decode_batch_idx_cpu = None
+        self.mamba_lazy_spec_track_positions_cpu = None
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
+        self.mamba_clear_indices = None
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        if self.return_logprob:
+            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
+            self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
+        else:
+            self.top_logprobs_nums = None
+            self.token_ids_logprobs = None
+
+        self.has_grammar = any(req.grammar for req in self.reqs)
+        self.return_hidden_states_mode = get_batch_return_hidden_states_mode(self.reqs)
+        self.return_hidden_states = self.return_hidden_states_mode.need_capture()
+
+        self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        if self.spec_info:
+            self.spec_info.filter_batch(
+                new_indices=keep_indices_device,
+                new_indices_cpu=keep_indices,
+            )
+
+    def merge_batch(self, other: ScheduleBatch):
+        strip_beam_tail(self)
+        strip_beam_tail(other)
+        # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
+        # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
+        # needs to be called with pre-merged Batch.reqs.
+        self.sampling_info.merge_batch(other.sampling_info)
+
+        # Encoder-decoder infos
+        if self.model_config.is_encoder_decoder:
+            self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
+            self.encoder_lens_cpu = self.encoder_lens_cpu + other.encoder_lens_cpu
+        self.req_pool_indices = torch.cat(
+            [self.req_pool_indices, other.req_pool_indices]
+        )
+        self.req_pool_indices_cpu = torch.cat(
+            [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
+        )
+        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self.out_cache_loc = None
+        # Sum is recomputed lazily by ForwardBatch.init_new.
+        self.seq_lens_sum = None
+        # Cat only when both sides hold a real token tensor; otherwise drop to
+        # None and let resolve_forward_inputs rebuild from the merged
+        # req_pool_indices. Mismatch arises e.g. with spec_v1, which keeps its
+        # tensor while a relay-staged side is None -- there the worker rebuilds.
+        if self.input_ids is not None and other.input_ids is not None:
+            self.input_ids = torch.cat([self.input_ids, other.input_ids])
+        else:
+            self.input_ids = None
+        # Optional under no-verify-sync; drop the mirror if either side absent.
+        if self.seq_lens_cpu is None or other.seq_lens_cpu is None:
+            self.seq_lens_cpu = None
+        else:
+            self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
+        self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
+        self.mamba_track_mask = None
+        self.mamba_track_seqlens = None
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_prefill_track_mask_cpu = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_mask_next_cpu = None
+        self.mamba_decode_batch_idx_cpu = None
+        self.mamba_lazy_spec_track_positions_cpu = None
+        if self.return_logprob and other.return_logprob:
+            self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
+            self.token_ids_logprobs = self.token_ids_logprobs + other.token_ids_logprobs
+        elif self.return_logprob:
+            self.top_logprobs_nums = self.top_logprobs_nums + [0] * len(other.reqs)
+            self.token_ids_logprobs = self.token_ids_logprobs + [None] * len(other.reqs)
+        elif other.return_logprob:
+            self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
+            self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
+        self.reqs = self.reqs + other.reqs
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs = self.multimodal_inputs + other.multimodal_inputs
+
+        self.return_logprob = self.return_logprob or other.return_logprob
+        self.has_grammar = self.has_grammar or other.has_grammar
+        self.return_hidden_states_mode = max(
+            self.return_hidden_states_mode, other.return_hidden_states_mode
+        )
+        self.return_hidden_states = self.return_hidden_states_mode.need_capture()
+        self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
+
+        if self.spec_info:
+            self.spec_info.merge_batch(other.spec_info)
+
+    def copy(self):
+        # Only contain fields that will be used by process_batch_result.
+        # Shallow-copy the reqs list as a defensive snapshot. filter_batch and
+        # merge_batch historically mutated the list in place; they now rebind
+        # new lists, but the slice stays so this snapshot never aliases the
+        # original.
+        return ScheduleBatch(
+            reqs=self.reqs[:],
+            launched_reqs=self.launched_reqs,
+            chunked_req=self.chunked_req,
+            extend_lens=self.extend_lens,
+            prefix_lens=self.prefix_lens,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            req_pool_indices=self.req_pool_indices,
+            req_pool_indices_cpu=self.req_pool_indices_cpu,
+            model_config=self.model_config,
+            forward_mode=self.forward_mode,
+            out_cache_loc=self.out_cache_loc,
+            return_logprob=self.return_logprob,
+            has_grammar=self.has_grammar,
+            return_hidden_states=self.return_hidden_states,
+            return_hidden_states_mode=self.return_hidden_states_mode,
+            decoding_reqs=self.decoding_reqs,
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
+            dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
+            dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
+            global_num_tokens=self.global_num_tokens,
+            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
+            can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
+            can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
+            dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
+            is_extend_in_batch=self.is_extend_in_batch,
+            is_prefill_only=self.is_prefill_only,
+            seq_lens_cpu=self.seq_lens_cpu,
+            enable_overlap=self.enable_overlap,
+            mamba_track_indices=self.mamba_track_indices,
+            mamba_track_buffer_indices=self.mamba_track_buffer_indices,
+            mamba_track_mask=self.mamba_track_mask,
+            mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
+            mamba_prefill_track_mask_cpu=self.mamba_prefill_track_mask_cpu,
+            mamba_track_mask_cpu=self.mamba_track_mask_cpu,
+            mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
+            mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,
+            mamba_lazy_spec_track_positions_cpu=self.mamba_lazy_spec_track_positions_cpu,
+            dp_cooperation_info=self.dp_cooperation_info,
+            dp_balance_stats=self.dp_balance_stats,
+            prefill_stats=self.prefill_stats,
+            forward_iter=self.forward_iter,
+            launch_ts=self.launch_ts,
+            after_idle_gap=self.after_idle_gap,
+            extend_num_tokens=self.extend_num_tokens,
+        )
+
+    def _window_eviction_trigger(self, eviction_interval: int):
+        """Pick this forward's per-request window eviction trigger, and the
+        interval each window then checks its own cursor against.
+
+        Default: a window evicts only once >= eviction_interval tokens have
+        slid out of it, amortizing eviction work while keeping each request's
+        overshoot within the interval the pool budget reserves; every window
+        gates on its own cursor. Gating on accumulated tokens rather than an
+        iteration-counter phase cannot starve, because seqlen progress is
+        monotonic per KV handle.
+
+        Aiter MegaMoE DSV4 keeps the older forward-interval cadence instead:
+        per-request token gating synchronizes SWA pressure across DP ranks and
+        triggers a retraction / re-prefill storm at high concurrency.
+        """
+        if windows_retire_by_forward():
+            due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
+            return (lambda req: due_this_forward), 1
+        windows = self.tree_cache.window_lengths()
+        return (
+            lambda req: any(
+                req.seqlen - 1 - window
+                >= req.kv.get_evicted_seqlen(sub_pool) + eviction_interval
+                for sub_pool, window in windows
+            )
+        ), eviction_interval
+
+    def maybe_evict_swa(self):
+        if self.tree_cache.supports_swa():
+            retain_window = self.tree_cache.swa_retain_window
+            # With several windows each checks its own cursors and prefix locks.
+            several_windows = len(self.tree_cache.window_sub_pools()) > 1
+
+            release_leaf_lock = envs.SGLANG_OPT_RELEASE_PREFILL_SWA.get() and hasattr(
+                self.tree_cache, "release_swa_prefix_lock"
+            )
+
+            eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+            window_evict_due, window_interval = self._window_eviction_trigger(
+                eviction_interval
+            )
+            self.token_to_kv_pool_allocator.free_group_begin()
+            for idx, req in enumerate(self.reqs):
+                if self.forward_mode.is_decode():
+                    # In overlap scheduler, we cannot evict swa when
+                    # req.decode_batch_idx == 0 since the prev extend batch is
+                    # still running. `_window_eviction_trigger` owns the rest.
+                    if (
+                        req.decode_batch_idx >= 1
+                        and req.kv.holds_kv
+                        and window_evict_due(req)
+                    ):
+                        # Each window rechecks its own cursor against
+                        # ``window_interval``.
+                        self._evict_swa(
+                            req, req.seqlen - 1, eviction_interval=window_interval
+                        )
+
+                    # Past the retain window the request no longer reads its prefill's
+                    # SWA; release that part of the tree lock so SWA LRU can reclaim it.
+                    if release_leaf_lock and (
+                        several_windows or req.decode_batch_idx >= retain_window
+                    ):
+                        self.tree_cache.release_swa_prefix_lock(req)
+                elif (
+                    self.forward_mode.is_extend()
+                    and not self.tree_cache.supports_prefix_sharing()
+                ):
+                    pre_len = self.prefix_lens[idx]
+                    if self.enable_overlap:
+                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                        if req.extend_batch_idx < 2:
+                            continue
+                        else:
+                            pre_len = (
+                                pre_len - get_schedule().chunked_prefill_size
+                                if get_schedule().chunked_prefill_size > 0
+                                else pre_len
+                            )
+                            self._evict_swa(req, pre_len)
+                    else:
+                        self._evict_swa(req, pre_len)
+            self.token_to_kv_pool_allocator.free_group_end()
+
+    def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
+        assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        retire_window(
+            req, pre_len, self.tree_cache, eviction_interval=eviction_interval
+        )
+
+    def __str__(self):
+        return (
+            f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
+            f"#req={(len(self.reqs))})"
+        )
+
+
+class NextBatchPlan(msgspec.Struct):
+    batch_to_run: Optional[ScheduleBatch]
+    running_batch: ScheduleBatch
