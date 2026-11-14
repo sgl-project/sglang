@@ -1,6 +1,6 @@
-"""Host (L2) pools for MXFP8 MHA KV caches.
+"""Host (L2) pool for the MXFP8 block-scaled MHA KV cache.
 
-The FA4 pool stores the fp8 payload in the regular MHA host pool and adds the
+The fp8 payload rides the regular MHA host pool; this subclass adds the
 per-page UE8M0 scale blocks, which the device pool keeps in the FA4
 interleaved layout (num_pages, head, 32, page_size // 32, sf_dim). A page's
 scales are one contiguous block, so they move as whole-page rows of
