@@ -45,6 +45,15 @@ class StateType(str, enum.Enum):
     BLOCK_SCALE_SWA = "block_scale_swa"
 
 
+class AscendStateType(str, enum.Enum):
+    """DSV4-on-NPU PD components without a cross-hardware equivalent."""
+
+    DSV4_C128 = "dsv4_c128"
+    # C4 state (attention + indexer) transfers row by row on A3 and Ascend 950
+    # because the prefill and decode peers may use different SWA-page ring sizes.
+    DSV4_C4_STATE = "dsv4_c4_state"
+
+
 @dataclasses.dataclass
 class KVTransferMetric:
     # Backends that cannot isolate transfer latency can leave this as None.

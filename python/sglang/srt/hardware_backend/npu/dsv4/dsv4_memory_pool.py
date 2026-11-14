@@ -459,6 +459,42 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             [buf[0].nbytes for buf in buffers],
         )
 
+    def get_kv_layer_ids(self) -> List[int]:
+        """Global layer id per main PD buffer, in registration order."""
+        if self.c4_kv_pool is None:
+            return []
+        c4_ids = self.sources_by_ratio.get(4, [])
+        indexer_pool = self._indexer_pool(4)
+        ids: List[int] = []
+        for buffers in (
+            self.c4_kv_pool.kv_buffer,
+            indexer_pool.index_k_buffer,
+            indexer_pool.index_scale_buffer,
+        ):
+            ids.extend(layer_id for _, layer_id in zip(buffers, c4_ids))
+        return ids
+
+    def get_c128_layer_ids(self) -> List[int]:
+        if self.c128_kv_pool is None:
+            return []
+        return list(self.sources_by_ratio.get(128, []))
+
+    def get_c4_state_layer_ids(self) -> List[int]:
+        """Attention state, then indexer state: one id per c4 layer of the stage."""
+        c4_ids = self.sources_by_ratio.get(4, [])
+        ids: List[int] = []
+        for pools in (
+            self.compress_state_pools,
+            self.indexer_compress_state_pools,
+        ):
+            buffers = [pool for pool in pools if pool is not None and pool.ratio == 4]
+            ids.extend(layer_id for _, layer_id in zip(buffers, c4_ids))
+        return ids
+
+    def get_swa_state_layer_ids(self) -> List[int]:
+        """Global layer ids for the SWA KV-only component."""
+        return self.swa_layer_ids()
+
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
         kv+score buffer — the public compressor operator's ``state_cache``

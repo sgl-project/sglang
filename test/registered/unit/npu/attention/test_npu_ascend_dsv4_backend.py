@@ -538,6 +538,8 @@ class TestC4StateTransferLayout(unittest.TestCase):
     def test_a3_swa_component_excludes_whole_c4_rings(self, _):
         for ring_size in (8, 16):
             pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+            pool.sources_by_ratio = {4: [0]}
+            pool.stage_layer_ids = [0]
             swa = torch.empty((4, 128, 1, 8), dtype=torch.bfloat16)
             pool.swa_kv_pool = SimpleNamespace(kv_buffer=[swa])
             pool.compress_state_pools = [
@@ -588,6 +590,8 @@ class TestC4StateTransferLayout(unittest.TestCase):
                 ["swa", "dsv4_c4_state"],
             )
             self.assertEqual(entries.regions["state1"].item_lens, (8192, 2048))
+            self.assertEqual(entries.regions["state0"].layer_ids, (0,))
+            self.assertEqual(entries.regions["state1"].layer_ids, (0, 0))
 
 
 class TestC4IndexerInitialization(unittest.TestCase):

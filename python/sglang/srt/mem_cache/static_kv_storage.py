@@ -866,6 +866,7 @@ class _StaticStateEntries(msgspec.Struct, frozen=True, kw_only=True):
 
 def _static_owner_region(token_to_kv_pool) -> Region:
     """The KV entries a static pool registers."""
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
@@ -880,7 +881,8 @@ def _static_owner_region(token_to_kv_pool) -> Region:
     layer_ids = (
         token_to_kv_pool.get_kv_layer_ids()
         if token_to_kv_pool.layer_router.wrapped_view() is not None
-        or isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        or isinstance(token_to_kv_pool, (MiniMaxM3Nvfp4KVPool, NPUMLATokenToKVPool))
+        or (is_npu() and _is_dsv4_npu(token_to_kv_pool))
         else ()
     )
     return Region(
@@ -909,7 +911,7 @@ def _static_state_entries(
     """A static pool's state entries in the order PD peers register them; a
     draft's state rides in the target's entries where the pool family shares
     them."""
-    from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.disaggregation.base.conn import AscendStateType, StateType
     from sglang.srt.disaggregation.utils import remap_draft_layer_ids
     from sglang.srt.hardware_backend.npu.memory_pool_npu import (
         NPUMHATokenToKVPool,
@@ -1007,11 +1009,15 @@ def _static_state_entries(
                 router.view(IdSpaceKind.SLIDING_WINDOW), MHATokenToKVPool
             ):
                 swa_kv_layout = router.view(IdSpaceKind.SLIDING_WINDOW).kv_cache_layout
+            swa_layer_ids = None
+            if is_npu() and _is_dsv4_npu(token_to_kv_pool):
+                swa_layer_ids = token_to_kv_pool.get_swa_state_layer_ids()
             add(
                 StateType.SWA,
                 data_ptrs,
                 data_lens,
                 item_lens,
+                layer_ids=swa_layer_ids,
                 kv_layout=swa_kv_layout,
                 # Read when asked, as the window's view was: not every pool
                 # with window state keeps a window pool of its own.
@@ -1184,8 +1190,6 @@ def _static_state_entries(
                     add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
 
     if is_npu() and _is_dsv4_npu(token_to_kv_pool):
-        from sglang.srt.disaggregation.ascend.conn import AscendStateType
-
         c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
         if c128_ptrs:
             add(
@@ -1193,6 +1197,7 @@ def _static_state_entries(
                 c128_ptrs,
                 c128_lens,
                 c128_item_lens,
+                layer_ids=token_to_kv_pool.get_c128_layer_ids(),
             )
 
         # Register C4 state by row on both A3 and Ascend 950 so prefill and
@@ -1204,6 +1209,7 @@ def _static_state_entries(
                 c4_ptrs,
                 c4_lens,
                 c4_item_lens,
+                layer_ids=token_to_kv_pool.get_c4_state_layer_ids(),
             )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same

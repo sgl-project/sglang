@@ -15,7 +15,12 @@ import numpy.typing as npt
 import torch
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    AscendStateType,
+    KVArgs,
+    KVPoll,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
@@ -2200,6 +2205,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
+            AscendStateType.DSV4_C128,
+            AscendStateType.DSV4_C4_STATE,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
@@ -2211,6 +2218,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DRAFT_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
+            AscendStateType.DSV4_C128,
+            AscendStateType.DSV4_C4_STATE,
         )
 
     def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):

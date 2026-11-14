@@ -1,5 +1,4 @@
 import concurrent.futures
-import enum
 import logging
 from typing import List, Optional, Tuple
 
@@ -7,7 +6,7 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
-from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.base.conn import AscendStateType, StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
@@ -20,15 +19,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
-
-
-class AscendStateType(str, enum.Enum):
-    """DSV4-on-NPU PD components without a cross-hardware equivalent."""
-
-    DSV4_C128 = "dsv4_c128"
-    # Ascend 950 C4 state (attention + indexer) transfers row by row because
-    # the prefill and decode peers may use different SWA-page ring sizes.
-    DSV4_C4_STATE = "dsv4_c4_state"
 
 
 _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
