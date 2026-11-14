@@ -117,10 +117,15 @@ class Gemma3MLP(nn.Module):
         self.act_fn = GeluAndMul()
         self.prefix = prefix
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, output_tensor: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """``output_tensor``: optional caller-owned storage for down_proj's result."""
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        # pass output_tensor only when given: LoRA-wrapped layers do not take it
+        kwargs = {} if output_tensor is None else {"output_tensor": output_tensor}
+        x, _ = self.down_proj(x, **kwargs)
         return x
 
 

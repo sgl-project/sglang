@@ -1480,6 +1480,33 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, x, bias=bias)
 
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the linear into the caller-owned ``output`` (RowParallelLinear's
+        ``output_tensor``). Schemes with ``apply_weights_into`` may write it
+        directly; the others compute normally and copy."""
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        # layer.output_size, not weight.shape[0]: per-tensor / per-channel FP8
+        # transpose the weight to [K, N] after loading
+        rows = (x[0] if isinstance(x, tuple) else x).shape[:-1]
+        expected = (*rows, layer.output_size)
+        if output.shape != expected:
+            raise ValueError(
+                f"caller-owned linear output has shape {tuple(output.shape)}, "
+                f"expected {expected}"
+            )
+        apply_weights_into = getattr(scheme, "apply_weights_into", None)
+        if apply_weights_into is not None:
+            return apply_weights_into(layer, x, output, bias=bias)
+        return output.copy_(scheme.apply_weights(layer, x, bias=bias))
+
 
 class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quantization_config: CompressedTensorsConfig):
