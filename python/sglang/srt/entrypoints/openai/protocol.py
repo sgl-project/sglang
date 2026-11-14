@@ -2655,6 +2655,7 @@ class MessageProcessingResult:
         Callable[[], Optional[ToolCallConstraint]]
     ] = None
     uses_response_template: bool = False
+    ngram_corpus_seeds: Optional[List[List[int]]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

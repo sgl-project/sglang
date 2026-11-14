@@ -264,6 +264,21 @@ class TestNgramCorpusSqueeze(CustomTestCase):
         self.assertIn(2003, ids_list, "Recent sequence should still be matchable")
 
 
+class TestNgramCorpusSeeding(CustomTestCase):
+    """Request corpus seeds are inserted before any output exists and must be
+    drafted from their own prefix; parameterless tool calls render to very
+    short seeds."""
+
+    def test_seed_prefix_drafts_the_rest_of_the_seed(self):
+        corpus = _make_corpus("BFS")
+        seed = [7, 8, 9, 10, 11, 12, 13]
+        corpus.batch_put([seed, [20], [30, 31]])
+        corpus.synchronize()
+
+        ids, _ = _batch_get(corpus, [seed[:2]])
+        self.assertEqual(ids.tolist()[:6], [8, 9, 10, 11, 12, 13])
+
+
 class TestNgramCorpusLeafPaths(CustomTestCase):
     """Verify the leaf_paths_from_mask utility."""
 
