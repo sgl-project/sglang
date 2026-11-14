@@ -630,7 +630,9 @@ def test_padded_prefix_replays_one_graph_across_prompt_lengths(
                     kwargs["timestep"].fill_(timestep)
                     expected = model(**kwargs)
                     padded = stage._bcg_pad_prompt_kwargs(kwargs, current_model=model)
-                    torch.testing.assert_close(model(**padded), expected, atol=0, rtol=0)
+                    torch.testing.assert_close(
+                        model(**padded), expected, atol=0, rtol=0
+                    )
                     actual = stage._bcg_run(runner, kwargs, model)
                     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
             packed = weakref.ref(padded["prefix_kv"])
