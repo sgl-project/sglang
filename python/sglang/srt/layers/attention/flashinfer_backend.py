@@ -1135,6 +1135,14 @@ class FlashInferAttnBackend(AttentionBackend):
             return None, None
         return layer.k_scale, layer.v_scale
 
+    def _kv_read_scales(self, layer: RadixAttention, q: torch.Tensor) -> dict:
+        # The pool divides K/V by the layer's KV-cache scales only when it casts
+        # them to another dtype (e.g. FP8); a cache in q's dtype is unscaled.
+        if layer.k_scale_float is None or self.flashinfer_kv_cache_dtype == q.dtype:
+            return {}
+        # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+        return {"k_scale": layer.k_scale_float, "v_scale": layer.v_scale_float}
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if is_cp_active(forward_batch):
             self._init_forward_metadata_cp(forward_batch)
@@ -1626,9 +1634,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 window_left=paged_window_left,
                 logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+                **self._kv_read_scales(layer, q),
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
@@ -1690,9 +1696,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     window_left=paged_window_left,
                     logits_soft_cap=logits_soft_cap,
-                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                    k_scale=layer.k_scale_float,
-                    v_scale=layer.v_scale_float,
+                    **self._kv_read_scales(layer, q),
                 )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
@@ -1767,9 +1771,7 @@ class FlashInferAttnBackend(AttentionBackend):
             kv_cache,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
+            **self._kv_read_scales(layer, q),
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

@@ -271,6 +271,7 @@ class TritonAttnBackend(AttentionBackend):
         # verify degrades linearly with prefix length.
         self.use_verify_splitkv = (_is_cuda or is_gfx95_supported()) and self.topk == 1
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
         # GQA with exactly one TP-local KV head.
         self.use_verify_shared_kv = _should_use_verify_shared_kv(
@@ -1700,6 +1701,16 @@ class TritonAttnBackend(AttentionBackend):
             return output, lse
         return output
 
+    def _kv_descales(self, layer: RadixAttention, q: torch.Tensor):
+        # The pool divides K/V by the layer's KV-cache scales only when it casts
+        # them to another dtype (e.g. FP8), so a cache in q's dtype is unscaled.
+        # The MLA path divides K by its scale itself before storing it.
+        if layer.k_scale is None or layer.v_scale is None:
+            return 1.0, 1.0
+        if not self.use_mla and self.kv_cache_dtype == q.dtype:
+            return 1.0, 1.0
+        return layer.k_scale_float, layer.v_scale_float
+
     def _set_kv_buffer(
         self,
         forward_batch: ForwardBatch,
@@ -1946,12 +1957,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
-        if layer.k_scale is not None and layer.v_scale is not None:
-            k_descale = layer.k_scale_float
-            v_descale = layer.v_scale_float
-        else:
-            k_descale = 1.0
-            v_descale = 1.0
+        k_descale, v_descale = self._kv_descales(layer, q)
 
         if (
             self.use_verify_gfx115
@@ -2161,12 +2167,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices = self.forward_metadata.kv_indices
         max_extend_len = self.forward_metadata.max_extend_len
 
-        if layer.k_scale is not None and layer.v_scale is not None:
-            k_descale = layer.k_scale_float
-            v_descale = layer.v_scale_float
-        else:
-            k_descale = 1.0
-            v_descale = 1.0
+        k_descale, v_descale = self._kv_descales(layer, q)
 
         k_buffer = self.kv_layers.read(layer.layer_id).key()
         v_buffer = self.kv_layers.read(layer.layer_id).value()
@@ -2389,12 +2390,7 @@ class TritonAttnBackend(AttentionBackend):
         # Convert prefix_lens to int32 for the kernel
         prefix_lens = prefix_lens.to(torch.int32)
 
-        if layer.k_scale is not None and layer.v_scale is not None:
-            k_descale = layer.k_scale_float
-            v_descale = layer.v_scale_float
-        else:
-            k_descale = 1.0
-            v_descale = 1.0
+        k_descale, v_descale = self._kv_descales(layer, q)
 
         # Call unified kernel
         self.extend_attention_fwd_unified(
@@ -2501,12 +2497,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
-        if layer.k_scale is not None and layer.v_scale is not None:
-            k_descale = layer.k_scale_float
-            v_descale = layer.v_scale_float
-        else:
-            k_descale = 1.0
-            v_descale = 1.0
+        k_descale, v_descale = self._kv_descales(layer, q)
 
         # Select the correctly-sized attn_logits buffer for this layer.
         # The triton kernel's // Lv stride trick requires attn_logits.shape[-1]
