@@ -659,6 +659,19 @@ class TokenizerControlMixin:
 
         return success, message
 
+    def _validate_dynamic_lora_supported(self: TokenizerManager) -> None:
+        # Each tokenizer worker keeps its own LoRA registry; dynamic updates
+        # are not synchronized across workers (issue #31084).
+        if get_serving().tokenizer_worker_num > 1:
+            raise ValueError(
+                "Dynamic LoRA updates are not supported with "
+                "--tokenizer-worker-num > 1: each tokenizer worker keeps its "
+                "own LoRA registry and dynamic updates are not synchronized "
+                "across workers (https://github.com/sgl-project/sglang/issues/31084). "
+                "Launch with --tokenizer-worker-num 1, or preload adapters at "
+                "startup via --lora-paths."
+            )
+
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -696,6 +709,8 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
+
+            self._validate_dynamic_lora_supported()
 
             assert get_parallel().dp_size == 1, (
                 "data-parallel replicas are not supported for dynamic lora loading"
@@ -782,6 +797,8 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
+
+            self._validate_dynamic_lora_supported()
 
             assert get_parallel().dp_size == 1, (
                 "data-parallel replicas are not supported for dynamic lora loading"
@@ -872,6 +889,8 @@ class TokenizerControlMixin:
             assert obj.lora_name is not None, (
                 "lora_name must be provided to unload LoRA adapter"
             )
+
+            self._validate_dynamic_lora_supported()
 
             assert get_parallel().dp_size == 1, (
                 "data-parallel replicas are not supported for dynamic lora loading"
