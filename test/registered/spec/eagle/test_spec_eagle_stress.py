@@ -17,7 +17,7 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=440, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestEagle3Perf(Eagle3Base, SpecPerfKit):
@@ -35,6 +35,9 @@ class TestEagleLlama2Retract(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
         (envs.SGLANG_TEST_RETRACT, True),
         (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
     )
+    # Forced retract every few steps; 100 nodes still retract hundreds of times.
+    radix_num_nodes = 100
+    radix_seed = 0
 
 
 class TestEagle3Topk16V2Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
@@ -51,6 +54,9 @@ class TestEagle3Topk16V2Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
         (envs.SGLANG_TEST_RETRACT, True),
         (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
     )
+    # Forced retract every few steps; 100 nodes still retract hundreds of times.
+    radix_num_nodes = 100
+    radix_seed = 0
 
 
 if __name__ == "__main__":

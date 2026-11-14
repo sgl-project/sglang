@@ -26,6 +26,11 @@ logger = init_logger(__name__)
 
 # Built-in diffusion model overlay registry.
 BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
+    "tencent/Hy-Nomas": {
+        "overlay_repo_id": "Niehen6174/Hy-Nomas-overlay",
+        "overlay_revision": "14088cc131c66fb7265cefbf99276428ccd5a957",
+        "source_revision": "dea948068220d1037f1d1c10b95b6793d92bee28",
+    },
     "Lightricks/LTX-2.3": {
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
         "overlay_revision": "e0cc94f279ec16bb87c230134d40319f6ce40c5e",
@@ -57,6 +62,11 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_repo_id": "Niehen6174/FastH3-Omni-overlay",
         "overlay_revision": "953ede55daf20a70cc6f0b59464293e2f408608c",
         "source_revision": "53e0d26a1691aa473b6262d8196a8feb2c297df0",
+    },
+    "Pika-Labs/Pika-H3-Flex": {
+        "overlay_repo_id": "Niehen6174/Pika-H3-Flex-overlay",
+        "overlay_revision": "2d8d5e4d81d2ad0ba4b0bbcf7049231bfbe3e9c2",
+        "source_revision": "3ff166447d5edb1406107ab8370c42000ce173e4",
     },
 }
 
@@ -175,6 +185,20 @@ def resolve_model_overlay_target(
                 return source_model_id, spec
 
     return None
+
+
+def is_model_overlay(model_name_or_path: str) -> bool:
+    """A registered overlay source id, or a local overlay dir (no network).
+
+    Unlike ``resolve_model_overlay_target``, a local dir is not matched to a
+    registered source by its basename: only its own overlay manifest counts.
+    """
+    if resolve_model_overlay(model_name_or_path) is not None:
+        return True
+    return (
+        os.path.isdir(model_name_or_path)
+        and load_overlay_manifest_if_present(model_name_or_path) is not None
+    )
 
 
 def load_overlay_manifest_if_present(overlay_dir: str) -> dict[str, Any] | None:

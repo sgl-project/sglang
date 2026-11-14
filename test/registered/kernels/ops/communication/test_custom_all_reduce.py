@@ -36,6 +36,7 @@ from sglang.kernels.ops.communication.all_reduce import (
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+    choose_algo,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -220,14 +221,15 @@ def _check_custom_all_reduce(
 ) -> None:
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    comm.override_algo = algo
+    comm.forced_algo = algo
 
     if use_graph:
         graph = torch.cuda.CUDAGraph()
         graph_inp = torch.zeros((TEST_LAYERS, size), dtype=dtype, device=device)
         outs: list[torch.Tensor] = []
         with comm.capture():
-            with torch.cuda.graph(graph):
+            # the reference NCCL group's watchdog thread queries events meanwhile
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 for i in range(TEST_LAYERS):
                     outs.append(comm.custom_all_reduce(graph_inp[i]))
                 out_jit_stack = torch.stack(outs)
@@ -277,11 +279,11 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
     """Without an override, eager calls launch the tuned algorithm (cached per size)."""
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
-    comm.override_algo = None
+    comm.forced_algo = None
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
     nbytes = inp[0].numel() * inp.element_size()
-    tuned = comm._pick_config(nbytes, False) is not None
+    tuned = choose_algo(comm.config, nbytes, can_use_graph=False) is not None
     assert comm.should_custom_ar(inp[0]) == tuned
     if not tuned:
         return
@@ -298,7 +300,7 @@ def test_custom_all_reduce_eager_plan_follows_config() -> None:
     """The cached eager launch is rebuilt when the config object is replaced."""
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
-    comm.override_algo = None
+    comm.forced_algo = None
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     inp = torch.randint(0, 16, (TEST_LAYERS, 1024), dtype=torch.bfloat16, device=device)
     assert comm.should_custom_ar(inp[0])  # cached under the tuned config
@@ -309,6 +311,7 @@ def test_custom_all_reduce_eager_plan_follows_config() -> None:
             one_shot_pull_threshold=0,
             two_shot_pull_threshold=0,
             mc=tuned.eager.mc._replace(min_bytes=0, max_bytes=0),
+            two_shot_push_threshold=0,
         )
         comm.config = tuned._replace(eager=eager)
         assert not comm.should_custom_ar(inp[0])

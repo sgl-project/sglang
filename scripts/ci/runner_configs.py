@@ -4,7 +4,7 @@ runner_configs.py <runner_config>
     Per-field `key=value` lines (install / artifact_version /
     install_timeout / rdma_devices). `runs_on` is intentionally omitted —
     it carries the `$b200_runner` sentinel and is resolved via --map.
-    Called per stage by _pr-test-stage.yml.
+    Called per stage by _pr-test-stage.yml and _diffusion-pr-test-stage.yml.
 
 runner_configs.py --map <b200_runner_label>
     `runs_on_map={json}` — flat dict {runner_config: runs_on}, with

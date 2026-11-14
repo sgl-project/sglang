@@ -64,14 +64,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-fmt)
 
-# Triton kernel
-FetchContent_Declare(
-    repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.8.0.tar.gz
-    URL_HASH SHA256=d50981f98bf61a5ce21d2a0c6ac067c20b7f741acf3bee4b8370edc3b63fd337
-)
-FetchContent_Populate(repo-triton)
-
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
@@ -79,14 +71,6 @@ FetchContent_Declare(
     URL_HASH SHA256=931dfd118f4b6de8c7d98702153c7c03840139170af21a07607693bd9749744d
 )
 FetchContent_Populate(repo-flashinfer)
-
-# flash-attention
-FetchContent_Declare(
-    repo-flash-attention
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/f89bc2306632d1ec5f97b014dded4254f5b4a907.tar.gz
-    URL_HASH SHA256=418b5681584dc3efff496a1cab5ffd58d2728d89dcfe0ea16e6985d6ef35c68c
-)
-FetchContent_Populate(repo-flash-attention)
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -107,12 +91,13 @@ endif()
 
 option(ENABLE_BELOW_SM90 "Enable gencode below SM90" ${DEFAULT_ENABLE_BELOW_SM90})
 
-set(DEFAULT_SGL_KERNEL_ENABLE_FA3 OFF)
+# sm_90a gencode for the common ops; off by default on aarch64.
+set(DEFAULT_SGL_KERNEL_ENABLE_SM90A OFF)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-    message(STATUS "For aarch64, disable FA3 by default")
+    message(STATUS "For aarch64, disable SM90A by default")
 endif()
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-    set(DEFAULT_SGL_KERNEL_ENABLE_FA3 ON)
+    set(DEFAULT_SGL_KERNEL_ENABLE_SM90A ON)
 endif()
 
 include_directories(
@@ -175,9 +160,7 @@ list(APPEND SGL_KERNEL_CUDA_FLAGS
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
-option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SGL_KERNEL_ENABLE_FA3})
-option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
-option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
+option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            ${DEFAULT_SGL_KERNEL_ENABLE_SM90A})
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
 if (SGL_KERNEL_ENABLE_BF16)
@@ -241,7 +224,7 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_SM90A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
@@ -308,7 +291,6 @@ set(INCLUDES
     ${repo-flashinfer_SOURCE_DIR}/csrc
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
-    ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
 # =========================== Common SM90 Build ============================= #
@@ -358,122 +340,16 @@ endif()
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
-# sparse flash attention
-target_compile_definitions(common_ops_sm90_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
-target_compile_definitions(common_ops_sm100_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
-
 # Install to different subdirectories
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
-# ============================ Optional Install: FA3 ============================= #
-# set flash-attention sources file
-# Now FA3 support sm80/sm86/sm90
-if (SGL_KERNEL_ENABLE_FA3)
-    set(SGL_FLASH_KERNEL_CUDA_FLAGS
-        "-DNDEBUG"
-        "-DOPERATOR_NAMESPACE=sgl-kernel"
-        "-O3"
-        "-Xcompiler"
-        "-fPIC"
-        "-gencode=arch=compute_90a,code=sm_90a"
-        "-std=c++${SGL_KERNEL_CXX_STANDARD}"
-        "-DCUTE_USE_PACKED_TUPLE=1"
-        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
-        "-DCUTLASS_VERSIONS_GENERATED"
-        "-DCUTLASS_TEST_LEVEL=0"
-        "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
-        "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
-        "-DCUTLASS_ENABLE_GDC_FOR_SM90"  # For PDL
-        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"  # Necessary for the WGMMA shapes that we use
-        "--expt-relaxed-constexpr"
-        "--expt-extended-lambda"
-        "--use_fast_math"
-        "-Xcompiler=-Wconversion"
-        "-Xcompiler=-fno-strict-aliasing"
-    )
-
-    if (ENABLE_BELOW_SM90)
-        list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_80,code=sm_80"
-            "-gencode=arch=compute_86,code=sm_86"
-        )
-        # SM8X Logic
-        file(GLOB FA3_SM8X_GEN_SRCS
-            "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim*_sm80.cu")
-    endif()
-
-    file(GLOB FA3_BF16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_bf16*_sm90.cu")
-    file(GLOB FA3_BF16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
-    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
-
-    # FP16 source files - use individual hdim files instead of hdimall to avoid ptxas crash
-    file(GLOB FA3_FP16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_fp16*_sm90.cu")
-    file(GLOB FA3_FP16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
-    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
-
-    # FP8 source files
-    file(GLOB FA3_FP8_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_e4m3*_sm90.cu")
-    file(GLOB FA3_FP8_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
-    list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
-
-    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
-
-    set(FLASH_SOURCES
-        "csrc/flash_extension.cc"
-        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
-        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
-        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
-        "${FA3_GEN_SRCS}"
-    )
-
-    Python_add_library(flash_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FLASH_SOURCES})
-
-    target_compile_options(flash_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_FLASH_KERNEL_CUDA_FLAGS}>)
-    target_include_directories(flash_ops PRIVATE
-        ${repo-cutlass_SOURCE_DIR}/include
-        ${repo-cutlass_SOURCE_DIR}/tools/util/include
-        ${repo-flash-attention_SOURCE_DIR}/hopper
-    )
-    target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
-
-    install(TARGETS flash_ops LIBRARY DESTINATION "sgl_kernel")
-    set(FLASH_OPS_COMPILE_DEFS
-        FLASHATTENTION_DISABLE_BACKWARD
-        FLASHATTENTION_DISABLE_DROPOUT
-        FLASHATTENTION_DISABLE_UNEVEN_K
-        FLASHATTENTION_VARLEN_ONLY
-    )
-
-    if(NOT ENABLE_BELOW_SM90)
-        list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)
-    endif()
-    if(NOT SGL_KERNEL_ENABLE_FA3_SPARSE_MASK)
-        list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SPARSE_MASK)
-    endif()
-    target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
-endif()
-
 # ===================== InfLLM-V2 FlashAttention backend ===================== #
 # Standalone pybind extension `infllm_ops`, vendored from
 # 3rdparty/infllmv2_cuda_impl. Kept as its own module so its `flash::` symbols
-# stay isolated from sgl-kernel's own flash attention. Mirrors the original
+# stay isolated from sgl-kernel's other extension modules. Mirrors the original
 # setup.py: only hdim 64/128 bf16 forward instantiations are compiled (the
 # vendored static_switch.h forces bf16 and dispatches headdim to {64, 128}
 # only). Backward kernels are intentionally omitted because SGLang only uses
@@ -531,23 +407,3 @@ target_include_directories(infllm_ops PRIVATE
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
 target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} c10 cuda)
 install(TARGETS infllm_ops LIBRARY DESTINATION "sgl_kernel")
-
-# Build spatial_ops as a separate, optional extension for green contexts
-set(SPATIAL_SOURCES
-    "csrc/spatial/greenctx_stream.cu"
-    "csrc/spatial_extension.cc"
-)
-
-Python_add_library(spatial_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
-target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
-install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
-
-# ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
-
-# ============================ Extra Install: triton kernels ============================= #
-install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
-        DESTINATION "triton_kernels"
-        PATTERN ".git*" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)
