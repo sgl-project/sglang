@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from fnmatch import fnmatch
 import os
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from sglang.srt.connector import BaseConnector
+from sglang.srt.connector.base_connector import BaseConnector
 
 
 def parse_model_name(url: str) -> str:
@@ -28,8 +29,18 @@ def pull_files_from_db(
     files = connector.list(prefix)
 
     for file in files:
-        destination_file = os.path.join(local_dir, file.removeprefix(prefix))
-        local_dir = Path(destination_file).parent
-        os.makedirs(local_dir, exist_ok=True)
+        rel_path = file.removeprefix(prefix).lstrip("/")
+        if not rel_path:
+            continue
+        if allow_pattern is not None and not any(
+            fnmatch(rel_path, pattern) for pattern in allow_pattern
+        ):
+            continue
+        if ignore_pattern is not None and any(
+            fnmatch(rel_path, pattern) for pattern in ignore_pattern
+        ):
+            continue
+        destination_file = os.path.join(local_dir, rel_path)
+        os.makedirs(Path(destination_file).parent, exist_ok=True)
         with open(destination_file, "wb") as f:
             f.write(connector.getstr(file).encode("utf-8"))
