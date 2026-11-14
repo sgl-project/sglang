@@ -1680,6 +1680,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                max_top_logprobs_num=get_disagg().disaggregation_max_top_logprobs_num,
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
@@ -1722,6 +1723,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                max_top_logprobs_num=get_disagg().disaggregation_max_top_logprobs_num,
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
@@ -3506,12 +3508,28 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            and req.return_logprob
+            and req.logprob.top_logprobs_num
+            > get_disagg().disaggregation_max_top_logprobs_num
+        ):
+            self._reject_bad_request(
+                req,
+                f"top_logprobs_num {req.logprob.top_logprobs_num} exceeds "
+                "disaggregation metadata capacity "
+                f"{get_disagg().disaggregation_max_top_logprobs_num}. Lower "
+                "top_logprobs_num or raise --disaggregation-max-top-logprobs-num "
+                "on prefill and decode.",
+            )
+            return
+
         if req.return_sampling_mask:
             if (
                 self.disaggregation_mode != DisaggregationMode.NULL
                 and not self.disagg_metadata_buffers.enable_sampling_mask
             ):
-                self._reject_sampling_mask_request(
+                self._reject_bad_request(
                     req,
                     "return_sampling_mask requires "
                     "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
@@ -3527,13 +3545,13 @@ class Scheduler(
                     f"{top_k}. Lower top_k or increase "
                     "--sampling-mask-max-tokens."
                 )
-                self._reject_sampling_mask_request(req, error_msg)
+                self._reject_bad_request(req, error_msg)
                 return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
             if error_msg is not None:
-                self._reject_sampling_mask_request(req, error_msg)
+                self._reject_bad_request(req, error_msg)
                 return
 
         # Handle multimodal inputs
@@ -3853,8 +3871,8 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
-    def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
-        """Return a sampling-mask validation error without running the model."""
+    def _reject_bad_request(self, req: Req, error_msg: str) -> None:
+        """Return a validation error as a 400 without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.request_retirer.retire_unadmitted(req)

@@ -39,6 +39,9 @@ pub trait Runnable: Send + 'static {
     fn run(self);
 }
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 /// Live runtime. Held by the pyo3 bridge; the Python boundary reads the `to_scheduler_rx` channel,
 /// and write to `from_scheduler_tx` channel. `request_shutdown` (also run on `Drop`) stops every stage.
 pub struct Runtime {
@@ -184,6 +187,11 @@ impl Runtime {
     /// none is left in flight. `force` closes them without waiting.
     pub fn begin_drain(&self, force: bool) {
         self.core.begin_drain(force);
+    }
+
+    /// Python's `--warmups` finished (see [`CoreHandle::finish_custom_warmups`]).
+    pub fn finish_custom_warmups(&self) {
+        self.core.finish_custom_warmups();
     }
 
     /// Whether a drain has begun and every listener has since closed, its
@@ -533,9 +541,13 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             metrics,
             request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args)?,
             generate_validator: cfg.generate_validator.clone(),
+            abort_hook: cfg.abort_hook.clone(),
         },
     );
     core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
+    if cfg.server_args.custom_warmups_pending {
+        core.hold_for_custom_warmups();
+    }
 
     // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
     let listeners_closed = Arc::new(AtomicBool::new(false));
@@ -685,6 +697,7 @@ mod tests {
             server_args: Arc::new(test_server_args()),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         }
     }
@@ -1223,6 +1236,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         // Bind is synchronous in `start`, so the port is already accepting.
@@ -1373,6 +1387,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
@@ -1450,6 +1465,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
@@ -1858,6 +1874,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         let err = match start(cfg, None) {
@@ -1955,6 +1972,31 @@ mod tests {
         }
         rt.request_shutdown();
         assert_eq!(rt.wait_startup_failure(), None);
+    }
+
+    /// With `custom_warmups_pending`, the server is not serving and freezes no
+    /// garbage collector until Python reports its `--warmups` finished, as
+    /// Python freezes only after them, with or without a startup warmup.
+    #[test]
+    fn custom_warmups_hold_health_and_the_gc_freeze() {
+        let (http_addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            custom_warmups_pending: true,
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        assert!(rt.core.is_ready(), "the startup warmup is skipped");
+        assert!(!rt.core.is_serving());
+        assert!(
+            !rt.to_scheduler_rx
+                .wait(std::time::Duration::from_millis(200)),
+            "froze GC before the custom warmups finished"
+        );
+        rt.finish_custom_warmups();
+        assert!(rt.core.is_serving());
+        take_startup_freeze_gc(&rt);
+        rt.request_shutdown();
     }
 
     /// End to end over the configured socket: the generated api.v1 client
@@ -2180,5 +2222,75 @@ mod tests {
         );
         assert!(std::net::TcpStream::connect(http_addr).is_err());
         assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// Every abort by rid reaches the package's abort hook, from each entry:
+    /// `/abort_request`, an abort another DP rank's listener relays
+    /// (`/internal/peer`), and the gRPC `Abort`. An `abort_all` or an empty
+    /// rid names no request, and does not.
+    #[test]
+    fn every_abort_by_rid_reaches_the_abort_hook() {
+        use crate::message::ids::Rid;
+        use crate::message::io_struct::{AbortReq, ControlRequest};
+        use std::io::Write;
+
+        #[derive(Debug, Default)]
+        struct Named(Mutex<Vec<String>>);
+        impl crate::AbortHook for Named {
+            fn named_abort(&self, rid: &str) {
+                self.0.lock().unwrap().push(rid.to_owned());
+            }
+        }
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let named = Arc::new(Named::default());
+        let cfg = RuntimeConfig {
+            abort_hook: Some(named.clone()),
+            ..test_config(http_addr, Some(grpc_addr))
+        };
+        let rt = start(cfg, None).expect("start runtime");
+        for body in [
+            r#"{"rid":"http"}"#,
+            r#"{"rid":""}"#,
+            r#"{"rid":"all","abort_all":true}"#,
+        ] {
+            let response = read_response(send_http(http_addr, "POST", "/abort_request", body));
+            assert!(response.starts_with("HTTP/1.1 200"), "{body}: {response}");
+        }
+        for abort in [
+            AbortReq::new("relayed".into(), false),
+            AbortReq::new(Rid::new().to_string(), true),
+        ] {
+            let body = ControlRequest::AbortReq(abort).encode().unwrap();
+            let mut conn = std::net::TcpStream::connect(http_addr).unwrap();
+            write!(
+                conn,
+                "POST /internal/peer HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            conn.write_all(&body).unwrap();
+            // The reply body is msgpack.
+            let mut response = Vec::new();
+            std::io::Read::read_to_end(&mut conn, &mut response).unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+        }
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            for (rid, abort_all) in [("grpc", false), ("", true)] {
+                let request = proto::AbortRequest {
+                    rid: rid.into(),
+                    abort_all,
+                };
+                client.abort(request).await.expect("Abort RPC");
+            }
+        });
+        assert_eq!(*named.0.lock().unwrap(), ["http", "relayed", "grpc"]);
+        rt.request_shutdown();
     }
 }
