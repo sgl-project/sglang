@@ -214,7 +214,8 @@ class TestPLEStateCoordinates(unittest.TestCase):
                     get_mamba_indices=lambda rows: mapping[rows],
                 )
                 reader = SimpleNamespace(
-                    state_ids=lambda _: SimpleNamespace(ids=lambda indices: indices)
+                    state_ids=lambda _: SimpleNamespace(ids=lambda indices: indices),
+                    request_ids=lambda: SimpleNamespace(ids=lambda rows: rows),
                 )
                 backend = AscendMambaAttnBackendBase(
                     SimpleNamespace(

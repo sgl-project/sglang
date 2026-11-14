@@ -5,10 +5,10 @@ server. Integrated mode keeps ComfyUI's CLIP / VAE / sampler loop and uses
 SGLang only as a per-step DiT forward.
 
 Integrated mode no longer ships dedicated `comfyui_*` pipelines. It starts the
-native Flux / Qwen-Image / Z-Image / MiniMax-H3 pipeline under `--comfyui-mode`,
-loads a single-file ComfyUI `.safetensors` (or GGUF overlay) through a
-checkpoint spec, and translates each `apply_model` call through a small
-per-model adapter.
+native Flux / Qwen-Image / Qwen-Image-2.1 / Z-Image / LTX-2 / MiniMax-H3
+pipeline with `comfyui_mode` set, loads a single-file ComfyUI `.safetensors`
+(or GGUF overlay) through a checkpoint spec, and translates each `apply_model`
+call through a small per-model adapter.
 
 ## Installation
 
@@ -127,12 +127,18 @@ Take **Integrated Mode** only when the model denoises a single latent tensor
 that ComfyUI already knows how to build and decode, so its KSampler can drive
 the loop unchanged. Each model then needs:
 
-- `runtime/pipelines/comfyui_<model>_pipeline.py` mapping ComfyUI's
-  single-file checkpoint layout onto the native module tree (350-690 lines in
-  the existing three)
-- an executor in `executors/` adapting latent layout and conditioning to `Req`
-- entries in both `pipeline_class_dict` and `executor_class_dict` in
-  `core/generator.py`
+- a checkpoint spec module in `runtime/loader/comfyui_checkpoints/<model>.py`
+  mapping ComfyUI's single-file checkpoint layout onto the native module tree,
+  imported in that package's `__init__.py` so it registers
+- a `ComfyUIModelAdapter` subclass (setting `model_types` and
+  `pipeline_class_name`) and an `SGLDiffusionExecutor` subclass in `executors/`
+  adapting latent layout and conditioning to `Req`
+- the executor class added to `_load_executor_classes()` in
+  `core/generator.py`, which builds `pipeline_class_dict` and
+  `executor_class_dict` automatically
+
+The native pipeline runs under `comfyui_mode` (override `create_comfyui_stages`
+if needed). Do not add a `comfyui_*` pipeline class.
 
 ## Example Workflows
 
@@ -150,6 +156,43 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).
 
 For other workflows supporting the models, you can easily use SGLang by replacing the official `UNET Loader` node with the `SGLDUNETLoader` node. Similarly, for LoRA support, replace the official LoRA loader with the `SGLDiffusion LoRA Loader`.
+
+### Converting a workflow
+
+An offline converter makes those swaps and lists what is left to do by hand. It
+reads a UI or API workflow JSON and needs neither ComfyUI nor a GPU:
+
+```bash
+python -m sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.convert my_workflow.json
+# writes my_workflow_sgld.json and the report my_workflow_sgld.md;
+# -o picks the output path, -o - prints the workflow (report on stderr)
+```
+
+It changes, also inside subgraphs:
+
+- `UNETLoader` / `UnetLoaderGGUF` with an H3 / Qwen-Image / Z-Image / FLUX.1
+  file -> `SGLDUNETLoader`. Other models (e.g. an LTX or Wan stage) stay on
+  ComfyUI.
+- `LoraLoaderModelOnly` and `LoraLoader` whose MODEL comes from an SGLD loader ->
+  `SGLDiffusion LoRA Loader`. That node applies only the diffusion-model half of
+  a LoRA: for `LoraLoader`, the nodes that used its CLIP output are wired to its
+  CLIP input, so the LoRA's text-encoder half is dropped (the report lists each).
+
+The report also lists what it does not convert:
+
+- **Speed-only patch nodes** on the SGLD model (SageAttention patches such as
+  `PathchSageAttentionKJ`, `ModelAttentionBackend`, TeaCache / EasyCache and
+  other step caches, Sol / sparse attention, `TorchCompileModel`). The DiT runs
+  in the SGLD worker, so remove or bypass them and set the equivalent in
+  `SGLDiffusion Options`: `attention_backend` (e.g. `sage_attention2`),
+  `cache_mode` (e.g. `cache_dit` on H3), `execution_mode` (`torch_compile`).
+  The report names every MODEL -> MODEL node on the SGLD model except
+  `ModelSampling*`.
+- **LoRA stack nodes** (rgthree Power Lora Loader, AusBoss, LoraManager): replace
+  them with chained `SGLDiffusion LoRA Loader` nodes, one per LoRA.
+
+Without conversion, a stock LoRA or patch node on an SGLD model fails at run time
+with an error that names the converter.
 
 To use these workflows:
 1. Open ComfyUI.
@@ -207,7 +250,7 @@ flowchart LR
     R0 -->|otherwise| PYO["Original SP / CFG / TP<br/>broadcast_pyobj"]
     NCCL --> PIPE
     PYO --> PIPE
-    PIPE["Native pipeline<br/>--comfyui-mode"]
+    PIPE["Native pipeline<br/>comfyui_mode"]
     SPEC["Checkpoint spec<br/>single .safetensors"] --> PIPE
     PIPE --> STAGE["Latent prep + session cache<br/>+ DenoisingStage"]
   end
@@ -220,7 +263,7 @@ Per sampler step:
 
 1. The adapter turns ComfyUI `apply_model` tensors into an SGLang `Req`.
 2. Local ZMQ pickle replaces CUDA tensors with IPC handles so latents stay on GPU.
-3. Rank 0 materializes the handles. Multi-rank `--comfyui-mode` then detaches CUDA tensors and broadcasts them over NCCL; the general SP / CFG / TP path is still the original whole-list `broadcast_pyobj`.
+3. Rank 0 materializes the handles. Multi-rank `comfyui_mode` then detaches CUDA tensors and broadcasts them over NCCL; the general SP / CFG / TP path is still the original whole-list `broadcast_pyobj`.
 4. The worker pipeline is the native model class with modules trimmed to `transformer` + pass-through scheduler. A single-file checkpoint goes through `comfyui_checkpoints`. After the first step, conditioning stays in a worker session; later steps send latents and the timestep.
 
 Adding a model means a checkpoint spec plus a `ComfyUIModelAdapter`. There is no extra ComfyUI pipeline class.

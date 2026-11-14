@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -95,7 +96,10 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
+    PLE_FILE_PREFETCH_MIN_ROWS,
+    advise_rows_willneed,
     allocate_ple_host_table,
+    device_faults_pageable_pages,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
@@ -1027,6 +1031,18 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
+        # ... and only there does a prefill-sized gather read its rows on the host, on a
+        # GPU that faults each row's page through the driver (see _gathers_on_host).
+        table_path = getattr(host_table, "_sglang_ple_file_path", None)
+        self._stages_on_host = (
+            table_path is not None
+            and torch.cuda.is_available()
+            and device_faults_pageable_pages(torch.cuda.current_device())
+        )
+        # The host copy advises its rows' pages through this descriptor first.
+        self._table_fd = (
+            os.open(table_path, os.O_RDONLY) if self._stages_on_host else None
+        )
         # ... and only it needs its resident set bounded: a fault maps a whole
         # folio, so the mapping would otherwise creep towards the full table.
         self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
@@ -1073,23 +1089,65 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
-            if self._file_prefetcher is not None:
+            table, ids = self.weight, flat_ids
+            vocab_start = self.shard_indices.org_vocab_start_index
+            vocab_end = self.shard_indices.org_vocab_end_index
+            if self._gathers_on_host(flat_ids):
+                table, ids = self._stage_rows(flat_ids, vocab_start, vocab_end)
+                vocab_start, vocab_end = 0, table.shape[0]
+            elif self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
-                    flat_ids,
-                    vocab_start=self.shard_indices.org_vocab_start_index,
-                    vocab_end=self.shard_indices.org_vocab_end_index,
+                    flat_ids, vocab_start=vocab_start, vocab_end=vocab_end
                 )
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
-                flat_ids,
+                table.data_ptr(),
+                ids,
                 output,
                 embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                tp_vocab_start=vocab_start,
+                tp_vocab_end=vocab_end,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
                 BLOCK_D=self._block_d,
             )
         return output
+
+    def _gathers_on_host(self, flat_ids: torch.Tensor) -> bool:
+        """A prefill-sized gather from the file-backed table reads its rows on the host when
+        the GPU faults pageable pages through the driver (HMM): from the kernel, every row
+        whose page the GPU has not mapped is a fault served one at a time, ~0.5 ms per page,
+        seconds per prefill chunk. A GPU that reads through the host's page tables (GB10),
+        decode-sized gathers and captured ones stay in the kernel."""
+        return (
+            self._stages_on_host
+            and flat_ids.is_cuda
+            and flat_ids.numel() >= PLE_FILE_PREFETCH_MIN_ROWS
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _stage_rows(self, flat_ids: torch.Tensor, vocab_start: int, vocab_end: int):
+        """This rank's distinct rows of ``flat_ids``, read from the table on the host into
+        pinned memory and copied to the device in one transfer, and the ids remapped into
+        them (-1 outside the shard). The kernel then converts the staged rows exactly as it
+        converts the table's."""
+        ids = flat_ids.cpu()  # a prefill chunk's ids: one sync, as the page hint takes
+        in_range = (ids >= vocab_start) & (ids < vocab_end)
+        rows, inverse = torch.unique(ids[in_range] - vocab_start, return_inverse=True)
+        if rows.numel() == 0:
+            # The kernel reads row 0 for an id outside the shard before zeroing it.
+            rows = torch.zeros(1, dtype=torch.int64)
+        # [rows, row bytes], whatever the dtype.
+        table = self.weight.data.view(torch.uint8)
+        # The copy below runs on one thread: queue every cold row's read first.
+        advise_rows_willneed(self._table_fd, rows, table.shape[1])
+        staged = torch.empty(
+            (rows.numel(), table.shape[1]), dtype=torch.uint8, pin_memory=True
+        )
+        torch.index_select(table, 0, rows, out=staged)
+        local = torch.full(ids.shape, -1, dtype=torch.int64)
+        local[in_range] = inverse
+        device = flat_ids.device
+        staged = staged.to(device, non_blocking=True).view(self.weight.dtype)
+        return staged, local.pin_memory().to(device, non_blocking=True)
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:

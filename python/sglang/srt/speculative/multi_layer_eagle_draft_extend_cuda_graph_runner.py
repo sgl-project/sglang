@@ -963,9 +963,6 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     def get_runner(self, step):
         return self.runners[step]
 
-    def get_last_runner(self):
-        return self.runners[-1] if self.runners else None
-
     def can_run_graph(self, forward_batch):
         return self.runners[0].can_run_graph(forward_batch)
 

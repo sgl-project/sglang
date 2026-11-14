@@ -236,6 +236,8 @@ def _batch(num_tokens, req_rows):
 
 
 def _verify(backend, layers, batch, inputs):
+    # The ring rows the verify resolves; on static pools, the request rows.
+    backend.forward_metadata.replayssm_ring_indices = batch.req_pool_indices
     return [
         backend.forward_extend(layer, batch, mixed_qkv, a, b)
         for layer, (mixed_qkv, a, b) in zip(layers, inputs)
@@ -710,6 +712,8 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         ]
         graph_arm = self._replayssm(template)
         graph_backend = graph_arm.backend(qsl, static_cache)
+        # The captured ring rows: the request rows, refilled in place per replay.
+        graph_backend.forward_metadata.replayssm_ring_indices = static_rows
         capture_batch = _batch(num_tokens, static_rows)
 
         def run():
@@ -823,6 +827,54 @@ class TestGDNReplaySSMSpecCursors(CustomTestCase):
             expected,
         ):
             self.assertEqual(actual.tolist(), want.tolist(), name)
+
+    def test_entry_cursors_advance_like_contiguous_ones(self):
+        """Cursors that sit one per unit inside larger entries, as unified memory
+        lays them out, advance as their own arrays do."""
+        rows, entry_bytes, spec_len = 16, 64, 3
+        torch.manual_seed(0)
+        write_pos = torch.randint(0, 6, (rows,), dtype=torch.int32, device="cuda")
+        cache_base = torch.randint(0, RING, (rows,), dtype=torch.int32, device="cuda")
+        is_flush = torch.randint(0, 2, (rows,), dtype=torch.int8, device="cuda")
+        raw = torch.full((rows * entry_bytes,), 0x5A, dtype=torch.uint8, device="cuda")
+        # The three cursors at byte offsets 0, 4 and 8 of every entry.
+        ints = raw.view(torch.int32)
+        entry = (
+            torch.as_strided(ints, (rows,), (entry_bytes // 4,), 0),
+            torch.as_strided(ints, (rows,), (entry_bytes // 4,), 1),
+            torch.as_strided(raw.view(torch.int8), (rows,), (entry_bytes,), 8),
+        )
+        for dst, src in zip(entry, (write_pos, cache_base, is_flush)):
+            dst.copy_(src)
+        untouched = raw.clone()
+        replay_rows = torch.tensor([3, 0, 11, 7, 15], dtype=torch.int64, device="cuda")
+        accepted = torch.randint(
+            1, spec_len + 2, (replay_rows.numel(),), dtype=torch.int32, device="cuda"
+        )
+        for cursors in ((write_pos, cache_base, is_flush), entry):
+            commit_gdn_replayssm_spec(
+                *cursors,
+                num_accepted=accepted,
+                replay_indices=replay_rows,
+                # Every row has a live state slot, so every cursor advances.
+                state_batch_indices=torch.arange(
+                    replay_rows.numel(), dtype=torch.int64, device="cuda"
+                ),
+                max_cache_len=RING,
+                max_spec_len=spec_len,
+                null_block_id=-1,
+            )
+        for got, want in zip(entry, (write_pos, cache_base, is_flush)):
+            torch.testing.assert_close(got, want)
+        # Bytes beyond the cursors stay as they were.
+        mask = torch.ones_like(raw, dtype=torch.bool).view(rows, entry_bytes)
+        mask[:, :9] = False
+        self.assertTrue(
+            torch.equal(
+                raw.view(rows, entry_bytes)[mask],
+                untouched.view(rows, entry_bytes)[mask],
+            )
+        )
 
 
 if __name__ == "__main__":
