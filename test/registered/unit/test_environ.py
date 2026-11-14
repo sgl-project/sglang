@@ -59,6 +59,13 @@ RENAMED_NV_MEGA_RUNTIME_CHILDREN = {
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP": "SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
 }
 
+RENAMED_ENVS = {
+    **RENAMED_NV_MEGA_RUNTIME_CHILDREN,
+    # The Kimi-K3 cookbook still sets these old ROCm names.
+    "SGLANG_OPT_HIP_K3_AITER": "SGLANG_AITER_K3_OPT",
+    "SGLANG_OPT_HIP_K3_RADIX4_TOPK": "SGLANG_K3_RADIX4_TOPK",
+}
+
 
 class TestEnvField(unittest.TestCase):
     def setUp(self):
@@ -212,7 +219,7 @@ class TestRenamedEnvAliases(unittest.TestCase):
     def test_former_name_applies_with_a_visible_warning(self):
         """The warning must reach users: a DeprecationWarning raised from library
         code is filtered out by Python's default warning filters."""
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
+        for new, old in RENAMED_ENVS.items():
             with self.subTest(new=new):
                 field, value, deprecations = self._read(new, {old: "1"})
                 self.assertEqual(field.deprecated_name, old)
@@ -221,7 +228,7 @@ class TestRenamedEnvAliases(unittest.TestCase):
                 self.assertIn(new, str(deprecations[0].message))
 
     def test_new_name_wins_over_former_name(self):
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
+        for new, old in RENAMED_ENVS.items():
             with self.subTest(new=new):
                 _, value, deprecations = self._read(new, {old: "1", new: "0"})
                 self.assertIs(value, False)

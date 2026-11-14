@@ -153,7 +153,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu
-from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
+from sglang.srt.utils.common import BumpAllocator
 from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
 if TYPE_CHECKING:
@@ -166,7 +166,7 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_k3_opt = envs.SGLANG_OPT_HIP_K3_AITER.get()
 
 # (n, k) -> ((m_lo, m_hi, tactic), ...); tactic None = the ladder pick.
 _K3_TGV_M_RANGES = {
