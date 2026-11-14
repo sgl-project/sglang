@@ -606,6 +606,19 @@ class DPShutdownVoteSent:
         self.value = False
 
 
+def _fence_world_gather(model_runner: ModelRunner) -> None:
+    """Queue the WORLD gather behind the previous forward. It runs on the device
+    backend from the scheduler's stream, and must not share the GPU with that
+    forward's a2a kernels, whose blocks wait on each other and on peers. A rank
+    with no result to read back (an idle one) reaches this gather first."""
+    forward_stream = getattr(model_runner, "forward_stream", None)
+    if forward_stream is None:
+        return
+    current = torch.get_device_module(model_runner.device).current_stream()
+    if current != forward_stream:
+        current.wait_stream(forward_stream)
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -741,6 +754,8 @@ def prepare_mlp_sync_batch_raw(
     if num_dp_ranks == 1:
         mlp_sync_info.finalize_local()
     elif not skip_all_gather:
+        if use_world_group:
+            _fence_world_gather(model_runner)
         mlp_sync_info.all_gather(
             device=device,
             group=group,
