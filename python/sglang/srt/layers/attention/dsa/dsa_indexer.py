@@ -1611,8 +1611,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if batch_size == 0:
                 return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
             if batch_size <= self.sm_count or (
-                envs.SGLANG_DSA_FULL_BATCH_MQA.get()
-                and dcp_size > 1
+                dcp_size > 1
                 and chunk_next_n <= 8
                 and batch_size <= 1024
                 and torch.cuda.get_device_capability(q.device)[0] == 10

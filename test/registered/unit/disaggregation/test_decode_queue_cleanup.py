@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -431,6 +432,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
             return queue.req_to_token_pool.req_to_token[1, : len(req.origin_input_ids)]
 
         queue._pre_alloc = MagicMock(side_effect=pre_alloc)
+        queue.draft_kv_ring = None
         queue.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(4)
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=1,
@@ -519,6 +521,77 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertFalse(decode_req.awaiting_publish)
         self.assertEqual(queue._pending_publish, [])
         self.assertFalse(queue.has_published_destinations)
+
+    def test_draft_ring_floor_resets_only_for_a_fake_transfer(self):
+        def acquire(reqs):
+            reqs[0].kv.req_pool_idx = 1
+            return [1]
+
+        self.storage.acquire = acquire
+        for host, resets in (("10.0.0.1", False), (FAKE_BOOTSTRAP_HOST, True)):
+            with self.subTest(host=host):
+                decode_req = self._decode_req(_PollingReceiver())
+                decode_req.req.bootstrap_host = host
+                queue = self._deferring_queue([decode_req])
+                queue.draft_kv_ring = MagicMock()
+                # The real _pre_alloc, over a stubbed allocation.
+                queue._pre_alloc = DecodePreallocQueue._pre_alloc.__get__(queue)
+                queue._required_alloc_tokens = MagicMock(return_value=5)
+                queue._window_tails = MagicMock(return_value={})
+                queue._budgets_count_from_zero = MagicMock(return_value=False)
+                queue._alloc_for_decode_prealloc = MagicMock(
+                    return_value=torch.arange(8, 13)
+                )
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue),
+                    ([decode_req], []),
+                )
+                if resets:
+                    queue.draft_kv_ring.reset_floor.assert_called_once_with(1, 5)
+                else:
+                    queue.draft_kv_ring.reset_floor.assert_not_called()
+
+    def test_draft_ring_floor_resets_for_a_resumed_request(self):
+        req = FakeReq(
+            rid="r",
+            is_retracted=True,
+            origin_input_ids=[0] * 7,
+            output_ids=[1, 2, 3],
+            kv=SimpleNamespace(req_pool_idx=3),
+        )
+        queue = object.__new__(DecodePreallocQueue)
+        queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
+        move([req], queue.retracted_queue)
+        queue.req_to_token_pool = SimpleNamespace(available_size=lambda: 4)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(state=None)
+        queue.tree_cache = None
+        queue.scheduler = SimpleNamespace(enable_overlap=False)
+        queue._uses_swa_reservation = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=4096)
+        queue._prealloc_required = MagicMock(return_value=(1, {}))
+        queue._pending_state_slots = MagicMock(return_value=0)
+        queue._prealloc_demand = MagicMock(return_value=1)
+        queue._admit_preallocation = MagicMock(return_value=True)
+        queue._pre_alloc = MagicMock()
+        queue.draft_kv_ring = MagicMock()
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ensure_mamba_capacity",
+                return_value=True,
+            ),
+            patch("sglang.srt.disaggregation.decode.restore_kv_cache"),
+            patch(
+                "sglang.srt.disaggregation.decode.get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_retraction_backup="cpu_tensor"
+                ),
+            ),
+        ):
+            self.assertEqual(
+                queue.move_resumed(IndexedReqList(ListKind.WAITING)), [req]
+            )
+        # Prompt plus all outputs but the pending decode input.
+        queue.draft_kv_ring.reset_floor.assert_called_once_with(3, 9)
 
     def test_deferred_publish_waits_for_a_page_move_since_its_allocation(self):
         """A page move between the allocation and the deferred publish rebinds

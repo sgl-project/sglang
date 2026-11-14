@@ -56,13 +56,15 @@ def warn_unverified_short_edge(short_edge: int) -> None:
 # The distilled checkpoint has exactly one positive denoise branch.
 MINIMAX_H3_DEFAULT_BRANCHES: tuple = ({"name": "cond_1"},)
 
-# Audited 4xH200 T2VA Cache-DiT parameters for quality="high":
-# (warmup steps, residual-difference threshold, max consecutive cached steps).
-# Measured SSIM 0.931 / PSNR 28.16 dB against quality="exact" on the
-# validated workload. quality="exact" (the default) uses no Cache-DiT
-# configuration at all. Process-wide SGLANG_CACHE_DIT_* environment controls
-# remain available for manual experiments and are independent of this field.
-MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG: tuple[int, float, int] = (4, 0.04, 1)
+# quality="high" Cache-DiT schedule audited on 4xH200 T2VA, as phases of
+# (first step, end step, period): the last step of each period runs the DiT
+# stack, the others reuse its residual, and steps outside the phases always run;
+# measured SSIM 0.911 / PSNR 29.09 dB against quality="lossless", and reusing
+# before step 15 changes the layout of the sample
+MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_PHASES: tuple[tuple[int, int, int], ...] = (
+    (15, 25, 2),
+    (25, 50, 8),
+)
 
 # Supported reference-image resize policies for Ref2VA. All modes preserve the
 # source aspect ratio, avoid cropping, and independently round the resolved width

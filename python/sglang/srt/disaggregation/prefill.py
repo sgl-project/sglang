@@ -109,7 +109,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
 
@@ -119,6 +118,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 logger = logging.getLogger(__name__)
 
@@ -281,10 +281,12 @@ class PrefillBootstrapQueue:
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         transfer_backend: TransferBackend,
+        draft_kv_ring: Optional[DFlashDraftKVRing],
     ):
         parallel = get_parallel()
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.draft_kv_ring = draft_kv_ring
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -340,12 +342,8 @@ class PrefillBootstrapQueue:
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.kv_checksum_signature = kv_layout_signature(kv_args)
-            self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=torch.device(f"cuda:{get_device().gpu_id}"),
-                kv_data_ptrs=kv_args.kv_data_ptrs,
-                kv_item_lens=kv_args.kv_item_lens,
-                state_data_ptrs=kv_args.state_data_ptrs,
-                state_item_lens=kv_args.state_item_lens,
+            self.scheduler.kv_checksum_computer = KvChecksumComputer.for_kv_args(
+                kv_args, torch.device(f"cuda:{get_device().gpu_id}")
             )
         else:
             self.scheduler.kv_checksum_computer = None
@@ -455,6 +453,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
+            draft_kv_ring=self.draft_kv_ring,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -1867,7 +1866,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _draft_ring_payload():
-                ring = get_draft_kv_ring()
+                ring = self.disagg_prefill_bootstrap_queue.draft_kv_ring
                 if ring is None:
                     return None
                 return ring.transfer_rows(int(req.kv.req_pool_idx), seq_len)

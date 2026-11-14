@@ -2129,6 +2129,37 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
                 validate_hisparse(server_args)
 
+    def _validate_hisparse_with_spec(self, algorithm):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            speculative_algorithm=algorithm,
+            speculative_eagle_topk=1,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.hisparse_hook.model_config_of",
+                return_value=model_config,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+        ):
+            validate_hisparse(server_args)
+
+    def test_hisparse_accepts_dflash_speculation(self):
+        self._validate_hisparse_with_spec("DFLASH")
+
+    def test_hisparse_rejects_unvalidated_speculation(self):
+        with self.assertRaisesRegex(ValueError, "has not validated"):
+            self._validate_hisparse_with_spec("NGRAM")
+
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force

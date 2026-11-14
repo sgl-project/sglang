@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops import diffusion as diffusion_kernels
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site import (
@@ -60,6 +61,7 @@ _JOY_QKV_CAT = BitExactFusionGate(
     "Joy image/text QKV concatenation", per_signature=True
 )
 _JOY_IMAGE_QK_ROPE = BitExactFusionGate("Joy strided image QK RoPE", per_signature=True)
+_JOY_RESIDUAL_GATE = BitExactFusionGate("Joy image residual gate", per_signature=True)
 
 
 def _joy_image_qk_rope(
@@ -195,22 +197,37 @@ def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
 def fused_add_gate(
     residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
-    """Fused residual addition with gate.
+    """Preserve addcmul's FP32 product before the final cast."""
+    gate = gate.unsqueeze(1)
 
-    Computes: residual + x * gate.unsqueeze(1)
+    def reference():
+        return torch.addcmul(residual, x, gate)
 
-    This fuses the gate multiplication and residual addition to reduce
-    intermediate tensor allocations and memory bandwidth.
-
-    Args:
-        residual (torch.Tensor): The residual tensor to add to. Shape: (B, L, D)
-        x (torch.Tensor): The input tensor to be gated. Shape: (B, L, D)
-        gate (torch.Tensor): The gate tensor. Shape: (B, D)
-
-    Returns:
-        torch.Tensor: residual + x * gate.unsqueeze(1)
-    """
-    return torch.addcmul(residual, x, gate.unsqueeze(1))
+    # Keep small text updates on the faster native path.
+    if (
+        torch.compiler.is_compiling()
+        or torch.is_grad_enabled()
+        or not residual.is_cuda
+        or not current_arch().is_sm(10, 3)
+        or residual.numel() < 16 * 1024 * 1024
+        or residual.ndim != 3
+        or residual.shape != x.shape
+        or residual.dtype != torch.bfloat16
+        or x.dtype != residual.dtype
+        or gate.dtype != residual.dtype
+        or x.device != residual.device
+        or gate.device != residual.device
+        or not residual.is_contiguous()
+        or not x.is_contiguous()
+        or gate.shape != (residual.shape[0], 1, residual.shape[2])
+    ):
+        return reference()
+    return _JOY_RESIDUAL_GATE.run(
+        lambda: diffusion_kernels.residual_gate_fp32(residual, x, gate),
+        reference,
+        sig=(residual.device, residual.shape, gate.stride()),
+        logger=logger,
+    )
 
 
 def _joy_complex_freqs(freqs_cis: Optional[torch.Tensor]) -> Optional[torch.Tensor]:

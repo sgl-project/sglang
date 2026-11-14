@@ -44,7 +44,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
@@ -841,15 +840,10 @@ class TestDcpStorage(unittest.TestCase):
             "file_kda",
             "mooncake_kda",
             "wrong_pool",
-            "file_indexer",
-            "mooncake_indexer",
-            "replicated_indexer",
-            "draft_indexer",
         ):
             host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
             host.kv_buffer = None if case == "dummy" else object()
             host.layout = "page_first"
-            host.size = 1024
             if case == "split":
                 host.layout = "page_first_kv_split"
             cc = HiCacheController.__new__(HiCacheController)
@@ -868,26 +862,8 @@ class TestDcpStorage(unittest.TestCase):
                         else MambaPoolHost.__new__(MambaPoolHost),
                     )
                 )
-            if case.endswith("indexer"):
-                indexer = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
-                indexer.dcp_size, indexer.size = host.dcp_size, host.size
-                entries.append(
-                    SimpleNamespace(
-                        name=PoolName.DRAFT_INDEXER
-                        if case == "draft_indexer"
-                        else PoolName.INDEXER,
-                        host_pool=indexer,
-                    )
-                )
             cc.mem_pool_host = SimpleNamespace(entries=entries)
-            accepted = case in (
-                "file",
-                "mooncake",
-                "file_kda",
-                "mooncake_kda",
-                "file_indexer",
-                "mooncake_indexer",
-            )
+            accepted = case in ("file", "mooncake", "file_kda", "mooncake_kda")
             cc._stop_storage_threads = mock.Mock(
                 side_effect=RuntimeError("past validation") if accepted else None
             )
@@ -902,10 +878,6 @@ class TestDcpStorage(unittest.TestCase):
                 mock.patch(
                     "sglang.srt.managers.cache_controller.get_parallel",
                     return_value=SimpleNamespace(attn_dcp_size=2),
-                ),
-                mock.patch(
-                    "sglang.srt.layers.dcp.layout.dsa_shards_index_k",
-                    return_value=case != "replicated_indexer",
                 ),
                 self.assertRaisesRegex(RuntimeError, "previous detach")
                 if accepted

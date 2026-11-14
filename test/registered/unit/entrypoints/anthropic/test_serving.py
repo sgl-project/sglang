@@ -907,12 +907,17 @@ class TestAnthropicServing(unittest.TestCase):
             f"expected unenforced-budget warning: {log.output}",
         )
 
+    def test_request_thinking_enabled_without_budget_tokens_is_accepted(self):
+        serving = self._serving()
+        request = self._anthropic_request(thinking={"type": "enabled"}, stream=False)
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+
     def test_request_thinking_shape_violations_are_rejected(self):
         """Each SDK thinking variant's field rules (``thinking_config_*_param.py``)."""
         from pydantic import ValidationError
 
         for thinking, field in [
-            ({"type": "enabled"}, "budget_tokens"),
             ({"type": "enabled", "budget_tokens": 512}, "1024"),
             ({"type": "disabled", "display": "omitted"}, "display"),
             ({"type": "disabled", "budget_tokens": 2048}, "budget_tokens"),

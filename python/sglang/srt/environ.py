@@ -660,10 +660,10 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
-    # --enable-kv-cache-sharding: register single-node prefix gather scratch
-    # as NCCL symmetric memory and request copy engines on its dedicated
-    # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
-    # The engine defaults NCCL cuMem on for eligible single-node deployments.
+    # --enable-kv-cache-sharding: allocate single-node prefix gather scratch
+    # with PyTorch symmetric memory and gather it on copy engines through its
+    # CUDA multicast mapping (MulticastAllGather). Without multicast the
+    # gather stays an NCCL allgather.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
@@ -1817,18 +1817,15 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
+    # startup to off where it does not fit.
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
     # Disable the compact-slot SWA window lookup for compact MLA drafts; off by default.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
-    # Keep an all-sliding-window MLA DFLASH draft's KV in a per-request ring of
-    # window + verify-block rows instead of one row per target slot. On by default;
-    # resolved at startup to off for drafts or backends it does not fit.
-    SGLANG_DFLASH_DRAFT_KV_RING = EnvBool(True)
     # Gather DFLASH candidate top-k in one multicast all-gather.
     SGLANG_OPT_DFLASH_FUSED_CANDIDATE_AG = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
-    # Compute a draft block's ring locs in one Triton launch; off by default.
-    SGLANG_OPT_DFLASH_RING_LOCS_FUSED = EnvBool(False)
     # Capture the DFLASH aux append (draft KV) as CUDA graphs.
     SGLANG_DFLASH_AUX_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
@@ -1839,10 +1836,6 @@ class Envs:
     )
     # Replay the DFLASH aux graph on a side stream over the draft prep.
     SGLANG_OPT_DFLASH_AUX_OVERLAP = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
-    )
-    # Skip the SWA draft's LSE and zero-KV fixup when DCP is off.
-    SGLANG_OPT_DFLASH_SWA_SKIP_LSE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
     # Defer the TP gather of an unsoftcapped target-verify vocab shard; off by default.
@@ -2308,9 +2301,6 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
-    # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
-    # (0.2.3 does); set to 0 for an older DeepGEMM.
-    SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
     # Prefill indexer: bf16 instead of fp32 MQA logits, read by a bf16 top-k.
     SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
@@ -2351,9 +2341,6 @@ class Envs:
     # ===================================================================
     # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
     SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
-    # Use the experimental FlyDSL split-K paged GQA kernel for Muse Spark's
-    # short-window decode layers on gfx950.
-    SGLANG_ROCM_MUSE_FLYDSL_DECODE = EnvBool(False)
     # Muse Spark on MI355X (gfx950): AgentX fast paths, all on by default. Each
     # variable is the off-switch of one optimization; the paths are shape-gated, so
     # they only engage on the Muse Spark shapes they were measured on.
@@ -2367,6 +2354,10 @@ class Envs:
     # That FP8 extend on the gfx950 Gluon kernel (P kept in registers between the two MFMAs) instead of aiter's
     # unified 2D kernel.
     SGLANG_ROCM_MUSE_EXTEND_GLUON = EnvBool(True)
+    # Sliding layers on that Gluon kernel too (its 2047-token window variant, FP8 Q), 1.6x the aiter 2D kernel.
+    SGLANG_ROCM_MUSE_EXTEND_SWA_GLUON = EnvBool(True)
+    # Full-layer FP8 extend on the FlyDSL kernel; =0 keeps the Gluon kernel there.
+    SGLANG_ROCM_MUSE_EXTEND_FLYDSL = EnvBool(True)
     # Spec-v2 decode without the per-step seq_lens_cpu D2H (the aiter Muse verify path reads GPU lengths only).
     SGLANG_ROCM_MUSE_SYNC_FREE_VERIFY = EnvBool(True)
     # Target verify: merge the split-KV attention partials inside the output norm-gate kernel (one launch for both).
@@ -2376,11 +2367,12 @@ class Envs:
     # Target verify full layers on the FlyDSL kernel (exact BF16, 4.75 TB/s at TP4 n8) when flydsl is importable;
     # =0 keeps the Triton pair kernel (SGLANG_ROCM_MUSE_VERIFY_FULL_V2 / _FP8).
     SGLANG_ROCM_MUSE_VERIFY_FLYDSL = EnvBool(True)
-    # aiter patch 05 tiles: long-prefill 2D config, unmasked interior 2D tiles,
-    # 64-row verify tiles with an exact q-block grid and 256 split-KV segments.
-    SGLANG_ROCM_MUSE_PREFILL_2D_TILES = EnvBool(True)
-    SGLANG_ROCM_MUSE_UNMASKED_INTERIOR = EnvBool(True)
-    SGLANG_ROCM_MUSE_VERIFY_BM64 = EnvBool(True)
+    # That FlyDSL full-layer verify with a length-balanced split-KV work list (equal KV chunks per program instead of
+    # equal splits per request), from 4 requests at 4 KV heads per rank and 8 at 2.
+    SGLANG_ROCM_MUSE_VERIFY_BALANCED = EnvBool(True)
+    # Sliding-layer verify on the FlyDSL kernel (fixed splits over the window), from 16 requests at 4 KV heads per
+    # rank and 48 at 2; Triton below.
+    SGLANG_ROCM_MUSE_VERIFY_SWA_FLYDSL = EnvBool(True)
     # Verify kernels: sliding layers split-KV (<= 8 requests) / GQA-folded
     # (> 8); full layers two-KV-head kernel, else GQA-folded from 8 requests.
     SGLANG_ROCM_MUSE_VERIFY_SWA_SPLITKV = EnvBool(True)
@@ -2421,6 +2413,10 @@ class Envs:
     # and joint router/pooler projections.
     SGLANG_ROCM_MUSE_FUSED_QKV_CACHE = EnvBool(True)
     SGLANG_ROCM_MUSE_QK_ROPE_CACHE = EnvBool(True)
+    # Row cap of the fused QK norm / RoPE / cache-write kernel (one program per row and Q head, no limit of its own).
+    SGLANG_ROCM_MUSE_QK_ROPE_CACHE_MAX_ROWS = EnvInt(512)
+    # Row cap of the joint router + pooler GEMM; above 64 rows only the joint form (BM 128 row-major tile) serves.
+    SGLANG_ROCM_MUSE_JOINT_ROUTER_MAX_ROWS = EnvInt(128)
     SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
     SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY = EnvBool(True)
     SGLANG_ROCM_MUSE_A4W4_MOE = EnvBool(True)
@@ -2432,7 +2428,7 @@ class Envs:
     # Ulysses all-to-alls in row chunks on a side stream, overlapped with the chunks' QKV / O projections
     # (needs SGLANG_ROCM_MUSE_ULYSSES_LOCAL_GATE).
     SGLANG_ROCM_MUSE_ULYSSES_PIPELINE = EnvBool(True)
-    # TP4 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
+    # TP4 / TP8 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
     # FlyDSL finalize + aiter two-stage all-reduce).
     SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH = EnvBool(True)
     SGLANG_ROCM_MUSE_DENSE_TUNED = EnvBool(True)

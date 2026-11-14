@@ -348,6 +348,37 @@ def test_fused_qk_norm_rope_and_modulate_cast_are_bitwise_exact():
 
 @pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
 @torch.inference_mode()
+def test_mean_square_fusion_preserves_compiled_rope_and_camera_fallback():
+    from sglang.multimodal_gen.runtime.models.dits import nomas_layers as layers
+
+    for dim in (128, 64):
+        x = torch.randn(1, 2000, 3, 16, dim, device="cuda", dtype=torch.bfloat16)[
+            :, :, 1
+        ]
+        norm = layers.RMSNorm(dim).cuda().bfloat16()
+        norm.weight.normal_(1, 0.1)
+        angles = torch.randn(2000, dim, device="cuda")
+        freqs = (angles.cos(), angles.sin())
+        cos, sin = layers._rope_tables(x, freqs)
+        expected = layers._compiled_norm_rotate()(
+            x,
+            x.float().square().mean(-1, keepdim=True),
+            norm.eps,
+            norm.weight,
+            cos,
+            sin,
+            torch.bfloat16,
+        )
+        assert torch.equal(
+            layers.rms_norm_rotate(norm, x, freqs, torch.bfloat16), expected
+        )
+        if dim == 128:
+            assert layers._MEAN_SQUARE.is_verified((x.shape, x.stride(), x.device))
+            assert not layers._MEAN_SQUARE.disabled
+
+
+@pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
+@torch.inference_mode()
 def test_pixelumm_fused_norm_and_swiglu_are_bitwise_exact():
     from sglang.multimodal_gen.runtime.models.vaes import nomas as vae
 

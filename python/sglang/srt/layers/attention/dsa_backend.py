@@ -3950,19 +3950,19 @@ class DeepseekSparseAttnBackend(
         lse = lse.view(-1, lse.shape[1])[:, :num_q_heads]
         return o, lse
 
-    @staticmethod
     def _dcp_flashmla_sched_meta(
-        q: torch.Tensor, indices: torch.Tensor, topk_length: Optional[torch.Tensor]
+        self,
+        q: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
     ) -> FlashMLASchedMeta:
-        # The schedule depends on topk_length, so it is built per call, by the
-        # DeepSeek-V4 scheduler kernel's windowed schedule (FlashMLA's own walk
-        # over the partitions sits on the critical path for tens of us).
-        from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
+        # Depends on topk_length, so it is built per call; left empty where the
+        # scheduler kernel does not apply, and FlashMLA then schedules itself.
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _maybe_precompute_flashmla_sched_meta,
         )
 
-        sched_meta = get_mla_metadata()[0]
+        sched_meta = self._call_get_mla_metadata()[0]
         _maybe_precompute_flashmla_sched_meta(
             sched_meta,
             q=q,
@@ -4825,6 +4825,13 @@ class DeepseekSparseAttnBackend(
         row_plan: _RowPlan,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         assert self._prims_ts is not None
+        if k_scale != 1.0:
+            # The raw FP8 store casts K/V unscaled (quant_scale_kv=1.0), and
+            # trtllm-gen applies the scale to the logits only.
+            raise ValueError(
+                "--dsa-*-backend prims_ts does not support a checkpoint KV scale "
+                f"(k_scale={k_scale}); the raw FP8 MLA cache is stored unscaled."
+            )
         rows = q_all.shape[0]
         assert q_all.shape[1] == layer.tp_q_head_num
         lengths = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
