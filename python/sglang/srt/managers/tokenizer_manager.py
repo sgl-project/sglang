@@ -503,6 +503,20 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 
 
+def wait_for_schedulers_to_exit() -> None:
+    deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
+    while time.monotonic() < deadline and collect_scheduler_processes():
+        time.sleep(0.1)
+    stragglers = [proc.pid for proc in collect_scheduler_processes()]
+    if stragglers:
+        # SIGKILL here lands mid-release,
+        # which is how GPU memory survives a shutdown. Name the pids.
+        logger.warning(
+            f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
+            f"ShutdownReq, killing them before they released: {stragglers}"
+        )
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -3728,19 +3742,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
-        # Ask schedulers to release resources in userspace and exit (see
-        # ShutdownReq), then wait for them before hard-killing the rest.
-        self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
-        while time.monotonic() < deadline and collect_scheduler_processes():
-            time.sleep(0.1)
-        stragglers = [proc.pid for proc in collect_scheduler_processes()]
-        if stragglers:
-            # SIGKILL here lands mid-release,
-            # which is how GPU memory survives a shutdown. Name the pids.
-            logger.warning(
-                f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
-                f"ShutdownReq, killing them before they released: {stragglers}"
+        if self._subprocess_watchdog is not None or self.tokenizer_ipc_name is None:
+            # Ask schedulers to release resources in userspace and exit (see
+            # ShutdownReq), then wait for them before hard-killing the rest.
+            self._dispatch_to_scheduler(ShutdownReq())
+            wait_for_schedulers_to_exit()
+        else:
+            logger.info(
+                "Drained. The process that launched the schedulers shuts them down."
             )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         if self._server_stop_hook is not None:
