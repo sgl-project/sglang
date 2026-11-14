@@ -3,13 +3,15 @@ import enum
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _ChunkStatus(enum.Enum):
@@ -171,6 +173,63 @@ class TestEngineStateNotifications(CustomTestCase):
 
         self.assertEqual(self.notifications, 1)
         self.assertFalse(handle.health_check())
+
+
+class TestServerInfoSchedulerFields(CustomTestCase):
+    def test_scheduler_info_fields_reach_json_info(self):
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = SimpleNamespace(
+            server_args=ServerArgs(model_path="dummy"), mm_processor=None
+        )
+        handle.scheduler_info = {
+            "max_req_input_len": 1024,
+            "hicache_object_layout": {
+                "enabled": True,
+                "backend": "mooncake",
+                "page_size": 256,
+                "hicache_object_layout": {
+                    "pools": [],
+                    "key_prefix": "deepseek-ai-DeepSeek-V4",
+                },
+            },
+        }
+
+        payload = json.loads(handle.get_server_info())
+
+        self.assertEqual(payload["max_req_input_len"], 1024)
+        self.assertEqual(
+            payload["hicache_object_layout"]["hicache_object_layout"]["key_prefix"],
+            "deepseek-ai-DeepSeek-V4",
+        )
+
+
+class TestServerInfo(CustomTestCase):
+    def test_advertises_each_media_kind_the_processor_places(self):
+        vision = SimpleNamespace(
+            mm_tokens=SimpleNamespace(
+                image_token="<image>", video_token="<video>", audio_token=None
+            )
+        )
+        for mm_processor, features in (
+            (vision, ["image_inputs", "video_inputs"]),
+            (SimpleNamespace(mm_tokens=None), []),
+            (None, []),
+        ):
+            with self.subTest(features=features, mm_processor=mm_processor):
+                handle = RuntimeHandle.__new__(RuntimeHandle)
+                handle.tokenizer_manager = SimpleNamespace(
+                    server_args=None, mm_processor=mm_processor
+                )
+                handle.scheduler_info = {}
+
+                with patch(
+                    "sglang.srt.entrypoints.grpc_bridge.build_server_info",
+                    return_value={"model_path": "model"},
+                ):
+                    info = json.loads(handle.get_server_info())
+
+                self.assertEqual(info["model_path"], "model")
+                self.assertEqual(info["grpc_features"], features)
 
 
 if __name__ == "__main__":

@@ -22,10 +22,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.elementwise.elementwise import (
+from sglang.kernels.ops.activation.gelu_and_mul_triton import gelu_and_mul_triton
+from sglang.kernels.ops.layernorm.fused_rmsnorm import (
     fused_dual_residual_rmsnorm,
     fused_rmsnorm,
-    gelu_and_mul_triton,
 )
 from sglang.kernels.ops.moe.router import fused_moe_router_shim
 from sglang.srt.distributed import (
@@ -44,12 +44,12 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import (
-    RotaryEmbedding,
-    _yarn_find_correction_range,
-    _yarn_get_mscale,
-    get_rope,
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
+from sglang.srt.layers.rotary_embedding.yarn import (
+    yarn_find_correction_range,
+    yarn_get_mscale_simple,
 )
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -59,11 +59,18 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_cpu, is_npu
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
+
+
+if _is_cpu:
+    fused_moe_router_shim = torch.ops.sgl_kernel.fused_moe_router_cpu
+    fused_rmsnorm = torch.ops.sgl_kernel.rmsnorm_cpu
+    fused_dual_residual_rmsnorm = torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu
 
 
 class Grok1MLP(nn.Module):
@@ -102,7 +109,10 @@ class Grok1MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x, _ = gelu_and_mul_triton(gate_up)
+        if _is_cpu:
+            x = torch.ops.sgl_kernel.gelu_and_mul_cpu(gate_up)
+        else:
+            x = gelu_and_mul_triton(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -161,6 +171,7 @@ class Grok1MoE(nn.Module):
             inplace=inplace,
             no_combine=no_combine,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not _is_npu:
@@ -245,7 +256,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         if _is_npu:
             dtype = torch.float32
         # Get n-d magnitude scaling corrected for interpolation
-        self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
+        self.mscale = float(yarn_get_mscale_simple(self.scaling_factor) * attn_factor)
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -257,7 +268,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
-        low, high = _yarn_find_correction_range(
+        low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
             self.rotary_dim,
@@ -352,7 +363,7 @@ class Grok1Attention(nn.Module):
         self.rope_theta = rope_theta
         rope_scaling = get_rope_scaling(config)
         self.load_presharded_attn = load_presharded_attn
-        self.alt_stream = alt_stream or torch.cuda.Stream()
+        self.alt_stream = None if _is_cpu else (alt_stream or torch.cuda.Stream())
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -468,7 +479,7 @@ class Grok1DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.residual_moe = getattr(config, "residual_moe", False)
         self.layer_id = layer_id
-        self.alt_stream = alt_stream or torch.cuda.Stream()
+        self.alt_stream = None if _is_cpu else (alt_stream or torch.cuda.Stream())
 
         rope_theta = getattr(config, "rope_theta", None)
         if rope_theta is None:
@@ -555,9 +566,6 @@ class Grok1DecoderLayer(nn.Module):
         deferred_norm: Optional[RMSNorm] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, RMSNorm]:
 
-        hidden_states_original = hidden_states
-        residual_original = residual
-
         # Self Attention
         if deferred_norm is not None:
             assert residual is not None
@@ -640,7 +648,7 @@ class Grok1Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.alt_stream = get_stream("alt")
+        self.alt_stream = None if _is_cpu else get_stream("alt")
         self.layers = nn.ModuleList(
             [
                 Grok1DecoderLayer(
@@ -883,69 +891,28 @@ class Grok1ForCausalLM(nn.Module):
 
         return hit_names
 
-    def get_num_params_analytical(self):
-        cfg = self.config
-        moe_intermediate_size = getattr(
-            cfg,
-            "moe_intermediate_size",
-            getattr(cfg, "intermediate_size", None),
-        )
-        residual_moe = getattr(cfg, "residual_moe", False)
-        if cfg.num_local_experts > 0:
-            num_experts = cfg.num_local_experts + (1 if residual_moe else 0)
-        else:
-            num_experts = 1
-
-        wq = (
-            cfg.num_hidden_layers
-            * cfg.hidden_size
-            * cfg.num_attention_heads
-            * cfg.head_dim
-        )
-        wkv = (
-            cfg.num_hidden_layers
-            * cfg.hidden_size
-            * cfg.num_key_value_heads
-            * cfg.head_dim
-            * 2
-        )
-        out = (
-            cfg.num_hidden_layers
-            * cfg.hidden_size
-            * cfg.num_attention_heads
-            * cfg.head_dim
-        )
-        ffn1 = (
-            cfg.num_hidden_layers
-            * num_experts
-            * cfg.hidden_size
-            * moe_intermediate_size
-            * 2
-        )
-        ffn2 = (
-            cfg.num_hidden_layers
-            * num_experts
-            * cfg.hidden_size
-            * moe_intermediate_size
-        )
-        embed = cfg.hidden_size * cfg.vocab_size * 2
-        return wq + wkv + out + ffn1 + ffn2 + embed
-
-    def get_num_params_torch(self):
-        return sum(p.numel() for p in self.parameters()) * get_parallel().tp_size
-
 
 old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")
 
 
 def _prepare_presharded_weights(
-    self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+    self,
+    model_name_or_path: str,
+    revision: Optional[str],
+    fall_back_to_pt: bool,
+    allow_patterns_overrides: Optional[list[str]] = None,
 ) -> Tuple[str, list[str], bool]:
     import glob
     import os
 
-    if get_parallel().tp_size == 1:
-        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
+    if get_parallel().tp_size == 1 or allow_patterns_overrides is not None:
+        return old_prepare_weights(
+            self,
+            model_name_or_path,
+            revision,
+            fall_back_to_pt,
+            allow_patterns_overrides,
+        )
 
     if not os.path.isdir(model_name_or_path):
         from sglang.srt.model_loader.weight_utils import download_weights_from_hf
@@ -974,7 +941,13 @@ def _prepare_presharded_weights(
         hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
 
     if not hf_weights_files:
-        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
+        return old_prepare_weights(
+            self,
+            model_name_or_path,
+            revision,
+            fall_back_to_pt,
+            allow_patterns_overrides,
+        )
 
     if hf_weights_files[0].endswith("safetensors"):
         use_safetensors = True

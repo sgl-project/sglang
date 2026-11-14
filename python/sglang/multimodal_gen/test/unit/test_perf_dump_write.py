@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -99,34 +100,43 @@ def test_finalize_preserves_perf_report_ownership(
 
 
 @pytest.mark.parametrize("is_output_rank", [True, False])
+@pytest.mark.parametrize("save_fails", [False, True])
 def test_finalize_preserves_the_output_rank_report_guard(
-    tmp_path, monkeypatch, is_output_rank
+    tmp_path, monkeypatch, is_output_rank, save_fails
 ):
     monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
     worker = GPUWorker.__new__(GPUWorker)
     worker.is_output_rank = is_output_rank
     worker.server_args = SimpleNamespace(model_path="model")
-    worker._materialize_output_transport = Mock()
+    error = (
+        OSError("output storage unavailable") if save_fails and is_output_rank else None
+    )
+    worker._materialize_output_transport = Mock(side_effect=error)
     worker._record_output_peak_memory = Mock()
     worker._record_replica_peak_memory = Mock()
     path = tmp_path / "perf.json"
     metrics = RequestMetrics("request")
 
-    worker._finalize_output_batch(
-        output_batch=OutputBatch(metrics=metrics),
-        req=SimpleNamespace(
-            request_id="request",
-            perf_dump_path=str(path),
-            is_warmup=False,
-            suppress_logs=True,
-            return_raw_frames=True,
-        ),
-        save_output_paths=Mock(),
-        output_metrics=[metrics],
-        deferred=False,
-    )
+    with (
+        pytest.raises(OSError, match="output storage unavailable")
+        if error
+        else nullcontext()
+    ):
+        worker._finalize_output_batch(
+            output_batch=OutputBatch(metrics=metrics),
+            req=SimpleNamespace(
+                request_id="request",
+                perf_dump_path=str(path),
+                is_warmup=False,
+                suppress_logs=True,
+                return_raw_frames=True,
+            ),
+            save_output_paths=Mock(),
+            output_metrics=[metrics],
+            deferred=False,
+        )
 
     worker._record_replica_peak_memory.assert_called_once_with([metrics])
-    assert path.exists() == is_output_rank
-    if is_output_rank:
+    assert path.exists() == (is_output_rank and not save_fails)
+    if path.exists():
         assert json.loads(path.read_text())["request_id"] == "request"

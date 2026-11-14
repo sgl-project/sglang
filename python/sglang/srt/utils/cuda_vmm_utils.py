@@ -880,6 +880,50 @@ def exchange_posix_fds(
             pass
 
 
+def exchange_shareable_handles(
+    retained_handles, group: ProcessGroup, rank: int, world_size: int
+):
+    """Export this rank's retained VMM handles and collect every peer's.
+
+    FABRIC handles when every rank can export them; otherwise POSIX fds over UNIX
+    sockets, which only reach ranks on this host, so a group spanning hosts raises.
+    Returns ``(use_fabric, peer_handles)``: ``peer_handles[(peer_rank, idx)]`` is a
+    FABRIC handle or a received fd the caller must close. This rank's exported fds
+    are closed here.
+    """
+    fabric_handles, local_fds, use_fabric = export_shareable_handles(
+        retained_handles, group, rank
+    )
+    if use_fabric:
+        all_fabric = [None] * world_size
+        dist.all_gather_object(all_fabric, fabric_handles, group=group)
+        return True, {
+            (r, i): handle
+            for r, handles in enumerate(all_fabric)
+            if r != rank
+            for i, handle in enumerate(handles)
+        }
+    try:
+        info = [None] * world_size
+        dist.all_gather_object(
+            info, (socket.gethostname(), len(local_fds)), group=group
+        )
+        if len({host for host, _ in info}) > 1:
+            raise RuntimeError(
+                "VMM handles cannot reach ranks on other hosts without FABRIC "
+                "handles (one NVLink domain with IMEX)"
+            )
+        return False, exchange_posix_fds(
+            group, rank, world_size, local_fds, [n for _, n in info]
+        )
+    finally:
+        for fd in local_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def import_peer_handle(fabric_handle, fd, *, use_fabric: bool, peer_rank: int):
     """Import a peer allocation handle (FABRIC or POSIX fd). Returns the handle.
 

@@ -16,10 +16,10 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_module(head_bytes: int) -> Module:
-    # Build marker is (head_bytes, kUsePDL); the index dtype (int32/int64) is a
-    # runtime dispatch inside the C++ launcher.
-    args = make_cpp_args(head_bytes, is_arch_support_pdl())
+def _jit_module(head_bytes: int, cast_fp8: bool) -> Module:
+    # Build marker is (head_bytes, cast_fp8, kUsePDL); the index dtype
+    # (int32/int64) is a runtime dispatch inside the C++ launcher.
+    args = make_cpp_args(head_bytes, cast_fp8, is_arch_support_pdl())
     return load_jit(
         "minimax_store_kv_index",
         *args,
@@ -49,8 +49,9 @@ def store_kv_index(
     at the per-token rows given by ``indices`` (out_cache_loc). In-place on the
     four cache tensors.
 
-    All tensors must share the same (store) dtype and a head_dim whose byte size
-    equals ``head_bytes`` (a multiple of 16). ``k``/``idx_k`` are 2D rows
+    Inputs and caches share one dtype, or inputs are bf16 and caches fp8_e4m3
+    (saturating cast, unit scale); ``head_bytes`` is the cache head size (a
+    multiple of 16). ``k``/``idx_k`` are 2D rows
     ``[T, num_kv_heads*head_dim]`` / ``[T, head_dim]``; caches are the matching
     ``[num_pages, ...]`` buffers. When ``idx_v`` is None there is no index value
     head (the layer is a pure block selector).
@@ -63,7 +64,7 @@ def store_kv_index(
         idx_v_cache = idx_k_cache
     heads_per_token = 2 * num_kv_heads + 1 + (1 if has_v else 0)
 
-    module = _jit_module(head_bytes)
+    module = _jit_module(head_bytes, k.dtype != k_cache.dtype)
     module.store_kv_index(
         k,
         v,

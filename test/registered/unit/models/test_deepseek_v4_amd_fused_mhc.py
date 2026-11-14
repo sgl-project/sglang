@@ -1,10 +1,13 @@
 import unittest
 from unittest import mock
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_fused_mhc
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -322,6 +325,33 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         # layernorm before attention. Pre-fix this was never called on the
         # fused-success path.
         layer.input_layernorm.assert_called_once_with(fused_hs)
+
+
+class TestAmdFusedMhcBufferCache(CustomTestCase):
+    def test_cache_keeps_only_decode_sized_batches(self):
+        """Only batches up to the M threshold may stay cached; larger ones are
+        allocated per call, or every distinct prefill size stays alive forever."""
+        threshold = deepseek_v4_fused_mhc._FUSED_HC_POST_PRE_M_THRESHOLD
+        fake_ops = (None, lambda *args, **kwargs: ({"BLOCK_K": 64}, False))
+        cache = deepseek_v4_fused_mhc._FUSED_HC_POST_PRE_CACHE
+        with (
+            mock.patch.object(
+                deepseek_v4_fused_mhc,
+                "_get_triton_mhc_post_pre_ops",
+                return_value=fake_ops,
+            ),
+            mock.patch.dict(cache, clear=True),
+        ):
+            for num_tokens in (1, threshold, threshold + 1, 2048):
+                bufs = deepseek_v4_fused_mhc._get_fused_hc_post_pre_buffers(
+                    num_tokens=num_tokens,
+                    hidden_size=64,
+                    hc_mult=4,
+                    dtype=torch.bfloat16,
+                    device=torch.device("cpu"),
+                )
+                self.assertIsNotNone(bufs)
+            self.assertEqual(sorted(key[0] for key in cache), [1, threshold])
 
 
 def _hardware_available() -> bool:

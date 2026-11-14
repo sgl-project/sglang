@@ -3,10 +3,6 @@
   "by_file": {},
   "by_suite": {},
   "suite_labels": {
-    "base-b-kernel-benchmark-1-gpu-large": ["1-gpu-h100"],
-    "base-b-kernel-unit-1-gpu-b200": ["$b200_runner"],
-    "base-b-kernel-unit-1-gpu-large": ["1-gpu-h100"],
-    "base-b-kernel-unit-8-gpu-h200": ["8-gpu-h200"],
     "stress": ["8-gpu-h200"]
   },
   "deny": [

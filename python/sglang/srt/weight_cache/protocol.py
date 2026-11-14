@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import safe_pickle_loads
+from sglang.srt.utils.serialization import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
 

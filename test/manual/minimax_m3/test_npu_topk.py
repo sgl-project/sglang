@@ -92,7 +92,7 @@ def _make_topk_config(
         num_expert_group=None,
         renormalize=renormalize,
         scoring_func="sigmoid",
-        num_fused_shared_experts=0,
+        num_shared_topk_slots=0,
         routed_scaling_factor=routed_scaling_factor,
         apply_routed_scaling_factor_on_output=True,
     )

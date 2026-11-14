@@ -75,6 +75,12 @@ class KimiK3Detector(BaseFormatDetector):
         self.bot_token = TOOLS_OPEN
         self.eot_token = TOOLS_CLOSE
         self._sent_normal_idx = 0
+        self._tool_pos = None
+        self._in_call = False
+        self._argument_type = None
+        self._argument_value = ""
+        self._argument_count = 0
+        self.incomplete_tool_call_indices: set[int] = set()
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -105,7 +111,7 @@ class KimiK3Detector(BaseFormatDetector):
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto",
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
     ) -> StructuralTag:
@@ -185,27 +191,9 @@ class KimiK3Detector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=self._emit_normal_text())
 
             normal_text = self._emit_normal_text(limit=open_idx)
-            section = self._buffer[open_idx + len(self.bot_token) :]
-            calls = []
-            parsed = self._parse_calls(section)
-            for call in parsed[self.current_tool_id + 1 :]:
-                self.current_tool_id += 1
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": call["name"],
-                    "arguments": json.loads(call["arguments"]),
-                }
-                self.streamed_args_for_tool[self.current_tool_id] = call["arguments"]
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id,
-                        name=call["name"],
-                        parameters=call["arguments"],
-                    )
-                )
+            if self._tool_pos is None:
+                self._tool_pos = open_idx + len(self.bot_token)
+            calls = self._stream_calls()
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(
@@ -216,7 +204,115 @@ class KimiK3Detector(BaseFormatDetector):
             # and silently drops the rest of the response.
             self._buffer = ""
             self._sent_normal_idx = 0
+            self._tool_pos = None
+            self._in_call = False
+            self._argument_type = None
+            self._argument_value = ""
+            self._argument_count = 0
             return StreamingParseResult()
+
+    def _stream_calls(self) -> list[ToolCallItem]:
+        """Convert XTML to JSON as it arrives; a non-string argument waits for its
+        close marker so invalid JSON falls back to a string as in `_decode_call`."""
+        calls = []
+        argument_close = "<|close|>argument<|sep|>"
+        call_close = "<|close|>call<|sep|>"
+
+        def emit(fragment: str, source: str, name: str | None = None):
+            if fragment or name:
+                self.streamed_args_for_tool[self.current_tool_id] += fragment
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=name,
+                        parameters=fragment,
+                        source_text=source,
+                    )
+                )
+
+        while self._tool_pos < len(self._buffer):
+            remaining = self._buffer[self._tool_pos :]
+            if self._argument_type is not None:
+                end = remaining.find(argument_close)
+                count = (
+                    end
+                    if end >= 0
+                    else len(remaining)
+                    - partial_suffix_len(remaining, [argument_close])
+                )
+                value = remaining[:count]
+                self._tool_pos += count
+                if self._argument_type == "string":
+                    emit(json.dumps(value, ensure_ascii=False)[1:-1], value)
+                else:
+                    self._argument_value += value
+                if end < 0:
+                    break
+                if self._argument_type == "string":
+                    emit('"', argument_close)
+                else:
+                    try:
+                        value = json.loads(self._argument_value)
+                    except json.JSONDecodeError:
+                        value = self._argument_value
+                    emit(
+                        json.dumps(value, ensure_ascii=False),
+                        self._argument_value + argument_close,
+                    )
+                self._tool_pos += len(argument_close)
+                self._argument_type = None
+                self._argument_value = ""
+                continue
+
+            # Whitespace between XTML elements is not part of any argument.
+            stripped = remaining.lstrip()
+            self._tool_pos += len(remaining) - len(stripped)
+            remaining = stripped
+            if self._in_call and remaining.startswith(call_close):
+                emit("}", call_close)
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = json.loads(
+                    self.streamed_args_for_tool[self.current_tool_id]
+                )
+                self.incomplete_tool_call_indices.discard(self.current_tool_id)
+                self._in_call = False
+                self._tool_pos += len(call_close)
+                continue
+
+            tag = "argument" if self._in_call else "call"
+            header = re.match(
+                rf"<\|open\|>{tag}\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>",
+                remaining,
+                re.DOTALL,
+            )
+            if header is None:
+                break  # Incomplete header, tools close, or malformed XTML.
+            attrs = _parse_attrs(header["attrs"])
+            if not self._in_call:
+                name = attrs.get("tool", "")
+                if not name:
+                    # Skip the whole call, as the non-streaming decoder does.
+                    end = remaining.find(call_close, header.end())
+                    if end < 0:
+                        break
+                    self._tool_pos += end + len(call_close)
+                    continue
+                self.current_tool_id += 1
+                self.prev_tool_call_arr.append({"name": name})
+                self.streamed_args_for_tool.append("")
+                self.incomplete_tool_call_indices.add(self.current_tool_id)
+                self._argument_count = 0
+                self._in_call = True
+                emit("{", header[0], name=name)
+            else:
+                prefix = ", " if self._argument_count else ""
+                prefix += json.dumps(attrs.get("key", ""), ensure_ascii=False) + ": "
+                self._argument_type = attrs.get("type", "string")
+                if self._argument_type == "string":
+                    prefix += '"'
+                emit(prefix, header[0])
+                self._argument_count += 1
+            self._tool_pos += header.end()
+        return calls
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         open_idx = self._buffer.find(self.bot_token)

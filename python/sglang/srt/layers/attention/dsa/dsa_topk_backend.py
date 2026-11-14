@@ -7,12 +7,9 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -105,6 +102,7 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        packed_extend_topk: bool = False,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
@@ -151,21 +149,26 @@ class DSATopKBackend(Enum):
                 logits, lengths, topk, topk_indices_offset, row_starts
             )
 
-        # Packed PAGED extend (GLM DSA prefill), ROCm-only: CUDA gets the same
-        # fusion from RAGGED above. Unsupported shapes fall back, not raise.
+        # Packed PAGED extend (DSA prefill with a paged-KV prefill backend, e.g.
+        # trtllm with an fp8 KV cache): exact in the default top-k mode, where the
+        # legacy fused transform truncates the threshold bin. Unsupported shapes
+        # fall back, not raise.
         # The row -> request map is `token_to_batch_idx` for a whole-forward call
         # and the chunk's own `batch_idx_list` when the indexer split the logits.
+        # A prefill-CP (interleave) shard, whose rows are the rank's token shard,
+        # takes the packed kernel only with `packed_extend_topk`; otherwise it
+        # stays on legacy.
         if batch_idx_list is None:
             row_to_batch = attn_metadata.token_to_batch_idx
         elif isinstance(batch_idx_list, torch.Tensor):
             row_to_batch = batch_idx_list
         else:
-            # The prefill-CP list selects requests, not rows: leave it on legacy.
+            # A Python list selects requests, not rows: leave it on legacy.
             row_to_batch = None
         if (
-            _is_hip
-            and self.should_use_topk_v2()
+            self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
+            and (packed_extend_topk or not attn_metadata.prefill_cp_sharded)
             and 0 < topk <= 2048
             and lengths.shape[0] == logits.shape[0]
             and logits.dtype == torch.float32

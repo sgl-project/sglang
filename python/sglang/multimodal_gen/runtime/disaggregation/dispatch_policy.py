@@ -84,9 +84,6 @@ class PoolDispatcher:
     def select_denoiser_with_capacity(self, free_slots: list[int]) -> int | None:
         return self.denoiser_policy.select_with_capacity(free_slots)
 
-    def select_decoder_with_capacity(self, free_slots: list[int]) -> int | None:
-        return self.decoder_policy.select_with_capacity(free_slots)
-
 
 def create_dispatch_policy(name: str, num_instances: int) -> DispatchPolicy:
     policies = {

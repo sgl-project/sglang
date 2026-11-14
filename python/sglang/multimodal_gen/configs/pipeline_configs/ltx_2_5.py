@@ -8,8 +8,8 @@ from sglang.multimodal_gen.configs.models.encoders import (
     Gemma4UnifiedConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_video import LTX25VideoVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 # Explicit sigma schedule the distilled LTX-2.5 DiT was trained against. Upstream
 # exposes it as `diffusers.pipelines.ltx2.utils.DISTILLED_SIGMA_VALUES`.

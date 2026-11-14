@@ -10,21 +10,43 @@ export const Qwen36Deployment = () => {
         { id: 'b200', label: 'B200', default: false },
         { id: 'b300', label: 'B300', default: false },
         { id: 'xeon', label: 'XEON', default: false },
+        { id: 'rtx-spark', label: 'RTX Spark', default: false },
+        { id: 'a3', label: 'A3 (NPU)', default: false },
+      ],
+    },
+    // Atlas 800I A3: 1 card = 2 dies, so --tp-size is twice the card count.
+    npuCards: {
+      name: 'npuCards',
+      title: 'Ascend Cards',
+      condition: (values) => values.hardware === 'a3',
+      items: [
+        { id: '1', label: '1 Card (2 dies)', default: true },
+        { id: '2', label: '2 Cards (4 dies)', default: false },
       ],
     },
     modelSize: {
       name: 'modelSize',
       title: 'Model Size',
-      items: [
+      // RTX Spark only has a validated recipe for 35B-A3B NVFP4.
+      getDynamicItems: (values) => [
         { id: '35b-a3b', label: '35B-A3B (MoE)', default: true },
-        { id: '27b', label: '27B (Dense)', default: false },
+        { id: '27b', label: '27B (Dense)', default: false, disabled: values.hardware === 'rtx-spark',
+          disabledReason: values.hardware === 'rtx-spark' ? 'Only 35B-A3B NVFP4 is validated on RTX Spark' : '' },
       ],
     },
     quantization: {
       name: 'quantization',
       title: 'Quantization',
       // NVFP4 checkpoints are available for both model sizes on Blackwell (B200/B300).
+      // Ascend NPU deployment offers BF16 for both model sizes.
+      // RTX Spark only has a validated NVFP4 recipe (35B-A3B).
       getDynamicItems: (values) => {
+        if (values.hardware === 'a3') {
+          return [{ id: 'bf16', label: 'BF16', default: true }];
+        }
+        if (values.hardware === 'rtx-spark') {
+          return [{ id: 'nvfp4', label: 'NVFP4', default: true }];
+        }
         const items = [
           { id: 'fp8', label: 'FP8', default: true },
           { id: 'bf16', label: 'BF16', default: false },
@@ -59,20 +81,34 @@ export const Qwen36Deployment = () => {
       title: 'Speculative Decoding (MTP)',
       getDynamicItems: (values) => {
         const isXeon = values.hardware === 'xeon';
+        const isSpark = values.hardware === 'rtx-spark';
+        const noSpec = isXeon || isSpark;
         return [
-          { id: 'disabled', label: 'Disabled', default: isXeon },
-          { id: 'enabled', label: 'Enabled', default: !isXeon, disabled: isXeon,
-            disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : '' },
+          { id: 'disabled', label: 'Disabled', default: noSpec },
+          { id: 'enabled', label: 'Enabled', default: !noSpec, disabled: noSpec,
+            disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : isSpark ? 'Speculative decoding is not validated on RTX Spark' : '' },
         ];
       },
-      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
+      commandRule: (value, values) => {
+        if (value !== 'enabled') return null;
+        // Ascend NPU uses the built-in MTP weights via the NEXTN algorithm.
+        const algo = values.hardware === 'a3' ? 'NEXTN' : 'EAGLE';
+        return `--speculative-algorithm ${algo} \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4`;
+      },
     },
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => values.hardware !== 'xeon',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'a3',
       getDynamicItems: (values) => {
         const mtpEnabled = values.speculative === 'enabled';
+        if (values.hardware === 'rtx-spark') {
+          return [
+            { id: 'v1', label: 'V1', default: false, disabled: true,
+              disabledReason: 'The validated RTX Spark recipe uses extra_buffer (V2)' },
+            { id: 'v2', label: 'V2', default: true },
+          ];
+        }
         if (mtpEnabled) {
           return [
             { id: 'v1', label: 'V1', default: false, disabled: true },
@@ -96,6 +132,7 @@ export const Qwen36Deployment = () => {
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       xeon: { bf16: { tp: 3 },           fp8: { tp: 3 } },
+      'rtx-spark': { nvfp4: { tp: 1, mem: 0.8 } },
     },
     '27b': {
       baseName: '27B',
@@ -164,6 +201,30 @@ export const Qwen36Deployment = () => {
   const generateCommand = () => {
     const { hardware, modelSize, quantization, speculative } = values;
     const sizeConfig = modelConfigs[modelSize];
+
+    // Atlas 800I A3 (Ascend NPU): PD-mixed single-node serving. Follows the
+    // baseline settings in the Ascend NPU tutorials — ascend attention
+    // backend, bfloat16 mamba state, NEXTN speculative decoding on the built-in
+    // MTP weights, with BF16 checkpoints for both model sizes.
+    if (hardware === 'a3') {
+      const cards = Number(values.npuCards) || 1;
+      const modelName = `Qwen/Qwen3.6-${sizeConfig.baseName}`;
+      let cmd = `sglang serve --model-path ${modelName}`;
+      cmd += ` \\\n  --tp-size ${cards * 2} --nnodes 1`;
+      cmd += ` \\\n  --attention-backend ascend --device npu`;
+      const reasoningRule = options.reasoning.commandRule(values.reasoning, values);
+      if (reasoningRule) cmd += ` \\\n  ${reasoningRule}`;
+      const toolcallRule = options.toolcall.commandRule(values.toolcall, values);
+      if (toolcallRule) cmd += ` \\\n  ${toolcallRule}`;
+      if (speculative === 'enabled') {
+        cmd += ` \\\n  --speculative-algorithm NEXTN --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`;
+      }
+      cmd += ` \\\n  --mamba-ssm-dtype bfloat16`;
+      cmd += ` \\\n  --mem-fraction-static 0.7`;
+      cmd += ` \\\n  --host 0.0.0.0 --port 30000`;
+      return cmd;
+    }
+
     const hwConfig = sizeConfig?.[hardware]?.[quantization];
     if (!hwConfig) {
       return '# Please select a valid hardware and quantization combination';
@@ -173,6 +234,20 @@ export const Qwen36Deployment = () => {
       ...values,
       mambaCache: speculative === 'enabled' ? 'v2' : values.mambaCache,
     };
+
+    // RTX Spark (35B-A3B NVFP4 only): user-tested recipe; single GPU, no --attention-backend,
+    // flashinfer_cutlass MoE runner, --mem-fraction-static 0.8, no speculative decoding.
+    if (hardware === 'rtx-spark') {
+      let cmd = `sglang serve --model-path nvidia/Qwen3.6-${sizeConfig.baseName}-NVFP4`;
+      const reasoningRule = options.reasoning.commandRule(values.reasoning);
+      if (reasoningRule) cmd += ` \\\n  ${reasoningRule}`;
+      const toolcallRule = options.toolcall.commandRule(values.toolcall);
+      if (toolcallRule) cmd += ` \\\n  ${toolcallRule}`;
+      cmd += ` \\\n  --mamba-radix-cache-strategy extra_buffer`;
+      cmd += ` \\\n  --mem-fraction-static ${hwConfig.mem}`;
+      cmd += ` \\\n  --moe-runner-backend flashinfer_cutlass`;
+      return cmd;
+    }
 
     // NVFP4: nvidia/Qwen3.6-{35B-A3B,27B}-NVFP4 on Blackwell (B200/B300). Follows the exact command
     // shape from the checkpoint's docs — explicit --tp-size 1, --attention-backend trtllm_mha,
@@ -210,7 +285,7 @@ export const Qwen36Deployment = () => {
       if (key === 'quantization' || key === 'hardware' || key === 'modelSize') continue;
       if (option.condition && !option.condition(values)) continue;
       if (!option.commandRule) continue;
-      const rule = option.commandRule(adjustedValues[key]);
+      const rule = option.commandRule(adjustedValues[key], values);
       if (rule) {
         cmd += ` \\\n  ${rule}`;
       }

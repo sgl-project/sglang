@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import (
     DSA_DECODE_IMPL_VARIANTS,
@@ -12,6 +12,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import 
     make_dsa_dense_fallback_cases,
     make_dsa_sparse_cases,
     run_dsa_attention_case,
+    run_dsa_mtp_seed_handoff_case,
     run_dsa_sparse_attention_case,
     run_dsa_sparse_cuda_graph_decode_impl_variant_case,
     run_dsa_sparse_decode_impl_variant_case,
@@ -30,8 +31,8 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner i
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -253,10 +254,10 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
     # noise — same separation principle as the DSV4 SWA fixture so a
     # silent pack/write bug cannot corrupt both paths identically.
     #
-    # FP8 + `flashmla_sparse` prefill + EXTEND + non-empty prefix is the
-    # only combo that hits `TopkTransformMethod.RAGGED`
+    # FP8 + `flashmla_sparse` prefill + EXTEND (or MIXED) + non-empty prefix
+    # is the only combo that hits `TopkTransformMethod.RAGGED`
     # (`get_topk_transform_method`), which exercises
-    # `dequantize_k_cache_paged` and the `topk_indices_offset` shift —
+    # `dequantize_k_cache_paged_dsa` and the `topk_indices_offset` shift —
     # paths that the BF16 default suite never reaches.
     FP8_PREFILL_RAGGED_CASE = DSAAttentionCase(
         name="dsa_sparse_fp8_prefill_ragged_topk",
@@ -302,6 +303,25 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                     else self.FP8_PREFILL_PAGED_CASE
                 )
                 run_dsa_sparse_fp8_prefill_case(self, case, dsa_prefill_backend=impl)
+
+    # --enable-mixed-chunk batch: one prefill chunk plus 1-token decode rows.
+    FP8_MIXED_CASE = DSAAttentionCase(
+        name="dsa_sparse_fp8_mixed_chunk",
+        backend="dsa",
+        forward_mode=ForwardMode.MIXED,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        prefix_lens=(2048, 2048, 2048),
+        extend_lens=(4, 1, 1),
+    )
+
+    def test_sparse_fp8_mixed_chunk_prefill_cases(self):
+        for impl in DSA_PREFILL_IMPL_VARIANTS:
+            with self.subTest(impl=impl):
+                run_dsa_sparse_fp8_prefill_case(
+                    self, self.FP8_MIXED_CASE, dsa_prefill_backend=impl
+                )
 
     def test_sparse_fp8_decode_cases(self):
         for impl in DSA_DECODE_IMPL_VARIANTS:
@@ -394,6 +414,44 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                 run_dsa_sparse_cuda_graph_decode_impl_variant_case(
                     self, self.CUDA_GRAPH_DECODE_CASES[0], impl
                 )
+
+    # MTP seed handoff with fused top-k + fp8 KV + `flashmla_sparse_q8`: the
+    # draft prefill's RAGGED top-k must reach the first draft decode as
+    # physical slots. Short prefills export through dense MHA, longer ones
+    # through the sparse-MLA `publish()` path; both must convert.
+    MTP_SEED_HANDOFF_CASES = (
+        (
+            DSAAttentionCase(
+                name="dsa_mtp_seed_handoff_mha",
+                backend="dsa",
+                forward_mode=ForwardMode.EXTEND,
+                num_heads=4,
+                num_kv_heads=1,
+                page_size=DSA_PAGE_SIZE,
+                prefix_lens=(512, 256),
+                extend_lens=(3, 2),
+            ),
+            "mha",
+        ),
+        (
+            DSAAttentionCase(
+                name="dsa_mtp_seed_handoff_sparse_mla",
+                backend="dsa",
+                forward_mode=ForwardMode.EXTEND,
+                num_heads=4,
+                num_kv_heads=1,
+                page_size=DSA_PAGE_SIZE,
+                prefix_lens=(2048, 1024),
+                extend_lens=(3, 2),
+            ),
+            "sparse_mla",
+        ),
+    )
+
+    def test_mtp_seed_handoff_cases(self):
+        for case, seed_path in self.MTP_SEED_HANDOFF_CASES:
+            with self.subTest(case=case.name, seed_path=seed_path):
+                run_dsa_mtp_seed_handoff_case(self, case, seed_path=seed_path)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import forward_
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestRocmHiSparseFusedKV(CustomTestCase):
@@ -54,6 +54,8 @@ class TestRocmHiSparseFusedKV(CustomTestCase):
                 lambda *args, **kwargs: args,
                 create=True,
             ),
+            # The gfx1250 fused branch excludes DSA, so these DSA pools use the gfx95 one.
+            patch.object(forward_mla_rocm, "_use_gfx1250_fused_mla_rope", False),
         ):
             args = forward_mla_rocm._fused_rope_cat_and_cache(
                 self.attn, torch.empty(0), None, None, None, None, locations

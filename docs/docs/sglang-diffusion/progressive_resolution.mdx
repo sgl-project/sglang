@@ -283,7 +283,7 @@ Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Timing = denoising loop on
 
 ## Ideogram 4
 
-Supports `ideogram-ai/ideogram-4`. Ideogram 4 uses a **dual-transformer architecture**: a conditional transformer (text + image tokens) and a separately-weighted unconditional transformer (image tokens only, zero LLM features). Both transformers shrink at coarse resolution, providing the same token-ratio benefit as single-transformer models.
+Supports `ideogram-ai/ideogram-4-fp8` and `ideogram-ai/ideogram-4-nf4`. Ideogram 4 uses a **dual-transformer architecture**: a conditional transformer (text + image tokens) and a separately-weighted unconditional transformer (image tokens only, zero LLM features). Both transformers shrink at coarse resolution, providing the same token-ratio benefit as single-transformer models.
 
 > **Note:** Ideogram 4's logit-normal noise schedule (`std=1.75`, `mu=0`) concentrates steps near the mid-sigma range. Fewer steps fall in the high-sigma coarse-eligible region compared to FLUX, which limits the achievable speedup at a given δ.
 
@@ -293,7 +293,7 @@ Supports `ideogram-ai/ideogram-4`. Ideogram 4 uses a **dual-transformer architec
 
 ```bash
 sglang generate \
-    --model-path ideogram-ai/ideogram-4 \
+    --model-path ideogram-ai/ideogram-4-fp8 \
     --prompt "A serene mountain lake at golden hour, photorealistic" \
     --height 1024 --width 1024 \
     --num-inference-steps 20 \
@@ -307,7 +307,7 @@ sglang generate \
 
 ```bash
 sglang generate \
-    --model-path ideogram-ai/ideogram-4 \
+    --model-path ideogram-ai/ideogram-4-fp8 \
     --prompt "A serene mountain lake at golden hour, photorealistic" \
     --height 1024 --width 1024 \
     --num-inference-steps 48 \
@@ -345,7 +345,7 @@ Hardware: RTX A6000 48 GB, `torch_sdpa`, `--dit-cpu-offload false`. Timing = den
 from sglang.multimodal_gen import DiffGenerator
 
 gen = DiffGenerator.from_pretrained(
-    model_path="ideogram-ai/ideogram-4",
+    model_path="ideogram-ai/ideogram-4-fp8",
     dit_cpu_offload=False,
 )
 result = gen.generate(sampling_params_kwargs={

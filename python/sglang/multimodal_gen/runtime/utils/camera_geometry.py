@@ -65,8 +65,12 @@ def get_plucker_embeddings(
     width: int,
 ) -> torch.Tensor:
     n_frames = c2ws_mat.shape[0]
+    # bf16/fp16 cannot represent integer pixel coordinates above 256/2048.
+    compute_dtype = torch.promote_types(c2ws_mat.dtype, torch.float32)
+    c2ws_mat = c2ws_mat.to(compute_dtype)
+    Ks = Ks.to(compute_dtype)
     grid_xy = create_meshgrid(
-        n_frames, height, width, device=c2ws_mat.device, dtype=c2ws_mat.dtype
+        n_frames, height, width, device=c2ws_mat.device, dtype=compute_dtype
     )
     fx, fy, cx, cy = Ks.chunk(4, dim=-1)
     i = grid_xy[..., 0]

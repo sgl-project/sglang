@@ -27,8 +27,6 @@ from typing import Callable, TypeVar
 
 F = TypeVar("F", bound=Callable)
 
-_CUDA_LIKE = frozenset({"cuda", "hip"})
-
 
 def platform_key() -> str:
     """Return the live device family: ``cuda``/``hip``/``npu``/``mps``/``musa``/``xpu``/``cpu``.
@@ -70,11 +68,6 @@ def is_xpu() -> bool:
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     return current_platform.is_xpu()
-
-
-def has_triton() -> bool:
-    """True when the live device runs the Triton implementations."""
-    return platform_key() in _CUDA_LIKE
 
 
 def lazy_fallback(kind: str, name: str) -> Callable:

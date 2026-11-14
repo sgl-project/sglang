@@ -135,8 +135,10 @@ message GenerateRequest {
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
   optional KVHintsEnvelope kv_hints = 17;
-  // Also return the detokenized text, as HTTP /generate does; off by default.
   optional bool return_text = 18;
+  repeated string image_data = 19;
+  repeated string video_data = 20;
+  repeated string audio_data = 21;
 }
 
 // Versioned KV-hint envelope forwarded from a trusted orchestrator.

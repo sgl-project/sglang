@@ -3,19 +3,26 @@
 
 use thiserror::Error;
 
+use crate::multi_modality::worker::MediaError;
+
 // Some variants are emitted only once their stage matures (real validation,
 // the deferred Encoder, HF detok). They are part of the stable error surface.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Error)]
 pub enum Error {
-    #[error("validation failed: {0}")]
+    /// A request the client got wrong. The message is the client-facing text,
+    /// worded as Python's `ValueError` for the same check, so it is shown as is.
+    #[error("{0}")]
     Validation(String),
 
     #[error("tokenize failed: {0}")]
     Tokenize(String),
 
+    /// The multimodal processor failed the request, keeping Python's status
+    /// class: refused media (an undecodable image, a placeholder that matches
+    /// no item, ...) is the client's, anything else the server's.
     #[error("encode failed: {0}")]
-    Encode(String),
+    Encode(MediaError),
 
     #[error("detokenize failed: {0}")]
     Detokenize(String),
@@ -42,11 +49,23 @@ impl Error {
         matches!(
             self,
             Error::Tokenize(_)
-                | Error::Encode(_)
+                | Error::Encode(MediaError::Server(_))
                 | Error::Detokenize(_)
                 | Error::Codec(_)
                 | Error::Internal(_)
         )
+    }
+
+    /// Why the client's request is at fault, as the client reads it, or `None`
+    /// when it is not: the server answers 400 and, like Python's
+    /// `[http_server] Error:` line, logs this reason.
+    pub fn client_fault_reason(&self) -> Option<&str> {
+        match self {
+            Error::Validation(message) | Error::Encode(MediaError::Client(message)) => {
+                Some(message)
+            }
+            _ => None,
+        }
     }
 }
 

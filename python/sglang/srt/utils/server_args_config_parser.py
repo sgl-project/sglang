@@ -14,6 +14,30 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+def _config_keys(action: argparse.Action) -> set[str]:
+    # YAML keys may use any long spelling of a flag, not just the one matching dest.
+    return {action.dest} | {
+        option[2:].replace("-", "_")
+        for option in action.option_strings
+        if option.startswith("--")
+    }
+
+
+def _takes_one_value(action: argparse.Action) -> bool:
+    # Passed as "--flag value", like store; e.g. a deprecated valued alias.
+    return isinstance(action, argparse._StoreAction) or action.nargs is None
+
+
+def _is_boolean_flag(action: argparse.Action) -> bool:
+    from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
+
+    return isinstance(action, argparse._StoreTrueAction) or (
+        isinstance(action, DeprecatedAction)
+        and action.nargs == 0
+        and action.error_message is None
+    )
+
+
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
@@ -23,23 +47,30 @@ class ConfigArgumentMerger:
         boolean_actions: List[str] = None,
     ):
         """Initialize with list of store_true action names."""
-        # NOTE: The current code does not support actions other than "store_true" and "store".
+        # NOTE: Only boolean flags, store and other single-value actions are supported.
         if parser is not None:
             self.parser = parser
             self.store_true_actions = [
-                action.dest
+                key
                 for action in parser._actions
-                if isinstance(action, argparse._StoreTrueAction)
+                if _is_boolean_flag(action)
+                for key in _config_keys(action)
             ]
+            supported = [
+                a for a in parser._actions if _is_boolean_flag(a) or _takes_one_value(a)
+            ]
+            supported_keys = {key for a in supported for key in _config_keys(a)}
             self.unsupported_actions = {
-                a.dest: a
+                key: a
                 for a in parser._actions
                 if a.option_strings
-                and not isinstance(a, argparse._StoreTrueAction)
-                and not isinstance(a, argparse._StoreAction)
+                and a not in supported
                 and "--config" not in a.option_strings
                 and "--help" not in a.option_strings
                 and "-h" not in a.option_strings
+                for key in _config_keys(a)
+                # a key a supported flag also reads, e.g. a shared dest, stays usable
+                if key not in supported_keys
             }
         elif boolean_actions is not None:
             # Legacy interface for compatibility
@@ -163,7 +194,7 @@ class ConfigArgumentMerger:
         """
         Add boolean argument to the list.
 
-        Only store_true flags:
+        Store_true and retired no-op flags:
             - value True -> add flag
             - value False -> skip
         Regular booleans:

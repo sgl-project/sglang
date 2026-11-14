@@ -8,7 +8,7 @@ from sglang.srt.utils.auth import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 ADMIN_PATHS = [
     "/load_lora_adapter",
@@ -40,6 +40,9 @@ class TestAdminEndpointAuthLevels(CustomTestCase):
             with self.subTest(path=path):
                 self.assertFalse(self._decide(path, None).allowed)
                 self.assertTrue(self._decide(path, "Bearer admin-secret").allowed)
+
+    def test_api_key_middleware_is_outermost_on_the_module_level_app(self):
+        self.assertEqual(app.user_middleware[0].cls.__name__, "_ApiKeyASGIMiddleware")
 
 
 if __name__ == "__main__":

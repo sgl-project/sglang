@@ -4,7 +4,7 @@ Qwen3.5-4B is a gated-delta-net / linear-attention hybrid, which exercises the
 path most prone to subtle bugs: the Mamba conv/SSM state stays a strided
 envelope view (its kernels are stride-aware by design) while the
 full-attention KV is per-layer views, which the fa3 / flashinfer cells read
-through the translator's read tables.
+through the `RunnerIds`' read tables.
 """
 
 import unittest
@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=261, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=259, stage="extra-a", runner_config="1-gpu-large")
 
 _UNIFIED_COMMON_ARGS = [
     "--trust-remote-code",

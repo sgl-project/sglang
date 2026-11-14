@@ -68,6 +68,24 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
                 return arg.dtype
         return None
 
+    def _load_inner_state(self, state_dict: dict[str, torch.Tensor]) -> None:
+        missing, unexpected = self._inner_model.load_state_dict(
+            state_dict, strict=False
+        )
+        if missing:
+            logger.warning(
+                "AutoencoderDC missing keys when loading: %d keys", len(missing)
+            )
+            if len(missing) > 10:
+                logger.debug("First 10 missing keys: %s", list(missing)[:10])
+            else:
+                logger.debug("Missing keys: %s", list(missing))
+        if unexpected:
+            logger.debug(
+                "AutoencoderDC unexpected keys when loading: %d keys",
+                len(unexpected),
+            )
+
     def _ensure_inner_model(self, state_dict: dict[str, torch.Tensor] | None = None):
         if self._inner_model is not None:
             return
@@ -94,22 +112,7 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         self._inner_model = DiffusersAutoencoderDC.from_config(hf_config)
 
         if state_to_load:
-            missing, unexpected = self._inner_model.load_state_dict(
-                state_to_load, strict=False
-            )
-            if missing:
-                logger.warning(
-                    "AutoencoderDC missing keys when loading: %d keys", len(missing)
-                )
-                if len(missing) > 10:
-                    logger.debug("First 10 missing keys: %s", list(missing)[:10])
-                else:
-                    logger.debug("Missing keys: %s", list(missing))
-            if unexpected:
-                logger.debug(
-                    "AutoencoderDC unexpected keys when loading: %d keys",
-                    len(unexpected),
-                )
+            self._load_inner_state(state_to_load)
             if state_dict is None:
                 self._loaded_state_dict.clear()
 
@@ -190,7 +193,11 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         assign: bool = False,
     ):
         """Intercept load_state_dict to route weights into the inner diffusers model."""
-        self._ensure_inner_model(state_dict=state_dict)
+        if self._inner_model is None:
+            self._ensure_inner_model(state_dict=state_dict)
+        else:
+            # The loader reads state_dict() first, which builds the inner model.
+            self._load_inner_state(state_dict)
 
     def state_dict(self, *args, **kwargs) -> dict[str, torch.Tensor]:
         self._ensure_inner_model()

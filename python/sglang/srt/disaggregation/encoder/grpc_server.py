@@ -29,7 +29,7 @@ from sglang.srt.disaggregation.encoder.server import (
     launch_encoder,
 )
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,

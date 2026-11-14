@@ -2,18 +2,19 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 import unittest
+from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    BaseMultiModalProcessorOutput,
 )
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 
 
 class _StubProcessor(BaseMultimodalProcessor):
@@ -35,6 +36,7 @@ def _item(modality, rows, offsets):
 class TestPrecomputedEmbeddingValidation(unittest.TestCase):
     def setUp(self):
         self.processor = object.__new__(_StubProcessor)
+        self.processor.processor_fingerprint = "sha256:" + "12" * 32
 
     def _validate(self, items, embeddings):
         self.processor.output = MultimodalProcessorOutput(
@@ -42,6 +44,24 @@ class TestPrecomputedEmbeddingValidation(unittest.TestCase):
             mm_items=items,
         )
         return self.processor.get_validated_mm_data([], embeddings)
+
+    def test_precomputed_input_preserves_caller_hash_and_offsets(self):
+        payload = {
+            "format": "precomputed_embedding",
+            "feature": torch.zeros(2, 4),
+            "offsets": [(1, 2)],
+            "hash": 123,
+        }
+        self.processor.use_cuda_ipc = False
+        self.processor._resolve_processor = Mock(return_value=(None, None))
+        items, _, _ = self.processor.process_and_combine_mm_data(
+            BaseMultiModalProcessorOutput(
+                input_text="", input_ids=[7, 99, 99, 8], images=[payload]
+            ),
+            None,
+        )
+        self.assertEqual(items[0].hash, payload["hash"])
+        self.assertEqual(items[0].offsets, payload["offsets"])
 
     def test_accepts_exact_multi_item_layout(self):
         image_embedding = torch.zeros(5, 4)
@@ -59,6 +79,34 @@ class TestPrecomputedEmbeddingValidation(unittest.TestCase):
         )
 
         self.assertEqual(len(output.mm_items), 3)
+
+    def test_caller_identity_cannot_override_precomputed_tensor(self):
+        self.processor.use_cuda_ipc = False
+        self.processor._resolve_processor = Mock(return_value=(None, None))
+        keys = []
+        for feature in (
+            torch.zeros(2, 4),
+            torch.ones(2, 4),
+            torch.zeros(2, 4, dtype=torch.bfloat16),
+        ):
+            payload = {
+                "format": "precomputed_embedding",
+                "feature": feature,
+                "offsets": [(1, 2)],
+                "hash": 7,
+                "identity": b"x" * 32,
+                "processor_fingerprint": "sha256:" + "00" * 32,
+            }
+            items, _, _ = self.processor.process_and_combine_mm_data(
+                BaseMultiModalProcessorOutput(
+                    input_text="", input_ids=[7, 99, 99, 8], images=[payload]
+                ),
+                None,
+            )
+            keys.append(items[0].cache_key)
+        self.assertTrue(all(len(key) == 32 for key in keys))
+        self.assertEqual(len(set(keys)), 3)
+        self.assertNotIn(b"x" * 32, keys)
 
     def test_rejects_item_shorter_than_prompt_offsets(self):
         with self.assertRaisesRegex(RuntimeError, "expected 3 rows.*got 2"):

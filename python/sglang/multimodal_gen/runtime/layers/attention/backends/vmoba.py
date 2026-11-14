@@ -7,12 +7,12 @@ from dataclasses import dataclass
 
 import torch
 from einops import rearrange
-from kernel.attn.vmoba_attn.vmoba import (
+
+from sglang.multimodal_gen.csrc.attn.vmoba_attn.vmoba import (
     moba_attn_varlen,
     process_moba_input,
     process_moba_output,
 )
-
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -26,8 +26,6 @@ logger = init_logger(__name__)
 
 
 class VMOBAAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.VMOBA_ATTN

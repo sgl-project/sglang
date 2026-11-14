@@ -151,10 +151,11 @@ def final_norm(
         capture: Optional callback retaining the same updated residual;
             it must copy borrowed storage when retention requires ownership.
         finalize_norm: Optional adapter with finalize(handoff, residual, gamma)
-            for a producer-specific finalize handoff; when a handoff arrives it
-            cannot be combined with capture. Without it, a handoff is completed
-            unfused first. Its gamma is layernorm.gemma_weight, so the final
-            norm must then be a GemmaRMSNorm.
+            for a producer-specific finalize handoff, returning (normed,
+            updated residual); capture then gets that residual, borrowed.
+            Without it, a handoff is completed unfused first. Its gamma is
+            layernorm.gemma_weight, so the final norm must then be a
+            GemmaRMSNorm.
         skip_empty: Skip the ordinary norm on a zero-row completed output.
         **read_kwargs: Extra arguments forwarded to the two-input final norm.
 
@@ -173,13 +174,11 @@ def final_norm(
     if isinstance(hidden_states, DeferredFinalize):
         if residual is None:
             raise RuntimeError("invalid final deferred MoE handoff")
-        if capture is not None:
-            raise RuntimeError(
-                "final handoff capture requires an explicit capture adapter"
-            )
-        hidden_states, _ = finalize_norm.finalize(
+        hidden_states, residual = finalize_norm.finalize(
             handoff=hidden_states, residual=residual, gamma=layernorm.gemma_weight
         )
+        if capture is not None:
+            capture(residual)
         return hidden_states
     if skip_empty and hidden_states.shape[0] == 0:
         if capture is not None:

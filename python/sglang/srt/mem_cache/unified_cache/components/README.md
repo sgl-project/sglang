@@ -51,11 +51,20 @@ A component-based, pluggable prefix cache framework for SGLang that unifies Full
 
 ```python
 node.component_data[ComponentType.FULL]   # FullComponent data
-node.component_data[ComponentType.SWA]    # SWAComponent data
+node.component_data[window_slot]          # SWAComponent data, one per window slot
 node.component_data[ComponentType.MAMBA]  # MambaComponent data
 ```
 
-**`UnifiedLRUList`** — One doubly-linked list per auxiliary component, threaded through the same tree nodes via `lru_prev[component_type]`/`lru_next[component_type]`. Host LRUs use a separate pointer slot range so device and host lists do not collide. Supports O(1) insert/remove/promote and O(L) scan for eviction (L = locked nodes skipped). Full eviction is driven by `evictable_device_leaves` / `evictable_host_leaves`, not a Full LRU.
+A slot's id comes from its name (`tree_slot_ids`): a window slot goes by its
+sub-pool's name; `window_slot` is the cache's `slot_id(TREE_WINDOW)` or one of
+`window_slots()`.
+
+The list is indexed by id, but only the token component and the tree's own
+components get a record of their own; every other id shares
+`ABSENT_COMPONENT_DATA`, an empty record that refuses writes
+(`node_component_records`).
+
+**`UnifiedLRUList`** — One doubly-linked list per auxiliary component, threaded through the same tree nodes via `lru_prev[pt]`/`lru_next[pt]`, where `pt` (`lru_pointer_slot`) numbers only the tree's own components. Host LRUs use a separate pointer slot range so device and host lists do not collide. Supports O(1) insert/remove/promote and O(L) scan for eviction (L = locked nodes skipped). Full eviction is driven by `evictable_device_leaves` / `evictable_host_leaves`, not a Full LRU.
 
 **`ComponentData`** — Per-component data stored on each node:
 - `value: Tensor | None` — Device indices into the component's memory pool (`TokenToKVPool` for Full, `SWAKVPool` for SWA, `MambaPool` for Mamba). `None` means tombstone (data evicted but node structure retained).
@@ -127,7 +136,7 @@ Insert a key-value pair into the tree.
 | **Mutation** | Creates new leaf nodes; updates component data on overlapping nodes; frees duplicate KV indices; may split nodes; updates LRU lists and evictable sizes |
 | **Complexity** | **O(K + D·C)** |
 
-**Algorithm detail** (the resumable insert steps: `_insert_walk_step` / `_insert_commit_step` / `_insert_tail_step`):
+**Algorithm detail** (the resumable insert steps: `_insert_walk_step` / `_insert_overlap_step` / `_insert_commit_step` / `_insert_tail_step`):
 1. At each existing node, calls `_touch_node` → promotes to MRU via `node_has_component_data()`
 2. If key diverges mid-node, calls `_split_node` → `redistribute_on_node_split()` per component
 3. For each overlapping node, calls `update_component_on_insert_overlap()` per component — returns `consumed_from` index; the tree frees `value[dup_start:consumed_from]` as duplicate pool indices
@@ -144,13 +153,13 @@ Insert a key-value pair into the tree.
 
 ### `evict(params: EvictParams) → EvictResult`
 
-Free cached tokens to reclaim memory.
+Free cached tokens to reclaim memory. `evict_for_alloc(demand: KVDemand)` takes what an allocation will take instead, and evicts whatever lets it be served.
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | Each component drives eviction from its own LRU list until its target is met |
-| **Inputs** | `params.num_tokens` (full), `params.swa_num_tokens` (SWA), `params.mamba_num` (Mamba) |
-| **Output** | `EvictResult(num_tokens_evicted, swa_num_tokens_evicted, mamba_num_evicted)` |
+| **Inputs** | `params.num_tokens` (full), `params.window_num_tokens` (tokens per window sub-pool, by name), `params.mamba_num` (Mamba) |
+| **Output** | `EvictResult(num_tokens_evicted, window_num_tokens_evicted, mamba_num_evicted)` |
 | **Mutation** | Frees pool indices; removes nodes from LRU lists; deletes leaf nodes from tree; cascades to lower-priority components; walks up parent chain to delete tombstone ancestors |
 | **Complexity** | **O(E·H + L)** — E = nodes evicted, H = tombstone chain height, L = locked nodes skipped in LRU scan. |
 
@@ -269,7 +278,7 @@ Each component implements these hooks. See `base.py` for the ABC and docstrings.
 
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
-| `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_walk_step` | returns `prefix_len` |
+| `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_overlap_step` | returns `prefix_len` |
 | `recover_after_unevict()` | Rebuild auxiliary component data after `_unevict_node_on_insert()` restores a Full device value from fresh KV indices. SWA uses this to rebuild in-window SWA data. | `_insert_walk_step` | no-op |
 | `commit_insert_component_data()` | Finalize component data on the target node after the insert walk completes. Full: no-op (handled by `_add_new_node`). SWA: checks window boundary, may split node — parent becomes tombstone, child gets SWA data. Mamba: sets mamba pool indices and inserts into Mamba LRU. | `_insert_commit_step` | no-op |
 
