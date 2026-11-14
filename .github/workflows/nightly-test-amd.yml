@@ -2367,14 +2367,26 @@ jobs:
       - nightly-1-gpu-zimage-turbo
     runs-on: ubuntu-latest
     steps:
-      - name: Check if any job failed
+      - name: Check job results
         run: |
           if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
             echo "One or more ROCm nightly test jobs failed"
             exit 1
           fi
+
           if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             echo "One or more ROCm nightly test jobs were cancelled"
             exit 1
           fi
+
+          if [[ "${{ contains(needs.*.result, 'skipped') }}" == "true" ]]; then
+            if [[ "${{ (inputs.job_filter || inputs.job_select) != '' && (inputs.job_filter || inputs.job_select) != 'all' }}" == "true" ]]; then
+              echo "::warning::Partial nightly run: some jobs were intentionally skipped. This run does not certify the full nightly."
+              exit 0
+            else
+              echo "::error::One or more ROCm nightly test jobs were skipped unexpectedly"
+              exit 1
+            fi
+          fi
+
           echo "All ROCm nightly test jobs passed"
