@@ -123,14 +123,31 @@ def rocm_platform_plugin() -> str | None:
 
         amdsmi.amdsmi_init()
         try:
-            if len(amdsmi.amdsmi_get_processor_handles()) > 0:
-                is_rocm = True
-                logger.debug("ROCm platform is available")
+            # amd-smi is authoritative when it works: zero devices keeps a ROCm
+            # build on a machine without an AMD GPU off this platform.
+            is_rocm = len(amdsmi.amdsmi_get_processor_handles()) > 0
         finally:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
-        logger.debug("ROCm platform is unavailable: %s", e)
+        # amd-smi is not installed, or cannot open the device (e.g. WSL, where
+        # the GPU is reached through /dev/dxg). Fall back to the HIP runtime,
+        # the same check the LLM runtime uses (sglang.srt.utils.is_hip).
+        logger.debug("amd-smi ROCm detection unavailable: %s", e)
+        try:
+            import torch
 
+            is_rocm = (
+                getattr(torch.version, "hip", None) is not None
+                and torch.cuda.is_available()
+                and torch.cuda.device_count() > 0
+            )
+            if is_rocm:
+                logger.info("ROCm detected via torch (amd-smi unavailable: %s)", e)
+        except Exception as exc:
+            logger.debug("torch ROCm detection failed: %s", exc)
+
+    if is_rocm:
+        logger.debug("ROCm platform is available")
     return _BUILTIN_PLATFORM_QUALNAMES["rocm"] if is_rocm else None
 
 
