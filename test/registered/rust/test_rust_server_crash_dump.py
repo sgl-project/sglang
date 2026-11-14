@@ -67,6 +67,7 @@ def _server_args(ext, port: int):
         skip_tokenizer_init=True,
         skip_server_warmup=True,
         gc_threshold=None,
+        custom_warmups_pending=False,
         default_priority_value=None,
         enable_request_header_overrides=False,
         enable_request_decompression=False,

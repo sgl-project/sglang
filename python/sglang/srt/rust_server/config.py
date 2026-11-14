@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.rust_server.warmups import rust_server_warmup_names
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -170,6 +171,7 @@ def _build_server_args(
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
         gc_threshold=get_device().gc_threshold,
+        custom_warmups_pending=bool(rust_server_warmup_names(get_serving().warmups)),
         health_generate_headers=dict(health_generate_headers or {}),
         default_priority_value=(
             get_schedule().default_priority_value
