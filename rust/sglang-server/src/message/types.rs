@@ -251,6 +251,9 @@ pub(super) use {control_messages, wire_struct};
 /// scheduler's to validate, as for a message this process encoded itself.
 #[derive(Debug)]
 pub struct ForwardedControlReq {
+    /// The message's `Tagged::TAG`, so the relay knows which frontend state
+    /// the request changes.
+    pub tag: String,
     pub rid: String,
     pub header: Bytes,
 }
@@ -259,13 +262,18 @@ impl ForwardedControlReq {
     pub fn parse(header: Bytes) -> Result<Self, Error> {
         let value = rmpv::decode::read_value(&mut &header[..])
             .map_err(|e| Error::Codec(format!("forwarded control request: {e}")))?;
-        let rid = match &value {
-            rmpv::Value::Array(items) if items.len() >= 2 => items[1].as_str(),
-            _ => None,
-        }
-        .filter(|rid| !rid.is_empty())
-        .ok_or_else(|| Error::Codec("forwarded control request: no rid at position 1".into()))?;
+        let (tag, rid) = match &value {
+            rmpv::Value::Array(items) if items.len() >= 2 => (items[0].as_str(), items[1].as_str()),
+            _ => (None, None),
+        };
+        let tag = tag.filter(|tag| !tag.is_empty()).ok_or_else(|| {
+            Error::Codec("forwarded control request: no tag at position 0".into())
+        })?;
+        let rid = rid.filter(|rid| !rid.is_empty()).ok_or_else(|| {
+            Error::Codec("forwarded control request: no rid at position 1".into())
+        })?;
         Ok(Self {
+            tag: tag.to_owned(),
             rid: rid.to_owned(),
             header,
         })
@@ -282,6 +290,7 @@ mod tests {
     fn forwarded_control_reads_the_rid_from_the_base_req_position() {
         let header = rmp_serde::to_vec(&("FlushCacheReqInput", "rid-7", (), 1.5)).unwrap();
         let forwarded = ForwardedControlReq::parse(Bytes::from(header.clone())).unwrap();
+        assert_eq!(forwarded.tag, "FlushCacheReqInput");
         assert_eq!(forwarded.rid, "rid-7");
         assert_eq!(forwarded.header, Bytes::from(header));
         assert!(ForwardedControlReq::parse(Bytes::from_static(b"\xc0")).is_err());

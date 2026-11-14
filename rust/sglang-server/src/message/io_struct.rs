@@ -112,26 +112,10 @@ control_messages! {
         gc_threshold: Option<Vec<i64>>,
     }
 
-    /// Clear the HiCache storage backend.
-    ClearHiCacheReqInput {}
-
-    /// Detach the HiCache storage backend.
-    DetachHiCacheStorageReqInput {}
-
-    /// Attach a HiCache storage backend with optional configuration and policies.
-    AttachHiCacheStorageReqInput {
-        hicache_storage_backend: String,
-        hicache_storage_backend_extra_config_json: Option<String>,
-        hicache_storage_prefetch_policy: Option<String>,
-        hicache_write_policy: Option<String>,
-    }
-
-    /// `/start_profile` and `/stop_profile`'s control request, built only by
-    /// [`ProfileReq::start`] / [`ProfileReq::stop`]. The frontend fans it out
-    /// to every DP rank's scheduler, and each broadcasts it from its TP rank
-    /// 0, so every rank starts (or stops) its profiler.
+    /// `/start_profile` and `/stop_profile`'s control request, Python's
+    /// `ProfileReq`. `req_type` is the `ProfileReqType` enum's value on the
+    /// wire: 1 starts, 2 stops.
     ProfileReq {
-        /// Python's `ProfileReqType` value: 1 starts, 2 stops.
         req_type: u8,
         output_dir: Option<String>,
         start_step: Option<i64>,
@@ -145,6 +129,31 @@ control_messages! {
         profile_prefix: Option<String>,
         profile_stages: Option<Vec<String>>,
         detailed_annotations: bool,
+    }
+
+    /// `/pause_generation`: Python's `PauseGenerationReqInput`. The scheduler
+    /// accepts `in_place` and `retract`; `abort` never reaches it.
+    PauseGenerationReqInput {
+        mode: String,
+    }
+
+    /// `/continue_generation`: Python's `ContinueGenerationReqInput`.
+    ContinueGenerationReqInput {
+        torch_empty_cache: bool,
+    }
+
+    /// Clear the HiCache storage backend.
+    ClearHiCacheReqInput {}
+
+    /// Detach the HiCache storage backend.
+    DetachHiCacheStorageReqInput {}
+
+    /// Attach a HiCache storage backend with optional configuration and policies.
+    AttachHiCacheStorageReqInput {
+        hicache_storage_backend: String,
+        hicache_storage_backend_extra_config_json: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
     }
 }
 
@@ -234,6 +243,21 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 impl FreezeGCReq {
     pub fn new(rid: String, gc_threshold: Option<Vec<i64>>) -> Self {
         Self { rid, gc_threshold }
+    }
+}
+
+impl PauseGenerationReqInput {
+    pub fn new(rid: String, mode: String) -> Self {
+        Self { rid, mode }
+    }
+}
+
+impl ContinueGenerationReqInput {
+    pub fn new(rid: String, torch_empty_cache: bool) -> Self {
+        Self {
+            rid,
+            torch_empty_cache,
+        }
     }
 }
 

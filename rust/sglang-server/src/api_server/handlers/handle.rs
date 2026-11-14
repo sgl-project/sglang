@@ -23,6 +23,7 @@ use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
 
 use super::control::PEER_ABORT_MAX_IN_FLIGHT;
+use super::frontend_state::FrontendState;
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{
@@ -185,6 +186,8 @@ pub(super) struct CoreInner {
     /// Requests this listener relayed to another DP rank's listener and has
     /// not finished answering (see [`CoreHandle::track_relayed`]).
     pub(super) relayed: AtomicUsize,
+    /// The pause flag and the model-facts cache; see `frontend_state`.
+    pub(super) frontend: FrontendState,
 }
 
 /// A request relayed to another DP rank's listener, counted until dropped
@@ -206,7 +209,8 @@ impl CoreHandle {
         abort_tx: flume::Sender<AbortSource>,
         config: CoreConfig,
     ) -> Self {
-        let dp_rank = config.metadata.deployment_info.dp_rank.unwrap_or(0);
+        let metadata = config.metadata;
+        let dp_rank = metadata.deployment_info.dp_rank.unwrap_or(0);
         Self {
             inner: Arc::new(CoreInner {
                 intake_tx,
@@ -219,7 +223,6 @@ impl CoreHandle {
                 mm_limits: config.mm_limits,
                 multimodal: config.multimodal,
                 mm_processor: SetOnce::new(),
-                metadata: config.metadata,
                 generations: Generations::default(),
                 metrics: config.metrics,
                 request_log: config.request_log,
@@ -231,6 +234,8 @@ impl CoreHandle {
                 graceful_close_timeout: OnceLock::new(),
                 peer_abort_permits: tokio::sync::Semaphore::new(PEER_ABORT_MAX_IN_FLIGHT),
                 relayed: AtomicUsize::new(0),
+                frontend: FrontendState::new(&metadata),
+                metadata,
             }),
         }
     }
