@@ -456,7 +456,8 @@ class EmbeddingBatchResult:
 
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+    # A batch request's rid is a list, so `rid is not None` still calls startswith and raises.
+    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 class MsgpackDecodeError(ValueError):
