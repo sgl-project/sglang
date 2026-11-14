@@ -187,7 +187,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         self.assertEqual(len(launch_ts_at_copy_time), 1)
         self.assertEqual(launch_ts_at_copy_time[0], 1.0)
 
-    def test_chained_launch_restamps_launch_ts(self):
+    def _run_two_decodes(self, *, still_running):
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )
@@ -200,6 +200,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         events = []
         req = MagicMock()
         req.finished.return_value = False
+        scheduler.running_reqs = [req] if still_running else []
         batch = MagicMock()
         batch.reqs = [req]
         fresh_copy = MagicMock()
@@ -248,6 +249,12 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
             self.assertRaises(_StopLoop),
         ):
             SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
+        return scheduler, events, batch, chained_copy
+
+    def test_chained_launch_restamps_launch_ts(self):
+        scheduler, events, batch, chained_copy = self._run_two_decodes(
+            still_running=True
+        )
 
         scheduler.tp_worker.async_chained_decode_mlx.assert_called_once()
         self.assertLess(events.index("launch_ts:2.0"), events.index("chained_forward"))
@@ -256,6 +263,10 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         # the next fresh launch; per-step timing consumes the batch copy.
         self.assertEqual(batch.forward_iter, 2)
         self.assertEqual(batch.launch_ts, 1.0)
+
+    def test_no_chain_after_a_request_left_running(self):
+        scheduler, _, _, _ = self._run_two_decodes(still_running=False)
+        scheduler.tp_worker.async_chained_decode_mlx.assert_not_called()
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)

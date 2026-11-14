@@ -357,14 +357,15 @@ class SessionController:
         session = self.sessions[session_id]
         if self._has_live_readers(session):
             # A request still reads what the close frees: a streaming turn
-            # decodes on the session's KV memory, or an unfinished turn holds
-            # the session's media. Mark the session for deferred cleanup: the
+            # decodes on the session's KV memory, or a turn that is unfinished
+            # or still carried by a step holds the session's media. Mark the
+            # session for deferred cleanup: the
             # request keeps its session reference so release_kv_cache takes
             # the streaming path, and maybe_reap closes the session once no
             # request reads it.
             session.close_on_finish = True
             logger.info(
-                "Deferring session close for %s (unfinished request)",
+                "Deferring session close for %s (a request still reads it)",
                 session_id,
             )
             return
@@ -423,9 +424,11 @@ class SessionController:
     @staticmethod
     def _has_live_readers(session: Session) -> bool:
         """Whether a request still reads what closing `session` frees: the
-        streaming turn in flight, or an unfinished turn that holds media."""
+        streaming turn in flight, or a turn holding media that is unfinished or
+        still carried by a step in flight."""
         return session._inflight or any(
-            not turn.finished() and turn.multimodal_inputs is not None
+            (not turn.finished() or turn.inflight_steps > 0)
+            and turn.multimodal_inputs is not None
             for turn in session.turns.values()
         )
 

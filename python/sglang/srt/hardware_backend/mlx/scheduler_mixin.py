@@ -228,6 +228,9 @@ class SchedulerMlxOverlapMixin:
                 and pending_curr.launch.decode is not None
                 and pending_curr.chain_safe
                 and not self.waiting_queue
+                # A request taken out since the launch must not run on its
+                # released row.
+                and all(req in self.running_reqs for req in pending_curr.reqs)
             )
             if can_chain:
                 # Build + launch the chained step BEFORE we block on
