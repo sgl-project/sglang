@@ -1,6 +1,5 @@
 import base64
 import io
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -18,25 +17,23 @@ def _gif_bytes() -> bytes:
 
 
 @pytest.mark.parametrize(
-    "status_code, payload, error",
+    "payload, error",
     [
-        (200, _gif_bytes(), None),
-        (200, b"not a gif", UnidentifiedImageError),
-        (404, b"", ValueError),
+        (_gif_bytes(), None),
+        (b"not a gif", UnidentifiedImageError),
+        (ValueError("Media URL must not point to a local or private address"), ValueError),
     ],
 )
-def test_load_video_removes_downloaded_temp_file(
-    monkeypatch, tmp_path, status_code, payload, error
-):
+def test_load_video_removes_downloaded_temp_file(monkeypatch, tmp_path, payload, error):
     """A downloaded URL video must not outlive load_video, on success or failure."""
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
-    closed = []
-    response = SimpleNamespace(
-        status_code=status_code,
-        iter_content=lambda chunk_size: iter([payload]),
-        close=lambda: closed.append(True),
-    )
-    monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
+
+    def download(url, timeout):
+        if isinstance(payload, Exception):
+            raise payload
+        return payload
+
+    monkeypatch.setattr(vision, "download_remote_media", download)
 
     if error is None:
         frames = vision.load_video("https://example.com/clip.gif")
@@ -49,7 +46,13 @@ def test_load_video_removes_downloaded_temp_file(
             vision.load_video("https://example.com/clip.gif")
 
     assert list(tmp_path.iterdir()) == []
-    assert closed == [True]
+
+
+def test_load_video_applies_media_url_policy(monkeypatch):
+    """Remote video URLs go through the shared private-address check."""
+    monkeypatch.delenv("SGLANG_ALLOW_PRIVATE_MEDIA_URLS", raising=False)
+    with pytest.raises(ValueError, match="local or private"):
+        vision.load_video("http://127.0.0.1/clip.mp4")
 
 
 def test_line_wrapped_base64_image_is_saved_in_full(tmp_path):

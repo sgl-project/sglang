@@ -47,6 +47,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
+from sglang.srt.multimodal.media_io import assert_media_url_allowed
 
 # re-export LoRA protocol types for backward compatibility
 __all__ = [
@@ -541,8 +542,13 @@ async def _save_url_image_to_path(
     max_attempts = 3
     backoff_seconds = 0.2
 
+    async def _check_media_url(request: httpx.Request) -> None:
+        await asyncio.to_thread(assert_media_url_allowed, str(request.url))
+
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True, event_hooks={"request": [_check_media_url]}
+        ) as client:
             for attempt in range(1, max_attempts + 1):
                 part_path = None
                 try:
