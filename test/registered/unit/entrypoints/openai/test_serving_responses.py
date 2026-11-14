@@ -550,6 +550,54 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(output_items[1].content[0].text, "\nanswer")
 
 
+class NullStreamTestCase(CustomTestCase):
+    def test_null_stream_is_served_as_non_streaming(self):
+        """A request with `"stream": null` gets a normal non-streaming response."""
+        serving = make_serving()
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        captured = {}
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["adapted_request"] = adapted_request
+            context.append_output(
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(model="x", input="hi", stream=None, store=False)
+        with patch.object(
+            serving, "_apply_conversation_template", return_value=rendered
+        ):
+            response = asyncio.run(serving.create_responses(request))
+
+        self.assertIsInstance(response, ResponsesResponse)
+        self.assertEqual(response.status, "completed")
+        self.assertIs(captured["adapted_request"].stream, False)
+
+
 class ReasoningRequestForwardingTestCase(unittest.TestCase):
     def test_create_responses_uses_processed_reasoning_state(self):
         serving = make_serving()
