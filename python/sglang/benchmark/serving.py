@@ -1963,6 +1963,11 @@ async def benchmark(
             result_for_dump = result | result_details
         else:
             result_for_dump = result
+        if args.dataset_name == "generated-shared-prefix":
+            result_for_dump = result_for_dump | {
+                "gsp_system_prompt_len": args.gsp_system_prompt_len,
+                "gsp_question_len": args.gsp_question_len,
+            }
         file.write(json.dumps(result_for_dump) + "\n")
 
     return result | result_details
