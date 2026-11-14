@@ -224,6 +224,40 @@ class TestMambaSlotFused(CustomTestCase):
         for b, g in zip(base, got):
             self.assertTrue(torch.equal(b, g))
 
+    def test_noncontiguous_int64_indices(self):
+        # Indices that arrive as a strided view of an int64 tensor (e.g. one
+        # column of a staged [n, 2] (src, dst) buffer). ``.to(torch.int64)`` is
+        # a no-op for such a view, so the kernels, which read the index array
+        # with unit stride, would otherwise walk the wrong addresses and clear /
+        # copy the wrong slots. The wrappers must materialize a contiguous copy.
+        dev = DEVICE
+        pool = 32
+        base = _make_convs(HETERO_DIMS, 2, pool, dev, seed=5)
+        perm = torch.randperm(pool, device=dev)
+        staged = torch.stack([perm[:4], perm[4:8]], dim=1).to(torch.int64)  # [4, 2]
+        idx = staged[:, 0]
+        self.assertEqual(idx.dtype, torch.int64)
+        self.assertFalse(idx.is_contiguous())
+
+        ref = [t.clone() for t in base]
+        got = [t.clone() for t in base]
+        _ref_clear(ref, idx.contiguous())
+        fused_clear_conv_slots(build_conv_slot_descriptor(got), idx)
+        get_device_module().synchronize()
+        for r, g in zip(ref, got):
+            self.assertTrue(torch.equal(r, g))
+
+        src, dst = staged[:, 0], staged[:, 1]  # both strided, disjoint
+        self.assertFalse(src.is_contiguous())
+        self.assertFalse(dst.is_contiguous())
+        ref = [t.clone() for t in base]
+        got = [t.clone() for t in base]
+        _ref_copy(ref, src.contiguous(), dst.contiguous())
+        fused_copy_conv_slots(build_conv_slot_descriptor(got), src, dst)
+        get_device_module().synchronize()
+        for r, g in zip(ref, got):
+            self.assertTrue(torch.equal(r, g))
+
     def test_int32_indices_accepted(self):
         # deferred-clear/COW indices are staged as int32; the wrappers must upcast.
         dev = DEVICE
