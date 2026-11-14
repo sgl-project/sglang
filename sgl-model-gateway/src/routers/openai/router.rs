@@ -8,7 +8,10 @@ use std::{
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CONTENT_TYPE, RETRY_AFTER},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
@@ -597,6 +600,16 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     let status = StatusCode::from_u16(resp.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
+                    // Preserve the upstream `Retry-After` header (delta-seconds
+                    // or HTTP-date) so clients receive the provider's retry
+                    // guidance on 429/503 responses. It is copied from the
+                    // final upstream response only: the retry executor returns
+                    // the last attempt's response, so an intermediate 429's
+                    // header is never retained after a successful retry.
+                    // Captured here because `resp` is consumed below by the
+                    // streaming path (`bytes_stream()`).
+                    let retry_after = resp.headers().get(RETRY_AFTER).cloned();
+
                     if !is_streaming {
                         // Non-streaming: record the breaker outcome inline
                         // once the body is fully read.
@@ -613,6 +626,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                                 *response.status_mut() = status;
                                 if let Some(ct) = content_type {
                                     response.headers_mut().insert(CONTENT_TYPE, ct);
+                                }
+                                if let Some(retry_after) = retry_after {
+                                    response.headers_mut().insert(RETRY_AFTER, retry_after);
                                 }
                                 response
                             }
@@ -647,6 +663,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         response
                             .headers_mut()
                             .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                        if let Some(retry_after) = retry_after {
+                            response.headers_mut().insert(RETRY_AFTER, retry_after);
+                        }
                         response
                     }
                 }
