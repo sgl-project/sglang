@@ -21,8 +21,6 @@ BSA_BLOCK_SIZE = 128
 
 
 class BlockSparseAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128]

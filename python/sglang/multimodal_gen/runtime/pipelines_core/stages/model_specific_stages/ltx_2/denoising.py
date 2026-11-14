@@ -614,8 +614,10 @@ class LTX2DenoisingStage(DenoisingStage):
         sigma_up = torch.nan_to_num(
             sigma_up if sigma_up is not None else torch.zeros_like(sigma_next), 0.0
         )
-        nan_mask = torch.isnan(sigma_down)
-        sigma_down[nan_mask] = sigma_next[nan_mask].to(sigma_down.dtype)
+        # torch.where, not a 0-dim boolean index: that index syncs on its nonzero
+        sigma_down = torch.where(
+            torch.isnan(sigma_down), sigma_next.to(sigma_down.dtype), sigma_down
+        )
         alpha_ratio = torch.nan_to_num(alpha_ratio, 1.0)
         return alpha_ratio, sigma_down, sigma_up
 
@@ -646,6 +648,26 @@ class LTX2DenoisingStage(DenoisingStage):
             alpha_ratio * (denoised_next + sigma_down * eps_next) + sigma_up * noise
         )
         return x_noised.to(dtype=sample.dtype)
+
+    @staticmethod
+    def _ltx2_bongmath_anchor_refine(
+        h: torch.Tensor | float,
+        a21: torch.Tensor | float,
+        x_mid: torch.Tensor,
+        denoised: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Closed-form fixed point of the Bongmath anchor-refinement iteration.
+
+        ``anchor = x_mid - c * eps1; eps1 = denoised - anchor`` (``c = h * a21``,
+        in practice ``|c| <= 0.22``) is an affine contraction in ``eps1`` that
+        converges to ``eps1* = (denoised - x_mid) / (1 - c)``; solving it in
+        closed form skips the ~100 fp64 iterations the loop used to take to
+        reach that same value.
+        """
+        c = h * a21
+        eps1 = (denoised - x_mid) / (1 - c)
+        anchor = x_mid - c * eps1
+        return anchor, eps1
 
     def _ltx2_stage2_res2s_step(
         self,
@@ -745,11 +767,12 @@ class LTX2DenoisingStage(DenoisingStage):
         if h_value < 0.5 and sigma_val > 0.03:
             x_mid_v = midpoint_video_latents.double()
             x_mid_a = midpoint_audio_latents.double()
-            for _ in range(100):
-                anchor_video = x_mid_v - h * a21 * eps1_video
-                eps1_video = denoised_video.double() - anchor_video
-                anchor_audio = x_mid_a - h * a21 * eps1_audio
-                eps1_audio = denoised_audio.double() - anchor_audio
+            anchor_video, eps1_video = self._ltx2_bongmath_anchor_refine(
+                h, a21, x_mid_v, denoised_video.double()
+            )
+            anchor_audio, eps1_audio = self._ltx2_bongmath_anchor_refine(
+                h, a21, x_mid_a, denoised_audio.double()
+            )
 
         mid_v, mid_a, mid_video_timestep, mid_audio_timestep = midpoint_model_call(
             midpoint_video_model_latents, midpoint_audio_model_latents, sub_sigma
@@ -1473,7 +1496,9 @@ class LTX2DenoisingStage(DenoisingStage):
             step.current_model, ctx.use_ltx23_hq_timestep_semantics
         ):
             with set_forward_context(
-                current_timestep=step.step_index, attn_metadata=step.attn_metadata
+                current_timestep=step.step_index,
+                attn_metadata=step.attn_metadata,
+                quality=self._mounted_quality or "exact",
             ):
                 yield
 
@@ -2409,7 +2434,11 @@ class LTX2DenoisingStage(DenoisingStage):
                 sigma_d = sigma.double()
                 sigma_next_d = sigma_next.double()
                 if ctx.use_ltx23_hq_timestep_semantics:
-                    h = self._ltx2_res2s_step_size_scalar(sigma_d, sigma_next_d)
+                    # host copies of the same fp32 sigmas: reading the device ones syncs
+                    h = self._ltx2_res2s_step_size_scalar(
+                        torch.tensor(sigma_val, dtype=torch.float64),
+                        torch.tensor(sigma_next_val, dtype=torch.float64),
+                    )
                     a21, b1, b2 = self._ltx2_get_res2s_coefficients_scalar(h)
                     h_value = h
                 else:
@@ -2477,11 +2506,12 @@ class LTX2DenoisingStage(DenoisingStage):
                 if h_value < 0.5 and sigma_val > 0.03:
                     x_mid_v = midpoint_video_latents.double()
                     x_mid_a = midpoint_audio_latents.double()
-                    for _ in range(100):
-                        anchor_video = x_mid_v - h * a21 * eps1_video
-                        eps1_video = denoised_video.double() - anchor_video
-                        anchor_audio = x_mid_a - h * a21 * eps1_audio
-                        eps1_audio = denoised_audio.double() - anchor_audio
+                    anchor_video, eps1_video = self._ltx2_bongmath_anchor_refine(
+                        h, a21, x_mid_v, denoised_video.double()
+                    )
+                    anchor_audio, eps1_audio = self._ltx2_bongmath_anchor_refine(
+                        h, a21, x_mid_a, denoised_audio.double()
+                    )
 
                 midpoint_denoised_video, midpoint_denoised_audio = (
                     evaluate_stage1_guided_x0(

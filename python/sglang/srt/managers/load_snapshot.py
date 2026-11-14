@@ -14,7 +14,13 @@ transport backends are supported:
     TokenizerManager  ──ShmLoadSnapshotReader───┘  (for /v1/loads)
     DataParallelController  ──ShmLoadSnapshotReader─┘  (for dispatch)
 
-**ZMQ mode** (multi-node DP attention, or ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ=1``)::
+With the embedded Rust server (``SGLANG_RUST_SERVER``), each DP rank's
+listener runs in that rank's scheduler process and reads only that rank's
+slot, so SHM mode also covers multi-node DP attention: every node's ranks
+write a node-local file.
+
+**ZMQ mode** (multi-node DP attention without the Rust server, or
+``SGLANG_LOAD_SNAPSHOT_USE_ZMQ=1``)::
 
     Scheduler (any node)  ──ZmqLoadSnapshotWriter (PUSH)──▶  network
                                                                │
@@ -26,7 +32,7 @@ transport backends are supported:
     TokenizerManager / DataParallelController  ──ShmLoadSnapshotReader──┘
 
 Shared memory does not work across nodes, so multi-node DP attention
-requires the ZMQ transport.  The ``ZmqShmLoadSnapshotReader`` on node 0
+requires the ZMQ transport to reach node 0.  The ``ZmqShmLoadSnapshotReader`` on node 0
 receives snapshots from all schedulers via zmq PUSH/PULL and writes them
 into the local SHM file.  All readers (TokenizerManager,
 DataParallelController) on
@@ -71,11 +77,15 @@ def should_use_zmq() -> bool:
 
     Shared memory (mmap) only works within a single node.  When schedulers
     run on multiple nodes (multi-node DP attention), they cannot write to
-    the SHM file on node 0, so we fall back to zmq transport.  The env var
-    ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ`` forces zmq mode for testing.
+    the SHM file on node 0, so we fall back to zmq transport.  The Rust
+    server needs no collector: each listener reads its own rank's slot from
+    the file on its own node.  The env var ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ``
+    forces zmq mode for testing.
     """
     return (
-        get_parallel().attn_dp_enabled and get_parallel().nnodes > 1
+        get_parallel().attn_dp_enabled
+        and get_parallel().nnodes > 1
+        and not envs.SGLANG_RUST_SERVER.get()
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
@@ -86,7 +96,7 @@ def _tokenizer_load_snapshot_owner_caller() -> str:
     """The caller that plays the tokenizer-side zmq owner role.
 
     In multi-tokenizer mode (``tokenizer_worker_num > 1``) there are N
-    independent ``TokenizerWorker`` processes that would all try to bind the
+    independent tokenizer worker processes that would all try to bind the
     same zmq PULL endpoint.  Instead, the single ``MultiTokenizerRouter``
     process owns the socket (polls zmq -> SHM) and every worker reads SHM.
     """
@@ -340,7 +350,7 @@ class ShmLoadSnapshotWriter:
                 HEADER_STRUCT.pack_into(
                     self.mmap, 0, MAGIC, VERSION, dp_size, self.slot_size
                 )
-                self._write_payload(LoadSnapshot(dp_rank=dp_rank))
+                self._copy_payload(self._encode_payload(LoadSnapshot(dp_rank=dp_rank)))
         except Exception:
             if self.fd >= 0:
                 os.close(self.fd)
@@ -352,10 +362,12 @@ class ShmLoadSnapshotWriter:
                 f"snapshot dp_rank={snapshot.dp_rank} does not match writer dp_rank={self.dp_rank}"
             )
 
+        # Encode before taking the lock so readers wait only for the copy.
+        payload = self._encode_payload(snapshot)
         with file_lock(self.fd, fcntl.LOCK_EX):
-            self._write_payload(snapshot)
+            self._copy_payload(payload)
 
-    def _write_payload(self, snapshot: LoadSnapshot) -> None:
+    def _encode_payload(self, snapshot: LoadSnapshot) -> bytes:
         payload = snapshot_encoder.encode(snapshot)
         max_payload_size = self.slot_size - SLOT_LEN_STRUCT.size
         if len(payload) > max_payload_size:
@@ -363,7 +375,9 @@ class ShmLoadSnapshotWriter:
                 f"load snapshot payload size {len(payload)} exceeds slot payload "
                 f"capacity {max_payload_size}"
             )
+        return payload
 
+    def _copy_payload(self, payload: bytes) -> None:
         offset = slot_offset(self.dp_rank, self.slot_size)
         payload_start = offset + SLOT_LEN_STRUCT.size
         payload_end = payload_start + len(payload)
