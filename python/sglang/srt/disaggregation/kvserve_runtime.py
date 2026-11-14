@@ -62,12 +62,10 @@ def parse_compression_config(values):
     return config
 
 
-def select_execution_backend(config, requested_backend):
+def select_execution_backend(config):
     """Keep the default codec fused; use the standard CUDA path for other profiles."""
     from kvserve_v1.compression.runtime import CompressionConfig
 
-    if requested_backend not in ("auto", "standard", "fused"):
-        raise ValueError("Unknown KVServe execution backend")
     default = CompressionConfig.from_extra_config(
         {"compression": {"enable-compression-pipeline": True}}
     )
@@ -79,13 +77,7 @@ def select_execution_backend(config, requested_backend):
         )
         == default
     )
-    if not is_default:
-        if requested_backend == "fused":
-            raise ValueError(
-                "KVServe fused execution requires the default codec profile"
-            )
-        return "standard"
-    return requested_backend
+    return "auto" if is_default else "standard"
 
 
 def prepare_runtime(kvc):
@@ -127,9 +119,7 @@ def prepare_runtime(kvc):
         if kvc.gpu_id in _runtimes:
             return
         config = parse_compression_config(json.loads(Path(path).read_text()))
-        backend = select_execution_backend(
-            config, os.environ.get("SGLANG_KVSERVE_EXECUTION_BACKEND", "auto")
-        )
+        backend = select_execution_backend(config)
         if kvc.page_size < 1 or config.logical_blocks_per_chunk % kvc.page_size:
             raise ValueError(
                 "KVServe chunk tokens must be divisible by native page size"
@@ -162,7 +152,10 @@ def prepare_runtime(kvc):
             device=device,
             warm_cpp_backend=True,
         )
-        from kvserve_v1.compression.runtime.fused_runtime import create_runtime
+        from kvserve_v1.compression.runtime.fused_runtime import (
+            FusedCompressionRuntime,
+            create_runtime,
+        )
 
         execution = {"prefill": "encode", "decode": "decode"}[mode]
         banks = 4 if mode == "prefill" else 0
@@ -183,12 +176,33 @@ def prepare_runtime(kvc):
             banks,
             config.pipeline,
         )
-        _runtimes[kvc.gpu_id] = runtime
+        runtimes = [runtime]
+        # A decoder can restore either representation, but the Prefill GPU may
+        # not support the fused encoder. Reserve both before sizing native KV.
+        if mode == "decode" and isinstance(runtime, FusedCompressionRuntime):
+            try:
+                runtimes.append(
+                    create_runtime(
+                        plan,
+                        "HND",
+                        1,
+                        device,
+                        backend="standard",
+                        output_slots=0,
+                        execution="decode",
+                        standard_backend="cpp",
+                    )
+                )
+            except BaseException:
+                runtime.shutdown()
+                raise
+        _runtimes[kvc.gpu_id] = tuple(runtimes)
         logger.info(
-            "KVServe reserved before KV sizing: owned=%d driver_estimate=%d bulk=%d",
-            runtime.plan.reserved_bytes - runtime.plan.retained_driver_bytes,
-            runtime.plan.retained_driver_bytes,
-            runtime.bulk.numel(),
+            "KVServe reserved before KV sizing: owned=%d driver_estimate=%d bulk=%d formats=%d",
+            sum(r.plan.reserved_bytes - r.plan.retained_driver_bytes for r in runtimes),
+            sum(r.plan.retained_driver_bytes for r in runtimes),
+            sum(r.bulk.numel() for r in runtimes),
+            len(runtimes),
         )
 
 

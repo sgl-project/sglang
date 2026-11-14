@@ -72,7 +72,7 @@ class OptimizedKVServeAdapter(KVServeAdapter):
     ):
         if self._source_pool is None:
             raise RuntimeError("Decode adapter cannot submit Prefill codec frames")
-        tokens_total, pool = self._prepare_send(
+        tokens_total, pool, peer = self._prepare_send(
             request, registration, source_ids, destination_ids, num_tokens
         )
         futures, transfers, frames = [], [], []
@@ -92,7 +92,7 @@ class OptimizedKVServeAdapter(KVServeAdapter):
                             self.send_frame,
                             room,
                             request,
-                            registration.kvserve,
+                            peer,
                             src,
                             dst_pages,
                             part,
@@ -271,7 +271,10 @@ class OptimizedKVServeAdapter(KVServeAdapter):
             return False
         if self._receive_pipeline_v2 is None:
             raise ValueError("Prefill adapter cannot accept restore READY frames")
-        self._receive_pipeline_v2.accept(msgspec.msgpack.decode(msg[1]))
+        metas = msgspec.msgpack.decode(msg[1])
+        self._receive_pipeline_v2.accept(
+            metas, before_enqueue=self.select_receive_profile
+        )
         return True
 
     def close(self):

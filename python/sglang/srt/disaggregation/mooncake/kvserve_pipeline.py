@@ -256,7 +256,7 @@ class RestorePipeline:
         for thread in self.waiters:
             thread.start()
 
-    def accept(self, metas):
+    def accept(self, metas, before_enqueue=None):
         # Reserve all slots atomically, before enqueue, so malformed duplicate
         # READY cannot grow an executor queue or reuse scratch behind the GPU.
         with self.condition:
@@ -278,6 +278,8 @@ class RestorePipeline:
                 slot in self.busy for slot in slots
             ):
                 raise ValueError("Duplicate or unsettled KVServe receive slot")
+            if before_enqueue is not None:
+                before_enqueue(metas)
             for slot, meta in zip(slots, metas):
                 self.busy[slot] = meta
             for meta in metas:

@@ -17,7 +17,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVSender,
 )
-from sglang.srt.disaggregation.mooncake.kvserve import ACK, KVServeAdapter
+from sglang.srt.disaggregation.mooncake.kvserve import ACK, READY, KVServeAdapter
+from sglang.srt.disaggregation.mooncake.kvserve_optimized import OptimizedKVServeAdapter
 from sglang.srt.disaggregation.mooncake.kvserve_pipeline import (
     EncodedTransferPipeline,
     RestorePipeline,
@@ -84,6 +85,79 @@ class TestAdapterProtocol(unittest.TestCase):
         ):
             with self.subTest(peer=other), self.assertRaises(ValueError):
                 self.adapter.validate_peer(other)
+
+    def test_sender_selects_matching_advertised_buffers(self):
+        def runtime(profile, ptr):
+            slot = SimpleNamespace(
+                arena_a=SimpleNamespace(data_ptr=lambda: ptr, numel=lambda: 4096),
+                aux=SimpleNamespace(data_ptr=lambda: ptr + 4096, numel=lambda: 128),
+            )
+            return SimpleNamespace(wire_profile=profile, slots=[slot, slot])
+
+        fused, standard = runtime("fused", 4096), runtime("standard", 16384)
+        self.adapter.runtime, self.adapter.runtimes = fused, (fused, standard)
+        peer = self.adapter.registration()
+        self.assertEqual(peer["profile"], "fused")
+        self.assertEqual(peer["alternatives"][0]["profile"], "standard")
+        self.adapter.runtime, self.adapter.runtimes = standard, (standard,)
+        selected = self.adapter.validate_peer(peer)
+        self.assertEqual(selected["slots"][0]["ptrs"], [16384, 20480])
+        for invalid in (
+            {**peer, "alternatives": []},
+            {**peer, "alternatives": [selected, selected]},
+            {**peer, "alternatives": [{**selected, "page_size": 16}]},
+        ):
+            with self.subTest(peer=invalid), self.assertRaises(ValueError):
+                self.adapter.validate_peer(invalid)
+
+    def test_ready_selects_one_advertised_profile_and_never_switches(self):
+        adapter = object.__new__(OptimizedKVServeAdapter)
+        fused = SimpleNamespace(wire_profile="fused")
+        standard = SimpleNamespace(wire_profile="standard")
+        adapter.runtime, adapter.runtimes = fused, (fused, standard)
+        adapter._receive_profile = None
+        adapter._closing = False
+        adapter.submit_lock = threading.Lock()
+        adapter._receive_pipeline_v2 = SimpleNamespace(
+            accept=Mock(side_effect=lambda metas, before_enqueue: before_enqueue(metas))
+        )
+
+        def send(metas):
+            return adapter.handle_ready([READY, msgspec.msgpack.encode(metas)])
+
+        for invalid in (
+            [],
+            [{"profile": []}],
+            [{"profile": "unknown"}],
+            [{"profile": "fused"}, {"profile": "standard"}],
+        ):
+            with self.subTest(metas=invalid), self.assertRaises(ValueError):
+                send(invalid)
+        self.assertIsNone(adapter._receive_profile)
+        self.assertTrue(send([{"profile": "standard"}]))
+        self.assertIs(adapter.runtime, standard)
+        self.assertTrue(send([{"profile": "standard"}]))
+        with self.assertRaises(ValueError):
+            send([{"profile": "fused"}])
+        self.assertEqual(adapter._receive_pipeline_v2.accept.call_count, 7)
+
+    def test_close_releases_all_advertised_runtimes(self):
+        fused = SimpleNamespace(shutdown=Mock())
+        standard = SimpleNamespace(shutdown=Mock())
+        self.adapter.runtime, self.adapter.runtimes = standard, (fused, standard)
+        self.adapter.poisoned = False
+        self.adapter.pending_lock = threading.Lock()
+        self.adapter.pending = {}
+        self.adapter.expected_rooms = {}
+        self.adapter.registered_ptrs = [4096, 8192]
+        self.adapter.notifier = SimpleNamespace(close=Mock())
+        self.adapter.manager.engine = SimpleNamespace(batch_deregister=Mock())
+        self.adapter.close()
+        self.adapter.manager.engine.batch_deregister.assert_called_once_with(
+            [4096, 8192]
+        )
+        fused.shutdown.assert_called_once()
+        standard.shutdown.assert_called_once()
 
     def test_duplicate_and_stale_ack_never_release_another_credit(self):
         self.adapter.epoch = "current"
@@ -410,6 +484,19 @@ class TestRestoreCompletion(unittest.TestCase):
             cuda=SimpleNamespace(device=lambda _: contextlib.nullcontext())
         )
         return RestorePipeline(adapter, fake_torch, KVPoll.Failed)
+
+    def test_profile_selection_runs_only_after_ready_validation(self):
+        adapter = FakeReceiveAdapter()
+        pipeline = self.make_pipeline(adapter)
+        self.addCleanup(pipeline.close)
+        self.addCleanup(lambda: [event.set() for event in adapter.completions])
+        select = Mock()
+        with self.assertRaises(ValueError):
+            pipeline.accept([{**ready(0, 0), "slot_id": 10}], before_enqueue=select)
+        select.assert_not_called()
+        frames = [ready(0, 0)]
+        pipeline.accept(frames, before_enqueue=select)
+        select.assert_called_once_with(frames)
 
     def test_ack_and_page_accounting_wait_for_each_restore(self):
         adapter = FakeReceiveAdapter()

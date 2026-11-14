@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import logging
 import os
 import threading
 import time
@@ -26,6 +27,7 @@ from sglang.srt.utils.network import NetworkAddress
 
 READY = b"KVSERVE_READY_V3"
 ACK = b"KVSERVE_ACK_V3"
+logger = logging.getLogger(__name__)
 
 
 def endpoint(host, port):
@@ -107,18 +109,30 @@ class KVServeAdapter:
         self.cache_blocks = min(x[0].shape[0] for x in caches.values())
         from sglang.srt.disaggregation.kvserve_runtime import take_runtime
 
-        self.runtime = take_runtime(self.device)
-        if self.runtime is None:
+        self.runtimes = take_runtime(self.device)
+        if not self.runtimes:
             raise RuntimeError(
                 "KVServe runtime was not reserved before KV cache sizing"
             )
-        plan = self.runtime.plan
-        if self.runtime.config != self.config:
-            raise ValueError("KVServe reserved plan does not match bound caches")
-        owned_bytes = plan.reserved_bytes - plan.retained_driver_bytes
-        self.runtime.bind_kv_caches(caches, {name: 0 for name in caches})
-        self.runtime.stream.synchronize()
-        ptrs, sizes = self.runtime.registered_memory()
+        self.runtime = self.runtimes[0]
+        ptrs, sizes = [], []
+        for runtime in self.runtimes:
+            if runtime.config != self.config or len(runtime.slots) != len(
+                self.runtime.slots
+            ):
+                raise ValueError("KVServe reserved plan does not match bound caches")
+            runtime.bind_kv_caches(caches, {name: 0 for name in caches})
+            runtime.stream.synchronize()
+            runtime_ptrs, runtime_sizes = runtime.registered_memory()
+            ptrs.extend(runtime_ptrs)
+            sizes.extend(runtime_sizes)
+        if len({runtime.wire_profile for runtime in self.runtimes}) != len(
+            self.runtimes
+        ):
+            raise ValueError("KVServe decode representations must be distinct")
+        owned_bytes = sum(
+            r.plan.reserved_bytes - r.plan.retained_driver_bytes for r in self.runtimes
+        )
         rc = manager.engine.batch_register(ptrs, sizes)
         if rc not in (None, 0):
             raise RuntimeError(f"Failed to register KVServe buffers: {rc}")
@@ -130,6 +144,7 @@ class KVServeAdapter:
         self.pending = {}
         self.credit_pools = {}
         self.submit_lock = threading.Lock()
+        self._receive_profile = None
         self.notifier = InlineNotifications(
             manager._send_multipart_locked, self.control_failed, self.record
         )
@@ -152,10 +167,12 @@ class KVServeAdapter:
             {
                 "event": "init",
                 "profile": self.runtime.wire_profile,
-                "reserved_bytes": plan.reserved_bytes,
+                "reserved_bytes": sum(r.plan.reserved_bytes for r in self.runtimes),
                 "owned_plan_bytes": owned_bytes,
-                "driver_retention_estimate_bytes": plan.retained_driver_bytes,
-                "bulk_bytes": self.runtime.bulk.numel(),
+                "driver_retention_estimate_bytes": sum(
+                    r.plan.retained_driver_bytes for r in self.runtimes
+                ),
+                "bulk_bytes": sum(r.bulk.numel() for r in self.runtimes),
                 "cache_blocks": self.cache_blocks,
                 "raw_per_token": self.raw_per_token,
                 "config": values,
@@ -187,19 +204,50 @@ class KVServeAdapter:
                 f.write(json.dumps({"time": time.time(), **value}) + "\n")
 
     def registration(self):
-        return {
-            "version": 3,
-            "profile": self.runtime.wire_profile,
-            "page_size": self.page_size,
-            "has_mamba": self.has_mamba,
-            "slots": [
-                {
-                    "ptrs": [slot.arena_a.data_ptr(), slot.aux.data_ptr()],
-                    "capacities": [slot.arena_a.numel(), slot.aux.numel()],
-                }
-                for slot in self.runtime.slots
-            ],
-        }
+        def describe(runtime):
+            return {
+                "version": 3,
+                "profile": runtime.wire_profile,
+                "page_size": self.page_size,
+                "has_mamba": self.has_mamba,
+                "slots": [
+                    {
+                        "ptrs": [slot.arena_a.data_ptr(), slot.aux.data_ptr()],
+                        "capacities": [slot.arena_a.numel(), slot.aux.numel()],
+                    }
+                    for slot in runtime.slots
+                ],
+            }
+
+        profiles = [describe(r) for r in getattr(self, "runtimes", (self.runtime,))]
+        if len(profiles) > 1:
+            profiles[0]["alternatives"] = profiles[1:]
+        return profiles[0]
+
+    def select_receive_profile(self, metas):
+        if (
+            not isinstance(metas, list)
+            or not metas
+            or any(
+                not isinstance(meta, dict) or not isinstance(meta.get("profile"), str)
+                for meta in metas
+            )
+        ):
+            raise ValueError("Invalid KVServe READY metadata")
+        profiles = {meta.get("profile") for meta in metas}
+        if len(profiles) != 1:
+            raise ValueError("KVServe READY frames use different profiles")
+        profile = profiles.pop()
+        with self.submit_lock:
+            if self._closing:
+                raise RuntimeError("KVServe adapter is closing")
+            runtimes = {r.wire_profile: r for r in self.runtimes}
+            if profile not in runtimes or self._receive_profile not in (None, profile):
+                raise ValueError("KVServe receive profile is not available")
+            if self._receive_profile is None:
+                logger.info("KVServe selected receive profile: %s", profile)
+            self.runtime = runtimes[profile]
+            self._receive_profile = profile
 
     def expect_room(self, room, indices, is_dummy):
         if not is_dummy:
@@ -269,7 +317,21 @@ class KVServeAdapter:
 
     def validate_peer(self, peer):
         local = self.registration()["slots"]
-        remote = peer.get("slots", []) if isinstance(peer, dict) else []
+        alternatives = peer.get("alternatives", []) if isinstance(peer, dict) else []
+        if not isinstance(alternatives, list):
+            raise ValueError("Invalid KVServe peer representations")
+        matches = [
+            candidate
+            for candidate in [peer, *alternatives]
+            if isinstance(candidate, dict)
+            and candidate.get("profile") == self.runtime.wire_profile
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "KVServe peer is disabled or uses an incompatible compression profile"
+            )
+        peer = matches[0]
+        remote = peer.get("slots", [])
         if (
             not isinstance(peer, dict)
             or peer.get("version") != 3
@@ -290,6 +352,7 @@ class KVServeAdapter:
             raise ValueError(
                 "KVServe peer is disabled or uses an incompatible compression profile"
             )
+        return peer
 
     def digest(self, sizes, slot_id):
         slot = self.runtime.slots[slot_id]
@@ -325,7 +388,7 @@ class KVServeAdapter:
     def _prepare_send(
         self, request, registration, source_ids, destination_ids, num_tokens
     ):
-        self.validate_peer(registration.kvserve)
+        peer = self.validate_peer(registration.kvserve)
         if len(source_ids) != len(destination_ids):
             raise ValueError("KVServe source/destination page counts differ")
         num_tokens = (
@@ -335,9 +398,9 @@ class KVServeAdapter:
         with self.pending_lock:
             pool = self.credit_pools.setdefault(
                 request.mooncake_session_id,
-                ReceiveCredits(len(registration.kvserve["slots"])),
+                ReceiveCredits(len(peer["slots"])),
             )
-        return num_tokens, pool
+        return num_tokens, pool, peer
 
     def _frame_chunks(self, source_ids, destination_ids, num_tokens):
         page_chunk = self.chunk_size // self.page_size
@@ -507,4 +570,5 @@ class KVServeAdapter:
                 )
         self.notifier.close()
         self.manager.engine.batch_deregister(self.registered_ptrs)
-        self.runtime.shutdown()
+        for runtime in getattr(self, "runtimes", (self.runtime,)):
+            runtime.shutdown()

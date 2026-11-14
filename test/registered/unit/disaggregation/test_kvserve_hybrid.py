@@ -68,6 +68,7 @@ class TestHybridPlan(unittest.TestCase):
         self.plan = types.SimpleNamespace(reserved_bytes=99, retained_driver_bytes=1)
         self.api.build_memory_plan = Mock(return_value=self.plan)
         self.fused = types.ModuleType("kvserve_v1.compression.runtime.fused_runtime")
+        self.fused.FusedCompressionRuntime = type("FakeFused", (), {})
         self.fused.create_runtime = Mock(
             return_value=types.SimpleNamespace(
                 plan=self.plan, bulk=types.SimpleNamespace(numel=lambda: 64)
