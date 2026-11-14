@@ -409,6 +409,7 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
+            decoding_req_ids = None
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 is_middle_chunk = req is batch.chunked_req
@@ -488,10 +489,16 @@ class SchedulerBatchResultProcessor:
                         req.update_finish_state()
                     # A mixed spec tail committed its pending bonus token; advance
                     # so the next spec prepare_for_decode reserves from the right base.
+                    if decoding_req_ids is None:
+                        decoding_req_ids = (
+                            {id(r) for r in batch.decoding_reqs}
+                            if batch.decoding_reqs
+                            else ()
+                        )
+                    is_decoding_req = id(req) in decoding_req_ids
                     if (
                         not req.finished()
-                        and batch.decoding_reqs
-                        and req in batch.decoding_reqs
+                        and is_decoding_req
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.commit_decode(1)

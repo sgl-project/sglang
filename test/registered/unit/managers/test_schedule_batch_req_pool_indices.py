@@ -66,5 +66,71 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         )
 
 
+class TestFilterBatchReqsToExclude(unittest.TestCase):
+    def _make_filter_req(self, rid: str, finished: bool = False):
+        return types.SimpleNamespace(
+            rid=rid,
+            finished=lambda: finished,
+            return_logprob=False,
+            grammar=None,
+            beam_group=None,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+        )
+
+    def test_filter_batch_excludes_specified_and_finished_reqs(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        r0 = self._make_filter_req("r0")
+        r1 = self._make_filter_req("r1")
+        r2 = self._make_filter_req("r2", finished=True)
+        r3 = self._make_filter_req("r3")
+        batch = ScheduleBatch(
+            reqs=[r0, r1, r2, r3],
+            device="cpu",
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            sampling_info=MagicMock(),
+            spec_info=None,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            multimodal_inputs=None,
+            req_pool_indices=torch.arange(4, dtype=torch.int64),
+            req_pool_indices_cpu=torch.arange(4, dtype=torch.int64),
+            seq_lens=torch.ones(4, dtype=torch.int64),
+            orig_seq_lens=torch.ones(4, dtype=torch.int64),
+        )
+
+        batch.filter_batch(reqs_to_exclude=[r1])
+
+        self.assertEqual([r.rid for r in batch.reqs], ["r0", "r3"])
+        self.assertTrue(
+            torch.equal(
+                batch.req_pool_indices_cpu, torch.tensor([0, 3], dtype=torch.int64)
+            )
+        )
+
+
+class TestHf3fsRankMetadataSet(unittest.TestCase):
+    def test_rank_metadata_release_and_delete_deduplicate_free_pages(self):
+        from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
+            RankMetadata,
+        )
+
+        meta = RankMetadata(num_pages=4)
+        alloc = meta.reserve_and_allocate_page_indices([("k0", ""), ("k1", "")])
+        self.assertEqual(alloc, [(False, 3), (False, 2)])
+        self.assertEqual(meta.free_pages, [0, 1])
+        self.assertEqual(meta.free_pages_set, {0, 1})
+
+        meta.confirm_write([("k0", 3)], [2, 2, 1])
+        self.assertEqual(meta.free_pages, [0, 1, 2])
+        self.assertEqual(meta.free_pages_set, {0, 1, 2})
+
+        deleted = meta.delete_keys(["k0", "missing"])
+        self.assertEqual(deleted, 1)
+        self.assertEqual(meta.free_pages, [0, 1, 2, 3])
+        self.assertEqual(meta.free_pages_set, {0, 1, 2, 3})
+
+
 if __name__ == "__main__":
     unittest.main()
