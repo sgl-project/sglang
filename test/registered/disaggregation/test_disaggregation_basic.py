@@ -40,6 +40,8 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.pause_generate_url = cls.lb_url
         cls.pause_target_urls = [cls.prefill_url, cls.decode_url]
+        cls.extra_prefill_args = ["--admin-api-key", ADMIN_API_KEY_FOR_TEST]
+        cls.extra_decode_args = ["--admin-api-key", ADMIN_API_KEY_FOR_TEST]
         cls.launch_all()
 
     def test_gsm8k(self):
@@ -617,6 +619,8 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             "--max-running-requests",
             str(cls.MAX_RUNNING),
             "--enable-metrics",
+            "--admin-api-key",
+            ADMIN_API_KEY_FOR_TEST,
         ]
         cls.launch_all()
 
@@ -639,12 +643,14 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             async with session.post(
                 self.prefill_url + "/pause_generation",
                 json={"mode": mode},
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
             async with session.post(
                 self.prefill_url + "/continue_generation",
                 json={},
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
@@ -712,6 +718,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             async with session.post(
                 url,
                 json=json_data,
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp.raise_for_status()

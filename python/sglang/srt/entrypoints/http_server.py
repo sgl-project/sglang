@@ -1664,7 +1664,7 @@ async def check_weights(
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
     when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
@@ -1874,7 +1874,7 @@ async def separate_reasoning_request(
 
 
 @app.post("/pause_generation")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def pause_generation(
     obj: Annotated[PauseGenerationReqInput, Body()], request: Request
 ):
@@ -1887,7 +1887,7 @@ async def pause_generation(
 
 
 @app.post("/continue_generation")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def continue_generation(
     obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
 ):
