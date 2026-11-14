@@ -194,9 +194,9 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         if (
             cfg.disaggregation_mode != "null"
-            and cfg.disaggregation_transfer_backend != "mooncake"
+            and cfg.disaggregation_transfer_backend not in ("mooncake", "mori")
         ):
-            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
+            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake or MoRI.")
         if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,

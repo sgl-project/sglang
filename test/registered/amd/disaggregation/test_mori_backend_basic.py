@@ -263,5 +263,36 @@ class TestMoriPpDsaStatePairing(CustomTestCase):
                 manager._submit_batch_transfer_plan.assert_not_called()
 
 
+class TestMoriDraftRingState(unittest.TestCase):
+    def test_ring_rows_pair_only_where_both_dcp_ranks_own_the_position(self):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.pp_size = 1
+        manager.state_mem_descs = [["s-ring"], ["s-floor"]]
+        manager.kv_args = SimpleNamespace(
+            state_types=["draft_ring", "request_row"],
+            state_item_lens=[[64], [4]],
+            state_dim_per_tensor=[[], []],
+            state_layer_ids=[[], []],
+        )
+        manager._submit_batch_transfer_plan = Mock(return_value=[])
+        peer = SimpleNamespace(
+            dst_state_mem_descs=[["d-ring"], ["d-floor"]],
+            dst_state_item_lens=[[64], [4]],
+            dst_state_dim_per_tensor=[[], []],
+            dst_state_layer_ids=[[], []],
+        )
+        src = [np.array([5, 0, 7, 9], dtype=np.int32), np.array([11], dtype=np.int32)]
+        dst = [np.array([3, 4, 0, 8], dtype=np.int32), np.array([2], dtype=np.int32)]
+
+        manager.send_state(peer, src, dst)
+
+        ring = mori_conn.BatchTransferPlan([5 * 64, 9 * 64], [3 * 64, 8 * 64], [64, 64])
+        floor = mori_conn.BatchTransferPlan([11 * 4], [2 * 4], [4])
+        self.assertEqual(
+            manager._submit_batch_transfer_plan.call_args_list,
+            [call("s-ring", "d-ring", ring), call("s-floor", "d-floor", floor)],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
