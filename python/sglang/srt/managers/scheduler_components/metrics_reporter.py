@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.forward_pass_metrics import (
     ScheduledRequestMetrics,
     WelfordAccumulator,
@@ -443,10 +444,16 @@ class SchedulerMetricsReporter:
         sum_prefill_kv_tokens = 0
         prefill_lengths = WelfordAccumulator()
 
+        # convert_decode_to_extend (DP attention) leaves a decode batch in EXTEND
+        # mode with every request in decoding_reqs; it still only decodes.
+        is_decode_viewed_as_extend = batch.forward_mode == ForwardMode.EXTEND and bool(
+            batch.decoding_reqs
+        )
+
         if batch.forward_mode.is_mixed():
             decode_req_ids = {id(req) for req in batch.decoding_reqs or []}
             prefill_reqs = [req for req in batch.reqs if id(req) not in decode_req_ids]
-        elif batch.forward_mode.is_extend():
+        elif batch.forward_mode.is_extend() and not is_decode_viewed_as_extend:
             prefill_reqs = batch.reqs
         else:
             prefill_reqs = []
@@ -465,7 +472,7 @@ class SchedulerMetricsReporter:
         if batch.forward_mode.is_mixed():
             for req in batch.decoding_reqs or []:
                 decode_kv.add(req.seqlen)
-        elif batch.forward_mode.is_decode():
+        elif batch.forward_mode.is_decode() or is_decode_viewed_as_extend:
             # Sync-free spec-v2 lens leave decode batches without a host mirror.
             if batch.seq_lens_cpu is None:
                 for req in batch.reqs:
