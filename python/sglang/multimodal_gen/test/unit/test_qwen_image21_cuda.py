@@ -618,20 +618,21 @@ def test_padded_prefix_replays_one_graph_across_prompt_lengths(
             stage._bcg_run(runner, warmup, model)
         assert len(runner.entries) == 2
         replays.clear()
-        lengths = (2, 7, 8, 13, 16)
+        lengths = (2, 7, 8, 13, 16, 2)
         for seed, text_tokens in enumerate(lengths, start=20):
             kwargs = prompt_inputs_hd128(seed, text_tokens)
             with set_forward_context(
                 None, None, Req(sampling_params=QwenImage21SamplingParams())
             ):
                 model(**kwargs)
-                kwargs["timestep"].fill_(300.0)
-                expected = model(**kwargs)
-                padded = stage._bcg_pad_prompt_kwargs(kwargs, current_model=model)
-                torch.testing.assert_close(model(**padded), expected, atol=0, rtol=0)
-                actual = stage._bcg_run(runner, kwargs, model)
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        assert len(replays) == len(lengths)
+                for timestep in (300.0, 100.0):
+                    kwargs["timestep"].fill_(timestep)
+                    expected = model(**kwargs)
+                    padded = stage._bcg_pad_prompt_kwargs(kwargs, current_model=model)
+                    torch.testing.assert_close(model(**padded), expected, atol=0, rtol=0)
+                    actual = stage._bcg_run(runner, kwargs, model)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert len(replays) == 2 * len(lengths)
         assert len(runner.entries) == 2
     finally:
         runner.reset()

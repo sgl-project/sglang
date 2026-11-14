@@ -50,11 +50,18 @@ def pad_qwen_image21_prompt_kwargs(
     bucket = next((bucket for bucket in buckets if seq <= bucket), None)
     if bucket is None:
         return call_kwargs
-    rows = torch.stack(
-        [tensor for cache in caches[0] for tensor in (cache["key"], cache["value"])]
-    )
-    prefix_kv = rows.new_zeros(*rows.shape[:2], bucket, *rows.shape[3:])
-    prefix_kv[:, :, bucket - seq :] = rows
+    packed = caches[0][0].get("bcg_prefix")
+    if packed is None or packed[0] != bucket:
+        rows = torch.stack(
+            [tensor for cache in caches[0] for tensor in (cache["key"], cache["value"])]
+        )
+        prefix_kv = rows.new_zeros(*rows.shape[:2], bucket, *rows.shape[3:])
+        prefix_kv[:, :, bucket - seq :] = rows
+        # Prefix K/V is immutable after prefill. Keep one bucket with the
+        # request's cache, including when warmup visits several buckets.
+        packed = (bucket, prefix_kv, torch.tensor(bucket - seq))
+        caches[0][0]["bcg_prefix"] = packed
+    _, prefix_kv, prefix_pad = packed
     return dict(
         call_kwargs,
         encoder_hidden_states=None,
@@ -63,7 +70,7 @@ def pad_qwen_image21_prompt_kwargs(
         layouts=[{"target_rope": call_kwargs["layouts"][0]["target_rope"]}],
         prefix_caches=None,
         prefix_kv=prefix_kv,
-        prefix_pad=torch.tensor(bucket - seq),
+        prefix_pad=prefix_pad,
     )
 
 
