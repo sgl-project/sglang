@@ -417,12 +417,28 @@ class _Dumper:
     def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
+        *,
+        spec_role: Optional[str] = None,
     ) -> Optional["_NonIntrusiveDumper"]:
+        """Hook *model* for non-intrusive dumping.
+
+        ``spec_role`` ("draft" / "target") tags every dump these hooks emit.
+        Pass it when speculative decoding runs two model runners in one
+        process. Which model a forward belongs to is a property of the runner,
+        not of the forward: the forward mode names the execution shape, and a
+        draft path may borrow a target mode (DSPARK's draft block runs as
+        ``TARGET_VERIFY``), so the mode alone cannot name the model. Because
+        the role never changes it is bound here rather than re-set per forward
+        via ``set_ctx``, a process-wide value the second runner would clobber.
+        Leave it None for a single-runner process to keep names unchanged.
+        """
         self._http_manager  # noqa: B018
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None
-        non_intrusive = _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
+        non_intrusive = _NonIntrusiveDumper(
+            dumper=self, model=model, mode=mode, spec_role=spec_role
+        )
         self._non_intrusives.append(non_intrusive)
         return non_intrusive
 
@@ -662,10 +678,14 @@ class _NonIntrusiveDumper:
         dumper: _Dumper,
         model: "torch.nn.Module",
         mode: str,
+        spec_role: Optional[str] = None,
     ):
         self._dumper = dumper
         self._mode = mode
         self._handles: list = []
+        # Splatted into every dump() below; empty when no role was bound, so
+        # a single-runner process keeps its existing tags and filenames.
+        self._role_tags: dict = {"spec_role": spec_role} if spec_role else {}
         self._core_fields: frozenset[str] = frozenset().union(
             *(p.core_fields() for p in _plugins)
         )

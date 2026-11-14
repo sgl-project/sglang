@@ -2215,6 +2215,68 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         assert "non_intrusive__layer.output" in captured
 
 
+class TestNonIntrusiveSpecRole(_NonIntrusiveTestBase):
+    """Tests for spec_role — the runner identity bound at registration.
+
+    Speculative decoding runs a draft and a target model runner in one
+    process, and DSPARK's draft block borrows ForwardMode.TARGET_VERIFY, so
+    forward_mode names the execution shape rather than the model. The role is
+    a property of the runner, so it is bound once per registration instead of
+    re-set per forward.
+    """
+
+    class _Inner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def _register_pair(self, d):
+        draft = self._wrap_as_outer(self._Inner)
+        target = self._wrap_as_outer(self._Inner)
+        d.register_non_intrusive_dumper(draft, spec_role="draft")
+        d.register_non_intrusive_dumper(target, spec_role="target")
+        return draft, target
+
+    def test_absent_when_not_passed(self, tmp_path):
+        """A single-runner process keeps its existing tags and filenames."""
+        d = self._make_dumper(tmp_path)
+        model = self._wrap_as_outer(self._Inner)
+        d.register_non_intrusive_dumper(model)
+
+        model(torch.randn(2, 4))
+
+        _assert_files(_get_filenames(tmp_path), not_exist=["spec_role"])
+
+    def test_tags_filenames_per_runner(self, tmp_path):
+        d = self._make_dumper(tmp_path)
+        draft, target = self._register_pair(d)
+
+        x = torch.randn(2, 4)
+        draft(x)
+        target(x)
+
+        _assert_files(
+            _get_filenames(tmp_path), exist=["spec_role=draft", "spec_role=target"]
+        )
+
+    def test_is_filterable(self, tmp_path):
+        d = self._make_dumper(tmp_path, filter='spec_role == "draft"')
+        draft, target = self._register_pair(d)
+
+        x = torch.randn(2, 4)
+        draft(x)
+        target(x)
+
+        _assert_files(
+            _get_filenames(tmp_path),
+            exist=["spec_role=draft"],
+            not_exist=["spec_role=target"],
+        )
+
+
 class _LayerWithNumber(torch.nn.Module):
     """Test helper: module with a ``layer_number`` attribute (Megatron style)."""
 
