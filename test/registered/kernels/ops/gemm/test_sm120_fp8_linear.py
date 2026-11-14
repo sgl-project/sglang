@@ -27,6 +27,7 @@ SUPPORTED_CONFIGS = [
     ("Qwen3.8-27B", "attn-qkv", 8192, 5120, ALL_M),
     ("Qwen3.8-27B", "gdn-in", 16384, 5120, (1, 2, 4, 8)),
     ("Qwen3.8-27B", "out", 5120, 6144, ALL_M),
+    ("Qwen3.8-27B-TP2", "out", 5120, 3072, (2, 4, 8)),
     ("Qwen3-8B/Llama-3.1-8B", "qkv", 6144, 4096, (1,)),
     ("Qwen3-8B/Llama-3.1-8B", "o", 4096, 4096, ALL_M),
     ("Qwen3-14B", "qkv", 7168, 5120, ALL_M),
@@ -48,6 +49,7 @@ UNSUPPORTED_CONFIGS = [
     pytest.param((2, 4, 8, 9), 5376, 4096, id="nemotron-shared-up"),
     pytest.param((2, 4, 8, 9), 4096, 5376, id="nemotron-shared-down"),
     pytest.param((8,), 6144, 4096, id="qwen3-8b-qkv"),
+    pytest.param((3, 9), 5120, 3072, id="qwen38-tp2-out"),
 ]
 
 

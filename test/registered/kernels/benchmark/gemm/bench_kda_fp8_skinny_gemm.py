@@ -76,6 +76,7 @@ PROJECTIONS = [
     ("Qwen3.8-27B/gdn-in", 16384, 5120),
     ("Qwen3.8-27B/attn-qkv", 8192, 5120),
     ("Qwen3.8-27B/out", 5120, 6144),
+    ("Qwen3.8-27B-TP2/out", 5120, 3072),
     ("Qwen3-8B+Llama-3.1-8B/qkv", 6144, 4096),
     ("Qwen3-8B+Llama-3.1-8B/o", 4096, 4096),
     ("Qwen3-8B/gate-up", 24576, 4096),
