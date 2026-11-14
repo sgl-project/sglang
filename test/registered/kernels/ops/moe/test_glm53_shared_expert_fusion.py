@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 # backend-specific: exercises AITER's gfx950 block-FP8 fused-MoE path.
-register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(
@@ -228,10 +228,10 @@ class TestGlm53SharedExpertFusion(CustomTestCase):
         torch.testing.assert_close(fused, separate, rtol=0.05, atol=0.02)
 
     @torch.inference_mode()
-    def test_tp4_tp8_retained_buckets_match_separate_reference(self):
+    def test_tp2_tp4_tp8_retained_buckets_match_separate_reference(self):
         """A wrong appended ID, non-unit shared weight, or incompatible weight
         layout silently changes model output while every operator still runs."""
-        for tp_size in (4, 8):
+        for tp_size in (2, 4, 8):
             weights = self._make_weights(tp_size)
             for tokens in self.TOKEN_BUCKETS:
                 with self.subTest(tp_size=tp_size, tokens=tokens):
@@ -246,7 +246,7 @@ class TestGlm53SharedExpertFusion(CustomTestCase):
     def test_fused_operator_replays_under_cuda_graph(self):
         """The serving path captures decode; eager-only correctness would miss
         graph-unsafe allocations or stale shared routing tensors."""
-        for tp_size in (4, 8):
+        for tp_size in (2, 4, 8):
             weights = self._make_weights(tp_size)
             inputs = self._inputs(8, tp_size)
             _, eager = self._separate_and_fused(inputs, weights)
