@@ -279,6 +279,10 @@ def test_comfy_weight_patches_on_an_sgld_model_are_rejected() -> None:
     assert patcher.add_patches({}) == []
     with pytest.raises(ValueError, match="SGLDLoraLoader"):
         patcher.add_patches({"diffusion_model.blocks.0.attn.to_q.weight": ()}, 1.0)
+    with pytest.raises(ValueError, match="cannot apply ComfyUI model patches"):
+        patcher.set_model_patch(object(), "double_block")
+    with pytest.raises(ValueError, match="cannot apply ComfyUI model patches"):
+        patcher.set_model_patch_replace(object(), "dit", "single_block", 0)
 
 
 def test_failed_lora_switch_is_not_recorded_as_active() -> None:

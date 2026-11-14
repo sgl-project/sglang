@@ -472,3 +472,9 @@ def test_control_is_rejected_for_adapters_that_do_not_apply_it() -> None:
         )
     assert FluxAdapter.applied_conditioning == ("control",)
     assert ZImageAdapter.applied_conditioning == ()
+
+
+def test_executor_transformer_blocks_access_raises_clear_error() -> None:
+    ex = _RowRecordingExecutor(ZImageAdapter())
+    with pytest.raises(ValueError, match="cannot apply ComfyUI model patches"):
+        _ = ex.transformer_blocks
