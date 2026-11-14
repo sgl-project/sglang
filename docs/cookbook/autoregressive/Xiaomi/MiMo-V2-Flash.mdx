@@ -52,6 +52,12 @@ pip install sglang==0.5.6.post2.dev8005+pr.15207.g39d5bd57a \
   --extra-index-url https://sgl-project.github.io/whl/pr/
 ```
 
+### Ascend NPU
+
+On Ascend A3 Series, SGLang is deployed with the Ascend CANN software stack. Follow the [Ascend NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) for the component version mapping (CANN, TorchNPU, Triton, SGLang NPU kernel, MemFabric) — all components must come from the same version set, do not mix versions across sets. The quick path is the prebuilt image listed in [Ascend NPU quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start).
+
+The NPU recipe uses the W8A8 INT8 weights [MiMo-V2-Flash-W8A8](https://www.modelscope.cn/models/iridiumine/MiMo-V2-Flash-W8A8) (ModelScope, 311.5 GB). Download them to a directory readable from all nodes and set it as `MODEL_PATH`.
+
 ## Model Deployment
 
 Use the configuration selector below to automatically generate the appropriate deployment command.
@@ -61,6 +67,8 @@ import { MiMoV2FlashDeployment } from "/src/snippets/autoregressive/mimo-v2-flas
 <MiMoV2FlashDeployment />
 
 MI355X (ROCm) is validated in the selector above with `--tp-size 4`, Triton attention, and `--disable-custom-all-reduce`. `--tp-size 8` hit a QKV sharding error during validation. EAGLE speculative decoding is still WIP on MI355X.
+
+Ascend A3 is validated in the selector above with the 2-node PD-disaggregated recipe (1 prefill node + 1 decode node + router). See [Ascend NPU deployment](#ascend-npu-deployment-a3-series) for environment setup and verification notes.
 
 ## Testing the deployment
 
@@ -94,6 +102,19 @@ curl http://localhost:30000/v1/chat/completions \
   }]
 }
 ```
+
+## Ascend NPU deployment (A3 Series)
+
+The `A3` option in the configuration selector emits the validated 2-node PD-disaggregated recipe: a prefill node (TP8 / DP2, NPU graph off) and a decode node (TP16, EAGLE speculative decoding), bridged by the SGLang router. Each A3 card exposes 2 dies, so `--tp-size` counts dies, not cards; the recipe fills both 8-card nodes — prefill runs TP8 with DP2 (16 dies) and decode runs TP16 (16 dies), 16 cards (32 dies) in total.
+
+### PD disaggregation notes
+
+- Cross-node KV transfer uses the Ascend transfer backend (`--disaggregation-transfer-backend ascend`), which needs the `memfabric_hybrid` package on both nodes. It is part of the reference component set from the installation guide.
+- `ASCEND_MF_STORE_URL` points at the prefill node and must be reachable from the decode node.
+- Source the CANN environment (`set_env.sh`) in every shell that starts a server or the router.
+- Send client requests to the router endpoint (default `http://<router-host>:6688`), not to the role servers.
+
+For the full set of tuned configurations and benchmark data, see the [MiMo-V2-Flash Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash).
 
 ## Troubleshooting
 
