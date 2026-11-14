@@ -23,6 +23,9 @@ class CacheConfig:
     decoder_swa_bounded_replay: bool = False
 
     enable_mamba_extra_buffer: bool = False
+    enable_mamba_extra_buffer_lazy: bool = False
+    # Two ping-pong tracking slots with the overlap scheduler, one without.
+    enable_overlap_schedule: bool = True
     mamba_cache_size: int = 20
     mamba_intermediate_size: int = 256
     mamba_n_groups: int = 1

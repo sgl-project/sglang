@@ -774,7 +774,7 @@ fn one_way_control_bypasses_request_ring_capacity() {
 #[test]
 fn oversized_rid_is_rejected() {
     let mut req = generate_req(51, SamplingParams::default());
-    req.rid = "x".repeat(MAX_RID_LEN + 1).into();
+    req.rid = Rid::from_client(&"x".repeat(MAX_RID_LEN + 1));
     let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
     assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("over the"), "{err}");
@@ -783,6 +783,47 @@ fn oversized_rid_is_rejected() {
     let mut req = generate_req(52, SamplingParams::default());
     req.rid = "0123456789abcdef0123456789abcdef".into();
     assert!(validate(&mut req, &test_limits()).is_ok());
+}
+
+#[test]
+fn namespaced_rids_are_accepted_without_rewriting() {
+    for byte_len in [32, 128, 129, 200, MAX_RID_LEN] {
+        let public_id = format!("caller_namespace_{}", "x".repeat(byte_len - 17));
+        assert_eq!(public_id.len(), byte_len);
+        let mut req = generate_req(53, SamplingParams::default());
+        req.rid = Rid::from_client(&public_id);
+        assert!(validate(&mut req, &test_limits()).is_ok(), "{byte_len}");
+        assert_eq!(req.rid.client_facing(), public_id);
+    }
+}
+
+#[test]
+fn rid_limit_counts_client_utf8_bytes_not_private_suffix() {
+    let public_id = "é".repeat(MAX_RID_LEN / 2);
+    let mut req = generate_req(54, SamplingParams::default());
+    req.rid = Rid::from_client(&public_id);
+    assert!(req.rid.len() > MAX_RID_LEN);
+    assert!(validate(&mut req, &test_limits()).is_ok());
+    assert_eq!(req.rid.client_facing(), public_id);
+
+    let oversized = format!("{public_id}x");
+    req.rid = Rid::from_client(&oversized);
+    let error = validate(&mut req, &test_limits()).expect_err("one extra byte exceeds the cap");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("rid is {} bytes", MAX_RID_LEN + 1))
+    );
+}
+
+#[test]
+fn oversized_client_rid_never_registers_or_reaches_scheduler() {
+    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let mut req = generate_req(55, SamplingParams::default());
+    req.rid = Rid::from_client(&"x".repeat(MAX_RID_LEN + 1));
+    intake.drive(req);
+    assert!(detok_rx.try_recv().is_err());
+    assert!(consumer.drain(8).is_empty());
 }
 
 /// A request rejected BEFORE `register_detok` must not send `Deregister`: the

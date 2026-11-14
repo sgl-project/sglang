@@ -96,6 +96,7 @@ def set_mla_kv_buffer_kernel_norope(
     kv_buffer_ptr,
     cache_k_nope_ptr,
     loc_ptr,
+    reserved_skip_index,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
@@ -115,9 +116,11 @@ def set_mla_kv_buffer_kernel_norope(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    is_valid = loc != reserved_skip_index
+    safe_loc = tl.where(is_valid, loc, 0)
     dst_ptr = (
         kv_buffer_ptr
-        + paged_row_offset(loc, PAGE_STRIDE, buffer_stride, PAGE_SIZE)
+        + paged_row_offset(safe_loc, PAGE_STRIDE, buffer_stride, PAGE_SIZE)
         + offs
     )
 
@@ -125,7 +128,7 @@ def set_mla_kv_buffer_kernel_norope(
         cache_k_nope_ptr + pid_loc * nope_stride + offs,
         mask=mask,
     )
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -163,12 +166,7 @@ def set_mla_kv_buffer_naive(
     has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
 
     loc = loc.to(torch.int64)
-    if has_rope:
-        is_valid = loc != reserved_skip_index
-    else:
-        # set_mla_kv_buffer_kernel_norope takes no skip index and writes every
-        # loc; keep the two paths bit-identical rather than fixing it here.
-        is_valid = torch.ones_like(loc, dtype=torch.bool)
+    is_valid = loc != reserved_skip_index
     if dcp_world_size > 1:
         is_valid &= loc % dcp_world_size == dcp_rank
     dst = loc[is_valid] // dcp_world_size
@@ -264,6 +262,7 @@ def _set_mla_kv_buffer_impl(
             kv_buffer,
             cache_k_nope,
             loc,
+            reserved_skip_index,
             row_stride,
             cache_k_nope.stride(0),
             nope_dim,
