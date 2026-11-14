@@ -124,12 +124,12 @@ def test_context_projection_uses_the_same_norm_convention(gemma):
 
 @pytest.mark.parametrize(
     "activation,alpha,limit",
-    [("silu", 1.0, 7.0), ("swigluoai", 1.702, 7.0), ("swigluoai", 0.75, 2.5)],
+    [("silu", 1.0, None), ("swigluoai", 1.702, 7.0), ("swigluoai", 0.75, 2.5)],
 )
 def test_mlp_matches_activation_formula_including_saturated_inputs(
     activation, alpha, limit
 ):
-    mlp = dflash.DFlashMLP(
+    mlp = dflash.DFlashMLP.from_config(
         _config(hidden_act=activation, swiglu_alpha=alpha, swiglu_limit=limit)
     )
     with torch.no_grad():
