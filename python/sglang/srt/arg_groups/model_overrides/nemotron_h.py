@@ -108,7 +108,9 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     elif (is_modelopt or model_config.quantization is None) and (
         cfg.moe_runner_backend == "auto"
     ):
-        if get_platform().is_sm100 and cfg.moe_a2a_backend == "none":
+        if get_platform().is_hip and quantization == "modelopt_fp8":
+            overrides["moe_runner_backend"] = "triton"
+        elif get_platform().is_sm100 and cfg.moe_a2a_backend == "none":
             overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(
                 f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
