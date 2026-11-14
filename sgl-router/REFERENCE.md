@@ -423,8 +423,8 @@ templates are fixture-verified against SGLang's request normalization, so they f
 chat except multimodal ones and those with caller-provided `input_ids`. Renderers
 without that verification (HF Jinja templates)
 forward only plain text chat requests (string `content`, no tools, no template
-kwargs or reasoning controls or historical `reasoning_content`, no assistant
-continuation, no consecutive users or non-leading system turns) and warn
+kwargs or reasoning controls or historical `reasoning_content` or `reasoning`, no
+assistant continuation, no consecutive users or non-leading system turns) and warn
 `UNVERIFIED` at startup; every other request shape is rendered for routing
 only. A `continue_final_message` prefix is tokenized on its own with the special
 tokens the tokenizer adds around a text, less one leading BOS, as SGLang's
