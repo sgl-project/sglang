@@ -125,22 +125,12 @@ impl StreamingToolHandler {
     }
 
     /// Process an SSE event and determine what action to take
-    pub fn process_event(&mut self, event_name: Option<&str>, data: &str) -> StreamAction {
-        // Always feed to accumulator for storage
-        self.accumulator.ingest_block(&format!(
-            "{}data: {}",
-            event_name
-                .map(|n| format!("event: {}\n", n))
-                .unwrap_or_default(),
-            data
-        ));
+    pub fn process_event(&mut self, event_name: Option<&str>, parsed: &Value) -> StreamAction {
+        // The streaming loop parses each payload once and shares that value
+        // with the accumulator, tool-state transition, and forwarding path.
+        self.accumulator.ingest_event(event_name, parsed);
 
-        let parsed: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => return StreamAction::Forward,
-        };
-
-        match get_event_type(event_name, &parsed) {
+        match get_event_type(event_name, parsed) {
             ResponseEvent::CREATED => {
                 if self.original_response_id.is_none() {
                     self.original_response_id = parsed
@@ -152,12 +142,12 @@ impl StreamingToolHandler {
                 StreamAction::Forward
             }
             ResponseEvent::COMPLETED => StreamAction::Forward,
-            OutputItemEvent::ADDED => self.handle_output_item_added(&parsed),
-            FunctionCallEvent::ARGUMENTS_DELTA => self.handle_arguments_delta(&parsed),
-            FunctionCallEvent::ARGUMENTS_DONE => self.handle_arguments_done(&parsed),
-            OutputItemEvent::DELTA => self.process_output_delta(&parsed),
+            OutputItemEvent::ADDED => self.handle_output_item_added(parsed),
+            FunctionCallEvent::ARGUMENTS_DELTA => self.handle_arguments_delta(parsed),
+            FunctionCallEvent::ARGUMENTS_DONE => self.handle_arguments_done(parsed),
+            OutputItemEvent::DELTA => self.process_output_delta(parsed),
             OutputItemEvent::DONE => {
-                if let Some(output_index) = extract_output_index(&parsed) {
+                if let Some(output_index) = extract_output_index(parsed) {
                     self.ensure_output_index(output_index);
                 }
                 if self.has_complete_calls() {
