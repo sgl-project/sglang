@@ -1531,6 +1531,12 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
             shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
+            bounded_lpm_enabled=self.dllm_config is None,
+        )
+        self.policy._on_bounded_state_change = lambda active: (
+            self.waiting_queue.set_on_leave(
+                self.policy.retire_waiting_members if active else None
+            )
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -4669,12 +4675,22 @@ class Scheduler(
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        bounded_active = self.policy._bounded_active
+        candidates = (
+            self.policy.admission_candidates(self.waiting_queue)
+            if bounded_active
+            else self.waiting_queue
+        )
+        for req in candidates:
+            if bounded_active and not self.policy.allows_admission(req):
+                break
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4684,6 +4700,8 @@ class Scheduler(
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
             ):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4717,6 +4735,8 @@ class Scheduler(
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    if bounded_active:
+                        self.policy.mark_admission_skipped(req)
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4744,6 +4764,8 @@ class Scheduler(
             ):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
@@ -4751,6 +4773,8 @@ class Scheduler(
                 if not staging_ready:
                     if defer_cow_slot:
                         self._drop_unadmitted_match(req)
+                    if bounded_active:
+                        self.policy.mark_admission_skipped(req)
                     continue
             res = adder.add_one_req(
                 req,
