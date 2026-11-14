@@ -1,6 +1,7 @@
 """Unit tests for srt/parser/reasoning_parser.py"""
 
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
@@ -181,6 +182,26 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         # State is cleared, so a second finish() is a no-op.
         self.assertEqual(detector._buffer, "")
         self.assertEqual(detector.finish().reasoning_text, "")
+
+    def test_get_think_end_token_ids_prefers_native_id(self):
+        # split_special_tokens=True makes encode() split a special-added marker
+        # into ordinary ids, so the grammar gate waits for a sequence the model
+        # never emits (#47205). The native vocab id must win.
+        tokenizer = SimpleNamespace(
+            unk_token_id=0,
+            convert_tokens_to_ids=lambda token: 200007,
+            encode=lambda text, add_special_tokens=False: [27, 91, 419, 91, 29],
+        )
+        self.assertEqual(self.detector.get_think_end_token_ids(tokenizer), [200007])
+
+    def test_get_think_end_token_ids_falls_back_to_encode_for_unknown_token(self):
+        # A marker absent from the vocabulary still resolves by encoding.
+        tokenizer = SimpleNamespace(
+            unk_token_id=0,
+            convert_tokens_to_ids=lambda token: 0,
+            encode=lambda text, add_special_tokens=False: [10, 20, 30],
+        )
+        self.assertEqual(self.detector.get_think_end_token_ids(tokenizer), [10, 20, 30])
 
 
 class TestDeepSeekR1Detector(CustomTestCase):

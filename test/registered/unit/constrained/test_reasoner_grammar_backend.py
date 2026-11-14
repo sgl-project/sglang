@@ -43,11 +43,20 @@ register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 
 class _DummyTokenizer:
+    unk_token_id = 0
+
     def __init__(self, token_map):
         self._token_map = token_map
 
     def encode(self, text, add_special_tokens=False):
         return list(self._token_map.get(text, []))
+
+    def convert_tokens_to_ids(self, token):
+        if token not in self._token_map:
+            return self.unk_token_id
+        return (
+            self._token_map[token][0] if self._token_map[token] else self.unk_token_id
+        )
 
 
 class _DummyGrammarBackend(BaseGrammarBackend):
