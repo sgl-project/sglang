@@ -352,10 +352,27 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             LRURefreshPhase::Walkdown => {}
             LRURefreshPhase::MatchEnd | LRURefreshPhase::InsertEnd => {
                 let window = self.sliding_window_size + tree_core.page_size;
+                let stamps_joint_lru = tree_core.joint_lru.is_some();
+                let mut refreshed = Vec::new();
                 let (lru, arena) = tree_core.device_lru_list_mut_with_arena(SWA);
                 lru.reset_node_and_window_ancestors_mru(node_id, window, arena, |node| {
-                    node.has_device_value(SWA)
+                    let included = node.has_device_value(SWA);
+                    if included && stamps_joint_lru {
+                        refreshed.push(node.idx);
+                    }
+                    included
                 });
+                if !refreshed.is_empty() {
+                    // The first refreshed (deepest) node is the newest, as in the
+                    // refreshed SWA LRU order.
+                    let newest_tick = tree_core
+                        .arena
+                        .get_and_batch_bump_access_counter(refreshed.len() as i64);
+                    let joint_lru = tree_core.joint_lru.as_mut().expect("checked above");
+                    for (i, idx) in refreshed.into_iter().enumerate() {
+                        joint_lru.set_swa_tick(idx, newest_tick - i as i64);
+                    }
+                }
             }
         }
     }
@@ -788,7 +805,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             // The SWA LRU filters its own transfer/request locks. A Full load
             // pin can also cover an ancestor outside the loaded SWA window,
             // whose separately restored SWA rows remain independently evictable.
-            if tree_core.evictable_device_leaves.contains(x) {
+            if !tree_core.component_state(SWA).evict_device_strip_only
+                && tree_core.evictable_device_leaves.contains(x)
+            {
                 break 'step Some(x);
             }
             let node = tree_core.arena.node(x);
