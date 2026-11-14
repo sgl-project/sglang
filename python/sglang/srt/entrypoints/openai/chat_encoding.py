@@ -62,7 +62,7 @@ def resolve_chat_encoding_spec(
 def spec_supports_inline_system(spec: Optional[str]) -> bool:
     """Native encoders verified to render mid-conversation system messages in place."""
     # K3's tokenizer renders in Python, so there is no Jinja source to probe.
-    return spec == "kimi_k3"
+    return spec in ("kimi_k3", "dsv41")
 
 
 def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
