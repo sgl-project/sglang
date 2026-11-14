@@ -37,6 +37,9 @@ class DllmAlgorithm:
     reuse_forward_metadata: bool = False
     supported_attention_backends: Tuple[str, ...] = ()
     capture_input_preparation: bool = False
+    # Blocks starting with a mask take their first token from the previous
+    # block's last-position prediction, returned per request as the algo state.
+    inherits_next_token: bool = False
 
     def __init__(self, config: DllmConfig):
         self.block_size = config.block_size

@@ -1229,6 +1229,10 @@ class Req(ReqDllmMixin):
             block_size = self.dllm_config.block_size
             committed_len = len(self.origin_input_ids) + len(self.output_ids)
             max_prefix_len = min(max_prefix_len, committed_len)
+            if self.dllm_config.inherits_next_token:
+                # Re-run the last committed block so its forward predicts the
+                # first token of the next block.
+                max_prefix_len = min(max_prefix_len, committed_len - 1)
             max_prefix_len = max_prefix_len // block_size * block_size
         return max(max_prefix_len, 0)
 
