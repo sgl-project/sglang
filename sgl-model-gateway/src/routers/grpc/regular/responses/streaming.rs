@@ -51,7 +51,7 @@ use crate::{
             streaming::{OutputItemType, ResponseStreamEventEmitter},
             ResponsesContext,
         },
-        mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
+        mcp_utils::{extract_server_label, RequestMcpTools, DEFAULT_MAX_ITERATIONS},
     },
 };
 
@@ -418,6 +418,7 @@ impl StreamingResponseAccumulator {
 /// continues with the next streaming iteration.
 pub(super) async fn execute_tool_loop_streaming(
     ctx: &ResponsesContext,
+    request_mcp: Arc<RequestMcpTools>,
     current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
@@ -434,6 +435,7 @@ pub(super) async fn execute_tool_loop_streaming(
     tokio::spawn(async move {
         let result = execute_tool_loop_streaming_internal(
             &ctx_clone,
+            &request_mcp,
             current_request,
             &original_request_clone,
             headers,
@@ -485,6 +487,7 @@ pub(super) async fn execute_tool_loop_streaming(
 /// Internal streaming tool loop implementation
 async fn execute_tool_loop_streaming_internal(
     ctx: &ResponsesContext,
+    request_mcp: &RequestMcpTools,
     mut current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
@@ -514,7 +517,7 @@ async fn execute_tool_loop_streaming_internal(
     emitter.send_event(&event, &tx)?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = ctx.mcp_manager.list_tools();
+    let mcp_tools = request_mcp.list_tools();
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     trace!(
         "Streaming: Converted {} MCP tools to chat format",
@@ -716,8 +719,7 @@ async fn execute_tool_loop_streaming_internal(
                     tool_call.arguments
                 );
                 let tool_start = Instant::now();
-                let (output_str, success, error) = match ctx
-                    .mcp_manager
+                let (output_str, success, error) = match request_mcp
                     .call_tool(tool_call.name.as_str(), tool_call.arguments.as_str())
                     .await
                 {

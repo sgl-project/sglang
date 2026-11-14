@@ -6,12 +6,10 @@
 //! - MCP metadata builders
 //! - Conversation history loading
 
-use std::sync::Arc;
-
 use axum::response::Response;
 use data_connector::{self, ConversationId, ResponseId};
 use serde_json::{json, Value};
-use smg_mcp::{self as mcp, McpManager};
+use smg_mcp as mcp;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -24,7 +22,7 @@ use crate::{
             ResponseOutputItem, ResponsesRequest,
         },
     },
-    routers::{error, grpc::common::responses::ResponsesContext},
+    routers::{error, grpc::common::responses::ResponsesContext, mcp_utils::RequestMcpTools},
 };
 
 // ============================================================================
@@ -178,11 +176,10 @@ pub(super) fn generate_mcp_id(prefix: &str) -> String {
 
 /// Build mcp_list_tools output item
 pub(super) fn build_mcp_list_tools_item(
-    mcp: &Arc<McpManager>,
+    mcp: &RequestMcpTools,
     server_label: &str,
-    server_keys: &[String],
 ) -> ResponseOutputItem {
-    let tools = mcp.list_tools_for_servers(server_keys);
+    let tools = mcp.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|t| McpToolInfo {

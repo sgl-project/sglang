@@ -28,7 +28,7 @@ use crate::{
             },
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
-        mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
+        mcp_utils::{extract_server_label, RequestMcpTools, DEFAULT_MAX_ITERATIONS},
     },
 };
 
@@ -46,18 +46,12 @@ pub(crate) async fn serve_harmony_responses_stream(
         Err(err_response) => return err_response,
     };
 
-    // Check MCP connection BEFORE starting stream and get whether MCP tools are present
-    let (has_mcp_tools, server_keys) =
+    // Check MCP connection BEFORE starting stream and get the MCP tools this request may use
+    let request_mcp =
         match ensure_mcp_connection(&ctx.mcp_manager, current_request.tools.as_deref()).await {
             Ok(result) => result,
             Err(response) => return response,
         };
-
-    // Set the server keys in the context
-    {
-        let mut servers = ctx.requested_servers.write().unwrap();
-        *servers = server_keys;
-    }
 
     // Create SSE channel
     let (tx, rx) = mpsc::unbounded_channel();
@@ -91,9 +85,16 @@ pub(crate) async fn serve_harmony_responses_stream(
             return;
         }
 
-        if has_mcp_tools {
-            execute_mcp_tool_loop_streaming(ctx, current_request, &request, &mut emitter, &tx)
-                .await;
+        if let Some(request_mcp) = request_mcp {
+            execute_mcp_tool_loop_streaming(
+                ctx,
+                &request_mcp,
+                current_request,
+                &request,
+                &mut emitter,
+                &tx,
+            )
+            .await;
         } else {
             execute_without_mcp_streaming(ctx, &current_request, &request, &mut emitter, &tx).await;
         }
@@ -113,6 +114,7 @@ pub(crate) async fn serve_harmony_responses_stream(
 /// - Persists response internally
 async fn execute_mcp_tool_loop_streaming(
     ctx: &ResponsesContext,
+    request_mcp: &RequestMcpTools,
     mut current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     emitter: &mut ResponseStreamEventEmitter,
@@ -131,10 +133,7 @@ async fn execute_mcp_tool_loop_streaming(
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
     // Add filtered MCP tools (static + requested dynamic) to the request
-    let mcp_tools = {
-        let servers = ctx.requested_servers.read().unwrap();
-        ctx.mcp_manager.list_tools_for_servers(&servers)
-    };
+    let mcp_tools = request_mcp.list_tools();
     if !mcp_tools.is_empty() {
         let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
         let mut all_tools = current_request.tools.clone().unwrap_or_default();
@@ -351,7 +350,7 @@ async fn execute_mcp_tool_loop_streaming(
                 // Execute MCP tools (if any)
                 let mcp_results = if !mcp_tool_calls.is_empty() {
                     match execute_mcp_tools(
-                        &ctx.mcp_manager,
+                        request_mcp,
                         &mcp_tool_calls,
                         &mut mcp_tracking,
                         &current_request.model,
