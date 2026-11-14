@@ -1637,6 +1637,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._selector_sample = (candidate_ids, q_rows)
         return tokens.view(bs, num_pred)
 
+    def _broadcast_selector_draft(self, draft_next: torch.Tensor) -> torch.Tensor:
+        # Ranks sample the selector with their own uniforms and scores, but only
+        # rank 0's accept length and bonus are broadcast; verify rank 0's draft
+        # everywhere so token histories cannot split.
+        draft_next = self._tp_sync.sync(
+            SpecTpSyncSite.DFLASH_SELECTOR, draft_next.contiguous()
+        )
+        if self._selector_sample is not None:
+            candidate_ids, q_rows = self._selector_sample
+            self._selector_sample = (
+                self._tp_sync.sync(
+                    SpecTpSyncSite.DFLASH_SELECTOR, candidate_ids.contiguous()
+                ),
+                self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, q_rows.contiguous()),
+            )
+        return draft_next
+
     def _selector_sampling_accept(
         self,
         *,
@@ -2550,6 +2567,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 return_iteration_ids=True,
+                before_sample=(
+                    grammar_barrier if batch.mixed_decode_rows_have_grammar() else None
+                ),
             )
             iteration_ids, batch_output.iteration_ids = batch_output.iteration_ids, None
 
@@ -3034,6 +3054,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     ),
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
+
+        if self.selector is not None or self.lilicorr is not None:
+            draft_next = self._broadcast_selector_draft(draft_next)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])

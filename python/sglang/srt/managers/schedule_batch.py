@@ -2219,6 +2219,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             and not self.spec_algorithm.supports_grammar_overlap()
         )
 
+    def mixed_decode_rows_have_grammar(self) -> bool:
+        # These rows are sampled in the extend forward, so their bitmask must see
+        # the previous batch's committed tokens.
+        return self.forward_mode.is_mixed() and any(
+            req.grammar is not None for req in self.decoding_reqs or ()
+        )
+
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
     ):

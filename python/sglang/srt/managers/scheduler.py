@@ -2286,7 +2286,16 @@ class Scheduler(
                 return True
 
         # The next batch's grammar bitmask needs this result's FSM advance.
-        return last_batch.grammar_needs_sync()
+        if last_batch.grammar_needs_sync():
+            return True
+        # A mixed batch samples its decode rows in the target extend, with no verify()
+        # barrier, so a worker without a mixed barrier needs this result first.
+        return (
+            self.is_mixed_chunk
+            and last_batch.has_grammar
+            and not last_batch.spec_algorithm.is_none()
+            and not last_batch.spec_algorithm.supports_mixed_grammar_barrier()
+        )
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
