@@ -465,3 +465,102 @@ def attn_res_all_gather(
         write_prefix=write_prefix,
     )
     return output
+
+
+_PREFILL_SP_AG = "prefill_sp_all_gather"
+_PREFILL_SP_COMM = None
+_PREFILL_SP_COMM_INIT = False
+
+
+def prefill_sp_comm():
+    global _PREFILL_SP_COMM, _PREFILL_SP_COMM_INIT
+    if _PREFILL_SP_COMM_INIT:
+        return _PREFILL_SP_COMM
+    _PREFILL_SP_COMM_INIT = True
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+    from sglang.srt.utils.common import get_device_sm
+
+    group = get_parallel().tp_group
+    comm = group.ca_comm
+    if (
+        get_device_sm() not in (100, 103)
+        or group.world_size not in _SUPPORTED_WORLD_SIZES
+        or not isinstance(comm, CustomAllReduceV2)
+        or comm.disabled
+        or not comm.has_multicast
+        or not getattr(comm, "pull_enabled", True)
+        or not k3_ar_fusion.enabled()
+    ):
+        logger.info("K3.1 prefill SP tail: no multicast pull plane; using NCCL.")
+        return None
+    from sglang.kernels.ops.communication import sp_collective
+
+    sp_collective.register_comm(comm.obj)
+    _PREFILL_SP_COMM = comm
+    logger.info(
+        "K3.1 prefill SP tail: pull RS / direct AG on the TP%d multicast plane",
+        group.world_size,
+    )
+    return comm
+
+
+def _pull_tuning(comm, num_blocks: int, block_size: int):
+    from sglang.kernels.ops.communication import sp_collective
+
+    try:
+        cap = int(comm.config.num_pull_blocks)
+    except Exception:
+        cap = num_blocks
+    return sp_collective.Tuning(max(1, min(num_blocks, cap)), block_size)
+
+
+def prefill_sp_reduce_scatter(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    *,
+    num_blocks: int,
+    block_size: int = 1024,
+) -> torch.Tensor:
+    group = get_parallel().tp_group
+    comm = prefill_sp_comm()
+    mc_ptr = k3_ar_fusion.find_mc_ptr(x) if comm is not None else None
+    if comm is not None and mc_ptr is not None:
+        from sglang.kernels.ops.communication import sp_collective
+
+        return sp_collective.reduce_scatter_pull(
+            group.world_size,
+            x,
+            out,
+            residual,
+            input_mc_ptr=mc_ptr,
+            tuning=_pull_tuning(comm, num_blocks, block_size),
+        )
+    group.reduce_scatter_tensor(out, x)
+    if residual is not None:
+        out.add_(residual)
+    return out
+
+
+def prefill_sp_all_gather(
+    x: torch.Tensor, *, num_blocks: int, block_size: int = 1024
+) -> torch.Tensor:
+    group = get_parallel().tp_group
+    rows = x.shape[0] * group.world_size
+    comm = prefill_sp_comm()
+    if comm is not None and x.dtype == torch.bfloat16 and x.is_contiguous():
+        from sglang.kernels.ops.communication import sp_collective
+
+        out = k3_ar_fusion.symm_buffer(_PREFILL_SP_AG, rows, x.shape[1], x.dtype)
+        return sp_collective.all_gather_direct(
+            group.world_size,
+            x,
+            out,
+            output_mc_ptr=k3_ar_fusion.get_mc_ptr(out),
+            tuning=_pull_tuning(comm, num_blocks, block_size),
+        )
+    out = x.new_empty((rows, *x.shape[1:]))
+    group.all_gather_into_tensor(out, x.contiguous())
+    return out
