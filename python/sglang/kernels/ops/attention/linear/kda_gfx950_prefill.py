@@ -3,7 +3,9 @@
 
 ``TritonKDAKernel.extend`` tries :func:`extend` first on ROCm. It returns None for
 anything the kernel does not cover, and the caller keeps the Triton ``chunk_kda``
-path. Used on gfx950 only.
+path. Used on gfx950 only. Batch-invariant mode keeps ``chunk_kda``: the kernel's
+launch layout follows the batch's longest sequence, so a long sequence's rows
+depend on its batchmates.
 
 The kernel is ``attention.kda_prefill_gfx950`` (``KernelBackend.KDA``), implemented
 in ``sglang.kernels.kda_kernels.kda_prefill_gfx950``.
@@ -18,6 +20,7 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
 
 @lru_cache(maxsize=1)
@@ -58,6 +61,7 @@ def extend(
     track_ssm_h_src = kwargs.get("track_ssm_h_src")
     if not (
         available()
+        and not is_batch_invariant_mode_enabled()
         # spec-decode extends stay on the reference path
         and not kwargs.get("is_spec_decode", False)
         # breakable prefill CUDA graphs pass padded chunk tables
