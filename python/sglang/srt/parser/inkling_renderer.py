@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import uuid
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from sglang.srt.parser.inkling_tokenizer import (
 )
 
 INKLING_DEFAULT_REASONING_EFFORT = 0.9
+_THINKING_EFFORT_PREFIX = "Thinking effort level:"
 
 TML_RENDERERS_INSTALL_HINT = (
     "Serving Inkling requires the `tml-renderers` package (TML's reference "
@@ -40,9 +42,12 @@ def load_tml_renderers() -> SimpleNamespace:
         from tml_renderers import chat, tokenizers, v0
     except ImportError as exc:
         raise ImportError(TML_RENDERERS_INSTALL_HINT) from exc
-    tokenizer = tokenizers.o200k_base_chat()
+    tokenizer = tokenizers.O200kBaseChatTokenizer()
     return SimpleNamespace(
-        chat=chat, v0=v0, tokenizer=tokenizer, renderer=v0.Renderer(tokenizer)
+        chat=chat,
+        v0=v0,
+        tokenizer=tokenizer,
+        renderer=v0.Renderer(tokenizer),
     )
 
 
@@ -50,28 +55,39 @@ def render_inkling_messages(
     messages: Sequence[Mapping[str, Any]],
     *,
     tools: Sequence[Mapping[str, Any]] | None = None,
+    tool_choice: str | Mapping[str, Any] | None = "auto",
+    parallel_tool_calls: bool = True,
     reasoning_effort: float | None = None,
 ) -> list[int]:
-    """Media parts emit one placeholder each for later MM expansion.
-    Inkling samples its own assistant header."""
+    """Media parts emit one placeholder each; Inkling samples its own assistant header.
+    The tool-choice instruction joins the first system message."""
     tml = load_tml_renderers()
     media_marker = f"sglang-inkling-media-{uuid.uuid4().hex}:"
     oss_messages, media_kinds = _to_oss_messages(messages, media_marker)
-    if tools:
-        oss_messages.insert(
-            _leading_system_count(oss_messages), _tool_declare_message(tools)
-        )
-    native = [
-        _resolve_media(message, tml.chat, media_marker, media_kinds)
-        for oss_message in tml.chat.OpenAIMessage.from_oss_messages(oss_messages)
-        for message in oss_message.to_messages()
-    ]
+    tools = _tools_for_choice(tools=tools, tool_choice=tool_choice)
     effort = (
         INKLING_DEFAULT_REASONING_EFFORT
         if reasoning_effort is None
         else reasoning_effort
     )
-    spans, _parser = tml.renderer.render_for_completion_with_effort(native, effort)
+    oss_messages.insert(
+        _leading_system_count(oss_messages), _thinking_effort_message(effort)
+    )
+    if tools:
+        instruction = _tool_choice_instruction(
+            tool_choice=tool_choice, parallel_tool_calls=parallel_tool_calls
+        )
+        if instruction is not None:
+            oss_messages[0] = _with_appended_text(
+                message=oss_messages[0], text=instruction
+            )
+        oss_messages.insert(0, _tool_declare_message(tools))
+    native = [
+        _resolve_media(message, tml.chat, media_marker, media_kinds)
+        for oss_message in tml.chat.OpenAIMessage.from_oss_messages(oss_messages)
+        for message in oss_message.to_messages()
+    ]
+    spans, _parser = tml.renderer.render_for_completion(native)
     return _spans_to_input_ids(spans, tml)
 
 
@@ -189,6 +205,72 @@ def _leading_system_count(messages: Sequence[Mapping[str, Any]]) -> int:
     return count
 
 
+def _thinking_effort_message(effort: float) -> dict[str, Any]:
+    if not math.isfinite(effort) or not 0.0 <= effort <= 1.0:
+        raise ValueError(f"Inkling reasoning effort must be in [0, 1], got {effort}")
+    return {
+        "role": "system",
+        "content": f"{_THINKING_EFFORT_PREFIX} {round(effort, 2):g}",
+    }
+
+
+def _tools_for_choice(
+    *,
+    tools: Sequence[Mapping[str, Any]] | None,
+    tool_choice: str | Mapping[str, Any] | None,
+) -> Sequence[Mapping[str, Any]] | None:
+    if not tools or tool_choice == "none":
+        return None
+    name = _chosen_function_name(tool_choice)
+    if name is None:
+        return tools
+    chosen = [
+        tool for tool in tools if (tool.get("function") or {}).get("name") == name
+    ]
+    if not chosen:
+        raise ValueError(f"tool_choice names an undeclared function: {name!r}")
+    return chosen
+
+
+def _tool_choice_instruction(
+    *, tool_choice: str | Mapping[str, Any] | None, parallel_tool_calls: bool
+) -> str | None:
+    name = _chosen_function_name(tool_choice)
+    if name is not None:
+        target = f"the function named {json.dumps(name)}"
+        if parallel_tool_calls:
+            return f"Call {target} in your next response."
+        return f"Call {target} exactly once in your next response."
+    if tool_choice == "required":
+        quantity = "at least one" if parallel_tool_calls else "exactly one"
+        return f"Call {quantity} of the provided functions in your next response."
+    if tool_choice not in (None, "auto"):
+        raise ValueError(f"unsupported tool_choice: {tool_choice!r}")
+    if parallel_tool_calls:
+        return None
+    return "If you call a function, call at most one function in your next response."
+
+
+def _chosen_function_name(tool_choice: str | Mapping[str, Any] | None) -> str | None:
+    if not isinstance(tool_choice, Mapping):
+        return None
+    name = (tool_choice.get("function") or {}).get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"named tool_choice needs a function name: {tool_choice!r}")
+    return name
+
+
+def _with_appended_text(*, message: Mapping[str, Any], text: str) -> dict[str, Any]:
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        content = f"{content}\n\n{text}"
+    elif content is None or isinstance(content, str):
+        content = text
+    else:
+        content = [*content, {"type": "text", "text": text}]
+    return {**message, "content": content}
+
+
 def _tool_declare_message(tools: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     declared = []
     for tool in tools:
@@ -214,7 +296,11 @@ def _spans_to_input_ids(spans: Sequence[Any], tml: SimpleNamespace) -> list[int]
         if isinstance(span, tml.chat.EncodedTextTokenSpan):
             input_ids.extend(span.tokens)
         elif isinstance(span, tml.chat.ImageAssetPointerTokenSpan):
-            _append_media_placeholder(input_ids, span.location, tml.tokenizer)
+            _append_media_placeholder(
+                input_ids,
+                location=span.location,
+                tokenizer=tml.tokenizer,
+            )
         else:
             raise ValueError(
                 f"unexpected TMLv0 span in Inkling prompt: {type(span).__name__}"
@@ -223,7 +309,10 @@ def _spans_to_input_ids(spans: Sequence[Any], tml: SimpleNamespace) -> list[int]
 
 
 def _append_media_placeholder(
-    input_ids: list[int], location: str, tokenizer: Any
+    input_ids: list[int],
+    *,
+    location: str,
+    tokenizer: Any,
 ) -> None:
     if location.startswith(_IMAGE_LOCATION_PREFIX):
         input_ids.append(IMAGE_TOKEN_ID)
