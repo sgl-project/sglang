@@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_cfg_group
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -54,10 +55,18 @@ class SenseNovaU1GenerationOptions:
 
 
 class SenseNovaU1GenerationStage(PipelineStage):
-    def __init__(self, model: torch.nn.Module, tokenizer: Any):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        tokenizer: Any,
+        *,
+        enable_cfg_parallel: bool = False,
+    ):
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
+        # Every CFG rank runs this stage; the model splits the branches by rank.
+        self.enable_cfg_parallel = enable_cfg_parallel
 
     @property
     def role_affinity(self) -> RoleType:
@@ -117,6 +126,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             t_eps=options.t_eps,
             think_mode=options.think_mode,
             seed=seed,
+            cfg_group=get_cfg_group() if self.enable_cfg_parallel else None,
         )
         think_text = None
         if options.think_mode:

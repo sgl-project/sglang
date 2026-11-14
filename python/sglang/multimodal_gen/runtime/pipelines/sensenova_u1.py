@@ -7,6 +7,7 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
+    validate_sensenova_u1_parallelism,
 )
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1SamplingParams,
@@ -49,22 +50,18 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         if loaded_modules is not None and {"model", "tokenizer"} <= set(loaded_modules):
             return loaded_modules
 
-        if server_args.num_gpus != 1:
-            raise ValueError(
-                "SenseNovaU1Pipeline currently supports num_gpus=1. "
-                "Native tensor/pipeline parallelism is not implemented yet."
-            )
+        validate_sensenova_u1_parallelism(server_args)
         modules = load_model_and_tokenizer(self.model_path, server_args)
         logger.info("Loaded SenseNova-U1 model from %s", self.model_path)
         return modules
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        del server_args
         self.add_stage(InputValidationStage())
         self.add_stage(
             SenseNovaU1GenerationStage(
                 model=self.get_module("model"),
                 tokenizer=self.get_module("tokenizer"),
+                enable_cfg_parallel=server_args.enable_cfg_parallel,
             ),
             "sensenova_u1_generation_stage",
         )
