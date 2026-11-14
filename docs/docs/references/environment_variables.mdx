@@ -678,7 +678,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Configure the custom memory pool type for Mooncake. Supports <code>NVLINK</code>, <code>BAREX</code>, <code>INTRA_NODE_NVLINK</code>. If set to <code>true</code>, it defaults to <code>NVLINK</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Configure the custom memory pool type for Mooncake. Supports <code>NVLINK</code>, <code>BAREX</code>, <code>INTRA_NODE_NVLINK</code>, <code>AMD_GEM</code>. If set to <code>true</code>, it defaults to <code>NVLINK</code>. <code>AMD_GEM</code> (ROCm) keeps the KV pools in amdgpu GEM BOs so that registering them for RDMA does not exhaust the KFD allocation limit; see <a href="../advanced_features/pd_disaggregation#amd-gpus-kv-pools-in-amdgpu-gem-bos">PD disaggregation</a>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
 </tbody>
