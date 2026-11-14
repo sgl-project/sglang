@@ -719,6 +719,55 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertEqual(rp, "qwen3")
         self.assertEqual(tcp, "qwen")
 
+    def test_plain_json_tool_call_format_detects_qwen_parser(self):
+        # The Qwen2.5 / Qwen3-Instruct / Ling-mini chat templates document the
+        # plain-JSON tool-call format and carry no enable_thinking toggle, so
+        # the qwen3 rule (which keys on that toggle) cannot fire for them and
+        # they used to fall through to "no tool-call parser".
+        templates = {
+            # The format is documented inside a Jinja string literal, where
+            # the JSON quotes are escaped.
+            "escaped_json_key": (
+                '{{- "\\n<tool_call>\\n{\\"name\\": <function-name>, '
+                '\\"arguments\\": <args-json-object>}\\n</tool_call>\\n" }}'
+            ),
+            # The template renders a tool call back to the model, where the
+            # JSON quotes are not escaped.
+            "plain_json_key": (
+                "{%- for tool_call in message.tool_calls %}\n"
+                '{{- \'\\n<tool_call>\\n{"name": "\' }}\n'
+                "{{- tool_call.name }}\n"
+                '{{- \'", "arguments": \' }}\n'
+                "{{- tool_call.arguments | tojson }}\n"
+                "{{- '}\\n</tool_call>' }}\n"
+                "{%- endfor %}"
+            ),
+        }
+        for name, template in templates.items():
+            with self.subTest(name=name):
+                force, config = detect_reasoning_pattern(template)
+                result = detect_tool_call_parser(
+                    template, _DummyTokenizer([]), config, force
+                )
+                self.assertEqual(result, "qwen")
+
+    def test_tool_call_tag_without_json_name_is_not_qwen(self):
+        # The XML-KV tool format (GLM style) shares the tool-call tag but has
+        # no JSON payload, so the plain-JSON rule must not claim it.
+        template = (
+            "<tool_call>get_weather\n"
+            "<arg_key>city</arg_key><arg_value>Paris</arg_value>\n"
+            "</tool_call>"
+        )
+        force, config = detect_reasoning_pattern(template)
+        result = detect_tool_call_parser(template, _DummyTokenizer([]), config, force)
+        self.assertIsNone(result)
+
+    def test_qwen25_plain_json_template_detects_qwen_tool_call_parser(self):
+        rp, tcp = self._detect_all("Qwen/Qwen2.5-0.5B-Instruct")
+        self.assertIsNone(rp)
+        self.assertEqual(tcp, "qwen")
+
     def test_tool_call_parser_rule_values_via_snippets(self):
         """Table-driven: verify tool-call rule values differ from reasoning where expected."""
         cases = [
@@ -983,6 +1032,8 @@ class TestToolCallParserDetection(unittest.TestCase):
         )
         self.assertLess(tool_index["step3"], tool_index["deepseek_v3"])
         self.assertLess(tool_index["qwen3_coder"], tool_index["qwen"])
+        self.assertLess(tool_index["qwen"], tool_index["qwen_json_tool_call"])
+        self.assertLess(tool_index["qwen_json_tool_call"], tool_index["deepseek_v3"])
 
     def test_xml_kv_requires_both_arg_tokens(self):
         template = "Hello {{ user }}"

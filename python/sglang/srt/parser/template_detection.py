@@ -498,6 +498,22 @@ def _is_qwen3_coder(ctx):
     return ctx.has_text("<function=") and ctx.has_text("<parameter=")
 
 
+def _is_qwen_json_tool_call(ctx):
+    # Plain-JSON tool-call format:
+    #   <tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>
+    # Used by the Qwen2.5 / Qwen3-Instruct / Ling-mini chat templates. Those
+    # templates have no ``enable_thinking`` toggle, so the qwen3 rule (which
+    # keys on that toggle) cannot fire for them and they fell through to "no
+    # tool-call parser", which returns tool calls as plain text.
+    #
+    # The JSON key appears either escaped (``\"name\":``) where the template
+    # documents the format inside a Jinja string literal, or plain
+    # (``"name":``) where the template renders a tool call back to the model.
+    return ctx.has_text("<tool_call>") and (
+        ctx.has_text('"name":') or ctx.has_text('\\"name\\":')
+    )
+
+
 def _is_qwen3(ctx):
     return ctx.reasoning_config == ReasoningToggleConfig(
         toggle_param="enable_thinking", default_enabled=True
@@ -624,6 +640,9 @@ TOOL_CALL_PARSER_RULES = (
     ),
     DetectionRule(name="qwen3_coder", value="qwen3_coder", predicate=_is_qwen3_coder),
     DetectionRule(name="qwen", value="qwen", predicate=_is_qwen3),
+    DetectionRule(
+        name="qwen_json_tool_call", value="qwen", predicate=_is_qwen_json_tool_call
+    ),
     DetectionRule(name="deepseek_v3", value="deepseekv3", predicate=_is_deepseek_v3),
     DetectionRule(name="deepseek_r1", value="deepseekv3", predicate=_is_deepseek_r1),
 )
