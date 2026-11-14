@@ -75,6 +75,7 @@ def _limits_worker(rank, path):
     runner = ModelRunner.__new__(ModelRunner)
     runner.kv_cache_configurator = configurator
     runner.is_hybrid_swa = True
+    runner.enable_hisparse = False
     runner.max_total_num_tokens = runner.full_max_total_num_tokens = 64
     runner.swa_max_total_num_tokens = 64
     runner.max_running_requests = 4

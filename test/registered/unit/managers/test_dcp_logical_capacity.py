@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_disagg
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
@@ -81,6 +82,7 @@ def make_worker(dcp_size):
     runner.server_args = NS(dcp_size=dcp_size)
     runner.kv_cache_configurator = make_configurator()
     runner.is_hybrid_swa = False
+    runner.enable_hisparse = False
     runner.max_total_num_tokens = PHYSICAL
     runner.max_running_requests = 64
     runner.token_to_kv_pool = kv
@@ -154,6 +156,32 @@ class TestDcpLogicalCapacity(CustomTestCase):
         runner.swa_max_total_num_tokens = 16
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
         self.assertEqual(runner.effective_logical_max_total_num_tokens, 32)
+
+    def _hisparse_worker(self):
+        # The device rows hold only each request's hot buffer; on a decode
+        # engine its KV lives in the host-backed logical pool.
+        worker = self.make_worker(1)
+        runner = worker.model_runner
+        runner.enable_hisparse = True
+        runner.max_total_num_tokens = 170_496
+        runner.token_to_kv_pool_allocator = NS(size_full=170_496 * 16)
+        return worker
+
+    def test_hisparse_decode_request_limit_follows_the_logical_pool(self):
+        worker = self._hisparse_worker()
+        with get_disagg().override(disaggregation_mode="decode"):
+            info = TpModelWorker.get_worker_info(worker)
+        self.assertEqual(info[4], min(CONTEXT, 170_496 * 16) - 1)
+        self.assertGreater(info[5], 262_146)
+
+    def test_hisparse_prefilling_engine_keeps_the_device_row_limit(self):
+        # An engine that prefills itself needs a device row per prompt token.
+        for mode in ("null", "prefill"):
+            with self.subTest(mode=mode):
+                worker = self._hisparse_worker()
+                with get_disagg().override(disaggregation_mode=mode):
+                    info = TpModelWorker.get_worker_info(worker)
+                self.assertEqual(info[4], 170_496 - 1)
 
     def test_short_pool_warning_uses_served_capacity(self):
         # dcp1 serves 690K < 1M and warns; dcp2 widens the same rows to 1.38M.

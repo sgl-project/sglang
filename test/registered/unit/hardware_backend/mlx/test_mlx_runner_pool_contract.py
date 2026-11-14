@@ -56,6 +56,7 @@ class TestMlxRunnerPoolContract(CustomTestCase):
         runner.max_running_requests = 2
         runner.is_hybrid_swa = False
         runner.forward_stream = None
+        runner.enable_hisparse = False
         runner.req_to_token_pool = ReqToTokenPool(
             size=2,
             max_context_len=128,
