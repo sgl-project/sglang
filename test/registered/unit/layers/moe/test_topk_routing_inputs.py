@@ -15,7 +15,6 @@ from sglang.srt.batch_overlap.operations import (
 )
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
-from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 from sglang.srt.layers.dp_attention import DpPaddingMode
@@ -23,8 +22,6 @@ from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
-from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutputPacked,
     TopK,
@@ -864,7 +861,7 @@ class TestTopKRoutingInputs(CustomTestCase):
             output = router.forward_cuda(self.hidden, self.logits)
             self.assertEqual(output.format, TopKOutputFormat.BYPASSED)
             self.assertIs(output.router_logits, self.logits)
-            for algorithm in ("fake", "lp"):
+            for algorithm in ("fake",):
                 with (
                     self.subTest(algorithm=algorithm),
                     get_exec().moe.override(ep_dispatch_algorithm=algorithm),
@@ -951,146 +948,6 @@ class TestTopKRoutingInputs(CustomTestCase):
             self.assertFalse(
                 deepseek_v2.DeepseekV2MoE._can_dual_stream_graph(moe, self.hidden)
             )
-
-    def test_lp_keeps_global_shared_columns_outside_routed_domain(self):
-        router = self._router(num_fused_shared_experts=1)
-        ids = torch.tensor([[0, 4], [1, 4], [2, 4], [3, 4]], dtype=torch.int32)
-        weights = torch.tensor([[0.8, 0.2]]).repeat(4, 1)
-        solved = []
-
-        def solve(routed_ids):
-            self.assertEqual(routed_ids.tolist(), [[0], [1], [2], [3]])
-            solved.append(routed_ids.clone())
-            return torch.ones(4, 1)
-
-        def dispatch(routed_ids, info, probability=None):
-            self.assertTrue(bool(((routed_ids >= 0) & (routed_ids < 4)).all()))
-            return info.partial_logical_to_rank_dispatch_physical_map[routed_ids]
-
-        get_resources().lplb_solvers[0] = SimpleNamespace(solve=solve)
-        self.addCleanup(get_resources().lplb_solvers.pop, 0)
-        with (
-            get_exec().moe.override(ep_dispatch_algorithm="lp"),
-            patch.object(topk_module, "_is_cuda", True),
-            patch.object(topk_module, "topk_ids_logical_to_physical", dispatch),
-        ):
-            _, info = router.routing_inputs()
-            output_ids, output_weights, _ = topk_module._post_process_topk_ids(
-                ids,
-                weights,
-                topk_config=router.topk_config,
-                router_logits=self.logits,
-                layer_id=0,
-                num_token_non_padded=torch.tensor(2),
-                expert_location_dispatch_info=info,
-            )
-        self.assertEqual(len(solved), 1)
-        self.assertEqual(output_ids.tolist(), [[2, 4], [0, 4], [-1, -1], [-1, -1]])
-        torch.testing.assert_close(output_weights[:2], weights[:2])
-
-    def test_lazy_lp_materialization_uses_its_owner_or_explicit_override(self):
-        """Lazy dispatcher materialization must retain the layer's solver and capture slot."""
-        get_resources().expert_location_metadata = _placement(num_layers=8)
-        hidden = self.hidden.to(torch.bfloat16)
-        group = SimpleNamespace(all_gatherv=lambda tensors, sizes: tensors)
-        dispatcher = object.__new__(FlashinferDispatcher)
-        dispatcher.ep_size = 1
-        dispatcher.ep_rank = 0
-        with get_parallel().override(moe_ep_size=1, moe_ep_rank=0):
-            dispatcher.prefill_dispatcher = StandardDispatcher(
-                SimpleNamespace(
-                    runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
-                    num_experts=4,
-                    num_local_experts=4,
-                    num_fused_shared_experts=0,
-                )
-            )
-        for owner, override, expected_owner in (
-            (7, None, 7),
-            (0, None, 0),
-            (7, 0, 0),
-            (0, 7, 7),
-        ):
-            with self.subTest(owner=owner, override=override):
-                solved = []
-                captured = {}
-
-                def solver(layer_id):
-                    def solve(ids):
-                        self.assertEqual(ids.tolist(), [[0, 1]] * 4)
-                        solved.append(layer_id)
-                        return torch.ones((4, 1))
-
-                    return SimpleNamespace(solve=solve)
-
-                class Capture:
-                    def capture(self, *, layer_id, topk_indices):
-                        captured[layer_id] = topk_indices.clone()
-
-                def dispatch_probability(ids, info, probability):
-                    return info.partial_logical_to_rank_dispatch_physical_map[ids]
-
-                with (
-                    get_exec().moe.override(ep_dispatch_algorithm="lp"),
-                    get_parallel().override(
-                        tp_group=group, moe_ep_size=1, moe_ep_rank=0
-                    ),
-                    patch.dict(
-                        get_resources().lplb_solvers,
-                        {0: solver(0), 7: solver(7)},
-                        clear=True,
-                    ),
-                    patch.object(get_resources(), "experts_capturer", Capture()),
-                    patch.object(topk_module, "_is_cuda", True),
-                    patch.object(
-                        expert_location_dispatch,
-                        "_topk_ids_logical_to_physical_probability",
-                        dispatch_probability,
-                    ),
-                    patch(
-                        "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_dp_global_num_tokens",
-                        return_value=None,
-                    ),
-                ):
-                    router = self._router(
-                        layer_id=owner, output_format=TopKOutputFormat.BYPASSED
-                    )
-                    output = router.forward_cuda(
-                        hidden, self.logits, num_token_non_padded=torch.tensor(2)
-                    )
-                    self.assertEqual(len(output), 5)
-                    if override is not None:
-                        output = output.to_standard(layer_id=override)
-                    dispatched = dispatcher._dispatch_prefill_allgather(hidden, output)
-                self.assertEqual(solved, [expected_owner])
-                self.assertEqual(set(captured), {expected_owner})
-                self.assertEqual(captured[expected_owner].tolist(), [[0, 1]] * 4)
-                self.assertEqual(
-                    dispatched.topk_output.topk_ids.tolist(),
-                    [[2, 0], [2, 0], [-1, -1], [-1, -1]],
-                )
-                self.assertIs(dispatched.hidden_states, hidden)
-
-    def test_empty_target_participates_in_lp_without_caller_layer_id(self):
-        class Solver:
-            def __init__(self):
-                self.participations = []
-
-            def solve(self, ids):
-                self.participations.append(tuple(ids.shape))
-
-        solver = Solver()
-        get_resources().lplb_solvers[0] = solver
-        self.addCleanup(get_resources().lplb_solvers.pop, 0)
-        target = self._router()
-        with draft_model_build_scope():
-            draft = self._router()
-        with get_parallel().override(tp_group=SimpleNamespace(world_size=1)):
-            output = target.empty_topk_output(torch.device("cpu"))
-            draft_output = draft.empty_topk_output(torch.device("cpu"))
-        self.assertEqual(output.topk_ids.shape, (0, 2))
-        self.assertEqual(draft_output.topk_ids.shape, (0, 2))
-        self.assertEqual(solver.participations, [(0, 2)])
 
     def test_compile_reads_current_buffer(self):
         router = self._router(is_draft=True)

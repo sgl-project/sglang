@@ -1061,7 +1061,7 @@ class DeepseekV2MoE(nn.Module):
             and not self.is_hash
             and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not is_expert_remapping_enabled()
-            and get_exec().moe.ep_dispatch_algorithm not in ("fake", "lp")
+            and get_exec().moe.ep_dispatch_algorithm != "fake"
         )
 
     def forward(

@@ -329,7 +329,6 @@ POSITIONAL_FIELD_ORDER = (
     "elastic_ep_backend",
     "enable_elastic_expert_backup",
     "mooncake_ib_device",
-    "enable_waterfill",
     "ep_join_mode",
     "ep_join_rank_offset",
     "elastic_ep_initial_size",
@@ -573,5 +572,6 @@ POSITIONAL_FIELD_ORDER = (
     "hybrid_cache_checkpoints_level",
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
+    "moe_load_balancer_algorithm",
 )
 # fmt: on

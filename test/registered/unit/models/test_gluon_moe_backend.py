@@ -159,16 +159,21 @@ class _Gluon:
 
 
 def _resolve_shared_experts(monkeypatch, model_class, *, disable_fusion=False):
+    from sglang.srt.eplb import moe_load_balancer_glue
     from sglang.srt.layers.moe import utils as moe_utils
 
     monkeypatch.setattr(
         moe_utils,
         "get_exec",
         lambda: SimpleNamespace(
-            moe=SimpleNamespace(
-                disable_shared_experts_fusion=disable_fusion, enable_waterfill=False
-            )
+            moe=SimpleNamespace(disable_shared_experts_fusion=disable_fusion)
         ),
+    )
+    # No --moe-load-balancer-algorithm: the shared expert is not routed by EvenMoE.
+    monkeypatch.setattr(
+        moe_load_balancer_glue,
+        "get_configured_moe_load_balancer_pipeline",
+        lambda: None,
     )
     # Isolate the Gluon layout policy from the generic hardware/quant gates.
     monkeypatch.setattr(

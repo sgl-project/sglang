@@ -986,8 +986,17 @@ class ExecMoe(msgspec.Struct):
     ep_num_redundant_experts: A[
         int, "Allocate this number of redundant experts in expert parallel."
     ] = 0
+    moe_load_balancer_algorithm: A[
+        Optional[str],
+        Arg(
+            help="EvenMoE expert routing pipeline for redundant experts (static, "
+            "lplb, waterfill, ultraep, or a composition such as lplb+waterfill). "
+            "Requires the evenmoe package.",
+            resolvable=True,
+        ),
+    ] = None
     ep_dispatch_algorithm: A[
-        Optional[Literal["static", "dynamic", "fake", "lp"]],
+        Optional[Literal["static", "dynamic", "fake"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
     ] = None
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
@@ -1043,10 +1052,6 @@ class ExecMoe(msgspec.Struct):
         Optional[str],
         "The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
     ] = None
-    enable_waterfill: A[
-        bool,
-        "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
-    ] = False
     ep_join_mode: A[
         Optional[Literal["scale", "recover"]],
         Arg(
@@ -1064,7 +1069,7 @@ class ExecMoe(msgspec.Struct):
     disable_shared_experts_fusion: A[
         bool,
         Arg(
-            help="Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. Note: Waterfill (--enable-waterfill) routes the shared expert as an extra MoE slot, so the shared expert is not separated from the MoE path when Waterfill is enabled.",
+            help="Disable the built-in shared experts fusion optimization for DeepSeek V3/R1.",
             resolvable=True,
         ),
     ] = False

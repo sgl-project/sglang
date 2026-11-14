@@ -363,7 +363,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         num_tokens = [b * seq_len for b in bs]
         num_fused_shared_experts_list = [0, 1]
 
-        with get_context().override_server_args(enable_waterfill=False):
+        with get_context().override_server_args():
             for E_num in E_num_list:
                 for M in num_tokens:
                     for num_fused_shared_experts in num_fused_shared_experts_list:

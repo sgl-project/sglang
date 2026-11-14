@@ -193,16 +193,6 @@ class TestSharedExpertsModelScope(CustomTestCase):
             config = resolve_shared_experts_config(_FusesOne, SimpleNamespace(), None)
             self.assertTrue(config.fusion_disabled)
             self.assertEqual(config.num_fused_shared_experts, 0)
-        with get_exec().moe.override(enable_waterfill=True):
-            fused = resolve_shared_experts_config(_FusesOne, SimpleNamespace(), None)
-            unfused = resolve_shared_experts_config(
-                _AlwaysDisablesButCountsOne, SimpleNamespace(), None
-            )
-            self.assertEqual(
-                (fused.num_fused_shared_experts, fused.num_shared_topk_slots), (1, 0)
-            )
-            self.assertTrue(fused.use_waterfill)
-            self.assertFalse(unfused.use_waterfill)
         self.assertFalse(get_exec().moe.disable_shared_experts_fusion)
         self.assertIs(get_model().shared_experts, ambient)
 

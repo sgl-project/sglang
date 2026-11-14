@@ -1937,6 +1937,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-load-balancer-algorithm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>EvenMoE expert routing pipeline for redundant experts: `static`, `lplb`, `waterfill`, `ultraep`, or a composition such as `lplb+waterfill`. Mutually exclusive with `--ep-dispatch-algorithm`; `waterfill` requires a fused-shared-expert model and DeepEP, `lplb` requires `--ep-num-redundant-experts &gt; 0`. Use `--init-expert-location` to supply recorded placement statistics. Requires the `evenmoe` package. Online EPLB with policies that replace routing buffers requires `--disable-cuda-graph`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ep-dispatch-algorithm`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The algorithm to choose ranks for redundant experts in expert parallel.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
@@ -2033,12 +2039,6 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
         <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-waterfill`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports `--deepep-mode auto`, `normal`, or `low_latency` when used with DeepEP. Use `auto` or `low_latency` for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP &gt;= 2. By default, Waterfill uses the static local-batch path; set `SGLANG_DISABLE_STATIC_WATERFILL=1` to force dynamic Waterfill with runtime EP all-reduce.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
-    </tr>
-        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--flashinfer-allreduce-fusion-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer allreduce fusion and choose backend. Defaults to auto. 'auto': choose mnnvl on SM90 single-node systems and SM100/SM103 single-node or multi-node systems; choose trtllm otherwise. 'trtllm': available on single-node systems only. 'mnnvl': available on SM90 single-node systems and SM100/SM103 single-node or multi-node systems via MNNVL fabric. Fuses allreduce with Residual + RMSNorm for supported MoE models.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
@@ -2052,6 +2052,13 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
 </tbody>
 </table>
+
+Waterfill and LPLB are provided by the optional [EvenMoE package](https://github.com/ai-dynamo/evenmoe).
+Replace `--enable-waterfill` with `--moe-load-balancer-algorithm waterfill`, and
+`--ep-dispatch-algorithm lp` with `--moe-load-balancer-algorithm lplb`. To combine
+them, use `--moe-load-balancer-algorithm lplb+waterfill`.
+For dynamic Waterfill with global load counts, replace
+`SGLANG_DISABLE_STATIC_WATERFILL=1` with EvenMoE's `WATERFILL_USE_GLOBAL_LOAD=1`.
 
 ## Mamba Cache
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -2810,7 +2817,6 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
-
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-p2p-check`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable P2P check for GPU access, otherwise the p2p access is allowed by default.</td>

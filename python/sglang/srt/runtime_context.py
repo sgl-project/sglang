@@ -32,7 +32,7 @@ import os
 import sys
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import msgspec
 
@@ -659,8 +659,15 @@ class Resources(_FlagGroupBase):
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None
     expert_location_metadata: Any = None
-    # LPLB: layer_id -> solver.
-    lplb_solvers: dict = msgspec.field(default_factory=dict)
+    # Model expert counts published by ModelRunner before EvenMoE construction.
+    mlb_model_info: dict[str, int | None] | None = None
+    # The target's EvenMoE MoELoadBalancer, published by ModelRunner before it
+    # builds the model so every target (Hash)TopK binds it at construction.
+    moe_load_balancer: Any = None
+    # Per-layer placement refresh: LayerPlacementRefresher.refresh_layer(layer_id,
+    # logical_topk_ids), run by the routing glue ahead of each layer's dispatch.
+    # None unless placement refreshes per layer.
+    mlb_placement_refresh: Optional[Callable[[int, Any], None]] = None
     # Named side streams (see RuntimeContext.get_stream): name -> stream.
     streams: dict = msgspec.field(default_factory=dict)
     # Named persistent buffers (see RuntimeContext.get_buffer): name -> tensor.

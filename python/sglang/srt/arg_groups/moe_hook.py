@@ -39,6 +39,70 @@ from sglang.srt.utils.device import is_gfx1250_supported, is_sm100_supported
 logger = logging.getLogger(__name__)
 
 
+def handle_moe_load_balancer(server_args: Any):
+    """Resolve ``--moe-load-balancer-algorithm`` (EvenMoE) when it is set.
+
+    Without the flag, native EPLB dispatch does not import ``evenmoe``.
+    """
+    cfg = resolving_view(server_args)
+    from sglang.srt.eplb.moe_load_balancer_glue import (
+        get_moe_load_balancer_pipeline,
+        refreshes_placement_per_layer,
+        uses_coupled_placement,
+    )
+
+    pipeline = get_moe_load_balancer_pipeline(cfg.moe_load_balancer_algorithm)
+    if pipeline is not None:
+        if cfg.ep_dispatch_algorithm is not None:
+            raise ValueError(
+                "--moe-load-balancer-algorithm cannot be combined with --ep-dispatch-algorithm"
+            )
+        resolutions = {"moe_load_balancer_algorithm": pipeline.name}
+        capabilities = pipeline.capabilities
+        if not capabilities.supports_concurrent_microbatches and (
+            cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap
+        ):
+            raise ValueError(
+                "The selected EvenMoE pipeline does not support overlapping microbatches."
+            )
+        if (
+            capabilities.graph_stability == "realloc_on_placement_change"
+            and cfg.enable_eplb
+            and not cfg.disable_cuda_graph
+        ):
+            raise ValueError(
+                "The selected EvenMoE pipeline changes routing buffers after placement updates; "
+                "--enable-eplb requires --disable-cuda-graph."
+            )
+        if refreshes_placement_per_layer(pipeline):
+            _check_layer_refresh(cfg)
+        if uses_coupled_placement(pipeline):
+            _check_coupled_placement(cfg)
+        declare_resolution(server_args, "_handle_moe_load_balancer", **resolutions)
+
+
+def _check_layer_refresh(cfg: Any) -> None:
+    """SGLang limits for per-layer placement refresh, which moves one layer's
+    expert weights inside the forward."""
+    if cfg.elastic_ep_backend is not None or cfg.pp_size != 1:
+        raise ValueError(
+            "Per-layer EvenMoE placement refresh requires a fixed EP group and PP=1."
+        )
+
+
+def _check_coupled_placement(cfg: Any) -> None:
+    """Coupled routing needs its placement's routing state, which only a recorded
+    plan or an online refresh provides. The policy's own layout preconditions
+    are checked by EvenMoE at model load, as for every other pipeline."""
+    if not cfg.enable_eplb and cfg.init_expert_location == "trivial":
+        raise ValueError(
+            "Coupled EvenMoE placement requires --enable-eplb or recorded placement statistics."
+        )
+    # Its placement policy plans from each source rank's own counts.
+    if cfg.expert_distribution_recorder_mode not in (None, "stat"):
+        raise ValueError("Coupled EvenMoE placement requires the stat expert recorder.")
+
+
 def _flashinfer_a2a_topology_is_supported(
     *,
     architecture: str | None,
@@ -378,12 +442,19 @@ def handle_a2a_moe(server_args: Any):
 
     cfg = resolving_view(server_args)
 
-    # Check the requested backend before Waterfill's backend override. Waterfill
-    # currently supports DeepEP/MegaMOE only; otherwise the override below would
-    # hide an explicitly incompatible ascend_ops selection.
-    if cfg.enable_waterfill and cfg.moe_a2a_backend == "ascend_ops":
+    from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
+
+    pipeline = get_moe_load_balancer_pipeline(cfg.moe_load_balancer_algorithm)
+    # EvenMoE routing runs on NVIDIA CUDA only; ascend_ops is an NPU backend.
+    platform = get_platform()
+    if pipeline is not None and (
+        not platform.is_cuda
+        or platform.is_hip
+        or platform.is_musa
+        or cfg.moe_a2a_backend == "ascend_ops"
+    ):
         raise ValueError(
-            "--enable-waterfill is incompatible with --moe-a2a-backend ascend_ops."
+            "--moe-load-balancer-algorithm is only supported on NVIDIA CUDA."
         )
 
     run_post_process_pass(server_args, _a2a_backend_overrides)
@@ -396,11 +467,19 @@ def handle_a2a_moe(server_args: Any):
     run_post_process_pass(server_args, validate_ascend_ops_config)
 
     a2a_backend = resolved_view(server_args).moe_a2a_backend
-    if cfg.enable_waterfill:
+    if pipeline is not None and pipeline.capabilities.requires_post_topk_routing:
+        if a2a_backend == "none":
+            raise ValueError(
+                "--moe-load-balancer-algorithm requires a MoE A2A backend "
+                "to dispatch each token to its selected physical replica."
+            )
+    if pipeline is not None and pipeline.capabilities.routes_shared_expert:
         declare_resolution(
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
         )
-        logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
+        logger.info(
+            f"EvenMoE shared-expert routing uses moe_a2a_backend='{a2a_backend}'."
+        )
 
     if a2a_backend != "flashinfer_nvlink_one_sided" and (
         cfg.flashinfer_a2a_dispatch_type not in (None, "auto")
@@ -556,7 +635,7 @@ def handle_a2a_moe(server_args: Any):
         )
 
     # The resolving view, not the field: `_a2a_backend_overrides` may have
-    # moved this already (waterfill forces `deepep`).
+    # moved this already (a routing pipeline can require `deepep`).
     a2a_now = resolved_view(server_args).moe_a2a_backend
 
     if a2a_now == "flashinfer_nvlink_one_sided":

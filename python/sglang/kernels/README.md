@@ -36,7 +36,7 @@ sglang/kernels/
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
 `diffusion`, `elementwise`, `embeddings`, `gemm`, `grammar`, `kv_canary`,
-`kvcache`, `layernorm`, `lora`, `lplb`, `mamba`, `memory`, `mm`, `moe`,
+`kvcache`, `layernorm`, `lora`, `mamba`, `memory`, `mm`, `moe`,
 `quantization`, `sampling`, `speculative`.
 
 Place model-specific implementations and tuning data inside the corresponding

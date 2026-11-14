@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch.cuda
@@ -18,7 +19,7 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.runtime_context import get_context, get_exec, get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -35,11 +36,13 @@ class EPLBManager:
         get_expert_location_updater: Callable[[], ExpertLocationUpdater],
         get_expert_backup_client: Callable[[], Any],
         get_weight_updater: Callable[[], Any],
+        moe_load_balancer=None,
     ):
         super().__init__()
         # These collaborators are set on ModelRunner AFTER EPLBManager is
         # constructed (model load, expert_backup_client, weight_updater), so
         # they are read through getters at rebalance time, not captured here.
+        self._moe_load_balancer = moe_load_balancer
         self._model_config = model_config
         self._get_model = get_model
         self._get_expert_location_updater = get_expert_location_updater
@@ -137,9 +140,13 @@ class EPLBManager:
             broadcast_over_world=is_post_scale_rebalance,
         )
 
-        from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
-            init_lplb_solvers,
-        )
+        on_placement_committed = None
+        if self._moe_load_balancer is not None:
+            from evenmoe.adapters.sglang import commit_placement
+
+            on_placement_committed = partial(
+                commit_placement, self._moe_load_balancer, get_context()
+            )
 
         update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
         all_update_layer_ids = [
@@ -153,6 +160,7 @@ class EPLBManager:
             if len(update_layer_ids_chunks) > 1:
                 yield
             update_expert_location_with_recovery(
+                on_placement_committed=on_placement_committed,
                 expert_location_updater=self._get_expert_location_updater(),
                 model=self._get_model(),
                 new_expert_location_metadata=expert_location_metadata,
@@ -165,10 +173,6 @@ class EPLBManager:
                 use_flat_topology=is_post_scale_rebalance,
                 expert_backup_client=self._get_expert_backup_client(),
                 update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
-                ep_dispatch_algorithm=get_exec().moe.ep_dispatch_algorithm,
-                init_lplb_solvers_callable=lambda: init_lplb_solvers(
-                    model_config=self._model_config
-                ),
             )
             if is_post_scale_rebalance:
                 # P2P waits only synchronize participating peers. Ranks without
@@ -191,6 +195,7 @@ class EPLBManager:
             return ExpertLocationMetadata.init_by_eplb(
                 self._model_config,
                 logical_count,
+                moe_load_balancer=self._moe_load_balancer,
             )
 
         current_metadata = get_global_expert_location_metadata()
@@ -201,6 +206,7 @@ class EPLBManager:
             computed_metadata = ExpertLocationMetadata.init_by_eplb(
                 self._model_config,
                 logical_count,
+                moe_load_balancer=self._moe_load_balancer,
                 # Arbitrary append topologies may not preserve node divisibility.
                 use_flat_topology=True,
             )
@@ -305,8 +311,7 @@ def update_expert_location_with_recovery(
     use_flat_topology: bool = False,
     expert_backup_client,
     update_weights_from_disk_callable,
-    ep_dispatch_algorithm: str,
-    init_lplb_solvers_callable,
+    on_placement_committed=None,
 ):
     p2p_missing_logical_experts = expert_location_updater.update(
         model.routed_experts_weights_of_layer,
@@ -343,9 +348,8 @@ def update_expert_location_with_recovery(
                 weight_name_filter=weight_name_filter,
             )
 
-    # Re-init LPLB solvers after expert location update
-    if ep_dispatch_algorithm == "lp":
-        init_lplb_solvers_callable()
+    if on_placement_committed is not None:
+        on_placement_committed(update_layer_ids)
 
 
 def _chunk_list(items: List, chunk_size):

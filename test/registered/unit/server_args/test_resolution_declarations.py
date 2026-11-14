@@ -63,10 +63,8 @@ _SHAPES = (
     {"disaggregation_mode": "prefill"},
     {"enable_lora": True, "max_lora_rank": 16},
     {"kv_cache_dtype": "fp8_e4m3", "page_size": 64},
-    # A pass and a handler both decide this one: waterfill forces `deepep`
-    # and the ascend handler wants `none`. Without this shape nothing in
-    # the set reaches a field two writers disagree about.
-    {"enable_waterfill": True, "moe_a2a_backend": "none"},
+    # Exercise backend-driven EP resolution alongside the handler declarations.
+    {"moe_a2a_backend": "deepep", "tp_size": 2},
 )
 
 # Which converted fields the shapes above reach; the rest need a device or an
@@ -529,14 +527,6 @@ class TestResolutionDeclarations(CustomTestCase):
 
     def test_no_immediate_writer_overrides_a_deferred_one(self):
         """A handler must not declare over a value a pass already decided.
-
-        Routing a bare write into the stash changed which writer wins: the
-        appended entry is replayed last, so a handler now beats a pass or a
-        registry entry that ran earlier -- where before, the pass's declaration
-        was applied on top of the handler's bare write. One handler was found
-        that way (it gated on the raw field while its neighbours read the
-        resolving view, so `--enable-waterfill --moe-a2a-backend none`
-        silently stopped forcing `deepep`).
 
         This is the invariant rather than that instance: walk the stash in
         order and fail when an immediate writer declares a field whose previous

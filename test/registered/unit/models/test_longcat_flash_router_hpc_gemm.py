@@ -41,7 +41,7 @@ class TestLongcatFlashRouterHpcGemm(CustomTestCase):
             hidden_act="silu",
         )
         with get_context().override_server_args(model_path="dummy", device="cpu"):
-            for algorithm in ("static", "dynamic", "fake", "lp"):
+            for algorithm in ("static", "dynamic", "fake"):
                 with (
                     self.subTest(algorithm=algorithm),
                     get_exec().moe.override(ep_dispatch_algorithm=algorithm),
