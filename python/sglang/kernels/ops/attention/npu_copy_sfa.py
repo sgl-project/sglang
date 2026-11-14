@@ -1,13 +1,13 @@
-"""Public adapter for Ascend combined and split HBM Copy-SFA operators."""
+"""Public adapter for Ascend split HBM Copy-SFA operators."""
 
 from __future__ import annotations
 
 import torch
 
 
-def load_copy_sfa_operator(*, split_hbm=False):
+def load_copy_sfa_operator():
     """Resolve the registered A3 implementation before graph capture."""
-    name = "fused_scatter_copy_sparse_flash_attention" + ("_split" if split_hbm else "")
+    name = "fused_scatter_copy_sparse_flash_attention_split"
     try:
         import sgl_kernel_npu  # noqa: F401
 
@@ -21,7 +21,8 @@ def load_copy_sfa_operator(*, split_hbm=False):
 def fused_scatter_copy_sparse_flash_attention(
     query,
     query_rope,
-    combined_hbm_cache,
+    hbm_ckv,
+    hbm_rope,
     actual_seq_lengths_query,
     actual_seq_lengths_kv,
     num_cache_tokens,
@@ -37,19 +38,20 @@ def fused_scatter_copy_sparse_flash_attention(
     attention_out,
     scale_value,
     *,
-    operator=None,
-    split_hbm_rope=None,
+    operator,
+    current,
+    positions,
+    valid,
+    request_slots,
+    req_to_token,
+    resident_begin,
+    resident_end,
+    host_token_capacity,
+    dram_rope_dev_ptr,
     full_visible=False,
     resident_refresh_tail=False,
-    resident_inputs=None,
 ) -> None:
     """Copy resident KV and attend to selected cache tokens.
-
-    Without ``split_hbm_rope``, ``combined_hbm_cache`` is the legacy combined
-    HBM cache. With it, that argument is the CKV component and
-    ``split_hbm_rope`` is the RoPE component. The production split ABI receives
-    ``(query, query_rope, hbm_ckv, hbm_rope)`` as its first four arguments.
-    Split host storage supplies ``dram_rope_dev_ptr`` in ``resident_inputs``.
 
     Query tensors use contiguous TND ``[T, H, 512|64]`` and request-level
     cumulative query lengths. ``topk_src_ids`` and ``topk_dst_slots`` use
@@ -65,12 +67,11 @@ def fused_scatter_copy_sparse_flash_attention(
     Buffer ownership stays with the runtime manager. An injected operator must
     honor the same validation contract as the native host implementation.
     """
-    if operator is None:
-        operator = load_copy_sfa_operator(split_hbm=split_hbm_rope is not None)
-    inputs = (
+    operator(
         query,
         query_rope,
-        combined_hbm_cache,
+        hbm_ckv,
+        hbm_rope,
         actual_seq_lengths_query,
         actual_seq_lengths_kv,
         num_cache_tokens,
@@ -85,12 +86,15 @@ def fused_scatter_copy_sparse_flash_attention(
         dram_kv_dev_ptr,
         attention_out,
         scale_value,
-    )
-    if split_hbm_rope is not None:
-        inputs = (*inputs[:3], split_hbm_rope, *inputs[3:])
-    operator(
-        *inputs,
         full_visible=full_visible,
         resident_refresh_tail=resident_refresh_tail,
-        **(resident_inputs or {}),
+        current=current,
+        positions=positions,
+        valid=valid,
+        request_slots=request_slots,
+        req_to_token=req_to_token,
+        resident_begin=resident_begin,
+        resident_end=resident_end,
+        host_token_capacity=host_token_capacity,
+        dram_rope_dev_ptr=dram_rope_dev_ptr,
     )

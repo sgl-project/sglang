@@ -55,12 +55,12 @@ def forward_fused_sparse_kv_offload(
             layer,
             q[:rows].view(rows, -1, backend.kv_lora_rank),
             q_rope[:rows].view(rows, -1, backend.qk_rope_head_dim),
-            layer.tp_q_head_num,
-            layer.scaling,
             plan,
             current_inputs,
         )
-        return torch.nn.functional.pad(result, (0, 0, 0, q.shape[0] - rows))
+        if q.shape[0] > rows:
+            return torch.nn.functional.pad(result, (0, 0, 0, q.shape[0] - rows))
+        return result
 
     actual_q = backend.forward_metadata.actual_seq_lengths_q
     if actual_q is None:

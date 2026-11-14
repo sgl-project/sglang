@@ -33,7 +33,7 @@ class LIMSelection:
 class LIMDecodeAdapter:
     def __init__(self, manager):
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
-            fused_lim_copy_sfa_metadata,
+            prepare_copy_sfa_metadata,
         )
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_input_metadata import (
             fused_prepare_lim_metadata,
@@ -45,7 +45,7 @@ class LIMDecodeAdapter:
         self.max_query_width = manager.max_query_width
         self.operator = load_fused_lim_operator()
         self._fused_prepare_lim_metadata = fused_prepare_lim_metadata
-        self._fused_copy_sfa_metadata = fused_lim_copy_sfa_metadata
+        self._prepare_copy_sfa_metadata = prepare_copy_sfa_metadata
         device = manager.device
         for name, spec in manager.budget.adapter_buffers.items():
             if name == "query_ends":
@@ -134,24 +134,17 @@ class LIMDecodeAdapter:
             width,
         )
 
-    def copy_sfa_metadata(self, manager, plan) -> None:
+    def prepare_copy_sfa_metadata(self, manager, plan) -> None:
         batch = plan.request_safe_slots.numel()
-        self._fused_copy_sfa_metadata(
+        self._prepare_copy_sfa_metadata(
             source_ids=plan.source_ids,
-            topk_misses=plan.topk_misses,
-            miss_counts=plan.miss_counts,
             valid_rows=plan.valid_rows,
             sparse_rows=plan.sparse_rows,
             request_slots=plan.request_safe_slots,
             actual_seq_lengths_kv=manager.planner_actual_seq_lengths_kv[:batch],
-            num_cache_tokens=manager.planner_num_cache_tokens[:batch],
             hbm_block_table=manager.planner_hbm_block_table[:batch],
-            dram_block_table=manager.planner_dram_block_table[:batch],
             capacity=self.capacity,
-            host_context_len=manager.max_context_len,
-            request_rows=self.rows,
             query_width=plan.query_width,
             seq_lens=plan.prefix_lens,
-            host_block_table=self.block_table[:batch],
         )
         manager.planner_query_ends = self.query_ends[plan.query_width - 1, :batch]

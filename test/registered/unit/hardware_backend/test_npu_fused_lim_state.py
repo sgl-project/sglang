@@ -239,7 +239,7 @@ class TestLIMState(CustomTestCase):
             manager.budget.bind_native_pool(pool)
             pre, post = ModuleType("pre"), ModuleType("post")
             pre.fused_prepare_lim_metadata = Mock()
-            post.fused_lim_copy_sfa_metadata = Mock()
+            post.prepare_copy_sfa_metadata = Mock()
             with (
                 patch(prefix + "fused_lim.load_fused_lim_operator", return_value=None),
                 patch.dict(
@@ -348,7 +348,7 @@ class TestLIMState(CustomTestCase):
         req_pool.req_to_token[2, 4096] = 73
         pre, post = ModuleType("pre"), ModuleType("post")
         pre.fused_prepare_lim_metadata = Mock()
-        post.fused_lim_copy_sfa_metadata = Mock()
+        post.prepare_copy_sfa_metadata = Mock()
 
         def shm(shape, dtype, device_id, name):
             tensor = torch.empty(shape, dtype=dtype)
@@ -440,6 +440,8 @@ class TestLIMState(CustomTestCase):
         adapter.request_safe_slots[:2].copy_(torch.tensor([1, 2]))
         adapter._pre_next_prefix[:2].zero_()
         adapter._pre_valid[:2].fill_(True)
+        adapter._pre_cache_sizes[:2].copy_(torch.tensor([8192, 0]))
+        adapter.block_table[:2].copy_(torch.arange(66).view(2, 33))
         selection = adapter.select(
             manager,
             query=torch.zeros(rows, 64, 128, dtype=torch.bfloat16),
@@ -474,6 +476,14 @@ class TestLIMState(CustomTestCase):
                 tensors[4].data_ptr(),
                 adapter.query_ends[manager.max_query_width - 1].data_ptr(),
             )
+            self.assertEqual(tensors[6].data_ptr(), adapter._pre_cache_sizes.data_ptr())
+            torch.testing.assert_close(
+                tensors[6], torch.tensor([8192, 0], dtype=torch.int32)
+            )
+            self.assertEqual(tensors[14].data_ptr(), adapter.block_table.data_ptr())
+            torch.testing.assert_close(
+                tensors[14], torch.arange(66, dtype=torch.int32).view(2, 33)
+            )
             self.assertEqual(tensors[7].ndim, 2)
             self.assertEqual(tensors[8].ndim, 2)
             torch.testing.assert_close(tensors[7], source_values)
@@ -482,11 +492,9 @@ class TestLIMState(CustomTestCase):
 
         manager._copy_sfa_operator = native_copy_sfa
         result = manager.copy_sfa_attention(
-            SimpleNamespace(layer_id=0),
+            SimpleNamespace(layer_id=0, scaling=0.1),
             torch.zeros(rows, 8, 512, dtype=torch.bfloat16),
             torch.zeros(rows, 8, 64, dtype=torch.bfloat16),
-            8,
-            0.1,
             selection,
             (
                 torch.empty(rows, 1, 576, dtype=torch.bfloat16),

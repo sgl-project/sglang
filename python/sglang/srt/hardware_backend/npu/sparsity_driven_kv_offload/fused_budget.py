@@ -102,12 +102,8 @@ class BudgetPlan:
             "planner_actual_seq_lengths_kv": BufferSpec(
                 (batch_capacity,), metadata_dtype
             ),
-            "planner_num_cache_tokens": BufferSpec((batch_capacity,), metadata_dtype),
             "planner_hbm_block_table": BufferSpec(
                 (batch_capacity, cache_tokens // page_size), metadata_dtype
-            ),
-            "planner_dram_block_table": BufferSpec(
-                (batch_capacity, context_len // page_size), metadata_dtype
             ),
             "fused_attn_out": BufferSpec(
                 (

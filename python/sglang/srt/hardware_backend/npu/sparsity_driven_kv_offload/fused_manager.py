@@ -159,7 +159,7 @@ class FusedSparseKVCacheManager:
             self.budget.prefill_workspace_bytes,
         )
         self.cache_capacity = self.device_cache_size
-        self._copy_sfa_operator = load_copy_sfa_operator(split_hbm=True)
+        self._copy_sfa_operator = load_copy_sfa_operator()
         split_host = use_pd_split_kv()
 
         # Allocate exactly the persistent shapes reserved by the plan.
@@ -343,14 +343,14 @@ class FusedSparseKVCacheManager:
         layer,
         query_nope,
         query_rope,
-        query_heads,
-        scale_value,
         plan,
         current_inputs,
     ):
         batch = plan.request_safe_slots.numel()
         rows = batch * plan.query_width
-        self.lim_adapter.copy_sfa_metadata(self, plan)
+        self.lim_adapter.prepare_copy_sfa_metadata(self, plan)
+        query_heads = query_nope.shape[1]
+        current, positions, valid = current_inputs
         padded_heads = self.fused_attn_out.shape[1]
         if query_nope.shape[1] < padded_heads:
             padding = padded_heads - query_nope.shape[1]
@@ -365,43 +365,38 @@ class FusedSparseKVCacheManager:
             -1, 128, self.head_num, self.qk_rope_head_dim
         )
         fused_scatter_copy_sparse_flash_attention(
-            query_nope.contiguous(),
-            query_rope.contiguous(),
-            cache,
-            self.planner_query_ends,
-            self.planner_actual_seq_lengths_kv[:batch],
-            self.planner_num_cache_tokens[:batch],
-            plan.source_ids,
-            plan.device_slots,
-            plan.topk_misses,
-            plan.miss_sources,
-            plan.miss_slots,
-            plan.miss_counts,
-            self.planner_hbm_block_table[:batch],
-            self.planner_dram_block_table[:batch],
-            self.dev_ptr_list[layer_idx],
-            output,
-            scale_value,
+            query=query_nope.contiguous(),
+            query_rope=query_rope.contiguous(),
+            hbm_ckv=cache,
+            hbm_rope=rope_cache,
+            actual_seq_lengths_query=self.planner_query_ends,
+            actual_seq_lengths_kv=self.planner_actual_seq_lengths_kv[:batch],
+            num_cache_tokens=self.lim_adapter._pre_cache_sizes[:batch],
+            topk_src_ids=plan.source_ids,
+            topk_dst_slots=plan.device_slots,
+            topk_miss_counts=plan.topk_misses,
+            miss_src_ids=plan.miss_sources,
+            miss_dst_slots=plan.miss_slots,
+            miss_counts=plan.miss_counts,
+            hbm_block_table=self.planner_hbm_block_table[:batch],
+            dram_block_table=self.lim_adapter.block_table[:batch],
+            dram_kv_dev_ptr=self.dev_ptr_list[layer_idx],
+            attention_out=output,
+            scale_value=layer.scaling,
             operator=self._copy_sfa_operator,
-            split_hbm_rope=rope_cache,
             full_visible=True,
             resident_refresh_tail=plan.query_width > 1,
-            resident_inputs={
-                "current": current_inputs[0],
-                "positions": current_inputs[1],
-                "valid": current_inputs[2],
-                "request_slots": plan.request_safe_slots,
-                "req_to_token": self.req_to_token_pool.req_to_token,
-                "resident_begin": self.resident_begin[layer_idx],
-                "resident_end": self.resident_end[layer_idx],
-                "host_token_capacity": self.host_token_capacity,
-                "dram_rope_dev_ptr": self.rope_dev_ptr_list[layer_idx],
-            },
+            current=current,
+            positions=positions,
+            valid=valid,
+            request_slots=plan.request_safe_slots,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            resident_begin=self.resident_begin[layer_idx],
+            resident_end=self.resident_end[layer_idx],
+            host_token_capacity=self.host_token_capacity,
+            dram_rope_dev_ptr=self.rope_dev_ptr_list[layer_idx],
         )
-        valid = (
-            plan.valid_rows[:, None].expand(batch, plan.query_width).reshape(rows, 1)
-        )
-        return output[:, :query_heads].reshape(rows, -1).masked_fill(~valid, 0)
+        return output[:, :query_heads].reshape(rows, -1)
 
     def _install_req_alloc_hook(self, req_to_token_pool: ReqToTokenPool) -> None:
         # Preserve the target manager's hook when adding the draft manager.

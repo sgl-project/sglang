@@ -393,7 +393,7 @@ def test_short_sparse_graph_lifecycle(
                                 (actual[t].float() - expected).abs().max().item(),
                             )
                     assert torch.count_nonzero(actual[2 * width :]) == 0
-                assert manager.planner_num_cache_tokens[:batch].cpu().tolist() == [
+                assert manager.lim_adapter._pre_cache_sizes[:batch].cpu().tolist() == [
                     capacity if lengths[0] >= capacity else 0,
                     capacity,
                     0,

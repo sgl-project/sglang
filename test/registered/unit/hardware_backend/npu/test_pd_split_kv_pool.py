@@ -99,8 +99,8 @@ class TestPDSplitKVPool(CustomTestCase):
         observed = {}
 
         def copy_sfa(*args, **kwargs):
-            observed["ckv"] = args[14]
-            observed["kpe"] = kwargs["resident_inputs"]["dram_rope_dev_ptr"]
+            observed["ckv"] = kwargs["dram_kv_dev_ptr"]
+            observed["kpe"] = kwargs["dram_rope_dev_ptr"]
 
         def allocate(*, shape, dtype, device_id, name):
             tensor = torch.zeros(shape, dtype=dtype)
@@ -160,13 +160,15 @@ class TestPDSplitKVPool(CustomTestCase):
         m.fused_attn_out = torch.zeros(1, 1, 512)
         m.device_kv_buffer = [torch.zeros(128, 1, 512)]
         m.device_rope_buffer = [torch.zeros(128, 1, 64)]
-        m.lim_adapter = SimpleNamespace(copy_sfa_metadata=lambda *_: None)
+        m.lim_adapter = SimpleNamespace(
+            prepare_copy_sfa_metadata=lambda *_: None,
+            _pre_cache_sizes=torch.zeros(1, dtype=torch.int32),
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+        )
         m.planner_query_ends = torch.ones(1, dtype=torch.int32)
         for name in (
             "planner_actual_seq_lengths_kv",
-            "planner_num_cache_tokens",
             "planner_hbm_block_table",
-            "planner_dram_block_table",
             "resident_begin",
             "resident_end",
         ):
@@ -185,11 +187,9 @@ class TestPDSplitKVPool(CustomTestCase):
             valid_rows=torch.ones(1, dtype=torch.bool),
         )
         m.copy_sfa_attention(
-            SimpleNamespace(layer_id=0),
+            SimpleNamespace(layer_id=0, scaling=1.0),
             torch.zeros(1, 1, 512),
             torch.zeros(1, 1, 64),
-            1,
-            1.0,
             plan,
             (None, None, None),
         )
