@@ -50,10 +50,11 @@ def configure_kv_cache_dtype(
     elif server_args_kv_cache_dtype == "fp8_e5m2":
         if current_platform.is_cpu():
             raise ValueError("--kv-cache-dtype fp8_e5m2 is not supported on CPU.")
-        if _is_hip:  # Using natively supported format
-            kv_cache_dtype = fp8_dtype
-        else:
-            kv_cache_dtype = torch.float8_e5m2
+        if _is_hip:
+            raise ValueError(
+                "FP8 E5M2 KV cache is not supported on HIP. Use fp8_e4m3 instead."
+            )
+        kv_cache_dtype = torch.float8_e5m2
     elif server_args_kv_cache_dtype == "fp8_e4m3":
         if _is_hip:  # Using natively supported format
             kv_cache_dtype = fp8_dtype

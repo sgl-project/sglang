@@ -1921,6 +1921,35 @@ class TestSkipTokenizerInit(unittest.TestCase):
                 )
 
 
+class TestHipKvCacheDtype(CustomTestCase):
+    @override_platform(is_hip=True)
+    def test_reject_e5m2_for_target_or_draft(self):
+        """An explicit E5M2 request must not silently select E4M3 on HIP."""
+        for field in ("kv_cache_dtype", "speculative_draft_kv_cache_dtype"):
+            with self.subTest(field=field):
+                args = ServerArgs(model_path="dummy", **{field: "fp8_e5m2"})
+                with self.assertRaisesRegex(ValueError, "E5M2.*HIP"):
+                    handle_cache_compatibility(args)
+
+    @override_platform(is_hip=True)
+    def test_supported_hip_dtypes_remain_accepted(self):
+        for dtype in ("auto", "fp8_e4m3", "bfloat16"):
+            with self.subTest(dtype=dtype):
+                handle_cache_compatibility(
+                    ServerArgs(
+                        model_path="dummy",
+                        kv_cache_dtype=dtype,
+                        speculative_draft_kv_cache_dtype=dtype,
+                    )
+                )
+
+    @override_platform(is_hip=False)
+    def test_e5m2_is_not_rejected_on_other_platforms(self):
+        handle_cache_compatibility(
+            ServerArgs(model_path="dummy", kv_cache_dtype="fp8_e5m2")
+        )
+
+
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.
