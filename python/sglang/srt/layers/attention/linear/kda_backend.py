@@ -749,6 +749,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # An eager forward never runs on a graph bucket's tables.
         self.prefill_graph_metadata = None
         super().init_forward_metadata(forward_batch)
+        if (
+            self.kernel_dispatcher.extend_kernel.wants_int64_query_start_loc
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            self.forward_metadata.query_start_loc_i64 = (
+                self.forward_metadata.query_start_loc.to(torch.int64)
+            )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -1201,6 +1208,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            query_start_loc_i64=self.forward_metadata.query_start_loc_i64,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
@@ -1300,14 +1308,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
             )
-        # ReplaySSM: the ring-write is fused into the verify kernel
-        # (CACHE_RING) on both the fused chain-verify and the unfused triton
-        # paths; commit replays the ring instead of reading per-step
-        # snapshots. ring_kwargs stays empty for non-triton verify kernels,
-        # which never see replayssm. Ragged layouts work natively on the
-        # unfused path -- step_idx is the within-row step under varlen, so
-        # row i writes ring[slot][0..verify_lens[i]) and commit folds at most
-        # commit_lens of them (absorb overflow is bounded in-kernel).
+        # ReplaySSM: the verify kernel writes the ring (CACHE_RING) and skips
+        # per-step snapshots; commit folds the ring. Under a ragged layout, row i
+        # writes ring steps [0, verify_lens[i]) and commit folds at most commit_lens.
         replayssm_rawk = replayssm_g = replayssm_beta = None
         ring_kwargs = {}
         if replayssm_on:
@@ -1321,13 +1324,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             )
-            # Request-scoped rows exist only for the host-only ring. The slot
-            # ring keeps writing at h0_indices, and metadata stubs that predate
-            # the field stay on that path.
+            # A request-scoped ring (unified memory, or host-only checkpoints)
+            # has rows of its own, resolved with the forward's metadata; a slot
+            # ring keeps writing at h0_indices.
             if self.state_pool is not None and self.state_pool.replayssm_request_ring:
                 ring_indices = fm.replayssm_ring_indices
-                if ring_indices is not None:
-                    ring_kwargs["ring_indices"] = ring_indices
+                assert ring_indices is not None, "request-scoped ring without rows"
+                ring_kwargs["ring_indices"] = ring_indices
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
@@ -1368,6 +1371,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_rawk=mamba_cache_params.replayssm_rawk,
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
+                replayssm_ring_indices=ring_kwargs.get("ring_indices"),
             )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
@@ -1788,11 +1792,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
         if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
             return False
-        # Request-scoped rings are indexed by req_pool_idx. This kernel still
-        # writes the ring through the mamba slot, so keep the Triton path.
-        pool = self.state_pool
-        if pool is not None and pool.replayssm_request_ring:
-            return False
         if importlib.util.find_spec("cutlass") is None:
             return False
         if torch.cuda.get_device_capability()[0] != 10:
@@ -1887,6 +1886,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
+        replayssm_ring_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
@@ -1956,6 +1956,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
+            replayssm_ring_indices=replayssm_ring_indices,
             onorm_gate=onorm_gate,
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,

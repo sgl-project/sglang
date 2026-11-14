@@ -36,8 +36,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
-from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.utils import is_npu
+from sglang.srt.models.utils import npu_draft_quant_config
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,8 @@ class Glm4MoeModelNextN(nn.Module):
 
 
 class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
+    own_quant_config = staticmethod(npu_draft_quant_config)
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -127,8 +129,7 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        if is_npu() and get_spec().speculative_draft_model_quantization is None:
-            quant_config = None
+        quant_config = self.own_quant_config(config, quant_config)
         self.quant_config = quant_config
 
         # Drives the inherited loader's shared-expert remap after the build.

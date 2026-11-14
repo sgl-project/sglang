@@ -6,7 +6,6 @@ import blake3
 import numpy as np
 import torch
 
-from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.kernels.ops.memory.gpu_tensor_hash_blake3 import (
     gpu_tensor_blake3,
     gpu_tensors_blake3,
@@ -65,8 +64,6 @@ class TestGpuTensorBlake3(CustomTestCase):
                     x = torch.from_numpy(a.view(np.uint8)).view(dtype).cuda()
                     y = torch.from_numpy(b.view(np.uint8)).view(dtype).cuda()
                     self.assertNotEqual(gpu_tensor_blake3(x), gpu_tensor_blake3(y))
-                    # Diagnostic checksums may collide; cache identities must not.
-                    self.assertEqual(gpu_tensor_hash(x), gpu_tensor_hash(y))
                     first = MultimodalDataItem(modality=Modality.IMAGE, feature=x)
                     second = MultimodalDataItem(modality=Modality.IMAGE, feature=y)
                     self.assertNotEqual(first.cache_key, second.cache_key)
