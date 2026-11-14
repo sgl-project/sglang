@@ -2169,13 +2169,9 @@ class LayerwiseOffloadManager:
                 ].view(meta["shape"])
                 target.data = self._wrap_for_target(target, local_tensor)
 
-        if self.copy_stream is not None:
+        if self.copy_stream is not None and capture_keepalive is None:
             # record after all copies so the consumer waits for every weight copy
-            event = torch.get_device_module().Event(
-                **({"external": True} if capture_keepalive is not None else {})
-            )
-            if capture_keepalive is not None:
-                capture_keepalive.append(event)
+            event = torch.get_device_module().Event()
             event.record(self.copy_stream)
             self._prefetch_events[layer_idx] = event
 
@@ -2708,10 +2704,14 @@ class LayerwiseOffloadManager:
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
-                if i in self._prefetch_events and self.copy_stream is not None:
-                    torch.get_device_module().current_stream().wait_event(
-                        self._prefetch_events[i]
-                    )
+                if self.copy_stream is not None:
+                    compute_stream = torch.get_device_module().current_stream()
+                    if self._graph_capture_keepalive is not None:
+                        # Copies use the capture stream; join at the consumer in
+                        # this segment instead of carrying an event across breaks.
+                        compute_stream.wait_stream(self.copy_stream)
+                    elif i in self._prefetch_events:
+                        compute_stream.wait_event(self._prefetch_events[i])
 
                 if self.residency_policy == RESIDENCY_POLICY_STRIDED:
                     # Top up the stream at every layer rather than in bursts of
