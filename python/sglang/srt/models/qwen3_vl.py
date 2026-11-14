@@ -106,6 +106,7 @@ _is_cpu = is_cpu()
 # Below this image count the per-image loop beats the vectorized path (which has a
 # fixed setup cost; measured crossover ~6 on H20); both give the same result.
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
+_VISION_MLP_CHUNK_ROWS = 16_384
 
 
 def _resolve_vision_parallel_group(
@@ -166,6 +167,7 @@ class Qwen3_VisionMLP(nn.Module):
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.act = ACT2FN[hidden_act]
+        self.can_chunk_rows = tp_size == 1 and quant_config is None
 
     def forward(self, x: torch.Tensor):
         x_fc1, _ = self.linear_fc1(x)
@@ -275,6 +277,18 @@ class Qwen3_VisionBlock(nn.Module):
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
+        # Patch rows have independent post-attention residuals. Bound the
+        # wide MLP activation without adding a collective per slice under TP.
+        if (
+            self.mlp.can_chunk_rows
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+            and x.size(0) > _VISION_MLP_CHUNK_ROWS
+        ):
+            for rows in x.split(_VISION_MLP_CHUNK_ROWS):
+                rows.add_(self.mlp(self.norm2(rows)))
+            return x
+
         norm2 = self.norm2(x)
         mlp = self.mlp(norm2)
         x += mlp
