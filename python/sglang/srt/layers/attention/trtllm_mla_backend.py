@@ -226,12 +226,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
         backend: str = "trtllm-gen",
+        speculative_step_id: Optional[int] = None,
     ):
         super().__init__(
             model_runner,
             skip_prefill,
             kv_indptr_buf,
             q_indptr_decode_buf,
+            speculative_step_id=speculative_step_id,
         )
 
         config = model_runner.model_config
@@ -509,7 +511,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Initialize CUDA graph state for TRTLLM MLA."""
 
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        # One table serves every captured mode, so it holds the longest tail.
+        max_blocks_per_seq = self._calc_padded_blocks(
+            self.max_context_len
+            + max(
+                self.num_draft_tokens or 0, self._draft_step_tokens(ForwardMode.DECODE)
+            )
+        )
 
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
@@ -565,6 +573,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def verify_mask(self) -> Optional[VerifyMask]:
         return self._verify_mask
 
+    def _graph_tail_tokens(self, forward_mode: ForwardMode) -> int:
+        # A verify's and a draft extend's keys reach their drafts past the committed
+        # length; their scheduling bound adds the drafts in forward_extend.
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+            return self.num_draft_tokens
+        return self._draft_step_tokens(forward_mode)
+
     @staticmethod
     def _graph_metadata_key(bs: int, forward_mode: ForwardMode):
         # Share buffers within a mode; keep different layouts separate.
@@ -614,10 +629,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
         # Capture with full width so future longer sequences are safe during replay.
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        max_seq_len = self.max_context_len + self._draft_step_tokens(forward_mode)
+        max_blocks_per_seq = self._calc_padded_blocks(
+            self.max_context_len + self._graph_tail_tokens(forward_mode)
+        )
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
         metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
+        metadata.max_seq_len_k = max_seq_len
 
         if get_parallel().dcp_enabled:
             if metadata.global_seq_lens_k is None:
@@ -627,7 +645,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     (bs,), dtype=torch.int32, device=device
                 )
             metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
-                self.max_context_len
+                max_seq_len
                 + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
             )
 
@@ -671,6 +689,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
+        elif step_tokens := self._draft_step_tokens(forward_mode):
+            # Intentional int64 -> int32 same-kind out= downcast.
+            torch.add(seq_lens[:bs], step_tokens, out=metadata.seq_lens_k)
+            seq_lens = metadata.seq_lens_k
         elif metadata.seq_lens_k is not None:
             # Plain decode: int64 -> int32 downcast copy into the static
             # buffer (once per step, replacing the per-layer conversion).
@@ -732,7 +754,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
             local_seq_lens = metadata.seq_lens_k
         else:
-            seq_lens = seq_lens[:bs]
+            seq_lens = seq_lens[:bs] + self._draft_step_tokens(forward_mode)
             metadata.global_seq_lens_k.copy_(seq_lens)
             metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
             local_seq_lens = metadata.seq_lens_k
@@ -878,6 +900,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     self.forward_decode_metadata.seq_lens_k
                 )
             elif forward_batch.forward_mode.is_decode_or_idle():
+                step_tokens = self._draft_step_tokens(forward_batch.forward_mode)
+                if step_tokens:
+                    max_seq = max_seq + step_tokens
+                    seq_lens = seq_lens + step_tokens
                 # One int32 conversion per step; forward_decode reads it back
                 # so the per-layer .to(int32) in _run_decode_kernel stays a
                 # no-op (24 elementwise copies/step otherwise).
@@ -1255,6 +1281,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         return output, lse
 
+    def _decode_metadata(self, forward_batch: ForwardBatch) -> TRTLLMMLADecodeMetadata:
+        # A multi-step draft plans all its steps on one batch before any step
+        # decodes, so that batch holds only the last step's metadata.
+        if self.speculative_step_id is not None:
+            return self.forward_decode_metadata
+        return (
+            getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+            or self.forward_decode_metadata
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,  # q_nope
@@ -1365,10 +1401,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         # Get metadata
-        metadata = (
-            getattr(forward_batch, "decode_trtllm_mla_metadata", None)
-            or self.forward_decode_metadata
-        )
+        metadata = self._decode_metadata(forward_batch)
 
         # Backstop: metadata was built pre-pad (marked) and DP padding then
         # grew the batch. The marker path deliberately does not re-plan
@@ -1928,6 +1961,7 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
                 backend=backend,
+                speculative_step_id=i,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
