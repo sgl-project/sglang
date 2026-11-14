@@ -85,7 +85,8 @@ def fused_topk_npu(
             k_group=topk_config.topk_group if use_grouped_topk else 1,
             group_count=topk_config.num_expert_group if use_grouped_topk else 1,
             group_select_mode=(1 if use_grouped_topk else 0),
-            renorm=renormalize,
+            # Sigmoid already normalizes selected weights; CANN 9.1 only accepts 0.
+            renorm=0 if topk_config.scoring_func == "sigmoid" else renormalize,
             # 1 for sigmoid, 0 for softmax
             norm_type=(0 if topk_config.scoring_func == "softmax" else 1),
             routed_scaling_factor=(
