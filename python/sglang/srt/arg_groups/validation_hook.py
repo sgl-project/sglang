@@ -25,6 +25,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
@@ -294,6 +295,30 @@ def check_server_args(server_args: Any):
         "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
         f"Got: {cfg.pp_max_micro_batch_size}"
     )
+
+    if cfg.device == "npu":
+        from sglang.srt.hardware_backend.npu.compile_backend import (
+            validate_npugraph_ex_config,
+        )
+
+        # Local import: server_args imports this module at load time.
+        from sglang.srt.server_args import compute_world_size
+
+        # cuda_graph_config stays None until handle_cuda_graph_config runs, which
+        # the resolution pipeline skips for a "none"/"dummy" model path.
+        graph_cfg = cfg.cuda_graph_config
+
+        validate_npugraph_ex_config(
+            enable_compile=cfg.enable_torch_compile,
+            graph_enabled=(
+                graph_cfg is not None and graph_cfg.decode.backend != Backend.DISABLED
+            ),
+            world_size=compute_world_size(
+                dp_size=cfg.dp_size,
+                tp_size=cfg.tp_size,
+                pp_size=cfg.pp_size,
+            ),
+        )
 
     assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (
         "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
