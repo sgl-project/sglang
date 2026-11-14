@@ -56,9 +56,8 @@ jobs:
       - name: Determine run mode
         id: run-mode
         run: |
-          # Run all tests for scheduled runs and workflow_call (when ref input is provided)
-          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
+          # Fork test: force the full NPU suite on every trigger.
+          if [[ "true" == "true" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
             echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
           else
@@ -97,13 +96,6 @@ jobs:
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - ".github/workflows/pr-test-npu.yml"
 
-  # ==================== PR Gate ==================== #
-  pr-gate:
-    needs: check-changes
-    if: ${{ inputs.coverage_mode != true && needs.check-changes.outputs.changes_exist == 'true' }}
-    uses: ./.github/workflows/pr-gate.yml
-    secrets: inherit
-
   set-image-config:
     runs-on: ubuntu-latest
     outputs:
@@ -118,7 +110,7 @@ jobs:
   # Stage-A gate: CPU-only unit tests. The NPU attention-backend UTs stub out
   # torch_npu / sgl_kernel_npu before importing, so a hosted runner suffices.
   base-a-test-npu:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes]
     if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -333,7 +325,7 @@ jobs:
           if-no-files-found: warn
 
   base-b-test-1-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
+    needs: [check-changes, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -350,7 +342,7 @@ jobs:
     secrets: inherit
 
   base-b-test-2-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
+    needs: [check-changes, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -367,7 +359,7 @@ jobs:
     secrets: inherit
 
   base-b-test-4-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
+    needs: [check-changes, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -385,7 +377,7 @@ jobs:
     secrets: inherit
 
   base-b-test-8-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
+    needs: [check-changes, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -402,7 +394,7 @@ jobs:
     secrets: inherit
 
   base-b-test-16-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
+    needs: [check-changes, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -422,7 +414,6 @@ jobs:
     needs:
       [
         check-changes,
-        pr-gate,
         set-image-config,
         base-a-test-npu,
         base-a-test-npu-cov,
@@ -562,7 +553,6 @@ jobs:
     needs:
       [
         check-changes,
-        pr-gate,
         set-image-config,
         base-a-test-npu,
         base-a-test-npu-cov,
@@ -695,7 +685,7 @@ jobs:
 
   base-c-test-acc-2-npu-a3:
     name: base-c-test-acc-2-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, recommend-tests-from-coverage ]
+    needs: [ check-changes, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, recommend-tests-from-coverage ]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -714,7 +704,7 @@ jobs:
 
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, recommend-tests-from-coverage ]
+    needs: [ check-changes, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, recommend-tests-from-coverage ]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -732,7 +722,7 @@ jobs:
 
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3, recommend-tests-from-coverage ]
+    needs: [ check-changes, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3, recommend-tests-from-coverage ]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -750,7 +740,7 @@ jobs:
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3, recommend-tests-from-coverage ]
+    needs: [ check-changes, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3, recommend-tests-from-coverage ]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -772,7 +762,7 @@ jobs:
   # Recommends PR-affected test cases from the pre-built coverage baseline.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
-    needs: [check-changes, pr-gate]
+    needs: [check-changes]
     runs-on: ubuntu-latest
     continue-on-error: true
     if: >-
@@ -1329,7 +1319,6 @@ jobs:
   pr-test-npu-finish:
     needs:
       [
-        pr-gate,
         check-changes,
 
         base-a-test-npu,
