@@ -59,7 +59,9 @@ def test_qsa_decode_topk_repeatability(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(42)
     logits = torch.randn(16, 2048, device="cuda").round()
 
-    def mock_mqa_decode(*args: object, min_scored_len: int) -> torch.Tensor:
+    def mock_mqa_decode(
+        *args: object, min_scored_len: int, rows_per_request: int = 1
+    ) -> torch.Tensor:
         assert min_scored_len == 0
         return logits
 
