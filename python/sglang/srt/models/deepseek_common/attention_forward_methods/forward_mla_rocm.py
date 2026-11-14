@@ -9,6 +9,7 @@ The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -52,6 +53,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
     get_kv_layers,
     get_token_to_kv_pool,
 )
@@ -1070,8 +1072,19 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if self._skip_rope_for_aiter_fused_mla() or self._fuse_rope_for_gfx1250_mla(
-                forward_batch
+            fused_q_cache = self._maybe_fused_q_cache(
+                q_nope_out=q_nope_out,
+                q_pe=q_pe,
+                k_nope=k_nope,
+                k_pe=k_pe,
+                forward_batch=forward_batch,
+            )
+            if fused_q_cache is not None:
+                q, k = fused_q_cache
+                save_kv_cache = False
+            elif (
+                self._skip_rope_for_aiter_fused_mla()
+                or self._fuse_rope_for_gfx1250_mla(forward_batch)
             ):
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
@@ -1212,6 +1225,48 @@ class DeepseekMLARocmForwardMixin:
             return output, None
         else:
             return output, topk_indices
+
+    def _maybe_fused_q_cache(
+        self: DeepseekV2AttentionMLA,
+        *,
+        q_nope_out: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        mode = forward_batch.forward_mode
+        if (
+            self.rocm_mla_q_cache_writer is None
+            or get_parallel().dcp_enabled
+            or not (mode.is_decode() or mode.is_target_verify())
+        ):
+            return None
+        kv_layer = get_kv_layers().read(self.attn_mqa.layer_id)
+        # The writer scatters at out_cache_loc; KVLayer.store writes there only for
+        # the owner sub-pool, and at the batch's swa_loc for any other.
+        if not kv_layer.owner:
+            return None
+        # The writer calls this only when it runs the AITER op, so a declined
+        # write allocates no fp8 buffer.
+        get_fp8_q_out = functools.partial(
+            get_attn_backend().mla_fp8_q_out,
+            forward_batch=forward_batch,
+            num_tokens=q_nope_out.shape[0],
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        return self.rocm_mla_q_cache_writer.write(
+            q_nope=q_nope_out,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            out_cache_loc=forward_batch.out_cache_loc,
+            kv_cache=kv_layer.key(),
+            k_scale_float=self.attn_mqa.k_scale_float,
+            attention_backend=self.current_attention_backend,
+            is_target_verify=mode.is_target_verify(),
+            get_fp8_q_out=get_fp8_q_out,
+        )
 
     def _dcp_q_gather_dtype(self: DeepseekV2AttentionMLA) -> Optional[torch.dtype]:
         """FP8 KV dtype to gather q in, or None to gather it as computed.

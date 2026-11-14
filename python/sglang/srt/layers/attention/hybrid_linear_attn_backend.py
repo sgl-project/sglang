@@ -1435,6 +1435,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         elif not forward_batch.forward_mode.is_draft_extend_v2():
             self.linear_attn_backend.init_forward_metadata(forward_batch)
 
+    def mla_fp8_q_out(
+        self, *, forward_batch: ForwardBatch, num_tokens: int, head_dim: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        return self.full_attn_backend.mla_fp8_q_out(
+            forward_batch=forward_batch, num_tokens=num_tokens, head_dim=head_dim
+        )
+
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
