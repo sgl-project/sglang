@@ -1378,3 +1378,5 @@ jobs:
           # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0
+
+# test-only: gy005 dispatch probe (do not merge)
