@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from compressed_tensors.quantization import QuantizationType
 from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
@@ -59,12 +60,18 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+    get_masked_input_and_mask,
+)
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
@@ -109,6 +116,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
 
+MXFP8_GROUP_SIZE = 32
+
 
 def _ple_table_is_fp8(
     config: Qwen4ExpTextConfig,
@@ -126,6 +135,67 @@ def _ple_table_is_fp8(
     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
         return quant_config.resolve_quant_algo(prefix) == "FP8"
     return False
+
+
+def _ple_table_is_mxfp8(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    """MXFP8 PLE shards: a compressed-tensors group-32 fp8 target for the table."""
+    if not isinstance(quant_config, CompressedTensorsConfig):
+        return False
+    weights = quant_config.target_scheme_map.get(prefix, {}).get("weights")
+    return (
+        weights is not None
+        and weights.type == QuantizationType.FLOAT
+        and weights.num_bits == 8
+        and weights.group_size == MXFP8_GROUP_SIZE
+    )
+
+
+class Qwen4ExpMxfp8Embedding(VocabParallelEmbedding):
+    """fp8 e4m3 table with a uint8 (E8M0) scale per MXFP8_GROUP_SIZE columns."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self.embedding_dim % MXFP8_GROUP_SIZE != 0:
+            raise ValueError(
+                f"MXFP8 PLE dim {self.embedding_dim} is not a multiple of "
+                f"{MXFP8_GROUP_SIZE}"
+            )
+        self.register_buffer(
+            "weight_scale",
+            torch.full(
+                (
+                    self.num_embeddings_per_partition,
+                    self.embedding_dim // MXFP8_GROUP_SIZE,
+                ),
+                127,
+                dtype=torch.uint8,
+            ),
+            persistent=True,
+        )
+
+    def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
+        masked_input, input_mask = get_masked_input_and_mask(
+            input_,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        ids = masked_input.long()
+        # uint8 views keep the gather independent of fp8 index_select support.
+        values = F.embedding(ids, self.weight.view(torch.uint8)).view(
+            torch.float8_e4m3fn
+        )
+        scales = F.embedding(ids, self.weight_scale)
+        out = values.float().unflatten(-1, (-1, MXFP8_GROUP_SIZE)) * torch.exp2(
+            scales.float() - 127
+        ).unsqueeze(-1)
+        out = out.flatten(-2).to(self.output_dtype)
+        out.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return out
 
 
 @eager_on_graph(True)
@@ -689,24 +759,30 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
         offload_embedding = bool(config.ple_offload_embedding)
+        is_mxfp8 = _ple_table_is_mxfp8(quant_config, ngram_prefix)
+        if is_mxfp8 and offload_embedding:
+            raise NotImplementedError("MXFP8 PLE table does not support offload")
         # Offload only needs this embedding's metadata: build it on meta so the
         # shard is never allocated on the device.
         with torch.device("meta") if offload_embedding else nullcontext():
-            ngram_embedding = VocabParallelEmbedding(
+            ngram_embedding = (
+                Qwen4ExpMxfp8Embedding if is_mxfp8 else VocabParallelEmbedding
+            )(
                 padded_vocab_size,
                 self.head_dim_per_ngram,
                 params_dtype=(
                     torch.float8_e4m3fn
-                    if _ple_table_is_fp8(config, quant_config, ngram_prefix)
+                    if is_mxfp8 or _ple_table_is_fp8(config, quant_config, ngram_prefix)
                     else torch.bfloat16
                 ),
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
             )
         # weight_scale stays a real device tensor.
-        ngram_embedding.register_buffer(
-            "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
-        )
+        if not is_mxfp8:
+            ngram_embedding.register_buffer(
+                "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
+            )
         if offload_embedding:
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 ngram_embedding,
@@ -766,7 +842,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids, forward_batch, physical_tokens
         )
         embeddings = self.ngram_embedding(lookup_ids)
-        embeddings = embeddings * self.ngram_embedding.weight_scale
+        if not isinstance(self.ngram_embedding, Qwen4ExpMxfp8Embedding):
+            embeddings = embeddings * self.ngram_embedding.weight_scale
         return self._finish_embedding_lookup(
             embeddings, semantic_tokens, forward_batch, physical_tokens
         )
@@ -2486,8 +2563,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return True
 
         def copy_ple_rows_to_tp_embedding(
-            emb, loaded_weight: torch.Tensor, row_start: int, row_end: int
+            emb,
+            loaded_weight: torch.Tensor,
+            row_start: int,
+            row_end: int,
+            target: Optional[torch.Tensor] = None,
         ) -> None:
+            if target is None:
+                target = emb.weight.data
             tp_start = emb.shard_indices.org_vocab_start_index
             tp_end = emb.shard_indices.org_vocab_end_index
             ov_start = max(row_start, tp_start)
@@ -2496,9 +2579,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 local_start = ov_start - tp_start
                 src_start = ov_start - row_start
                 n_rows = ov_end - ov_start
-                emb.weight.data[local_start : local_start + n_rows].copy_(
+                target[local_start : local_start + n_rows].copy_(
                     loaded_weight[src_start : src_start + n_rows].to(
-                        device=emb.weight.device, dtype=emb.weight.dtype
+                        device=target.device, dtype=target.dtype
                     )
                 )
 
@@ -2512,15 +2595,18 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 return False
             import re
 
-            match = re.search(r"\.ngram_embedding\.shard_(\d+)\.weight$", name)
+            match = re.search(r"\.ngram_embedding\.shard_(\d+)\.weight(_scale)?$", name)
             if not match:
                 return False
             shard_idx = int(match.group(1))
+            is_scale_shard = match.group(2) is not None
             mod_prefix = name[: name.index(".ngram_embedding.shard_")]
             ple_mod = ple_modules.get(mod_prefix)
             if ple_mod is None:
                 return False
             emb = ple_mod.ngram_embedding
+            if is_scale_shard and not isinstance(emb, Qwen4ExpMxfp8Embedding):
+                return False
             if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn
@@ -2551,7 +2637,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 params_dict.pop(f"{mod_prefix}.ngram_embedding.weight", None)
                 torch.cuda.empty_cache()
             if (
-                emb.weight.dtype == torch.float8_e4m3fn
+                not is_scale_shard
+                and emb.weight.dtype == torch.float8_e4m3fn
                 and loaded_weight.dtype != torch.float8_e4m3fn
             ):
                 if not ple_warned_downcast:
@@ -2568,6 +2655,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shard_start = shard_idx * shard_size
             actual_rows = loaded_weight.shape[0]
             shard_end = shard_start + actual_rows
+            if is_scale_shard:
+                copy_ple_rows_to_tp_embedding(
+                    emb, loaded_weight, shard_start, shard_end, emb.weight_scale
+                )
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight_scale")
+                return True
             copy_ple_rows_to_tp_embedding(emb, loaded_weight, shard_start, shard_end)
             loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
             return True
