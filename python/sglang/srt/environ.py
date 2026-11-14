@@ -2305,6 +2305,12 @@ class Envs:
     SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # DCP local top-2048 on HIP: split rows longer than one block's registers over several
+    # blocks, then merge (exact). Set 0 for the single-block-per-row kernel.
+    SGLANG_DSA_DCP_TOPK_CHUNKED = EnvBool(True)
+    # aiter paged indexer logits on ROCm: balance the grid over each row's real length
+    # (persistent schedule) instead of a fixed split per row. Set 0 for the fixed split.
+    SGLANG_DSA_MQA_PERSISTENT_SCHEDULE = EnvBool(True)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)
