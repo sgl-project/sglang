@@ -205,6 +205,9 @@ class ComposedPipelineBase(ABC):
     def add_module(self, module_name: str, module: Any):
         self.modules[module_name] = module
 
+    def _preflight_model_config(self, model_subfolder: str | None) -> None:
+        """Validate model metadata before downloading any component weights."""
+
     def _load_config(self) -> dict[str, Any]:
         model_subfolder = self.server_args.model_subfolder
         if model_subfolder is None and not os.path.isfile(
@@ -212,13 +215,7 @@ class ComposedPipelineBase(ABC):
         ):
             model_subfolder = self.default_model_subfolder
 
-        if model_subfolder is None:
-            model_path = maybe_download_model(
-                self.model_path,
-                force_diffusers_model=True,
-                revision=self.server_args.revision,
-            )
-        else:
+        if model_subfolder is not None:
             model_subfolder = os.path.normpath(model_subfolder)
             if (
                 os.path.isabs(model_subfolder)
@@ -228,6 +225,16 @@ class ComposedPipelineBase(ABC):
                 raise ValueError(
                     f"model_subfolder must stay inside the model repository: {model_subfolder!r}"
                 )
+
+        self._preflight_model_config(model_subfolder)
+
+        if model_subfolder is None:
+            model_path = maybe_download_model(
+                self.model_path,
+                force_diffusers_model=True,
+                revision=self.server_args.revision,
+            )
+        else:
             if is_model_overlay(self.model_path):
                 # an overlay materializes every partition under one root
                 model_root = maybe_download_model(
