@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import (
     window_read,
 )
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -193,6 +193,20 @@ global_override_indptr_cpu = None
 global_override_window_indptr_cpu = None
 
 
+def _verify_plan_uniform_q_len(spec_info) -> Optional[int]:
+    """EAGLE verify gives every request exactly num_tokens_per_req query rows.
+    Every plan through a captured verify wrapper must carry the same
+    per-request q length: capture fixes the kernel's query tile from it.
+    None keeps plan() unchanged."""
+    if spec_info is None or spec_info.spec_input_type != SpecInputType.EAGLE_VERIFY:
+        return None
+    # SpecInput defaults num_tokens_per_req to -1 ("not set"). EagleVerifyInput
+    # sets it to draft_token_num (>= 1), so real verify batches never return here.
+    if spec_info.num_tokens_per_req <= 0:
+        return None
+    return int(spec_info.num_tokens_per_req)
+
+
 def fast_prefill_plan(
     self,
     qo_indptr: torch.Tensor,
@@ -227,6 +241,7 @@ def fast_prefill_plan(
     max_q_len: int,
     max_kv_len: int,
     uniform_verify_width: Optional[int] = None,
+    uniform_q_len: int = 0,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
     draft-extend or uniform-width verify CUDA graph (FlashInfer fa2 only).
@@ -289,7 +304,8 @@ def fast_prefill_plan(
         packed_lengths = (kv_lens_host * uniform_verify_width + 7) // 8
         packed_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
         packed_indptr[1:] = torch.cumsum(packed_lengths, dim=0)
-        assert int(packed_indptr[-1]) <= self._custom_mask_buf.numel()
+        # FlashInfer's SM90 fp8-KV verify kernel reads up to 8 bytes past the mask.
+        assert int(packed_indptr[-1]) + 8 <= self._custom_mask_buf.numel()
         self._mask_indptr_buf.copy_(packed_indptr, non_blocking=non_blocking)
         pack_verify_mask_into(
             custom_mask,
@@ -307,9 +323,8 @@ def fast_prefill_plan(
     )
     self._cached_o_data_type = o_data_type
     self._block_tables = None
-    # FlashInfer's plan() clears this on every call and may set it again for its
-    # SM90 fp8-KV verify kernel. This plan never takes that route, so clear it
-    # here too rather than let run() launch it with a previous plan's state.
+    # The captured graph may hold FlashInfer's SM90 fp8-KV verify kernel, which
+    # reads only the buffers refreshed above; this plan does not rebuild its state.
     self._eagle_verify_fp8kv_sm90_state = None
 
     args = [
@@ -332,7 +347,7 @@ def fast_prefill_plan(
         fixed_split_size if fixed_split_size is not None else -1,
         False,  # disable_split_kv
         0,  # num_colocated_ctas
-        0,  # uniform_q_len
+        uniform_q_len,
         False,  # fixed_uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
@@ -554,17 +569,29 @@ class FlashInferAttnBackend(AttentionBackend):
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
-        )
 
-        # Two wrappers: one for sliding window attention and one for full attention.
-        # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+        # Sliding/full or decoder/cross-attention layers use separate plans.
+        self.prefill_wrappers_ragged = []
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
-        for _ in range(self.num_wrappers):
+        for wrapper_id in range(self.num_wrappers):
             if not skip_prefill:
+                self.prefill_wrappers_ragged.append(
+                    BatchPrefillWithRaggedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        # FlashInfer fmha_varlen hardcodes use_sliding_window=False;
+                        # use CUTLASS ragged here once it honors window_left.
+                        backend=(
+                            "fa2"
+                            if fmha_backend == "cutlass"
+                            and self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                            and wrapper_id == 0
+                            else fmha_backend
+                        ),
+                    )
+                )
                 self.prefill_wrappers_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -1530,9 +1557,8 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             return output.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
+        wrapper_idx = self._get_wrapper_idx(layer)
+        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[wrapper_idx]
         # Window-read planning may put the window in a custom mask. Other
         # wrappers leave per-layer windows to forward, even when planned with -1.
         paged_window_left = layer.sliding_window_size
@@ -1580,7 +1606,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc.for_layer(
                         forward_batch,
                         layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -1622,16 +1650,18 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            prefill_wrapper_ragged = self.prefill_wrappers_ragged[wrapper_idx]
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
+                o = prefill_wrapper_ragged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
+                    window_left=layer.sliding_window_size,
                     logits_soft_cap=logits_soft_cap,
                 )
 
@@ -1644,7 +1674,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     else -1
                 )
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                o1, s1 = prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -1673,7 +1703,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc.for_layer(
                         forward_batch,
                         layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -1704,7 +1736,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc.for_layer(
                         forward_batch,
                         layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -2083,7 +2117,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self._swa_space = attn_backend._swa_space
-        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self.prefill_wrappers_ragged = attn_backend.prefill_wrappers_ragged
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -2148,7 +2182,7 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.prefill_wrapper_ragged,
+            self.prefill_wrappers_ragged[0],
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
@@ -2254,7 +2288,7 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                self.prefill_wrappers_ragged[wrapper_id],
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -2351,7 +2385,7 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                self.prefill_wrappers_ragged[wrapper_id],
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -2465,6 +2499,9 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                # window.window_left is the paged pass's: -1 on this prefix read,
+                # which its custom mask keeps to the window.
+                window_left=window.window if window is not None else -1,
             )
 
         if use_sliding_window_kv_pool and not use_swa_source:
@@ -2561,6 +2598,12 @@ class FlashInferIndicesUpdaterPrefill:
             and window.window_left >= 0
         ):
             paged_plan_kwargs["window_left"] = window.window_left
+
+        # A captured kernel keeps the tile size FlashInfer picked from this hint,
+        # so every replay must pass the same hint, including fast_prefill_plan.
+        uniform_q_len = _verify_plan_uniform_q_len(spec_info)
+        if uniform_q_len is not None:
+            paged_plan_kwargs["uniform_q_len"] = uniform_q_len
 
         wrapper_paged.begin_forward(
             qo_indptr,

@@ -6,11 +6,23 @@ from types import SimpleNamespace
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+from sglang.srt.mem_cache.capacity import (
+    check_decode_capacity,
+    create_prefill_budget,
+    evict_to_free_tokens,
+    reclaim_for_prealloc,
+)
+from sglang.srt.mem_cache.kv.alloc.demand import (
+    DemandPurpose,
+    KVDemand,
+    WindowRetirement,
+    demand_inputs,
+)
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     DerivedPartDecl,
     MHAGeometry,
-    RequestPartDecl,
     StateGeometry,
     StateReplay,
     TensorPartDecl,
@@ -20,12 +32,36 @@ from sglang.srt.mem_cache.kv.decl import (
 )
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel, mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import setup_allocator_context
+from sglang.test.token_demand import demand_windows, token_demand
+from sglang.test.tree_slots import window_evictable
+from sglang.test.unified_allocator_fixtures import (
+    hold_band,
+    largest_take,
+    release_band,
+    setup_allocator_context,
+)
+
+# A request that holds no request row: no other holder of memory unless a
+# test takes rows for one.
+_NO_ROW_REQ = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=None))
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+# The tree slot of the fused draft's window sub-pool ("draft_swa") when the
+# target keeps a window of its own.
+DRAFT_WINDOW = ComponentType.of("DRAFT_SWA")
+# The target window's slot in a tree that also keeps the draft window.
+TARGET_WINDOW = ComponentType.of("WINDOW_16")
+
+
+# GDN speculative ReplaySSM: its ring and cursors are request memory.
+_GDN_SPEC_REPLAY = StateReplay(
+    decode=False, speculative=True, is_kda=False, cache_len=16, key_heads=1
+)
 
 
 class _RequestKV:
@@ -38,10 +74,22 @@ class _RequestKV:
         return self.req_pool_idx is not None
 
 
+class _StateRequestKV(_RequestKV):
+    def __init__(self):
+        super().__init__()
+        self.mamba_pool_idx = None
+        self.mamba_needs_clear = False
+        self.mamba_cow_src_index = None
+        self.mamba_ping_pong_track_buffer = None
+
+    @property
+    def holds_mamba(self):
+        return self.mamba_pool_idx is not None
+
+
 def _build(
     *,
     extra=(),
-    requests=(),
     derived=(),
     state=False,
     gamma=None,
@@ -52,7 +100,7 @@ def _build(
     window=16,
     full_tokens=256,
     window_tokens=128,
-    lazy_compaction=False,
+    lazy_compaction=True,
     enable_mamba_extra_buffer=False,
     setup=True,
 ):
@@ -97,7 +145,6 @@ def _build(
         decls,
         page_size=4,
         speculative_num_draft_tokens=gamma,
-        request_parts=requests,
         derived_parts=derived,
         fused_draft=fused_draft,
     )
@@ -257,7 +304,6 @@ class TestDeclaredParts(CustomTestCase):
             FusedDraftPlacement,
         )
         from sglang.srt.mem_cache.radix_cache import RadixKey
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.model_executor.forward_mode import ForwardMode
 
@@ -331,18 +377,20 @@ class TestDeclaredParts(CustomTestCase):
                         # after this window has left the current decode tail.
                         with patch.object(cache, "swa_retain_floor", return_value=0):
                             batch.maybe_evict_swa()
-                        for ct in (ComponentType.SWA, ComponentType.AUXILIARY_SWA):
+                        for ct in (TARGET_WINDOW, DRAFT_WINDOW):
                             self.assertEqual(node.component_data[ct].lock_ref, 1)
                     batch.maybe_evict_swa()
                     # Repeated scheduling must neither release twice nor drop
                     # the longer window while it still reads the cached prefix.
                     batch.maybe_evict_swa()
                     cache.evict(
-                        EvictParams(swa_num_tokens=80, auxiliary_swa_num_tokens=80)
+                        EvictParams(
+                            window_num_tokens={"window_16": 80, "draft_swa": 80}
+                        )
                     )
                     for ct, window in (
-                        (ComponentType.SWA, 16),
-                        (ComponentType.AUXILIARY_SWA, draft_window),
+                        (TARGET_WINDOW, 16),
+                        (DRAFT_WINDOW, draft_window),
                     ):
                         self.assertEqual(
                             node.component_data[ct].lock_ref,
@@ -359,7 +407,8 @@ class TestDeclaredParts(CustomTestCase):
                 cache.unlock(lock)
                 cache.evict(
                     EvictParams(
-                        num_tokens=80, swa_num_tokens=80, auxiliary_swa_num_tokens=80
+                        num_tokens=80,
+                        window_num_tokens={"window_16": 80, "draft_swa": 80},
                     )
                 )
                 self.assertEqual(storage.accounting_violations(), [])
@@ -374,7 +423,6 @@ class TestDeclaredParts(CustomTestCase):
             DraftBand,
             FusedDraftPlacement,
         )
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_draft_pool import routed_draft_pool
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -427,6 +475,7 @@ class TestDeclaredParts(CustomTestCase):
                     )
                     reaches = worker.draft_window_reaches
                     self.assertEqual(reaches, {"draft_swa": draft_window + front})
+                    storage.bind_window_retention(16, reaches)
                     cache = UnifiedRadixCache(
                         CacheInitParams(
                             disable=False,
@@ -434,8 +483,7 @@ class TestDeclaredParts(CustomTestCase):
                             token_to_kv_pool_allocator=a,
                             page_size=4,
                             sliding_window_size=16,
-                            draft_window_reaches=reaches,
-                            tree_slots=storage.tree_slots(window_reaches=reaches),
+                            tree_slots=storage.tree_slots(),
                             tree_core_backend="python",
                         )
                     )
@@ -458,7 +506,7 @@ class TestDeclaredParts(CustomTestCase):
                         req.seqlen = frontier + 1
                         batch.maybe_evict_swa()
                         for name, window in (
-                            ("swa", 16),
+                            ("window_16", 16),
                             ("draft_swa", draft_window + front),
                         ):
                             self.assertLessEqual(
@@ -467,12 +515,96 @@ class TestDeclaredParts(CustomTestCase):
                                 ).allocated_count(),
                                 window + interval + 4,
                             )
-                    self.assertGreater(
-                        req.kv.get_evicted_seqlen(ComponentType.AUXILIARY_SWA), 0
-                    )
+                    self.assertGreater(req.kv.get_evicted_seqlen("draft_swa"), 0)
                     self.assertEqual(a.full_attn_allocator.allocated_count(), 64)
                     a.free(torch.cat(chunks))
                     self.assertEqual(storage.accounting_violations(), [])
+
+    def test_each_window_retires_by_its_own_cursor(self):
+        """A shorter further window frees by its own cursor before the target's
+        window is due, and the prefill shield holds every window's rows below
+        it, not only the first window's."""
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        for floor in (0, 32):
+            with (
+                self.subTest(floor=floor),
+                envs.SGLANG_SWA_EVICTION_INTERVAL.override(8),
+                envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
+            ):
+                placement = FusedDraftPlacement.from_counts(
+                    counts={"draft_swa": [1, 1]},
+                    regions={
+                        "draft_swa": DenseDraftRegion(
+                            lane_num=2,
+                            head_num=1,
+                            head_dim=8,
+                            store_dtype=torch.bfloat16,
+                        )
+                    },
+                    new_bands={"draft_swa": DraftBand(kind="window", window=8)},
+                )
+                storage, _, _ = _build(fused_draft=placement)
+                a = storage.allocator
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        req_to_token_pool=storage.requests,
+                        token_to_kv_pool_allocator=a,
+                        page_size=4,
+                        sliding_window_size=16,
+                        tree_slots=storage.tree_slots(),
+                        tree_core_backend="python",
+                    )
+                )
+                first, further = (name for name, _ in cache.window_sub_pools())
+                req = SimpleNamespace(
+                    seqlen=1,
+                    decode_batch_idx=1,
+                    kv=ReqKvInfo(req_pool_idx=1, window_evict_floor=floor),
+                )
+                batch = ScheduleBatch(
+                    reqs=[req],
+                    tree_cache=cache,
+                    req_to_token_pool=storage.requests,
+                    token_to_kv_pool_allocator=a,
+                    forward_mode=ForwardMode.DECODE,
+                )
+                draft_band = next(
+                    b for b in a.members if b.sub_pool_name == "draft_swa"
+                )
+                chunks = []
+                for frontier in range(4, 65, 4):
+                    ids = a.alloc(4)
+                    self.assertIsNotNone(ids)
+                    chunks.append(ids)
+                    storage.requests.req_to_token[1, frontier - 4 : frontier] = ids
+                    req.seqlen = frontier + 1
+                    batch.maybe_evict_swa()
+                    if frontier == 20 and floor == 0:
+                        # The 8-token window is 8 tokens past due; the
+                        # 16-token window is not due yet.
+                        self.assertGreater(req.kv.get_evicted_seqlen(further), 0)
+                        self.assertEqual(req.kv.get_evicted_seqlen(first), 0)
+                for component in (first, further):
+                    self.assertGreaterEqual(req.kv.get_evicted_seqlen(component), floor)
+                # Rows below the shield stay held in the further window too.
+                self.assertGreaterEqual(draft_band.allocated_count(), floor)
+                if floor:
+                    self.assertLessEqual(
+                        draft_band.allocated_count(), floor + 8 + 8 + 4
+                    )
+                a.free(torch.cat(chunks))
+                self.assertEqual(storage.accounting_violations(), [])
 
     def test_unified_sizing_rejects_an_unbudgeted_private_draft(self):
         from unittest.mock import patch
@@ -536,7 +668,7 @@ class TestDeclaredParts(CustomTestCase):
                 cfg._unified_config_from_budget(1 << 20).max_total_num_tokens, 0
             )
 
-    def test_kda_spec_replay_pd_is_rejected_before_state_allocation(self):
+    def test_kda_spec_replay_keeps_pd_state_entries_alike(self):
         from unittest.mock import patch
 
         from sglang.srt.configs.mamba_utils import (
@@ -561,37 +693,47 @@ class TestDeclaredParts(CustomTestCase):
         )
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = True
-        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=8)
+        cfg.model_config = SimpleNamespace(
+            kv_lora_rank=8,
+            qk_rope_head_dim=8,
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"]),
+        )
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
         cfg.hybrid_gdn_config = None
         cfg.hybrid_kda_config = cfg.mambaish_config
-        with (
-            patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.mamba_cache_chunk_size",
-                return_value=4,
-            ),
-            get_context().override_server_args(
-                enable_linear_replayssm_spec=True,
-                disaggregation_mode="decode",
-                speculative_algorithm="DFLASH",
-            ),
-        ):
-            with self.assertRaisesRegex(ValueError, "different state entry layouts"):
-                cfg._kv_layer_decls()
 
-        with (
-            patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.mamba_cache_chunk_size",
-                return_value=4,
-            ),
-            get_context().override_server_args(
-                enable_linear_replayssm_spec=True,
-                disaggregation_mode="null",
-                speculative_algorithm="DFLASH",
-            ),
-        ):
-            self.assertEqual(len(cfg._kv_layer_decls()), 2)
+        def plan_for(*, mode, replay_spec):
+            with (
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.mamba_cache_chunk_size",
+                    return_value=4,
+                ),
+                get_context().override_server_args(
+                    enable_linear_replayssm_spec=replay_spec,
+                    disaggregation_mode=mode,
+                    speculative_algorithm="DFLASH" if replay_spec else None,
+                ),
+            ):
+                return plan_kv_storage(cfg._kv_layer_decls(), page_size=4)
+
+        # A PD prefill server runs no verify, so it declares no ring; its decode
+        # peer does. The ring is request memory, so the state entries they
+        # transfer are laid out alike.
+        prefill = plan_for(mode="prefill", replay_spec=False)
+        decode = plan_for(mode="decode", replay_spec=True)
+        (request,) = decode.requests()
+        self.assertIn("mamba.replayssm_rawv", {p.name for p in request.geometry.parts})
+        self.assertFalse(prefill.requests())
+        sent = prefill.sub_pool("mamba").spec
+        received = decode.sub_pool("mamba").spec
+        self.assertEqual(received.entry_bytes(), sent.entry_bytes())
+        self.assertEqual(received.entry_layout().offsets, sent.entry_layout().offsets)
+        self.assertEqual(
+            [(e.sub_pool, e.part, e.state_type) for e in decode.wire_entries()],
+            [(e.sub_pool, e.part, e.state_type) for e in prefill.wire_entries()],
+        )
+        self.assertNotIn(request.name, {e.sub_pool for e in decode.wire_entries()})
 
     def test_window_shares_do_not_limit_shared_arena_borrowing(self):
         """A long FULL history may borrow bytes released by its short window,
@@ -626,7 +768,7 @@ class TestDeclaredParts(CustomTestCase):
                 a = storage.allocator
                 self.assertIsNone(a.full_attn_allocator.max_live_tokens)
                 self.assertGreaterEqual(a.size_full, 1500)
-                self.assertTrue(a.can_reserve(1500, 20))
+                self.assertTrue(a.admits(KVDemand(1500, demand_windows(a, 1500, 20))))
                 chunks = []
                 for i in range(375):
                     if i >= 5:
@@ -746,7 +888,11 @@ class TestDeclaredParts(CustomTestCase):
         )
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = True
-        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=4)
+        cfg.model_config = SimpleNamespace(
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"]),
+        )
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
         cfg.hybrid_gdn_config = cfg.hybrid_kda_config = None
@@ -868,50 +1014,120 @@ class TestDeclaredParts(CustomTestCase):
         with self.assertRaises(RuntimeError):
             size_plan(plan, msgspec.structs.replace(inp, budget_bytes=16 * 1024 * 1024))
 
-    def test_each_request_part_resets_only_on_fresh_acquisition(self):
-        declarations = tuple(
-            RequestPartDecl(part=p)
-            for p in (
-                TensorPartDecl(name="cursor", shape=(), dtype=torch.int32),
-                TensorPartDecl(
-                    name="ring", shape=(4, 8), dtype=torch.float32, layer_ids=(1, 3)
-                ),
-                TensorPartDecl(
-                    name="context", shape=(3,), dtype=torch.int64, reset_value=7
-                ),
-            )
-        )
-        storage, _, sized = _build(requests=declarations)
-        memory = storage._request_memory
-        self.assertEqual(
-            memory.nbytes,
-            sum(t.bytes for t in sized.fixed if t.name != "request_table"),
-        )
-        req = SimpleNamespace(kv=_RequestKV())
+    def test_request_units_bind_with_rows_and_start_zeroed(self):
+        """A request sub-pool's unit is bound with its request row, zeroed when
+        a row binds it, kept while the row is held, and given back with it."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        (request,) = plan.requests()
+        allocator = storage.allocator
+        band = allocator.request_allocators[request.name]
+        ids = allocator.request_id_spaces()[request.name]
+        cursor = storage.view("mamba").replayssm_spec_write_pos
+        req = SimpleNamespace(rid="r0", kv=_StateRequestKV())
         row = storage.acquire([req])[0]
-        addresses = {n: t.data_ptr() for n, t in memory.tensors.items()}
-        for part in memory.parts:
-            tensor = memory.tensors[part.name].select(part.row_axis, row)
-            self.assertTrue(torch.all(tensor == part.reset_value))
-            tensor.fill_(19)
+        unit = int(ids.ids(torch.tensor([row]))[0])
+        self.assertGreater(unit, 0)
+        self.assertEqual(band.allocated_count(), 1)
+        self.assertEqual(int(cursor[unit]), 0)
+        cursor[unit] = 19
+        # A later chunk keeps its row, and with it its unit.
         self.assertEqual(storage.acquire([req]), [row])
-        for part in memory.parts:
-            self.assertTrue(
-                torch.all(memory.tensors[part.name].select(part.row_axis, row) == 19)
-            )
+        self.assertEqual(int(ids.ids(torch.tensor([row]))[0]), unit)
+        self.assertEqual(int(cursor[unit]), 19)
         storage.release_row(req)
-        other = SimpleNamespace(kv=_RequestKV())
-        self.assertEqual(storage.acquire([other]), [row])
-        for part in memory.parts:
-            self.assertTrue(
-                torch.all(
-                    memory.tensors[part.name].select(part.row_axis, row)
-                    == part.reset_value
-                )
-            )
-        self.assertEqual(
-            addresses, {n: t.data_ptr() for n, t in memory.tensors.items()}
+        self.assertEqual(band.allocated_count(), 0)
+        other = SimpleNamespace(rid="r1", kv=_StateRequestKV())
+        row = storage.acquire([other])[0]
+        unit = int(ids.ids(torch.tensor([row]))[0])
+        self.assertEqual(int(cursor[unit]), 0)
+
+    def test_request_usage_counts_rows_past_a_larger_state_entry(self):
+        """Usage lists every sub-pool, the request sub-pool included, though
+        views and the prefix tree's components leave it out; its usage is the
+        request rows bound and free. The arena's padding sink spans the largest
+        unit, so with a state entry larger than a request entry the request
+        band's first physical unit lies past 1. That padding is physical: the
+        free request rows are still the request table's rows past its padding
+        row 0."""
+        big = TensorPartDecl(
+            name="wide", shape=(512,), dtype=torch.float32, layer_ids=(1, 2)
         )
+        storage, plan, _ = _build(
+            extra=(big,), state=True, gamma=3, replay=_GDN_SPEC_REPLAY
+        )
+        (request,) = plan.requests()
+        (snapshot, *_) = storage.allocator._stage_snapshots()
+        self.assertGreater(snapshot.band(request.name).min_page, 1)
+        self.assertEqual(
+            [u.name for u in storage.usage()],
+            [s.name for s in plan.owner_first()],
+        )
+
+        def request_usage():
+            (usage,) = [u for u in storage.usage() if u.metrics == "request"]
+            self.assertEqual((usage.name, usage.label), (request.name, "request"))
+            return usage.capacity, usage.available
+
+        rows = storage.requests.available_size()
+        self.assertGreater(rows, 0)
+        self.assertEqual(request_usage(), (rows, rows))
+        req = SimpleNamespace(rid="r0", kv=_StateRequestKV())
+        storage.acquire([req])
+        self.assertEqual(request_usage(), (rows, rows - 1))
+        storage.release_row(req)
+        self.assertEqual(request_usage(), (rows, rows))
+
+    def test_request_rows_are_priced_with_the_other_units(self):
+        """A demand's request rows take a unit of every request sub-pool, priced
+        in the same layout as its tokens and state slots; nothing evictable
+        frees one."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        allocator = storage.allocator
+        (request,) = plan.requests()
+        demand = KVDemand(full_tokens=4, state_slots=1, request_rows=2)
+        demands = allocator.page_demands(demand)
+        self.assertEqual(demands[request.name], 2)
+        self.assertEqual(demands["mamba"], 1)
+        units, reclaim = allocator._admission_units(
+            demand, {request.name: 5}, empty_pool=False
+        )
+        self.assertEqual(units[request.name], 2)
+        self.assertEqual(reclaim[request.name], 0)
+
+    def test_reclaim_guard_prices_request_rows(self):
+        """The prefix tree evicts only for a demand that fits once everything
+        evictable is gone: that check prices the request rows the demand binds,
+        as the fit checks that stop the eviction do. Without them, a demand
+        whose state alone fits but whose request units do not evicts every
+        cached entry and still fails."""
+        from unittest.mock import MagicMock, patch
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        allocator = storage.allocator
+        (request,) = plan.requests()
+        cache = object.__new__(UnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = allocator
+        cache.full_evictable_size = lambda: 0
+        cache.window_evictable_size = lambda name: 0
+        cache.mamba_evictable_size = lambda: 0
+        cache.supports_mamba = lambda: True
+        cache.evict_until = MagicMock()
+        demand = cache._units_demand({"mamba": 1, request.name: 1})
+        self.assertEqual((demand.state_slots, demand.request_rows), (1, 1))
+        priced = []
+        with (
+            patch.object(allocator, "fits_after_frees", return_value=False),
+            patch.object(
+                allocator,
+                "admits",
+                side_effect=lambda d, **kw: priced.append(d) or False,
+            ),
+        ):
+            cache._reclaim({"mamba": 1, request.name: 1})
+        self.assertEqual(priced[0].request_rows, 1)
+        cache.evict_until.assert_not_called()
 
     def test_total_budget_charges_fixed_storage_once(self):
         storage, plan, _ = _build(state=True, gamma=3)
@@ -999,7 +1215,7 @@ class TestDeclaredParts(CustomTestCase):
             },
             new_bands={"draft_swa": DraftBand(kind="window", window=256)},
         )
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 storage, _, _ = _build(
                     state=True,
@@ -1010,7 +1226,7 @@ class TestDeclaredParts(CustomTestCase):
                 a = storage.allocator
                 states = a.alloc_state_slots(16)
                 chunks = []
-                while a.ensure_capacity(4, 4):
+                while a.ensure_capacity(token_demand(a, 4, 4)):
                     chunks.append(a.alloc(4))
                 cache = UnifiedRadixCache(
                     CacheInitParams(
@@ -1043,7 +1259,13 @@ class TestDeclaredParts(CustomTestCase):
                     nodes.append(
                         cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
                     )
-                budget = a.create_prefill_budget(cache)
+                # The tree checkpoints every 4 tokens here: so does the bound.
+                from unittest import mock
+
+                with mock.patch.object(
+                    cache, "window_checkpoint_interval", return_value=4
+                ):
+                    budget = create_prefill_budget(a, cache)
                 self.assertTrue(budget.state_slots_fit(1))
                 # The longer draft retains this whole prompt. Its bytes plus
                 # FULL 248 require a state donor, while the prompt remains below
@@ -1054,7 +1276,6 @@ class TestDeclaredParts(CustomTestCase):
                     total_tokens=248,
                     max_new_tokens=0,
                     input_tokens=240,
-                    swa_host_hit_length=0,
                     chunk_limit=16,
                     state_slots=1,
                 )
@@ -1065,22 +1286,33 @@ class TestDeclaredParts(CustomTestCase):
                         node,
                         skip_lock_components=(
                             ComponentType.FULL,
-                            ComponentType.SWA,
-                            ComponentType.AUXILIARY_SWA,
+                            TARGET_WINDOW,
+                            DRAFT_WINDOW,
                         ),
                     )
                     for node in nodes
                 ]
                 try:
                     self.assertEqual(cache.mamba_evictable_size(), 0)
-                    self.assertFalse(budget.check_prefill(**demand)[0])
+                    # Without the donor the whole prompt does not fit now. It
+                    # would fit an empty pool, so the pressure is transient: it
+                    # waits rather than being cut to the chunk that fits now.
+                    self.assertEqual(
+                        budget.check_prefill(**(demand | {"chunk_limit": None})),
+                        (False, None),
+                    )
+                    self.assertEqual(budget.check_prefill(**demand), (False, None))
                 finally:
                     for node, receipt in zip(nodes, receipts):
                         cache.dec_lock_ref(node, receipt.to_dec_params())
                 self.assertTrue(budget.check_prefill(**demand)[0])
                 self.assertIsNone(
-                    a.reclaim_for_prealloc(
-                        cache, 248, 20, auxiliary_swa_tokens=244, state_slots=1
+                    reclaim_for_prealloc(
+                        cache,
+                        a,
+                        token_demand(
+                            a, 248, 20, windows={"draft_swa": 244}, state_slots=1
+                        ),
                     )
                 )
                 incoming_state = a.alloc_state_slots(1)
@@ -1088,7 +1320,11 @@ class TestDeclaredParts(CustomTestCase):
                 first_chunk = a.alloc(16)
                 self.assertIsNotNone(first_chunk)
                 budget.reserve(240, 0, state_slots=1, chunk_limit=16)
-                self.assertFalse(budget.check_prefill(**demand)[0])
+                # The reservation is charged: a second such prompt no longer
+                # fits whole beside it.
+                self.assertFalse(
+                    budget.check_prefill(**(demand | {"chunk_limit": None}))[0]
+                )
                 a.free(first_chunk)
                 a.state_slots.free(incoming_state)
                 self.assertEqual(storage.accounting_violations(), [])
@@ -1119,7 +1355,7 @@ class TestDeclaredParts(CustomTestCase):
             },
             new_bands={"draft_swa": DraftBand(kind="window", window=32)},
         )
-        for lazy, demand in ((lazy, n) for lazy in (False, True) for n in (4, 16, 32)):
+        for lazy, demand in ((lazy, n) for lazy in (True,) for n in (4, 16, 32)):
             with self.subTest(lazy=lazy, demand=demand):
                 storage, _, _ = _build(
                     state=True,
@@ -1130,7 +1366,7 @@ class TestDeclaredParts(CustomTestCase):
                 a = storage.allocator
                 states = a.state_slots.alloc(16)
                 chunks = []
-                while a.ensure_capacity(4, 4):
+                while a.ensure_capacity(token_demand(a, 4, 4)):
                     chunks.append(a.alloc(4))
                 cache = UnifiedRadixCache(
                     CacheInitParams(
@@ -1168,29 +1404,38 @@ class TestDeclaredParts(CustomTestCase):
                     receipts.append((node, receipt))
                 try:
                     self.assertEqual(cache.full_evictable_size(), 0)
-                    self.assertEqual(cache.swa_evictable_size(), 0)
-                    self.assertEqual(cache.auxiliary_swa_evictable_size(), 0)
+                    self.assertEqual(
+                        cache.window_evictable_size(
+                            cache.token_to_kv_pool_allocator.target_window_pool()
+                        ),
+                        0,
+                    )
+                    self.assertEqual(cache.window_evictable_size("draft_swa"), 0)
                     self.assertEqual(cache.mamba_evictable_size(), 16)
                     phases = []
-                    original = cache.evict_for_alloc
+                    original = cache.evict_until
 
                     def walk(params, **kwargs):
-                        phases.append(params)
-                        return original(params, **kwargs)
+                        result = original(params, **kwargs)
+                        phases.append((params, result))
+                        return result
 
-                    with patch.object(cache, "evict_for_alloc", side_effect=walk):
-                        self.assertTrue(a.evict_to_free_tokens(cache, demand))
+                    with patch.object(cache, "evict_until", side_effect=walk):
+                        self.assertTrue(evict_to_free_tokens(cache, a, demand))
                     self.assertIsNotNone(a.alloc(demand))
-                    self.assertEqual(len(phases), 2)
-                    self.assertEqual(phases[0].mamba_num, 0)
+                    # Every token entry is locked, so the tokens are funded
+                    # from state checkpoints alone, and no more of them than
+                    # the bytes the tokens need.
+                    self.assertTrue(phases)
+                    self.assertTrue(all(p.num_tokens == 0 for p, _ in phases))
                     token_bytes = demand * sum(
                         b.entry_bytes for b in (a.full_attn_allocator, *a._windows)
                     )
+                    evicted = sum(r.mamba_num_evicted for _, r in phases)
                     self.assertEqual(
-                        phases[1].mamba_num,
-                        -(-token_bytes // a.mamba_allocator.entry_bytes),
+                        evicted, -(-token_bytes // a.mamba_allocator.entry_bytes)
                     )
-                    self.assertEqual(phases[1].num_tokens, 0)
+                    self.assertEqual(cache.mamba_evictable_size(), 16 - evicted)
                     for (node, _), prior in zip(receipts, chunks):
                         torch.testing.assert_close(
                             cache.tree_core.get_component_device_value(
@@ -1242,16 +1487,21 @@ class TestDeclaredParts(CustomTestCase):
                 )
                 if not state:
                     self.assertTrue(
-                        a.can_reserve(
-                            4,
-                            4,
-                            full_evictable_tokens=cache.full_evictable_size(),
-                            swa_evictable_tokens=cache.swa_evictable_size(),
+                        a.admits(
+                            KVDemand(4, demand_windows(a, 4, 4)),
+                            evictable={
+                                a.full_attn_allocator.sub_pool_name: cache.full_evictable_size(),
+                                a.swa_attn_allocator.sub_pool_name: window_evictable(
+                                    cache
+                                ),
+                            },
                         )
                     )
-                self.assertFalse(a.can_reserve(20, 4, empty_pool=True))
-                self.assertFalse(a.ensure_capacity(1, 1))
-                self.assertTrue(a.evict_to_free_tokens(cache, 4))
+                self.assertFalse(
+                    a.admits(KVDemand(20, demand_windows(a, 20, 4)), empty_pool=True)
+                )
+                self.assertFalse(a.ensure_capacity(token_demand(a, 1, 1)))
+                self.assertTrue(evict_to_free_tokens(cache, a, 4))
                 self.assertLessEqual(a.full_attn_allocator.allocated_count(), 12)
                 self.assertIsNotNone(a.alloc(4))
                 self.assertEqual(storage.accounting_violations(), [])
@@ -1260,6 +1510,9 @@ class TestDeclaredParts(CustomTestCase):
         from unittest.mock import patch
 
         from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+            ForwardStateSlots,
+        )
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
         from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
@@ -1273,7 +1526,7 @@ class TestDeclaredParts(CustomTestCase):
                         decode=False,
                         speculative=True,
                         is_kda=mode == "kda_fold",
-                        cache_len=8,
+                        cache_len=16,
                         key_heads=1,
                     ),
                 )
@@ -1283,13 +1536,15 @@ class TestDeclaredParts(CustomTestCase):
                 a.state.pool.replayssm_spec_fold = mode != "gdn_circular"
                 slots = a.alloc_state_slots(8)
                 a.state_slots.free(slots[:4])
+                a.mamba_allocator.flush_for_allocation()
                 active, track = slots[4:5], slots[7:8]
                 physical_active = a.mamba_allocator.ids.translate(active)
                 physical_track = a.mamba_allocator.ids.translate(track)
                 self.assertFalse(torch.equal(active, physical_active))
-                req.req_index_to_mamba_index_mapping[1] = active.int()[0]
+                (row,) = storage.take_rows(1)
+                req.req_index_to_mamba_index_mapping[row] = active.int()[0]
                 batch = SimpleNamespace(
-                    req_pool_indices=torch.tensor([1]),
+                    req_pool_indices=torch.tensor([row]),
                     forward_mode=ForwardMode.TARGET_VERIFY,
                     mamba_track_indices=track,
                     seq_lens=torch.tensor([15]),
@@ -1310,16 +1565,40 @@ class TestDeclaredParts(CustomTestCase):
                         device="cpu",
                     ),
                 )
-                outputs, conv_destinations = [], []
+                # The verify forward's metadata preparation resolved its slots.
+                state_ids = runner.runner_ids.state_ids(req.state_sub_pool)
+                forward_slots = ForwardStateSlots(
+                    state_ids.ids(req.get_mamba_indices(batch.req_pool_indices)),
+                    state_ids.ids(track),
+                    runner.runner_ids.request_ids().ids(batch.req_pool_indices),
+                )
+                runner.attn_backend = SimpleNamespace(
+                    forward_state_slots=lambda n, track_ids: forward_slots
+                )
+                # The row's ring unit is neither its row nor its state slot; after
+                # the forward resolved it, the row is rebound to another unit,
+                # which a commit reading the live table would pick up.
+                ring_ids = runner.runner_ids.request_ids()
+                resolved = forward_slots.ring
+                self.assertNotIn(int(resolved[0]), (row, int(physical_active[0])))
+                storage.release_rows([row])
+                spare = row + 1
+                self.assertTrue(a.alloc_request_rows(torch.tensor([spare])))
+                self.assertEqual(storage.take_rows(1), [row])
+                live = ring_ids.ids(torch.tensor([row]))
+                self.assertFalse(torch.equal(live, resolved))
+                ring_keyword = {
+                    "gdn_circular": "replay_indices",
+                    "kda_fold": "ring_indices",
+                }
+                outputs, conv_destinations, ring_rows = [], [], []
 
                 def commit(**kw):
                     outputs.append(
                         (kw["state_batch_indices"], kw["mamba_track_indices"])
                     )
-                    if "replay_indices" in kw:
-                        torch.testing.assert_close(
-                            kw["replay_indices"], batch.req_pool_indices
-                        )
+                    if mode in ring_keyword:
+                        ring_rows.append(kw[ring_keyword[mode]])
 
                 def scatter(*args):
                     conv_destinations.append(args[2])
@@ -1351,6 +1630,11 @@ class TestDeclaredParts(CustomTestCase):
                         prepared_step_indices=(torch.tensor([1]), torch.tensor([0])),
                     )
                 self.assertEqual(len(outputs), 1)
+                if mode in ring_keyword:
+                    # The ring rows the forward resolved, not the table's.
+                    torch.testing.assert_close(
+                        ring_rows[0], resolved, check_dtype=False
+                    )
                 torch.testing.assert_close(
                     outputs[0][0], physical_active, check_dtype=False
                 )
@@ -1371,7 +1655,62 @@ class TestDeclaredParts(CustomTestCase):
                     check_dtype=False,
                 )
 
-    def test_replay_algorithm_guard_covers_unified_and_static_construction(self):
+    def test_direct_kda_commit_uses_the_resolved_ring_rows(self):
+        """DSPARK and DFLASH commit KDA through the hybrid backend directly: it
+        writes the ring rows the forward resolved, not what the request table
+        names when the commit runs."""
+        from unittest.mock import patch
+
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+            ForwardStateSlots,
+        )
+
+        storage, plan, _ = _build(
+            state=True,
+            gamma=4,
+            replay=StateReplay(
+                decode=False, speculative=True, is_kda=True, cache_len=8, key_heads=1
+            ),
+        )
+        a = storage.allocator
+        a.state.bind_routes(a.get_kvcache().layer_router)
+        (request,) = plan.requests()
+        ring_ids = a.request_id_spaces()[request.name]
+        (row,) = storage.take_rows(1)
+        resolved = ring_ids.ids(torch.tensor([row]))
+        slots = a.alloc_state_slots(1)
+        working = a.mamba_allocator.ids.translate(slots)
+        forward_slots = ForwardStateSlots(working, None, resolved)
+        # The row is rebound to another unit before the commit runs.
+        storage.release_rows([row])
+        self.assertTrue(a.alloc_request_rows(torch.tensor([row + 1])))
+        self.assertEqual(storage.take_rows(1), [row])
+        self.assertFalse(torch.equal(ring_ids.ids(torch.tensor([row])), resolved))
+
+        hybrid = object.__new__(HybridLinearAttnBackend)
+        hybrid.linear_attn_backend = SimpleNamespace(state_pool=a.state.pool)
+        with patch(
+            "sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode."
+            "commit_kda_replayssm_after_verify"
+        ) as commit:
+            hybrid.update_mamba_state_after_mtp_verify(
+                torch.tensor([1]),
+                None,
+                None,
+                None,
+                req_pool_indices=torch.tensor([row]),
+                state_slots=forward_slots,
+            )
+        kwargs = commit.call_args.kwargs
+        torch.testing.assert_close(kwargs["ring_indices"], resolved, check_dtype=False)
+        torch.testing.assert_close(
+            kwargs["state_batch_indices"], working, check_dtype=False
+        )
+
+    def test_gdn_replay_spec_declares_parts_for_every_algorithm(self):
         from sglang.srt.configs.qwen3_next import Qwen3NextConfig
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_exec, get_spec
@@ -1383,10 +1722,14 @@ class TestDeclaredParts(CustomTestCase):
         cfg.mambaish_config = cfg.hybrid_gdn_config = hf
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = True
-        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=4)
+        cfg.model_config = SimpleNamespace(
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"]),
+        )
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
-        for algorithm in ("DFLASH", "DSPARK"):
+        for algorithm in ("DFLASH", "DSPARK", "EAGLE"):
             with (
                 self.subTest(algorithm=algorithm),
                 get_exec().mamba.override(enable_linear_replayssm_spec=True),
@@ -1394,20 +1737,7 @@ class TestDeclaredParts(CustomTestCase):
                     speculative_algorithm=algorithm, speculative_num_draft_tokens=4
                 ),
             ):
-                with self.assertRaisesRegex(ValueError, "requires a KDA"):
-                    cfg._kv_layer_decls()
-                with self.assertRaisesRegex(ValueError, "requires a KDA"):
-                    cfg._build_hybrid_req_pool(max_num_reqs=3, extra_max_context_len=4)
-                cfg.hybrid_kda_config = object()
-                cfg._validate_replay_spec_algorithm()
-                cfg.hybrid_kda_config = None
-        with (
-            get_exec().mamba.override(enable_linear_replayssm_spec=True),
-            get_spec().override(
-                speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
-            ),
-        ):
-            self.assertEqual(len(cfg._kv_layer_decls()), 2)
+                self.assertEqual(len(cfg._kv_layer_decls()), 2)
 
     def test_full_cap_is_enforced_on_live_allocations(self):
         storage, _, _ = _build()
@@ -1444,77 +1774,67 @@ class TestDeclaredParts(CustomTestCase):
         self.assertTrue(torch.all(ngram.intermediate_context == 17))
         self.assertEqual(len(plan.scratch), 4)
 
-    def test_gdn_replay_request_parts_reset_on_row_reuse(self):
+    def test_gdn_spec_ring_is_request_memory(self):
+        """The GDN speculative ring and its cursors form the request sub-pool: a
+        float of the chain the prefix tree, host stores and PD peers never see,
+        and no state slot (so no checkpoint) carries them."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        view = storage.view("mamba")
+        self.assertIsNone(view.mamba_cache.intermediate_ssm)
+        (request,) = plan.requests()
+        self.assertEqual(request.spec.grow_direction, "float")
+        self.assertEqual(
+            {p.name for p in request.geometry.parts},
+            {
+                f"mamba.{name}"
+                for name in (
+                    "replayssm_d",
+                    "replayssm_k",
+                    "replayssm_g",
+                    "replayssm_rawv",
+                    "replayssm_rawk",
+                    "replayssm_spec_write_pos",
+                    "replayssm_cache_base",
+                    "replayssm_is_flush",
+                )
+            },
+        )
+        self.assertNotIn(request.name, storage.sub_pool_names())
+        self.assertNotIn(request, plan.drive_order())
+        self.assertNotIn(request.name, {e.sub_pool for e in plan.wire_entries()})
+        self.assertTrue(view.replayssm_request_ring)
+        self.assertEqual(view._checkpoint_extra_buffers, ())
+        self.assertNotIn(
+            "replayssm_d", {p.name for p in plan.sub_pool("mamba").spec.extra_parts}
+        )
+        # The cursors sit one per unit in the request entries.
+        entry = request.spec.entry_bytes()
+        self.assertEqual(view.replayssm_spec_write_pos.stride(0) * 4, entry)
+        self.assertEqual(view.replayssm_is_flush.stride(0), entry)
+
+    def test_decode_replay_records_and_cursor_move_together(self):
+        """The decode ring and its cursor lag the slot's state, so they are the
+        slot's: copied, cleared and backed up with its entry."""
         storage, plan, _ = _build(
             state=True,
-            gamma=3,
             replay=StateReplay(
-                decode=False,
-                speculative=True,
-                is_kda=False,
-                cache_len=8,
-                key_heads=1,
+                decode=True, speculative=False, is_kda=False, cache_len=8, key_heads=1
             ),
         )
         view = storage.view("mamba")
-        self.assertIsNone(view.mamba_cache.intermediate_ssm)
-        self.assertEqual(len(plan.request_parts), 8)
-        row = storage.take_rows(1)[0]
-        for part in storage._request_memory.parts:
-            with self.subTest(part=part.name):
-                storage._request_memory.tensors[part.name].select(
-                    part.row_axis, row
-                ).fill_(23)
-        storage.release_rows([row])
-        self.assertEqual(storage.take_rows(1), [row])
-        for part in storage._request_memory.parts:
-            with self.subTest(part=part.name):
-                self.assertTrue(
-                    torch.all(
-                        storage._request_memory.tensors[part.name].select(
-                            part.row_axis, row
-                        )
-                        == part.reset_value
-                    )
-                )
-        self.assertIs(
-            view.replayssm_spec_write_pos,
-            storage._request_memory.tensors["mamba.replayssm_spec_write_pos"],
-        )
-        self.assertEqual(view._checkpoint_extra_buffers, ())
-
-    def test_replay_state_records_and_cursor_move_together(self):
-        for speculative in (False, True):
-            with self.subTest(speculative=speculative):
-                storage, plan, _ = _build(
-                    state=True,
-                    gamma=3 if speculative else None,
-                    replay=StateReplay(
-                        decode=True,
-                        speculative=speculative,
-                        is_kda=speculative,
-                        cache_len=8,
-                        key_heads=1,
-                    ),
-                )
-                view = storage.view("mamba")
-                self.assertFalse(plan.request_parts)
-                self.assertEqual(len(view.extra_parts), 7 if speculative else 4)
-                for part in view.extra_parts:
-                    view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
-                view.copy_from(torch.tensor([3]), torch.tensor([7]))
-                saved = view.get_cpu_copy(torch.tensor([7]))
-                view.clear_slots(torch.tensor([7]))
-                view.load_cpu_copy(saved, torch.tensor([7]))
-                for part in view.extra_parts:
-                    self.assertTrue(
-                        torch.all(
-                            view.extra_views[part.name].select(part.row_axis, 7) == 5
-                        )
-                    )
-                self.assertIs(
-                    view.replayssm_write_pos, view.extra_views["replayssm_write_pos"]
-                )
+        self.assertFalse(plan.requests())
+        self.assertEqual(len(view.extra_parts), 4)
+        for part in view.extra_parts:
+            view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
+        view.copy_from(torch.tensor([3]), torch.tensor([7]))
+        saved = view.get_cpu_copy(torch.tensor([7]))
+        view.clear_slots(torch.tensor([7]))
+        view.load_cpu_copy(saved, torch.tensor([7]))
+        for part in view.extra_parts:
+            self.assertTrue(
+                torch.all(view.extra_views[part.name].select(part.row_axis, 7) == 5)
+            )
+        self.assertIs(view.replayssm_write_pos, view.extra_views["replayssm_write_pos"])
 
     def test_window_resume_keeps_the_handoff_boundary(self):
         storage, _, _ = _build()
@@ -1525,10 +1845,14 @@ class TestDeclaredParts(CustomTestCase):
         expected = (
             storage.allocator.translate_swa_indices_for_transfer(tokens[4:23])[::4] // 4
         )
-        resume = storage.resume_units("swa", req, token_start=0, token_boundary=23)
+        resume = storage.resume_units(
+            "window_16", req, token_start=0, token_boundary=23
+        )
         self.assertEqual((resume.token_start, resume.token_boundary), (4, 23))
         torch.testing.assert_close(resume.unit_ids, expected)
-        resumed = storage.resume_units("swa", req, token_start=12, token_boundary=23)
+        resumed = storage.resume_units(
+            "window_16", req, token_start=12, token_boundary=23
+        )
         self.assertEqual((resumed.token_start, resumed.token_boundary), (12, 23))
         torch.testing.assert_close(resumed.unit_ids, expected[2:])
 
@@ -1585,7 +1909,7 @@ class TestDeclaredParts(CustomTestCase):
             ),
         )
         allocator = storage.allocator
-        available = allocator.available_size()
+        available = largest_take(allocator)
         ids = allocator.alloc(available)
         self.assertIsNotNone(ids)
         self.assertIsNone(allocator.alloc(4))
@@ -1597,7 +1921,7 @@ class TestDeclaredParts(CustomTestCase):
         allocator.load_cpu_copy(saved, ids)
         self.assertTrue(torch.all(view.k_buffer[0][physical] == 7))
         allocator.free(ids)
-        self.assertEqual(allocator.available_size(), available)
+        self.assertEqual(largest_take(allocator), available)
         self.assertEqual(allocator.verify_byte_accounting(), [])
         self.assertEqual(
             storage.plan.tree_slots()[0].component,
@@ -1643,7 +1967,9 @@ class TestDeclaredParts(CustomTestCase):
                 first = alloc.alloc(16 * dcp)
                 self.assertIsNotNone(first)
                 self.assertEqual(alloc.available_size(), 16 * dcp)
-                self.assertFalse(alloc.can_reserve(20 * dcp, 0))
+                self.assertFalse(
+                    alloc.admits(KVDemand(20 * dcp, demand_windows(alloc, 20 * dcp, 0)))
+                )
                 second = alloc.alloc(16 * dcp)
                 self.assertIsNotNone(second)
                 self.assertIsNone(alloc.alloc(4 * dcp))
@@ -1721,14 +2047,15 @@ class TestDeclaredParts(CustomTestCase):
                         ),
                         num_runners=1,
                         ctx=PlacementContext(
-                            host_names=("full", "swa", "mamba")
+                            host_names=("full", "window_16", "mamba")
                             if target_state
-                            else ("full", "swa"),
-                            target_window=16,
+                            else ("full", "window_16"),
+                            target_windows=(16,),
                         ),
                         store_dtype=torch.bfloat16,
                     ).placement
-                    self.assertEqual(set(placement.new_bands), {"draft_swa"})
+                    band = f"window_{draft_window}"
+                    self.assertEqual(set(placement.new_bands), {band})
                     storage, plan, _ = _build(
                         state=target_state,
                         window_with_state=True,
@@ -1738,11 +2065,9 @@ class TestDeclaredParts(CustomTestCase):
                     self.assertEqual(len(allocator.bands), 4 if target_state else 3)
                     ids = allocator.alloc(8)
                     self.assertIsNotNone(ids)
-                    draft = allocator.window_allocators["draft_swa"]
+                    draft = allocator.window_allocators[band]
                     physical = draft.ids.translate(ids).long()
-                    k, v = plan.sub_pool("draft_swa").spec.draft_views(
-                        storage.allocator.arena
-                    )
+                    k, v = plan.sub_pool(band).spec.draft_views(storage.allocator.arena)
                     k[0][physical] = 11
                     v[0][physical] = 13
                     allocator.free_swa_segment(ids[:4], start_pos=0)
@@ -1752,32 +2077,20 @@ class TestDeclaredParts(CustomTestCase):
                     torch.testing.assert_close(
                         k[0][physical], torch.full_like(k[0][physical], 11)
                     )
-                    # Failure in the last physical reservation leaves every id
-                    # and live page untouched, including the earlier window.
-                    before = [
-                        (b, b.allocated_count(), b.ids.virtual_to_physical.clone())
-                        for b in allocator.bands
-                    ]
-                    free_ids = allocator.full_attn_allocator.free_virtual_ids.clone()
-                    with patch.object(
-                        allocator._windows[-1],
-                        "take_planned_physical_pages",
-                        return_value=None,
-                    ):
-                        self.assertIsNone(allocator.alloc(4))
-                    for band, count, mapping in before:
-                        self.assertEqual(band.allocated_count(), count)
-                        torch.testing.assert_close(
-                            band.ids.virtual_to_physical, mapping
-                        )
-                    torch.testing.assert_close(
-                        allocator.full_attn_allocator.free_virtual_ids, free_ids
-                    )
                     allocator.free(ids)
                     self.assertEqual(allocator.verify_byte_accounting(), [])
                     self.assertTrue(
                         all(b.allocated_count() == 0 for b in allocator.bands)
                     )
+                    # A band refusing a take its own planned layout reserved is
+                    # an internal error, raised rather than reported as no room.
+                    with patch.object(
+                        allocator._windows[-1],
+                        "take_physical_pages",
+                        return_value=None,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "was refused"):
+                            allocator.alloc(4)
 
     def test_request_cleanup_releases_independently_retained_windows(self):
         """Returning owner ids must not strand a longer window's physical pages."""
@@ -1817,15 +2130,12 @@ class TestDeclaredParts(CustomTestCase):
                             a.free(ids[16:])
                         else:
                             from sglang.srt.managers.schedule_batch import ReqKvInfo
-                            from sglang.srt.mem_cache.unified_cache.component_type import (
-                                ComponentType,
-                            )
 
                             storage.requests.req_to_token[0, :32] = ids
                             kv = ReqKvInfo(req_pool_idx=0)
-                            kv.set_evicted_seqlen(ComponentType.SWA, 16)
+                            kv.set_evicted_seqlen("window_16", 16)
                             if window < 16:
-                                kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 24)
+                                kv.set_evicted_seqlen("draft_swa", 24)
                             storage.free_row(kv, [(0, 32)])
                         if grouped:
                             a.free_group_end()
@@ -1899,7 +2209,7 @@ class TestDeclaredParts(CustomTestCase):
                 need_sort=False,
                 max_num_reqs=3,
                 model_context_len=1024,
-                lazy_compaction=False,
+                lazy_compaction=True,
             ),
         )
         a = storage.allocator
@@ -1914,23 +2224,26 @@ class TestDeclaredParts(CustomTestCase):
                 tree_core_backend="python",
             )
         )
-        self.assertTrue(a.can_reserve(400, 16))
-        self.assertFalse(a.can_reserve(400, 400))
-        full_budget = a.full_available_size()
+        self.assertTrue(a.admits(KVDemand(400, demand_windows(a, 400, 16))))
+        self.assertFalse(a.admits(KVDemand(400, demand_windows(a, 400, 400))))
+        full_budget = largest_take(a, a.full_attn_allocator.sub_pool_name)
         swa_budget = a.conserve_swa_available_size()
+        # Over a shared memory the budgets count from zero: holding nothing
+        # back, the request fits.
         self.assertTrue(
             a.prealloc_fits(
-                cache,
-                400,
-                16,
-                full_budget_tokens=full_budget,
-                swa_budget_tokens=swa_budget,
+                token_demand(a, 400, 16),
+                evictable=evictable_by_sub_pool(cache, a),
+                full_budget_tokens=0,
+                window_budget_tokens={a.target_window_pool(): 0},
             )
         )
         # Pending requests and decode headroom are deducted from these budgets.
         # They must still be charged to the joint byte demand, not just compared
         # with this request's individual token counts.
-        self.assertFalse(a.can_reserve(full_budget, 16))
+        self.assertFalse(
+            a.admits(KVDemand(full_budget, demand_windows(a, full_budget, 16)))
+        )
         for full_reserved, swa_reserved, fits in (
             (4, 4, True),
             (full_budget - 400, 0, False),
@@ -1940,16 +2253,15 @@ class TestDeclaredParts(CustomTestCase):
             with self.subTest(full_reserved=full_reserved, swa_reserved=swa_reserved):
                 self.assertEqual(
                     a.prealloc_fits(
-                        cache,
-                        400,
-                        16,
-                        full_budget_tokens=full_budget - full_reserved,
-                        swa_budget_tokens=swa_budget - swa_reserved,
+                        token_demand(a, 400, 16),
+                        evictable=evictable_by_sub_pool(cache, a),
+                        full_budget_tokens=-full_reserved,
+                        window_budget_tokens={a.target_window_pool(): -swa_reserved},
                     ),
                     fits,
                 )
-        self.assertIsNone(a.reclaim_for_prealloc(cache, 400, 16))
-        self.assertTrue(a.ensure_capacity(400, 16))
+        self.assertIsNone(reclaim_for_prealloc(cache, a, token_demand(a, 400, 16)))
+        self.assertTrue(a.ensure_capacity(token_demand(a, 400, 16)))
 
     def test_multiwindow_reclaim_uses_one_window_as_joint_byte_donor(self):
         """A reclaimable window can fund a page in every locked companion band."""
@@ -1969,7 +2281,7 @@ class TestDeclaredParts(CustomTestCase):
         from sglang.srt.mem_cache.radix_cache import RadixKey
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        for lazy, draft_dim in ((False, 16), (True, 16), (False, 32), (True, 32)):
+        for lazy, draft_dim in ((True, 16), (True, 32)):
             with self.subTest(lazy=lazy, draft_dim=draft_dim):
                 placement = FusedDraftPlacement.from_counts(
                     counts={"draft_swa": [1]},
@@ -2017,24 +2329,41 @@ class TestDeclaredParts(CustomTestCase):
                 receipt = cache.inc_lock_ref(node)
                 try:
                     self.assertEqual(cache.full_evictable_size(), 0)
-                    self.assertEqual(cache.auxiliary_swa_evictable_size(), 0)
-                    self.assertEqual(cache.swa_evictable_size(), 144)
-                    self.assertFalse(a.ensure_capacity(4, 4))
+                    self.assertEqual(cache.window_evictable_size("draft_swa"), 0)
+                    self.assertEqual(
+                        cache.window_evictable_size(
+                            cache.token_to_kv_pool_allocator.target_window_pool()
+                        ),
+                        144,
+                    )
+                    self.assertFalse(a.ensure_capacity(token_demand(a, 4, 4)))
                     self.assertEqual(a._windows[0].sub_pool_name, "draft_swa")
-                    with patch.object(
-                        cache, "evict_for_alloc", wraps=cache.evict_for_alloc
-                    ) as evict:
+                    original = cache.evict_until
+                    evicted = []
+
+                    def walk(params, **kwargs):
+                        result = original(params, **kwargs)
+                        evicted.append(
+                            result.window_num_tokens_evicted.get("window_16", 0)
+                        )
+                        return result
+
+                    with patch.object(cache, "evict_until", side_effect=walk):
                         self.assertTrue(
-                            a.check_decode_capacity(num_tokens=4, tree_cache=cache)
+                            check_decode_capacity(
+                                allocator=a, num_tokens=4, tree_cache=cache
+                            )
                         )
                     # FULL/target cost 32 bytes per token; draft costs 64 or 128.
                     # A four-token request therefore needs 16 or 24 target
                     # donor tokens, regardless of physical retention order.
-                    expected_quota = 16 if draft_dim == 16 else 24
-                    self.assertEqual(
-                        evict.call_args_list[0].args[0].swa_num_tokens, expected_quota
+                    self.assertEqual(sum(evicted), 16 if draft_dim == 16 else 24)
+                    self.assertGreater(
+                        cache.window_evictable_size(
+                            cache.token_to_kv_pool_allocator.target_window_pool()
+                        ),
+                        0,
                     )
-                    self.assertGreater(cache.swa_evictable_size(), 0)
                     fresh = a.alloc(4)
                     self.assertIsNotNone(fresh)
                     a.free(fresh)
@@ -2045,47 +2374,73 @@ class TestDeclaredParts(CustomTestCase):
     def test_host_match_keeps_each_window_restore_length(self):
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.storage_prefetch import (
+            StagedPrefetchPlan,
+            WindowLoadBackPlan,
+        )
         from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
         root = object()
         node = SimpleNamespace(
             parent=root,
             component_data={
-                ComponentType.SWA: SimpleNamespace(
-                    value=None, host_value=torch.arange(4)
-                ),
-                ComponentType.AUXILIARY_SWA: SimpleNamespace(
-                    value=None, host_value=torch.arange(32)
-                ),
+                TARGET_WINDOW: SimpleNamespace(value=None, host_value=torch.arange(4)),
+                DRAFT_WINDOW: SimpleNamespace(value=None, host_value=torch.arange(32)),
             },
         )
         for order in (
-            (ComponentType.SWA, ComponentType.AUXILIARY_SWA),
-            (ComponentType.AUXILIARY_SWA, ComponentType.SWA),
+            (TARGET_WINDOW, DRAFT_WINDOW),
+            (DRAFT_WINDOW, TARGET_WINDOW),
         ):
             with self.subTest(order=order):
                 result = MatchResult(64, node, node, node, full_kv_hit_length=64)
                 for ct in order:
                     component = SWAComponent.__new__(SWAComponent)
                     component.component_type = ct
-                    component.tree_core = SimpleNamespace(root_node=root, page_size=4)
-                    component.sliding_window_size = 4 if ct == ComponentType.SWA else 32
+                    component.tree_core = SimpleNamespace(
+                        root_node=root,
+                        page_size=4,
+                        slot_id=lambda family: TARGET_WINDOW,
+                    )
+                    component.sliding_window_size = 4 if ct == TARGET_WINDOW else 32
                     result = component.finalize_match_result_in_tree_core(
                         result, None, [], 0
                     )
-                self.assertEqual(result.swa_host_hit_length, 4)
-                self.assertEqual(result.auxiliary_swa_host_hit_length, 32)
-                req = Req.__new__(Req)
-                req.matched_auxiliary_swa_host_hit_length = (
-                    result.auxiliary_swa_host_hit_length
+                self.assertEqual(
+                    result.window_host_hit_lengths.get(TARGET_WINDOW, 0), 4
                 )
+                self.assertEqual(
+                    result.window_host_hit_lengths,
+                    {TARGET_WINDOW: 4, DRAFT_WINDOW: 32},
+                )
+                # Outside the tree a request's hits go by sub-pool name.
+                req = Req.__new__(Req)
+                req.matched_window_host_hit_lengths = {"window_16": 4, "draft_swa": 32}
                 req.staged_prefetch_plan = None
-                self.assertEqual(req.auxiliary_swa_host_hit_length, 32)
-                req.staged_prefetch_plan = SimpleNamespace(window_tokens=lambda ct: 16)
-                self.assertEqual(req.auxiliary_swa_host_hit_length, 16)
+                self.assertEqual(
+                    req.window_host_hit_lengths, {"window_16": 4, "draft_swa": 32}
+                )
+                req.staged_prefetch_plan = StagedPrefetchPlan(
+                    0,
+                    None,
+                    0,
+                    0,
+                    {
+                        TARGET_WINDOW: WindowLoadBackPlan(0, 16, ((0, 16),)),
+                        DRAFT_WINDOW: WindowLoadBackPlan(0, 16, ((0, 16),)),
+                    },
+                    window_sub_pools={
+                        TARGET_WINDOW: "window_16",
+                        DRAFT_WINDOW: "draft_swa",
+                    },
+                )
+                self.assertEqual(
+                    req.window_host_hit_lengths, {"window_16": 16, "draft_swa": 16}
+                )
 
     def test_final_chunk_bounds_each_window_by_its_resolved_read_reach(self):
+        from unittest.mock import patch
+
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from sglang.srt.mem_cache.layout.fused_draft import (
             DenseDraftRegion,
@@ -2106,7 +2461,7 @@ class TestDeclaredParts(CustomTestCase):
             },
             new_bands={"draft_swa": DraftBand(kind="window", window=8)},
         )
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 storage, _, _ = _build(
                     fused_draft=placement,
@@ -2116,6 +2471,7 @@ class TestDeclaredParts(CustomTestCase):
                     lazy_compaction=lazy,
                 )
                 a = storage.allocator
+                storage.bind_window_retention(16, {"draft_swa": 12})
                 cache = UnifiedRadixCache(
                     CacheInitParams(
                         disable=False,
@@ -2123,17 +2479,52 @@ class TestDeclaredParts(CustomTestCase):
                         token_to_kv_pool_allocator=a,
                         page_size=4,
                         sliding_window_size=16,
-                        tree_slots=storage.tree_slots(window_reaches={"draft_swa": 12}),
+                        tree_slots=storage.tree_slots(),
                         tree_core_backend="python",
                     )
                 )
-                budget = a.create_prefill_budget(cache)
+                # Window rows retire at once here: the bound checked is the
+                # draft's read reach.
+                with patch(
+                    "sglang.srt.mem_cache.prefill_budget.window_retirement",
+                    return_value=WindowRetirement(0, 0, 1),
+                ):
+                    budget = create_prefill_budget(a, cache)
                 # The draft reads beyond its retained window during speculation.
-                self.assertEqual(budget.auxiliary_window_size, 12)
-                self.assertEqual(budget.auxiliary_tokens(1, 400, chunk_limit=8), 16)
+                retained = dict(budget.windows)
+                self.assertEqual(retained["draft_swa"], 12)
+
+                def priced(retention, extend, purpose=DemandPurpose.ADMIT, **kw):
+                    """The draft window's demand at ``retention``, as every
+                    site prices it (`demand_inputs`)."""
+                    return (
+                        demand_inputs(
+                            purpose,
+                            extend,
+                            400,
+                            windows={"draft_swa": retention},
+                            page_size=4,
+                            chunk_limit=8,
+                            prefill_retire_lag=0,
+                            eviction_interval=1,
+                            checkpoint_interval=budget.checkpoint_interval,
+                            **kw,
+                        )
+                        .demand()
+                        .window_tokens["draft_swa"]
+                    )
+
+                # Priced at its own read reach (12), below what the target's
+                # retention (16) would charge.
+                self.assertEqual(
+                    budget.window_tokens(1, 400, chunk_limit=8)["draft_swa"],
+                    priced(12, 1),
+                )
+                self.assertLess(priced(12, 1), priced(16, 1))
                 self.assertIsNotNone(a.alloc(8))
                 self.assertEqual(
                     budget.fit_chunk(
+                        _NO_ROW_REQ,
                         extend_input_len=1,
                         max_new_tokens=400,
                         chunk_limit=8,
@@ -2151,20 +2542,36 @@ class TestDeclaredParts(CustomTestCase):
                 self.assertIsNotNone(a.alloc(4))
                 budget.reserve(1, 400, chunk_limit=8)
                 self.assertEqual(budget.total_offset, 408)
-                self.assertEqual(budget.auxiliary_swa_offset, 16)
+                # The commitment: its page-ceiled row, priced alike.
+                self.assertEqual(budget.window_offsets["draft_swa"], priced(12, 4))
                 # A later request includes both selected work and restored pages,
                 # each priced with this band's own retention and page size.
-                full, primary, demand = budget._load_back_demand(
+                demand = budget._load_back_demand(
                     full_tokens=8,
                     extend_input_len=1,
                     max_new_tokens=400,
-                    swa_host_hit_length=5,
-                    auxiliary_swa_host_hit_length=9,
+                    window_host_hit_lengths={"window_16": 5, "draft_swa": 9},
                     chunk_limit=8,
                 )
-                self.assertEqual(full, 416)
-                self.assertEqual(demand["auxiliary_swa_tokens"], 44)
-                self.assertGreater(primary, budget.swa_offset)
+                self.assertEqual(demand.full_tokens, 416)
+                # The pending commitment beside this request and its restored
+                # pages, priced at the draft's own retention.
+                self.assertEqual(
+                    demand.window_tokens["draft_swa"],
+                    budget.ceil_paged_tokens(
+                        budget.window_offsets["draft_swa"]
+                        + priced(
+                            12,
+                            1,
+                            DemandPurpose.LOAD_BACK,
+                            host_hit_lengths={"draft_swa": 9},
+                        )
+                    ),
+                )
+                self.assertGreater(
+                    demand.window_tokens["window_16"],
+                    budget.window_offsets["window_16"],
+                )
                 self.assertEqual(storage.accounting_violations(), [])
 
     def test_auxiliary_restore_reserves_prefill_and_pending_demand(self):
@@ -2191,27 +2598,30 @@ class TestDeclaredParts(CustomTestCase):
         a = storage.allocator
         cache = SimpleNamespace(
             sliding_window_size=16,
-            window_retain_size=lambda component: 32,
+            # The target's window slot retains its own window; the draft's more.
+            window_retain_size=lambda name: 16 if name == "window_16" else 32,
             full_evictable_size=lambda: 0,
             full_unreclaimable_size=lambda: 0,
-            swa_evictable_size=lambda: 0,
-            auxiliary_swa_evictable_size=lambda: 0,
+            window_evictable_size=lambda component: 0,
             supports_mamba=lambda: False,
+            supports_prefix_sharing=lambda: True,
+            window_checkpoint_interval=lambda: 0,
+            transfers_in_flight=lambda: False,
             evict_for_alloc=lambda *args, **kwargs: EvictResult(),
         )
-        budget = a.create_prefill_budget(cache)
-        from sglang.srt.mem_cache.kv.alloc.pricing import no_relief_plan
+        budget = create_prefill_budget(a, cache)
+        from sglang.srt.mem_cache.kv.alloc.pricing import feasible
 
         def fits_restore(tokens):
-            return no_relief_plan(
+            # The layout search admission prices with.
+            return feasible(
                 a.pricing_snapshot(),
-                tuple(
-                    (
-                        b.sub_pool_name,
-                        tokens // 4 if b.sub_pool_name == "draft_swa" else 2,
+                {
+                    b.sub_pool_name: (
+                        tokens // 4 if b.sub_pool_name == "draft_swa" else 2
                     )
                     for b in (a.full_attn_allocator, *a._windows)
-                ),
+                },
             )
 
         resident = a.alloc(32)
@@ -2226,42 +2636,52 @@ class TestDeclaredParts(CustomTestCase):
             total_tokens=8,
             max_new_tokens=0,
             input_tokens=4,
-            swa_host_hit_length=0,
             chunk_limit=None,
         )
         self.assertEqual(budget.check_prefill(**kwargs), (True, None))
         self.assertEqual(
-            budget.check_prefill(**kwargs, auxiliary_swa_host_hit_length=capacity),
+            budget.check_prefill(
+                **kwargs, window_host_hit_lengths={"draft_swa": capacity}
+            ),
             (False, None),
         )
         prepare = dict(
             full_tokens=8,
             extend_input_len=4,
             max_new_tokens=0,
-            swa_host_hit_length=0,
             chunk_limit=None,
         )
         self.assertFalse(
-            budget.prepare_load_back(**prepare, auxiliary_swa_host_hit_length=capacity)
+            budget.prepare_load_back(
+                **prepare, window_host_hit_lengths={"draft_swa": capacity}
+            )
         )
         restore = min(32, capacity - 8)
         self.assertEqual(
-            budget.check_prefill(**kwargs, auxiliary_swa_host_hit_length=restore),
+            budget.check_prefill(
+                **kwargs, window_host_hit_lengths={"draft_swa": restore}
+            ),
             (True, None),
         )
         budget.reserve(capacity, 0)
         self.assertEqual(
-            budget.check_prefill(**kwargs, auxiliary_swa_host_hit_length=restore),
+            budget.check_prefill(
+                **kwargs, window_host_hit_lengths={"draft_swa": restore}
+            ),
             (False, None),
         )
-        budget = a.create_prefill_budget(cache)
+        budget = create_prefill_budget(a, cache)
         self.assertTrue(
-            budget.prepare_load_back(**prepare, auxiliary_swa_host_hit_length=restore)
+            budget.prepare_load_back(
+                **prepare, window_host_hit_lengths={"draft_swa": restore}
+            )
         )
         # Realize a window-only host restoration, then the promised joint
         # allocation. Admission must leave both in the same byte envelope.
         window = next(w for w in a._windows if w.sub_pool_name == "draft_swa")
-        with budget.load_back_scope(**prepare, auxiliary_swa_host_hit_length=restore):
+        with budget.load_back_scope(
+            **prepare, window_host_hit_lengths={"draft_swa": restore}
+        ):
             window.alloc_with_virtual(resident[:restore:4] // 4)
         self.assertIsNotNone(a.alloc(8))
         self.assertEqual(storage.accounting_violations(), [])
@@ -2297,9 +2717,13 @@ class TestDeclaredParts(CustomTestCase):
         )
         storage, _, _ = _build(fused_draft=placement)
         a = storage.allocator
-        empty_demands = [n for n in range(8, 128, 4) if a.can_reserve(n, n)]
+        empty_demands = [
+            n
+            for n in range(8, 128, 4)
+            if a.admits(KVDemand(n, demand_windows(a, n, n)))
+        ]
         ids = []
-        while a.can_reserve(4, 4):
+        while a.admits(KVDemand(4, demand_windows(a, 4, 4))):
             allocation = a.alloc(4)
             self.assertIsNotNone(allocation)
             ids.append(allocation)
@@ -2317,17 +2741,33 @@ class TestDeclaredParts(CustomTestCase):
         )
         key = RadixKey(array("q", range(ids.numel())))
         cache.insert(InsertParams(key=key, value=ids.clone()))
-        need = next(n for n in empty_demands if not a.can_reserve(n, n))
-        budget = a.create_prefill_budget(cache)
+        need = next(
+            n for n in empty_demands if not a.ensure_capacity(token_demand(a, n, n))
+        )
+        budget = create_prefill_budget(a, cache)
         before = a.pricing_snapshot()
-        self.assertTrue(budget._fits(need, need, empty_pool=True))
-        self.assertTrue(budget._fits(need, need))
+        self.assertTrue(
+            budget._fits(
+                need, dict.fromkeys(budget.window_offsets, need), empty_pool=True
+            )
+        )
+        self.assertTrue(budget._fits(need, dict.fromkeys(budget.window_offsets, need)))
         self.assertEqual(a.pricing_snapshot(), before)
         node = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
         receipt = cache.inc_lock_ref(node)
         try:
-            self.assertFalse(budget._fits(need, need))
-            self.assertTrue(budget._fits(need, need, empty_pool=True))
+            # The lock keeps the prefix's FULL pages, but window pages outside
+            # its windows stay reclaimable, and the bytes they free serve every
+            # band: the planner admits, and eviction then the take deliver it.
+            self.assertEqual(cache.full_evictable_size(), 0)
+            self.assertTrue(
+                budget._fits(need, dict.fromkeys(budget.window_offsets, need))
+            )
+            self.assertTrue(
+                budget._fits(
+                    need, dict.fromkeys(budget.window_offsets, need), empty_pool=True
+                )
+            )
         finally:
             cache.dec_lock_ref(node, receipt.to_dec_params())
         self.assertEqual(
@@ -2336,7 +2776,6 @@ class TestDeclaredParts(CustomTestCase):
                 total_tokens=need,
                 max_new_tokens=0,
                 input_tokens=need - 4,
-                swa_host_hit_length=0,
                 chunk_limit=None,
             ),
             (True, None),
@@ -2348,25 +2787,58 @@ class TestDeclaredParts(CustomTestCase):
         queue = object.__new__(DecodePreallocQueue)
         queue.tree_cache = cache
         queue.token_to_kv_pool_allocator = a
-        full_budget = a.full_available_size() + cache.full_evictable_size()
-        swa_budget = a.swa_available_size() + cache.swa_evictable_size()
-        for full, swa, fits in (
-            (full_budget, swa_budget, True),
-            (need - 1, swa_budget, False),
-            (full_budget, need - 1, False),
+        full_budget = (
+            largest_take(a, a.full_attn_allocator.sub_pool_name)
+            + cache.full_evictable_size()
+        )
+        swa_budget = largest_take(
+            a, a.swa_attn_allocator.sub_pool_name
+        ) + cache.window_evictable_size(a.swa_attn_allocator.sub_pool_name)
+        from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+
+        evictable = evictable_by_sub_pool(cache, a)
+        target = a.target_window_pool()
+
+        def jointly(full, swa):
+            # A budget below what is reachable holds the rest back for other
+            # requests: charged beside this one in one admission question,
+            # where reclaimed bytes of either side may serve it.
+            held_full = (
+                largest_take(a, a.full_attn_allocator.sub_pool_name)
+                + evictable[a.full_attn_allocator.sub_pool_name]
+                - full
+            )
+            held_swa = largest_take(a, target) + evictable[target] - swa
+            demand = token_demand(a, need, need)
+            return a.admits(
+                KVDemand(
+                    demand.full_tokens + max(0, held_full),
+                    {
+                        **demand.window_tokens,
+                        target: demand.window_tokens[target] + max(0, held_swa),
+                    },
+                    demand.state_slots,
+                ),
+                evictable=evictable,
+            )
+
+        for full, swa in (
+            (full_budget, swa_budget),
+            (need - 1, swa_budget),
+            (full_budget, need - 1),
         ):
             self.assertEqual(
                 queue._prealloc_reservation_fits(
-                    need,
-                    need,
-                    full_allocatable_tokens=full,
-                    swa_allocatable_tokens=swa,
+                    token_demand(a, need, need),
+                    # Counted from zero: what each budget holds back.
+                    full_allocatable_tokens=full - full_budget,
+                    window_allocatable_tokens={target: swa - swa_budget},
                 ),
-                fits,
+                jointly(full, swa),
             )
-        self.assertTrue(a.prealloc_fits_assumes_reclaim())
+        self.assertTrue(jointly(full_budget, swa_budget))
         self.assertIsNone(
-            queue._reclaim_swa_tail_capacity(need, "resume", full_len=need)
+            queue._reclaim_prealloc_capacity(token_demand(a, need, need), "resume")
         )
         fresh = a.alloc(need)
         self.assertIsNotNone(fresh)
@@ -2412,7 +2884,7 @@ class TestDeclaredParts(CustomTestCase):
         # This fixture specifies retained contents, independent of prefill order.
         ids = a.full_attn_allocator.alloc(100)
         self.assertIsNotNone(ids)
-        for name, tail in (("swa", 8), ("draft_swa", 4)):
+        for name, tail in (("window_8", 8), ("draft_swa", 4)):
             retained = torch.cat((ids[20 - tail : 20], ids[100 - tail : 100]))
             a.window_allocators[name].alloc_with_virtual(retained[::4] // 4)
         self.assertEqual(storage.accounting_violations(), [])
@@ -2437,8 +2909,8 @@ class TestDeclaredParts(CustomTestCase):
                     key=cache_key,
                     value=value.clone(),
                     component_evicted_seqlens={
-                        ComponentType.SWA: value.numel() - 8,
-                        ComponentType.AUXILIARY_SWA: value.numel() - 4,
+                        ComponentType.of("WINDOW_8"): value.numel() - 8,
+                        DRAFT_WINDOW: value.numel() - 4,
                     },
                 )
             )
@@ -2448,29 +2920,30 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(
             (
                 cache.full_evictable_size(),
-                cache.swa_evictable_size(),
-                cache.auxiliary_swa_evictable_size(),
+                cache.window_evictable_size(a.swa_attn_allocator.sub_pool_name),
+                cache.window_evictable_size("draft_swa"),
             ),
             (80, 8, 4),
         )
-        budget = a.create_prefill_budget(cache)
-        pinned = [True]
-        a.full_attn_allocator.add_pin_source(lambda: pinned[0])
-        a.swa_attn_allocator.add_pin_source(lambda: pinned[0])
-        self.assertFalse(budget._fits(8, 8))
-        pinned[0] = False
-        self.assertTrue(budget._fits(8, 8))
-        cache.evict_for_alloc(
+        budget = create_prefill_budget(a, cache)
+        hold_band(a.full_attn_allocator)
+        hold_band(a.swa_attn_allocator)
+        self.assertFalse(budget._fits(8, dict.fromkeys(budget.window_offsets, 8)))
+        release_band(a.full_attn_allocator)
+        release_band(a.swa_attn_allocator)
+        self.assertTrue(budget._fits(8, dict.fromkeys(budget.window_offsets, 8)))
+        cache.evict(
             EvictParams(
                 num_tokens=80,
-                swa_num_tokens=8,
-                auxiliary_swa_num_tokens=4,
+                window_num_tokens={"window_8": 8, "draft_swa": 4},
             )
         )
-        self.assertFalse(a.can_reserve(8, 8))
+        # The evicted end holes are credited before any flush: the planned
+        # take compacts the ends.
+        self.assertTrue(a.admits(KVDemand(8, demand_windows(a, 8, 8))))
         for band in (a.full_attn_allocator, a.swa_attn_allocator):
             band.flush_for_allocation()
-        self.assertTrue(a.can_reserve(8, 8))
+        self.assertTrue(a.admits(KVDemand(8, demand_windows(a, 8, 8))))
         fresh = a.alloc(8)
         self.assertIsNotNone(fresh)
         a.free(fresh)
@@ -2507,7 +2980,9 @@ class TestDeclaredParts(CustomTestCase):
                 },
             ),
             num_runners=1,
-            ctx=PlacementContext(host_names=("full", "swa", "mamba"), target_window=16),
+            ctx=PlacementContext(
+                host_names=("full", "window_16", "mamba"), target_windows=(16,)
+            ),
             store_dtype=torch.bfloat16,
         ).placement
         storage, plan, _ = _build(
@@ -2639,7 +3114,7 @@ class TestDeclaredParts(CustomTestCase):
         key = RadixKey(array("q", range(32)))
         ids = alloc.alloc(32)
         cache.insert(InsertParams(key=key, value=ids.clone()))
-        cache.evict(EvictParams(auxiliary_swa_num_tokens=4))
+        cache.evict(EvictParams(window_num_tokens={"draft_swa": 4}))
         old_full = alloc.full_attn_allocator.ids.translate(ids).clone()
         incoming = alloc.alloc(32)
         self.assertIsNotNone(incoming)
@@ -2651,7 +3126,10 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(matched.device_prefix_len, 32)
         self.assertEqual(storage.accounting_violations(), [])
         cache.evict(
-            EvictParams(num_tokens=64, swa_num_tokens=64, auxiliary_swa_num_tokens=64)
+            EvictParams(
+                num_tokens=64,
+                window_num_tokens={"window_16": 64, "draft_swa": 64},
+            )
         )
         self.assertEqual(
             {b.sub_pool_name: b.allocated_count() for b in alloc.bands},
@@ -2688,7 +3166,8 @@ class TestDeclaredParts(CustomTestCase):
             )
             floors = dict(sized.bs1_floor_terms)
             self.assertEqual(
-                floors["swa_window_kv"], 20 * plan.sub_pool("swa").spec.entry_bytes()
+                floors["window_16_window_kv"],
+                20 * plan.sub_pool("window_16").spec.entry_bytes(),
             )
             self.assertEqual(
                 floors["draft_swa_window_kv"],
@@ -2737,8 +3216,10 @@ class TestDeclaredParts(CustomTestCase):
             lane_num=1, head_num=1, head_dim=3, v_head_dim=5, store_dtype=torch.bfloat16
         )
         placement = FusedDraftPlacement.from_counts(
-            counts={"full": [1], "swa": [1]},
-            regions={"full": region, "swa": region},
+            counts={"full": [1], "window_16": [1]},
+            regions={"full": region, "window_16": region},
+            # The target's window sub-pool hosts as a window.
+            hosted={"window_16": "window"},
         )
         storage, _, _ = _build(fused_draft=placement)
         with TemporaryDirectory() as directory:
@@ -2757,7 +3238,7 @@ class TestDeclaredParts(CustomTestCase):
                     extra_config={"file_storage_path": directory},
                 )
             )
-            for name, wire in (("full", PoolName.KV), ("swa", PoolName.SWA)):
+            for name, wire in (("full", PoolName.KV), ("window_16", PoolName.SWA)):
                 host = storage.host_layout(name).build(
                     HostPoolOptions(
                         ratio=1,
@@ -2832,7 +3313,7 @@ class TestDeclaredParts(CustomTestCase):
                     plan=plan,
                     owner="full",
                     page_size=4,
-                    lanes_by_host={"swa": {0: 0}},
+                    lanes_by_host={"window_16": {0: 0}},
                 )
                 runner = RunnerIds(
                     req_to_token=storage.requests.req_to_token,
@@ -2861,7 +3342,7 @@ class TestDeclaredParts(CustomTestCase):
                 torch.testing.assert_close(mapping[ids[::4] // 4], physical[::4] // 4)
                 from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
 
-                for name in ("full", "swa"):
+                for name in ("full", "window_16"):
                     layout = storage.host_layout(name)
                     self.assertEqual(layout.page_size, alloc.page_size)
                     host = layout.build(
@@ -2924,7 +3405,7 @@ class TestDeclaredParts(CustomTestCase):
                 },
             ),
             num_runners=1,
-            ctx=PlacementContext(host_names=("full", "swa")),
+            ctx=PlacementContext(host_names=("full", "window_16")),
             store_dtype=torch.bfloat16,
         ).placement
         storage, plan, _ = _build(fused_draft=placement)
@@ -3253,31 +3734,16 @@ class TestDeclaredParts(CustomTestCase):
                                 storage.host_layout(band.sub_pool_name).capacity,
                                 capacity * factor,
                             )
-                        if a.mamba_allocator is not None:
-                            token_page_bytes = sum(
-                                b.entry_bytes_per_page
-                                for b in (a.full_attn_allocator, *a._windows)
-                            )
-                            expected_cost = -(
-                                -a.mamba_allocator.entry_bytes
-                                * a.page_size
-                                // token_page_bytes
-                            )
-                            self.assertEqual(
-                                a.admission_rules().state_slot_cost,
-                                0 if shape == "multi" else expected_cost,
-                            )
                         ids = a.alloc(32 * factor)
                         self.assertIsNotNone(ids)
                         self.assertEqual(
                             a.conserve_swa_available_size(),
                             (window_capacity - 32) * factor,
                         )
-                        self.assertGreater(a.swa_available_size(), 0)
-                        full, window = a.swa_capacity_and_available(
-                            full_capacity=sized.full_tokens,
-                            swa_capacity=sized.window_tokens,
+                        self.assertGreater(
+                            largest_take(a, a.swa_attn_allocator.sub_pool_name), 0
                         )
+                        window = a.usage()[a.swa_attn_allocator.sub_pool_name]
                         self.assertEqual(window[0] - window[1], 32 * factor)
                         a.free(ids)
                         self.assertEqual(
@@ -3364,7 +3830,7 @@ class TestDeclaredParts(CustomTestCase):
                 )
                 self.assertEqual(storage.requests.size, sized.max_running_requests)
 
-    def test_retraction_carries_whole_entries_derived_pages_and_request_parts(self):
+    def test_retraction_carries_whole_entries_and_derived_pages(self):
         from unittest.mock import patch
 
         from torch.utils._python_dispatch import TorchDispatchMode
@@ -3424,19 +3890,10 @@ class TestDeclaredParts(CustomTestCase):
                             ),
                         ),
                     ),
-                    requests=(
-                        RequestPartDecl(
-                            part=TensorPartDecl(
-                                name="pending", shape=(3,), dtype=torch.int32
-                            )
-                        ),
-                    ),
                 )
                 allocator = storage.allocator
                 source = allocator.alloc(16)
                 state_ids = allocator.alloc_state_slots(1) if with_state else None
-                (request_row,) = storage.take_rows(1)
-                storage.request_memory.tensors["pending"][request_row].fill_(97)
                 original = {}
                 for n, band in enumerate(allocator.members):
                     ids = (
@@ -3462,12 +3919,11 @@ class TestDeclaredParts(CustomTestCase):
                     BoundedGather(),
                 ):
                     saved = allocator.get_cpu_copy(
-                        source, mamba_indices=state_ids, req_pool_index=request_row
+                        source, mamba_indices=state_ids, req_pool_index=None
                     )
                 # A distinct allocation changes both virtual and physical rows.
                 destination = allocator.alloc(16)
                 new_state = allocator.alloc_state_slots(1) if with_state else None
-                (new_row,) = storage.take_rows(1)
                 if not with_state:
                     allocator.free_swa_segment(destination[:4], start_pos=0)
                 with (
@@ -3482,7 +3938,7 @@ class TestDeclaredParts(CustomTestCase):
                         saved,
                         destination,
                         mamba_indices=new_state,
-                        req_pool_index=new_row,
+                        req_pool_index=None,
                     )
                 for band in allocator.members:
                     ids = (
@@ -3502,11 +3958,28 @@ class TestDeclaredParts(CustomTestCase):
                     destination[::4] // 4
                 ]
                 self.assertTrue(torch.all(blob[:, pages] == 83))
-                self.assertTrue(
-                    torch.all(storage.request_memory.tensors["pending"][new_row] == 97)
-                )
 
-    def test_sparse_page_regions_and_request_ring_reuse(self):
+    def test_retraction_carries_request_units(self):
+        """A retracted request's request-sub-pool unit is backed up by its row
+        and restored into the unit its new row binds."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        (request,) = plan.requests()
+        allocator = storage.allocator
+        ids = allocator.request_id_spaces()[request.name]
+        entries = allocator.arena.entries(request.name)
+        source = allocator.alloc(4)
+        (row,) = storage.take_rows(1)
+        entries[int(ids.ids(torch.tensor([row]))[0])] = 97
+        saved = allocator.get_cpu_copy(source, req_pool_index=row)
+        storage.release_rows([row])
+        destination = allocator.alloc(4)
+        (other,) = [r for r in storage.take_rows(2) if r != row]
+        unit = int(ids.ids(torch.tensor([other]))[0])
+        self.assertTrue(torch.all(entries[unit] == 0))
+        allocator.load_cpu_copy(saved, destination, req_pool_index=other)
+        self.assertTrue(torch.all(entries[unit] == 97))
+
+    def test_sparse_page_regions(self):
         # Packed DSA pages put all 128-byte keys before the 4-byte scales;
         # QSA pages contain two compressed K rows. Neither is token-interleaved.
         dsa = TensorPartDecl(
@@ -3519,36 +3992,16 @@ class TestDeclaredParts(CustomTestCase):
             layer_ids=(0, 4),
             slice_axis=1,
         )
-        tails = tuple(
-            RequestPartDecl(
-                part=TensorPartDecl(
-                    name=name, shape=(7, 128), dtype=torch.bfloat16, layer_ids=(0, 4)
-                ),
-                wire="dsa_tail",
-            )
-            for name in ("tail_k", "tail_score")
-        )
-        pending = RequestPartDecl(
-            part=TensorPartDecl(
-                name="pending", shape=(2, 2, 8), dtype=torch.bfloat16, layer_ids=(0, 4)
-            ),
-            wire="qsa_pending",
-        )
-        rope = RequestPartDecl(
-            part=TensorPartDecl(name="rope", shape=(2, 3), dtype=torch.int64),
-            wire="qsa_pending",
-        )
         storage, plan, sized = _build(
             derived=(
                 DerivedPartDecl(sub_pool="full", part=dsa, wire="dsa"),
                 DerivedPartDecl(sub_pool="full", part=qsa, wire="qsa_compressed"),
             ),
-            requests=(*tails, pending, rope),
         )
         wires = plan.wire_entries()
         self.assertEqual(
             [e.state_type for e in wires],
-            ["swa", "dsa", "dsa_tail", "qsa_pending", "qsa_compressed"],
+            ["swa", "dsa", "qsa_compressed"],
         )
         self.assertEqual(storage.regions("full", part="dsa").item_lens, (528, 528))
         region = storage.regions("full", part="qsa_compressed")
@@ -3556,44 +4009,12 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(region.layer_ids, (0, 4))
         self.assertEqual(region.dim_per_tensor, (2, 2))
         self.assertEqual(region.slice_outer_counts, (2, 2))
-        self.assertEqual(
-            storage.regions("full", part="dsa_tail").item_lens, (1792,) * 4
-        )
-        self.assertEqual(
-            storage.regions("full", part="qsa_pending").item_lens, (64, 64, 48)
-        )
         arena = storage.allocator.arena
         for tensor in arena.page_parts["full"].tensors.values():
             tensor[:, 3].fill_(7)
         arena.move_units("full", torch.tensor([9]), torch.tensor([3]))
         for tensor in arena.page_parts["full"].tensors.values():
             self.assertTrue(torch.all(tensor[:, 9] == 7))
-        for declared in plan.request_parts:
-            storage._request_memory.tensors[declared.part.name].fill_(9)
-        row = storage.take_rows(1)[0]
-        for declared in plan.request_parts:
-            part = declared.part
-            tensor = storage._request_memory.tensors[part.name]
-            self.assertTrue(
-                torch.all(tensor.select(part.row_axis, row) == part.reset_value)
-            )
-        storage.release_rows([row])
-        for declared in plan.request_parts:
-            part = declared.part
-            storage._request_memory.tensors[part.name].select(part.row_axis, row).fill_(
-                11
-            )
-        self.assertEqual(storage.take_rows(1), [row])
-        for declared in plan.request_parts:
-            part = declared.part
-            self.assertTrue(
-                torch.all(
-                    storage._request_memory.tensors[part.name].select(
-                        part.row_axis, row
-                    )
-                    == part.reset_value
-                )
-            )
 
     def test_derived_page_blobs_move_with_physical_pages(self):
         part = TensorPartDecl(

@@ -9,8 +9,10 @@ from torch.nn import functional as F
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_rmsnorm_cast_before_weight,
+    can_use_rmsnorm_cast_before_weight_scale,
     fused_packed_silu_mul_bitexact,
     rmsnorm_cast_before_weight_bitexact,
+    rmsnorm_cast_before_weight_scale_bitexact,
 )
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
@@ -19,7 +21,10 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     shard_seq,
     tail_attn_meta,
 )
-from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageTransformer2DModel
+from sglang.multimodal_gen.runtime.models.dits.zimage import (
+    ZImageTransformer2DModel,
+    ZImageTransformerBlock,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.layernorm import RMSNorm
 
@@ -29,6 +34,9 @@ _MING_SWIGLU_FUSION = BitExactFusionGate(
 )
 
 _MING_RMSNORM_FUSION = BitExactFusionGate("Ming-Image RMSNorm", per_signature=True)
+_MING_NORM_SCALE_FUSION = BitExactFusionGate(
+    "Ming-Image RMSNorm epilogue", per_signature=True
+)
 
 
 def _eager_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
@@ -77,6 +85,43 @@ class MingRMSNorm(RMSNorm):
         )
 
 
+def _ming_norm_scale(x, scale, norm, enable_fused, residual=None):
+    def reference():
+        y = norm(x) * scale
+        return y if residual is None else residual + y
+
+    if (
+        not enable_fused
+        or torch.compiler.is_compiling()
+        or norm.variance_epsilon not in (1e-6, 1e-5)
+        or not can_use_rmsnorm_cast_before_weight_scale(x, norm.weight, scale, residual)
+    ):
+        return reference()
+    return _MING_NORM_SCALE_FUSION.run(
+        lambda: rmsnorm_cast_before_weight_scale_bitexact(
+            x, norm.weight, scale, residual, norm.variance_epsilon
+        ),
+        reference,
+        sig=(x.device, x.dtype, norm.variance_epsilon, residual is not None),
+        logger=logger,
+        reraise=(ValueError,),
+    )
+
+
+class MingImageTransformerBlock(ZImageTransformerBlock):
+    def __init__(self, *args, quant_config=None, **kwargs):
+        super().__init__(*args, quant_config=quant_config, **kwargs)
+        self.enable_ming_norm_fusion = quant_config is None
+
+    def _norm_scale(self, x, scale, norm):
+        return _ming_norm_scale(x, scale, norm, self.enable_ming_norm_fusion)
+
+    def _norm_tanh_mul_add(self, x, gate, residual, norm):
+        return _ming_norm_scale(
+            x, torch.tanh(gate), norm, self.enable_ming_norm_fusion, residual
+        )
+
+
 class MingSiluAndMul(nn.Module):
     def forward(self, x):
         # Inductor can fuse the reference expression while tracing.
@@ -116,6 +161,8 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
     """Ming-Image's joint DiT, sharing Z-Image blocks and TP/SP attention."""
 
     norm_cls = MingRMSNorm
+    block_cls = MingImageTransformerBlock
+    _no_split_modules = ["MingImageTransformerBlock"]
     _aliases = ["DiffusionTransformer"]
 
     def __init__(self, config, hf_config, quant_config=None):
@@ -182,6 +229,14 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         x_valid = x_target if self.learned_padding else x_length
         cap_valid = cap_target if self.learned_padding else cap_length
         x_freqs, cap_freqs = self.rotary_emb(x_ids), self.rotary_emb(cap_ids)
+        # Freqs are rebuilt every forward, so the identity-keyed _get_rope_cache
+        # would never hit.
+        x_rope_cos_sin_cache, x_rope_positions, x_rope_freqs_complex = (
+            self._build_rope_cache(x_freqs)
+        )
+        cap_rope_cos_sin_cache, cap_rope_positions, cap_rope_freqs_complex = (
+            self._build_rope_cache(cap_freqs)
+        )
         x_mask, x_meta = self._get_attn_mask_and_meta(
             "_ming_x_mask", [x_valid] * batch_size, x_target, x.device
         )
@@ -196,12 +251,23 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
                 x,
                 x_freqs,
                 adaln,
+                rope_cos_sin_cache=x_rope_cos_sin_cache,
+                rope_positions=x_rope_positions,
                 attn_mask=x_mask,
                 attn_mask_meta=x_meta,
                 skip_sequence_parallel_override=True,
+                rope_freqs_complex=x_rope_freqs_complex,
             )
         for layer in self.context_refiner:
-            cap = layer(cap, cap_freqs, attn_mask=cap_mask, attn_mask_meta=cap_meta)
+            cap = layer(
+                cap,
+                cap_freqs,
+                rope_cos_sin_cache=cap_rope_cos_sin_cache,
+                rope_positions=cap_rope_positions,
+                attn_mask=cap_mask,
+                attn_mask_meta=cap_meta,
+                rope_freqs_complex=cap_rope_freqs_complex,
+            )
         if sp_size > 1:
             # masked alignment rows never contribute; learned registers must stay
             x, cap = x[:, :x_valid], cap[:, :cap_valid]
@@ -224,13 +290,19 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
             unified, shard = shard_seq(unified)
             freqs = tuple(shard_like(freq, shard, dim=0) for freq in freqs)
             mask, meta = None, tail_attn_meta(shard, batch_size, x.device)
+        rope_cos_sin_cache, rope_positions, rope_freqs_complex = self._build_rope_cache(
+            freqs
+        )
         for layer in self.layers:
             unified = layer(
                 unified,
                 freqs,
                 adaln,
+                rope_cos_sin_cache=rope_cos_sin_cache,
+                rope_positions=rope_positions,
                 attn_mask=mask,
                 attn_mask_meta=meta,
+                rope_freqs_complex=rope_freqs_complex,
             )
         if sp_size == 1:
             unified = unified[:, :x_target]

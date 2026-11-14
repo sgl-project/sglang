@@ -283,6 +283,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(

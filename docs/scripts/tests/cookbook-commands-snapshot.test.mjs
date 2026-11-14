@@ -11,13 +11,13 @@ const docs = fileURLToPath(new URL("../..", import.meta.url));
 const configsDir = join(docs, "src/snippets/configs");
 const snapshotPath = fileURLToPath(new URL("cookbook-commands.snapshot.json", import.meta.url));
 const engineSource = readFileSync(join(docs, "src/snippets/_deployment.jsx"), "utf8");
-const START = "  // ==== 1. Hardware catalog";
-const END = "  const renderBenchmarkCard";
+const START = "  // ==== COMMAND ENGINE ====";
+const END = "  // ==== end COMMAND ENGINE ====";
 const start = engineSource.indexOf(START);
 const end = engineSource.indexOf(END);
 assert.ok(start > 0 && end > start, `_deployment.jsx no longer contains "${START}" ... "${END}"; update the slice markers`);
 const createEngine = new Function(
-  "config", "benchmarks", "agenticLink",
+  "config",
   `${engineSource.slice(start, end)}\nreturn { renderCommand, findCell };`,
 );
 
@@ -121,7 +121,6 @@ test("cookbook commands match the snapshot", async (t) => {
       added.length ? `Added:\n${show(added)}` : "",
       removed.length ? `Removed:\n  ${removed.slice(0, 5).join("\n  ")}` : "",
       "Only if the change is intended, regenerate the snapshot with:",
-      // TODO(Yichi): point this message at the pre-commit command once it exists.
       "  UPDATE_SNAPSHOTS=1 node --test docs/scripts/tests/cookbook-commands-snapshot.test.mjs",
     ].filter(Boolean).join("\n"));
   }

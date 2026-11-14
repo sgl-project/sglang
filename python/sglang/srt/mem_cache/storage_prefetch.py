@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -100,7 +100,16 @@ class StagedPrefetchPlan:
     full_tokens: int
     windows: dict[ComponentType, WindowLoadBackPlan]
     mamba_slots: int = 0
+    # Each window slot's sub-pool, the name its host hit goes by outside the tree.
+    window_sub_pools: dict[ComponentType, str] = field(default_factory=dict)
 
     def window_tokens(self, component_type: ComponentType) -> int:
         window = self.windows.get(component_type)
         return window.num_tokens if window is not None else 0
+
+    def window_host_hit_lengths(self) -> dict[str, int]:
+        """Host hit tokens per window sub-pool."""
+        return {
+            self.window_sub_pools[ct]: window.num_tokens
+            for ct, window in self.windows.items()
+        }

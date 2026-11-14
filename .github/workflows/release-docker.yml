@@ -44,6 +44,9 @@ jobs:
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
       sgl_version: ${{ needs.resolve-version.outputs.version }}
+      # Manual rebuilds must read the pin from the release tag, not the run branch.
+      checkout_ref: refs/tags/v${{ needs.resolve-version.outputs.version }}
+      mega_use_release_pin: true
       use_environment: prod
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
       tag_config: |

@@ -96,7 +96,7 @@ named `nightly-test-{runner_config}` — one suite per machine type, holding eve
 that runs nightly on it, with `auto_partition` splitting the work. There is no
 per-purpose split; kernel, eval, perf, and precision all share their machine's suite.
 
-> **Note**: Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
+> **Note**: A CUDA diffusion test registers on a `diffusion-*` runner_config (for example `stage="base-b", runner_config="diffusion-unit-1-gpu-h100"`), whose install adds the diffusion extra; those suites run in `pr-test-multimodal-gen.yml`. AMD diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`.
 
 ### Choosing a Tier
 
@@ -355,9 +355,9 @@ They are ordinary registered tests; only their stage differs:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Correctness tests in test/registered/kernels/ops/<group>/
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 
 # Benchmarks in test/registered/kernels/benchmark/<group>/
 register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")

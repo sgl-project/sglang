@@ -48,6 +48,8 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    output_indices=None,
+    HAS_OUTPUT_INDICES: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = (
         tl.program_id(0),
@@ -77,7 +79,10 @@ def chunk_fwd_kernel_o(
     q += (bos * Hg + i_h // (H // Hg)) * K
     k += (bos * Hg + i_h // (H // Hg)) * K
     v += (bos * H + i_h) * V
-    o += (bos * H + i_h) * V
+    if HAS_OUTPUT_INDICES:
+        o += i_h * V
+    else:
+        o += (bos * H + i_h) * V
     h += (i_tg * H + i_h).to(tl.int64) * V * K
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
@@ -116,7 +121,13 @@ def chunk_fwd_kernel_o(
     b_A = tl.where(m_A, b_A, 0)
 
     p_v = v + o_t[:, None] * (H * V) + o_v[None, :]
-    p_o = o + o_t[:, None] * (H * V) + o_v[None, :]
+    if HAS_OUTPUT_INDICES:
+        destinations = tl.load(output_indices + bos + o_t, mask=m_t, other=0).to(
+            tl.int64
+        )
+        p_o = o + destinations[:, None] * (H * V) + o_v[None, :]
+    else:
+        p_o = o + o_t[:, None] * (H * V) + o_v[None, :]
     b_v = tl.load(p_v, mask=m_t[:, None] & (o_v < V)[None, :], other=0.0)
 
     # to fix mma -> mma layout conversion
@@ -242,6 +253,8 @@ def chunk_fwd_o(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
     chunk_indices: Optional[torch.LongTensor] = None,
+    out: Optional[torch.Tensor] = None,
+    output_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -252,9 +265,13 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.zeros_like(v)
+    if (out is None) != (output_indices is None):
+        raise ValueError("out and output_indices must be supplied together")
+    o = torch.zeros_like(v) if out is None else out
 
-    use_grouped = _use_grouped_three_head(q, k, v, h, g, cu_seqlens, chunk_size, NT)
+    use_grouped = output_indices is None and _use_grouped_three_head(
+        q, k, v, h, g, cu_seqlens, chunk_size, NT
+    )
     if use_grouped:
         chunk_fwd_kernel_o_grouped_three_head[(2, 16, NT)](
             q,
@@ -298,6 +315,8 @@ def chunk_fwd_o(
             BV=64,
             USE_G=g is not None,
             IS_VARLEN=cu_seqlens is not None,
+            output_indices=output_indices,
+            HAS_OUTPUT_INDICES=output_indices is not None,
             num_warps=4,
             num_stages=2,
         )

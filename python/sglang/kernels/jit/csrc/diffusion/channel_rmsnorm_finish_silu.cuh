@@ -13,6 +13,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -79,7 +80,7 @@ __global__ void kernel(const Params __grid_constant__ params) {
       value = cast<fp32_t>(cast<bf16_t>(__fmul_rn(value, gamma)));
       // + bias (0.0): rounds to bf16 and turns -0.0 into +0.0 exactly like the eager add.
       const float normed = cast<fp32_t>(cast<bf16_t>(__fadd_rn(value, 0.0f)));
-      out[i] = cast<bf16_t>(div_rn(normed, __fadd_rn(1.0f, expf(-normed))));
+      out[i] = cast<bf16_t>(activation::silu<false>(normed));
     }
     out.store(params.out + element);
   }

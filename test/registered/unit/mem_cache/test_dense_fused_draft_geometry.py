@@ -565,7 +565,7 @@ class TestFusedMLAHost(unittest.TestCase):
             page_size=self.PS,
             need_sort=False,
             forward_stream=None,
-            lazy_compaction=False,
+            lazy_compaction=True,
         )
         dp = DraftMHAView(
             arena=pool,
@@ -638,6 +638,8 @@ class TestRoutedDraftPool(CustomTestCase):
             fused_draft=FusedDraftPlacement.from_counts(
                 counts={"full": [1], "swa": [1]},
                 regions={"full": full_region, "swa": swa_region},
+                # This pool names its window sub-pool `swa`.
+                hosted={"swa": "window"},
             ),
         )
 
@@ -675,7 +677,7 @@ class TestRoutedDraftPool(CustomTestCase):
         self.assertEqual(swa_only.get_v_head_dim(), 8)
         self.assertEqual(swa_only.layer_router.route(0).sub_pool, "swa")
 
-    def test_window_write_needs_the_swa_loc_and_stays_in_the_swa_entry(self):
+    def test_window_write_needs_its_window_loc_and_stays_in_the_swa_entry(self):
         pool = self._pool()
         dp = self._draft_pool(pool)
         layer = SimpleNamespace(layer_id=1)
@@ -692,7 +694,10 @@ class TestRoutedDraftPool(CustomTestCase):
         # CPU by contract (register_cpu_ci), and the subject here is WHERE the
         # bytes land, not which kernel puts them there -- take the naive path.
         with patch.object(mem_pool, "can_use_store_cache", return_value=False):
-            dp.set_kv_buffer(layer, KVWriteLoc(loc, swa_loc=loc, physical=True), k, v)
+            window = dp.layer_router.route(1).sub_pool
+            dp.set_kv_buffer(
+                layer, KVWriteLoc(loc, window_locs={window: loc}, physical=True), k, v
+            )
         swa_entry = pool.spec("swa").entry_bytes()
         lo = 6 * swa_entry + pool.spec("swa").draft_offset_in_entry()
         nz = raw.nonzero()
@@ -761,7 +766,11 @@ class TestRoutedDraftPool(CustomTestCase):
                 expected = self._expected_writes(arena, full, swa, values, commit_lens)
                 loc = KVWriteLoc(
                     full if commit_lens is not None else full.flatten(),
-                    swa_loc=swa if commit_lens is not None else swa.flatten(),
+                    window_locs={
+                        pool.layer_router.route(1).sub_pool: swa
+                        if commit_lens is not None
+                        else swa.flatten()
+                    },
                     physical=True,
                 )
                 with patch.multiple(

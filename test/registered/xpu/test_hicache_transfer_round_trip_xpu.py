@@ -15,13 +15,18 @@ load_to_device_per_layer / backup_from_device_all_layer):
     direct      page_first_direct   transfer_kv_per_layer_direct_pf_lf  transfer_kv_all_layer_direct_lf_pf
     kernel      layer_first (MLA)   transfer_kv_per_layer_mla           transfer_kv_all_layer_mla
     kernel      page_first (MLA)    transfer_kv_per_layer_mla_pf_lf     transfer_kv_all_layer_mla_lf_pf
+    kernel      page_first (Mamba)  transfer_kv_mamba_pf_lf             transfer_kv_mamba_lf_pf
+    direct      page_first_direct   transfer_kv_per_layer_direct_pf_lf  transfer_kv_all_layer_direct_lf_pf
+                (Mamba)
 """
 
 import unittest
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_xpu_ci
@@ -64,7 +69,9 @@ def _transfer_indices(io_backend: str):
 
 @unittest.skipUnless(XPU_AVAILABLE, "Intel XPU not available")
 class TestHiCacheTransferRoundTripXpu(CustomTestCase):
-    def _assert_round_trip(self, host, device_pool, device_buffers, io_backend):
+    def _assert_round_trip(
+        self, host, device_pool, device_buffers, io_backend, num_layers=LAYER_NUM
+    ):
         reference = _fill_random(device_buffers)
         host_indices, device_indices, n = _transfer_indices(io_backend)
 
@@ -75,7 +82,7 @@ class TestHiCacheTransferRoundTripXpu(CustomTestCase):
         for buf in device_buffers:
             buf.zero_()
         torch.xpu.synchronize()
-        for layer_id in range(LAYER_NUM):
+        for layer_id in range(num_layers):
             host.load_to_device_per_layer(
                 device_pool, host_indices, device_indices, layer_id, io_backend
             )
@@ -143,6 +150,39 @@ class TestHiCacheTransferRoundTripXpu(CustomTestCase):
         buffers = [device_pool.kv_buffer[i] for i in range(LAYER_NUM)]
         self._assert_round_trip(host, device_pool, buffers, io_backend)
 
+    def _mamba_round_trip(self, io_backend: str, layout: str, num_drafts: int = 0):
+        def state(layers):
+            return MambaStateBufferInfo(
+                temporal=torch.empty(
+                    (layers, POOL_TOKENS, 4, 32), dtype=torch.float32, device=DEVICE
+                ),
+                conv=(
+                    torch.empty(
+                        (layers, POOL_TOKENS, 3, 64), dtype=DTYPE, device=DEVICE
+                    ),
+                ),
+            )
+
+        infos = (state(LAYER_NUM), *(state(1) for _ in range(num_drafts)))
+        host = MambaPoolHost(
+            infos[0],
+            host_to_device_ratio=2.0,
+            host_size=0,
+            device_capacity=POOL_TOKENS,
+            layout=layout,
+            mtp_draft_buffer_infos=infos[1:],
+        )
+        # Per-layer views, so the comparison covers each target and draft layer.
+        buffers = [
+            buf[layer]
+            for info in infos
+            for buf in (info.temporal, *info.conv)
+            for layer in range(buf.shape[0])
+        ]
+        self._assert_round_trip(
+            host, None, buffers, io_backend, num_layers=host.num_mamba_layers
+        )
+
     def test_mha_kernel_layer_first(self):
         self._mha_round_trip("kernel", "layer_first")
 
@@ -163,6 +203,16 @@ class TestHiCacheTransferRoundTripXpu(CustomTestCase):
 
     def test_mla_kernel_page_first(self):
         self._mla_round_trip("kernel", "page_first")
+
+    def test_mamba_kernel_page_first(self):
+        self._mamba_round_trip("kernel", "page_first")
+
+    def test_mamba_direct_page_first_direct(self):
+        self._mamba_round_trip("direct", "page_first_direct")
+
+    def test_mamba_kernel_page_first_mtp_draft(self):
+        # Draft layers are separate allocations; backup stacks them for the XPU op.
+        self._mamba_round_trip("kernel", "page_first", num_drafts=1)
 
 
 if __name__ == "__main__":

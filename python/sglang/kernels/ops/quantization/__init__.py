@@ -8,12 +8,23 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
+    CapabilityRequirement,
     KernelBackend,
     KernelSpec,
 )
 
 if TYPE_CHECKING:
     import torch
+
+
+register_kernel(
+    KernelSpec(
+        op="quantization.groupwise_int8_dequant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.groupwise_int8_dequant:groupwise_int8_dequant",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 
 register_kernel(
@@ -134,6 +145,24 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="quantization.mxfp8_group_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp8_group_quant:mxfp8_group_quant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.mxfp4_dequant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp4_dequant:mxfp4_dequant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="quantization.quantize_fp4_indexer_tensor",
         backend=KernelBackend.TRITON,
         target=(
@@ -160,3 +189,24 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "mxfp4_quant_rows",
+        "mxfp4_quant_rows",
+        "per-row MXFP4 (E8M0 per 32) activation quant, runtime M",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"quantization.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.quantization.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc

@@ -43,6 +43,7 @@ class TestPLEStateCoordinates(unittest.TestCase):
         slots = alloc.state_slots.alloc(8)
         if moved:
             alloc.state_slots.free(slots[:4])
+            alloc.mamba_allocator.flush_for_allocation()
         working, tracking = slots[-1:], slots[-2:-1]
         physical = alloc.mamba_allocator.ids.translate(working)
         track_physical = alloc.mamba_allocator.ids.translate(tracking)
@@ -132,6 +133,7 @@ class TestPLEStateCoordinates(unittest.TestCase):
                         token_to_kv_pool=pool,
                         runner_ids=reader,
                         linear_attn_backend=backend,
+                        forward_state_slots=backend.forward_state_slots,
                     )
                 )
             ),
@@ -161,7 +163,8 @@ class TestPLEStateCoordinates(unittest.TestCase):
 
     def test_ascend_graph_metadata_checkpoints_static_ple_state(self):
         """Capture and replay save both PLE parts to the recurrent checkpoint rows."""
-        from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+        from sglang.srt.mem_cache.kv.decl import STATE_PART
+        from sglang.srt.mem_cache.kv.router import KVLayerRouter
         from sglang.srt.mem_cache.ple_state_pool import (
             NGRAM_PART,
             SHORT_CONV_PART,
@@ -211,7 +214,8 @@ class TestPLEStateCoordinates(unittest.TestCase):
                     get_mamba_indices=lambda rows: mapping[rows],
                 )
                 reader = SimpleNamespace(
-                    state_ids=lambda _: SimpleNamespace(ids=lambda indices: indices)
+                    state_ids=lambda _: SimpleNamespace(ids=lambda indices: indices),
+                    request_ids=lambda: SimpleNamespace(ids=lambda rows: rows),
                 )
                 backend = AscendMambaAttnBackendBase(
                     SimpleNamespace(
@@ -255,6 +259,7 @@ class TestPLEStateCoordinates(unittest.TestCase):
                                 token_to_kv_pool=pool,
                                 runner_ids=reader,
                                 linear_attn_backend=backend,
+                                forward_state_slots=backend.forward_state_slots,
                             )
                         )
                     ),
