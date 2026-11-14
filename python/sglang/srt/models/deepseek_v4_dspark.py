@@ -74,13 +74,14 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_gfx1250_supported, is_npu
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
 _is_npu = is_npu()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def apply_rotary_emb(
@@ -959,6 +960,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             assert x.dim() == 2, "V4.1 draft hidden states leave forward() collapsed"
             return x
         last = self.stages[-1]
+        if _is_gfx1250_supported and x.is_cuda and x.numel() > 0:
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                last.hc_head_fn,
+                last.hc_head_scale,
+                last.hc_head_base,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
         return hc_head_torch(
             x,
             last.hc_head_fn,
