@@ -6,6 +6,14 @@ import json
 import pytest
 
 from sglang.multimodal_gen import registry
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlus_2511_PipelineConfig,
+    QwenImageEditPlusPipelineConfig,
+    QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
+    QwenImage21PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan_Animate_2_14B_Config,
     Wan_Animate_2_14B_Distilled_Config,
@@ -120,6 +128,86 @@ def test_model_id_short_name_selects_the_variant_for_a_neutral_directory():
         "/models/ckpt-7f3a", model_id="Wan2.2-Animate-2-14B-Distilled-Diffusers"
     )
     assert info.pipeline_config_cls is Wan_Animate_2_14B_Distilled_Config
+
+
+# sgl-project/sglang#48635: a locally downloaded Qwen-Image-2.1 checkpoint whose
+# directory is named with "_" instead of "." (e.g. "Qwen-Image-2_1") resolved
+# to the v1 config, which has no `sample_sigmas`, so
+# QwenImage21Pipeline._load_config crashed at server startup with
+# "AttributeError: 'QwenImagePipelineConfig' object has no attribute
+# 'sample_sigmas'". Directory names must match with separators normalized.
+
+
+@pytest.mark.parametrize(
+    "dirname, index_class, config_cls",
+    [
+        ("Qwen-Image-2_1", "QwenImage21Pipeline", QwenImage21PipelineConfig),
+        ("Qwen-Image-2.1", "QwenImage21Pipeline", QwenImage21PipelineConfig),
+        (
+            "Qwen-Image-2_1-Turbo",
+            "QwenImage21Pipeline",
+            QwenImage21PipelineConfig,
+        ),
+        (
+            "Qwen-Image-2.1-Turbo",
+            "QwenImage21Pipeline",
+            QwenImage21PipelineConfig,
+        ),
+        ("Qwen-Image", "QwenImagePipeline", QwenImagePipelineConfig),
+        ("Qwen-Image-2512", "QwenImagePipeline", QwenImagePipelineConfig),
+        (
+            "Qwen-Image-Edit_2509",
+            "QwenImageEditPlusPipeline",
+            QwenImageEditPlusPipelineConfig,
+        ),
+        (
+            "Qwen-Image-Edit-2509",
+            "QwenImageEditPlusPipeline",
+            QwenImageEditPlusPipelineConfig,
+        ),
+        (
+            "Qwen-Image-Edit_2511",
+            "QwenImageEditPlusPipeline",
+            QwenImageEditPlus_2511_PipelineConfig,
+        ),
+    ],
+)
+def test_qwen_image_separator_variants_route_to_the_matching_config(
+    tmp_path, dirname, index_class, config_cls
+):
+    path = _checkpoint_dir(tmp_path, name=dirname, index_class=index_class)
+    assert registry._get_config_info(path).pipeline_config_cls is config_cls
+
+
+def test_qwen_image_21_config_exposes_sample_sigmas(tmp_path):
+    # QwenImage21Pipeline._load_config reads this attribute unconditionally;
+    # resolving the underscore directory to the v1 config crashed startup.
+    path = _checkpoint_dir(
+        tmp_path, name="Qwen-Image-2_1", index_class="QwenImage21Pipeline"
+    )
+    info = registry._get_config_info(path)
+    assert info.pipeline_config_cls is QwenImage21PipelineConfig
+    assert info.pipeline_config_cls().sample_sigmas is None
+
+
+def test_qwen_image_detectors_match_separator_variants():
+    # Same normalization as the registry's short-name match, for the
+    # detector fallback path (e.g. when the directory name carries no model
+    # name and only the model_index class is probed).
+    from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+        _is_qwen_image_edit_2509_model,
+        _is_qwen_image_model,
+    )
+    from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
+        _is_qwen_image_21_model,
+    )
+
+    assert _is_qwen_image_21_model("/models/Qwen-Image-2_1")
+    assert _is_qwen_image_21_model("Qwen/Qwen-Image-2.1-Turbo")
+    assert not _is_qwen_image_21_model("Qwen/Qwen-Image")
+    assert not _is_qwen_image_model("/models/Qwen-Image-2_1")
+    assert _is_qwen_image_model("Qwen/Qwen-Image")
+    assert _is_qwen_image_edit_2509_model("/models/Qwen-Image-Edit_2509")
 
 
 @pytest.mark.parametrize("entry", ["Model", '[Model, "Model"]', '(Model, "Model")'])
