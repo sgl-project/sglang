@@ -673,6 +673,10 @@ class Envs:
     SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # Bucket aiter paged_attention_ragged decode partitions by sequence length.
     SGLANG_AITER_DECODE_PARTITION_BUCKETS = EnvBool(True)
+    # Attention (aiter, ROCm): gfx950 fp8 hd256 extend whose GQA ratio the fp8
+    # ASM FMHA kernel lacks (e.g. 6) repeats each KV head so the ratio becomes
+    # one it has, instead of falling back to unified/CK prefill. Default on.
+    SGLANG_ENABLE_AITER_FP8_ASM_PREFILL_GQA_REPEAT = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
     # Index a compact-window DFLASH draft KV pool by the hybrid-SWA target's
