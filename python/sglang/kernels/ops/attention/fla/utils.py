@@ -267,6 +267,11 @@ device_platform = _check_platform()
 
 is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"
+# Tensor-descriptor tiles lower to 2D block I/O on Intel XPU; masked pointer loads do not.
+# TODO(dayanandav): drop once the XPU torch ships a triton-xpu with
+# https://github.com/intel/intel-xpu-backend-for-triton/pull/7196 and
+# bench_gdn_chunk_prefill_xpu.py passes on the masked path.
+use_tensor_desc = is_intel
 is_nvidia = device_platform == "nvidia"
 is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
 is_nvidia_hopper = is_nvidia and (

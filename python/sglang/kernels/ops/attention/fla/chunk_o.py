@@ -9,8 +9,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
-from sglang.kernels.ops.attention.fla.op import exp, safe_exp
-from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.kernels.ops.attention.fla.op import exp, make_tensor_descriptor, safe_exp
+from sglang.kernels.ops.attention.fla.utils import (
+    check_shared_mem,
+    is_nvidia_hopper,
+    use_tensor_desc,
+)
 from sglang.srt.utils import use_gfx115_kernels
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -50,7 +54,9 @@ def chunk_fwd_kernel_o(
     IS_VARLEN: tl.constexpr,
     output_indices=None,
     HAS_OUTPUT_INDICES: tl.constexpr = False,
+    USE_TENSOR_DESC: tl.constexpr = False,
 ):
+    # USE_TENSOR_DESC is fla.utils.use_tensor_desc; other backends compile the pointer path.
     i_v, i_t, i_bh = (
         tl.program_id(0),
         tl.program_id(1).to(tl.int64),
@@ -91,18 +97,41 @@ def chunk_fwd_kernel_o(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
     o_v = i_v * BV + tl.arange(0, BV)
+    if USE_TENSOR_DESC:
+        # descriptor offsets must be int32
+        i_tc = (i_t * BT).to(tl.int32)
+        q_desc = make_tensor_descriptor(
+            base=q, shape=(T, K), strides=(Hg * K, 1), block_shape=(BT, BK)
+        )
+        k_desc = make_tensor_descriptor(
+            base=k, shape=(T, K), strides=(Hg * K, 1), block_shape=(BT, BK)
+        )
+        h_desc = make_tensor_descriptor(
+            base=h, shape=(V, K), strides=(K, 1), block_shape=(BV, BK)
+        )
+        v_desc = make_tensor_descriptor(
+            base=v, shape=(T, V), strides=(H * V, 1), block_shape=(BT, BV)
+        )
     for i_k in range(tl.cdiv(K, BK)):
-        o_k = i_k * BK + tl.arange(0, BK)
-        m_k = o_k < K
-        p_q = q + o_t[:, None] * (Hg * K) + o_k[None, :]
-        p_k = k + o_k[:, None] + o_t[None, :] * (Hg * K)
-        p_h = h + o_v[:, None] * K + o_k[None, :]
-        # [BT, BK]
-        b_q = tl.load(p_q, mask=m_t[:, None] & m_k[None, :], other=0.0)
-        # [BK, BT]
-        b_k = tl.load(p_k, mask=m_k[:, None] & m_t[None, :], other=0.0)
-        # [BV, BK]
-        b_h = tl.load(p_h, mask=(o_v[:, None] < V) & m_k[None, :], other=0.0)
+        if USE_TENSOR_DESC:
+            # [BT, BK]
+            b_q = q_desc.load([i_tc, i_k * BK])
+            # [BK, BT]
+            b_k = tl.trans(k_desc.load([i_tc, i_k * BK]))
+            # [BV, BK]
+            b_h = h_desc.load([i_v * BV, i_k * BK])
+        else:
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_k = o_k < K
+            p_q = q + o_t[:, None] * (Hg * K) + o_k[None, :]
+            p_k = k + o_k[:, None] + o_t[None, :] * (Hg * K)
+            p_h = h + o_v[:, None] * K + o_k[None, :]
+            # [BT, BK]
+            b_q = tl.load(p_q, mask=m_t[:, None] & m_k[None, :], other=0.0)
+            # [BK, BT]
+            b_k = tl.load(p_k, mask=m_k[:, None] & m_t[None, :], other=0.0)
+            # [BV, BK]
+            b_h = tl.load(p_h, mask=(o_v[:, None] < V) & m_k[None, :], other=0.0)
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
         b_o += tl.dot(b_q, tl.trans(b_h))
@@ -120,20 +149,34 @@ def chunk_fwd_kernel_o(
     m_A = o_i[:, None] >= o_i[None, :]
     b_A = tl.where(m_A, b_A, 0)
 
-    p_v = v + o_t[:, None] * (H * V) + o_v[None, :]
-    if HAS_OUTPUT_INDICES:
-        destinations = tl.load(output_indices + bos + o_t, mask=m_t, other=0).to(
-            tl.int64
-        )
-        p_o = o + destinations[:, None] * (H * V) + o_v[None, :]
+    if USE_TENSOR_DESC:
+        b_v = v_desc.load([i_tc, i_v * BV])
     else:
-        p_o = o + o_t[:, None] * (H * V) + o_v[None, :]
-    b_v = tl.load(p_v, mask=m_t[:, None] & (o_v < V)[None, :], other=0.0)
+        p_v = v + o_t[:, None] * (H * V) + o_v[None, :]
+        b_v = tl.load(p_v, mask=m_t[:, None] & (o_v < V)[None, :], other=0.0)
 
     # to fix mma -> mma layout conversion
     # already solved by triton v3.2 or higher
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
+    if HAS_OUTPUT_INDICES:
+        # scattered rows: stays a pointer store on every backend
+        destinations = tl.load(output_indices + bos + o_t, mask=m_t, other=0).to(
+            tl.int64
+        )
+        p_o = o + destinations[:, None] * (H * V) + o_v[None, :]
+        tl.store(
+            p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :]
+        )
+    elif USE_TENSOR_DESC:
+        o_desc = make_tensor_descriptor(
+            base=o, shape=(T, V), strides=(H * V, 1), block_shape=(BT, BV)
+        )
+        o_desc.store([i_tc, i_v * BV], b_o.to(o.dtype.element_ty))
+    else:
+        p_o = o + o_t[:, None] * (H * V) + o_v[None, :]
+        tl.store(
+            p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :]
+        )
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -317,6 +360,7 @@ def chunk_fwd_o(
             IS_VARLEN=cu_seqlens is not None,
             output_indices=output_indices,
             HAS_OUTPUT_INDICES=output_indices is not None,
+            USE_TENSOR_DESC=use_tensor_desc,
             num_warps=4,
             num_stages=2,
         )

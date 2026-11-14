@@ -125,8 +125,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
     # Padded rows carry the -1 sentinel; without this guard the sentinel
     # reaches pointer arithmetic and addresses before the state pool.
     valid_state = index >= 0
-    h0 = initial_state + index * stride_init_state
-    ht = initial_state + index * stride_init_state
+    # Descriptor bases stay inside the pool for padded rows; their accesses are gated off.
+    state_offset = tl.where(valid_state, index, 0) * stride_init_state
+    h0 = initial_state + state_offset
+    ht = initial_state + state_offset
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * V * K
     if INPLACE_UPDATE:
@@ -141,60 +143,49 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         i_track = -1
         p_track_base = track_state
 
-    o_v = i_v * BV + tl.arange(0, BV)
-    m_v = o_v < V
-    o_k64 = tl.arange(0, 64)
+    # descriptors lower to 2D block I/O on XPU, masked pointer accesses do not
+    h0_desc = make_tensor_descriptor(
+        base=h0, shape=(V, K), strides=(K, 1), block_shape=(BV, 64)
+    )
+    ht_desc = make_tensor_descriptor(
+        base=ht, shape=(V, K), strides=(K, 1), block_shape=(BV, 64)
+    )
+    if TRACK_STATE:
+        track_desc = make_tensor_descriptor(
+            base=p_track_base, shape=(V, K), strides=(K, 1), block_shape=(BV, 64)
+        )
 
     # main recurrence — time is the outer loop
     for i_t in range(NT):
         ########################################################################
         # Phase 1: store h to output, compute v_new = u - sum_k(w_k @ h_k^T)
         ########################################################################
+        ho_desc = make_tensor_descriptor(
+            base=h + i_t.to(tl.int64) * stride_h,
+            shape=(V, K),
+            strides=(K, 1),
+            block_shape=(BV, 64),
+        )
         b_v_corr = tl.zeros([BT, BV], dtype=tl.float32)
         for k_blk in range(0, K, 64):
             # Load h: from initial_state (i_t==0) or scratch (i_t>0)
             if i_t == 0:
                 if USE_INITIAL_STATE and valid_state:
-                    p_hs = h0 + o_v[:, None] * K + (k_blk + o_k64)[None, :]
-                    b_h = tl.load(
-                        p_hs,
-                        mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
-                        other=0.0,
-                    ).to(tl.float32)
+                    b_h = h0_desc.load([i_v * BV, k_blk]).to(tl.float32)
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
             elif valid_state:
-                p_hs = ht + o_v[:, None] * K + (k_blk + o_k64)[None, :]
-                b_h = tl.load(
-                    p_hs,
-                    mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
-                    other=0.0,
-                ).to(tl.float32)
+                b_h = ht_desc.load([i_v * BV, k_blk]).to(tl.float32)
             else:
                 b_h = tl.zeros([BV, 64], dtype=tl.float32)
 
             # Store pre-update h to output
-            p_ho = (
-                h
-                + i_t.to(tl.int64) * stride_h
-                + o_v[:, None] * K
-                + (k_blk + o_k64)[None, :]
-            )
-            tl.store(
-                p_ho,
-                b_h.to(p_ho.dtype.element_ty),
-                mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
-            )
+            ho_desc.store([i_v * BV, k_blk], b_h.to(h.dtype.element_ty))
 
             # Mid-sequence checkpoint for the mamba prefix cache: the same
             # pre-update state, kept in fp32 so the caller rounds only once.
             if TRACK_STATE and i_t == i_track:
-                p_track = p_track_base + o_v[:, None] * K + (k_blk + o_k64)[None, :]
-                tl.store(
-                    p_track,
-                    b_h,
-                    mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
-                )
+                track_desc.store([i_v * BV, k_blk], b_h)
 
             # Accumulate correction: w_k @ h_k^T
             b_w = w_desc.load([i_t * BT, k_blk])
@@ -217,6 +208,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             b_g_last = exp(b_g_last)
 
         b_v = b_v.to(k.dtype.element_ty)
+        if INPLACE_UPDATE:
+            # Phase 2 overwrites the ht tiles other warps read in Phase 1.
+            tl.debug_barrier()
 
         ########################################################################
         # Phase 2: reload h, apply gate, update h += k^T @ v, save to scratch
@@ -225,21 +219,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             # Reload h (same source as Phase 1)
             if i_t == 0:
                 if USE_INITIAL_STATE and valid_state:
-                    p_hs = h0 + o_v[:, None] * K + (k_blk + o_k64)[None, :]
-                    b_h = tl.load(
-                        p_hs,
-                        mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
-                        other=0.0,
-                    ).to(tl.float32)
+                    b_h = h0_desc.load([i_v * BV, k_blk]).to(tl.float32)
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
             elif valid_state:
-                p_hs = ht + o_v[:, None] * K + (k_blk + o_k64)[None, :]
-                b_h = tl.load(
-                    p_hs,
-                    mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
-                    other=0.0,
-                ).to(tl.float32)
+                b_h = ht_desc.load([i_v * BV, k_blk]).to(tl.float32)
             else:
                 b_h = tl.zeros([BV, 64], dtype=tl.float32)
 
@@ -265,12 +249,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
 
             # Save updated h to scratch (initial_state) for next time step
             if INPLACE_UPDATE and valid_state:
-                p_hs = ht + o_v[:, None] * K + (k_blk + o_k64)[None, :]
-                tl.store(
-                    p_hs,
-                    b_h.to(p_hs.dtype.element_ty),
-                    mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
-                )
+                ht_desc.store([i_v * BV, k_blk], b_h.to(ht.dtype.element_ty))
+        # The next time step reloads ht across warps.
+        tl.debug_barrier()
 
 
 def chunk_gated_delta_rule_fwd_h(

@@ -9,6 +9,8 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.op import make_tensor_descriptor
+from sglang.kernels.ops.attention.fla.utils import use_tensor_desc
 from sglang.srt.utils import use_gfx115_kernels
 
 
@@ -41,7 +43,9 @@ def recompute_w_u_fwd_kernel(
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_MAJOR: tl.constexpr = False,
+    USE_TENSOR_DESC: tl.constexpr = False,
 ):
+    # USE_TENSOR_DESC is fla.utils.use_tensor_desc; other backends compile the pointer path.
     # HEAD_MAJOR: heads vary fastest across the grid, so the programs running at once read
     # the same token rows ([T, H, D] puts each head's row of a chunk 4 KB apart)
     if HEAD_MAJOR:
@@ -62,40 +66,87 @@ def recompute_w_u_fwd_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
     o_t = i_t * BT + tl.arange(0, BT)
-    o_A = tl.arange(0, BT)
     m_t = o_t < T
-    m_A = m_t[:, None] & (o_A[None, :] < BT)
     p_beta = beta + bos * H + i_h + o_t * H
     p_g = g + (bos * H + i_h) + o_t * H
-    p_A = A + (bos * H + i_h) * BT + o_t[:, None] * (H * BT) + o_A[None, :]
     b_beta = tl.load(p_beta, mask=m_t, other=0.0)
-    b_A = tl.load(p_A, mask=m_A, other=0.0)
+    if USE_TENSOR_DESC:
+        # descriptor offsets must be int32
+        i_tc = (i_t * BT).to(tl.int32)
+        A_desc = make_tensor_descriptor(
+            base=A + (bos * H + i_h) * BT,
+            shape=(T, BT),
+            strides=(H * BT, 1),
+            block_shape=(BT, BT),
+        )
+        v_desc = make_tensor_descriptor(
+            base=v + (bos * H + i_h) * V,
+            shape=(T, V),
+            strides=(H * V, 1),
+            block_shape=(BT, BV),
+        )
+        u_desc = make_tensor_descriptor(
+            base=u + (bos * H + i_h) * V,
+            shape=(T, V),
+            strides=(H * V, 1),
+            block_shape=(BT, BV),
+        )
+        k_desc = make_tensor_descriptor(
+            base=k + (bos * Hg + i_h // (H // Hg)) * K,
+            shape=(T, K),
+            strides=(Hg * K, 1),
+            block_shape=(BT, BK),
+        )
+        w_desc = make_tensor_descriptor(
+            base=w + (bos * H + i_h) * K,
+            shape=(T, K),
+            strides=(H * K, 1),
+            block_shape=(BT, BK),
+        )
+        b_A = A_desc.load([i_tc, 0])
+    else:
+        o_A = tl.arange(0, BT)
+        m_A = m_t[:, None] & (o_A[None, :] < BT)
+        p_A = A + (bos * H + i_h) * BT + o_t[:, None] * (H * BT) + o_A[None, :]
+        b_A = tl.load(p_A, mask=m_A, other=0.0)
     b_g = tl.exp(tl.load(p_g, mask=m_t, other=0.0))
 
     for i_v in range(tl.cdiv(V, BV)):
-        o_v = i_v * BV + tl.arange(0, BV)
-        m_v = m_t[:, None] & (o_v[None, :] < V)
-        p_v = v + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
-        p_u = u + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
-        b_v = tl.load(p_v, mask=m_v, other=0.0)
+        if USE_TENSOR_DESC:
+            b_v = v_desc.load([i_tc, i_v * BV])
+        else:
+            o_v = i_v * BV + tl.arange(0, BV)
+            m_v = m_t[:, None] & (o_v[None, :] < V)
+            p_v = v + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
+            p_u = u + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
+            b_v = tl.load(p_v, mask=m_v, other=0.0)
         b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
         b_u = tl.dot(b_A, b_vb, allow_tf32=False)
-        tl.store(p_u, b_u.to(p_u.dtype.element_ty), mask=m_v)
+        if USE_TENSOR_DESC:
+            u_desc.store([i_tc, i_v * BV], b_u.to(u.dtype.element_ty))
+        else:
+            tl.store(p_u, b_u.to(p_u.dtype.element_ty), mask=m_v)
 
     for i_k in range(tl.cdiv(K, BK)):
-        o_k = i_k * BK + tl.arange(0, BK)
-        m_k = m_t[:, None] & (o_k[None, :] < K)
-        p_k = (
-            k
-            + (bos * Hg + i_h // (H // Hg)) * K
-            + o_t[:, None] * (Hg * K)
-            + o_k[None, :]
-        )
-        p_w = w + (bos * H + i_h) * K + o_t[:, None] * (H * K) + o_k[None, :]
-        b_k = tl.load(p_k, mask=m_k, other=0.0)
+        if USE_TENSOR_DESC:
+            b_k = k_desc.load([i_tc, i_k * BK])
+        else:
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_k = m_t[:, None] & (o_k[None, :] < K)
+            p_k = (
+                k
+                + (bos * Hg + i_h // (H // Hg)) * K
+                + o_t[:, None] * (Hg * K)
+                + o_k[None, :]
+            )
+            p_w = w + (bos * H + i_h) * K + o_t[:, None] * (H * K) + o_k[None, :]
+            b_k = tl.load(p_k, mask=m_k, other=0.0)
         b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
         b_w = tl.dot(b_A, b_kb)
-        tl.store(p_w, b_w.to(p_w.dtype.element_ty), mask=m_k)
+        if USE_TENSOR_DESC:
+            w_desc.store([i_tc, i_k * BK], b_w.to(w.dtype.element_ty))
+        else:
+            tl.store(p_w, b_w.to(p_w.dtype.element_ty), mask=m_k)
 
 
 def recompute_w_u_fwd(
@@ -121,6 +172,7 @@ def recompute_w_u_fwd(
     head_major = use_gfx115_kernels()
     recompute_w_u_fwd_kernel[(B * H, NT) if head_major else (NT, B * H)](
         HEAD_MAJOR=head_major,
+        USE_TENSOR_DESC=use_tensor_desc,
         k=k,
         v=v,
         beta=beta,
