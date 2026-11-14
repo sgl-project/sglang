@@ -15,6 +15,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
 )
+from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import (
     BaseSpecWorker,
     EagleDraftWorkerBase,
@@ -170,8 +171,18 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
-        # TODO: Adaptive speculative
+        # Adaptive speculative. Runtime states are registered and built by
+        # EAGLEWorkerV2.init_cuda_graphs once target and draft backends exist;
+        # the standalone draft reuses EAGLEWorkerV2's build/apply protocol.
         self.adaptive_controller: Optional[AdaptiveController] = None
+        if get_spec().speculative_adaptive:
+            self.adaptive_controller = AdaptiveController(
+                self,
+                AdaptiveSpeculativeParams(
+                    initial_steps=self.speculative_num_steps,
+                    cfg_path=get_spec().speculative_adaptive_config,
+                ),
+            )
 
     def _validate_vocab_compatibility(
         self,

@@ -3372,6 +3372,60 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
+    def _resolve_standalone_adaptive(self, cfg_path: str, **overrides) -> ServerArgs:
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "STANDALONE"
+        args.speculative_draft_model_path = "dummy-draft"
+        args.speculative_adaptive = True
+        args.speculative_adaptive_config = cfg_path
+        args.device = "cuda"
+        args.page_size = 1
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"],
+                get_text_config=lambda: SimpleNamespace(),
+            )
+        )
+        dummy_draft_cfg = SimpleNamespace(architectures=["LlamaForCausalLM"])
+        with patch(
+            "sglang.srt.utils.hf_transformers.get_config",
+            return_value=dummy_draft_cfg,
+        ):
+            handle_speculative_decoding(args)
+        return args
+
+    def test_adaptive_supports_standalone(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump({"1": {"candidate_steps": [1, 3, 5]}}, f)
+            f.flush()
+            args = self._resolve_standalone_adaptive(f.name)
+            self.assertEqual(max_speculative_num_draft_tokens(args), 6)
+
+        self.assertTrue(resolution_result(args, "speculative_adaptive"))
+        self.assertEqual(resolution_result(args, "speculative_eagle_topk"), 1)
+        self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
+        self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
+
+    def test_adaptive_standalone_topk_gt_1_falls_back_to_static(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump({"1": {"candidate_steps": [1, 3, 5]}}, f)
+            f.flush()
+            args = self._resolve_standalone_adaptive(
+                f.name,
+                speculative_num_steps=3,
+                speculative_eagle_topk=4,
+                speculative_num_draft_tokens=8,
+            )
+
+        self.assertFalse(resolution_result(args, "speculative_adaptive"))
+        self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
+        self.assertEqual(resolution_result(args, "speculative_eagle_topk"), 4)
+        self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 8)
+        # The adaptive config's maximum is 6; static fallback must reserve 8.
+        self.assertEqual(max_speculative_num_draft_tokens(args), 8)
+
 
 class TestAscendOpsArgs(CustomTestCase):
     def test_ascend_ops_rejected_by_waterfill_without_config(self):
