@@ -1175,5 +1175,5 @@ sglang generate \
 
 ### Notes for ROCm / MPS
 
-- ROCm: Instinct (CDNA, gfx9) GPUs default to `aiter`; use `--attention-backend torch_sdpa` on Radeon (RDNA) GPUs or when AITER is unavailable (`fa` also resolves to `torch_sdpa` on ROCm). On gfx1151 / Strix Halo (wave32), do **not** use `aiter` — prefer `torch_sdpa` (image sets `SGLANG_USE_AITER=0`).
+- ROCm: without `--attention-backend`, Instinct (CDNA, gfx9) and gfx1250 GPUs default to `aiter` and Radeon (RDNA) GPUs default to `torch_sdpa`; use `--attention-backend torch_sdpa` when AITER is unavailable (`fa` also resolves to `torch_sdpa` on ROCm). On gfx1151 / Strix Halo (wave32), do **not** use `aiter` — prefer `torch_sdpa` (image sets `SGLANG_USE_AITER=0`).
 - MPS: the platform implementation always uses `torch_sdpa`.
