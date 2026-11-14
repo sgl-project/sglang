@@ -59,7 +59,7 @@ from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
-_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
+_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "video", "mmmu", "mooncake"}
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -99,6 +99,7 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    video_data: Optional[List[str]] = None
 
 
 @dataclass
@@ -440,14 +441,20 @@ async def async_request_openai_chat_completions(
 
     if isinstance(request_func_input.prompt, list):
         messages = request_func_input.prompt
-    elif request_func_input.image_data:
-        # Build multi-image content: a list of image_url entries followed by the text
+    elif request_func_input.image_data or request_func_input.video_data:
+        # Build multimodal content: image/video entries followed by the text
         content_items = [
             {
                 "type": "image_url",
                 "image_url": {"url": img_url},
             }
-            for img_url in request_func_input.image_data
+            for img_url in request_func_input.image_data or []
+        ] + [
+            {
+                "type": "video_url",
+                "video_url": {"url": vid_url},
+            }
+            for vid_url in request_func_input.video_data or []
         ]
         content_items.append({"type": "text", "text": request_func_input.prompt})
         messages = [
@@ -719,9 +726,11 @@ async def async_request_sglang_generate(
         if args.token_ids_logprob is not None:
             payload["token_ids_logprob"] = args.token_ids_logprob
 
-        # Add image data if available (list of image urls/base64)
+        # Add image/video data if available (list of urls/base64)
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
+        if request_func_input.video_data:
+            payload["video_data"] = request_func_input.video_data
 
         headers = get_request_headers()
         if request_func_input.routing_key:
@@ -1481,6 +1490,7 @@ async def benchmark(
         output_len=min(test_request.output_len, 32),
         lora_name=lora_name,
         image_data=test_request.image_data,
+        video_data=test_request.video_data,
         extra_request_body=extra_request_body,
     )
 
@@ -1606,6 +1616,7 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
+            video_data=request.video_data,
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
@@ -1695,7 +1706,7 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
-    if args.dataset_name in ["image", "mmmu"]:
+    if args.dataset_name in ["image", "video", "mmmu"]:
         print(
             "{:<40} {:<10}".format(
                 "Total input vision tokens:", metrics.total_input_vision
@@ -1935,6 +1946,12 @@ async def benchmark(
                 f"{args.random_output_len}_{args.image_count}imgs_"
                 f"{args.image_resolution}.jsonl"
             )
+        elif args.dataset_name == "video":
+            output_file_name = (
+                f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
+                f"{args.random_output_len}_{args.video_count}vids_"
+                f"{args.video_frames}frames_{args.video_resolution}.jsonl"
+            )
         elif args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
@@ -2140,10 +2157,10 @@ def run_benchmark(args_: argparse.Namespace):
         print(f"{args.dataset_name} dataset is unsupported for embeddings benchmark")
         sys.exit(1)
 
-    if args.dataset_name in ["image", "mmmu"]:
+    if args.dataset_name in ["image", "video", "mmmu"]:
         args.apply_chat_template = True
         assert not args.tokenize_prompt, (
-            "`--tokenize-prompt` not compatible with image dataset"
+            f"`--tokenize-prompt` not compatible with {args.dataset_name} dataset"
         )
 
     if args.lora_request_distribution in ["distinct", "skewed"]:
@@ -2334,6 +2351,7 @@ def cli_main():
             "generated-shared-prefix",
             "mmmu",
             "image",
+            "video",
             "mooncake",
             "longbench_v2",
             "speed-bench",
@@ -2408,20 +2426,20 @@ def cli_main():
         "--random-input-len",
         type=int,
         default=1024,
-        help="Number of input tokens per request, used only for random and image dataset.",
+        help="Number of input tokens per request, used only for random, image, and video datasets.",
     )
     parser.add_argument(
         "--random-output-len",
         default=1024,
         type=int,
-        help="Number of output tokens per request, used only for random and image dataset.",
+        help="Number of output tokens per request, used only for random, image, and video datasets.",
     )
     parser.add_argument(
         "--random-range-ratio",
         type=float,
         default=0.0,
         help="Range of sampled ratio of input/output length, "
-        "used only for random and image dataset.",
+        "used only for random, image, and video datasets.",
     )
     # image dataset args
     parser.add_argument(
@@ -2457,6 +2475,44 @@ def cli_main():
         type=str,
         default="random",
         help=("Content for images for image dataset. Supports random and blank."),
+    )
+    # video dataset args
+    parser.add_argument(
+        "--video-count",
+        type=int,
+        default=1,
+        help="Number of videos per request (only available with the video dataset)",
+    )
+    parser.add_argument(
+        "--video-resolution",
+        type=str,
+        default="720p",
+        help=(
+            "Resolution of videos for video dataset. Supports the same presets "
+            "and custom/random bounds as --image-resolution."
+        ),
+    )
+    parser.add_argument(
+        "--video-frames",
+        type=int,
+        default=8,
+        help=(
+            "Raw frame count encoded into each synthetic video (only available "
+            "with the video dataset). This is the frame count the client "
+            "encodes, not necessarily the frame count a target model samples "
+            "from it -- that depends on the model's own video preprocessing."
+        ),
+    )
+    parser.add_argument(
+        "--random-video-count",
+        action="store_true",
+        help="Enable Random Video Count",
+    )
+    parser.add_argument(
+        "--video-format",
+        type=str,
+        default="mp4",
+        help=("Container format for videos for video dataset."),
     )
     parser.add_argument(
         "--request-rate",
