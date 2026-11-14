@@ -67,7 +67,11 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
         backend = getattr(tokenizer, "backend_tokenizer", None)
         decoder = getattr(backend, "decoder", None)
         if isinstance(decoder, Decoder):
-            is_bl = _decoder_uses_byte_level(json.loads(decoder.__getstate__()))
+            try:
+                is_bl = _decoder_uses_byte_level(json.loads(decoder.__getstate__()))
+            except Exception:
+                # Custom Python decoders cannot be serialized; use the legacy probe.
+                pass
     if isinstance(is_bl, bool):
         if is_bl:
             _BYTE_LEVEL_TOKENIZERS.add(tid)

@@ -4661,6 +4661,32 @@ class ServingChatTestCase(CustomTestCase):
                     b"".join(bytes(item.bytes) for item in content).decode("utf-8"), "é"
                 )
 
+    def test_logprob_bytes_support_custom_python_decoders(self):
+        class CustomByteLevelDecoder:
+            def decode_chain(self, tokens):
+                return [decoders.ByteLevel().decode(tokens)]
+
+        backend = BackendTokenizer(
+            tokenizer_models.BPE(vocab={"Ã": 0, "©": 1}, merges=[])
+        )
+        self.tm.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+        self.tm.tokenizer.backend_tokenizer.decoder = decoders.Decoder.custom(
+            CustomByteLevelDecoder()
+        )
+        self.assertEqual(self.tm.tokenizer.decode([0, 1]), "é")
+        triples = [
+            (-0.1, token_id, self.tm.tokenizer.decode([token_id]))
+            for token_id in (0, 1)
+        ]
+        with patch("sglang.srt.entrypoints.openai.utils._BYTE_LEVEL_TOKENIZERS", set()):
+            content = self.chat._build_token_logprobs_from_raw(
+                triples, [[triple] for triple in triples]
+            )
+        self.assertEqual([item.bytes for item in content], [[195], [169]])
+        self.assertEqual(
+            [item.top_logprobs[0].bytes for item in content], [[195], [169]]
+        )
+
     def test_streaming_top_logprobs_follow_each_token_in_chunk(self):
         """Each token of a multi-token streaming chunk keeps its own alternatives."""
         content = {
