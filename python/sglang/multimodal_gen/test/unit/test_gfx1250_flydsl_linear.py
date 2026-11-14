@@ -39,6 +39,19 @@ class TestGfx1250FlyDSLLinear(unittest.TestCase):
         gemm.assert_not_called()
         self._assert_matches_fp32(out, x, w)
 
+    def test_aiter_rmsnorm_on_fused_qkv_slice_matches_contiguous(self):
+        """RMSNorm on a column slice of the fused QKV output must read its row stride."""
+        from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+
+        torch.manual_seed(0)
+        norm = RMSNorm(512, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+        norm.weight.data.normal_()
+        qkv = torch.randn(1, 300, 3 * 512, device="cuda", dtype=torch.bfloat16)
+        key = qkv[..., 512:1024]
+        self.assertTrue(
+            torch.equal(norm.forward_aiter(key), norm.forward_aiter(key.contiguous()))
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
