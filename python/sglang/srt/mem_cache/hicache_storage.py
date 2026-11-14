@@ -51,6 +51,9 @@ class HiCacheStorageConfig:
     # Byte ranges in a local page, paired with unified_suffixes in the same
     # order. The key grid is layer-major, whereas page bytes are head-major.
     unified_chunk_spans: Optional[List[tuple[int, int]]] = None
+    # Attention-TP rank, set only for unified LayerSplit: its CP ranks hold
+    # disjoint layers instead of replicas of one page.
+    layer_split_attn_tp_rank: Optional[int] = None
 
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
@@ -85,11 +88,15 @@ class HiCacheStorageConfig:
     def is_storage_writer(self) -> bool:
         """Select one writer for each shared storage object.
 
-        Unified full-page CP replicas share keys and use CP rank 0. Legacy
-        keys include the CP rank, so every CP copy retains its own writer.
-        MLA uses one writer per DCP shard in the first DCP group; with DCP
-        disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
+        Unified full-page CP replicas share keys and use CP rank 0. Unified
+        LayerSplit CP ranks own disjoint chunks, so each writes its own, and
+        only attention-TP peers replicate them. Legacy keys include the CP
+        rank, so every CP copy retains its own writer. MLA uses one writer per
+        DCP shard in the first DCP group; with DCP disabled, MLA uses TP rank 0
+        and non-MLA uses every TP rank.
         """
+        if self.layer_split_attn_tp_rank is not None:
+            return self.layer_split_attn_tp_rank == 0
         if self.unified_suffixes is not None and self.attn_cp_rank != 0:
             return False
         return not self.is_rank_replicated or self.tp_rank == self.dcp_rank
