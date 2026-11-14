@@ -2115,6 +2115,15 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
+        # Also before destroy_process_group(): the symmetric workspace is released
+        # collectively on cpu_group, after the custom all-reduce drops its views.
+        self.ca_comm = None
+        if self.cpu_group is not None:
+            from sglang.srt.distributed.device_communicators.symm_workspace import (
+                close_group_symm_workspaces,
+            )
+
+            close_group_symm_workspaces(self.cpu_group)
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -2125,8 +2134,6 @@ class GroupCoordinator:
             self.pynccl_comm = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -3338,17 +3345,29 @@ def close_custom_all_reduce() -> None:
     """
     if not is_hip():
         return
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        close_multinode_symm_workspaces,
+        is_multinode_symm_group,
+    )
+
     for name in sorted(_groups):
         group = _groups[name]()
-        if group is None or not getattr(group.ca_comm, "_is_multinode", False):
+        if group is None or not is_multinode_symm_group(group.cpu_group):
             continue
         try:
-            group.ca_comm.close()
+            if group.ca_comm is not None:
+                group.ca_comm.close()
         except Exception as e:
             logger.warning(
                 f"Custom all-reduce close on shutdown failed, {type(e).__name__}: {e}"
             )
         group.ca_comm = None
+    try:
+        close_multinode_symm_workspaces()
+    except Exception as e:
+        logger.warning(
+            f"Symmetric workspace close on shutdown failed, {type(e).__name__}: {e}"
+        )
 
 
 def abort_distributed_environment() -> None:
@@ -3536,7 +3555,7 @@ def _warn_if_called_from_outside(name: str, replacement: str):
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            if name not in _ALREADY_WARNED:
+            if not torch.compiler.is_compiling() and name not in _ALREADY_WARNED:
                 caller = sys._getframe(1).f_globals.get("__name__", "")
                 if not caller.startswith(_EXEMPT_CALLERS):
                     _ALREADY_WARNED.add(name)

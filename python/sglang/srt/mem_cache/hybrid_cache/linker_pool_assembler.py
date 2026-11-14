@@ -459,19 +459,30 @@ def _mha_device_pool_entry(
     page_size: int,
     indices_from_pool: PoolName | None = None,
 ) -> DevicePoolEntry:
-    # TODO(alphabetc1): support mxfp8.
-    if pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMXFP8
+
+    parts = [pool.k_buffer, pool.v_buffer]
+    if isinstance(pool, MHATokenToKVPoolMXFP8):
+        # Only whole aligned pages move, and a page's scales are contiguous in
+        # both layouts, so they ride as rows aligned with the payload slots.
+        slots = pool.k_buffer[0].shape[0]
+        parts += [
+            [scale.view(torch.uint8).reshape(slots, -1) for scale in scales]
+            for scales in (pool.k_scale_buffer, pool.v_scale_buffer)
+        ]
+    elif pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
         raise ValueError(
-            "The direct external linker does not support scaled KV caches yet."
+            "The direct external linker does not support FP4 scaled KV caches yet."
         )
     num_layers = len(pool.k_buffer)
     return DevicePoolEntry(
         name=name,
         indices_from_pool=indices_from_pool or name,
         device_pool=pool,
-        components=[[*pool.k_buffer, *pool.v_buffer]],
+        components=[[buffer for part in parts for buffer in part]],
         layer_mapping={
-            layer: (index, num_layers + index) for layer, index in layer_mapping.items()
+            layer: tuple(part * num_layers + index for part in range(len(parts)))
+            for layer, index in layer_mapping.items()
         },
         page_size=page_size,
         rows_are_pages=False,
