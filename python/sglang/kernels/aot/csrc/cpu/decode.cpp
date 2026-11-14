@@ -1269,6 +1269,8 @@ void decode_attention_kernel_impl(
     const int64_t* __restrict__ seq_lens,
     const int64_t* __restrict__ encoder_lens,
     const scalar_t* __restrict__ sinks,
+    const int64_t* __restrict__ full_to_swa_mapping,
+    int64_t max_mapping_size,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size,
@@ -1337,13 +1339,22 @@ void decode_attention_kernel_impl(
       for (int64_t n = kv_start; n < kv_end; n += BLOCK_N) {
         int64_t n_size = std::min(BLOCK_N, kv_end - n);
 
+        alignas(64) index_t swa_indices[BLOCK_N];
+        const index_t* ind_ptr = get_swa_indices(
+            req_to_token + req_pool_id * max_context_len + n + kv_offset,
+            swa_indices,
+            n_size,
+            full_to_swa_mapping,
+            max_mapping_size,
+            max_total_num_tokens);
+
         // calculate s_i <- scale * Q @ K
         index_gemm_kernel_nt<scalar_t, packed_t, index_t>(
             /* A   */ q_ptr,
             /* B   */ k_buffer + head_id * k_strideH,
             /* B_scale */ k_scale,
             /* C   */ s_i,
-            /* ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
+            /* ind */ ind_ptr,
             /* scl */ sm_scale,
             /* M   */ 1,
             /* N   */ n_size,
@@ -1384,7 +1395,7 @@ void decode_attention_kernel_impl(
             /* B   */ v_buffer + head_id * v_strideH,
             /* B_scale */ v_scale,
             /* C   */ v_prime,
-            /* ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
+            /* ind */ ind_ptr,
             /* scl */ &m_delta,
             /* M   */ 1,
             /* N   */ head_size_v,
@@ -1428,6 +1439,8 @@ void decode_attention_mla_kernel_impl(
     const int64_t* __restrict__ seq_lens,
     scalar_t* __restrict__ buffer,
     const scalar_t* __restrict__ sinks,
+    const int64_t* __restrict__ full_to_swa_mapping,
+    int64_t max_mapping_size,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size,
@@ -1513,13 +1526,22 @@ void decode_attention_mla_kernel_impl(
         int64_t n_size = std::min(BLOCK_N, kv_end - n);
         const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
 
+        alignas(64) index_t swa_indices[BLOCK_N];
+        const index_t* ind_ptr = get_swa_indices(
+            req_to_token + req_pool_id * max_context_len + n,
+            swa_indices,
+            n_size,
+            full_to_swa_mapping,
+            max_mapping_size,
+            max_total_num_tokens);
+
         // get key and pack
         pack_vnni<scalar_t, packed_t, index_t>(
             /*    dst0 */ Btmp0,
             /*    dst1 */ Btmp1,
             /*     src */ k_buffer + /* head_kv_id */ 0 * k_strideH,
             /* src_scale */ k_buf_scale,
-            /*     ind */ req_to_token + req_pool_id * max_context_len + n,
+            /*     ind */ ind_ptr,
             /*       N */ n_size,
             /*       K */ head_size,
             /*      Kv */ head_size_v,
@@ -1629,6 +1651,8 @@ void decode_attention_grouped_kernel_impl(
     const int64_t* __restrict__ seq_lens,
     const int64_t* __restrict__ encoder_lens,
     const scalar_t* __restrict__ sinks,
+    const int64_t* __restrict__ full_to_swa_mapping,
+    int64_t max_mapping_size,
     int64_t batches,
     int64_t num_heads,
     int64_t num_heads_kv,
@@ -1716,13 +1740,22 @@ void decode_attention_grouped_kernel_impl(
       for (int64_t n = kv_start; n < kv_end; n += BLOCK_N) {
         int64_t n_size = std::min(BLOCK_N, kv_end - n);
 
+        alignas(64) index_t swa_indices[BLOCK_N];
+        const index_t* ind_ptr = get_swa_indices(
+            req_to_token + req_pool_id * max_context_len + n + kv_offset,
+            swa_indices,
+            n_size,
+            full_to_swa_mapping,
+            max_mapping_size,
+            max_total_num_tokens);
+
         // calculate Q @ K
         index_gemm_kernel_nt<scalar_t, packed_t, index_t>(
             /* A   */ q_ptr,
             /* B   */ k_buffer + head_kv_id * k_strideH,
             /* B_scale */ k_scale,
             /* C   */ s_i,
-            /* ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
+            /* ind */ ind_ptr,
             /* scl */ sm_scale,
             /* M   */ h_size,
             /* N   */ n_size,
@@ -1767,7 +1800,7 @@ void decode_attention_grouped_kernel_impl(
             /* B   */ v_buffer + head_kv_id * v_strideH,
             /* B_scale */ v_scale,
             /* C   */ v_prime,
-            /* ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
+            /* ind */ ind_ptr,
             /* scl */ m_delta,
             /* M   */ h_size,
             /* N   */ head_size_v,
@@ -1832,7 +1865,8 @@ void decode_attention_cpu(
     bool is_cross_attn,
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
-    std::optional<at::Tensor> sinks) {
+    std::optional<at::Tensor> sinks,
+    std::optional<at::Tensor> full_to_swa_mapping) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
@@ -1840,6 +1874,15 @@ void decode_attention_cpu(
   CHECK_DIM(3, k_buffer);
   CHECK_DIM(3, v_buffer);
   CHECK_DIM(1, loc);
+
+  const int64_t* full_to_swa_mapping_ptr = nullptr;
+  int64_t max_mapping_size = 0;
+  if (full_to_swa_mapping.has_value() && full_to_swa_mapping->defined()) {
+    CHECK_CONTIGUOUS(full_to_swa_mapping.value());
+    CHECK_EQ(full_to_swa_mapping->scalar_type(), at::kLong);
+    full_to_swa_mapping_ptr = full_to_swa_mapping->data_ptr<int64_t>();
+    max_mapping_size = full_to_swa_mapping->numel();
+  }
 
   int64_t num_seqs = seq_lens.size(0);
   int64_t max_num_reqs = req_to_token.size(0);
@@ -1970,6 +2013,8 @@ void decode_attention_cpu(
               seq_lens.data_ptr<int64_t>(),
               encoder_lens_t.data_ptr<int64_t>(),
               sinks_tensor.data_ptr<scalar_t>(),
+              full_to_swa_mapping_ptr,
+              max_mapping_size,
               num_seqs,
               num_heads,
               head_size,
@@ -2007,6 +2052,8 @@ void decode_attention_cpu(
               seq_lens.data_ptr<int64_t>(),
               buffer.data_ptr<scalar_t>(),
               sinks_tensor.data_ptr<scalar_t>(),
+              full_to_swa_mapping_ptr,
+              max_mapping_size,
               num_seqs,
               num_heads,
               head_size,
@@ -2040,6 +2087,8 @@ void decode_attention_cpu(
               seq_lens.data_ptr<int64_t>(),
               encoder_lens_t.data_ptr<int64_t>(),
               sinks_tensor.data_ptr<scalar_t>(),
+              full_to_swa_mapping_ptr,
+              max_mapping_size,
               num_seqs,
               num_heads,
               num_heads_kv,

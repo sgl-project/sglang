@@ -41,6 +41,8 @@ void extend_attention_kernel_impl(
     const void* __restrict__ buffer,
     const scalar_t* __restrict__ sinks,
     const bool* __restrict__ tree_mask,
+    const int64_t* __restrict__ full_to_swa_mapping,
+    int64_t max_mapping_size,
     int batches,
     int num_heads,
     int num_heads_kv,
@@ -156,8 +158,25 @@ void extend_attention_kernel_impl(
       // kv_from_cache has no stage 2, so cover the extend range and stop at the diagonal
       int kv_start = 0;
       int kv_end = is_cross_attn ? encoder_lens[bs] : (kv_from_cache ? seq_len_prefix + m + m_size : seq_len_prefix);
+      if (!is_cross_attn && sliding_window_size > 0) {
+        // Every query in this block is at or after seq_len_prefix + m. Keys
+        // before this bound are outside the window for every row in the block
+        // and would be masked to -inf below, so skip their KV loads and GEMM.
+        const int64_t query_start = static_cast<int64_t>(seq_len_prefix) + m;
+        const int64_t window_start = query_start - sliding_window_size + 1;
+        kv_start = window_start > 0 ? static_cast<int>(window_start) : 0;
+      }
       for (int n = kv_start; n < kv_end; n += BLOCK_N) {
         int n_size = std::min(BLOCK_N, kv_end - n);
+
+        alignas(64) index_t swa_indices[BLOCK_N];
+        const index_t* ind_ptr = get_swa_indices(
+            req_to_token + req_to_token_row_offset + n + kv_offset,
+            swa_indices,
+            n_size,
+            full_to_swa_mapping,
+            max_mapping_size,
+            max_total_num_tokens);
 
         // `n_size` is K in 2nd gemm, pad to TILE_K;
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
@@ -167,7 +186,7 @@ void extend_attention_kernel_impl(
             /*    dst */ Btmp,
             /*    src */ k_buffer + head_kv_id * k_strideH,
             /* src_scale*/ k_buf_scale,
-            /*    ind */ req_to_token + req_to_token_row_offset + n + kv_offset,
+            /*    ind */ ind_ptr,
             /*     N  */ n_size,
             /*     K  */ head_size,
             /* ld_src */ k_strideN,
@@ -222,7 +241,7 @@ void extend_attention_kernel_impl(
             /*    dst */ Btmp,
             /*    src */ v_buffer + head_kv_id * v_strideH,
             /* src_scale*/ v_buf_scale,
-            /*    ind */ req_to_token + req_to_token_row_offset + n + kv_offset,
+            /*    ind */ ind_ptr,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
             /* ld_src */ v_strideN,
@@ -405,6 +424,8 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         buffer.data_ptr(),                                                                 \
         sinks_tensor.data_ptr<scalar_t>(),                                                 \
         tree_mask_ptr,                                                                     \
+        full_to_swa_mapping_ptr,                                                           \
+        max_mapping_size,                                                                  \
         num_seqs,                                                                          \
         num_heads,                                                                         \
         num_heads_kv,                                                                      \
@@ -475,8 +496,19 @@ void extend_attention_cpu(
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
     std::optional<at::Tensor> tree_mask,
-    bool is_causal = true) {
+    bool is_causal = true,
+    std::optional<at::Tensor> full_to_swa_mapping = std::nullopt) {
   TORCH_CHECK(k_extend_opt.has_value() == v_extend_opt.has_value(), "k_extend and v_extend must be given together");
+
+  const int64_t* full_to_swa_mapping_ptr = nullptr;
+  int64_t max_mapping_size = 0;
+  if (full_to_swa_mapping.has_value() && full_to_swa_mapping->defined()) {
+    CHECK_CONTIGUOUS(full_to_swa_mapping.value());
+    CHECK_EQ(full_to_swa_mapping->scalar_type(), at::kLong);
+    full_to_swa_mapping_ptr = full_to_swa_mapping->data_ptr<int64_t>();
+    max_mapping_size = full_to_swa_mapping->numel();
+  }
+
   // A KV-shared layer (Gemma 4) passes no extend K/V - the layer it shares with
   // already wrote them to the cache, so this kernel masks causally itself. Cross
   // attention can also arrive without K/V but reads an encoder sequence that
@@ -500,6 +532,12 @@ void extend_attention_cpu(
   int max_num_reqs = req_to_token.size(0);
   int max_context_len = req_to_token.size(1);
   int max_total_num_tokens = k_buffer.size(0);
+  // A window larger than the request table is equivalent to full context.
+  // Normalize it before the int-indexed kernel path to avoid narrowing a
+  // large int64_t window into a negative value.
+  if (sliding_window_size > max_context_len) {
+    sliding_window_size = max_context_len;
+  }
 
   int num_heads = q_extend.size(1);
   int num_heads_kv = k_extend.size(1);
