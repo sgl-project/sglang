@@ -54,6 +54,9 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
 )
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+    warm_prefill_schedule,
+)
 from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import indexer_head_weights
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.environ import envs
@@ -240,6 +243,8 @@ def refresh_low_ratio_prefill_workspaces(
     itself)."""
     previous = previous or {}
     workspaces = {}
+    for meta in metadata_by_ratio.values():
+        warm_prefill_schedule(meta.page_table.device)
     for ratio, meta in metadata_by_ratio.items():
         if ratio in page8_ratios:
             if extend_lens is not None:
