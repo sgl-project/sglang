@@ -47,7 +47,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         self.bot_token = "<｜tool▁calls▁begin｜>"
         self.eot_token = "<｜tool▁calls▁end｜>"
         self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
+        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```<｜tool▁call▁end｜>"
         self._last_arguments = ""
         self.current_tool_id = -1
 
@@ -69,21 +69,23 @@ class DeepSeekV3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=[])
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
-        try:
-            for match_result in match_result_list:
+        for match_result in match_result_list:
+            try:
                 # Get function name
                 func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
+                if func_detail is None:
+                    logger.warning("Dropping malformed DeepSeekV3 tool call block")
+                    continue
                 func_name = func_detail.group(2)
                 func_args = func_detail.group(3)
                 func_args = json.loads(func_args)
                 # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": func_args}
-                calls.extend(self.parse_base_json(match_result, tools))
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
-            # return the normal text if parsing fails
-            return StreamingParseResult(normal_text=text)
+                parsed_call = {"name": func_name, "parameters": func_args}
+                calls.extend(self.parse_base_json(parsed_call, tools))
+            except Exception as e:
+                logger.error(f"Error in detect_and_parse: {e}")
+                continue
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -100,23 +102,64 @@ class DeepSeekV3Detector(BaseFormatDetector):
         )
 
         if not has_tool_call:
-            self._buffer = ""
             for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+                if e_token in current_text:
+                    current_text = current_text.replace(e_token, "")
+            partial_len = max(
+                (
+                    i
+                    for token in (
+                        self.bot_token,
+                        "<｜tool▁call▁begin｜>",
+                        self.eot_token,
+                        "<｜tool▁call▁end｜>",
+                    )
+                    for i in range(1, min(len(current_text) + 1, len(token)))
+                    if token.startswith(current_text[-i:])
+                ),
+                default=0,
+            )
+            if partial_len > 0:
+                emit_text = current_text[:-partial_len]
+                self._buffer = current_text[-partial_len:]
+            else:
+                emit_text = current_text
+                self._buffer = ""
+            if self.current_tool_id != -1 and not emit_text.strip():
+                emit_text = ""
+            return StreamingParseResult(normal_text=emit_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        normal_text = ""
+        if self.current_tool_id == -1:
+            marker_positions = [
+                pos
+                for pos in (
+                    current_text.find(self.bot_token),
+                    current_text.find("<｜tool▁call▁begin｜>"),
+                )
+                if pos != -1
+            ]
+            if marker_positions:
+                first_marker_idx = min(marker_positions)
+                if first_marker_idx > 0:
+                    normal_text = current_text[:first_marker_idx]
+                    current_text = current_text[first_marker_idx:]
+                    self._buffer = current_text
+
         calls: list[ToolCallItem] = []
         try:
-            partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
-                string=current_text,
-                flags=re.DOTALL,
-            )
-            if partial_match:
+            while True:
+                partial_match = re.search(
+                    pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```.*",
+                    string=current_text,
+                    flags=re.DOTALL,
+                )
+                if not partial_match:
+                    break
+
                 func_name = partial_match.group(2).strip()
                 func_args_raw = partial_match.group(3).strip()
 
@@ -146,56 +189,51 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": {},
                     }
-                else:
-                    argument_diff = (
-                        func_args_raw[len(self._last_arguments) :]
-                        if func_args_raw.startswith(self._last_arguments)
-                        else func_args_raw
+
+                argument_diff = (
+                    func_args_raw[len(self._last_arguments) :]
+                    if func_args_raw.startswith(self._last_arguments)
+                    else func_args_raw
+                )
+
+                if argument_diff:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=argument_diff,
+                        )
                     )
+                    self._last_arguments += argument_diff
+                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
-                    if argument_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=argument_diff,
-                            )
+                if _is_complete_json(func_args_raw):
+                    # Update the stored arguments
+                    try:
+                        parsed_args = json.loads(func_args_raw)
+                        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                            parsed_args
                         )
-                        self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[self.current_tool_id] += (
-                            argument_diff
-                        )
+                    except json.JSONDecodeError:
+                        pass
 
-                    if _is_complete_json(func_args_raw):
-                        # Update the stored arguments
-                        try:
-                            parsed_args = json.loads(func_args_raw)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
-
-                        # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-                        )
-                        match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
-                        if match:
-                            # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[match.end() :]
-                        else:
-                            self._buffer = ""
-
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                    # Find the end of the current tool call and remove only that part from buffer
+                    tool_call_end_pattern = (
+                        r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+                    )
+                    match = re.search(tool_call_end_pattern, current_text, re.DOTALL)
+                    if match:
+                        # Remove the completed tool call from buffer, keep any remaining content
+                        self._buffer = current_text[match.end() :]
+                        current_text = self._buffer
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
-                        return result
+                        continue
 
-            return StreamingParseResult(normal_text="", calls=calls)
+                break
+
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
