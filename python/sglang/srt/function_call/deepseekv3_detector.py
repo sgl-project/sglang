@@ -111,12 +111,23 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
-            partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
-                string=current_text,
-                flags=re.DOTALL,
-            )
-            if partial_match:
+            # A single increment may carry more than one complete tool call (a
+            # coalesced backlog, or a large --stream-interval), and the serving
+            # layer feeds one delta at a time with no end-of-stream flush, so
+            # drain the buffer. Lazy quantifiers match the FIRST complete call;
+            # a greedy `.*` would span up to the last one and drop the rest
+            # (#43523). The loop repeats while more complete calls remain, and
+            # each completed call's arguments stream in the same increment.
+            while True:
+                current_text = self._buffer
+                partial_match = re.search(
+                    pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```.*",
+                    string=current_text,
+                    flags=re.DOTALL,
+                )
+                if not partial_match:
+                    break
+
                 func_name = partial_match.group(2).strip()
                 func_args_raw = partial_match.group(3).strip()
 
@@ -146,54 +157,54 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": {},
                     }
-                else:
-                    argument_diff = (
-                        func_args_raw[len(self._last_arguments) :]
-                        if func_args_raw.startswith(self._last_arguments)
-                        else func_args_raw
+                    # The arguments of this call may already be complete in the
+                    # buffer; loop again to stream them in this same increment.
+                    continue
+
+                argument_diff = (
+                    func_args_raw[len(self._last_arguments) :]
+                    if func_args_raw.startswith(self._last_arguments)
+                    else func_args_raw
+                )
+
+                if argument_diff:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=argument_diff,
+                        )
                     )
+                    self._last_arguments += argument_diff
+                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
-                    if argument_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=argument_diff,
-                            )
-                        )
-                        self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[self.current_tool_id] += (
-                            argument_diff
-                        )
+                if not _is_complete_json(func_args_raw):
+                    # Arguments still streaming in, wait for the next increment.
+                    break
 
-                    if _is_complete_json(func_args_raw):
-                        # Update the stored arguments
-                        try:
-                            parsed_args = json.loads(func_args_raw)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
+                # Update the stored arguments
+                try:
+                    parsed_args = json.loads(func_args_raw)
+                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                        parsed_args
+                    )
+                except json.JSONDecodeError:
+                    pass
 
-                        # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-                        )
-                        match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
-                        if match:
-                            # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[match.end() :]
-                        else:
-                            self._buffer = ""
+                # Find the end of the current tool call and remove only that part from buffer
+                tool_call_end_pattern = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+                match = re.search(tool_call_end_pattern, current_text, re.DOTALL)
+                if match:
+                    # Remove the completed tool call from buffer, keep any remaining content
+                    self._buffer = current_text[match.end() :]
+                else:
+                    self._buffer = ""
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        return result
+                self.current_tool_id += 1
+                self._last_arguments = ""
+                self.current_tool_name_sent = False
+                # The buffer may already hold the next complete call; keep
+                # draining it in this same increment.
 
             return StreamingParseResult(normal_text="", calls=calls)
 
