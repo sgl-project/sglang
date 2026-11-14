@@ -214,7 +214,13 @@ client sent. The router picks the first of these that applies:
    its rank and router replicas agree.
 2. The rank with the deepest cached prefix in the local KV tree.
 3. The rank with the fewest requests this router has in flight on it, or with
-   `--dp-rank-policy round_robin`, the worker's ranks in turn.
+   `--dp-rank-policy round_robin`, the worker's ranks in turn, or with
+   `--dp-rank-policy shape_aware`, the rank whose heavier phase stays lightest.
+   That policy tracks, per rank, the prompt tokens and the output tokens
+   (`max_tokens`, capped at 4096 and charged 4096 when unset) of this router's in-flight
+   requests, and sends the request where `max(input, output)` is smallest after
+   it joins, so prefill-heavy and decode-heavy requests are balanced separately.
+   In PD mode the prefill rank is charged the prompt and the decode rank the output.
 
 In PD mode, decode is ranked by step 3 only. The decode request names the
 prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies

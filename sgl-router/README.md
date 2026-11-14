@@ -144,6 +144,11 @@ under reorg) or per group in a bucket file:
   plain engines compare estimated prefill queue time, waiting uncached tokens,
   waiting, running, then in-flight requests; decode engines compare waiting and
   running requests, then KV usage. Decode groups always default to it.
+- **`shape_aware`**: prefers the engine whose heavier phase, prefill or decode,
+  stays lightest once the request joins, from the prompt tokens and `max_tokens`
+  (capped at 4096, charged 4096 when unset) of the requests this router has in
+  flight on it. Prefill engines are charged the prompt only. Plain and prefill
+  groups.
 - **`cache_aware`**: prefers the engine holding the longest cached prefix of the
   prompt (at least `--cache-affinity-min-matched-tokens`, default 1024, and
   optionally `--cache-affinity-min-match-ratio` of the prompt). Plain and
@@ -347,7 +352,8 @@ unset fields inherit the CLI flags. See
   [circuit breaker](REFERENCE.md#circuit-breaker).
 - **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
   engines, and `--dp-rank-policy round_robin` cycles ranks that no routing key
-  or cached prefix decides; in PD mode, `--decode-dispatch-limit N` picks the
+  or cached prefix decides, and `--dp-rank-policy shape_aware` balances their
+  prefill and decode load separately; in PD mode, `--decode-dispatch-limit N` picks the
   decode rank shortly before the KV arrives; see
   [DP-rank routing](REFERENCE.md#dp-rank-routing).
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and

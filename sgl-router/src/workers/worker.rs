@@ -83,16 +83,46 @@ fn grpc_client(host: &str, port: u16) -> Option<SglangServiceClient<tonic::trans
     )
 }
 
+/// Estimated engine work of one request on a DP rank or worker, in tokens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RankLoad {
+    /// Prompt tokens yet to prefill.
+    pub input_tokens: u64,
+    /// Tokens yet to generate, up to the decode budget.
+    pub output_tokens: u64,
+}
+
+/// What this router has in flight on one DP rank.
+#[derive(Default)]
+struct RankSlot {
+    requests: AtomicUsize,
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+}
+
+/// Estimated tokens this router has in flight on one worker.
+#[derive(Default)]
+struct TokenCounters {
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+}
+
 /// Holds one router in-flight slot on a DP rank; see [`Worker::dp_rank_guard`].
 #[must_use = "dropping a DpRankGuard releases the rank slot"]
 pub struct DpRankGuard {
-    inflight: Arc<[AtomicUsize]>,
+    slots: Arc<[RankSlot]>,
     rank: usize,
+    load: RankLoad,
 }
 
 impl Drop for DpRankGuard {
     fn drop(&mut self) {
-        self.inflight[self.rank].fetch_sub(1, Ordering::Relaxed);
+        let slot = &self.slots[self.rank];
+        slot.requests.fetch_sub(1, Ordering::Relaxed);
+        slot.input_tokens
+            .fetch_sub(self.load.input_tokens, Ordering::Relaxed);
+        slot.output_tokens
+            .fetch_sub(self.load.output_tokens, Ordering::Relaxed);
     }
 }
 
@@ -171,8 +201,9 @@ impl SlotRegistry {
 }
 
 /// RAII guard that increments `active_requests` on construction and decrements
-/// on drop. Obtain via [`Worker::load_guard`]. Policies that need to correct
-/// an engine snapshot use the crate-private timestamped variant.
+/// on drop, along with any tokens added by `with_tokens`. Obtain via
+/// [`Worker::load_guard`]. Policies that need to correct an engine snapshot use
+/// the crate-private timestamped variant.
 ///
 /// `#[must_use]`: a statement-form call like `worker.load_guard();` would
 /// drop the guard on the same line, so the counter would never see the
@@ -181,6 +212,22 @@ impl SlotRegistry {
 pub struct LoadGuard {
     active_requests: Arc<AtomicUsize>,
     tracked_slot: Option<(Arc<SlotRegistry>, u64)>,
+    token_load: Arc<TokenCounters>,
+    charged: RankLoad,
+}
+
+impl LoadGuard {
+    /// Also counts `load` on the worker's in-flight tokens until dropped.
+    pub fn with_tokens(mut self, load: RankLoad) -> Self {
+        self.token_load
+            .input_tokens
+            .fetch_add(load.input_tokens, Ordering::Relaxed);
+        self.token_load
+            .output_tokens
+            .fetch_add(load.output_tokens, Ordering::Relaxed);
+        self.charged = load;
+        self
+    }
 }
 
 impl Drop for LoadGuard {
@@ -189,6 +236,12 @@ impl Drop for LoadGuard {
             registry.release(*id);
         }
         self.active_requests.fetch_sub(1, Ordering::Relaxed);
+        self.token_load
+            .input_tokens
+            .fetch_sub(self.charged.input_tokens, Ordering::Relaxed);
+        self.token_load
+            .output_tokens
+            .fetch_sub(self.charged.output_tokens, Ordering::Relaxed);
     }
 }
 
@@ -230,6 +283,8 @@ pub struct Worker {
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
+    /// Estimated tokens of the in-flight requests whose guards carry them.
+    token_load: Arc<TokenCounters>,
     /// Timestamped ledger for requests whose policy reads Engine Load;
     /// answers [`Worker::slots_acquired_since`].
     slots: Arc<SlotRegistry>,
@@ -251,8 +306,8 @@ pub struct Worker {
     /// [`crate::discovery::WorkerSpec`].
     version_group: Option<String>,
     services: RwLock<BTreeSet<String>>,
-    /// Router in-flight requests per DP rank; one slot per rank.
-    dp_rank_inflight: Arc<[AtomicUsize]>,
+    /// Router in-flight requests and their estimated tokens, one slot per DP rank.
+    dp_rank_slots: Arc<[RankSlot]>,
     /// Round-robin position over this worker's DP ranks.
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
@@ -284,6 +339,7 @@ impl Worker {
         let bootstrap_host = parse_bootstrap_host(&spec.url);
         let grpc = grpc_port.and_then(|port| grpc_client(&bootstrap_host, port));
         let active_requests = Arc::new(AtomicUsize::new(0));
+        let token_load = Arc::new(TokenCounters::default());
         let slots = SlotRegistry::new();
         Self {
             id: spec.id,
@@ -294,13 +350,14 @@ impl Worker {
             model_ids: spec.model_ids,
             breaker,
             active_requests,
+            token_load,
             slots,
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             pooled_at: tokio::time::Instant::now(),
             version_group: spec.version_group,
             services: RwLock::new(spec.services),
-            dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
+            dp_rank_slots: (0..dp_ranks.max(1)).map(|_| RankSlot::default()).collect(),
             dp_rank_turn: AtomicUsize::new(0),
             openai,
         }
@@ -347,6 +404,7 @@ impl Worker {
             self.breaker = Arc::clone(&prev.breaker);
         }
         self.active_requests = Arc::clone(&prev.active_requests);
+        self.token_load = Arc::clone(&prev.token_load);
         self.slots = Arc::clone(&prev.slots);
     }
 
@@ -392,11 +450,22 @@ impl Worker {
     }
 
     pub fn dp_ranks(&self) -> u32 {
-        self.dp_rank_inflight.len() as u32
+        self.dp_rank_slots.len() as u32
     }
 
     pub fn dp_rank_inflight(&self, rank: u32) -> usize {
-        self.dp_rank_inflight[rank as usize].load(Ordering::Relaxed)
+        self.dp_rank_slots[rank as usize]
+            .requests
+            .load(Ordering::Relaxed)
+    }
+
+    /// Estimated tokens this router has in flight on `rank`.
+    pub fn dp_rank_load(&self, rank: u32) -> RankLoad {
+        let slot = &self.dp_rank_slots[rank as usize];
+        RankLoad {
+            input_tokens: slot.input_tokens.load(Ordering::Relaxed),
+            output_tokens: slot.output_tokens.load(Ordering::Relaxed),
+        }
     }
 
     /// Advances the round-robin DP-rank position and returns the previous one.
@@ -404,17 +473,32 @@ impl Worker {
         self.dp_rank_turn.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn dp_rank_guard(&self, rank: u32) -> DpRankGuard {
+    /// Counts one request, with its estimated `load`, on `rank` until dropped.
+    pub fn dp_rank_guard(&self, rank: u32, load: RankLoad) -> DpRankGuard {
         let rank = rank as usize;
-        self.dp_rank_inflight[rank].fetch_add(1, Ordering::Relaxed);
+        let slot = &self.dp_rank_slots[rank];
+        slot.requests.fetch_add(1, Ordering::Relaxed);
+        slot.input_tokens
+            .fetch_add(load.input_tokens, Ordering::Relaxed);
+        slot.output_tokens
+            .fetch_add(load.output_tokens, Ordering::Relaxed);
         DpRankGuard {
-            inflight: Arc::clone(&self.dp_rank_inflight),
+            slots: Arc::clone(&self.dp_rank_slots),
             rank,
+            load,
         }
     }
 
     pub fn router_inflight_load(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
+    }
+
+    /// Estimated tokens of this router's in-flight requests on the worker.
+    pub fn router_inflight_tokens(&self) -> RankLoad {
+        RankLoad {
+            input_tokens: self.token_load.input_tokens.load(Ordering::Relaxed),
+            output_tokens: self.token_load.output_tokens.load(Ordering::Relaxed),
+        }
     }
 
     /// Number of this worker's currently in-flight requests dispatched at or
@@ -430,6 +514,8 @@ impl Worker {
         LoadGuard {
             active_requests: Arc::clone(&self.active_requests),
             tracked_slot: None,
+            token_load: Arc::clone(&self.token_load),
+            charged: RankLoad::default(),
         }
     }
 
@@ -440,6 +526,8 @@ impl Worker {
         LoadGuard {
             active_requests: Arc::clone(&self.active_requests),
             tracked_slot: Some((Arc::clone(&self.slots), slot_id)),
+            token_load: Arc::clone(&self.token_load),
+            charged: RankLoad::default(),
         }
     }
 }

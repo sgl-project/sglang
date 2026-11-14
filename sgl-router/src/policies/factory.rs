@@ -16,6 +16,7 @@ use crate::policies::{
         Pipeline, ScorePolicy,
     },
     session_aware::SessionAwarePolicy,
+    shape_aware::ShapeAwarePolicy,
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
@@ -97,6 +98,7 @@ fn build_kind(
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        PolicyKind::ShapeAware => Arc::new(ShapeAwarePolicy::new()),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
             model.affinity.clone().unwrap_or_default(),
         )),
@@ -194,6 +196,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        PolicyKind::ShapeAware => Arc::new(ShapeAwarePolicy::new()),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
             crate::config::AffinityConfig::default(),
         )),
