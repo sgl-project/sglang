@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+import zmq
 
 from sglang.api.v1.api_types import GenerateMetaInfo
 from sglang.srt.disaggregation.mode import DisaggregationMode
@@ -31,6 +32,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.managers.scheduler_components.output_streamer import (
     OutputSink,
     SchedulerOutputStreamer,
@@ -642,6 +644,127 @@ def _streamer(outputs, enable_hicache_storage=lambda: False, is_generation=True)
         skip_tokenizer_init=False,
         enable_hicache_storage=enable_hicache_storage,
     )
+
+
+class TestDeferredDecodeCollection(unittest.TestCase):
+    def setUp(self):
+        _enter_streamer_scope(self)
+        self.context = zmq.Context()
+        self.addCleanup(self.context.term)
+        self.connections = 0
+
+    def make_streamer(self, deferred):
+        address = f"inproc://output-{self.connections}"
+        self.connections += 1
+        send = self.context.socket(zmq.PAIR)
+        recv = self.context.socket(zmq.PAIR)
+        self.addCleanup(send.close, 0)
+        self.addCleanup(recv.close, 0)
+        recv.setsockopt(zmq.RCVTIMEO, 1000)
+        send.bind(address)
+        recv.connect(address)
+        streamer = _streamer([])
+        streamer.send_to_detokenizer = SenderWrapper(send)
+        streamer.disaggregation_mode = DisaggregationMode.DECODE
+        streamer.defer_decode_collection = deferred
+        return streamer, recv
+
+    def test_snapshot_owns_token_delta_and_drains_before_release(self):
+        for pickle_ipc in (False, True):
+            with (
+                self.subTest(pickle_ipc=pickle_ipc),
+                patch.object(io_struct, "_USE_PICKLE_IPC", pickle_ipc),
+            ):
+                streamer, recv = self.make_streamer(True)
+                req = _metered_req()
+                req.output_ids.append(7)
+                streamer.stream_output([req], False)
+                first = io_struct.sock_recv(recv)
+                self.assertIsNotNone(first.detokenize_headers)
+                self.assertIsNotNone(first.request_stats)
+
+                req.output_ids.append(8)
+                req.reasoning_tokens = 5  # Clamped to the captured token count.
+                streamer.stream_output([req], False)
+                self.assertEqual(recv.poll(0), 0)
+                self.assertEqual(req.send_token_offset, 2)
+
+                # A later batch changes the live request; pending output must
+                # still carry the previous step's owned slice and scalar values.
+                req.output_ids[-1] = 99
+                req.output_ids.append(9)
+                req.reasoning_tokens = 0
+                req.reset_for_retract()
+                streamer.release_detokenize_state(req)
+                delta = io_struct.sock_recv(recv)
+                release = io_struct.sock_recv(recv)
+                self.assertEqual(list(row_output_ids(delta, 0)), [8])
+                self.assertEqual(delta.completion_tokens, [2])
+                self.assertEqual(delta.reasoning_tokens, [2])
+                self.assertIsNone(delta.detokenize_headers)
+                self.assertIsNone(delta.request_stats)
+                self.assertIsInstance(release, DetokenizeReleaseReq)
+                streamer.send_to_detokenizer.flush_output()
+                self.assertEqual(recv.poll(0), 0)
+
+    def test_stream_intervals_retractions_and_finish_match_immediate_output(self):
+        for stream, interval in ((True, 1), (True, 3), (False, 1)):
+            with self.subTest(stream=stream, interval=interval):
+                outputs = []
+                for deferred in (False, True):
+                    streamer, recv = self.make_streamer(deferred)
+                    req = _metered_req()
+                    req.stream = stream
+                    req.sampling_params.stream_interval = interval
+                    for token in range(1, 66):
+                        req.output_ids.append(token)
+                        if token == 35:
+                            req.reset_for_retract()
+                        if token == 36:
+                            req.is_retracted = False
+                        if token == 65:
+                            req.finished_reason = FINISH_LENGTH(length=65)
+                        streamer.stream_output([req], False)
+                    # Terminal output must drain all preceding deltas without a
+                    # subsequent forward, including non-streaming requests.
+                    payloads = []
+                    while recv.poll(0):
+                        payloads.append(io_struct.sock_recv(recv))
+                    self.assertTrue(payloads[-1].finished_reasons[0])
+                    self.assertEqual(req.send_token_offset, 65)
+                    outputs.append(payloads)
+                self.assertEqual(outputs[0], outputs[1])
+
+    def test_mixed_batch_falls_back_before_advancing_any_cursor(self):
+        for special in ("first", "finished", "retracted", "customized"):
+            with self.subTest(special=special):
+                streamer, recv = self.make_streamer(True)
+                req, other = _metered_req(), _metered_req()
+                other.rid = "other"
+                for item in (req, other):
+                    item.output_ids.append(1)
+                streamer.stream_output([req, other], False)
+                io_struct.sock_recv(recv)
+                req.output_ids.append(2)
+                other.output_ids.append(3)
+                if special == "first":
+                    other.detokenize_header_sent = False
+                elif special == "finished":
+                    other.finished_reason = FINISH_LENGTH(length=2)
+                elif special == "retracted":
+                    other.reset_for_retract()
+                else:
+                    other.customized_info = {"probe": [20, 30]}
+                streamer.stream_output([req, other], False)
+                payload = io_struct.sock_recv(recv)
+                self.assertEqual(
+                    [list(row_output_ids(payload, i)) for i in range(2)], [[2], [3]]
+                )
+                self.assertEqual(
+                    (req.send_token_offset, other.send_token_offset), (2, 2)
+                )
+                streamer.send_to_detokenizer.flush_output()
+                self.assertEqual(recv.poll(0), 0)
 
 
 class TestOutputStreamerRequestStats(unittest.TestCase):
