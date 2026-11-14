@@ -38,7 +38,7 @@ from sglang.test.kernels.minimax_h3_vae import _h3_install_gate, _h3_tiny_vae
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: preserve ROCm SDPA/autocast batching parity coverage.
-register_amd_ci(est_time=2, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=2, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

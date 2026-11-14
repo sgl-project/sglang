@@ -41,7 +41,7 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
 register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-small")
-register_amd_ci(est_time=38, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=38, stage="jit-kernel-unit", runner_config="amd")
 
 DEVICE = "cuda"
 CUDA_NATIVE_ONLY = pytest.mark.skipif(

@@ -21,7 +21,7 @@ from sglang.test.kernels.deepseek_v4.compress_state import (
 )
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=25, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=25, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
