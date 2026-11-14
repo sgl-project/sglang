@@ -1136,13 +1136,19 @@ def _get_cp_rank_page_bounds(
 
 def filter_kv_indices_for_shard_rank(
     *,
-    kv_indices: np.ndarray,
+    kv_indices: np.ndarray | torch.Tensor,
     index_slice: slice,
     shard_rank: int,
     shard_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Logical page l lives on rank l % N as local page l // N; returns the owned
-    local ids and their send positions, which replace the contiguous index_slice."""
+    local ids and their send positions, which replace the contiguous index_slice.
+
+    Host tensor inputs must be ready before this synchronous filter runs.
+    """
+    # A one-element torch bool tensor is interpreted as an integer index by
+    # NumPy. Keep the page ids and their positional mask in the same array type.
+    kv_indices = np.asarray(kv_indices)
     owned = kv_indices % shard_size == shard_rank
     positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
     return kv_indices[owned] // shard_size, positions[owned]

@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.device_pool_info import (
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self.qsa_compressed_dtype,
             self.index_state_dtype,
         )
-        state_size = size + page_size
+        # KV sharding stripes the full K/V, but every rank compresses the whole
+        # chunk, so compressed keys stay replicated over the widened slot space.
+        shard_size = (
+            self.full_kv_pool.shard_size
+            if isinstance(self.full_kv_pool, PageInterleaveKVPoolMixin)
+            else 1
+        )
+        state_size = (size + page_size) * shard_size
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
