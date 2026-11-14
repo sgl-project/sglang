@@ -1047,6 +1047,9 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # gfx950: BF16/FP16 unquantized linears without bias run the vendored tlx.ops.mm
+    # (sglang.kernels.ops.gemm.tlx) ahead of every other dense GEMM path. Needs TLX (uTLX or fbtriton).
+    SGLANG_USE_TLX_GEMM = EnvBool(False)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no

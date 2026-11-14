@@ -330,6 +330,17 @@ register_kernel(
 )
 
 
+# Vendored tlx.ops.moe (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
+register_kernel(
+    KernelSpec(
+        op="moe.tlx_moe",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.tlx_ops.kernels.moe.gfx950:moe",
+        capabilities=_HIP,
+    )
+)
+
+
 # Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
 # Triton attention backends dispatch to by shape; registered for inventory.
 _MUSE_SPARK_GFX950_KERNELS = [
