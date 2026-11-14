@@ -2348,7 +2348,10 @@ INLINE_SYSTEM_TEMPLATE = (
     "encoding_spec, chat_template_name, jinja_template, preserve",
     [
         ("kimi_k3", None, None, True),
-        ("dsv32", None, INLINE_SYSTEM_TEMPLATE, False),
+        ("dsv32", None, INLINE_SYSTEM_TEMPLATE, True),
+        ("dsv4", None, None, True),
+        ("dsv41", None, None, True),
+        ("inkling", None, None, True),
         (None, None, INLINE_SYSTEM_TEMPLATE, True),
         (None, "llama-3", INLINE_SYSTEM_TEMPLATE, False),
         (None, None, "{{ messages[0]['content'] }}", False),
