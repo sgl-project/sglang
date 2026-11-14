@@ -9,7 +9,6 @@ import unittest
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
-    checkpoint_weight_bytes,
     generate,
     generation_signature,
     get,
@@ -51,7 +50,6 @@ NO_MEMORY_ARGS = BASE_ARGS
 class TestNpuMemoryOccupation(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.weight_bytes = checkpoint_weight_bytes(MODEL)
         # One memory-saver server for all release/resume cases. Restarting a
         # mempool-backed server repeatedly is what stresses the NPU driver.
         cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS, env=npu_rl_env())
@@ -62,15 +60,15 @@ class TestNpuMemoryOccupation(CustomTestCase):
         cls._server.__exit__(None, None, None)
 
     def test_01_release_weights_frees_memory(self):
-        generate(self.base_url, PROMPTS[0])
+        golden = generation_signature(self.base_url, PROMPTS)
         before = npu_free_bytes()
 
         try:
             release_memory(self.base_url, ["weights"])
-            freed = npu_free_bytes() - before
+            after_release = npu_free_bytes()
             self.assertGreater(
-                freed,
-                int(0.5 * self.weight_bytes),
+                after_release - before,
+                int(0.5 * 2**30),
                 "release(weights) did not hand HBM back to the driver",
             )
             # /health generates a token, which is invalid while weights are
@@ -79,10 +77,28 @@ class TestNpuMemoryOccupation(CustomTestCase):
         finally:
             resume_memory(self.base_url, ["weights"])
 
+        reallocated = after_release - npu_free_bytes()
+        self.assertGreater(
+            reallocated,
+            int(0.4 * 2**30),
+            "resume(weights) did not reallocate HBM",
+        )
+        self.assertEqual(
+            generation_signature(self.base_url, PROMPTS),
+            golden,
+            "output changed after release/resume of weights",
+        )
+
     def test_release_all_then_resume_restores_output(self):
         golden = generation_signature(self.base_url, PROMPTS)
+        before = npu_free_bytes()
 
         release_memory(self.base_url, ["weights", "kv_cache"])
+        self.assertGreater(
+            npu_free_bytes() - before,
+            int(1.5 * 2**30),
+            "release(weights, kv_cache) did not hand HBM back to the driver",
+        )
         resume_memory(self.base_url, ["weights", "kv_cache"])
 
         actual = generation_signature(self.base_url, PROMPTS)
