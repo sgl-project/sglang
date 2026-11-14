@@ -34,7 +34,7 @@ def mega_gate_supported(moe) -> bool:
     if (
         _device_sm // 10 != 10
         or moe.config.model_type != "deepseek_v41"
-        or moe.topk.enable_waterfill
+        or moe.topk.moe_load_balancer is not None
         or moe.num_fused_shared_experts
         or get_exec().deterministic.enable_deterministic_inference
     ):
@@ -173,10 +173,7 @@ def run_mega_gate(
     moe, hidden_states, input_ids, buf=None, forward_batch=None
 ) -> Optional[MegaGateRouting]:
     bound, dispatch_info = moe.topk.routing_inputs()
-    if dispatch_info is not None and dispatch_info.ep_dispatch_algorithm in (
-        "lp",
-        "fake",
-    ):
+    if dispatch_info is not None and dispatch_info.ep_dispatch_algorithm == "fake":
         return None
     if moe.is_hash and input_ids is None:
         return None

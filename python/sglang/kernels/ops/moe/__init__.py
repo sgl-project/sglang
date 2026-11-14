@@ -193,7 +193,6 @@ _PHASE25_TRITON_KERNELS = [
     ("fused_moe_triton_kernels", "fused_moe_kernel_gptq_awq"),
     ("mxfp8_moe_amd_gfx95", "fused_experts_mxfp8"),
     ("router", "fused_moe_router_shim"),
-    ("deepep_waterfill_kernels", "materialize_waterfill_dispatch_fused"),
     ("fill_padded_rows", "_fill_padded_rows"),
     ("moe_fused_mul_sum", "moe_fused_mul_sum"),
 ]

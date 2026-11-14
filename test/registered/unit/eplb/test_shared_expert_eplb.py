@@ -1,4 +1,4 @@
-"""Unit tests for Waterfill and EPLB updater compatibility."""
+"""Unit tests for Shared-expert routing and EPLB updater compatibility."""
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.runtime_context import get_model
@@ -15,7 +15,7 @@ from torch import nn
 
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import TopK, TopKConfig, TopKOutputFormat
+from sglang.srt.layers.moe.topk import TopK, TopKConfig
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase
@@ -33,7 +33,7 @@ class _FakeExpertParam(nn.Module):
         self.global_scale._sglang_require_global_experts = True
 
 
-class TestWaterfillEPLB(CustomTestCase):
+class TestSharedExpertEPLB(CustomTestCase):
     def test_deepseek_moe_get_moe_weights_excludes_fused_shared_slot(self):
         experts = _FakeExpertParam()
         moe = SimpleNamespace(num_fused_shared_experts=1, experts=experts)
@@ -187,18 +187,19 @@ class TestWaterfillEPLB(CustomTestCase):
         self.assertTrue(torch.equal(recorder_ids, torch.tensor([[1, 34, 201]])))
 
     def test_the_shared_expert_column_has_exactly_one_writer(self):
-        """Shared slots must be written exactly once, by routing or Waterfill."""
+        """Shared slots must be written exactly once, by routing or the load balancer."""
         from sglang.srt.runtime_context import get_context
 
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
 
-        for enable_waterfill in (False, True):
-            with self.subTest(enable_waterfill=enable_waterfill):
+        for routed_by_load_balancer in (False, True):
+            with self.subTest(routed_by_load_balancer=routed_by_load_balancer):
                 with get_model().override(
                     shared_experts=SharedExpertsConfig(
-                        num_fused_shared_experts=1, use_waterfill=enable_waterfill
+                        num_fused_shared_experts=1,
+                        routed_by_load_balancer=routed_by_load_balancer,
                     )
                 ):
                     topk = TopK(top_k=8, layer_id=0)
@@ -216,18 +217,23 @@ class TestWaterfillEPLB(CustomTestCase):
                     ),
                     (hash_topk, hash_topk.topk, hash_topk.num_shared_topk_slots),
                 ):
-                    self.assertEqual(layer.enable_waterfill, enable_waterfill)
+                    config = (
+                        layer.topk_config.shared_experts
+                        if isinstance(layer, TopK)
+                        else layer.shared_experts
+                    )
                     self.assertEqual(
-                        router_shared_columns + int(layer.enable_waterfill), 1
+                        config.routed_by_load_balancer, routed_by_load_balancer
+                    )
+                    self.assertEqual(
+                        router_shared_columns + int(config.routed_by_load_balancer), 1
                     )
                     self.assertEqual(router_top_k - router_shared_columns, 8)
                 self.assertEqual(hash_topk.tid2eid.shape[1], 8)
-                if enable_waterfill:
-                    self.assertEqual(
-                        topk.topk_config.output_format, TopKOutputFormat.STANDARD
-                    )
 
-                self.assertFalse(unfused_topk.enable_waterfill)
+                self.assertFalse(
+                    unfused_topk.topk_config.shared_experts.routed_by_load_balancer
+                )
                 self.assertEqual(unfused_topk.topk_config.top_k, 8)
                 self.assertEqual(unfused_topk.topk_config.num_shared_topk_slots, 0)
 

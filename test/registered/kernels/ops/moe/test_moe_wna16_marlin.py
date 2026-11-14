@@ -877,7 +877,6 @@ def _check_marlin_inactive_routes(
         moe_runner_backend="auto",
         ep_dispatch_algorithm=None,
         enable_eplb=False,
-        enable_waterfill=False,
     ):
         flags = get_flags().moe
         flag_values = {name: getattr(flags, name) for name in flags.__struct_fields__}

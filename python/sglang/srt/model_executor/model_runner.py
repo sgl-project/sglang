@@ -180,9 +180,9 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
-    init_lplb_solvers,
+    commit_initial_moe_placement,
+    create_moe_load_balancer,
     prebuild_deepep_v2_buffer,
-    prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
@@ -736,8 +736,8 @@ class ModelRunner:
     def initialize(self):
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
+        self.maybe_init_moe_load_balancer()
         self.maybe_init_expert_location_metadata()
-        self.maybe_init_lplb_solvers()
         self.maybe_init_eplb_manager()
         self.expert_location_updater = ExpertLocationUpdater()
         self.maybe_init_elastic_ep()
@@ -748,7 +748,7 @@ class ModelRunner:
             check_layer_types_hybrid_swa_split(
                 model=self.model, model_config=self.model_config
             )
-        prepare_moe_topk(model=self.model, model_config=self.model_config)
+        self.maybe_commit_initial_moe_placement()
 
         self.maybe_init_dwdp()
 
@@ -786,6 +786,21 @@ class ModelRunner:
         if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
             self.remote_instance_weight_transporter.init_engine()
 
+    def maybe_init_moe_load_balancer(self):
+        """Create the target's EvenMoE balancer before the model is built."""
+        self.moe_load_balancer = (
+            None
+            if self.is_draft_worker
+            else create_moe_load_balancer(model_config=self.model_config)
+        )
+
+    def maybe_commit_initial_moe_placement(self):
+        """Hand the loaded placement to the balancer before the first forward."""
+        if self.moe_load_balancer is not None:
+            commit_initial_moe_placement(
+                model=self.model, moe_load_balancer=self.moe_load_balancer
+            )
+
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:
             return
@@ -798,6 +813,7 @@ class ModelRunner:
             compute_initial_expert_location_metadata(
                 model_config=self.model_config,
                 moe_ep_rank=expert_rank,
+                moe_load_balancer=self.moe_load_balancer,
             )
         )
         if (
@@ -815,21 +831,35 @@ class ModelRunner:
             )
         )
 
-    def maybe_init_lplb_solvers(self):
-        if get_exec().moe.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
-            init_lplb_solvers(model_config=self.model_config)
-
     def maybe_init_eplb_manager(self):
-        self.eplb_manager = (
-            EPLBManager(
+        from sglang.srt.eplb.moe_load_balancer_glue import refreshes_placement_per_layer
+
+        self.eplb_manager = None
+        self.layer_placement_refresher = None
+        if not get_exec().moe.enable_eplb or self.is_draft_worker:
+            return
+        if not refreshes_placement_per_layer(self.moe_load_balancer):
+            self.eplb_manager = EPLBManager(
                 model_config=self.model_config,
                 get_model=lambda: self.model,
                 get_expert_location_updater=lambda: self.expert_location_updater,
                 get_expert_backup_client=lambda: self.expert_backup_client,
                 get_weight_updater=lambda: self.weight_updater,
+                moe_load_balancer=self.moe_load_balancer,
             )
-            if get_exec().moe.enable_eplb and (not self.is_draft_worker)
-            else None
+            return
+        # Per-layer refresh replaces the periodic whole-model rebalance;
+        # statistics are recorded only when explicitly requested.
+        from sglang.srt.eplb.layer_refresh import LayerPlacementRefresher
+
+        self.layer_placement_refresher = LayerPlacementRefresher(
+            moe_load_balancer=self.moe_load_balancer,
+            get_model=lambda: self.model,
+            get_expert_location_updater=lambda: self.expert_location_updater,
+            refresh_interval=get_exec().moe.eplb_rebalance_num_iterations,
+        )
+        get_context().resources.mlb_placement_refresh = (
+            self.layer_placement_refresher.refresh_layer
         )
 
     def maybe_init_elastic_ep(self):
@@ -1916,6 +1946,12 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        refresh_ctx = (
+            self.layer_placement_refresher.forward_scope(forward_batch)
+            if self.layer_placement_refresher is not None
+            else contextlib.nullcontext()
+        )
+
         recorder = get_global_expert_distribution_recorder()
         # Draft batches can also use TARGET_VERIFY; ownership comes from the runner.
         record_ctx = (
@@ -1927,6 +1963,7 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            refresh_ctx,
             record_ctx,
             recorder.with_forward_pass(
                 self.forward_pass_id,

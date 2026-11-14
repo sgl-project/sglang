@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,9 @@ class ForwardContext:
     attn_backend: AttentionBackend
     # Resolve after batch preparation; captured calls retain the static buffer.
     moe_num_token_non_padded: Optional[Callable[[], Optional[torch.Tensor]]] = None
+    # The active batch's mode; MoE routing policies that differ between
+    # prefill and decode (sglang.srt.eplb.moe_load_balancer_glue) read it here.
+    forward_mode: Optional[ForwardMode] = None
     # A TBO child's rows within its parent batch; None outside a TBO child.
     tbo_parent_token_range: Optional[tuple[int, int]] = None
     # This DP rank's first parent row when the child's MoE sees gathered rows.
@@ -98,10 +102,16 @@ def forward_context(
 ):
     if forward_batch is not None:
         ctx = replace(
-            ctx, moe_num_token_non_padded=forward_batch.moe_num_token_non_padded
+            ctx,
+            moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            forward_mode=forward_batch.forward_mode,
         )
     elif ctx.moe_num_token_non_padded is None and _current is not None:
-        ctx = replace(ctx, moe_num_token_non_padded=_current.moe_num_token_non_padded)
+        ctx = replace(
+            ctx,
+            moe_num_token_non_padded=_current.moe_num_token_non_padded,
+            forward_mode=_current.forward_mode,
+        )
     prev = set_forward_context(ctx)
     try:
         yield

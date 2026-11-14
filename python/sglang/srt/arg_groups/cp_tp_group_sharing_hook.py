@@ -83,10 +83,10 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     if arch == "Qwen4ExpForConditionalGeneration":
         unsupported |= {
             # The MoE runs TP experts on rows gathered over the TP group.
-            # Waterfill turns on DeepEP and EP after this hook.
+            # A load-balancer pipeline can enable A2A and EP after this hook.
             "ep-size > 1": view.ep_size > 1,
             "moe-a2a-backend": view.moe_a2a_backend != "none",
-            "enable-waterfill": cfg.enable_waterfill,
+            "moe-load-balancer-algorithm": cfg.moe_load_balancer_algorithm is not None,
             "pp-size > 1": cfg.pp_size > 1,
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",

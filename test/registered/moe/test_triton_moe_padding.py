@@ -38,7 +38,6 @@ class TestTritonMoePadding(CustomTestCase):
                 moe_runner_backend="triton",
                 ep_dispatch_algorithm=None,
                 enable_eplb=False,
-                enable_waterfill=False,
             )
         )
         moe_flags = get_flags().moe

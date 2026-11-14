@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
+    _post_process_topk_ids,
     _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
     resolve_routing_inputs,
@@ -52,11 +53,12 @@ class HashTopK(nn.Module):
         self.is_draft = (
             get_flags().moe.in_speculative_scope if is_draft is None else is_draft
         )
+        # See TopK: the MoE load balancer routes after TopK on target layers.
+        from sglang.srt.eplb.moe_load_balancer_glue import resolve_moe_load_balancer
+
+        self.moe_load_balancer = None if self.is_draft else resolve_moe_load_balancer()
 
         self.shared_experts = get_model().shared_experts
-        self.enable_waterfill = self.shared_experts.use_waterfill
-        self.waterfill_balancer = None
-
         self.num_experts = num_experts
         # topk counts routed experts; the trailing columns the hash router fills
         # with fused shared experts follow them.
@@ -106,20 +108,13 @@ class HashTopK(nn.Module):
         self, device: torch.device, *, layer_id: Optional[int] = None
     ):
         topk = self.topk - self.num_shared_topk_slots
-        if not self.is_draft:
-            layer_id = self.layer_id
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-            lplb_solver = get_global_lplb_solver(layer_id)
-            if lplb_solver is not None:
-                lplb_solver.solve(
-                    torch.empty((0, topk), dtype=torch.int32, device=device)
-                )
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
-        if has_per_rank_fused_shared_slots(self.num_shared_topk_slots):
+        if has_per_rank_fused_shared_slots(self.num_shared_topk_slots) or (
+            self.moe_load_balancer is not None and self.num_shared_topk_slots > 0
+        ):
             n = self.num_shared_topk_slots
             topk_output = topk_output._replace(
                 topk_ids=topk_output.topk_ids.new_empty(
@@ -129,18 +124,34 @@ class HashTopK(nn.Module):
                     (0, topk_output.topk_weights.shape[-1] + n)
                 ),
             )
-        return self._apply_waterfill(topk_output, num_tokens=0)
+        return self._apply_moe_load_balancer(topk_output)
 
-    def _apply_waterfill(
-        self, topk_output: StandardTopKOutput, num_tokens: int
+    def _apply_moe_load_balancer(
+        self,
+        topk_output: StandardTopKOutput,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> StandardTopKOutput:
-        if self.enable_waterfill and self.waterfill_balancer is None:
-            raise RuntimeError(
-                "Waterfill HashTopK must be prepared by ModelRunner before forward."
-            )
-        if self.waterfill_balancer is None:
+        if self.moe_load_balancer is None:
             return topk_output
-        return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
+
+        topk_ids, topk_weights, _ = _post_process_topk_ids(
+            topk_ids=topk_output.topk_ids,
+            topk_weights=topk_output.topk_weights,
+            topk_config=TopKConfig(
+                top_k=self.topk,
+                shared_experts=self.shared_experts,
+                routed_scaling_factor=self.routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=self.apply_routed_scaling_factor_on_output,
+                # HashTopK's native path does not capture routed experts either.
+                allow_routed_experts_capture=False,
+            ),
+            router_logits=topk_output.router_logits,
+            layer_id=self.layer_id,
+            num_token_non_padded=num_token_non_padded,
+            moe_load_balancer=self.moe_load_balancer,
+        )
+        return StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits)
 
     def _forward_torch(
         self, router_logits: torch.Tensor, input_ids: torch.Tensor
@@ -264,25 +275,17 @@ class HashTopK(nn.Module):
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
 
+        if self.moe_load_balancer is not None:
+            return self._apply_moe_load_balancer(
+                StandardTopKOutput(topk_weights, topk_ids, router_logits),
+                num_token_non_padded=num_token_non_padded,
+            )
         num_shared_topk_slots = self.num_shared_topk_slots
         routed_ids = (
             topk_ids[:, :-num_shared_topk_slots] if num_shared_topk_slots else topk_ids
         )
-        log2phy_prob = None
-        if (
-            expert_location_dispatch_info is not None
-            and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
-        ):
-            if self.layer_id is None:
-                raise RuntimeError("HashTopK LP dispatch requires layer_id.")
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-            lplb_solver = get_global_lplb_solver(self.layer_id)
-            if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(routed_ids)
-
         routed_cols = topk_ids_logical_to_physical(
-            routed_ids, expert_location_dispatch_info, log2phy_prob
+            routed_ids, expert_location_dispatch_info
         )
         recorder_topk_ids = routed_cols if num_shared_topk_slots else None
         if has_per_rank_fused_shared_slots(num_shared_topk_slots):
@@ -325,12 +328,6 @@ class HashTopK(nn.Module):
         get_global_expert_distribution_recorder().on_select_experts(
             topk_ids=recorder_topk_ids
         )
-        topk_output = StandardTopKOutput(
+        return StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
-        topk_output = self._apply_waterfill(topk_output, hidden_states.shape[0])
-        if _is_hip or _is_npu:
-            _zero_topk_weights_padded_region(
-                topk_output.topk_weights, num_token_non_padded
-            )
-        return topk_output

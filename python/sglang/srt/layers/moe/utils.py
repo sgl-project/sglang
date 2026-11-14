@@ -646,6 +646,7 @@ def draft_model_build_scope():
 
     - ``boundary_reduction`` is ``--speculative-boundary-reduction``.
       Boundaries built here keep the resolved value after exit.
+    - EvenMoE target placement is excluded from the draft.
     - ``enable_w4a4_mxfp4_megamoe`` is ``--speculative-enable-w4a4-mxfp4-megamoe``
       when set, else inherited. ``FusedMoE`` layers built here keep the
       draft's MegaMoE MMA type after exit.
@@ -665,6 +666,11 @@ def draft_model_build_scope():
                 boundary_reduction=get_spec().speculative_boundary_reduction
             ),
             _draft_w4a4_mxfp4_megamoe_override(),
+            (
+                get_exec().moe.override(moe_load_balancer_algorithm=None)
+                if get_exec().moe.moe_load_balancer_algorithm is not None
+                else nullcontext()
+            ),
         ):
             yield
     finally:
@@ -698,10 +704,26 @@ def resolve_shared_experts_config(
         num_fused = 0
     else:
         num_fused = count_fusable(hf_config)
+    from sglang.srt.eplb.moe_load_balancer_glue import (
+        get_configured_moe_load_balancer_pipeline,
+    )
+
+    pipeline = get_configured_moe_load_balancer_pipeline()
+    routes_shared = pipeline is not None and pipeline.capabilities.routes_shared_expert
+    if pipeline is not None:
+        from evenmoe.adapters.sglang import to_deployment_config
+
+        from sglang.srt.runtime_context import get_context
+
+        reason = pipeline.is_applicable(
+            to_deployment_config(get_context(), routes_shared_expert=num_fused == 1)
+        )
+        if reason is not None:
+            raise ValueError(reason)
     return SharedExpertsConfig(
         fusion_disabled=disabled,
         num_fused_shared_experts=num_fused,
-        use_waterfill=num_fused > 0 and get_exec().moe.enable_waterfill,
+        routed_by_load_balancer=num_fused > 0 and routes_shared,
     )
 
 

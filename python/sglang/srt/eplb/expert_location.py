@@ -80,6 +80,9 @@ class ExpertLocationMetadata:
     ep_size: int
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+    # layer_id -> per-layer state an EvenMoE placement plan publishes for its
+    # routing half (carried into PlacementSnapshot.metadata; see adapters.sglang).
+    mlb_routing_metadata: dict = field(default_factory=dict)
     # dispatch algorithm -> int32 (map, replica count), built on first use by mega_gate_maps
     _mega_gate_maps: dict = field(default_factory=dict, init=False, repr=False)
 
@@ -192,6 +195,7 @@ class ExpertLocationMetadata:
         logical_count: torch.Tensor,
         *,
         use_flat_topology: bool = False,
+        moe_load_balancer=None,
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
@@ -209,22 +213,48 @@ class ExpertLocationMetadata:
         num_groups = model_config_for_expert_location.num_groups
         num_nodes = 1 if use_flat_topology else get_parallel().nnodes
 
-        from sglang.srt.eplb import eplb_algorithms
+        mlb_routing_metadata = None
+        if moe_load_balancer is None:
+            from sglang.srt.eplb import eplb_algorithms
 
-        physical_to_logical_map, logical_to_all_physical_map, expert_count = (
-            eplb_algorithms.rebalance_experts(
-                tokens_per_expert=logical_count,
-                num_physical_experts=num_physical_experts,
-                num_local_physical_experts=num_physical_experts // common["ep_size"],
-                num_groups=num_groups,
-                num_nodes=num_nodes,
-                algorithm=eplb_algorithms.compute_algorithm(
-                    raw_algorithm=get_exec().moe.eplb_algorithm,
+            physical_to_logical_map, logical_to_all_physical_map, expert_count = (
+                eplb_algorithms.rebalance_experts(
+                    tokens_per_expert=logical_count,
+                    num_physical_experts=num_physical_experts,
+                    num_local_physical_experts=num_physical_experts
+                    // common["ep_size"],
                     num_groups=num_groups,
                     num_nodes=num_nodes,
-                ),
+                    algorithm=eplb_algorithms.compute_algorithm(
+                        raw_algorithm=get_exec().moe.eplb_algorithm,
+                        num_groups=num_groups,
+                        num_nodes=num_nodes,
+                    ),
+                )
             )
-        )
+        else:
+            from evenmoe.adapters.sglang import (
+                to_placement_request,
+                to_sglang_maps,
+            )
+
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+            from sglang.srt.runtime_context import get_context
+
+            elastic_state = ElasticEPStateManager.instance()
+            request = to_placement_request(
+                logical_count,
+                context=get_context(),
+                num_nodes=1 if use_flat_topology else None,
+                active_ranks=elastic_state.active_ranks
+                if elastic_state is not None
+                else None,
+            )
+            plan = moe_load_balancer.plan_placement(request)
+            maps = to_sglang_maps(plan)
+            physical_to_logical_map = maps.physical_to_logical_map
+            logical_to_all_physical_map = maps.logical_to_all_physical_map
+            mlb_routing_metadata = maps.routing_metadata
 
         return ExpertLocationMetadata._init_raw(
             ep_size=common["ep_size"],
@@ -232,11 +262,11 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map.to(
                 get_device().device
             ),
+            mlb_routing_metadata=mlb_routing_metadata,
         )
 
     @staticmethod
     def _init_common(model_config: ModelConfig):
-
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
@@ -283,6 +313,7 @@ class ExpertLocationMetadata:
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
         moe_ep_rank: Optional[int] = None,
+        mlb_routing_metadata: Optional[dict] = None,
     ):
 
         _, num_physical_experts = physical_to_logical_map.shape
@@ -316,8 +347,10 @@ class ExpertLocationMetadata:
                     ),
                 )
                 if get_exec().moe.ep_dispatch_algorithm == "static"
+                or _mlb_requires_dispatch_map()
                 else None
             ),
+            mlb_routing_metadata=mlb_routing_metadata or {},
         )
 
     # -------------------------------- mutation ------------------------------------
@@ -344,12 +377,25 @@ class ExpertLocationMetadata:
             self_field = getattr(self, field)
             assert (other_field is not None) == (self_field is not None)
             if self_field is not None:
+                if other.num_layers == 1:
+                    # A one-layer plan (per-layer refresh): copy rows, do not
+                    # rebuild every layer's tensors on each refresh.
+                    for layer_id in update_layer_ids:
+                        self_field[layer_id].copy_(other_field[0])
+                    continue
                 mask_update = torch.tensor(
                     [i in update_layer_ids for i in range(self.num_layers)]
                 )
                 mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
                 mask_update = mask_update.to(self_field.device, non_blocking=True)
                 self_field[...] = torch.where(mask_update, other_field, self_field)
+        for layer_id in update_layer_ids:
+            if layer_id in other.mlb_routing_metadata:
+                self.mlb_routing_metadata[layer_id] = other.mlb_routing_metadata[
+                    layer_id
+                ]
+            else:
+                self.mlb_routing_metadata.pop(layer_id, None)
 
         for algorithm, (to_physical_map, logical_count) in self._mega_gate_maps.items():
             if algorithm == "static":
@@ -849,9 +895,21 @@ class ModelConfigForExpertLocation:
 def compute_initial_expert_location_metadata(
     model_config: ModelConfig,
     moe_ep_rank: int,
+    moe_load_balancer=None,
 ) -> Optional[ExpertLocationMetadata]:
+    from sglang.srt.eplb.moe_load_balancer_glue import uses_coupled_placement
+
     data = get_exec().moe.init_expert_location
+    coupled = uses_coupled_placement(moe_load_balancer)
     if data == "trivial":
+        if moe_load_balancer is not None:
+            # A placement policy with a layout of its own (UltraEP: each rank's
+            # masters, then its redundant slots) supplies it; otherwise trivial.
+            policy_layout = _init_policy_layout(
+                model_config, moe_ep_rank, moe_load_balancer
+            )
+            if policy_layout is not None:
+                return policy_layout
         return ExpertLocationMetadata.init_trivial(model_config, moe_ep_rank)
 
     # TODO unify with the utils function
@@ -863,6 +921,11 @@ def compute_initial_expert_location_metadata(
         data_dict = json.loads(data)
 
     if "physical_to_logical_map" in data_dict:
+        if coupled:
+            raise ValueError(
+                "Coupled EvenMoE placement keeps each rank's master experts fixed; "
+                "an arbitrary physical_to_logical_map may not follow that layout."
+            )
         logger.info(
             "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
         )
@@ -872,13 +935,66 @@ def compute_initial_expert_location_metadata(
             moe_ep_rank=moe_ep_rank,
         )
     elif "logical_count" in data_dict:
+        if (
+            moe_load_balancer is not None
+            and moe_load_balancer.requires_per_source_rank_statistics()
+            and data_dict.get("logical_count_layout") != "rank_layer_expert"
+        ):
+            raise ValueError(
+                "This EvenMoE placement policy needs statistics recorded per source EP rank "
+                "(logical_count_layout='rank_layer_expert'); record them with the "
+                "same --moe-load-balancer-algorithm."
+            )
         logger.info(
             "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
         )
         return ExpertLocationMetadata.init_by_eplb(
-            model_config, logical_count=data_dict["logical_count"]
+            model_config,
+            logical_count=data_dict["logical_count"],
+            moe_load_balancer=moe_load_balancer,
         )
     else:
         raise NotImplementedError(
             f"Unknown init_expert_location format ({list(data_dict.keys())=})"
         )
+
+
+def _init_policy_layout(model_config: ModelConfig, moe_ep_rank: int, moe_load_balancer):
+    """The configured EvenMoE placement policy's layout before any traffic, or
+    None when the policy has none of its own. Built raw so the policy's routing
+    state (UltraEP's quotas) is committed with it."""
+    common = ExpertLocationMetadata._init_common(model_config)
+    if common is None:
+        return None
+    from evenmoe.adapters.sglang import plan_initial_placement
+
+    from sglang.srt.runtime_context import get_context
+
+    maps = plan_initial_placement(
+        moe_load_balancer,
+        get_context(),
+        num_layers=common["model_config_for_expert_location"].num_layers,
+    )
+    if maps is None:
+        return None
+    device = get_device().device
+    return ExpertLocationMetadata._init_raw(
+        ep_size=common["ep_size"],
+        physical_to_logical_map=maps.physical_to_logical_map.to(device),
+        logical_to_all_physical_map=maps.logical_to_all_physical_map.to(device),
+        moe_ep_rank=moe_ep_rank,
+        # Routing reads the policy's state on device.
+        mlb_routing_metadata={
+            layer_id: {name: value.to(device) for name, value in state.items()}
+            for layer_id, state in maps.routing_metadata.items()
+        },
+    )
+
+
+def _mlb_requires_dispatch_map():
+    from sglang.srt.eplb.moe_load_balancer_glue import (
+        get_configured_moe_load_balancer_pipeline,
+    )
+
+    pipeline = get_configured_moe_load_balancer_pipeline()
+    return pipeline is not None and pipeline.capabilities.requires_rank_dispatch_map

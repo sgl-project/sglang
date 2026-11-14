@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import json
 import os
 import pickle
@@ -62,6 +63,7 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
+    handle_moe_load_balancer,
     resolve_ascend_ops_speculative_draft,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
@@ -104,6 +106,7 @@ from sglang.srt.entrypoints.sidecar import (
     start_sidecar,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
@@ -148,21 +151,21 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             (95, "disable_attn_tp_gather"),
             (96, "enable_p2p_check"),
             (97, "device"),
-            (532, "grpc_response_timeout_secs"),
-            (533, "enable_paged_experts"),
-            (534, "paged_experts_num_resident"),
-            (535, "enable_nvidia_megakernel"),
-            (536, "enable_megamoe_for_layernorm_sp"),
+            (531, "grpc_response_timeout_secs"),
+            (532, "enable_paged_experts"),
+            (533, "paged_experts_num_resident"),
+            (534, "enable_nvidia_megakernel"),
+            (535, "enable_megamoe_for_layernorm_sp"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
         # deprecated constructor fields keep their historical slots
-        positional = [getattr(defaults, field.name) for field in fields[:533]]
+        positional = [getattr(defaults, field.name) for field in fields[:532]]
         positional[95] = True
         positional[96] = False
         positional[97] = "cpu"
-        positional[532] = 123.0
+        positional[531] = 123.0
 
         args = ServerArgs(*positional)
 
@@ -2590,6 +2593,130 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
                     handle_a2a_moe(self._make_args())
 
 
+class TestMoELoadBalancerAlgorithm(unittest.TestCase):
+    def test_pipeline_capabilities_gate_overlap_and_online_graphs(self):
+        from types import SimpleNamespace
+
+        pipeline = SimpleNamespace(
+            name="custom",
+            placement_policy=None,
+            capabilities=SimpleNamespace(
+                supports_concurrent_microbatches=False,
+                graph_stability="realloc_on_placement_change",
+                requires_post_topk_routing=True,
+                routes_shared_expert=False,
+            ),
+        )
+        for fields, message in (
+            ({"enable_two_batch_overlap": True}, "microbatches"),
+            ({"enable_single_batch_overlap": True}, "microbatches"),
+            ({"enable_eplb": True}, "disable-cuda-graph"),
+        ):
+            with (
+                self.subTest(**fields),
+                patch(
+                    "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+                    return_value=pipeline,
+                ),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                handle_moe_load_balancer(
+                    ServerArgs(
+                        model_path="dummy",
+                        moe_load_balancer_algorithm="custom",
+                        **fields,
+                    )
+                )
+
+    def test_replica_routing_preserves_shared_fusion_configuration(self):
+        from types import SimpleNamespace
+
+        pipeline = SimpleNamespace(
+            name="custom",
+            placement_policy=None,
+            capabilities=SimpleNamespace(
+                supports_concurrent_microbatches=True,
+                graph_stability="stable",
+                requires_post_topk_routing=True,
+                routes_shared_expert=False,
+            ),
+        )
+        for disabled in (False, True):
+            with (
+                self.subTest(disabled=disabled),
+                patch(
+                    "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+                    return_value=pipeline,
+                ),
+            ):
+                args = ServerArgs(
+                    model_path="dummy",
+                    moe_load_balancer_algorithm="custom",
+                    disable_shared_experts_fusion=disabled,
+                )
+                handle_moe_load_balancer(args)
+                self.assertEqual(
+                    resolution_result(args, "disable_shared_experts_fusion"), disabled
+                )
+
+    def test_native_eplb_path_does_not_import_evenmoe(self):
+        server_args = ServerArgs(model_path="dummy", enable_eplb=True, ep_size=2)
+        with patch.dict(sys.modules, {"evenmoe": None}):
+            handle_moe_load_balancer(server_args)
+        self.assertIsNone(resolution_result(server_args, "moe_load_balancer_algorithm"))
+
+    def test_flag_without_evenmoe_installed_is_a_clear_error(self):
+        server_args = ServerArgs(
+            model_path="dummy", moe_load_balancer_algorithm="static"
+        )
+        with (
+            patch.dict(sys.modules, {"evenmoe": None}),
+            self.assertRaisesRegex(ImportError, "evenmoe"),
+        ):
+            handle_moe_load_balancer(server_args)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
+    def test_one_parameter_selects_composed_pipeline(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_load_balancer_algorithm="lplb+waterfill",
+        )
+
+        handle_moe_load_balancer(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "moe_load_balancer_algorithm"),
+            "lplb+waterfill",
+        )
+        capabilities = get_moe_load_balancer_pipeline(
+            resolution_result(server_args, "moe_load_balancer_algorithm")
+        ).capabilities
+        self.assertTrue(capabilities.requires_placement_state)
+        self.assertTrue(capabilities.routes_shared_expert)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
+    def test_bare_waterfill_gets_default_replica_routing(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_load_balancer_algorithm="waterfill",
+        )
+
+        handle_moe_load_balancer(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "moe_load_balancer_algorithm"),
+            "static+waterfill",
+        )
+        capabilities = get_moe_load_balancer_pipeline(
+            resolution_result(server_args, "moe_load_balancer_algorithm")
+        ).capabilities
+        self.assertTrue(capabilities.requires_rank_dispatch_map)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
@@ -3374,13 +3501,31 @@ class TestAdaptiveSpecArgs(CustomTestCase):
 
 
 class TestAscendOpsArgs(CustomTestCase):
-    def test_ascend_ops_rejected_by_waterfill_without_config(self):
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
+    @override_platform(is_cuda=True, is_hip=False, is_musa=False)
+    def test_ascend_ops_rejects_moe_load_balancer_without_config(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="ascend_ops",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
         )
-        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
+        with self.assertRaisesRegex(ValueError, "only supported on NVIDIA CUDA"):
+            handle_a2a_moe(server_args)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
+    @override_platform(is_cuda=True, is_hip=False, is_musa=False)
+    def test_ascend_ops_rejects_moe_load_balancer_with_config(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            moe_ascend_ops_config="{}",
+            moe_load_balancer_algorithm="waterfill",
+        )
+        with self.assertRaisesRegex(ValueError, "only supported on NVIDIA CUDA"):
             handle_a2a_moe(server_args)
 
     def test_ascend_ops_speculative_draft_requires_npu(self):
@@ -3418,12 +3563,37 @@ class TestAscendOpsArgs(CustomTestCase):
             resolve_ascend_ops_speculative_draft(server_args)
 
 
-class TestWaterfillArgs(CustomTestCase):
+@unittest.skipUnless(importlib.util.find_spec("evenmoe"), "evenmoe is not installed")
+class TestLoadBalancerSharedRoutingArgs(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        from types import SimpleNamespace
+
+        from evenmoe import A2A_DEEPEP, A2A_MEGAMOE, RoutingCapabilities
+
+        pipeline = SimpleNamespace(
+            capabilities=RoutingCapabilities(
+                supported_a2a_backends=(A2A_DEEPEP, A2A_MEGAMOE),
+                routes_shared_expert=True,
+                requires_post_topk_routing=True,
+            )
+        )
+        patcher = patch(
+            "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+            return_value=pipeline,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # EvenMoE routing is accepted on NVIDIA CUDA only.
+        platform = override_platform(is_cuda=True, is_hip=False, is_musa=False)
+        platform.install()
+        self.addCleanup(platform.restore)
+
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
             disable_shared_experts_fusion=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -3439,7 +3609,7 @@ class TestWaterfillArgs(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="none",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
@@ -3450,11 +3620,11 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertTrue(resolution_result(server_args, "enforce_shared_experts_fusion"))
 
-    def test_waterfill_keeps_megamoe_backend(self):
+    def test_pipeline_backend_requirement_preserves_megamoe(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="megamoe",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
             disable_shared_experts_fusion=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -3470,7 +3640,7 @@ class TestWaterfillArgs(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
             deepep_mode="low_latency",
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -3479,6 +3649,91 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertEqual(resolution_result(server_args, "deepep_mode"), "low_latency")
         self.assertFalse(resolution_result(server_args, "disable_cuda_graph"))
         self.assertTrue(resolution_result(server_args, "enforce_shared_experts_fusion"))
+
+
+@unittest.skipUnless(importlib.util.find_spec("evenmoe"), "evenmoe is not installed")
+class TestLoadBalancerBackendSelection(CustomTestCase):
+    def test_algorithm_backend_contract(self):
+        from sglang.srt.arg_groups.overrides import _a2a_backend_overrides
+
+        cases = [
+            ("waterfill", "deepep", "deepep"),
+            ("waterfill", "megamoe", "megamoe"),
+            ("waterfill", "none", "deepep"),
+            ("waterfill", "flashinfer", "deepep"),
+            ("lplb+waterfill", "megamoe", "megamoe"),
+            ("lplb", "megamoe", "megamoe"),
+            ("static", "mori", "mori"),
+            ("ultraep", "megamoe", "deepep"),
+            ("disabled", "megamoe", "megamoe"),
+        ]
+        for algorithm, backend, expected in cases:
+            with self.subTest(algorithm=algorithm, backend=backend):
+                args = ServerArgs(
+                    model_path="dummy",
+                    moe_load_balancer_algorithm=algorithm,
+                    moe_a2a_backend=backend,
+                )
+                overrides = _a2a_backend_overrides(args)
+                self.assertEqual(overrides.get("moe_a2a_backend", backend), expected)
+                self.assertEqual(args.moe_a2a_backend, backend)
+
+    def test_backend_override_warning_names_both_backends(self):
+        from sglang.srt.arg_groups import overrides as overrides_module
+
+        args = ServerArgs(
+            model_path="dummy",
+            moe_load_balancer_algorithm="ultraep",
+            moe_a2a_backend="megamoe",
+        )
+        with self.assertLogs(overrides_module.logger, level="WARNING") as logs:
+            overrides = overrides_module._a2a_backend_overrides(args)
+        self.assertEqual(overrides, {"moe_a2a_backend": "deepep"})
+        self.assertIn("from 'megamoe' to 'deepep'", "\n".join(logs.output))
+
+    def test_load_balancer_requires_nvidia_cuda(self):
+        no_device = dict(
+            is_cuda=False, is_hip=False, is_musa=False, is_npu=False, is_xpu=False
+        )
+
+        def args():
+            return ServerArgs(
+                model_path="dummy",
+                moe_load_balancer_algorithm="lplb",
+                moe_a2a_backend="deepep",
+            )
+
+        for name in ("npu", "xpu", "hip", "musa", "cpu"):
+            facts = no_device if name == "cpu" else {**no_device, f"is_{name}": True}
+            with self.subTest(platform=name), override_platform(**facts):
+                with self.assertRaisesRegex(
+                    ValueError, "only supported on NVIDIA CUDA"
+                ):
+                    handle_a2a_moe(args())
+        with override_platform(**{**no_device, "is_cuda": True}):
+            handle_a2a_moe(args())
+
+    def test_custom_policy_owns_backend_preference(self):
+        from evenmoe import RoutingCapabilities
+
+        from sglang.srt.arg_groups.overrides import _a2a_backend_overrides
+
+        # A backend SGLang does not have is skipped, not written to the flag.
+        for supported in (("megamoe", "deepep"), ("hybridep", "megamoe")):
+            with self.subTest(supported=supported):
+                pipeline = SimpleNamespace(
+                    capabilities=RoutingCapabilities(supported_a2a_backends=supported)
+                )
+                args = ServerArgs(
+                    model_path="dummy", moe_load_balancer_algorithm="custom"
+                )
+                with patch(
+                    "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+                    return_value=pipeline,
+                ):
+                    self.assertEqual(
+                        _a2a_backend_overrides(args), {"moe_a2a_backend": "megamoe"}
+                    )
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
@@ -4785,7 +5040,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
 
     dummy-model short-circuits __post_init__, so the guard handler is invoked
-    directly (same pattern as TestWaterfillArgs)."""
+    directly (same pattern as TestLoadBalancerSharedRoutingArgs)."""
 
     def _args(self, **overrides):
         args = ServerArgs(model_path="dummy")

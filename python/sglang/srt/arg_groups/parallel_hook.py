@@ -788,7 +788,7 @@ def handle_eplb_and_dispatch(server_args: Any):
     needs_rank_invariant_dispatch = resolved_view(server_args).moe_a2a_backend == "none"
 
     if (cfg.enable_eplb or (cfg.init_expert_location != "trivial")) and (
-        cfg.ep_dispatch_algorithm is None
+        cfg.ep_dispatch_algorithm is None and cfg.moe_load_balancer_algorithm is None
     ):
         declare_resolution(
             server_args,
@@ -799,11 +799,8 @@ def handle_eplb_and_dispatch(server_args: Any):
         )
 
     # `dynamic` / `fake` switch to the row-index pick; `static` reads a
-    # per-rank table and `lp` samples inside its kernel.
-    if needs_rank_invariant_dispatch and cfg.ep_dispatch_algorithm in (
-        "static",
-        "lp",
-    ):
+    # per-rank table.
+    if needs_rank_invariant_dispatch and cfg.ep_dispatch_algorithm == "static":
         raise ValueError(
             f"--ep-dispatch-algorithm {cfg.ep_dispatch_algorithm} picks a "
             "different physical replica per rank, which only holds up when an "

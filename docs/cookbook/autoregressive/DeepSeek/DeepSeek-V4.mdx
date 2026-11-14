@@ -283,6 +283,7 @@ This BF16 setting applies only to the compressed attention state pools and reduc
 
 **EPLB + Waterfill (Experimental)**
 
+Install [EvenMoE](https://github.com/ai-dynamo/evenmoe) in the server environment.
 For recorded/static EPLB reproduction, first record an expert-distribution file by following
 [Capture expert selection distribution in MoE models](../../../docs/basic_usage/native_api.mdx#capture-expert-selection-distribution-in-moe-models).
 For reproduction runs, use the generated `expert_distribution_recorder_*.pt` as
@@ -294,7 +295,7 @@ For non-PD reproduction, use:
 --moe-a2a-backend deepep \
 --deepep-mode auto \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-waterfill
+--moe-load-balancer-algorithm waterfill
 ```
 
 For PD-Disagg reproduction, use `normal` mode on the prefill server and
@@ -306,21 +307,17 @@ flag to both commands:
 --moe-a2a-backend deepep \
 --deepep-mode normal \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-waterfill
+--moe-load-balancer-algorithm waterfill
 
 # decode
 --moe-a2a-backend deepep \
 --deepep-mode low_latency \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-waterfill
+--moe-load-balancer-algorithm waterfill
 ```
 
 You can also add `--ep-num-redundant-experts` and `--eplb-algorithm` to customize
 EPLB placement.
-
-Waterfill also supports MegaMOE. Use `--moe-a2a-backend megamoe
---enable-waterfill` to keep the MegaMOE backend while applying Waterfill to the
-fused shared expert slot.
 
 **FP4 Indexer (Experimental)**
 
