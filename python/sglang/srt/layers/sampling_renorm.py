@@ -81,7 +81,13 @@ def _top_k_renorm_prob(
         return _flashinfer_sampling.top_k_renorm_probs(
             probs, top_k, is_deterministic=True
         )
-    return _platform.top_k_renorm_prob(probs, top_k)
+    renorm_probs = _platform.top_k_renorm_prob(probs, top_k)
+    if deterministic and probs.is_xpu:
+        # sgl-kernel-xpu's TopKRenormProbs adds the kept mass with a float atomic, so only
+        # its top-k mask is reproducible; drop once that sum runs in a fixed order.
+        kept = probs.masked_fill(renorm_probs == 0, 0)
+        return kept / kept.sum(dim=-1, keepdim=True)
+    return renorm_probs
 
 
 top_p_renorm_prob = (
