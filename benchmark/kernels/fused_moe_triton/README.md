@@ -145,6 +145,21 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --tune
 ```
 
+#### Intel XPU
+
+Ray only registers Intel GPUs as `GPU` resources when `dpctl` is installed
+(`pip install dpctl`, also part of the `ray` extra in `pyproject_xpu.toml`).
+Select the cards to tune on with `ZE_AFFINITY_MASK`; each Ray worker then sees
+its card as device 0:
+
+```bash
+ZE_AFFINITY_MASK=2 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
+    --model Qwen/Qwen3-30B-A3B \
+    --tp-size 4 \
+    --batch-sizes 1 2 4 8 16 32 \
+    --tune
+```
+
 ### Configuration Files
 
 After tuning, configuration files will be generated:
