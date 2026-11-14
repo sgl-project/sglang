@@ -5451,6 +5451,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # Packed E2M1 stores two values per byte.
         return self.index_head_dim // 2 if self.use_fp4_indexer else self.index_head_dim
 
+    def pd_kv_layout(self) -> str:
+        """The MLA row width, which differs between DSA backends for the same dtype."""
+        return f"dsa_mla_row:{self.kv_cache_dim}"
+
     def __init__(
         self,
         size: int,
