@@ -3260,6 +3260,68 @@ class TestHiCacheArgs(CustomTestCase):
         handle_cache_compatibility(args)
 
 
+class TestBlockDraftNumSteps(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            patch(
+                "sglang.srt.hf_transformers.get_config",
+                return_value=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            )
+        )
+        self.enterContext(
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_config."
+                "read_draft_checkpoint_config",
+                return_value=None,
+            )
+        )
+
+    def _make_args(self, algorithm, steps=None):
+        argv = [
+            "--model-path",
+            "dummy",
+            "--device",
+            "cuda",
+            "--speculative-algorithm",
+            algorithm,
+            "--speculative-draft-model-path",
+            "draft",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--speculative-draft-attention-backend",
+            "triton",
+        ]
+        if steps is not None:
+            argv.extend(["--speculative-num-steps", str(steps)])
+        return prepare_server_args(argv)
+
+    def test_num_steps_defaults_to_one(self):
+        for algorithm in ("DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_args(algorithm)
+                handle_speculative_decoding(args)
+                self.assertEqual(resolution_result(args, "speculative_num_steps"), 1)
+
+    def test_explicit_one_is_preserved(self):
+        for algorithm in ("DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_args(algorithm, 1)
+                handle_speculative_decoding(args)
+                self.assertEqual(resolution_result(args, "speculative_num_steps"), 1)
+
+    def test_unsupported_num_steps_rejected(self):
+        for algorithm in ("DFLASH", "DSPARK"):
+            for steps in (2, 0, -1):
+                with self.subTest(algorithm=algorithm, steps=steps):
+                    args = self._make_args(algorithm, steps)
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"(?i){algorithm} only supports --speculative-num-steps 1, got {steps}",
+                    ):
+                        handle_speculative_decoding(args)
+
+
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):
         args = ServerArgs(model_path="dummy")
