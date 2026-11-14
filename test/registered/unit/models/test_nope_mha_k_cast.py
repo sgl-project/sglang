@@ -5,6 +5,7 @@ from unittest import mock
 import pytest
 import torch
 
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mha,
     forward_mha_rocm,
@@ -49,6 +50,33 @@ def _run_nope_concat(backend: str, kv_cache_dtype: str, pool_dtype: torch.dtype)
 def test_nope_mha_k_cast(backend, kv_cache_dtype, pool_dtype, expected_dtype):
     out = _run_nope_concat(backend, kv_cache_dtype, pool_dtype)
     assert out.dtype == expected_dtype
+
+
+def test_nope_mha_cached_prefix_with_raw_fp8_dsa_pool():
+    """Mixed sparse prefill and TRTLLM decode must read raw FP8 prefix rows."""
+    rows = (torch.arange(3 * 512) % 7).view(3, 1, 512).to(torch.float8_e4m3fn)
+    indices = torch.tensor([2, 1], dtype=torch.int32)
+    pool = mock.Mock(dsa_kv_cache_store_fp8=False)
+    reader = pool.layer_router.read.return_value
+    reader.key.return_value = rows
+    reader.read_mla.side_effect = lambda layer, loc, dtype: (rows.to(dtype)[loc], None)
+    backend = SimpleNamespace(
+        token_to_kv_pool=pool,
+        forward_metadata=SimpleNamespace(page_table_1_flattened=indices),
+    )
+    attn = forward_mha.DeepseekMHAForwardMixin()
+    attn.dcp_size = 1
+    attn.attn_mha = SimpleNamespace(layer_id=0)
+
+    with (
+        forward_context(ForwardContext(attn_backend=backend)),
+        mock.patch.object(forward_mha, "_is_cuda", True),
+        mock.patch.object(forward_mha, "_use_aiter_gfx95", False),
+    ):
+        latent, rope = attn._get_mla_kv_buffer_from_fp8_for_dsa(SimpleNamespace())
+
+    torch.testing.assert_close(latent, rows.to(torch.bfloat16)[indices, 0])
+    assert rope is None
 
 
 def _run_nope_concat_rocm(backend: str, k_pe: torch.Tensor | None):
