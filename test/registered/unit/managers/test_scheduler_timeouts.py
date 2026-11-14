@@ -31,6 +31,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -87,7 +88,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     empty_request_lists(s)
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
-    s.waiting_queue.join(waiting_queue)
+    move(waiting_queue, s.waiting_queue)
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
@@ -234,7 +235,7 @@ class TestQueuedAbort(CustomTestCase):
         req = _req("staged")
         # Prefilled, in no batch, waiting for its host copy to land.
         staging = IndexedReqList(ListKind.HISPARSE_STAGING, req_of=lambda x: x.req)
-        staging.join([SimpleNamespace(req=req)])
+        move([SimpleNamespace(req=req)], staging)
         s = _scheduler([])
         s.disaggregation_mode = DisaggregationMode.NULL
         s.hisparse_coordinator = SimpleNamespace(

@@ -14,7 +14,7 @@ Unlimited-OCR-2 support is not in a tagged SGLang release yet. Until it is, inst
 
 <Tabs>
 
-<Tab title="Python (pip / uv)">
+<Tab title="Python (NVIDIA)">
 
 ```bash Command
 pip install -U uv
@@ -29,7 +29,7 @@ Then run the **Python** output of the command panel below in that environment.
 
 </Tab>
 
-<Tab title="Docker">
+<Tab title="Docker (NVIDIA)">
 
 ```bash Command
 docker pull lmsysorg/sglang:dev
@@ -39,16 +39,24 @@ For how to launch the image, see [Install → Method 3: Using Docker](/docs/get-
 
 </Tab>
 
+<Tab title="Apple Silicon">
+
+Install from a source build containing [PR #47921](https://github.com/sgl-project/sglang/pull/47921), using the [Apple Metal source installation steps](/docs/hardware-platforms/apple_metal#install-from-source). Use the **Python** command below: it selects Torch MPS with `SGLANG_USE_MLX=0`, not the MLX runtime. Docker is not supported for this recipe.
+
+</Tab>
+
 </Tabs>
 
 </Accordion>
 
-Pick your hardware to generate the launch command. SGLang selects the `unlimited_ocr_v2` attention backend, the page size the checkpoint requires and a disabled radix cache on its own, so the recipe only carries the serving options: the `unlimited-ocr` chat template, explicit page-window processing with `--uocr-doc-split`, a per-page output budget, and decode CUDA graphs, which are off by default for this model. The built-in page guard runs automatically; `--enable-custom-logit-processor` is only needed for an external custom processor.
+Pick your hardware to generate the launch command. SGLang selects the `unlimited_ocr_v2` attention backend, the page size the checkpoint requires and a disabled radix cache on its own. The recipes enable page-window processing with `--uocr-doc-split` and a per-page output budget; NVIDIA recipes also enable decode CUDA graphs. The built-in page guard runs automatically; `--enable-custom-logit-processor` is only needed for an external custom processor.
 
-The command panel provides Python and Docker recipes for **L20, H100, H200, B200, B300, GB200 and GB300**. These recipes target **Linux with NVIDIA GPUs and CUDA 13**; Docker also requires a CUDA 13-compatible driver and NVIDIA Container Toolkit. Each recipe starts with one GPU on one node, including on GB200/GB300 systems.
+The command panel provides Python and Docker recipes for **L20, H100, H200, B200, B300, GB200 and GB300**, and a Python-only **Apple Silicon** recipe. NVIDIA recipes target **Linux with CUDA 13**; Docker also requires a CUDA 13-compatible driver and NVIDIA Container Toolkit. Each recipe starts with one GPU on one node, including on GB200/GB300 systems.
+
+The Apple Silicon recipe was tested on an **M5 MacBook Pro with 16 GB unified memory**, macOS 26.6.2 and PyTorch 2.13.0. Other Apple Silicon configurations have not been verified. It uses the BF16 checkpoint and caps the KV pool at 32,768 tokens to leave memory for the vision encoder.
 
 <Note>
-The additional platforms are starting recipes marked **Not Verified**. H200 TP1 and B200 TP1/TP2 have passed service checks with a smaller per-page output budget and bounded concurrency/CUDA-graph sizes; these exact 8,000-token/page recipes remain unverified. H100, B300, GB200 and GB300 have not been tested for this model here.
+The additional NVIDIA platforms are starting recipes marked **Not Verified**. H200 TP1 and B200 TP1/TP2 have passed service checks with a smaller per-page output budget and bounded concurrency/CUDA-graph sizes; these exact 8,000-token/page recipes remain unverified. H100, B300, GB200 and GB300 have not been tested for this model here.
 </Note>
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
@@ -58,7 +66,7 @@ import { config } from "/src/snippets/configs/baidu/unlimited-ocr-2.jsx";
 
 ## Playground
 
-Use the Playground to adjust tensor parallelism on top of the selected deployment cell. TP2 requires two visible GPUs on the same node; it does not enable multi-node serving. The platform badge describes the base recipe, not every Playground override.
+Use the Playground to adjust tensor parallelism on top of the selected deployment cell. TP2 requires two visible NVIDIA GPUs on the same node; it does not enable multi-node serving. Torch MPS supports TP1 only. The platform badge describes the base recipe, not every Playground override.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -76,7 +84,7 @@ The checkpoint has about 3.3B parameters in BF16 (a DeepSeek-style MoE language 
 
 ## 2. Configuration Tips
 
-- **GPU memory:** for an out-of-memory error, first reduce `--max-running-requests` and `--cuda-graph-max-bs-decode` together, for example to 4. The recipes keep BF16 weights and the checkpoint's KV-cache precision. Reduce the per-page budget only when shorter output is acceptable; it can truncate a page.
+- **GPU memory:** on NVIDIA, first reduce `--max-running-requests` and `--cuda-graph-max-bs-decode` together, for example to 4. On MPS, reduce `--max-running-requests` or the KV pool cap (`--max-total-tokens`). The recipes keep BF16 weights and the checkpoint's KV-cache precision. Reduce the per-page budget only when shorter output is acceptable; it can truncate a page.
 - **Attention backend:** keep the model-selected `unlimited_ocr_v2` backend on every platform, including Blackwell, because the model requires DASH attention.
 - **Prompt layout**: list the page images first, then one text part holding `<PAGE><image>` once per page followed by the instruction, for example `"<PAGE><image>" * num_pages + "Multi page parsing."`.
 - **Whole-document processing is the default.** Omit `--uocr-doc-split` to process the document together, within the configured context length.
@@ -84,6 +92,7 @@ The checkpoint has about 3.3B parameters in BF16 (a DeepSeek-style MoE language 
 - **Per-page output budget:** `--uocr-max-page-tokens N` limits how many tokens one output page may spend before the guard advances to the next page or ends the document. The default 0 leaves the page length uncapped. A nonzero cap also sizes the default context of a split server. It changes stopping behavior and needs no custom-processor flag. The page budget excludes page markers and termination tokens; overlap scheduling may leave one already-computed token beyond the budget. Set the request's total `max_tokens` to cover the document.
 - **Per-request options:** `doc_split_options.max_batch_pages` may lower the server's window size; `max_page_tokens` may lower a nonzero server page cap. `lookahead_pages` defaults to 1 and `overlap_pages` to 0. Set `lookahead_pages: 0` to omit the following page from the window's input. Lookahead and overlap change the input context and must fit the server's context budget. Window options require `--uocr-doc-split`; a per-page output cap can also be used without splitting.
 - **Data parallelism:** page-window processing requires a single DP rank. Omit `--uocr-doc-split` with `--dp-size` or `--attn-dp-size` above 1.
+- **Apple Silicon:** select it in the command picker for the Torch MPS recipe. Quantized checkpoints, CUDA graphs and overlap scheduling are not supported on this path. See [Apple Metal](/docs/hardware-platforms/apple_metal#unlimited-ocr-v2) for details.
 - **Not supported**: speculative decoding, pipeline parallelism and PD disaggregation are rejected at launch.
 
 ## 3. Advanced Usage

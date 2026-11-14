@@ -436,16 +436,25 @@ class ComposedPipelineBase(ABC):
         elif external_path is not None:
             local_path = os.path.join(self.model_path, load_module_name)
             if os.path.exists(local_path):
-                raise ValueError(
-                    f"model_index.json loads {load_module_name!r} from "
-                    f"{external_path!r}, but the snapshot also has {local_path}"
+                # Releases may bundle a copy of the external component (the
+                # public MiniMax-H3-Image snapshot ships text_encoder/). Use it
+                # rather than downloading the other repository again.
+                logger.info(
+                    "Loading %s from the bundled %s (model_index.json names %s)",
+                    load_module_name,
+                    local_path,
+                    external_path,
                 )
-            logger.info(
-                "Loading %s from %s (model_index.json)", load_module_name, external_path
-            )
-            component_model_path = prepare_diffusers_component_path_for_loading(
-                external_path
-            )
+                component_model_path = local_path
+            else:
+                logger.info(
+                    "Loading %s from %s (model_index.json)",
+                    load_module_name,
+                    external_path,
+                )
+                component_model_path = prepare_diffusers_component_path_for_loading(
+                    external_path
+                )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)
 

@@ -41,6 +41,13 @@ from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
 
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
+
 
 _mm_http_session = threading.local()
 
@@ -466,7 +473,18 @@ class VideoData:
     max_long_side_pixel: Optional[int] = None
 
 
-image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+image_extension_names = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".heic",
+    ".heif",
+)
 
 
 GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]

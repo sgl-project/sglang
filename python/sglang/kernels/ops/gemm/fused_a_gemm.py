@@ -48,12 +48,16 @@ def fused_a_gemm_weight_eligible(
     *,
     backend: FusedAGemmBackend | str = FusedAGemmBackend.AUTO,
 ) -> bool:
+    # Any module may be passed (callers and tests use plain linears), and a
+    # packed-quantized one (e.g. compressed-tensors W4A16) has no dense weight.
+    weight = getattr(layer, "weight", None)
     return (
-        layer.weight.dtype == torch.bfloat16
+        weight is not None
+        and weight.dtype == torch.bfloat16
         # The kernels compute x @ weight.T only, so a biased layer keeps its own path.
         and layer.bias is None
-        and layer.weight.shape[0] % 16 == 0
-        and layer.weight.shape[1] % _K_ALIGNMENT[_resolve_backend(backend)] == 0
+        and weight.shape[0] % 16 == 0
+        and weight.shape[1] % _K_ALIGNMENT[_resolve_backend(backend)] == 0
         and _IS_CUDA
         and _DEVICE_SM >= 90
     )
