@@ -19,8 +19,10 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsManifest,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import KVPair
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -312,7 +314,7 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
             )
             # Every frame is committed: the next tick reads all of them.
             for local_idx, frame_idx in enumerate(range(chunk_start, chunk_end)):
-                state.history = self._commit_clean_frame(
+                state.history = self._commit_clean_chunk(
                     context,
                     state.history,
                     clean_chunk[:, :, local_idx : local_idx + 1],
@@ -320,7 +322,7 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
                     action=action[
                         :, local_idx * action_count : (local_idx + 1) * action_count
                     ],
-                    null_action=local_idx in null_indexes,
+                    null_indexes=(0,) if local_idx in null_indexes else (),
                 )
             outputs.append(clean_chunk)
             state.next_frame = chunk_end
@@ -345,13 +347,13 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
             device=context.device,
             dtype=context.dtype,
         )
-        state.history = self._commit_clean_frame(
+        state.history = self._commit_clean_chunk(
             context,
             state.history,
             latent,
             frame_idx=0,
             action=null_action,
-            null_action=True,
+            null_indexes=(0,),
         )
         state.pending_image_latent = None
         state.next_frame = 1
@@ -369,7 +371,13 @@ class CosmosDreamsCausalDecodingStage(Cosmos3DecodingStage):
         if batch.block_idx == 0:
             self.vae.reset_causal_decode_state()
         with self.use_declared_component(component_name="vae", module=self.vae):
-            with torch.no_grad():
+            with (
+                torch.no_grad(),
+                use_vae_fast_path(
+                    self.vae,
+                    quality_allows(batch.sampling_params.quality, "lossless"),
+                ),
+            ):
                 video = self.vae.causal_decode(self._denormalize_latents(batch.latents))
         output = self._postprocess_tensor(video)
         self.log_debug("Decoded realtime chunk: %s", tuple(output.shape))

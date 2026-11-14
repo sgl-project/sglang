@@ -79,6 +79,7 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
 from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps
+from sglang.test.test_utils import CustomTestCase
 
 # ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Bimanual
 # (checkpoint causal_8b_sf_dmd_max_4step_cam_chunk4_480p_961f@iter_000002000).
@@ -755,6 +756,147 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
             )
 
 
+class TestCosmosDreamsBatchedClean(CustomTestCase):
+    def test_batched_history_matches_sequential_eviction(self):
+        """Later layers must see frame-causal K/V, with eviction after each frame."""
+        generator = torch.Generator().manual_seed(2026)
+
+        def randn(*shape):
+            return torch.randn(*shape, dtype=torch.float64, generator=generator)
+
+        def attend(q, k, v):
+            return torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                enable_gqa=True,
+            ).transpose(1, 2)
+
+        weights = []
+        for _ in range(3):
+            qkv, output = randn(8, 16) * 0.2, randn(8, 8) * 0.2
+            weights.append(
+                SimpleNamespace(
+                    local_num_attention_heads=2,
+                    local_num_key_value_heads=1,
+                    head_dim=4,
+                    norm_q=None,
+                    norm_k=None,
+                    to_qkv=lambda x, w=qkv: (x @ w, None),
+                    to_out=lambda x, w=output: (x @ w, None),
+                    attn=attend,
+                )
+            )
+
+        def transformer(
+            latent, timestep, *, history_kv, text_kv, clean_frame_ranges, **kwargs
+        ):
+            hidden = latent.permute(0, 2, 3, 4, 1).flatten(1, 3)
+            current_kv = []
+            for layer, attention in enumerate(weights):
+                prefix_k, prefix_v = text_kv[layer]
+                if history_kv is not None:
+                    prefix_k = torch.cat([prefix_k, history_kv[layer][0]], dim=1)
+                    prefix_v = torch.cat([prefix_v, history_kv[layer][1]], dim=1)
+                output, k, v = cosmos_dreams._joint_attention(
+                    attention,
+                    hidden,
+                    prefix_k=prefix_k,
+                    prefix_v=prefix_v,
+                    cos_sin_cache=None,
+                    rope_positions=None,
+                    null_token_slices=[],
+                    clean_frame_ranges=clean_frame_ranges,
+                )
+                hidden = torch.tanh(hidden + output)
+                current_kv.append((k, v))
+            return SimpleNamespace(current_kv=current_kv)
+
+        stage = object.__new__(CosmosDreamsRolloutStage)
+        stage.transformer = transformer
+        tokens = 3
+        context = SimpleNamespace(
+            text_kv=[(randn(1, 2, 1, 4), randn(1, 2, 1, 4)) for _ in weights],
+            tokens_per_frame=tokens,
+            dtype=torch.float64,
+            fps=30.0,
+            domain_ids=torch.tensor([0]),
+        )
+        # Only the fused CUDA norm/RoPE dependency is bypassed; the production
+        # clean entry, attention slicing and K/V append all run on CPU in FP64.
+        with mock.patch.object(
+            cosmos_dreams, "_apply_qwen3_qk_norm_rope", lambda q, k, *args: (q, k)
+        ):
+            cases = []
+            for sink, window in [(0, None), (0, 1), (1, 3), (2, 1)]:
+                capacity = sink + window if window is not None else 5
+                for past in sorted({1, max(1, capacity - 1), capacity}):
+                    cases.extend((sink, window, past, f, None) for f in (1, 2, 3))
+            # Frustum reads a fixed selection while committing to the full archive.
+            # Cover empty, non-contiguous and complete selections, with archive
+            # entries omitted from attention still preserved by the commit.
+            cases.extend(
+                (2, 20, 8, f, selected)
+                for f in (1, 2, 3)
+                for selected in ([], [0, 3, 7], list(range(8)))
+            )
+            for sink, window, past, frames, selected in cases:
+                with self.subTest(
+                    sink=sink,
+                    window=window,
+                    past=past,
+                    frames=frames,
+                    selected=selected,
+                ):
+                    stage.profile = SimpleNamespace(
+                        sink_frames=sink, window_frames=window
+                    )
+                    history = [
+                        (
+                            randn(1, past * tokens, 1, 4),
+                            randn(1, past * tokens, 1, 4),
+                        )
+                        for _ in weights
+                    ]
+                    latent = randn(1, 8, frames, 1, tokens)
+                    action = torch.zeros(1, frames, 1)
+                    sequential = history
+                    for frame in range(frames):
+                        sequential = stage._commit_clean_chunk(
+                            context,
+                            sequential,
+                            latent[:, :, frame : frame + 1],
+                            frame_idx=past + frame,
+                            action=action[:, frame : frame + 1],
+                            null_indexes=(),
+                            read_history=(
+                                None
+                                if selected is None
+                                else _history_view(
+                                    sequential,
+                                    selected + list(range(past, past + frame)),
+                                    tokens,
+                                )
+                            ),
+                        )
+                    batched = stage._commit_clean_chunk(
+                        context,
+                        history,
+                        latent,
+                        frame_idx=past,
+                        action=action,
+                        null_indexes=(),
+                        read_history=(
+                            None
+                            if selected is None
+                            else _history_view(history, selected, tokens)
+                        ),
+                    )
+                    torch.testing.assert_close(
+                        batched, sequential, rtol=1e-12, atol=1e-12
+                    )
+
+
 UNIFIED_FIELDS = [
     ("ego_pose", 0, 9),
     ("right_wrist_pose", 9, 9),
@@ -1126,6 +1268,11 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA decode stream")
     def test_overlap_and_serial_vae_inputs_match(self):
+        from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+            VaeFastPathGate,
+            register_vae_fast_path_gate,
+        )
+
         class IdentityVAE(torch.nn.Module):
             def __init__(self, dtype):
                 super().__init__()
@@ -1135,11 +1282,15 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 self.config = SimpleNamespace(
                     latents_mean=[-0.7571, -0.7089], latents_std=[2.8184, 1.4541]
                 )
+                self.gate = VaeFastPathGate()
+                register_vae_fast_path_gate(self, self.gate)
+                self.seen_gates = []
 
             def reset_causal_decode_state(self):
                 self.cached_latents = None
 
             def causal_decode(self, latents):
+                self.seen_gates.append(self.gate.enabled)
                 self.cached_latents = latents.square()
                 return latents
 
@@ -1152,16 +1303,25 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 stage._latents_mean = stage._latents_std = None
                 expected = stage._denormalize_latents(latents)
                 with self.assertRaisesRegex(RuntimeError, "injected rollout failure"):
-                    with CausalDecodeQueue(vae, device=torch.device("cuda")) as queue:
+                    with CausalDecodeQueue(
+                        vae, device=torch.device("cuda"), quality="lossless"
+                    ) as queue:
                         queue.submit(latents[:, :, :2])
                         raise RuntimeError("injected rollout failure")
+                self.assertEqual(vae.seen_gates, [True])
+                self.assertFalse(vae.gate.enabled)
                 self.assertIsNone(vae.cached_latents)
                 self.assertTrue(queue.stream.query())
                 self.assertEqual(queue.outputs, [])
-                for _ in range(2):
-                    with CausalDecodeQueue(vae, device=torch.device("cuda")) as queue:
+                for quality, enabled in (("lossless", True), ("exact", False)):
+                    vae.seen_gates.clear()
+                    with CausalDecodeQueue(
+                        vae, device=torch.device("cuda"), quality=quality
+                    ) as queue:
                         for chunk in latents.split(2, dim=2):
                             queue.submit(chunk)
+                    self.assertEqual(vae.seen_gates, [enabled, enabled])
+                    self.assertFalse(vae.gate.enabled)
                     self.assertIsNone(vae.cached_latents)
                     torch.testing.assert_close(
                         queue.finish(), expected.cpu(), rtol=0, atol=0
