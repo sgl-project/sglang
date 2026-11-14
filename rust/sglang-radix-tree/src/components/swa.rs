@@ -478,6 +478,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             node.set_device_value(FULL, value_slice.copy());
             cache_actions.push(Box::new(FreeDeviceKVFullOnly {
                 indices: vec![old_full],
+                tree_owned: true,
             }));
             cache_actions.push(Box::new(SwaRebuild {
                 node_id: node.id,
@@ -513,6 +514,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             node.set_device_value(FULL, new_full.copy());
             cache_actions.push(Box::new(FreeDeviceKVFullOnly {
                 indices: vec![old_full],
+                tree_owned: true,
             }));
             cache_actions.push(Box::new(SwaRebuild {
                 node_id: node_ext_id,

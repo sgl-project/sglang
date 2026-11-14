@@ -4409,6 +4409,36 @@ def test_swa_straddling_insert_crosses_the_boundary_actions():
     assert free_duplicates.indices[0].tolist() == [20, 21]
 
 
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize(
+    "swa_evicted_seqlen, expected_frees",
+    [
+        pytest.param(0, [([10, 11, 12, 13], True)], id="whole_node"),
+        pytest.param(2, [([12, 13], True), ([20, 21], False)], id="partial"),
+    ],
+)
+def test_full_only_frees_say_whether_they_free_a_tree_value(
+    backend, swa_evicted_seqlen, expected_frees
+):
+    core, _ = _swa_transfer_core(backend, window=8)
+    # The first insert's SWARebuild stays unapplied, so the node is an SWA tombstone.
+    _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
+    result = _pump_insert(
+        core,
+        InsertParams(
+            key=_key([1, 2, 3, 4]),
+            value=torch.tensor([20, 21, 22, 23], dtype=torch.int64),
+            component_evicted_seqlens={ComponentType.SWA: swa_evicted_seqlen},
+        ),
+    )
+    frees = [
+        (torch.cat(action.indices).tolist(), action.tree_owned)
+        for action in result.cache_actions
+        if isinstance(action, FreeDeviceKVFullOnly)
+    ]
+    assert frees == expected_frees
+
+
 def test_every_pool_name_crosses_the_prefetch_commit_boundary():
     from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 
