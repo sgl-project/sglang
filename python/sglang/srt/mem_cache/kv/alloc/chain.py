@@ -1621,7 +1621,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             window._maybe_zero_pages(pages)
         return out
 
-    @_one_operation
     def _plan_and_take(
         self,
         demands: Dict[str, int],
@@ -1629,18 +1628,21 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         bind_at_frontier: bool = False,
         consumer: Consumer = Consumer.FORWARD,
     ) -> Optional[Dict[str, Optional[torch.Tensor]]]:
-        """Physical pages for ``demands`` (pages per band) in a planned layout;
-        None exactly when `feasible` says no, and a plan that does not realize
-        raises. With ``bind_at_frontier``, see `realize`."""
+        """Physical pages for ``demands`` (pages per band) in a planned layout,
+        as one allocator operation (`_one_operation`) that takes from the
+        demanded bands only; None exactly when `feasible` says no, and a plan
+        that does not realize raises. With ``bind_at_frontier``, see `realize`."""
         demands = {name: n for name, n in demands.items() if n > 0}
         if not demands:
             return {}
-        with self._relief(demands) as plan:
-            if plan is None:
-                return None
-            return self.realize(
-                plan, bind_at_frontier=bind_at_frontier, consumer=consumer
-            )
+        with allocator_operation(self.members) as op:
+            op.declare_takes(demands)
+            with self._relief(demands) as plan:
+                if plan is None:
+                    return None
+                return self.realize(
+                    plan, bind_at_frontier=bind_at_frontier, consumer=consumer
+                )
 
     @_one_operation
     def realize(
@@ -1718,10 +1720,51 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             # No layout serves it: refused before any pending page settles.
             yield None
             return
+        packed = self._pack_ends_on_device(demands)
+        if packed is not None:
+            yield packed
+            return
         # Settle pending pages first, so the plan and its realization see holes
         # and live pages only (a float left with no live page parks).
         with self.settle_pending_for_recovery(self.bands):
             yield from self._relief_plan(demands)
+
+    def _pack_ends_on_device(self, demands: Dict[str, int]) -> Optional[TakePlan]:
+        """Lay the chain out for ``demands`` with no host read, when its least
+        rearrangement only packs ends that can pack on the device
+        (`Band.pack_on_device`): pack them, and return the plan's takes left
+        to realize. None, with nothing changed, otherwise.
+
+        A host relief first reads every band's free and pending pages, which
+        parks the scheduler until the running forward ends whenever a stream
+        wait is already queued. Without a recorded transfer or a fixed page
+        nothing is held, and a float with no pending page parks nowhere, so
+        the plan is the one a host relief makes after settling, and so is the
+        layout. The choice reads counts and logical state alone, alike on
+        every rank."""
+        if self.full_attn_allocator.network_waiter is not None or any(
+            band.records_transfers
+            or band.usage.fixed
+            or (band.grow_direction == "float" and band._pending_until_retire)
+            for band in self.bands
+        ):
+            return None
+        plan = first_plan(self.pricing_snapshot(), demands, growth=self._growth)
+        bands = {band.sub_pool_name: band for band in self.bands}
+        if (
+            plan is None
+            or plan.targets
+            or not plan.flush
+            or not all(bands[name].can_pack_on_device() for name in plan.flush)
+        ):
+            return None
+        for name in plan.flush:
+            bands[name].pack_on_device()
+        # The other ends settle too, as at a host relief's entry, so their
+        # takes choose among the same holes.
+        for band in self.bands:
+            band.settle_pending()
+        return msgspec.structs.replace(plan, flush=())
 
     def _relief_plan(self, demands: Dict[str, int]):
         held = False
