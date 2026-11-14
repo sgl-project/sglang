@@ -14,6 +14,8 @@ python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --num
 
 import argparse
 import asyncio
+import contextlib
+import contextvars
 import copy
 import importlib.util
 import json
@@ -74,7 +76,7 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
     return value.lower() in ("true", "1")
 
 
-def _create_bench_client_session():
+def _new_bench_client_session(**kwargs) -> aiohttp.ClientSession:
     # When the pressure is big, the read buffer could be full before aio thread read
     # the content. We increase the read_bufsize from 64K to 10M.
     # Define constants for timeout and buffer size for clarity and maintainability
@@ -83,8 +85,44 @@ def _create_bench_client_session():
 
     aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
     return aiohttp.ClientSession(
-        timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES
+        timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES, **kwargs
     )
+
+
+# The session that benchmark() shares across its requests.
+_SHARED_BENCH_SESSION: contextvars.ContextVar[Optional[aiohttp.ClientSession]] = (
+    contextvars.ContextVar("_SHARED_BENCH_SESSION", default=None)
+)
+
+
+@contextlib.asynccontextmanager
+async def _create_bench_client_session():
+    """Yield the session of the running benchmark, or a new one outside it.
+
+    A new session per request opens a new connection per request, and that
+    connection setup is counted in the request's TTFT.
+    """
+    shared = _SHARED_BENCH_SESSION.get()
+    if shared is not None:
+        yield shared
+        return
+    async with _new_bench_client_session() as session:
+        yield session
+
+
+@contextlib.asynccontextmanager
+async def _shared_bench_client_session():
+    # limit=0: max_concurrency, not the connector, bounds the open requests.
+    # DummyCookieJar: requests stay independent, as with one session each.
+    async with _new_bench_client_session(
+        connector=aiohttp.TCPConnector(limit=0),
+        cookie_jar=aiohttp.DummyCookieJar(),
+    ) as session:
+        token = _SHARED_BENCH_SESSION.set(session)
+        try:
+            yield session
+        finally:
+            _SHARED_BENCH_SESSION.reset(token)
 
 
 @dataclass
@@ -1380,7 +1418,13 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
-async def benchmark(
+async def benchmark(*args, **kwargs):
+    """Run _benchmark with one client session for all of its requests."""
+    async with _shared_bench_client_session():
+        return await _benchmark(*args, **kwargs)
+
+
+async def _benchmark(
     backend: str,
     api_url: str,
     base_url: str,
