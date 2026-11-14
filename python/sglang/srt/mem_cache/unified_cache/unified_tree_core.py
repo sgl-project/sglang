@@ -1921,6 +1921,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             "before advancing"
         )
         updated_tracker = defaultdict(int, tracker)
+        evictable_before = self.component_evictable_size_.get(component_type, 0)
         self._begin_tracking_unbacked_tokens()
         try:
             step = component.evict_device_next_node(
@@ -1952,6 +1953,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             result.node_id is not None
             or result.mamba_backup_node_id is not None
             or result.swa_backup_node_id is not None
+            or self.component_evictable_size_.get(component_type, 0) != evictable_before
             or bool(result.tracker)
             or bool(result.cache_actions)
             or any(result.device_frees.values())

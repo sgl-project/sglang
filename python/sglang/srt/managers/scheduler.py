@@ -579,6 +579,9 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_lmcache = get_memory().enable_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
+        self.enable_flexkv = bool(
+            get_memory().enable_flexkv or get_memory().radix_cache_backend == "flexkv"
+        )
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
@@ -3764,6 +3767,9 @@ class Scheduler(
                     storage_hit_end=storage_hit_end,
                 )
 
+        elif self.enable_flexkv:
+            self.tree_cache.prefetch_request(req)
+
     def _process_storage_prefetch_retries(self):
         """Issue due L3 attempts in the current waiting-queue order."""
         retries = self.tree_cache.storage_prefetch_retries
@@ -4242,11 +4248,13 @@ class Scheduler(
         # (_should_defer_prefill) or ranks enter different collectives.
         if (
             self.enable_hierarchical_cache
-            or get_memory().enable_flexkv
+            or self.enable_flexkv
             or self.enable_unified_cache_external_linker
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
+            if self.enable_flexkv and envs.SGLANG_FLEXKV_PENDING_PREFIX_PROBE.get():
+                self.tree_cache.refresh_pending_prefix_metrics(self.waiting_queue)
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
 
@@ -4619,7 +4627,9 @@ class Scheduler(
 
         # The request between two chunks: in chunked_reqs, not in waiting_queue.
         resumed_req = self.chunked_req
-        if resumed_req is not None:
+        if resumed_req is not None and not self.tree_cache.has_uncommitted_restore(
+            resumed_req
+        ):
             resumed_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 resumed_req,
@@ -4670,6 +4680,8 @@ class Scheduler(
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if self.tree_cache.has_uncommitted_restore(req):
+                continue
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
@@ -4708,6 +4720,7 @@ class Scheduler(
 
             if (
                 self.enable_hicache_storage
+                or self.enable_flexkv
                 or self.enable_lmcache
                 or self.enable_unified_cache_external_linker
             ):
@@ -4735,6 +4748,13 @@ class Scheduler(
             # queued drops the copy its match staged.
             defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
             req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
+            defer_restore = getattr(
+                self.tree_cache, "should_defer_shared_restore", None
+            )
+            if defer_restore is not None and defer_restore(req):
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
+                continue
             if adder.should_defer(req):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
@@ -4772,6 +4792,10 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    if self.tree_cache.has_uncommitted_restore(req):
+                        raise RuntimeError(
+                            f"Request was rejected after storage load-back: rid={req.rid}"
+                        )
                     self._drop_unadmitted_match(req)
                 if res == AddReqResult.UNSCHEDULABLE and not added:
                     # Nothing holding memory will give it back: waiting would
@@ -4808,6 +4832,10 @@ class Scheduler(
                 can_run_list=can_run_list, running_batch=running_batch, adder=adder
             )
             return None, running_batch
+
+        launch_pending_loads = getattr(self.tree_cache, "launch_pending_loads", None)
+        if callable(launch_pending_loads):
+            launch_pending_loads(can_run_list)
 
         can_run_set = set(can_run_list)
         retries = self.tree_cache.storage_prefetch_retries

@@ -86,6 +86,20 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     params = ctx.params
 
     is_pure_swa = ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0
+    if get_memory().enable_flexkv:
+        # Importing the package side-effect registers the explicit
+        # ``--radix-cache-backend=flexkv`` factory; we then call the
+        # factory directly so --enable-flexkv stands on its own.
+        import os
+
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        # Honor a CLI --flexkv-config-file by forwarding it via the env
+        # var that FlexKV's config loader actually reads.
+        if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
+            os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
+        return _flexkv_factory(ctx)
+
     # A disabled cache publishes nothing, so no storage backend applies.
     # Host-pool retraction goes to UnifiedRadixCache, which validates it (and
     # rejects pure-SWA).
@@ -134,20 +148,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
         return PureSWARadixCache(params=params)
-
-    if get_memory().enable_flexkv:
-        # Importing the package side-effect registers the explicit
-        # ``--radix-cache-backend=flexkv`` factory; we then call the
-        # factory directly so --enable-flexkv stands on its own.
-        import os
-
-        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
-
-        # Honor a CLI --flexkv-config-file by forwarding it via the env
-        # var that FlexKV's config loader actually reads.
-        if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
-            os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
-        return _flexkv_factory(ctx)
 
     return create_unified_radix_cache(ctx)
 
@@ -250,7 +250,12 @@ def create_unified_radix_cache(
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
     name = get_memory().radix_cache_backend
-    if name:
+    if name == "flexkv":
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        cache = _flexkv_factory(ctx)
+        source = "registered('flexkv')"
+    elif name:
         factory = get_radix_cache_factory(name)
         if factory is None:
             raise ValueError(

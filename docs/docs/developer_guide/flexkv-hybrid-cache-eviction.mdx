@@ -1,0 +1,97 @@
+---
+title: "FlexKV hybrid cache eviction"
+description: "Restore ownership, named window demand, and cross-rank rollback in the FlexKV hybrid adapter."
+---
+
+FlexKV restores a hybrid-attention prefix into a FULL token pool and its live
+sliding-window (SWA) tail. The adapter wraps the unified cache created from the
+storage's tree slots. The unified cache retains responsibility for insertion,
+window state, tree locks, and pool accounting.
+
+## Price the allocation with KVDemand
+
+`FlexKVHybridRadixCache._alloc_restore_slots()` first attempts allocation. On
+failure it calls `evict_for_alloc(KVDemand(...))`, then retries once. A demand
+states the capacity the allocation needs, including each window pool by name:
+
+```python
+KVDemand(
+    full_tokens=host_hit_length,
+    window_tokens={name: swa_need for name, _ in cache.window_sub_pools()},
+)
+```
+
+For a paged restore, the current connector supplies one live SWA page:
+`min(page_size, host_hit_length)`. With `page_size == 1`, the SWA demand covers
+the full restored hit. Normal extend/decode allocations can have different
+window demands; do not replace all of them with the restore's tail demand.
+
+Allocation demand is different from the number of tokens to evict. For separate
+fixed pools, a FULL demand of 128 with 80 available requires 48 more FULL slots.
+A window demand of 64 with 32 available requires 32 more window slots. Shared
+allocators use their own reclaim discipline and byte/slot accounting. Passing
+those demands directly to `EvictParams` would over-evict; `evict_for_alloc`
+calculates the required reclaim through the allocator's discipline.
+
+## Agree before launching a restore
+
+When the connector implements `sync_load_ready`, every participating rank votes
+after its local allocation/retry, including ranks whose allocation failed.
+A rejected vote frees only successful peers' fresh allocations and releases
+held lookups. Existing tree prefixes retain their owners. Both ordinary and
+hybrid adapters follow this contract in MP and IP modes.
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler ranks
+    participant A as Local adapters
+    participant C as FlexKV connector
+    S->>A: Admit and allocate destination slots
+    A->>A: Evict for named KVDemand and retry if needed
+    A->>C: sync_load_ready(local_ready), on every rank
+    alt Any allocation failed
+        C-->>A: False on every rank
+        A->>A: Free fresh peer slots and release lookup
+        A-->>S: No restored prefix; retry or recompute
+    else All allocations succeeded
+        C-->>A: True on every rank
+        A->>C: Retrieve or prepare layerwise H2D
+        A-->>S: Restored length and node handle
+    end
+```
+
+Local-pressure eviction never polls Store-completion collectives. Those run at
+the scheduler's rank-symmetric cache-event hook.
+
+## Keep the restored row owned until checkpoint or release
+
+Matches expose `device_prefix_len`; `prefix_device_indices(req)` materializes
+the resident tree path plus any private restore lease. Hybrid MP and IP
+restores remain request-owned until `checkpoint(req, up_to=...)` publishes
+computed KV through the inner cache. Stores use a snapshot of tree-owned slots
+and retain the source node lock until synchronized completion.
+
+A discarded request follows the core's row-release path instead. The adapter
+validates its lease and applies the restored SWA eviction cursor **before** the
+inner cache frees the row. This prevents an older, unmapped part of the FULL
+restore from being freed again as live SWA. `on_release` then retires the lease
+without cancelling a successor that reused the tracking key.
+
+Queued aborts use `RequestRetirer` and `finish(handle, ABORT)`. An allocation
+that has not yet acquired a request row remains in the orphan ledger until
+reset fences the connector's writers. A positive partial layerwise return is
+fatal: its length does not establish that a DMA destination is idle.
+
+## Test memory pressure and ownership
+
+Run the FlexKV tests under `test/registered/unit/mem_cache/` and
+`test/registered/unit/managers/`, together with `test_registry.py`,
+`test_prefill_adder.py`, and `test_swa_eviction_accounting.py`.
+`test_evict_from_tree_cache.py` now exercises named KVDemand at the adapter's
+owning allocation interface, including tail-only windows and retry behavior.
+
+The allocation regression uses real two-rank Gloo with controlled CPU slots
+and transfer endpoints. It covers ordinary/hybrid × MP/IP, either rank failing,
+both ranks failing, rollback, and later progress. These checks establish CPU
+protocol behavior. GPU allocation failures, DMA, model output, physical remote
+I/O, and performance require separate validation on the intended deployment.
