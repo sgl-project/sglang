@@ -2491,6 +2491,7 @@ def init_distributed_environment(
     moe_a2a_backend: Optional[str] = None,
     recovered_rank: bool = False,
     max_world_size: Optional[int] = None,
+    elastic_mooncake_ep_enabled: bool = False,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
@@ -2539,8 +2540,10 @@ def init_distributed_environment(
             pg_options=pg_options,
         )
 
-        # Create a global TCPStore for coordination (used by NIXL)
-        if moe_a2a_backend == "nixl":
+        # NIXL always needs the store; Mooncake EP uses it for elastic buffers.
+        if moe_a2a_backend == "nixl" or (
+            moe_a2a_backend == "mooncake" and elastic_mooncake_ep_enabled
+        ):
             _create_global_tcp_store(
                 rank,
                 world_size,
