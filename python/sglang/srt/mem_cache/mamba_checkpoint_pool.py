@@ -52,6 +52,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.runtime_context import get_exec
 
@@ -112,6 +113,22 @@ class Int8CheckpointStore:
             dtype=scale_dtype,
             device=device,
         )
+        # Imported only when selected, so CPU and HIP never load Triton.
+        self._fused_codec = None
+        if (
+            envs.SGLANG_EXPERIMENTAL_FUSED_INT8_CHECKPOINT.get()
+            and torch.version.hip is None
+            and self.qdata.is_cuda
+        ):
+            from sglang.kernels.ops.kvcache import int8_mamba_checkpoint
+
+            self._fused_codec = int8_mamba_checkpoint
+        self._verify_fused = envs.SGLANG_DEBUG_VERIFY_FUSED_INT8_CHECKPOINT.get()
+        # Actual fused dispatches; tests assert the kernel path was taken.
+        self._fused_store_calls = 0
+        self._fused_restore_calls = 0
+        self._verified_store_calls = 0
+        self._verified_restore_calls = 0
 
     # ---- (de)quant math (also usable standalone for probes/tests) ----
 
@@ -162,6 +179,24 @@ class Int8CheckpointStore:
         """Dequantize checkpoints at ``src_slots`` directly into the active pool
         tensor ``dst_temporal`` [L, pool_slots, H, d_v, d_k] at ``dst_slots`` (the
         copy-on-write on a cache hit). Output dtype follows ``dst_temporal``."""
+        if self._use_fused(dst_temporal, src_slots=src_slots, dst_slots=dst_slots):
+            expected = None
+            if self._verifying():
+                expected = self.load(src_slots, dst_temporal.dtype)
+            self._fused_codec.restore_to_pool(
+                state=dst_temporal,
+                qdata=self.qdata,
+                scale=self.scale,
+                src_slots=src_slots,
+                dst_slots=dst_slots,
+            )
+            if expected is not None:
+                torch.testing.assert_close(
+                    dst_temporal[:, dst_slots], expected, rtol=0, atol=0, equal_nan=True
+                )
+                self._verified_restore_calls += 1
+            self._fused_restore_calls += 1
+            return
         dst_temporal[:, dst_slots] = self.load(src_slots, dst_temporal.dtype)
 
     def store_from_pool(
@@ -172,7 +207,49 @@ class Int8CheckpointStore:
     ) -> None:
         """Quantize states from an active pool tensor into checkpoint slots (cache
         store / donate)."""
+        if self._use_fused(src_temporal, src_slots=src_slots, dst_slots=dst_slots):
+            expected = None
+            if self._verifying():
+                expected = self.quantize(src_temporal[:, src_slots])
+            self._fused_codec.quantize_from_pool(
+                state=src_temporal,
+                qdata=self.qdata,
+                scale=self.scale,
+                src_slots=src_slots,
+                dst_slots=dst_slots,
+            )
+            if expected is not None:
+                expected_q, expected_scale = expected
+                torch.testing.assert_close(
+                    self.qdata[:, dst_slots], expected_q, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    self.scale[:, dst_slots],
+                    expected_scale.to(self.scale.dtype),
+                    rtol=0,
+                    atol=0,
+                    equal_nan=True,
+                )
+                self._verified_store_calls += 1
+            self._fused_store_calls += 1
+            return
         self.store(dst_slots, src_temporal[:, src_slots])
+
+    def _use_fused(
+        self, state: torch.Tensor, *, src_slots: torch.Tensor, dst_slots: torch.Tensor
+    ) -> bool:
+        if self._fused_codec is None or not self._fused_codec.can_use(
+            state, self.qdata, self.scale, src_slots, dst_slots
+        ):
+            return False
+        if self._verifying():
+            # The kernels race on duplicate destinations; can_use() cannot see values.
+            assert dst_slots.unique().numel() == dst_slots.numel()
+        return True
+
+    def _verifying(self) -> bool:
+        # The checks synchronize, which is illegal while a CUDA graph is captured.
+        return self._verify_fused and not torch.cuda.is_current_stream_capturing()
 
     def mem_usage_bytes(self) -> int:
         return (

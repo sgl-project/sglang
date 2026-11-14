@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
@@ -74,6 +74,21 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+# Cached recurrent-state conversion writes directly between existing pool slots.
+for _op, _fn in (
+    ("quantize_mamba_checkpoint", "quantize_from_pool"),
+    ("restore_mamba_checkpoint", "restore_to_pool"),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"kvcache.{_op}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.kvcache.int8_mamba_checkpoint:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _op, _fn
 
 register_kernel(
     KernelSpec(
