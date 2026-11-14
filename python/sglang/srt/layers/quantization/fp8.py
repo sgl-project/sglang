@@ -2152,15 +2152,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if _use_aiter and self.is_fp4_expert:
+            if get_moe_a2a_backend().is_megamoe() and self.dequant_fp4_to_fp8:
+                raise ValueError(
+                    "SGLANG_DSV4_FP4_DEQUANT strips the packed FP4 layout that "
+                    "aiter MegaMoE builds from; unset it, or pick another "
+                    "--moe-a2a-backend."
+                )
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
-            # claim the experts before the native-MXFP4 and dequant arms.
-            if get_moe_a2a_backend().is_megamoe():
-                if self.dequant_fp4_to_fp8:
-                    raise ValueError(
-                        "SGLANG_DSV4_FP4_DEQUANT strips the packed FP4 layout that "
-                        "aiter MegaMoEv2 builds from; unset it, or pick another "
-                        "--moe-a2a-backend."
-                    )
+            # claim the experts before the native-MXFP4 arm; the gfx1250 MegaMoE
+            # runs aiter fused_moe on that arm's layout.
+            if get_moe_a2a_backend().is_megamoe() and not _is_gfx1250_supported:
                 from sglang.srt.layers.moe.mega_moe import (
                     build_mega_moe_experts_weights,
                 )
@@ -2302,6 +2303,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         )
                 layer.w13_weight.is_shuffled = is_shuffled
                 layer.w2_weight.is_shuffled = is_shuffled
+                if get_moe_a2a_backend().is_megamoe():
+                    from sglang.srt.layers.moe.mega_moe import (
+                        build_mega_moe_experts_weights,
+                    )
+
+                    build_mega_moe_experts_weights(layer)
                 return
 
             # DSV4 dequant requested: convert to block-FP8 and use the standard
