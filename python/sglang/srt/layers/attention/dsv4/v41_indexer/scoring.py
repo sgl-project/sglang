@@ -452,10 +452,12 @@ def prefill_requests(
         slots = inputs.k_slots[k_starts[r] : k_starts[r] + lc]
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
-        # Keep BF16 GEMM output rows aligned for Hopper tensor-core kernels.
-        # Pad K once per request; padded positions never enter selection.
-        if index_k.is_cuda and index_k.dtype == torch.bfloat16 and lc >= 1024:
-            score_width = (lc + 63) // 64 * 64
+        # Keep GEMM output rows aligned: Hopper tensor cores want 64, and the fused
+        # ragged top-k requires a score stride that is a multiple of 4. Padded
+        # positions never enter selection.
+        if index_k.is_cuda:
+            align = 64 if (index_k.dtype == torch.bfloat16 and lc >= 1024) else 4
+            score_width = (lc + align - 1) // align * align
             if score_width != lc:
                 index_k = torch.nn.functional.pad(index_k, (0, 0, 0, score_width - lc))
         request = RequestScores(
@@ -509,10 +511,26 @@ def _score_chunks(
             )
         else:
             s = indexer.scores(q[tok_c], index_k, weights[tok_c])[:, :lc]
-            s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+            # Mask in place so the row stride stays the one the fused top-k needs.
+            s.masked_fill_(j[None, :] >= lens_c[:, None], -torch.inf)
         yield ChunkScores(
             rows=rows, tok=tok_c, lens=lens_c, scores=s, candidate_only=candidate_only
         )
+
+
+def prefill_topk_indices(request: RequestScores, chunk: ChunkScores) -> torch.Tensor:
+    """The ``request.k`` best visible columns of each scored row, request-local,
+    ``-1`` padded, unordered: the same fused ragged selection the candidate and
+    DeepGEMM paths use, instead of a ``torch.topk`` over the score matrix."""
+    rows = chunk.tok.numel()
+    out = torch.empty((rows, request.k), dtype=torch.int32, device=chunk.scores.device)
+    topk_ragged(
+        chunk.scores,
+        chunk.lens.to(torch.int32),
+        out=out,
+        offsets=torch.zeros(rows, dtype=torch.int32, device=chunk.scores.device),
+    )
+    return out
 
 
 def write_prefill(
@@ -523,7 +541,8 @@ def write_prefill(
 ) -> None:
     k, lc = request.k, request.lc
     idx = idx.sort(dim=-1).values
-    reach = idx < chunk.lens[:, None]
+    # `topk_ragged` pads the slots past a short row with -1; they are not reachable.
+    reach = (idx >= 0) & (idx < chunk.lens[:, None])
     if inputs.out_page_indices is not None:
         inputs.out_page_indices[chunk.tok, :k] = torch.where(
             reach, request.slots[idx.clamp_max(lc - 1)], -1
