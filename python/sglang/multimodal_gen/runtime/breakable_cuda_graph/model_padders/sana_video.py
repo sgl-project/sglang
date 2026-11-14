@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
 )
 
 _DEFAULT_PROMPT_LENGTH = 300
+_COMPACT_PROMPT_LENGTH = 64
 
 
 def is_sana_video_transformer(current_model: Any, call_kwargs: dict) -> bool:
@@ -24,22 +25,69 @@ def is_sana_video_transformer(current_model: Any, call_kwargs: dict) -> bool:
         bcg_utils.transformer_class_name_matches(current_model, "sanavideo")
         and torch.is_tensor(encoder_hidden_states)
         and encoder_hidden_states.dim() >= 2
-        and encoder_hidden_states.shape[1] == _DEFAULT_PROMPT_LENGTH
+        and encoder_hidden_states.shape[1]
+        in (_COMPACT_PROMPT_LENGTH, _DEFAULT_PROMPT_LENGTH)
     )
 
 
 def keep_sana_video_prompt_shape(
-    call_kwargs: dict, current_model: Any, buckets: tuple[int, ...]
+    call_kwargs: dict, _current_model: Any, _buckets: tuple[int, ...]
 ) -> dict:
-    """Keep the pipeline's fixed 300-token prompt shape unchanged.
+    """Keep SANA-Video's supported 64- and 300-token widths unchanged.
 
-    The SANA-Video text stage pads both CFG branches to 300 tokens by default.
-    Expanding that fixed shape to the generic 512/1024 buckets only increases
-    cross-attention work and captures unused graph signatures.
+    Expanding either width to generic buckets adds cross-attention work and
+    captures signatures the SANA-Video text stage does not use.
     """
     return call_kwargs
 
 
+def _resize_nested_prompt_dim(value: Any, source: int, target: int) -> Any:
+    if torch.is_tensor(value):
+        if value.ndim > 1 and value.shape[1] == source:
+            if target > source:
+                return bcg_utils.pad_tensor_dim(value, 1, target, value=0)
+            return value[:, :target]
+        return value
+    if isinstance(value, list):
+        return [_resize_nested_prompt_dim(item, source, target) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_resize_nested_prompt_dim(item, source, target) for item in value)
+    return value
+
+
+def sana_video_warmup_kwargs(call_kwargs: dict, _current_model: Any) -> dict | None:
+    """Return capture kwargs for the SANA width not present in this warmup."""
+    embeddings = bcg_utils.first_tensor(call_kwargs.get("encoder_hidden_states"))
+    if not torch.is_tensor(embeddings) or embeddings.ndim != 3:
+        return None
+    source = embeddings.shape[1]
+    if source == _COMPACT_PROMPT_LENGTH:
+        target = _DEFAULT_PROMPT_LENGTH
+    elif source == _DEFAULT_PROMPT_LENGTH:
+        target = _COMPACT_PROMPT_LENGTH
+    else:
+        return None
+
+    out = dict(call_kwargs)
+    for key, ndim in (
+        ("encoder_hidden_states", 3),
+        ("encoder_attention_mask", 2),
+        ("encoder_hidden_states_mask", 2),
+    ):
+        value = call_kwargs.get(key)
+        tensor = bcg_utils.first_tensor(value)
+        if (
+            not torch.is_tensor(tensor)
+            or tensor.ndim != ndim
+            or tensor.shape[:2] != embeddings.shape[:2]
+        ):
+            return None
+        out[key] = _resize_nested_prompt_dim(value, source, target)
+    return out
+
+
 bcg_utils.register_prompt_padder(
-    is_sana_video_transformer, keep_sana_video_prompt_shape
+    is_sana_video_transformer,
+    keep_sana_video_prompt_shape,
+    warmup_kwargs_provider=sana_video_warmup_kwargs,
 )

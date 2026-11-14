@@ -22,6 +22,23 @@ from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
 )
 
 
+def _sana_text_outputs(valid_tokens: int, sequence_length: int = 300):
+    embeddings = torch.arange(sequence_length * 2, dtype=torch.float32).reshape(
+        1, sequence_length, 2
+    )
+    attention_mask = torch.zeros(1, sequence_length, dtype=torch.long)
+    hidden_states_mask = torch.zeros(1, sequence_length, dtype=torch.bool)
+    attention_mask[:, :valid_tokens] = 1
+    hidden_states_mask[:, :valid_tokens] = True
+    return [
+        [embeddings],
+        [attention_mask],
+        [torch.tensor([1.0])],
+        [hidden_states_mask],
+        [[valid_tokens]],
+    ]
+
+
 def test_default_texture_follows_width_height_texture_size():
     """texture_size is (width, height); the blank default texture was built as
     (width, height, 3) instead of the (height, width, 3) of a loaded texture."""
@@ -108,6 +125,96 @@ def test_sana_video_negative_prompt_uses_requested_sequence_length():
         SimpleNamespace(negative_prompt="Blurry", max_sequence_length=None), None, [0]
     )
     assert captured["max_length"] == 300
+
+
+@pytest.mark.parametrize(
+    "valid_tokens,expected_width",
+    [(18, 64), (56, 64), (64, 64), (65, 300), (163, 300)],
+)
+def test_sana_video_compacts_only_a_fully_masked_default_suffix(
+    valid_tokens, expected_width
+):
+    from sglang.multimodal_gen.runtime.pipelines.sana_video import (
+        _compact_sana_video_text_outputs,
+    )
+
+    outputs = _sana_text_outputs(valid_tokens)
+    compacted = _compact_sana_video_text_outputs(outputs, 300)
+
+    assert compacted[0][0].shape == (1, expected_width, 2)
+    assert compacted[1][0].shape == (1, expected_width)
+    assert compacted[3][0].shape == (1, expected_width)
+    torch.testing.assert_close(compacted[0][0], outputs[0][0][:, :expected_width])
+    assert int(compacted[1][0].sum()) == valid_tokens
+    assert int(compacted[3][0].sum()) == valid_tokens
+    assert compacted[4] == [[valid_tokens]]
+    assert compacted[2] is outputs[2]
+
+
+def test_sana_video_preserves_suffix_validity_and_unsupported_layouts():
+    from sglang.multimodal_gen.runtime.pipelines.sana_video import (
+        _compact_sana_video_text_outputs,
+    )
+
+    for mask_index, value in ((1, 1), (3, True)):
+        suffix_valid = _sana_text_outputs(18)
+        suffix_valid[mask_index][0][0, 70] = value
+        assert _compact_sana_video_text_outputs(suffix_valid, 300) is suffix_valid
+
+    malformed = _sana_text_outputs(18)
+    malformed[1][0] = malformed[1][0].unsqueeze(-1)
+    assert _compact_sana_video_text_outputs(malformed, 300) is malformed
+
+    non_default = _sana_text_outputs(18, sequence_length=128)
+    assert _compact_sana_video_text_outputs(non_default, 128) is non_default
+
+
+@pytest.mark.parametrize(
+    "positive_tokens,negative_tokens",
+    [(163, 18), (18, 163)],
+)
+def test_sana_video_compacts_cfg_branches_independently(
+    positive_tokens, negative_tokens
+):
+    stage = SanaVideoTextEncodingStage.__new__(SanaVideoTextEncodingStage)
+    stage.tokenizers = [SimpleNamespace(encode=lambda _: [1, 2, 3])]
+    stage.text_encoders = [object()]
+    positive_outputs = _sana_text_outputs(positive_tokens)
+    negative_outputs = _sana_text_outputs(negative_tokens)
+    stage.encode_text = lambda text, *_args, **_kwargs: (
+        positive_outputs if isinstance(text, list) else negative_outputs
+    )
+    batch = SimpleNamespace(
+        prompt="A moving scene",
+        negative_prompt="Blurry",
+        max_sequence_length=None,
+        do_classifier_free_guidance=True,
+        prompt_embeds=[],
+        pooled_embeds=[],
+        prompt_attention_mask=None,
+        prompt_embeds_mask=None,
+        prompt_seq_lens=None,
+        negative_prompt_embeds=[],
+        neg_pooled_embeds=[],
+        negative_attention_mask=None,
+        negative_prompt_embeds_mask=None,
+        negative_prompt_seq_lens=None,
+    )
+
+    stage.forward(batch, None)
+
+    positive_width = 64 if positive_tokens <= 64 else 300
+    negative_width = 64 if negative_tokens <= 64 else 300
+    assert batch.prompt_embeds[0].shape == (1, positive_width, 2)
+    assert batch.negative_prompt_embeds[0].shape == (1, negative_width, 2)
+    assert batch.prompt_attention_mask[0].shape == (1, positive_width)
+    assert batch.prompt_embeds_mask[0].shape == (1, positive_width)
+    assert batch.negative_attention_mask[0].shape == (1, negative_width)
+    assert batch.negative_prompt_embeds_mask[0].shape == (1, negative_width)
+    assert batch.prompt_seq_lens == [[positive_tokens]]
+    assert batch.negative_prompt_seq_lens == [[negative_tokens]]
+    assert int(batch.prompt_attention_mask[0].sum()) == positive_tokens
+    assert int(batch.negative_attention_mask[0].sum()) == negative_tokens
 
 
 @pytest.mark.parametrize(
