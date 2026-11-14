@@ -214,12 +214,12 @@ def can_use_rmsnorm_indexed_scale_shift(
     indices: torch.Tensor,
 ) -> bool:
     return (
-        x.is_cuda
+        (x.is_cuda or x.is_xpu)
         and x.dim() == 2
         and x.is_contiguous()
         and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and x.numel() > 0
-        and weight.is_cuda
+        and weight.device == x.device
         and weight.dim() == 1
         and weight.numel() == x.shape[1]
         and shift.dim() == scale.dim() == 2

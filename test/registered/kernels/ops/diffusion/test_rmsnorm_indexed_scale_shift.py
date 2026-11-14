@@ -12,25 +12,28 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_bf16_,
     rmsnorm_indexed_scale_shift,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
+
+DEVICE = "xpu" if torch.xpu.is_available() else "cuda"
 
 EPS = 1e-5
 
 
 def _inputs(rows: int, hidden: int, seed: int):
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    x = (2 * torch.randn(rows, hidden, device="cuda", generator=g)).to(torch.bfloat16)
-    weight = (1 + 0.1 * torch.randn(hidden, device="cuda", generator=g)).to(
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    x = (2 * torch.randn(rows, hidden, device=DEVICE, generator=g)).to(torch.bfloat16)
+    weight = (1 + 0.1 * torch.randn(hidden, device=DEVICE, generator=g)).to(
         torch.bfloat16
     )
     # H3's shift/scale are chunks of one [M, 6 * hidden] AdaLN output
-    adaln = (0.1 * torch.randn(3, 6 * hidden, device="cuda", generator=g)).to(
+    adaln = (0.1 * torch.randn(3, 6 * hidden, device=DEVICE, generator=g)).to(
         torch.bfloat16
     )
     shift, scale = adaln[:, :hidden], adaln[:, hidden : 2 * hidden]
-    indices = torch.randint(0, 3, (rows,), device="cuda", generator=g)
+    indices = torch.randint(0, 3, (rows,), device=DEVICE, generator=g)
     return x, weight, shift, scale, indices
 
 
@@ -49,7 +52,7 @@ def test_matches_fp32_single_rounding(rows: int, hidden: int) -> None:
 
 def test_stays_within_rounding_of_the_reference_chain() -> None:
     x, weight, shift, scale, indices = _inputs(1025, 5376, 7)
-    norm = nn.RMSNorm(5376, eps=EPS, device="cuda", dtype=torch.bfloat16)
+    norm = nn.RMSNorm(5376, eps=EPS, device=DEVICE, dtype=torch.bfloat16)
     with torch.no_grad():
         norm.weight.copy_(weight)
     chain = indexed_scale_shift_bf16_(norm(x), shift, scale, indices)
