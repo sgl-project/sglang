@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from functools import wraps
 
 import zmq
+
 from sglang_simulator.compat import validate_coordinator_endpoint
 from sglang_simulator.simulation.coordinator import (
     Cancel,
@@ -20,8 +21,8 @@ from sglang_simulator.simulation.coordinator import (
     encode_message,
 )
 from sglang_simulator.simulation.manager import Envs, StateManager
-from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.execution_events import ExecutionEventRecorder
+from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.timing_metadata import attach_timing_output
 from sglang_simulator.simulation.sglang.token_events import TokenEventRecorder
 
@@ -155,10 +156,20 @@ class CoordinatedScheduler:
         self._watchdogs = []
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.REP)
+        self._input_waiter = None
         try:
             self._socket.setsockopt(zmq.LINGER, 0)
             self._socket.setsockopt(zmq.IPV6, 1)
             self._socket.bind(endpoint)
+            channels = getattr(scheduler, "ipc_channels", scheduler)
+            payload_socket = getattr(channels, "recv_from_tokenizer", None)
+            if isinstance(payload_socket, zmq.Socket):
+                # Ready and native HTTP payloads arrive on different sockets.
+                # Wake for either, then use the unchanged receive/admission path.
+                # Proxies without the native socket retain bounded polling.
+                self._input_waiter = zmq.Poller()
+                self._input_waiter.register(self._socket, zmq.POLLIN)
+                self._input_waiter.register(payload_socket, zmq.POLLIN)
             token_events_path = Envs.token_events_path()
             if token_events_path is not None:
                 self._token_events = TokenEventRecorder(token_events_path)
@@ -212,7 +223,14 @@ class CoordinatedScheduler:
         if self._execution_events is not None:
             self._execution_events.close()
         self._socket.close(linger=0)
+        self._input_waiter = None
         self._context.term()
+
+    def _wait_for_input(self):
+        if self._input_waiter is None:
+            self._socket.poll(5)
+        else:
+            self._input_waiter.poll(5)
 
     @contextmanager
     def _guard(self):
@@ -323,7 +341,7 @@ class CoordinatedScheduler:
                 if self._finished:
                     if self._payloads:
                         raise ProtocolError("run already finished")
-                    self._socket.poll(5)
+                    self._wait_for_input()
                     return
                 if self.clock.awaiting_ready and self._socket.poll(0):
                     first_ready = self.clock.run_id is None
@@ -366,7 +384,7 @@ class CoordinatedScheduler:
                         f"run={self.clock.run_id} round={self.clock.next_round}: "
                         f"driver/payload timeout; missing={self.clock.pending_rids}"
                     )
-                self._socket.poll(5)
+                self._wait_for_input()
         finally:
             self._waiting = False
 

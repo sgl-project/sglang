@@ -812,3 +812,10 @@ This stream is independent of verbose iteration retention, so a client may use
 `SGLANG_SIMULATOR_EVIDENCE_LEVEL=metrics` while preserving original request-to-native
 execution evidence. Neither the observer nor retention mode changes the modeled
 clock, native result, cost, progress policy or workload horizon.
+
+The coordinated scheduler waits for both the control socket and the native
+tokenizer payload socket when the latter is a ZMQ socket. Incoming HTTP payloads
+can wake the existing admission loop immediately; a control-only polling timeout
+does not delay their receipt. Unsupported receiver proxies retain bounded polling.
+This changes only wall-clock waiting: the native receiver, admission ordering,
+virtual clock, cancellation and result commitment remain the same owners.

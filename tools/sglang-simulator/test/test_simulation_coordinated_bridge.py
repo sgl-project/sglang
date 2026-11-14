@@ -200,6 +200,37 @@ class FakeScheduler:
         pass
 
 
+def test_native_payload_socket_wakes_waiter_without_ready_and_remains_owned():
+    context = zmq.Context()
+    receiver = context.socket(zmq.PULL)
+    sender = context.socket(zmq.PUSH)
+    receiver.bind("inproc://native-payload-wakeup")
+    sender.connect("inproc://native-payload-wakeup")
+    scheduler = FakeScheduler()
+    scheduler.ipc_channels.recv_from_tokenizer = receiver
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        endpoint = f"tcp://127.0.0.1:{reservation.getsockname()[1]}"
+    bridge = None
+    try:
+        bridge = CoordinatedScheduler(scheduler=scheduler, endpoint=endpoint)
+        sender.send(b"native-owned-payload")
+        events = dict(bridge._input_waiter.poll(1000))
+        assert events[receiver] & zmq.POLLIN
+        assert bridge._socket not in events  # No Ready on the control socket.
+        bridge._wait_for_input()
+        assert bridge.clock.now_ns == 0
+        assert receiver.recv(zmq.NOBLOCK) == b"native-owned-payload"
+        bridge.close()
+        assert not receiver.closed
+    finally:
+        if bridge is not None:
+            bridge.close()
+        receiver.close(linger=0)
+        sender.close(linger=0)
+        context.term()
+
+
 class Harness:
     def __init__(self, timeout_s=1.0):
         with socket.socket() as reservation:
