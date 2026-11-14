@@ -706,6 +706,33 @@
             "expected_avg_denoise_ms": 2749.56,
             "expected_median_denoise_ms": 613.17,
             "estimated_full_test_time_s": 320.0
+        },
+        "minimax_h3_ref2va_rf_v3_2npu": {
+            "stages_ms": {
+                "InputValidationStage": 0.12,
+                "MiniMaxH3PartitionAdmissionStage": 0.1,
+                "MiniMaxH3TextEncodingStage": 3414.53,
+                "MiniMaxH3VisualEncodingStage": 20049.06,
+                "MiniMaxH3AudioEncodingStage": 7464.33,
+                "MiniMaxH3LatentPreparationStage": 79.01,
+                "MiniMaxH3TimestepPreparationStage": 1.44,
+                "MiniMaxH3DenoisingStage": 260306.52,
+                "MiniMaxH3DecodingStage": 10280.32
+            },
+            "denoise_step_ms": {
+                "0": 207.52,
+                "1": 25480.08,
+                "2": 99458.0,
+                "3": 33727.95,
+                "4": 33613.95,
+                "5": 33802.5,
+                "6": 33686.44,
+                "7": 150.76
+            },
+            "expected_e2e_ms": 348769.07,
+            "expected_load_ms": 127799.83,
+            "expected_avg_denoise_ms": 32515.86,
+            "expected_median_denoise_ms": 33650.2
         }
     }
 }

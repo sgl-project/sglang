@@ -1,4 +1,6 @@
+import json
 import os
+import shlex
 
 from sglang.multimodal_gen.test.server.testcase_configs import (
     T2V_PROMPT,
@@ -195,6 +197,84 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         pin_consistency_quality=False,
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    # === Reference to Video+Audio (REF2VA)
+    DiffusionTestCase(
+        "minimax_h3_ref2va_rf_v3_2npu",
+        DiffusionServerArgs(
+            model_path=MINIMAX_H3_WEIGHTS_PATH,
+            modality="video",
+            num_gpus=2,
+            tp_size=2,
+            extras=[
+                "--model-variant",
+                "ref2va",
+                "--dit-cpu-offload",
+                "false",
+                "--sp-degree",
+                "1",
+                "--attention-backend",
+                "ascend_sparse_attn",
+                "--attention-backend-config",
+                # Exercise dense fallback before and after the sparse steps.
+                shlex.quote(
+                    '{"sparse_type":"rf_v3","precision":"bf16","sparsity":0.6,'
+                    '"skip_first_steps":2,"skip_last_steps":1,'
+                    '"dense_kwargs":{"precision":"bf16"}}'
+                ),
+                "--component-residency",
+                "text_encoder=layerwise-offload",
+            ],
+            env_vars={
+                "HCCL_BUFFSIZE": "256",
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "64",
+            },
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "Follow the motion and appearance of <Video 1> while moving the "
+                "scene to a quiet moonlit room, and use <Audio 1> as the sound "
+                "reference with coherent timing."
+            ),
+            output_size="1344x768",
+            seconds=4,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "extra_body": json.dumps(
+                    {
+                        "task": "ref2va",
+                        "conditions": [
+                            {
+                                "type": "video_audio",
+                                "uri": (
+                                    "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/"
+                                    "42ed227ee7df40d41602854ae760620d6eb651fe/assets/"
+                                    "ref2va.mp4"
+                                ),
+                                "role": "reference",
+                            }
+                        ],
+                        "target": {
+                            "short_edge": 768,
+                            "aspect_ratio": "16:9",
+                            "duration_seconds": 4.0,
+                        },
+                        "num_inference_steps": 8,
+                        "flow_shift": 12.0,
+                        "audio_flow_shift": 3.0,
+                        "seed": 42,
+                    }
+                ),
+            },
+        ),
+        perf_repeat_requests=2,
         run_perf_check=True,
         run_consistency_check=True,
         run_component_accuracy_check=False,

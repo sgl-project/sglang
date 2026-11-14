@@ -17,6 +17,7 @@ ARG PYTORCH_VERSION="2.10.0"
 ARG TORCHVISION_VERSION="0.25.0"
 ARG TORCHAUDIO_VERSION="2.10.0"
 ARG TORCH_NPU_VERSION="2.10.0.post6"
+ARG MINDIESD_VERSION="3.2.0"
 ARG TORCH_NPU_INDEX_URL="https://ascend.devcloud.huaweicloud.com/pypi/simple/"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
@@ -99,6 +100,9 @@ RUN . /etc/environment_new && \
     (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url https://download.pytorch.org/whl/cpu) \
     && (${PIP_INSTALL} torch-npu==${TORCH_NPU_VERSION} --extra-index-url ${TORCH_NPU_INDEX_URL})
 
+
+### Install MindIE-SD without replacing the pinned Torch/TorchNPU stack.
+RUN ${PIP_INSTALL} --no-deps "mindiesd==${MINDIESD_VERSION}"
 
 ### Install ModelScope & EvalScope
 # Installed right after torch/torch-npu so their dependencies resolve against the pinned torch.
