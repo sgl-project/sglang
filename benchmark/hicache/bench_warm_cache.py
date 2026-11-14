@@ -138,28 +138,46 @@ async def async_request_sglang_generate(
 
                         data = json.loads(chunk)
 
-                        if "text" in data and data["text"]:
-                            timestamp = time.perf_counter()
-                            generated_text = data["text"]
-                            current_output_len = data["meta_info"]["completion_tokens"]
+                        if "error" in data:
+                            err = data["error"]
+                            output.error = (
+                                err.get("message", str(err))
+                                if isinstance(err, dict)
+                                else str(err)
+                            )
+                            continue
 
-                            if ttft == 0.0:
+                        # Count tokens from meta_info.completion_tokens; text can be empty for special tokens.
+                        meta = data.get("meta_info") or {}
+                        finish = meta.get("finish_reason") or {}
+                        if isinstance(finish, dict) and finish.get("type") == "abort":
+                            output.error = finish.get("message") or "request aborted"
+                        cur = meta.get("completion_tokens")
+                        text = data.get("text", "")
+                        if text:
+                            generated_text = text
+                        if cur is not None:
+                            timestamp = time.perf_counter()
+                            if ttft == 0.0 and cur > 0:
                                 ttft = timestamp - st
                                 output.ttft = ttft
-                            else:
-                                num_new_tokens = current_output_len - last_output_len
-                                if num_new_tokens == 0:
-                                    continue
+                                most_recent_timestamp = timestamp
+                            elif cur > last_output_len:
+                                num_new_tokens = cur - last_output_len
                                 chunk_gap = timestamp - most_recent_timestamp
-                                adjust_itl = chunk_gap / num_new_tokens
-                                output.itl.extend([adjust_itl] * num_new_tokens)
-
-                            most_recent_timestamp = timestamp
-                            last_output_len = current_output_len
-                            output.output_len = current_output_len
+                                output.itl.extend(
+                                    [chunk_gap / num_new_tokens] * num_new_tokens
+                                )
+                                most_recent_timestamp = timestamp
+                            if cur > last_output_len:
+                                last_output_len = cur
+                                output.output_len = cur
 
                     output.generated_text = generated_text
-                    output.success = True
+                    # A 200 stream is a success only if it produced tokens and reported no error.
+                    if output.output_len == 0 and not output.error:
+                        output.error = "stream closed with 0 generated tokens"
+                    output.success = output.output_len > 0 and not output.error
                     output.latency = latency
                 else:
                     output.error = (
