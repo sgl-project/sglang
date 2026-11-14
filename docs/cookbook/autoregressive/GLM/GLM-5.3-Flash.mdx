@@ -276,6 +276,54 @@ Keep **HiCache** off when GPU memory is sufficient. Select **L1 + L2** to spill 
 
 For agentic MXFP4 serving on MI355X, select **Low Latency** with **L1 + L2**. The host tier uses `--hicache-size 180` (about 190 GB of host memory per rank once the KDA state and DSA indexer pools are included, 750 GB per node) and requires a build that includes [PR #42178](https://github.com/sgl-project/sglang/pull/42178). With less free host memory, keep HiCache off; the server does not start when the host tier does not fit.
 
+### Run the AMD monokernel on MI355X
+
+`--enable-amd-monokernel` runs each decoder layer of the target model as one gfx950 launch from [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono). With MTP 3/1/4 it serves the target's verify steps of one to four running requests (4 rows a request, at most 16 rows); larger steps take the normal forward, so the kernel serves fewer steps as concurrency grows. The command below is the recipe measured with the InferenceX AgentX harness ([InferenceX #4989](https://github.com/SemiAnalysisAI/InferenceX/pull/4989)): TP4·EP1 on four MI355X GPUs with GPU-resident KV at concurrency 1–32. Concurrency counts live sessions, not requests.
+
+- **Checkpoint.** Use AMD's Quark checkpoint [`amd/GLM-5.3-Flash-Quark-MXFP4`](https://huggingface.co/amd/GLM-5.3-Flash-Quark-MXFP4), whose routed and shared experts are both MXFP4. With a checkpoint that keeps the shared expert unquantized, such as the MXFP4 checkpoint of the deployment panel, SGLang refuses `--enable-amd-monokernel` at startup and names the reason.
+- **Parallelism and KV cache.** Keep `--ep-size 1`, because the kernels shard every expert across the TP ranks, and `--kv-cache-dtype bfloat16`, because the monokernel does not read an FP8 KV cache. Keep `--page-size 256` for the sparse-attention caches.
+- **Speculative decoding.** MTP 3/1/4 keeps up to four running requests within the kernel's 16 rows. With the monokernel it measured faster than 5/1/6 at concurrency 1–8 and level at 16–32.
+- **Container image.** Use the first MI35x image whose SGLang pins sgl-amd-mono [`52486703`](https://github.com/sgl-project/sgl-amd-mono/commit/52486703fbf27e77f05b573e4d931d4eec87118d) or later, which runs the MTP verify steps ([sgl-amd-mono#71](https://github.com/sgl-project/sgl-amd-mono/pull/71), [#98](https://github.com/sgl-project/sgl-amd-mono/pull/98), [#100](https://github.com/sgl-project/sgl-amd-mono/pull/100)). With an older pin, SGLang refuses `--enable-amd-monokernel` together with MTP at startup.
+
+```bash TP4·EP1 (concurrency 1–32)
+SGLANG_USE_AITER=1 AITER_ONLINE_TUNE=0 \
+SGLANG_OPT_FUSED_KDA_VERIFY=1 SGLANG_DSA_FUSE_TOPK=0 \
+SGLANG_ENABLE_WAR_BARRIER=1 SGLANG_FORCE_COARSE_WAR_BARRIER=1 \
+sglang serve \
+  --model-path amd/GLM-5.3-Flash-Quark-MXFP4 \
+  --trust-remote-code \
+  --quantization quark \
+  --tp-size 4 \
+  --ep-size 1 \
+  --page-size 256 \
+  --mem-fraction-static 0.82 \
+  --max-running-requests 96 \
+  --cuda-graph-max-bs-decode 96 \
+  --min-free-slots-delay 1 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --prefill-decode-interval 0 \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --linear-attn-verify-backend triton \
+  --kv-cache-dtype bfloat16 \
+  --moe-runner-backend aiter \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-attention-mode prefill \
+  --speculative-accept-threshold-single 1.0 \
+  --speculative-accept-threshold-acc 1.0 \
+  --speculative-moe-a2a-backend none \
+  --enable-amd-monokernel \
+  --mm-feature-transport cpu \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm47 \
+  --watchdog-timeout 1800 \
+  --dist-timeout 600
+```
+
 ### Multimodal memory
 
 All strategies enable multimodal serving. Image and video input use `Glm5NextProcessor`, which the pinned Transformers release ships (the MI355X checks predate that release and used commit `e4052f55`). On MI355X, text, image, and an image-bearing follow-up were qualified with that build; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
