@@ -160,6 +160,7 @@ dump_gpu_diagnostics() {
 ensure_vram_clear() {
     local max_retries=3
     local retry_count=0
+    local vram_status=0
 
     # Log host information for debugging
     echo "=== Host Information ==="
@@ -170,21 +171,27 @@ ensure_vram_clear() {
     echo "========================"
     echo "Running in ROCm mode"
 
-    # Always stop the well-known CI container first (best-effort).
+    # Unknown telemetry must not authorize container or process cleanup.
+    echo "=== Initial GPU Memory Status ==="
+    check_vram_clear || vram_status=$?
+    if [ "$vram_status" -ne 0 ] && [ "$vram_status" -ne 1 ]; then
+        return "$vram_status"
+    fi
+    echo "=================================="
+
+    # Stop the well-known CI container first (best-effort).
     echo "Stopping any existing $CI_CONTAINER_NAME container..."
     docker stop "$CI_CONTAINER_NAME" 2>/dev/null || true
     docker rm -f "$CI_CONTAINER_NAME" 2>/dev/null || true
-
-    # Show initial GPU status
-    echo "=== Initial GPU Memory Status ==="
-    rocm-smi --showmemuse
-    echo "=================================="
 
     # Fast path: if the runner is already clean, skip the cleanup loop
     # entirely so healthy jobs don't pay the ~35s/attempt cleanup cost.
     if check_vram_clear; then
         echo "✓ VRAM is already clear; skipping cleanup."
         return 0
+    else
+        vram_status=$?
+        [ "$vram_status" -eq 1 ] || return "$vram_status"
     fi
 
     while [ $retry_count -lt $max_retries ]; do
@@ -238,6 +245,8 @@ ensure_vram_clear() {
             echo "✓ VRAM cleanup successful after $((retry_count + 1)) attempts"
             return 0
         else
+            vram_status=$?
+            [ "$vram_status" -eq 1 ] || return "$vram_status"
             echo "✗ VRAM still not clear after attempt $((retry_count + 1))"
             # Step 4: dump diagnostics on every failed attempt so the next
             # attempt's logs already explain WHY cleanup didn't work.
