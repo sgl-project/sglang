@@ -1138,7 +1138,9 @@ def get_moe_padding_size(is_aiter_moe):
         return TRITON_PADDING_SIZE if envs.SGLANG_MOE_PADDING.get() else 0
 
 
-def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
+def get_moe_weight_sizes(
+    inter_dim, is_concat, is_packed, is_aiter_moe, aiter_padding_size=None
+):
     """
     Calculate dimensions for MoE weight tensors.
 
@@ -1147,13 +1149,19 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
         is_concat: If True, fusions W1 (gate) and W3 (up) projections.
         is_packed: If True, uses 4-bit quantization (two FP4 elements per byte).
         is_aiter_moe: If True, applies Aiter-specific kernel padding alignment.
+        aiter_padding_size: The Aiter alignment of w2_down_dim, in parameter
+            dtype units; AITER_PADDING_SIZE if None.
     """
     # w2_down_dim is the packing rank, but w13_up_dim not (of matrix to matmul)
     w13_up_dim = 2 * inter_dim if is_concat else inter_dim
     w2_down_dim = inter_dim // 2 if is_packed else inter_dim
 
     if is_aiter_moe:
-        padding_size = get_moe_padding_size(True)
+        padding_size = (
+            get_moe_padding_size(True)
+            if aiter_padding_size is None
+            else aiter_padding_size
+        )
         align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
         is_padded = (w2_down_dim % padding_size) > 0
         if is_padded:
