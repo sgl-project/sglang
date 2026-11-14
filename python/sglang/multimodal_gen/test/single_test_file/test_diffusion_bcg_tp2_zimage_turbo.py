@@ -44,7 +44,10 @@ BCG_CAPTURE_MARKER = "[Diffusion BCG] captured"
 GRAPH_BUFFER_REGISTRATION_MARKER = "cuda graph addresses"
 # CustomAllReduceV2 registers graph inputs only for its zero-copy pull algorithms,
 # which this workload does not select, so the marker only applies to v1.
-CUSTOM_ALL_REDUCE_V2_MARKER = "All Reduce config:"
+CUSTOM_ALL_REDUCE_V2_MARKERS = (
+    "All Reduce config:",
+    "custom_all_reduce_v2: slot =",
+)
 ILLEGAL_MEMORY_MARKER = "illegal memory access"
 
 # The regression fails during warmup within ~1 min; the timeout only has to be
@@ -149,7 +152,7 @@ class TestDiffusionBCGTP2ZImageTurbo(CustomTestCase):
             f"BCG never captured, so this run did not exercise TP+BCG. "
             f"Log: {log_path}\n{tail}",
         )
-        if CUSTOM_ALL_REDUCE_V2_MARKER not in result.stdout:
+        if not any(marker in result.stdout for marker in CUSTOM_ALL_REDUCE_V2_MARKERS):
             self.assertIn(
                 GRAPH_BUFFER_REGISTRATION_MARKER,
                 result.stdout,
