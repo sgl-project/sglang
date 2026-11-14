@@ -25,22 +25,6 @@ MODEL_CONFIG = SimpleNamespace(
 )
 
 
-def test_legacy_budget_requires_fused_mode(monkeypatch):
-    monkeypatch.setattr(config, "get_schedule", lambda: SimpleNamespace(page_size=128))
-    monkeypatch.setattr(config, "get_eager_max_batch_size", lambda _: 4)
-    with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(False):
-        with pytest.raises(ValueError):
-            config.get_sparse_kv_budget(
-                model_config=MODEL_CONFIG,
-                request_rows=3,
-                context_len=1024,
-                num_layers=2,
-                top_k=512,
-                kv_bytes_per_token=1152,
-                graph_batch_capacity=4,
-            )
-
-
 @pytest.mark.parametrize(
     "heads,width,expected_heads,valid",
     [

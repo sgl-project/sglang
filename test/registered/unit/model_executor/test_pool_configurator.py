@@ -1185,14 +1185,13 @@ class TestEagleConfigurator(CustomTestCase):
                 context_len=8192 + get_req_to_token_extra_context_len(),
                 top_k=2048,
                 kv_bytes_per_token=576 * 2,
-                copy_sfa_query_heads=128,
             )
             unpadded = get_sparse_kv_budget(num_layers=4, **options)
             manager_bytes = unpadded.managed_hbm_bytes
-            # Five BF16 index-K layers, the draft's full KV, and one target
-            # FP32 scale workspace. Only the target owns bounded residency.
-            cell_size = 5 * 128 * 2 + 576 * 2 + 4
-            fixed = manager_bytes + 128 * 4
+            # Five BF16 index-K layers and the draft's full KV. Only the
+            # target owns bounded residency; BF16 index keys have no scales.
+            cell_size = 5 * 128 * 2 + 576 * 2
+            fixed = manager_bytes
             self.assertEqual(cfg._cell_size, cell_size)
             self.assertEqual(cfg._fixed_overhead_bytes, fixed)
             available = fixed + 10_000_000
@@ -1211,7 +1210,7 @@ class TestEagleConfigurator(CustomTestCase):
                 actual = get_sparse_kv_budget(num_layers=4, **options)
                 self.assertEqual(
                     capped._fixed_overhead_bytes,
-                    actual.managed_hbm_bytes + 128 * 4,
+                    actual.managed_hbm_bytes,
                 )
 
             # Eager MLP-sync can pad a one-row target to attention TP=8 even
@@ -1230,7 +1229,12 @@ class TestEagleConfigurator(CustomTestCase):
                     num_layers=4, graph_batch_capacity=0, **options
                 )
                 self.assertEqual(padded.device_kv_bytes, 3 * 4 * 8192 * 1152)
-                self.assertGreater(padded.copy_sfa_bytes, unpadded.copy_sfa_bytes)
+                self.assertGreater(padded.batch_capacity, unpadded.batch_capacity)
+                self.assertEqual(padded.copy_sfa_query_heads, 16)
+                self.assertEqual(
+                    padded.manager_buffers["fused_attn_out"].shape,
+                    (padded.batch_capacity * 3, 16, 512),
+                )
 
     def test_sparse_mtp_budget_rows_follow_attention_dp_worker_capacity(self):
         """Budget the target manager per attention-DP worker, including PD slots."""

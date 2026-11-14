@@ -89,30 +89,6 @@ class MemFabricKVPool:
 
     def copy_rows(self, sources, destinations, source_rows, destination_rows, valid):
         """Enqueue byte-addressed MF sparse copies on the current NPU stream."""
-        if len(sources) != len(destinations) or not sources:
-            raise ValueError(
-                "Sparse KV copies require matching nonempty component lists"
-            )
-        if (
-            source_rows.ndim != 1
-            or source_rows.shape != destination_rows.shape
-            or source_rows.shape != valid.shape
-        ):
-            raise ValueError(
-                "Sparse KV row indices and validity must be matching vectors"
-            )
-        for source, destination in zip(sources, destinations):
-            if (
-                destination.shape[-1] != source.shape[-1]
-                or destination.dtype != source.dtype
-            ):
-                raise ValueError(
-                    "Sparse KV source and destination widths and dtypes must match"
-                )
-            if not source.is_contiguous() or not destination.is_contiguous():
-                raise ValueError(
-                    "Sparse KV copies require contiguous component buffers"
-                )
         if source_rows.numel() == 0:
             return
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (

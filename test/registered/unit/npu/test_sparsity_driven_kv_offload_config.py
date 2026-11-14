@@ -254,7 +254,6 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             ("null", False, None, 4),
             ("prefill", False, 2, 2),
             ("decode", False, None, 0),
-            ("decode", True, 8, 4),
         ):
             with (
                 self.subTest(mode=mode, switch=switch, cap=cap),
@@ -273,17 +272,21 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                         page_size=128, prefill_max_requests=cap
                     ),
                 ),
+                patch(
+                    prefix + "get_parallel",
+                    return_value=SimpleNamespace(attn_tp_size=1),
+                ),
                 patch(prefix + "get_sparse_kv_max_query_width", return_value=1),
                 patch(prefix + "get_eager_max_batch_size", return_value=4),
             ):
                 plan = get_sparse_kv_budget(
                     model_config=SimpleNamespace(
+                        num_attention_heads=8,
                         kv_lora_rank=512,
                         qk_rope_head_dim=64,
                         index_head_dim=128,
                         hf_config=SimpleNamespace(index_n_heads=64, index_topk=2048),
                     ),
-                    copy_sfa_query_heads=8,
                     request_rows=5,
                     context_len=129,
                     num_layers=1,

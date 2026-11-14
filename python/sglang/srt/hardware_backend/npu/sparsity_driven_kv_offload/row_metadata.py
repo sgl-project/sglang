@@ -5,54 +5,6 @@ from __future__ import annotations
 from sgl_kernel_npu.sparsity_driven_kv_offload import row_metadata as kernels
 
 
-def mtp_rows(
-    batch,
-    query_width,
-    request_rows,
-    context_len,
-    *,
-    publication_rows=None,
-    host_capacity=0,
-):
-    """Pass tensor inputs while retaining framework forward-mode policy."""
-    counts = (
-        batch.spec_info.num_accept_tokens
-        if batch.forward_mode.is_draft_extend_v2()
-        else None
-    )
-    return kernels.mtp_rows(
-        batch.req_pool_indices,
-        batch.seq_lens,
-        batch.positions,
-        batch.out_cache_loc,
-        counts,
-        query_width,
-        request_rows,
-        context_len,
-        publication_rows=publication_rows,
-        host_capacity=host_capacity,
-    )
-
-
-def mtp_publication_rows(batch, num_tokens, request_rows, context_len, host_capacity):
-    """Fuse MTP masks, TP padding, physical bounds and publication indices."""
-    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-        mtp_row_geometry,
-    )
-
-    _, width, _ = mtp_row_geometry(batch, num_tokens)
-    if batch.out_cache_loc is None or batch.out_cache_loc.numel() != num_tokens:
-        raise ValueError("Sparse MTP publication requires one physical row per token")
-    return mtp_rows(
-        batch,
-        width,
-        request_rows,
-        context_len,
-        publication_rows=num_tokens,
-        host_capacity=host_capacity,
-    )
-
-
 def prefill_plan(
     batch,
     manager,

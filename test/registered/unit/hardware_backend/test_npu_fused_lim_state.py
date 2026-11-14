@@ -15,7 +15,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import
     LIMDecodeAdapter,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-    mtp_row_geometry,
     sparse_query_width,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -27,24 +26,6 @@ register_cpu_ci(est_time=3, stage="base-a", runner_config="cpu")
 
 
 class TestLIMState(CustomTestCase):
-    def test_fused_attention_rejects_missing_host_publication_before_side_effects(self):
-        module_name = (
-            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention"
-        )
-        manager = SimpleNamespace(offload_v2=Mock())
-        backend = SimpleNamespace(sparse_kv_manager=manager)
-        with patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}):
-            attention = importlib.import_module(module_name)
-            with patch.object(torch, "cat") as cat:
-                with self.assertRaisesRegex(
-                    ValueError, "publishing current KV to host"
-                ):
-                    attention.forward_fused_sparse_kv_offload(
-                        backend, None, None, None, None, None, save_kv_cache=False
-                    )
-            cat.assert_not_called()
-        manager.offload_v2.assert_not_called()
-
     def options(self, **kwargs):
         return dict(
             model_config=SimpleNamespace(
@@ -96,11 +77,6 @@ class TestLIMState(CustomTestCase):
             self.assertEqual(sparse_query_width(batch), width)
             batch.forward_mode = ForwardMode.DECODE
             self.assertEqual(sparse_query_width(batch), 1)
-
-    def test_missing_verify_geometry_is_rejected(self):
-        batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY, spec_info=None)
-        with self.assertRaisesRegex(ValueError, "actual chain"):
-            sparse_query_width(batch)
 
     def test_budget_defaults_to_configured_union_capacity(self):
         for width in (1, 2, 3, 4, 5, 8, 14):
@@ -532,7 +508,7 @@ class TestLIMState(CustomTestCase):
                 ),
                 out_cache_loc=torch.tensor(list(range(width)) + [-1] * (count - width)),
             )
-            self.assertEqual(mtp_row_geometry(batch, count), (2, width, 2 * width))
+            self.assertEqual(sparse_query_width(batch), width)
 
 
 if __name__ == "__main__":

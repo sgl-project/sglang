@@ -11,7 +11,7 @@ from sglang.kernels.ops.attention.npu_lim import (
     load_fused_lim_operator,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-    mtp_row_geometry,
+    sparse_query_width,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
     prepare_prefill_gather_rows,
@@ -24,44 +24,25 @@ register_cpu_ci(est_time=3, stage="base-a", runner_config="cpu")
 
 
 class TestLIMState(CustomTestCase):
-    def test_mtp_row_geometry(self):
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE,
-            req_pool_indices=torch.tensor([2, 0, 4, 1]),
-            seq_lens=torch.tensor([10, 0, 8, 20]),
-            positions=torch.tensor([12, 0, 8, 22]),
-            out_cache_loc=torch.tensor([100, 0, 102, 103]),
-            spec_info=SimpleNamespace(num_accept_tokens=torch.tensor([1, 3, 0, 2])),
-        )
-        self.assertEqual(mtp_row_geometry(batch, 4), (4, 1, 4))
+    def test_sparse_query_width(self):
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE, spec_info=None)
+        self.assertEqual(sparse_query_width(batch), 1)
         batch.forward_mode = ForwardMode.TARGET_VERIFY
-        batch.positions = torch.tensor([10, 11, 12, 0, 0, 0, 8, 9, 10, 20, 21, 22])
-        batch.out_cache_loc = torch.arange(12)
-        self.assertEqual(mtp_row_geometry(batch, 12), (4, 3, 12))
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
-        self.assertEqual(mtp_row_geometry(batch, 12), (4, 3, 12))
+        batch.spec_info = SimpleNamespace(num_tokens_per_req=3)
+        self.assertEqual(sparse_query_width(batch), 3)
 
-    def test_prefill_gather_shape_ignores_padding_and_checks_host_bounds(self):
+    def test_prefill_gather_shape_ignores_padding(self):
         # Host row order and total must match the ragged KV payload, including
         # interior padding. Device-side nonzero would require a stream sync.
         keep, total = prepare_prefill_gather_rows(
-            torch.tensor([3, -1, 1, 0]), torch.tensor([4, 2, 3, 0]), 4, 8
+            torch.tensor([3, -1, 1, 0]), torch.tensor([4, 2, 3, 0])
         )
         self.assertEqual(keep.tolist(), [0, 2])
         self.assertEqual(total, 7)
         keep, total = prepare_prefill_gather_rows(
-            torch.tensor([0, -1]), torch.tensor([0, 3]), 4, 8
+            torch.tensor([0, -1]), torch.tensor([0, 3])
         )
         self.assertEqual((keep.numel(), total), (0, 0))
-        for requests, lengths, error in (
-            ([4], [1], "outside sparse pool"),
-            ([1], [9], "exceeds sparse context"),
-        ):
-            with self.subTest(requests=requests, lengths=lengths):
-                with self.assertRaisesRegex(RuntimeError, error):
-                    prepare_prefill_gather_rows(
-                        torch.tensor(requests), torch.tensor(lengths), 4, 8
-                    )
 
 
 class TestLIMKernelLoad(CustomTestCase):

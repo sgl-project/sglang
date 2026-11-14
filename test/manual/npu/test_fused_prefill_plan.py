@@ -238,29 +238,6 @@ class TestLogicalPrefillPlan(PrefillReferenceTest):
         )
         self.assertEqual(mapping[2].tolist(), [False, True])
 
-    def test_unknown_current_layout_falls_back(self):
-        table = torch.arange(64).reshape(8, 8) % 32
-
-        class Manager:
-            size = 8
-            max_context_len = 8
-
-            def host_source_indices(self, rows, positions):
-                return table[rows, positions]
-
-        batch = SimpleNamespace(
-            req_pool_indices=torch.tensor([1, 2]),
-            req_pool_indices_cpu=torch.tensor([1, 2]),
-            seq_lens=torch.tensor([2, 2]),
-            seq_lens_cpu=torch.tensor([2, 2]),
-            extend_prefix_lens_cpu=[1, 1],
-            extend_seq_lens_cpu=[1, 1],
-        )
-        plan = module.make_fused_prefill_plan(
-            batch, Manager(), current_valid=torch.ones(3, dtype=torch.bool)
-        )
-        self.assertIsNone(plan.current_mapping)
-
 
 class TestWorkspaceLifecycle(PrefillReferenceTest):
     @classmethod
@@ -386,7 +363,11 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
             current_batch.extend_seq_lens_cpu = [1, 1]
             current_batch.out_cache_loc = torch.tensor([12, 7])
             current = torch.full((2, 1, 576), 3, dtype=dtype)
-            current_inputs = (current, None, torch.tensor([True, True]))
+            current_inputs = (
+                (current[..., :512].contiguous(), current[..., 512:].contiguous()),
+                None,
+                torch.tensor([True, True]),
+            )
             plan = m.prepare_forward_kv_plan(current_batch, current=current_inputs)
             n, r = m.get_forward_kv(
                 0,

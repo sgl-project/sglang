@@ -23,29 +23,13 @@ def forward_fused_sparse_kv_offload(
     k_rope: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
 ):
-    """Publish current KV before fused attention.
-
-    MLAPO writes the native device pool, not this manager's host pool. Its
-    ``save_kv_cache=False`` mode is therefore unsupported for fused offload.
-    """
+    """Publish current KV before fused attention."""
     del v
-    if not save_kv_cache:
-        raise ValueError(
-            "Fused sparse KV attention requires publishing current KV to host storage."
-        )
-    if q_rope is None or k_rope is None or topk_indices is None:
-        raise ValueError("Sparse KV attention requires RoPE and indexer outputs.")
     manager = backend.sparse_kv_manager
-    if manager is None:
-        raise RuntimeError("Sparse KV offload has no native manager.")
     if q.shape[0] == 0:
         return q.new_empty((0, layer.tp_q_head_num * backend.kv_lora_rank))
     is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
     plan = None if is_prefill else backend.forward_metadata.sparse_kv_lim_plan
-    if not is_prefill and plan is None:
-        raise RuntimeError(
-            "Fused target attention requires its indexer owner's LIM plan."
-        )
     k_nope = k.view(-1, layer.tp_k_head_num, backend.kv_lora_rank).contiguous()
     k_pe = k_rope.view(-1, layer.tp_k_head_num, backend.qk_rope_head_dim).contiguous()
     current_inputs = manager.offload_v2(k_nope, k_pe, layer, forward_batch)

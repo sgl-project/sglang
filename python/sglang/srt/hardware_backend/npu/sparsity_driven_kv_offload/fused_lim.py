@@ -72,8 +72,6 @@ class LIMDecodeAdapter:
         batch = forward_batch.batch_size
         width = sparse_query_width(forward_batch)
         rows = batch * width
-        if block_table.shape[0] != batch:
-            raise ValueError("LIM source table must match the padded request batch.")
         columns = min(block_table.shape[1], self.block_table.shape[1])
         layer_index = layer_id - manager.start_layer
         self._fused_prepare_lim_metadata(

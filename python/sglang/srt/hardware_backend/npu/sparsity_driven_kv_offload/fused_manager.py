@@ -69,10 +69,6 @@ class ShmSplitKVPool:
         return None if pointer is None else pointer + tensor.data_ptr() - base
 
     def copy_rows(self, sources, destinations, source_rows, destination_rows, valid):
-        if len(sources) != len(destinations) or not sources:
-            raise ValueError(
-                "Sparse KV copies require matching nonempty component lists"
-            )
         for source, destination in zip(sources, destinations):
             src_ptr = self._device_pointer(source)
             dst_ptr = self._device_pointer(destination)
@@ -417,180 +413,61 @@ class FusedSparseKVCacheManager:
         forward_batch: ForwardBatch,
     ):
         """Publish KV to paged host storage and return decode rows for CopySFA."""
+        from sglang.kernels.ops.kvcache import prepare_sparse_kv_publication
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+            sparse_query_width,
+        )
+
         layer_idx = layer.layer_id - self.start_layer
-        device = k.device
-
-        # k:         [num_new_tokens, nhead, kv_lora_rank]
-        # k_rope:    [num_new_tokens, nhead, qk_rope_head_dim]
-        # kv_device: [num_new_tokens, nhead, kv_lora_rank + qk_rope_head_dim]
-        src_tensor = torch.cat([k, k_rope], dim=-1).contiguous()
-
-        num_src_kvs = int(src_tensor.shape[0])
-        fused_mtp_rows = not forward_batch.forward_mode.is_extend_without_speculative()
-        if not fused_mtp_rows:
-            src_index = torch.arange(num_src_kvs, device=device, dtype=torch.long)
-
-        if fused_mtp_rows:
-            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
-                mtp_publication_rows,
-            )
-
-            src_index, dst_index, token_positions, valid_mask = mtp_publication_rows(
-                forward_batch,
-                num_src_kvs,
-                self.size,
-                self.logical_max_context_len,
-                self.host_token_capacity,
-            )
-        else:
-            if (
-                forward_batch.extend_seq_lens is None
-                or forward_batch.extend_prefix_lens is None
-            ):
-                raise RuntimeError(
-                    "Sparse v2 prefill offload requires extend_seq_lens and "
-                    "extend_prefix_lens in ForwardBatch."
-                )
-
-            req_ids = forward_batch.req_pool_indices.to(torch.long)
-            extend_seq_lens = forward_batch.extend_seq_lens.to(torch.long)
-            extend_prefix_lens = forward_batch.extend_prefix_lens.to(torch.long)
-
-            batch_size = int(req_ids.shape[0])
-            if batch_size <= 0:
-                return
-
-            if int(extend_seq_lens.shape[0]) != batch_size:
-                raise RuntimeError(
-                    "Sparse v2 prefill offload expects extend_seq_lens to be "
-                    f"padded to batch size {batch_size}, got "
-                    f"{int(extend_seq_lens.shape[0])}."
-                )
-
-            prefix_len_size = int(extend_prefix_lens.shape[0])
-            if prefix_len_size < batch_size:
-                extend_prefix_lens = torch.cat(
-                    [
-                        extend_prefix_lens,
-                        torch.zeros(
-                            batch_size - prefix_len_size,
-                            device=device,
-                            dtype=torch.long,
-                        ),
-                    ],
-                    dim=0,
-                )
-            elif prefix_len_size > batch_size:
-                raise RuntimeError(
-                    "Sparse v2 prefill offload expects extend_prefix_lens length "
-                    f"<= batch size {batch_size}, got {prefix_len_size}."
-                )
-
-            if forward_batch.extend_seq_lens_cpu is not None:
-                extend_seq_lens_sum = int(
-                    sum(forward_batch.extend_seq_lens_cpu[:batch_size])
-                )
-            else:
-                extend_seq_lens_sum = int(extend_seq_lens.sum().item())
-            if extend_seq_lens_sum == num_src_kvs:
-                # Chunk prefill emits compact rows as [req0 tokens][req1 tokens]...
-                # instead of graph-captured padded [B, tokens_per_req] rows.
-                seq_starts = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens
-                flat_req_ids = torch.repeat_interleave(
-                    req_ids, extend_seq_lens, output_size=num_src_kvs
-                )
-                flat_seq_starts = torch.repeat_interleave(
-                    seq_starts, extend_seq_lens, output_size=num_src_kvs
-                )
-                flat_prefix_lens = torch.repeat_interleave(
-                    extend_prefix_lens, extend_seq_lens, output_size=num_src_kvs
-                )
-                token_pos = (
-                    flat_prefix_lens
-                    + torch.arange(num_src_kvs, device=device, dtype=torch.long)
-                    - flat_seq_starts
-                )
-                token_positions = token_pos
-                valid_mask = (
-                    (flat_req_ids > 0)
-                    & (token_pos >= 0)
-                    & (token_pos < self.max_context_len)
-                )
-            else:
-                if num_src_kvs % batch_size != 0:
-                    raise RuntimeError(
-                        "Sparse v2 prefill offload expects either compact ragged "
-                        "layout with rows=sum(extend_seq_lens) or graph-style "
-                        f"row-major layout [B, tokens_per_req], got rows={num_src_kvs}, "
-                        f"batch={batch_size}, extend_seq_lens_sum={extend_seq_lens_sum}."
-                    )
-
-                # Graph-friendly static layout:
-                # compact rows are interpreted as [batch_size, tokens_per_req].
-                # Invalid padded columns are masked by local_offsets < extend_seq_lens.
-                tokens_per_req = num_src_kvs // batch_size
-
-                local_offsets = (
-                    torch.arange(tokens_per_req, device=device, dtype=torch.long)
-                    .unsqueeze(0)
-                    .expand(batch_size, tokens_per_req)
-                )
-                req_ids_2d = req_ids.unsqueeze(1).expand(batch_size, tokens_per_req)
-                token_pos_2d = extend_prefix_lens.unsqueeze(1) + local_offsets
-
-                token_positions = token_pos_2d.reshape(-1).contiguous()
-                valid_mask = (
-                    (local_offsets < extend_seq_lens.unsqueeze(1))
-                    & (req_ids_2d > 0)
-                    & (token_pos_2d >= 0)
-                    & (token_pos_2d < self.max_context_len)
-                ).reshape(-1)
-
-            if (
-                forward_batch.out_cache_loc is not None
-                and int(forward_batch.out_cache_loc.numel()) == num_src_kvs
-            ):
-                valid_mask = valid_mask & (
-                    forward_batch.out_cache_loc.to(torch.long) >= 0
-                )
-            valid_mask = valid_mask.contiguous()
-
-        if not fused_mtp_rows:
-            dst_index = forward_batch.out_cache_loc.to(torch.long).reshape(-1)
-            valid_mask = (
-                valid_mask & (dst_index >= 0) & (dst_index < self.host_token_capacity)
-            )
-        assert src_index.shape == dst_index.shape == valid_mask.shape
-
+        is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        compact_prefill = is_prefill and (
+            sum(forward_batch.extend_seq_lens_cpu[: forward_batch.batch_size])
+            == k.shape[0]
+        )
+        src, dst, positions, valid, current = prepare_sparse_kv_publication(
+            k,
+            k_rope,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            None if is_prefill else forward_batch.positions,
+            forward_batch.out_cache_loc,
+            request_rows=self.size,
+            context_len=(
+                self.max_context_len if is_prefill else self.logical_max_context_len
+            ),
+            host_capacity=self.host_token_capacity,
+            query_width=1 if is_prefill else sparse_query_width(forward_batch),
+            extend_seq_lens=forward_batch.extend_seq_lens if is_prefill else None,
+            extend_prefix_lens=forward_batch.extend_prefix_lens if is_prefill else None,
+            compact_prefill=compact_prefill,
+        )
         if self.host_pool.rank == 0:
             self.host_pool.copy_rows(
-                (k.contiguous(), k_rope.contiguous()),
+                (k, k_rope),
                 (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
-                src_index,
-                dst_index,
-                valid_mask,
+                src,
+                dst,
+                valid,
             )
         self.host_pool.publish()
 
-        if forward_batch.forward_mode.is_extend_without_speculative():
+        if is_prefill:
             # A prefill can rewrite an existing request's host prefix.
             # Invalidate only this layer's resident extent.
             requests = forward_batch.req_pool_indices.to(torch.long)
             self.resident_begin[layer_idx].index_fill_(0, requests, -1)
             self.resident_end[layer_idx].index_fill_(0, requests, -1)
 
-        return src_tensor, token_positions, valid_mask
+        return current, positions, valid
 
     def prepare_forward_kv_plan(self, forward_batch, current=None):
         """Use a fixed budgeted workspace on the current compute stream."""
-        capacity = getattr(self.budget, "prefill_workspace_tokens", 0)
+        capacity = self.budget.prefill_workspace_tokens
         if not capacity:
             return None
         prepared = prepare_prefill_gather_rows(
             forward_batch.req_pool_indices_cpu,
             forward_batch.seq_lens_cpu,
-            self.size,
-            self.max_context_len,
         )
         _, total = prepared
         if not total or total > capacity:
@@ -626,17 +503,6 @@ class FusedSparseKVCacheManager:
         """
         layer_id = layer.layer_id if hasattr(layer, "layer_id") else int(layer)
         layer_idx = layer_id - self.start_layer
-        if layer_idx < 0 or layer_idx >= self.layer_num:
-            raise RuntimeError(
-                f"Invalid sparse KV layer id {layer_id}; start_layer="
-                f"{self.start_layer}, layer_num={self.layer_num}."
-            )
-
-        if forward_batch.req_pool_indices is None or forward_batch.seq_lens is None:
-            raise RuntimeError(
-                "get_forward_kv requires req_pool_indices and seq_lens in ForwardBatch."
-            )
-
         device = (
             forward_batch.req_pool_indices.device
             if forward_batch.req_pool_indices.device.type == "npu"
@@ -661,13 +527,11 @@ class FusedSparseKVCacheManager:
             if mapping is not None:
                 src, dst, valid, _ = mapping
                 for component, output in zip(
-                    current_payload.split(
-                        (self.kv_lora_rank, self.qk_rope_head_dim), dim=-1
-                    ),
+                    current_payload,
                     (nope, rope),
                 ):
                     unidex_copy_inplace(
-                        component.contiguous(),
+                        component,
                         output,
                         src,
                         dst,
@@ -681,23 +545,10 @@ class FusedSparseKVCacheManager:
         req_ids = forward_batch.req_pool_indices.to(device=device, dtype=torch.long)
         seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.long)
 
-        if int(req_ids.numel()) != int(seq_lens.numel()):
-            raise RuntimeError(
-                "get_forward_kv expects req_pool_indices and seq_lens to have the "
-                f"same length, got {int(req_ids.numel())} and "
-                f"{int(seq_lens.numel())}."
-            )
-
         keep_cpu, total_tokens = prepare_prefill_gather_rows(
             forward_batch.req_pool_indices_cpu,
             forward_batch.seq_lens_cpu,
-            self.size,
-            self.max_context_len,
         )
-        if forward_batch.req_pool_indices_cpu.numel() != req_ids.numel():
-            raise RuntimeError(
-                "Prefill CPU and device metadata must have matching sizes"
-            )
         if total_tokens == 0:
             empty_nope = torch.empty(
                 (0, self.head_num, self.kv_lora_rank),

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import torch
 import triton
 import triton.language as tl
 
@@ -105,87 +104,7 @@ def fused_prepare_lim_metadata(
     positions=None,
 ) -> None:
     """Fill request inputs and source pages; positions supply the actual visible length."""
-    if seq_lens.dtype not in (torch.int32, torch.int64):
-        raise TypeError("seq_lens must be int32 or int64")
-    if request_slots.dtype not in (torch.int32, torch.int64):
-        raise TypeError("request_slots must be int32 or int64")
-    if seq_lens.ndim != 1 or request_slots.ndim != 1:
-        raise ValueError("seq_lens and request_slots must be one-dimensional")
-    if not seq_lens.is_contiguous() or not request_slots.is_contiguous():
-        raise ValueError("seq_lens and request_slots must be contiguous")
-    if not isinstance(capacity, int) or capacity <= 0 or capacity % 128:
-        raise ValueError("capacity must be positive and aligned to 128")
-    if not isinstance(request_rows, int) or request_rows <= 0:
-        raise ValueError("request_rows must be positive")
     batch = seq_lens.numel()
-    if positions is not None and (
-        positions.device != seq_lens.device
-        or positions.ndim != 1
-        or positions.numel() != batch * query_width
-        or not positions.is_contiguous()
-        or positions.dtype not in (torch.int32, torch.int64)
-    ):
-        raise ValueError("positions must be contiguous same-device integer [B*Q].")
-    if not 1 <= query_width <= 16:
-        raise ValueError("query_width must be in [1,16]")
-    if batch <= 0 or request_slots.numel() != batch:
-        raise ValueError("seq_lens and request_slots must have equal nonzero length")
-    if seq_lens.device.type != "npu" or request_slots.device != seq_lens.device:
-        raise ValueError("pre-metadata kernel requires same-device NPU inputs")
-    if (
-        last_prefix.dtype != torch.int32
-        or last_prefix.ndim != 1
-        or last_prefix.numel() != request_rows + 1
-    ):
-        raise ValueError("last_prefix must be int32 [request_rows + 1]")
-    if last_prefix.device != seq_lens.device or not last_prefix.is_contiguous():
-        raise ValueError("last_prefix must be contiguous on the input device")
-    if (
-        block_table.device != seq_lens.device
-        or out_block_table.device != seq_lens.device
-    ):
-        raise ValueError("block tables must be on the input device")
-    if block_table.dtype != torch.int32 or out_block_table.dtype != torch.int32:
-        raise TypeError("block tables must be int32")
-    if block_table.ndim != 2 or out_block_table.ndim != 2:
-        raise ValueError("block tables must be rank two")
-    if block_table.shape[0] != batch or out_block_table.shape[0] < batch:
-        raise ValueError("block-table batch mismatch")
-    if out_block_table.shape[1] < block_table.shape[1]:
-        raise ValueError("destination block table cannot truncate source columns")
-    if out_block_table.shape[1] <= 0 or not out_block_table.is_contiguous():
-        raise ValueError("destination block table must be nonempty and contiguous")
-    if any(stride < 0 for stride in block_table.stride()) or any(
-        stride < 0 for stride in out_block_table.stride()
-    ):
-        raise ValueError("negative block-table strides are unsupported")
-    outputs = (
-        safe_slots,
-        lengths,
-        prefixes,
-        sparse_rows,
-        valid_rows,
-        request_states,
-        next_prefixes,
-        cache_sizes,
-    )
-    expected_dtypes = (
-        torch.int32,
-        torch.int32,
-        torch.int32,
-        torch.bool,
-        torch.bool,
-        torch.int32,
-        torch.int32,
-        torch.int32,
-    )
-    for output, dtype in zip(outputs, expected_dtypes):
-        if output.dtype != dtype or output.device != seq_lens.device:
-            raise TypeError(
-                "all preallocated outputs must have the specified dtype/device"
-            )
-        if output.ndim != 1 or output.numel() < batch or not output.is_contiguous():
-            raise ValueError("preallocated outputs must be contiguous [batch_capacity]")
     cols = out_block_table.shape[1]
     block = 128
     _prepare_kernel[(triton.cdiv(cols, block), batch)](

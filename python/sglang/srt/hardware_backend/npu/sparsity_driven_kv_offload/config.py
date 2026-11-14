@@ -178,19 +178,15 @@ def get_sparse_kv_budget(
     num_layers: int,
     top_k: int,
     kv_bytes_per_token: int,
-    copy_sfa_query_heads: Optional[int] = None,
     graph_batch_capacity: Optional[int] = None,
     kv_dtype: torch.dtype = torch.bfloat16,
 ) -> BudgetPlan:
-    if not use_fused_sparse_kv_offload():
-        raise ValueError("Sparse KV budgeting requires fused LIM and CopySFA.")
-    if copy_sfa_query_heads is None:
-        query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
-        # Native SFA accepts 1..64 or 128 query heads per KV head.
-        copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
+    query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
+    # Native SFA accepts 1..64 or 128 query heads per KV head.
+    copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
     disagg = get_disagg()
     prefill_rows = request_rows - 1
-    if disagg.disaggregation_mode == "decode" and not disagg.enable_pd_role_switch:
+    if disagg.disaggregation_mode == "decode":
         prefill_rows = 0
     elif get_schedule().prefill_max_requests is not None:
         prefill_rows = min(prefill_rows, get_schedule().prefill_max_requests)
