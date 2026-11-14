@@ -379,6 +379,12 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         if self.world_size == 1:
             return input_
+        if (scatter_dim, gather_dim) in ((2, 1), (1, 2)):
+            from .device_communicators.flashinfer_ulysses import exchange
+
+            out = exchange(input_, self.device_group, scatter=scatter_dim == 2)
+            if out is not None:
+                return out
         return self.device_communicator.all_to_all_4D(input_, scatter_dim, gather_dim)
 
     def all_reduce(
