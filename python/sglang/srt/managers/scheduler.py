@@ -346,6 +346,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocation import retire_window_before_chunk
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
@@ -4595,6 +4596,14 @@ class Scheduler(
             prefill_tile_block_m = attn_backend.extend_attention_block_m
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
+
+        # The adder sizes the next chunk from the window's free rows, so the rows
+        # the request no longer reads go back first. dLLM sizes its blocks from
+        # its own token budget instead.
+        if self.chunked_req is not None and self.dllm_config is None:
+            retire_window_before_chunk(
+                self.chunked_req, self.tree_cache, enable_overlap=self.enable_overlap
+            )
 
         adder = self.get_prefill_adder_class()(
             self.page_size,

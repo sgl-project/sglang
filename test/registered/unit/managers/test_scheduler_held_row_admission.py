@@ -97,7 +97,9 @@ class TestHeldRowAdmission(CustomTestCase):
         s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(
-            buffer_pipeline=None, storage_prefetch_retries=None
+            buffer_pipeline=None,
+            storage_prefetch_retries=None,
+            supports_swa=lambda: False,
         )
         s.token_to_kv_pool_allocator = SimpleNamespace(
             state_slots=None, pools_share_memory=False

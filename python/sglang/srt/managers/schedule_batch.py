@@ -113,6 +113,7 @@ from sglang.srt.mem_cache.allocation import (
     alloc_for_decode,
     alloc_for_extend,
     alloc_tracking_slots,
+    prefill_window_frontier,
     retire_window,
 )
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
@@ -3614,24 +3615,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         several_windows or req.decode_batch_idx >= retain_window
                     ):
                         self.tree_cache.release_swa_prefix_lock(req)
-                elif (
-                    self.forward_mode.is_extend()
-                    and not self.tree_cache.supports_prefix_sharing()
-                ):
-                    pre_len = self.prefix_lens[idx]
-                    if self.enable_overlap:
-                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
-                        if req.extend_batch_idx < 2:
-                            continue
-                        else:
-                            pre_len = (
-                                pre_len - get_schedule().chunked_prefill_size
-                                if get_schedule().chunked_prefill_size > 0
-                                else pre_len
-                            )
-                            self._evict_swa(req, pre_len)
-                    else:
-                        self._evict_swa(req, pre_len)
+                elif self.forward_mode.is_extend():
+                    # Shared with `retire_window_before_chunk`, which retires a
+                    # chunked request to this frontier before its chunk is sized.
+                    frontier = prefill_window_frontier(
+                        req,
+                        self.prefix_lens[idx],
+                        self.tree_cache,
+                        enable_overlap=self.enable_overlap,
+                    )
+                    if frontier is not None:
+                        self._evict_swa(req, frontier)
             self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
