@@ -82,3 +82,41 @@ def test_role_switch_forwards_decode_graph_requirements(monkeypatch):
     assert response.status_code == 200
     assert sent_body["decode_cuda_graph_bs"] == [1, 2, 4]
     assert sent_body["decode_cuda_graph_memory_gb"] == 1.25
+
+
+def test_switch_to_prefill_waits_settle_secs_before_routing(monkeypatch):
+    worker_url = "http://decode-b:8000"
+    load_balancer = mini_lb.MiniLoadBalancer.__new__(mini_lb.MiniLoadBalancer)
+    load_balancer.timeout = 1
+    load_balancer.prefill_urls = ["http://prefill:8000"]
+    load_balancer.prefill_bootstrap_ports = [8998]
+    load_balancer.decode_urls = ["http://decode-a:8000", worker_url]
+    monkeypatch.setattr(mini_lb, "lb", load_balancer)
+
+    async def post_role_switch(*_args, **_kwargs):
+        return 200, {"success": True, "message": "ok"}
+
+    waits = []
+
+    async def sleep(seconds):
+        # Not routable as a prefill while decode workers refresh their caches.
+        assert worker_url not in load_balancer.prefill_urls
+        waits.append(seconds)
+
+    monkeypatch.setattr(mini_lb, "_post_role_switch", post_role_switch)
+    monkeypatch.setattr(mini_lb.asyncio, "sleep", sleep)
+    response = asyncio.run(
+        mini_lb.pd_role_switch(
+            {
+                "worker_url": worker_url,
+                "new_role": "prefill",
+                "bootstrap_port": 8999,
+                "settle_secs": 5,
+            }
+        )
+    )
+
+    assert response.status_code == 200
+    assert waits == [5.0]
+    assert worker_url in load_balancer.prefill_urls
+    assert worker_url not in load_balancer.decode_urls

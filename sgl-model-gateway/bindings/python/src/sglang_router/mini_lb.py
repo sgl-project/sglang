@@ -308,7 +308,8 @@ async def pd_role_switch(request_data: dict):
     """Switch a running server's PD role (prefill<->decode) at runtime and
     update the LB's routing lists. Body: {"worker_url", "new_role":
     "prefill"|"decode", "bootstrap_port"?, "decode_cuda_graph_bs"?,
-    "decode_cuda_graph_memory_gb"?, "drain"?, "drain_timeout_secs"?}.
+    "decode_cuda_graph_memory_gb"?, "drain"?, "drain_timeout_secs"?,
+    "settle_secs"?}.
 
     The backend rejects a switch unless the instance is idle. To make this
     safe while serving, by default the LB first removes the server from its
@@ -350,6 +351,10 @@ async def pd_role_switch(request_data: dict):
             lb.add_worker(worker_url, old_role, old_port)
         return ORJSONResponse(content=result, status_code=status)
 
+    settle_secs = float(request_data.get("settle_secs", 0) or 0)
+    if new_role == "prefill" and settle_secs > 0:
+        # Let decode heartbeats see the prefill's new bootstrap epoch first.
+        await asyncio.sleep(settle_secs)
     lb.apply_role_switch(worker_url, new_role, request_data.get("bootstrap_port"))
     return ORJSONResponse(content=result, status_code=200)
 
