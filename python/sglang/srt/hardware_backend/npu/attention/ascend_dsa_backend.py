@@ -378,7 +378,7 @@ def _get_topk_npu(
     pool = get_token_to_kv_pool()
     kv = pool.layer_router.read(layer_id)
     pool, layer_id = kv.view, kv.view_layer_id
-    indices = pool_key_indexer(
+    indices, _ = pool_key_indexer(
         query=query_safe,
         pool_key=pool.get_index_k_buffer(layer_id),
         weights=weights_safe,
