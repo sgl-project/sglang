@@ -20,6 +20,7 @@ import zmq
 from transformers import AutoProcessor
 from zmq.utils.monitor import recv_monitor_message
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     DispatchPolicy,
     PoolDispatcher,
@@ -42,6 +43,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     decode_transfer_msg,
     encode_transfer_msg,
     is_transfer_message,
+)
+from sglang.multimodal_gen.runtime.disaggregation.transport.request import (
+    RequestUnpickler,
+    request_pickle_globals,
 )
 from sglang.multimodal_gen.runtime.observability.metrics import init_metrics
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -186,7 +191,9 @@ class DiffusionServer:
         image_encoder_work_endpoints: list[str] | None = None,
         prompt_encoder_result_endpoint: str | None = None,
         image_encoder_result_endpoint: str | None = None,
+        sampling_params_cls: type = SamplingParams,
     ):
+        self._request_pickle_globals = request_pickle_globals(sampling_params_cls)
         split_encoding = bool(
             prompt_encoder_work_endpoints or image_encoder_work_endpoints
         )
@@ -547,7 +554,7 @@ class DiffusionServer:
         payload = parts[-1]
 
         try:
-            reqs = pickle.loads(payload)
+            reqs = RequestUnpickler(payload, self._request_pickle_globals).load()
             if not isinstance(reqs, list):
                 reqs = [reqs]
             if len(reqs) != 1:

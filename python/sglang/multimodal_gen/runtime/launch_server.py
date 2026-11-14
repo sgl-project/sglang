@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    resolve_sampling_params_cls,
+)
 from sglang.multimodal_gen.runtime.managers.worker_bootstrap import (
     SchedulerProcessSpec,
     ServerArgsPayload,
@@ -411,6 +414,7 @@ def launch_pool_disagg_server(
         frontend_endpoint = f"tcp://{host}:{server_args.scheduler_port}"
 
         diffusion_server = DiffusionServer(
+            sampling_params_cls=resolve_sampling_params_cls(server_args),
             frontend_endpoint=frontend_endpoint,
             encoder_work_endpoints=encoder_work_endpoints,
             denoiser_work_endpoints=denoiser_work_endpoints,
@@ -564,6 +568,7 @@ def launch_disagg_server(server_args: ServerArgs):
         {"denoiser_capacity_per_worker": 1} if glm_distributed_mode_enabled else {}
     )
     diffusion_server = DiffusionServer(
+        sampling_params_cls=resolve_sampling_params_cls(server_args),
         frontend_endpoint=frontend_endpoint,
         encoder_work_endpoints=encoder_work_endpoints,
         denoiser_work_endpoints=denoiser_work_endpoints,
