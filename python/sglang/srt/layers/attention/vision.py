@@ -373,6 +373,19 @@ class VisionSdpaAttention(nn.Module):
         if cu_seqlens is None:
             return None
 
+        if cu_seqlens.is_cuda and torch.cuda.is_current_stream_capturing():
+            # Compute the mask on device from cu_seqlens during graph capture.
+            positions = torch.arange(s, device=cu_seqlens.device)
+            if flatten_batch:
+                sequence_ids = torch.searchsorted(cu_seqlens, positions, right=True)
+                valid = (positions >= cu_seqlens[0]) & (positions < cu_seqlens[-1])
+                mask = sequence_ids[:, None] == sequence_ids[None, :]
+                return (mask & valid[:, None] & valid[None, :]).unsqueeze(0)
+
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            valid = positions[None, :] < seq_lens[:, None]
+            return valid[:, None, :, None] & valid[:, None, None, :]
+
         cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
 
         return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
@@ -388,6 +401,8 @@ class VisionSdpaAttention(nn.Module):
             or bsz != 1
             or self.softmax_in_single_precision
             or self.num_kv_heads != self.num_heads
+            # Per-sequence splitting reads cu_seqlens on CPU and fixes slice shapes.
+            or (cu_seqlens.is_cuda and torch.cuda.is_current_stream_capturing())
         ):
             return None
         cu = cu_seqlens.tolist()
