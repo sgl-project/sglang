@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/kv_cache.py
 
 import logging
+from typing import Optional
 
 import torch
 
@@ -11,6 +12,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -81,3 +83,23 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
+
+
+def add_kv_cache_quant_methods(
+    module: torch.nn.Module,
+    quant_config: Optional[QuantizationConfig],
+    prefix: str = "",
+) -> None:
+    """Give the attention layers of a module built with quant_config=None (an
+    unquantized draft layer) the KV-cache method of `quant_config`."""
+    if quant_config is None:
+        return
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    for name, layer in module.named_modules():
+        if isinstance(layer, RadixAttention) and layer.quant_method is None:
+            layer.quant_method = quant_config.get_quant_method(
+                layer, prefix=add_prefix(name, prefix)
+            )
+            if layer.quant_method is not None:
+                layer.quant_method.create_weights(layer)

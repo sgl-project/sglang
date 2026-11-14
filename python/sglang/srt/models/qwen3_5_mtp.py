@@ -29,6 +29,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.quantization.kv_cache import add_kv_cache_quant_methods
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -113,6 +114,23 @@ def _mtp_quant_config(quant_config):
     return quant_config
 
 
+def _mtp_kv_cache_quant_config(quant_config):
+    """The quant config whose KV-cache method the MTP attention keeps.
+
+    `_mtp_quant_config` builds the MTP module of a ModelOpt checkpoint
+    unquantized when the checkpoint keeps it in BF16. The checkpoint's KV-cache
+    quantization still applies to the MTP attention, as it does to the
+    target's attention.
+    """
+    if (
+        quant_config is not None
+        and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
+        and _mtp_quant_config(quant_config) is None
+    ):
+        return quant_config
+    return None
+
+
 class Qwen3_5ForCausalLMMTP(nn.Module):
     # The loader reads this off the model class and hands it to the quant
     # config, which needs it to expand fused module names (qkv_proj ->
@@ -138,6 +156,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        kv_cache_quant_config = _mtp_kv_cache_quant_config(quant_config)
         quant_config = self.own_quant_config(config, quant_config)
 
         self.is_multimodal = hasattr(config, "text_config")
@@ -165,6 +184,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
+        )
+        add_kv_cache_quant_methods(
+            self.model, kv_cache_quant_config, add_prefix("mtp", prefix)
         )
 
         if get_parallel().pp_group.is_last_rank:
