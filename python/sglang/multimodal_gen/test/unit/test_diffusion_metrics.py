@@ -66,7 +66,9 @@ def test_scheduler_counts_original_requests_and_cleans_up(
 ):
     collector, registry = metrics
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.server_args = SimpleNamespace(pipeline_config=PipelineConfig())
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=PipelineConfig(), stage_role=None
+    )
     scheduler.worker = SimpleNamespace(release_cache_if_idle=Mock())
     scheduler._async_output_save = False
     scheduler._inflight_finalizes = deque()

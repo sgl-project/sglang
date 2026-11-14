@@ -16,6 +16,11 @@ from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 import torch
 from tqdm import tqdm
 
+from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
+    Deployment,
+    ExecutionPlan,
+    StageSpec,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -61,6 +66,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.postprocess import (
+    PostprocessStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
     ProgressiveDenoisingStageRouter,
@@ -98,6 +106,8 @@ class ComposedPipelineBase(ABC):
     _external_component_paths: Mapping[str, str] = MappingProxyType({})
     # Exact module keys; unspecified components retain the default loader dispatch.
     component_loaders: ClassVar[dict[str, type[ComponentLoader]]] = {}
+    stage_specs: ClassVar[tuple[StageSpec, ...]] = ()
+    deployment_plan: ExecutionPlan | None = None
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
     executor: PipelineExecutor | None = None
@@ -125,6 +135,13 @@ class ComposedPipelineBase(ABC):
         use. The pipeline should be stateless and not hold any batch state.
         """
         self.server_args = server_args
+        self.deployment_plan = (
+            ExecutionPlan.compile(
+                Deployment.load(server_args.stage_deployment), self.stage_specs
+            )
+            if server_args.stage_deployment
+            else None
+        )
         self._disagg_role = server_args.disagg_role
         self.validate_disagg_role(self._disagg_role)
 
@@ -147,6 +164,11 @@ class ComposedPipelineBase(ABC):
             base_required_config_modules = COMFYUI_REQUIRED_MODULES
         self._unfiltered_required_config_modules = tuple(base_required_config_modules)
         self._required_config_modules = list(self._unfiltered_required_config_modules)
+        if self.deployment_plan is not None:
+            required = self.deployment_plan.roles[server_args.stage_role].components
+            self._required_config_modules = [
+                name for name in self._required_config_modules if name in required
+            ]
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
@@ -198,6 +220,12 @@ class ComposedPipelineBase(ABC):
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
+        if self.deployment_plan is not None:
+            expected = self.deployment_plan.roles[self.server_args.stage_role].stages
+            if tuple(self._stage_name_mapping) != expected:
+                raise ValueError(
+                    f"Instantiated stages {tuple(self._stage_name_mapping)} do not match placement {expected}"
+                )
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         return self.modules.get(module_name, default_value)
@@ -529,6 +557,10 @@ class ComposedPipelineBase(ABC):
                         self._disagg_role == RoleType.MONOLITHIC
                         or module_role is None
                         or module_role == self._disagg_role
+                    ) and (
+                        self.deployment_plan is None
+                        or "transformer_2"
+                        in self.deployment_plan.roles[server_args.stage_role].components
                     ):
                         self.required_config_modules.append("transformer_2")
                     else:
@@ -561,7 +593,7 @@ class ComposedPipelineBase(ABC):
 
         # In disagg mode, read HF config for skipped components (e.g., VAE)
         # so that update_model_arch + post_init can derive pipeline_config.
-        if self._disagg_role != RoleType.MONOLITHIC:
+        if self._disagg_role != RoleType.MONOLITHIC or self.deployment_plan is not None:
             self._init_skipped_component_configs(model_index, server_args)
 
         declared_modules = model_index
@@ -753,6 +785,11 @@ class ComposedPipelineBase(ABC):
         role_affinity: RoleType,
         stage_name: str,
     ) -> bool:
+        if self.deployment_plan is not None:
+            return (
+                stage_name
+                in self.deployment_plan.roles[self.server_args.stage_role].stages
+            )
         if self._disagg_role.includes_stage(role_affinity):
             return True
 
@@ -765,6 +802,8 @@ class ComposedPipelineBase(ABC):
         return False
 
     def _profile_stage_name(self, stage: PipelineStage, stage_name: str) -> str:
+        if self.deployment_plan is not None:
+            return stage_name
         class_name = stage.__class__.__name__
         if any(existing.__class__.__name__ == class_name for existing in self._stages):
             return stage_name
@@ -955,12 +994,16 @@ class ComposedPipelineBase(ABC):
                 vae=self.get_module(vae_key),
                 pipeline=self,
                 component_name=vae_key,
+                separate_postprocess=True,
             )
 
-        return self.add_stage_factory(
+        self.add_stage_factory(
             RoleType.DECODER,
             create_stage,
             stage_name,
+        )
+        return self.add_stage_factory(
+            RoleType.DECODER, PostprocessStage, stage_name + "_postprocess"
         )
 
     def add_standard_t2i_stages(
@@ -1131,6 +1174,17 @@ class ComposedPipelineBase(ABC):
         self.add_standard_decoding_stage()
         return self
 
+    def _finalize_stage_result(self, result):
+        if self.deployment_plan is None and isinstance(result, Req):
+            output = result.extra.pop("_deployment_result", None)
+            if output is not None:
+                output.output = result.output
+                output.audio = result.audio
+                output.audio_sample_rate = result.audio_sample_rate
+                output.fps = result.fps
+                return output
+        return result
+
     # TODO(will): don't hardcode no_grad
     @torch.no_grad()
     def forward(
@@ -1168,7 +1222,9 @@ class ComposedPipelineBase(ABC):
 
         self._install_component_residency_manager(server_args)
 
-        return self.executor.execute_with_profiling(self.stages, batch, server_args)
+        return self._finalize_stage_result(
+            self.executor.execute_with_profiling(self.stages, batch, server_args)
+        )
 
     @torch.no_grad()
     def forward_batch(
@@ -1197,9 +1253,10 @@ class ComposedPipelineBase(ABC):
             )
 
         self._install_component_residency_manager(server_args)
-        return self.executor.execute_group_with_profiling(
+        results = self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
+        return [self._finalize_stage_result(result) for result in results]
 
     @torch.no_grad()
     def forward_batch_sequentially(
@@ -1216,11 +1273,12 @@ class ComposedPipelineBase(ABC):
             return
 
         self._install_component_residency_manager(server_args)
-        yield from self.executor.execute_group_sequentially_with_profiling(
+        for result in self.executor.execute_group_sequentially_with_profiling(
             self.stages,
             batches,
             server_args,
-        )
+        ):
+            yield self._finalize_stage_result(result)
 
     def _install_component_residency_manager(self, server_args: ServerArgs) -> None:
         """Publish the residency manager the executor dereferences unguarded.

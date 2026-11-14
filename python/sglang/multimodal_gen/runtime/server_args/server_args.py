@@ -614,7 +614,12 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
+    stage_deployment: str | None = None
+    stage_role: str | None = None
+    stage_endpoint: str | None = None
+    stage_node: str | None = None
     disagg_timeout: int = 3600
+    disagg_max_slots_per_instance: int = 8
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
@@ -2248,6 +2253,14 @@ class ServerArgs(DisaggServerArgsMixin):
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
+        if (
+            any(
+                value is not None
+                for value in (self.stage_role, self.stage_node, self.stage_endpoint)
+            )
+            and self.stage_deployment is None
+        ):
+            raise ValueError("Stage worker selectors require --stage-deployment")
         self._validate_disagg_capability()
         self.gpu_ids = normalize_gpu_ids(self.gpu_ids)
 

@@ -10,6 +10,7 @@ import torch
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     SlotHandle,
     TransferTensorBuffer,
+    tensor_payload_size,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
     BaseTransferEngine,
@@ -82,15 +83,7 @@ class DiffusionTransferManager:
 
         Caller MUST wait on the event before reading buffer data.
         """
-        total_size = 0
-        for name, t in tensor_fields.items():
-            if t is None:
-                continue
-            if isinstance(t, list):
-                for ti in t:
-                    total_size += ti.nelement() * ti.element_size()
-            else:
-                total_size += t.nelement() * t.element_size()
+        total_size = tensor_payload_size(tensor_fields)
 
         if total_size == 0:
             staged = StagedTransfer(
