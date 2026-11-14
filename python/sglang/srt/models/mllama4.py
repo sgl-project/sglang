@@ -675,8 +675,9 @@ class Llama4ForConditionalGeneration(nn.Module):
                     name, loaded_weight
                 )
 
-            if self._handle_scale_remapping(name, params_dict):
-                loaded_params.add(name)
+            if self._handle_scale_remapping(
+                name, loaded_weight, params_dict, loaded_params
+            ):
                 continue
 
             if self._handle_stacked_params(
@@ -718,11 +719,24 @@ class Llama4ForConditionalGeneration(nn.Module):
             return f"language_model.{name}"
         return name
 
-    def _handle_scale_remapping(self, name: str, params_dict: dict) -> bool:
-        """Handle scale parameter remapping. Returns True if handled."""
+    def _handle_scale_remapping(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict,
+        loaded_params: set,
+    ) -> bool:
+        """Load a KV-cache scale under its remapped name. Returns True if handled."""
         if "scale" in name and "expert" not in name:
             remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            return remapped_name != name
+            if remapped_name == name:
+                return False
+            if remapped_name in params_dict:
+                param = params_dict[remapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(remapped_name)
+            return True
         return False
 
     def _handle_stacked_params(
