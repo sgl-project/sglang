@@ -142,7 +142,8 @@ Parameters:
 
 ```bash Command
 # With timeout (wait up to 30s for idle state)
-curl -s -X POST "http://127.0.0.1:30000/flush_cache?timeout=30"
+curl -s -X POST "http://127.0.0.1:30000/flush_cache?timeout=30" \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 ```python Example

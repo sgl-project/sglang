@@ -30,7 +30,7 @@ class BenchmarkConfig:
         self.num_unique_requests = 100
         self.distribution = "POISSON"  # Options: "CONSTANT", "POISSON"
         self.profile = False
-        self.admin_api_key = None
+        self.admin_api_key = os.getenv("SGLANG_ADMIN_API_KEY")
 
         # Garbage Collection Control
         self.freeze_gc = True  # Enable/disable garbage collection freezing

@@ -4723,6 +4723,15 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "SGLANG_ADMIN_API_KEY"):
             handle_deprecated_args(sa)
 
+    def test_admin_key_env_resolves_before_the_grpc_check(self):
+        from sglang.srt.arg_groups import pipeline
+
+        source = Path(pipeline.__file__).read_text()
+        self.assertLess(
+            source.index("run_hook(handle_admin_api_key_env"),
+            source.index("run_hook(handle_deprecated_args"),
+        )
+
     def test_invalid_grpc_worker_threads_rejected(self):
         sa = self._args(grpc_port=40000)
         with envs.SGLANG_GRPC_WORKER_THREADS.override(0):

@@ -335,8 +335,7 @@ class Envs:
     # ===================================================================
     # HTTP server and health
     # ===================================================================
-    # --admin-api-key when the flag is not given; the bundled clients
-    # (sglang.profiler, bench_serving, send_one, ...) send it as well.
+    # --admin-api-key when the flag is not given; the bundled clients send it as well.
     SGLANG_ADMIN_API_KEY = EnvStr(None, secret=True)
     # Decompress request bodies tagged with `x-body-compressed`.
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)

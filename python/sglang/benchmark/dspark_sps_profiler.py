@@ -830,7 +830,7 @@ def count_aligned_steps(
     )
 
 
-# Local copy: the torch-free fallback (fit) cannot import sglang.srt at module level.
+# Local copy: sglang.srt.utils pulls in torch, which the torch-free fallback (fit) lacks.
 def _admin_headers(admin_api_key: Optional[str]) -> dict:
     from sglang.srt.environ import envs
 
