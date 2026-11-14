@@ -41,6 +41,7 @@ from sglang.benchmark.datasets.generated_shared_prefix import (
 )
 from sglang.benchmark.datasets.image import (
     ImageDataset,
+    get_image_token_id,
     parse_random_image_resolution,
     sample_image_requests,
 )
@@ -602,6 +603,37 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.image_data for row in rows))
+
+    def test_image_sampler_excludes_image_token_id_from_text(self):
+        image_token_id = 100
+        rows = sample_image_requests(
+            num_requests=4,
+            image_count=1,
+            input_len=4000,
+            output_len=4,
+            range_ratio=1.0,
+            processor=self.processor,
+            image_content="blank",
+            image_format="png",
+            image_resolution="8x8",
+            backend="sglang-oai-chat",
+            random_image_count=False,
+            image_token_id=image_token_id,
+        )
+        for row in rows:
+            ids = self.tokenizer.encode(row.prompt, add_special_tokens=False)
+            self.assertNotIn(image_token_id, ids)
+
+    def test_get_image_token_id_reads_config_for_bare_tokenizer(self):
+        with patch(
+            "sglang.benchmark.datasets.image.AutoConfig.from_pretrained",
+            return_value=SimpleNamespace(image_token_id=7),
+        ) as from_pretrained:
+            # A checkpoint without a multimodal processor loads as a bare tokenizer.
+            self.assertEqual(get_image_token_id(self.tokenizer, "test-model"), 7)
+            # A real processor keeps its own (here unset) image token id.
+            self.assertIsNone(get_image_token_id(self.processor, "test-model"))
+        from_pretrained.assert_called_once_with("test-model", trust_remote_code=True)
 
     def test_image_sampler_chat_backends_use_raw_prompt(self):
         for backend in ("sglang-oai-chat", "vllm-chat", "lmdeploy-chat"):
