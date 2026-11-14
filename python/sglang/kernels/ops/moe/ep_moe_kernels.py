@@ -1111,12 +1111,10 @@ def _fwd_kernel_ep_scatter_1(
         mask=offset_cumsum < num_experts,
         other=0,
     )
-    # Compute the prefix locally instead of reading back a cross-warp store.
-    cur_expert_start = tl.sum(
-        tl.where(offset_cumsum < cur_expert, tokens_per_expert, 0), axis=0
-    )
-    # Each program owns one entry, consumed by the subsequent scatter kernel.
-    tl.store(expert_start_loc + cur_expert, cur_expert_start)
+    cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
+    tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
+
+    cur_expert_start = tl.load(expert_start_loc + cur_expert)
     cur_expert_padded_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
     cur_expert_valid_token_num = tl.load(num_valid_tokens_per_expert + cur_expert)
 
@@ -2815,3 +2813,279 @@ def moe_unpermute(
 
     assert outputs is not None
     return outputs
+
+
+@triton.jit
+def _fwd_kernel_ep_scatter_2_optimal(
+    total_token_num,
+    expert_start_loc,
+    recv_x,
+    recv_x_stride0,
+    recv_x_stride1,
+    recv_x_scale,
+    recv_x_scale_stride0,
+    recv_x_scale_stride1,
+    recv_topk,
+    recv_topk_stride0,
+    recv_topk_stride1,
+    output_tensor,
+    output_tensor_stride0,
+    output_tensor_stride1,
+    output_tensor_scale,
+    output_tensor_scale_stride0,
+    output_tensor_scale_stride1,
+    output_index,
+    output_index_stride0,
+    output_index_stride1,
+    with_scale: tl.constexpr,
+    topk_num: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    SCALE_HIDDEN_SIZE: tl.constexpr,
+    COPY_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    num_stages: tl.constexpr,
+    is_block_wise=False,
+):
+    token_id_int32 = tl.program_id(0)
+    token_id = token_id_int32.to(tl.int64)
+
+    expert_offsets = tl.arange(0, BLOCK_SIZE)
+    expert_mask = expert_offsets < topk_num
+    expert_loc = tl.load(
+        recv_topk + token_id * recv_topk_stride0 + expert_offsets,
+        mask=expert_mask,
+        other=-1,
+    )
+
+    tt_mask = expert_mask & (expert_loc >= 0)
+    if tt_mask.sum() == 0:
+        return
+    dest_token_index_int32 = tl.atomic_add(
+        expert_start_loc + expert_loc, 1, mask=tt_mask
+    )
+    tl.store(
+        output_index + token_id * output_index_stride0 + expert_offsets,
+        dest_token_index_int32,
+        mask=tt_mask,
+        eviction_policy="evict_last",
+    )
+    tl.debug_barrier()
+    dest_token_index = tl.load(
+        output_index + token_id * output_index_stride0 + expert_offsets, mask=tt_mask
+    ).to(tl.int64)
+
+    value_offsets = tl.arange(0, COPY_SIZE)
+    for _ in tl.range(0, triton.cdiv(HIDDEN_SIZE, COPY_SIZE), num_stages=num_stages):
+        copy_mask = value_offsets < HIDDEN_SIZE
+        to_copy = tl.load(
+            recv_x + token_id * recv_x_stride0 + value_offsets, mask=copy_mask
+        )
+        output_offsets = (
+            dest_token_index[:, None] * output_tensor_stride0 + value_offsets[None, :]
+        )
+        to_copy = to_copy[None, :].broadcast_to(BLOCK_SIZE, COPY_SIZE)
+        tl.store(
+            output_tensor + output_offsets,
+            to_copy,
+            mask=(copy_mask[None, :] & tt_mask[:, None]),
+        )
+        value_offsets += COPY_SIZE
+
+    if with_scale:
+        if is_block_wise:
+            scale_offsets = tl.arange(0, COPY_SIZE)
+            for _ in tl.range(
+                0,
+                triton.cdiv(SCALE_HIDDEN_SIZE, COPY_SIZE),
+            ):
+                copy_mask = scale_offsets < SCALE_HIDDEN_SIZE
+                to_copy_scale = tl.load(
+                    recv_x_scale
+                    + token_id * recv_x_scale_stride0
+                    + scale_offsets * recv_x_scale_stride1,
+                    mask=copy_mask,
+                )
+                output_scale_offsets = (
+                    dest_token_index[:, None] * output_tensor_scale_stride0
+                    + scale_offsets[None, :] * output_tensor_scale_stride1
+                )
+                to_copy_scale = to_copy_scale[None, :].broadcast_to(
+                    BLOCK_SIZE, COPY_SIZE
+                )
+                tl.store(
+                    output_tensor_scale + output_scale_offsets,
+                    to_copy_scale,
+                    mask=(copy_mask[None, :] & tt_mask[:, None]),
+                )
+                scale_offsets += COPY_SIZE
+        else:
+            to_copy_scale = tl.load(recv_x_scale + token_id * recv_x_scale_stride0)
+            # to_copy_scale = to_copy_scale[None, :].broadcast_to(BLOCK_SIZE, 1)
+            output_scale_offsets = dest_token_index * output_tensor_scale_stride0
+            tl.store(
+                output_tensor_scale + output_scale_offsets, to_copy_scale, mask=tt_mask
+            )
+
+
+# copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
+@torch.no_grad()
+def ep_scatter(
+    recv_x: torch.Tensor,
+    recv_x_scale: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+    scale_ue8m0: bool = False,
+):
+    BLOCK_E = 128  # token num of per expert is aligned to 128
+    BLOCK_D = 128  # block size of quantization
+    num_warps = 8
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    hidden_size = recv_x.shape[1]
+    # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
+    grid = num_experts
+
+    scale_hidden_size = hidden_size // BLOCK_D
+    if scale_ue8m0:
+        # ue8m0 scales are packed here (4 scales per int32),
+        # hence the effective size of this dimension is divided by 4.
+        scale_hidden_size = ceil_div(scale_hidden_size, 4)
+
+    assert m_indices.shape[0] % BLOCK_E == 0
+
+    is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
+    if is_fp8:
+        assert recv_x_scale.dtype == output_tensor_scale.dtype, (
+            f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        )
+        assert (
+            recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
+        )
+
+    _fwd_kernel_ep_scatter_1[(grid,)](
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=num_warps,
+        BLOCK_E=BLOCK_E,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+    )
+
+    grid = min(recv_topk.shape[0], 1024 * 8)
+
+    _fwd_kernel_ep_scatter_2[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        recv_x_scale.stride(0) if is_fp8 else 0,
+        recv_x_scale.stride(1) if is_fp8 else 0,
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        output_tensor_scale.stride(0) if is_fp8 else 0,
+        output_tensor_scale.stride(1) if is_fp8 else 0,
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        topk_num=recv_topk.shape[1],
+        num_warps=num_warps,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+        # XXX (MUSA): Atomic add with "relaxed" semaphore on musa backend for better performance
+        ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
+        IS_FP8=is_fp8,
+    )
+    return
+
+
+# copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
+@torch.no_grad()
+def ep_scatter_sail(
+    recv_x: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+    recv_x_scale: Optional[torch.Tensor],
+    output_tensor_scale: Optional[torch.Tensor],
+    BLOCK_E: int = 128,  # token num of per expert is aligned to BLOCK_E
+    BLOCK_D: int = 128,
+    is_block_wise=False,
+):
+
+    num_warps = 8
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    hidden_size = recv_x.shape[1]
+    if recv_x.dtype == torch.int8:
+        # current not support int8 blockwise quant, change the BLOCK_D to hidden_size
+        BLOCK_D = hidden_size
+    # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
+    grid = num_experts
+    if recv_x_scale is not None and recv_x_scale.dtype == torch.uint16:
+        # MXFP4 fused uint16 scale
+        scale_hidden_size = recv_x_scale.shape[1]
+    else:
+        scale_hidden_size = hidden_size // BLOCK_D
+
+    assert m_indices.shape[0] % BLOCK_E == 0
+
+    _fwd_kernel_ep_scatter_1[(grid,)](
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=num_warps,
+        BLOCK_E=BLOCK_E,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+    )
+
+    grid = lambda meta: (recv_x.shape[0],)
+    _fwd_kernel_ep_scatter_2_optimal[grid](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        0 if recv_x_scale is None else recv_x_scale.stride(0),
+        0 if recv_x_scale is None else recv_x_scale.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        0 if output_tensor_scale is None else output_tensor_scale.stride(0),
+        0 if output_tensor_scale is None else output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        with_scale=(recv_x_scale is not None),
+        topk_num=recv_topk.shape[1],
+        HIDDEN_SIZE=hidden_size,
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        BLOCK_SIZE=triton.next_power_of_2(recv_topk.shape[1]),
+        COPY_SIZE=512,
+        num_stages=3,
+        num_warps=8,
+        is_block_wise=is_block_wise,
+    )
+
+    return
