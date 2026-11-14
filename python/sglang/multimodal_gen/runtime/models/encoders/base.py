@@ -72,13 +72,21 @@ DP_MIN_HIDDEN_SIZE = 1024
 
 def _encoder_dims(config: EncoderConfig):
     """Best-effort (hidden, attention_heads, mlp_intermediate) from a config,
-    spelled differently across families (hidden_size/d_model, num_heads, d_ff)."""
+    spelled differently across families (hidden_size/d_model, num_heads, d_ff).
+    Multimodal checkpoints (Gemma 4, Qwen-VL) keep the language model's dims in
+    a nested ``text_config``, which is read when the top level lacks them."""
+    text_config = getattr(config, "text_config", None)
+    if isinstance(text_config, dict):
+        nested = text_config.get
+    else:
+        nested = lambda name, default=None: getattr(text_config, name, default)
 
     def first(names):
-        for name in names:
-            value = getattr(config, name, None)
-            if isinstance(value, int) and value > 0:
-                return value
+        for get in (lambda name: getattr(config, name, None), nested):
+            for name in names:
+                value = get(name)
+                if isinstance(value, int) and value > 0:
+                    return value
         return None
 
     return (
