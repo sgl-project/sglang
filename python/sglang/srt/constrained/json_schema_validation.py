@@ -8,25 +8,27 @@ class UnsupportedJSONSchemaFeature(ValueError):
     """A schema uses constraints that the selected backend cannot preserve."""
 
 
-_SINGLE_SUBSCHEMA_KEYWORDS = frozenset(
-    {
-        "additionalItems",
-        "additionalProperties",
-        "contains",
-        "contentSchema",
-        "else",
-        "if",
-        "items",
-        "not",
-        "propertyNames",
-        "then",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-    }
+_SINGLE_SUBSCHEMA_KEYWORDS = (
+    "additionalItems",
+    "additionalProperties",
+    "contains",
+    "contentSchema",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
 )
-_SUBSCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
-_SUBSCHEMA_MAP_KEYWORDS = frozenset(
-    {"$defs", "definitions", "dependentSchemas", "patternProperties", "properties"}
+_SUBSCHEMA_ARRAY_KEYWORDS = ("allOf", "anyOf", "oneOf", "prefixItems")
+_SUBSCHEMA_MAP_KEYWORDS = (
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
 )
 
 _XGRAMMAR_UNSUPPORTED_KEYWORDS = frozenset(
@@ -107,7 +109,7 @@ def _iter_subschemas(
 
     for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
         child = schema.get(keyword)
-        if isinstance(child, (bool, dict)):
+        if isinstance(child, dict):
             yield from _iter_subschemas(child, f"{pointer}/{keyword}")
         elif keyword == "items" and isinstance(child, list):
             for index, item in enumerate(child):
@@ -131,7 +133,7 @@ def _iter_subschemas(
     dependencies = schema.get("dependencies")
     if isinstance(dependencies, dict):
         for name, child in dependencies.items():
-            if isinstance(child, (bool, dict)):
+            if isinstance(child, dict):
                 escaped_name = _escape_json_pointer(name)
                 yield from _iter_subschemas(
                     child, f"{pointer}/dependencies/{escaped_name}"
@@ -175,29 +177,26 @@ def validate_xgrammar_json_schema(schema: Any) -> None:
                 f"keyword(s) {', '.join(unsupported)} would be ignored",
             )
 
-        if _can_describe_string(subschema) and "format" in subschema:
-            format_name = subschema["format"]
-            if (
-                not isinstance(format_name, str)
-                or format_name not in _XGRAMMAR_STRING_FORMATS
-            ):
+        if _can_describe_string(subschema):
+            if "format" in subschema:
+                format_name = subschema["format"]
+                if (
+                    not isinstance(format_name, str)
+                    or format_name not in _XGRAMMAR_STRING_FORMATS
+                ):
+                    _raise_unsupported(
+                        "xgrammar",
+                        pointer,
+                        f"string format {format_name!r} is not implemented",
+                    )
+
+            groups = _string_constraint_groups(subschema)
+            if len(groups) > 1:
                 _raise_unsupported(
                     "xgrammar",
                     pointer,
-                    f"string format {format_name!r} is not implemented",
+                    f"constraints {', '.join(groups)} cannot be enforced together",
                 )
-
-        groups = (
-            _string_constraint_groups(subschema)
-            if _can_describe_string(subschema)
-            else []
-        )
-        if len(groups) > 1:
-            _raise_unsupported(
-                "xgrammar",
-                pointer,
-                f"constraints {', '.join(groups)} cannot be enforced together",
-            )
 
 
 def validate_outlines_json_schema(schema: Any) -> None:
