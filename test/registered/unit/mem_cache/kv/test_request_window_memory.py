@@ -14,10 +14,14 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
+REQUEST_WINDOW_LAYOUTS = tuple(
+    layout for layout in KVLayout if not layout.is_packed_main_kv
+)
+
 
 class TestRequestWindowMemory(CustomTestCase):
     def test_packed_extents_and_fresh_request_row_reset(self):
-        for layout in KVLayout:
+        for layout in REQUEST_WINDOW_LAYOUTS:
             with self.subTest(layout=layout):
                 spec = RequestWindowSpec.create(
                     num_slots=4,
@@ -61,7 +65,7 @@ class TestRequestWindowMemory(CustomTestCase):
 
     def test_attention_view_preserves_packed_token_dimension(self):
         """Request-owned packed pages must retain the HIP attention view contract."""
-        for layout in KVLayout:
+        for layout in REQUEST_WINDOW_LAYOUTS:
             with self.subTest(layout=layout):
                 spec = RequestWindowSpec.create(
                     num_slots=2,

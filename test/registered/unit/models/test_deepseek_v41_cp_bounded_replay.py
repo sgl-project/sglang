@@ -408,6 +408,8 @@ class TestCpBoundedReplayConfiguration(CustomTestCase):
     def test_eager_cp_opt_in_and_graph_rejection(self):
         for backend in (Backend.DISABLED, Backend.BREAKABLE):
             cfg = SimpleNamespace(
+                dsv41_main_kv_consumer="auto",
+                dsv41_main_kv_layout="auto",
                 enable_encoder_swa_bounded_replay=False,
                 dsv4_attn_backend="auto",
                 cuda_graph_config=SimpleNamespace(

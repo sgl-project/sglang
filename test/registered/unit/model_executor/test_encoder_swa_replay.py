@@ -741,6 +741,8 @@ class TestEncoderReplayDpStartupCheck(CustomTestCase):
         from sglang.srt.runtime_context import override_platform
 
         view = _View(
+            dsv41_main_kv_consumer="auto",
+            dsv41_main_kv_layout="auto",
             dsv4_attn_backend="dsv4",
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend=Backend.DISABLED)

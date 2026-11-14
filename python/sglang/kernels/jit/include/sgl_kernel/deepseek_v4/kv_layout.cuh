@@ -7,6 +7,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/deepseek_v4/kv_layout_id.cuh>
 
 #include <bit>
 #include <cstdint>
@@ -38,8 +39,6 @@
 namespace sglang {
 
 namespace deepseek_v4 {
-
-enum class KVLayout : int32_t { V4 = 0, V41 = 1, V41_FP4 = 2, UNIFORM_FP8 = 3, V41_NEW = 4, V41_FP4_NEW = 5 };
 
 /// The token encoding of a layout: V41_NEW / V41_FP4_NEW store the V41 / V41_FP4 bytes.
 constexpr KVLayout kv_encoding(KVLayout layout) {
