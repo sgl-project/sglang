@@ -132,8 +132,10 @@ inline int64_t get_4bit_block_k_size(int64_t group_size) {
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
 // pack weight to vnni format for int4
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
+// GPTQ: symmetric uses zero point 8; asymmetric decodes stored zero + 1.
+// AWQ: symmetric is unsupported; asymmetric uses checkpoint zero points.
+std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
+    at::Tensor qweight, at::Tensor qzeros, at::Tensor scales, int64_t quant_method_4bit, bool is_symmetric = false);
 
 // moe implementations for int8 w8a8
 template <typename scalar_t>
