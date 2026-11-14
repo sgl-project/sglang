@@ -34,6 +34,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_page_unified_lf as jit_transfer_hicache_one_layer_page_unified_lf,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyBufferInfo,
     IndexKeyLayout,
@@ -1749,6 +1750,18 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
 
 def get_mha_host_pool_cls(buffer_info: MHABufferInfo) -> type:
+    """Pick the right MHA host-pool class from the device buffer geometry.
+
+    Returns ``MHATokenToKVPoolMXFP8Host`` for the block-scaled MXFP8 pool (its
+    UE8M0 scales must travel with the payload),
+    ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
+    (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
+
+    With ``SGLANG_EXPERIMENTAL_HICACHE_INT8=1`` it returns
+    ``MHATokenToKVPoolHostINT8``, which stores L2 as INT8 payload plus BF16
+    per-head scales. The MXFP8 and asymmetric cases still take precedence,
+    because neither is representable in the INT8 record.
+    """
     is_mxfp8 = (
         buffer_info.scales is not None
         and buffer_info.scales.layout == KVScaleLayout.MXFP8_INTERLEAVED
@@ -1763,4 +1776,10 @@ def get_mha_host_pool_cls(buffer_info: MHABufferInfo) -> type:
         return MHATokenToKVPoolMXFP8Host
     if buffer_info.head_dim != buffer_info.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
+    if envs.SGLANG_EXPERIMENTAL_HICACHE_INT8.get():
+        from sglang.srt.mem_cache.pool_host.mha_int8 import (
+            MHATokenToKVPoolHostINT8,
+        )
+
+        return MHATokenToKVPoolHostINT8
     return MHATokenToKVPoolHost
