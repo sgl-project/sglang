@@ -98,7 +98,10 @@ from sglang.srt.entrypoints.openai.utils import (
     spec_tokens_details_from_meta_info,
     token_id_to_bytes,
 )
-from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.request_headers import (
+    apply_header_overrides,
+    resolve_request_priority,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -1355,6 +1358,11 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
+        adapted_request.priority = resolve_request_priority(
+            adapted_request.priority,
+            raw_request,
+            body_priority_is_set="priority" in request.model_fields_set,
+        )
         if processed_messages.uses_response_template:
             self._set_response_parser_context(
                 request,

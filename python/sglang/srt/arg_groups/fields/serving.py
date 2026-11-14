@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from typing import (
     Any,
@@ -23,6 +24,13 @@ class Serving(msgspec.Struct):
     """Namespace ``serving``."""
 
     _NS_PATH = "serving"
+    allow_header_priority: A[
+        Optional[bool],
+        Arg(
+            help="Accept X-Priority and RFC 9218 Priority on chat/completion requests when --enable-priority-scheduling is set. Enabled by default in priority mode; use --no-allow-header-priority to disable. Does not affect legacy x-override-priority.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = None
     enable_response_store: A[
         bool,
         "Enable in-memory Responses storage for retrieval, chaining, and background "
