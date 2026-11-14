@@ -425,6 +425,32 @@ pub(super) struct NativeFrame {
     keys: Option<Box<GenerateFrameKeys>>,
 }
 
+impl NativeFrame {
+    /// Internal consumers can keep ordinary frames typed. Extensions can
+    /// override schema fields, and these schema variants rely on JSON
+    /// normalization, so retain the original wire path for them.
+    pub(super) fn into_schema_or_json(self) -> Result<Box<api::GenerateResponse>, String> {
+        let needs_normalization = self.frame.meta_info.as_ref().is_some_and(|meta| {
+            !meta.hidden_states.is_empty()
+                || matches!(
+                    meta.finish_reason
+                        .as_ref()
+                        .and_then(|reason| reason.kind.as_ref()),
+                    Some(api::finish_reason::Kind::Unknown(_))
+                )
+        });
+        if self.request_stats.is_some()
+            || self.keys.is_some()
+            || !self.customized_info.0.is_empty()
+            || needs_normalization
+        {
+            Err(json_string(&self))
+        } else {
+            Ok(Box::new(self.frame))
+        }
+    }
+}
+
 impl serde::Serialize for NativeFrame {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap; // codespell:ignore ser
@@ -975,6 +1001,20 @@ pub(super) fn generation_event_stream_with(
     with_index: bool,
     error_frame: impl Fn(&CoreError, Option<u32>) -> String,
 ) -> impl futures::Stream<Item = String> {
+    generation_event_stream_mapped(calls, incremental, with_index, error_frame, |frame| {
+        json_string(&frame)
+    })
+}
+
+/// The same aggregation and request lifetime, with a consumer's frame encoder.
+/// Errors and the end marker keep the native stream's existing text path.
+pub(super) fn generation_event_stream_mapped<T: From<String>>(
+    calls: Vec<(CoreCall, RequestState)>,
+    incremental: bool,
+    with_index: bool,
+    error_frame: impl Fn(&CoreError, Option<u32>) -> String,
+    encode_frame: impl Fn(NativeFrame) -> T,
+) -> impl futures::Stream<Item = T> {
     async_stream::stream! {
         use futures::StreamExt;
 
@@ -1002,7 +1042,7 @@ pub(super) fn generation_event_stream_with(
                 // Defensive fallback: a premature runtime close is normally a
                 // Failed event produced by CoreCall. Keep this item's call
                 // armed if its semantic stream somehow ends unexpectedly.
-                yield json_string(&CoreError::ResponseTruncated.stream_error(idx(i)));
+                yield json_string(&CoreError::ResponseTruncated.stream_error(idx(i))).into();
                 continue;
             }
 
@@ -1019,7 +1059,7 @@ pub(super) fn generation_event_stream_with(
                         accumulated[i].append_delta(&out);
                         if incremental {
                             let out = delta_output(out, &accumulated[i]);
-                            yield json_string(&requests[i].frame(out, FrameMode::Incremental, &rid_strs[i], idx(i), None));
+                            yield encode_frame(requests[i].frame(out, FrameMode::Incremental, &rid_strs[i], idx(i), None));
                         } else {
                             coalesced = true;
                         }
@@ -1037,7 +1077,7 @@ pub(super) fn generation_event_stream_with(
             }
 
             if let Some(error) = failed {
-                yield error_frame(&error, idx(i));
+                yield error_frame(&error, idx(i)).into();
             } else if let Some(out) = terminal {
                 // The final frame carries the full cumulative state, so any
                 // coalesced non-terminal frames are moot.
@@ -1049,18 +1089,18 @@ pub(super) fn generation_event_stream_with(
                 } else {
                     (std::mem::take(&mut accumulated[i]), FrameMode::Cumulative)
                 };
-                yield json_string(&requests[i].frame(out, mode, &rid_strs[i], idx(i), e2e_latency));
+                yield encode_frame(requests[i].frame(out, mode, &rid_strs[i], idx(i), e2e_latency));
             } else {
                 if coalesced {
                     // An intermediate cumulative frame has to clone: the accumulated
                     // output stays behind for the next one.
                     let out = accumulated[i].clone();
-                    yield json_string(&requests[i].frame(out, FrameMode::Cumulative, &rid_strs[i], idx(i), None));
+                    yield encode_frame(requests[i].frame(out, FrameMode::Cumulative, &rid_strs[i], idx(i), None));
                 }
                 futs.push(recv_indexed(i, call)); // keep this item flowing
             }
         }
-        yield "[DONE]".to_string();
+        yield "[DONE]".to_string().into();
     }
 }
 
@@ -3407,5 +3447,177 @@ mod tests {
                 ),
             }
         }
+    }
+
+    fn schema_only_native_frame(frame: api::GenerateResponse) -> NativeFrame {
+        NativeFrame {
+            frame,
+            request_stats: None,
+            customized_info: ReportedCustomizedInfo::default(),
+            keys: None,
+        }
+    }
+
+    #[test]
+    fn plain_native_frames_keep_the_schema_round_trip() {
+        for reason in [
+            serde_json::Value::Null,
+            serde_json::json!({"type": "stop", "matched": "</s>"}),
+            serde_json::json!({"type": "length", "length": 2}),
+        ] {
+            let frame = schema_only_native_frame(api::GenerateResponse {
+                text: "é\n\"text\"".into(),
+                meta_info: Some(api::GenerateMetaInfo {
+                    id: "r".into(),
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    finish_reason: serde_json::from_value(reason).unwrap(),
+                    output_token_logprobs: Some(api::LogprobEntries {
+                        entries: [-0.0, f64::from(-0.1_f32)]
+                            .into_iter()
+                            .map(|logprob| api::LogprobEntry {
+                                logprob: Some(logprob),
+                                token_id: 7,
+                                text: Some("é".into()),
+                            })
+                            .collect(),
+                    }),
+                    ..Default::default()
+                }),
+                output_ids: Some(api::TokenIds { ids: vec![7, 8] }),
+                index: Some(1),
+                ..Default::default()
+            });
+            let expected_json = json_string(&frame);
+            let expected: api::GenerateResponse =
+                serde_json::from_value(parse(&expected_json)).unwrap();
+            let actual = frame.into_schema_or_json().unwrap();
+            assert_eq!(*actual, expected);
+            assert_eq!(json_string(&actual), expected_json);
+            // f64 equality alone would not distinguish +0.0 from -0.0.
+            assert_eq!(
+                actual
+                    .meta_info
+                    .as_ref()
+                    .unwrap()
+                    .output_token_logprobs
+                    .as_ref()
+                    .unwrap()
+                    .entries[0]
+                    .logprob
+                    .unwrap()
+                    .to_bits(),
+                (-0.0_f64).to_bits(),
+            );
+        }
+    }
+
+    #[test]
+    fn extended_native_frames_keep_their_original_json() {
+        for extension in ["stats", "customized", "hook"] {
+            let mut frame = schema_only_native_frame(api::GenerateResponse {
+                text: "original".into(),
+                meta_info: Some(api::GenerateMetaInfo {
+                    id: "r".into(),
+                    completion_tokens: 2,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            match extension {
+                "stats" => {
+                    let mut stats = serde_json::Map::new();
+                    stats.insert("queue_time".into(), serde_json::json!(0.25));
+                    frame.request_stats = Some(RequestStats(stats));
+                }
+                "customized" => {
+                    frame.customized_info = ReportedCustomizedInfo(vec![(
+                        Arc::<str>::from("score"),
+                        Arc::new(vec![serde_json::json!(0.25), serde_json::json!(0.5)]),
+                    )]);
+                }
+                "hook" => {
+                    let mut keys = GenerateFrameKeys::default();
+                    keys.frame
+                        .insert("text".into(), serde_json::json!("from hook"));
+                    keys.meta_info
+                        .insert("completion_tokens".into(), serde_json::json!(9));
+                    frame.keys = Some(Box::new(keys));
+                }
+                _ => unreachable!(),
+            }
+            let expected = json_string(&frame);
+            let actual = frame.into_schema_or_json().unwrap_err();
+            assert_eq!(actual, expected, "{extension}: preserve exact JSON bytes");
+            let value = parse(&actual);
+            match extension {
+                "stats" => assert_eq!(value["meta_info"]["queue_time"], 0.25),
+                "customized" => {
+                    assert_eq!(value["meta_info"]["score"], serde_json::json!([0.25, 0.5]));
+                }
+                "hook" => {
+                    // The lowered path first reads a Value. Its last-key-wins
+                    // behavior must survive hooks repeating schema field names.
+                    let schema: api::GenerateResponse = serde_json::from_value(value).unwrap();
+                    assert_eq!(schema.text, "from hook");
+                    assert_eq!(schema.meta_info.unwrap().completion_tokens, 9);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_native_finish_reason_keeps_api_normalization() {
+        // Runtime abort status is u16, while the API schema uses u32. An Unknown
+        // runtime map can therefore become a known API Abort after the JSON step.
+        let frame = schema_only_native_frame(api::GenerateResponse {
+            meta_info: Some(api::GenerateMetaInfo {
+                finish_reason: Some(api::FinishReason {
+                    kind: Some(api::finish_reason::Kind::Unknown(
+                        serde_json::json!({
+                            "type": "abort", "status_code": 65536, "matched": "old-extra"
+                        })
+                        .to_string(),
+                    )),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let expected = json_string(&frame);
+        let actual = frame.into_schema_or_json().unwrap_err();
+        assert_eq!(actual, expected);
+        let normalized: api::GenerateResponse = serde_json::from_value(parse(&actual)).unwrap();
+        assert!(matches!(
+            normalized.meta_info.as_ref().unwrap().finish_reason.as_ref().unwrap().kind.as_ref(),
+            Some(api::finish_reason::Kind::Abort(reason)) if reason.status_code == Some(65536)
+        ));
+        assert!(
+            serde_json::to_value(&normalized).unwrap()["meta_info"]["finish_reason"]
+                .get("matched")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_hidden_states_keep_the_original_json_path() {
+        let frame = schema_only_native_frame(api::GenerateResponse {
+            text: "ok".into(),
+            meta_info: Some(api::GenerateMetaInfo {
+                hidden_states: vec![api::HiddenStateRow {
+                    values: vec![0.25, -0.0],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let expected = json_string(&frame);
+        let actual = frame.into_schema_or_json().unwrap_err();
+        assert_eq!(actual, expected);
+        let normalized: api::GenerateResponse = serde_json::from_value(parse(&actual)).unwrap();
+        let values = &normalized.meta_info.as_ref().unwrap().hidden_states[0].values;
+        assert_eq!(values, &[0.25, -0.0]);
+        assert_eq!(values[1].to_bits(), (-0.0_f64).to_bits());
     }
 }
