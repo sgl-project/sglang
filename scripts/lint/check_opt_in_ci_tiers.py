@@ -13,6 +13,7 @@ import glob
 import json
 import re
 import sys
+from pathlib import Path
 
 import yaml
 
@@ -53,7 +54,8 @@ def main() -> int:
     workflows = {}
     for path in sorted(glob.glob(".github/workflows/*.yml")):
         with open(path, encoding="utf-8") as f:
-            workflows[path] = yaml.safe_load(f) or {}
+            # glob returns OS-native separators; the tiers file uses POSIX paths.
+            workflows[Path(path).as_posix()] = yaml.safe_load(f) or {}
 
     errors = []
     for name, tier in tiers.items():
