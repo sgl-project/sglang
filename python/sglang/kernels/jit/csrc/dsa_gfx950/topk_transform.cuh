@@ -879,6 +879,28 @@ inline bool prank_resident_ok(const void* fn, int blocks_per_row, int rows) {
   const long long slots = (long long)per_cu * (long long)s_cu[dev];
   return (long long)blocks_per_row * (long long)rows <= slots;
 }
+
+// The largest blocks-per-row <= g that passes prank_resident_ok for `rows`, if it is at least g_min; else g.  The
+// persistent-rank form is worth more than the blocks it gives up (measured, rows 48: 116 us at G 42 with it against
+// 120 us at G 48 without), and G only repartitions the exact selection, so the top-k set is unchanged.
+inline uint32_t prank_fit_g(const void* fn, uint32_t g, int rows, uint32_t g_min) {
+  if (rows <= 0 || prank_resident_ok(fn, static_cast<int>(g), rows)) {
+    return g;
+  }
+  uint32_t lo = g_min, hi = g;  // invariant: hi fails; find the largest passing value in [lo, hi)
+  if (!prank_resident_ok(fn, static_cast<int>(lo), rows)) {
+    return g;
+  }
+  while (hi - lo > 1) {
+    const uint32_t mid = (lo + hi) / 2;
+    if (prank_resident_ok(fn, static_cast<int>(mid), rows)) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
 }  // namespace dsa_gfx950::topk
 
 struct TopKTransformKernel {
@@ -904,7 +926,7 @@ struct TopKTransformKernel {
     const int64_t PTS = page_table.stride(0);
     RuntimeCheck(cand_idx.dim() == 2, "cand_idx must be [>=rows, cap]");
     const int64_t cap = cand_idx.size(1);
-    const uint32_t G = static_cast<uint32_t>(g_per_row);
+    uint32_t G = static_cast<uint32_t>(g_per_row);
     // page_size must be 1 or a power of two; both give the identical mapping.
     uint32_t PB = 0;
     for (int64_t ps = page_size; ps > 1; ps >>= 1) {
@@ -970,6 +992,11 @@ struct TopKTransformKernel {
             is_type<int32_t>(ghist.dtype()) && is_type<int32_t>(cursor.dtype()) && is_type<int32_t>(cand_idx.dtype()) &&
             is_type<fp32_t>(cand_val.dtype()),
         "logits/cand_val must be fp32 and out/page_table/ghist/cursor/cand_idx int32");
+
+    // Shrink G (to no less than 32) where that lets the persistent-rank form run; see prank_fit_g.  Host
+    // constants only, so graph-safe.
+    G = impl::prank_fit_g(
+        reinterpret_cast<const void*>(impl::k_scatter<2, true, 16>), G, static_cast<int>(R), G < 32u ? G : 32u);
 
     // PTMODE 2 is faster when its per-block page-table slice fits in LDS.  PTS
     // is a static graph property while row_ends is replay-time data, so use PTS

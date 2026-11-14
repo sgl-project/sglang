@@ -21,8 +21,52 @@ logger = logging.getLogger(__name__)
 # editing the kernel it belongs to; the sources reject any other value rather
 # than mis-launching.
 LOGITS_HIST_BITS = 12  # must match logits_hist_m<8, 12> and topk_transform.cuh
+# Logits kernel (node 3) variants, chosen per launch by logits_launch():
+#   0 logits_hist_m    per row, LOGITS_BLOCKS_PER_ROW blocks per row;
+#   1 logits_hist_s    per row, tuned for short batches (rows <= LOGITS_SHORT_MAX_ROWS);
+#   2 logits_hist_grp  sibling groups: consecutive rows of one request -- the MTP verify rows -- share its page
+#                      table, so each K page is loaded once per group instead of once per row.  The group size is a
+#                      template argument of the kernel (HOST_GR in paged_mqa_logits.cuh).
+# All three produce bit-identical logits and the same top-k selection.
 LOGITS_BLOCKS_PER_ROW = 48
-TOPK_G = 64
+LOGITS_SHORT_BLOCKS_PER_ROW = 32
+# Measured, graph timed, 6 rows per request at 120k tokens: rows 12 / 24 run 22 / 40 us on logits_hist_s against
+# 26 / 48 us on logits_hist_m; from 36 rows logits_hist_s is the slower one (80 vs 66 us).
+LOGITS_SHORT_MAX_ROWS = 24
+LOGITS_GROUP_ROWS = 6
+# Smallest row count routed to the sibling-group kernel (measured at 120k tokens: 30 / 36 / 48 rows run
+# 51 / 54 / 61 us grouped against 55 / 66 / 79 us on logits_hist_m; at 24 rows grouping only wins on long contexts).
+LOGITS_GROUP_MIN_ROWS = 30
+# topk_transform blocks per row.  The row-barrier and cursor-atomic cost per
+# block outweighs the extra fill past ~48 (measured: 48 beats 64 on every case);
+# G only repartitions the exact selection, so the top-k set does not change.
+# The kernel lowers it further where rows * G blocks would not be co-resident
+# for its persistent-rank form.
+TOPK_G = 48
+
+
+def logits_launch(
+    rows: int, table_pages: int, rows_per_request: int
+) -> Tuple[int, int]:
+    """(blocks_per_row, variant) for the logits kernel, in its argument order.
+
+    The sibling-group kernel is used when the rows come ``LOGITS_GROUP_ROWS`` per
+    request and there are at least ``LOGITS_GROUP_MIN_ROWS`` of them; it checks on
+    the device that the siblings really share their page ids and stays exact if
+    they do not.  ``logits_hist_s`` gets ``LOGITS_SHORT_BLOCKS_PER_ROW`` blocks,
+    raised so that a wave never walks more than 64 pages (its page ids live one
+    per lane) and kept a multiple of 8 so block x of every row lands on XCD x % 8.
+    """
+    if (
+        rows_per_request == LOGITS_GROUP_ROWS
+        and rows % LOGITS_GROUP_ROWS == 0
+        and rows >= LOGITS_GROUP_MIN_ROWS
+    ):
+        return 0, 2
+    if rows <= LOGITS_SHORT_MAX_ROWS:
+        need = -(-table_pages // (8 * 64))
+        return max(LOGITS_SHORT_BLOCKS_PER_ROW, -(-need // 8) * 8), 1
+    return LOGITS_BLOCKS_PER_ROW, 0
 
 
 @cache_once
