@@ -25,6 +25,9 @@ class XpuDeviceMixin(DeviceMixin):
     def get_device_total_memory(self, device_id: int = 0) -> int:
         return int(torch.xpu.get_device_properties(device_id).total_memory)
 
+    def memory_reserved(self, device_id: int = 0) -> int:
+        return int(torch.xpu.memory_reserved(device_id))
+
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None
     ) -> float:

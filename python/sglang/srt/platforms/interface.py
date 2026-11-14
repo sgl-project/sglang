@@ -13,7 +13,7 @@ Out-of-tree platforms register via setuptools entry_points under the
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Optional, Type
 
 import msgspec
 
@@ -66,6 +66,12 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     ``supports_pynccl``: model-parallel groups create a PyNccl communicator
     when the caller does not choose. Read for out-of-tree platforms; in-tree
     devices decide in ``parallel_state``.
+    ``weight_cache_transports``: names of the weight-cache transport backends
+    this device can serve, most preferred first. Empty means the weight cache
+    daemon refuses to start here. A name must be registered in
+    ``weight_cache.transport``; declaring one also commits the platform to
+    implementing ``memory_reserved``, which the daemon uses to size the
+    preloaded weights it reports to the scheduler.
     """
 
     supports_triton: bool = False
@@ -73,6 +79,7 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False
     supports_pynccl: bool = False
+    weight_cache_transports: tuple[str, ...] = ()
 
 
 class SRTPlatform(DeviceMixin):
@@ -299,6 +306,34 @@ class SRTPlatform(DeviceMixin):
         import torch
 
         return torch.device("cpu")
+
+    # ------------------------------------------------------------------
+    # Weight cache
+    # ------------------------------------------------------------------
+
+    def validate_weight_cache_allocator(self) -> None:
+        """Reject an allocator config whose memory the transport cannot export.
+
+        Called once in the weight cache daemon before it touches the device, so
+        a configuration that would break the handle export fails with an
+        actionable message instead of partway through it. Override alongside
+        ``capabilities.weight_cache_transports``; the default accepts
+        everything, which is what a platform with no declared transport gets.
+        """
+        pass
+
+    def prepare_weight_cache_export(
+        self, state_tensors: Mapping[str, tuple[torch.Tensor, bool]]
+    ) -> None:
+        """Run device setup the handle export needs, before the first export.
+
+        Called in the daemon with every tensor it is about to export, after
+        ``validate_weight_cache_allocator`` and before the transport backend is
+        chosen. The place for an import whose side effect registers a reducer,
+        or for a probe that warns when zero-copy is unavailable on this driver
+        stack. Raise to abort the daemon; log to let it continue degraded.
+        """
+        pass
 
     # ------------------------------------------------------------------
     # Initialization
