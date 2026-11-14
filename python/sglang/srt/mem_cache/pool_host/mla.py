@@ -882,9 +882,33 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # work on subsequent per-layer iterations.
                 if device_layer_id != 0:
                     return
-                for pool_slice in self._npu_transfer_pool_slices():
-                    self._transfer_npu_split_pages(
-                        pool_slice, host_indices, device_indices, TransferDirection.H2D
+                for (
+                    native,
+                    host_k,
+                    host_v,
+                    host_index_k,
+                    host_index_k_scale,
+                ) in self._npu_transfer_pool_slices():
+                    device_k, device_v = native.k, native.v
+                    if device_v.numel() and device_v.dtype != device_k.dtype:
+                        # memcpy2d uses K's element size for both K and V.
+                        device_k = device_k.view(torch.uint8)
+                        device_v = device_v.view(torch.uint8)
+                        host_k = host_k.view(torch.uint8)
+                        host_v = host_v.view(torch.uint8)
+                    transfer_kv_dim_exchange(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=device_k,
+                        host_k=host_k,
+                        device_v=device_v,
+                        host_v=host_v,
+                        device_index_k=native.index_k,
+                        host_index_k=host_index_k,
+                        device_index_k_scale=native.index_scales,
+                        host_index_k_scale=host_index_k_scale,
+                        page_size=self.page_size,
+                        direction=TransferDirection.H2D,
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -998,30 +1022,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self.index_k_scale_buffer if is_target else None,
             )
             layer_start = layer_end
-
-    def _transfer_npu_split_pages(
-        self, pool_slice, host_indices, device_indices, direction
-    ):
-        native, host_k, host_v, host_index_k, host_index_scale = pool_slice
-        device_k, device_v = native.k, native.v
-        if device_v.numel() and device_v.dtype != device_k.dtype:
-            # memcpy2d uses the K element size for both K and V pitches.
-            device_k, host_k = device_k.view(torch.uint8), host_k.view(torch.uint8)
-            device_v, host_v = device_v.view(torch.uint8), host_v.view(torch.uint8)
-        transfer_kv_dim_exchange(
-            device_indices=device_indices,
-            host_indices=host_indices,
-            device_k=device_k,
-            host_k=host_k,
-            device_v=device_v,
-            host_v=host_v,
-            device_index_k=native.index_k,
-            host_index_k=host_index_k,
-            device_index_k_scale=native.index_scales,
-            host_index_k_scale=host_index_scale,
-            page_size=self.page_size,
-            direction=direction,
-        )
 
     def _warn_draft_indexer_skipped(self, native):
         if getattr(self, "_draft_indexer_skip_warned", False):
@@ -1202,9 +1202,32 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         TransferDirection.D2H,
                     )
                     return
-                for pool_slice in self._npu_transfer_pool_slices():
-                    self._transfer_npu_split_pages(
-                        pool_slice, host_indices, device_indices, TransferDirection.D2H
+                for (
+                    native,
+                    host_k,
+                    host_v,
+                    host_index_k,
+                    host_index_k_scale,
+                ) in self._npu_transfer_pool_slices():
+                    device_k, device_v = native.k, native.v
+                    if device_v.numel() and device_v.dtype != device_k.dtype:
+                        device_k = device_k.view(torch.uint8)
+                        device_v = device_v.view(torch.uint8)
+                        host_k = host_k.view(torch.uint8)
+                        host_v = host_v.view(torch.uint8)
+                    transfer_kv_dim_exchange(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=device_k,
+                        host_k=host_k,
+                        device_v=device_v,
+                        host_v=host_v,
+                        device_index_k=native.index_k,
+                        host_index_k=host_index_k,
+                        device_index_k_scale=native.index_scales,
+                        host_index_k_scale=host_index_k_scale,
+                        page_size=self.page_size,
+                        direction=TransferDirection.D2H,
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
