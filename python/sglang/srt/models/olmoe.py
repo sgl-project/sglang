@@ -89,6 +89,7 @@ class OlmoeMoE(nn.Module):
 
         self.experts = FusedMoE(
             num_experts=num_experts,
+            top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             reduce_results=True,

@@ -188,7 +188,7 @@ ENV LANG=en_US.UTF-8 \
 #     |                  \-> halops_wheel (prebuilt wheel download)
 #     |
 #     +-- devtools_builder (independent)
-#     +-- gateway_builder  (independent, only needs gateway source)
+#     +-- router_builder   (independent, only needs router source)
 #     |
 #     v
 #   framework (combines all artifacts)
@@ -661,33 +661,27 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
 ########################################################
-# PARALLEL STAGE 5: Gateway Builder (starts from base)
+# PARALLEL STAGE 5: Router Builder (starts from base)
 ########################################################
-# Builds sgl-model-gateway in isolation so Python-only changes
+# Builds sgl-router in isolation so Python-only changes
 # don't trigger a full Rust recompilation.
-FROM base AS gateway_builder
-
-ARG GITHUB_ARTIFACTORY
-ARG BRANCH_TYPE
-ARG SGL_VERSION
-ARG USE_LATEST_SGLANG
+FROM base AS router_builder
 
 WORKDIR /build
 
-# Copy ONLY the gateway source (not the full repo)
-COPY sgl-model-gateway /build/sgl-model-gateway
+# sgl-router and the rust/ workspace that holds its path dependencies
+COPY sgl-router /build/sgl-router
+COPY rust /build/rust
 
-# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
-RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+# Install Rust at sgl-router's pinned toolchain, build the binary, then clean up
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain none \
     && export PATH="/root/.cargo/bin:${PATH}" \
-    && python3 -m pip install maturin \
-    && cd /build/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
-    && cd /build/sgl-model-gateway \
-    && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
-    && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
-    && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
+    && cd /build/sgl-router \
+    && rustup toolchain install \
+    && cargo build --locked --release --bin sgl-router \
+    && cp target/release/sgl-router /build/sgl-router-bin \
+    && rm -rf /root/.cargo /root/.rustup /build/sgl-router/target
 
 ########################################################
 ########## Final Framework Image ######################
@@ -966,12 +960,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Use the Rust extensions built above; never rebuild them at runtime.
 ENV SGLANG_RUST_BUILD_MODE=never
 
-# Install pre-built gateway artifacts from parallel builder
-COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
-COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
-    && rm -rf /tmp/gateway_wheels
+# Install the pre-built router from the parallel builder
+COPY --from=router_builder /build/sgl-router-bin /opt/sglang/bin/sgl-router
 
 # sgl-nvidia-mega: the NVIDIA megakernel plugin, inert unless a server passes
 # --enable-nvidia-megakernel. Installed with CUDA >= 12.9 only (its kernels are

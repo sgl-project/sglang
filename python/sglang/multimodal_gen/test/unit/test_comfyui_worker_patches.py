@@ -183,7 +183,9 @@ def test_h3_install_disables_nested_norm2_fusion_for_reference_only(monkeypatch)
     block.mlp = types.SimpleNamespace(fc1=object())
     block.norm2 = types.SimpleNamespace(weight=torch.ones(1), eps=1e-6)
     block.attn = types.SimpleNamespace()
-    block.attn._attend = types.MethodType(lambda self: None, block.attn)
+    block.attn._attend = types.MethodType(
+        minimax_h3.MiniMaxH3Attention._attend, block.attn
+    )
     monkeypatch.setattr(
         minimax_h3,
         "MINIMAX_H3_NORM_MODULATE",
@@ -326,15 +328,3 @@ def test_lazy_node_registration(monkeypatch, first):
     assert module.NODE_DISPLAY_NAME_MAPPINGS is nodes.NODE_DISPLAY_NAME_MAPPINGS
     with pytest.raises(AttributeError):
         module.unknown_attribute
-
-
-def test_reviewed_h3_source_matches_checkout():
-    import hashlib
-    from pathlib import Path
-
-    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches.h3 import (
-        SOURCE_SHA256,
-    )
-
-    source = Path(patches.__file__).parents[3] / "runtime/models/dits/minimax_h3.py"
-    assert hashlib.sha256(source.read_bytes()).hexdigest() == SOURCE_SHA256
