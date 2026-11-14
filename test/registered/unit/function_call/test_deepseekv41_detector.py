@@ -3,6 +3,7 @@
 import json
 import unittest
 from typing import get_args
+from unittest.mock import patch
 
 import xgrammar as xgr
 from xgrammar.structural_tag import JSONSchemaFormat
@@ -14,8 +15,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.parser.deepseek_recipe_renderer import load_deepseek_recipe
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -109,6 +113,68 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
             ],
         )
         self.assertEqual({t.end for t in calls.tags}, {f"</{DSML} invoke>\n"})
+
+    def test_omitted_strict_does_not_constrain_arguments_in_mixed_tools(self):
+        """An omitted strict flag must not enforce the argument schema, even
+        alongside a strict tool; building the grammar must not change tools."""
+        self.tools[1].function.strict = True
+        original = [tool.model_dump() for tool in self.tools]
+        for choice in (
+            "required",
+            ToolChoice(function=ToolChoiceFuncName(name="get_weather")),
+        ):
+            with self.subTest(choice=choice):
+                with patch(
+                    "sglang.srt.function_call.base_format_detector.get_model_structural_tag",
+                    wraps=xgr.get_model_structural_tag,
+                ) as build_tag:
+                    tag = self.detector.get_structural_tag(self.tools, choice)
+                converted = build_tag.call_args.kwargs["tools"]
+                self.assertIs(converted[0]["function"]["strict"], False)
+                self.assertIs(converted[1]["function"]["strict"], True)
+                self.assertEqual([tool.model_dump() for tool in self.tools], original)
+                grammar = xgr.Grammar.from_structural_tag(tag)
+                text = (
+                    f'\n\n<{DSML} calls>\n<{DSML} invoke name="get_weather">\n'
+                    f'<{DSML} parameter name="extra" string="false">42</{DSML} parameter>\n'
+                    f"</{DSML} invoke>\n</{DSML} calls>"
+                )
+                self.assertTrue(_is_grammar_accept_string(grammar, text))
+
+    def test_builtin_strict_defaults_are_scoped_to_deepseek(self):
+        """DeepSeek defaults must not change other builtin tags or caller tools."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=f"tool_{i}",
+                    parameters={"type": "object"},
+                    **flags,
+                ),
+            )
+            for i, flags in enumerate(
+                ({}, {"strict": None}, {"strict": True}, {"strict": False})
+            )
+        ]
+        original = [tool.model_dump() for tool in tools]
+        for detector in (
+            DeepSeekV41Detector(),
+            DeepSeekV4Detector(),
+            DeepSeekV32Detector(),
+            KimiK2Detector(),
+        ):
+            with self.subTest(tag=detector.get_structural_tag_name()):
+                with patch(
+                    "sglang.srt.function_call.base_format_detector.get_model_structural_tag",
+                    wraps=xgr.get_model_structural_tag,
+                ) as build_tag:
+                    detector.get_structural_tag(tools, "auto")
+                expected = [tool.model_dump() for tool in tools]
+                if not isinstance(detector, KimiK2Detector):
+                    expected[0]["function"]["strict"] = False
+                    expected[1]["function"]["strict"] = False
+                self.assertEqual(build_tag.call_args.kwargs["tools"], expected)
+                self.assertEqual([tool.model_dump() for tool in tools], original)
 
     def test_auto_tag_triggers_on_the_calls_block(self):
         tag = self.detector.get_structural_tag(tools=self.tools, tool_choice="auto")
