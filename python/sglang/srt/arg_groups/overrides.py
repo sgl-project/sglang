@@ -389,6 +389,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "MiniCPMV4_7ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
@@ -424,6 +425,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
@@ -1069,6 +1071,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         "Xing4_0ForCausalLM",
     }

@@ -15,10 +15,16 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+# Omni checkpoints wrap a NemotronH language model: Nemotron 3 Nano Omni ships
+# as NemotronH_Nano_Omni_Reasoning_V3, Nemotron 3.5 Super VL as
+# NemotronH_Omni_Reasoning_V3.
+_OMNI_ARCHS = ("NemotronH_Nano_Omni_Reasoning_V3", "NemotronH_Omni_Reasoning_V3")
+
+
 @_register_for(
     "NemotronHForCausalLM",
     "NemotronHPuzzleForCausalLM",
-    "NemotronH_Omni_Reasoning_V3",
+    *_OMNI_ARCHS,
 )
 def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     """NemotronH quantization / MoE runner / attention backend defaults
@@ -38,9 +44,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     quantization = cfg.quantization
     if is_modelopt:
         language_config = (
-            model_config.hf_text_config
-            if model_arch == "NemotronH_Omni_Reasoning_V3"
-            else hf_config
+            model_config.hf_text_config if model_arch in _OMNI_ARCHS else hf_config
         )
         assert language_config.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
