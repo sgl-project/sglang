@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
+
 """Shared config choices, re-exported by server_args for plugin compatibility."""
 
 LOAD_FORMAT_CHOICES = [
@@ -95,6 +98,7 @@ ATTENTION_BACKEND_CHOICES = [
     "wave",
     # Other platforms
     "intel_amx",
+    "arm",
     "ascend",
     "intel_xpu",
 ]
