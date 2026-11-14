@@ -267,15 +267,13 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 f"backend for both phases, got prefill={prefill_backend!r}, "
                 f"decode={decode_backend!r}."
             )
+        is_dsv41 = model_config_of(server_args).hf_config.model_type == "deepseek_v41"
         unsupported = (
             ("multiple nodes", cfg.nnodes > 1),
-            (
-                "DeepSeek-V4.1",
-                model_config_of(server_args).hf_config.model_type == "deepseek_v41",
-            ),
+            # V4.1 carries its own bounded-replay tail layout; V4 has none.
             (
                 "decoder SWA bounded replay",
-                cfg.enable_decoder_swa_bounded_replay,
+                cfg.enable_decoder_swa_bounded_replay and not is_dsv41,
             ),
             ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
         )
@@ -284,6 +282,11 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 raise ValueError(
                     f"DeepSeekV4 prefill CP on HIP does not support {feature} yet."
                 )
+        if is_dsv41 and not envs.SGLANG_CP_MIN_TOKENS_PER_RANK.is_set():
+            # TODO(At1a8): temporary work-around for the gfx950 aiter MXFP8 GEMM NaN
+            # (its small-M group32 tile returns NaN for wqkv_a: N=1792, K=5120, M=5..8),
+            # it can be safely removed later, once the aiter kernel is fixed
+            envs.SGLANG_CP_MIN_TOKENS_PER_RANK.set(16)
 
     attn_dp_size = context_parallel_attn_dp_size(cfg, "DeepSeek-V4 context parallelism")
     declare_resolution(
