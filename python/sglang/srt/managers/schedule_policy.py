@@ -41,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
-import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -200,7 +199,7 @@ class SchedulePolicy:
         shortest_prefill_aging_factor: float = 0.0,
         bounded_lpm_enabled: bool = True,
     ):
-        self._lpm_gate_next_check = 0.0
+        self._lpm_gate_calls = 0
         self._on_bounded_state_change = None
         self._bounded_lpm_enabled = bounded_lpm_enabled
         self._bounded_active = False
@@ -373,15 +372,16 @@ class SchedulePolicy:
 
     def _should_start_bounded_batch(self, waiting_queue: List[Req]) -> bool:
         from sglang.srt.managers.lpm_opportunity import (
-            RECHECK_SECONDS,
+            RECHECK_PASSES,
             competition_opportunity,
         )
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        now = time.monotonic()
-        if now < self._lpm_gate_next_check:
+        # Ranks sharing a queue execute the same eligible scheduling passes.
+        # Wall-clock deadlines can disagree across TP ranks and split admission.
+        self._lpm_gate_calls += 1
+        if (self._lpm_gate_calls - 1) % RECHECK_PASSES:
             return False
-        self._lpm_gate_next_check = now + RECHECK_SECONDS
         self._lpm_gate_competition = None
         cache = self.tree_cache
         # Fail closed for cache modes not represented in the observation study.

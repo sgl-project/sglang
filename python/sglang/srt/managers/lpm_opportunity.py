@@ -3,7 +3,7 @@
 from itertools import chain
 
 PREFIX_TOKENS = 4096
-RECHECK_SECONDS = 1.0
+RECHECK_PASSES = 32
 
 
 def _lcp(a, b):
@@ -27,7 +27,7 @@ def competition_opportunity(requests, capacity, *, include_pairs=True):
 
     Count long-prefix reuse pairs whose intervening unique input working set,
     including the target prefix, exceeds total KV capacity. Namespace boundaries
-    prevent false sharing. Evaluated at most once per second for long LPM queues.
+    prevent false sharing. Evaluated on a deterministic pass cadence for long LPM queues.
     """
     import time
     from collections import defaultdict

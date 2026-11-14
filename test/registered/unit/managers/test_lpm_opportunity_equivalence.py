@@ -13,7 +13,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 Req = SimpleNamespace
 
 PREFIX_TOKENS = 4096
-RECHECK_SECONDS = 1.0
 
 
 def _lcp(a, b):
@@ -37,7 +36,7 @@ def reference_competition_opportunity(requests, capacity):
 
     Count long-prefix reuse pairs whose intervening unique input working set,
     including the target prefix, exceeds total KV capacity. Namespace boundaries
-    prevent false sharing. Called only after the old gate, at most once/second.
+    prevent false sharing. Independent of the scheduling gate cadence.
     """
     import time
     from collections import defaultdict
