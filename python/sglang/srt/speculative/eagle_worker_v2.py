@@ -51,6 +51,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -111,11 +112,13 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     renorm_draft_probs,
     sample_draft_proposal,
+    scatter_draft_probs_to_target_vocab,
     select_top_k_tokens,
     simulated_acc_len_generator,
     spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
+    maybe_assert_async,
     maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
@@ -259,20 +262,33 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            draft_vocab_size = (
-                self.hot_token_id.shape[0]
-                if self.hot_token_id is not None
-                else target_vocab_size
-            )
-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
-            # into the target vocab via the d2t map before the sampling kernel.
-            if draft_vocab_size != target_vocab_size:
-                raise ValueError(
-                    "--speculative-use-rejection-sampling requires the draft and "
-                    f"target to share one vocab, but the draft vocab "
-                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
+            self.target_vocab_size = self.target_worker.model_config.vocab_size
+            if (
+                self.hot_token_id is not None
+                and self.hot_token_id.shape[0] != self.target_vocab_size
+            ):
+                if get_disagg().disaggregation_mode == "decode":
+                    # pd_first_draft_proposal builds a request's first q at the
+                    # target vocabulary width, not the draft width q travels at.
+                    raise ValueError(
+                        "--speculative-use-rejection-sampling with a reduced draft "
+                        "vocabulary is not supported on a PD-disaggregation decode "
+                        "server."
+                    )
+                logger.info(
+                    "Rejection sampling with a reduced draft vocabulary "
+                    f"({self.hot_token_id.shape[0]} -> {self.target_vocab_size}): q is "
+                    "scattered onto the target vocab through the d2t map, so non-hot "
+                    "target tokens are never proposed and keep their full target "
+                    "probability in the residual."
                 )
+
+    @property
+    def draft_probs_vocab_size(self) -> int:
+        """Vocabulary width of draft probabilities before verification."""
+        if self.hot_token_id is not None:
+            return self.hot_token_id.shape[0]
+        return self.draft_runner.model_config.vocab_size
 
     def init_attention_backends(self):
         with (
@@ -791,8 +807,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             get_spec().speculative_use_rejection_sampling
             and not forward_batch.sampling_info.is_all_greedy
         )
+        draft_probs_list: Optional[List[torch.Tensor]] = None
         if needs_draft_probs:
-            draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+            draft_probs_list = [spec_info.draft_probs]
 
         topk1_chain_fits = (
             self.topk == 1
@@ -908,29 +925,55 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
 
-        draft_probs = (
-            torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None
-        )
-
         # Organize the results
-        if draft_tokens_topk1 is not None:
-            bs = draft_tokens_topk1.shape[0]
-            top_scores_index = self._topk1_score_indices_prealloc[:bs]
-            parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
-
         if topk1_chain_fits:
-            bs = token_list[0].shape[0]
-            draft_tokens = torch.cat(token_list, dim=1)
+            draft_tokens = draft_tokens_topk1
+            if draft_tokens is None:
+                draft_tokens = torch.cat(token_list, dim=1)
+
+            bs = draft_tokens.shape[0]
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens, draft_probs
+        else:
+            parent_list, top_scores_index, draft_tokens = organize_draft_results(
+                score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            )
 
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
-        )
-
+        draft_probs = self._build_verify_draft_probs(draft_probs_list, draft_tokens)
         return parent_list, top_scores_index, draft_tokens, draft_probs
+
+    def _build_verify_draft_probs(
+        self,
+        draft_probs_list: Optional[List[torch.Tensor]],
+        draft_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Stack per-step q and align it with chain slots for verification.
+
+        Row i holds the distribution for chain slot i + 1; the verify kernel reads
+        row ``step - 1`` for slot ``step``. None means the proposal distribution
+        was not collected: rejection sampling is off, or the batch is all-greedy.
+        """
+        if draft_probs_list is None:
+            return None
+        draft_probs = torch.stack(draft_probs_list, dim=1)
+        if self.hot_token_id is None:
+            return draft_probs
+        draft_probs = scatter_draft_probs_to_target_vocab(
+            draft_probs, self.hot_token_id, self.target_vocab_size
+        )
+        # Every proposed token must have q > 0. Zero-mass rows are graph filler:
+        # capture warms up on zeroed q, and replay zeroes padded rows.
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            proposed_q = draft_probs.gather(
+                -1, draft_tokens.to(torch.int64).unsqueeze(-1)
+            )
+            has_mass = draft_probs.sum(-1, keepdim=True) > 0
+            maybe_assert_async(
+                ((proposed_q > 0) | ~has_mass).all(),
+                "draft_forward: q == 0 on a proposed draft token; draft_probs rows "
+                "are misaligned with the chain slots or the d2t scatter is wrong",
+            )
+        return draft_probs
 
     def _draft_forward_idle(
         self, forward_batch: ForwardBatch, spec_info: EagleDraftInput
@@ -1513,7 +1556,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     dtype=hidden_dtype,
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
+                    vocab_size=self.draft_worker.draft_probs_vocab_size,
                 )
             if batch.spec_info is not None and batch.spec_info.is_verify_input():
                 # PP+spec: the scheduler pre-built this round's verify input
