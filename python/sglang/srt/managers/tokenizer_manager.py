@@ -31,9 +31,12 @@ import time
 import traceback
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from datetime import datetime
 from enum import Enum
+from functools import partial
 from http import HTTPStatus
 from typing import (
     Any,
@@ -57,6 +60,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
@@ -237,6 +241,7 @@ from sglang.srt.utils.weight_versions import (
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_MAX_INLINE_TOKENIZER_CHARS = 256
 
 logger = logging.getLogger(__name__)
 
@@ -601,6 +606,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Give regular fast tokenization a backend the event loop never uses.
+        self.init_tokenizer_executor()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -724,6 +732,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--mm-feature-transport=cuda_vmm is not supported by model class "
                 f"{model_class.__name__}"
             )
+
+    def init_tokenizer_executor(self):
+        self._tokenizer_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sglang-tokenizer"
+        )
+        self._tokenizer_backend_source = None
+        self._tokenizer_backend = None
+        if isinstance(self.tokenizer, PreTrainedTokenizerFast):
+            # Copy once at startup: copying a real vocabulary on the request
+            # path can itself stall the loop. Other tokenizer implementations
+            # retain their synchronous path until they have an isolation contract.
+            self._tokenizer_backend_source = self.tokenizer.backend_tokenizer
+            self._tokenizer_backend = copy.deepcopy(self._tokenizer_backend_source)
+
+    def _regular_tokenizer_for_worker(self):
+        tokenizer = self.tokenizer
+        if (
+            not isinstance(tokenizer, PreTrainedTokenizerFast)
+            or tokenizer.backend_tokenizer is not self._tokenizer_backend_source
+        ):
+            # A replaced tokenizer must not use a stale backend or copy it
+            # during a request. Preserve the existing synchronous behavior.
+            return None
+        # Wrapper attributes (e.g. padding_side) may be configured after init.
+        # Pass this view explicitly; never swap the event loop's tokenizer.
+        worker_tokenizer = copy.copy(tokenizer)
+        worker_tokenizer._tokenizer = self._tokenizer_backend
+        return worker_tokenizer
+
+    async def run_in_tokenizer_executor(self, func, *args, **kwargs):
+        func_call = partial(copy_context().run, func, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._tokenizer_executor, func_call
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -1131,14 +1173,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
-                token_type_ids = None
+            def tokenize_sync(tokenizer):
+                if not is_cross_encoder and (not getattr(tokenizer, "is_fast", False)):
+                    return [tokenizer.encode(t) for t in tokenizer_input], None
+
+                encoded = tokenizer(tokenizer_input, **tokenizer_kwargs)
+                return (
+                    encoded["input_ids"],
+                    encoded.get("token_type_ids") if is_cross_encoder else None,
+                )
+
+            # Avoid an executor round trip for a bounded single text. The
+            # event loop owns its backend, even while a worker encodes longer
+            # inputs on the isolated backend.
+            inline_short_text = (
+                isinstance(texts, str)
+                and not is_cross_encoder
+                and len(texts) <= _MAX_INLINE_TOKENIZER_CHARS
+            )
+            worker_tokenizer = (
+                None if inline_short_text else self._regular_tokenizer_for_worker()
+            )
+            if worker_tokenizer is None:
+                input_ids, token_type_ids = tokenize_sync(self.tokenizer)
             else:
-                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-                input_ids = encoded["input_ids"]
-                token_type_ids = (
-                    encoded.get("token_type_ids") if is_cross_encoder else None
+                input_ids, token_type_ids = await self.run_in_tokenizer_executor(
+                    tokenize_sync, worker_tokenizer
                 )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
