@@ -35,6 +35,7 @@ from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
+    get_context,
     get_exec,
     get_parallel,
     get_spec,
@@ -212,6 +213,32 @@ def fast_sample(
     return sample_p, sample_index
 
 
+def spec_softmax(
+    logits: torch.Tensor,
+    temperatures: Optional[torch.Tensor] = None,
+    *,
+    rows_per_request: int = 1,
+) -> torch.Tensor:
+    """``sampling.softmax`` for speculative draft and verify distributions.
+
+    Deterministic inference uses torch.softmax, as the sampler does.
+    ``sampling.softmax`` selects its kernel and launch configuration from the batch
+    shape, and they round differently, so one row can get different bits in
+    different batches.
+    """
+    # Standalone draft and verify calls can run before the server publishes its config.
+    if (
+        not get_context().is_config_namespace_published("exec")
+        or not get_exec().deterministic.enable_deterministic_inference
+    ):
+        return sampling_softmax(logits, temperatures, rows_per_request=rows_per_request)
+    if temperatures is not None:
+        if rows_per_request > 1:
+            temperatures = temperatures.repeat_interleave(rows_per_request, dim=0)
+        logits = logits / temperatures
+    return torch.softmax(logits, dim=-1)
+
+
 def renorm_draft_probs(
     next_token_logits: torch.Tensor,
     sampling_info,
@@ -224,8 +251,8 @@ def renorm_draft_probs(
     temperature (higher acceptance; correctness holds for any q).
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
-        return sampling_softmax(next_token_logits)
-    return sampling_softmax(next_token_logits, temperatures=sampling_info.temperatures)
+        return spec_softmax(next_token_logits)
+    return spec_softmax(next_token_logits, temperatures=sampling_info.temperatures)
 
 
 def sample_draft_proposal(
@@ -257,7 +284,7 @@ def sample_draft_proposal(
     (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
     which is what greedy means. Drop that renorm and this stops holding.
     """
-    probs = sampling_softmax(next_token_logits, temperatures=temperatures)
+    probs = spec_softmax(next_token_logits, temperatures=temperatures)
     topk_p, topk_index = fast_sample(
         probs,
         num_samples=1,
