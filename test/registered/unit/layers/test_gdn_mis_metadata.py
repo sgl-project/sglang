@@ -9,6 +9,7 @@ import torch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import build_gdn_mis_metadata
+from sglang.srt.layers.pooler import pool_at_delimiter_positions
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,15 +45,15 @@ class TestGDNMISMetadata(CustomTestCase):
                     self._batch(), cache_indices=slots
                 ).batch_tensors
                 for tensors, query, items in (
-                    (first, [1], [1, 1, 1, 3, 3, 3]),
-                    (second, [3], [3, 3, 3, 1, 1, 1]),
+                    (first, [1], [1, 1, 3, 3]),
+                    (second, [3], [3, 3, 1, 1]),
                 ):
                     self.assertEqual(tensors.query_cache_indices.tolist(), query)
                     self.assertEqual(tensors.item_ssm_indices.tolist(), items)
-                    self.assertEqual(tensors.item_conv_indices.tolist(), list(range(6)))
+                    self.assertEqual(tensors.item_conv_indices.tolist(), list(range(4)))
                     self.assertEqual(tensors.query_has_initial_states.tolist(), [False])
                     self.assertEqual(
-                        tensors.item_has_initial_states.tolist(), [True] * 6
+                        tensors.item_has_initial_states.tolist(), [True] * 4
                     )
                     self.assertEqual(tensors.item_ssm_indices.dtype, dtype)
                 self.assertNotEqual(
@@ -101,6 +102,8 @@ class TestGDNMISMetadata(CustomTestCase):
 
             conv = torch.full((5, 12, 3), 5.0)
             ssm = torch.full((5, 2, 4, 4), 5.0)
+            expected_output = torch.zeros(1, 23, 2, 4)
+            expected_output[:, [0, 1, 2, 4, 6, 7, 8, 9, 10, 12, 14, 15, 16, 17, 18]] = 7
             with (
                 patch.object(backend, "_forward_mis_segments", side_effect=segments),
                 patch.object(
@@ -121,8 +124,7 @@ class TestGDNMISMetadata(CustomTestCase):
                         ssm_states=ssm,
                         cache_indices=slots,
                     )
-                    self.assertTrue(bool((output[:, :20] == 7).all()))
-                    self.assertTrue(bool((output[:, 20:] == 0).all()))
+                    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
                     self.assertTrue(bool((conv[slots] == 0).all()))
                     self.assertTrue(bool((ssm[slots] == 0).all()))
                     self.assertTrue(bool((conv[[0, 2, 4]] == 5).all()))
@@ -173,6 +175,47 @@ class TestGDNMISMetadata(CustomTestCase):
                 cache_indices=None,
             )
 
+    def test_only_real_items_and_empty_item_readouts_are_processed(self):
+        """Skip delimiters except when they are the existing empty-item readout."""
+        for query_len, item_lens in (
+            (3, [2]),
+            (0, [2, 1]),
+            (2, [0, 2, 0]),
+            (0, [0]),
+            (3, [0, 0]),
+        ):
+            with self.subTest(query_len=query_len, item_lens=item_lens):
+                delimiters = []
+                expected_segments = []
+                offset = query_len
+                for item_len in item_lens:
+                    delimiters.append(offset)
+                    if item_len:
+                        expected_segments.append(
+                            list(range(offset + 1, offset + 1 + item_len))
+                        )
+                    else:
+                        expected_segments.append([offset])
+                    offset += item_len + 1
+                delimiters.append(offset)
+                forward_batch = SimpleNamespace(
+                    input_ids=torch.empty(offset + 1, dtype=torch.int64),
+                    extend_seq_lens_cpu=[offset + 1],
+                    extend_prefix_lens_cpu=[0],
+                    multi_item_delimiter_indices=[
+                        torch.tensor(delimiters, dtype=torch.int64)
+                    ],
+                    is_prefill_only=True,
+                )
+
+                metadata = build_gdn_mis_metadata(forward_batch)
+                boundaries = metadata.item_cu_seqlens.tolist()
+                actual_segments = [
+                    metadata.item_token_indices[start:end].tolist()
+                    for start, end in zip(boundaries, boundaries[1:])
+                ]
+                self.assertEqual(actual_segments, expected_segments)
+
     def test_allows_trailing_attention_padding(self):
         forward_batch = SimpleNamespace(
             input_ids=torch.empty(8, dtype=torch.int64),
@@ -188,7 +231,7 @@ class TestGDNMISMetadata(CustomTestCase):
             torch.cat([metadata.query_token_indices, metadata.item_token_indices])
             .sort()
             .values,
-            torch.arange(5, dtype=torch.int64),
+            torch.tensor([0, 2, 3], dtype=torch.int64),
         )
 
     def test_mixed_batch_with_empty_query(self):
@@ -206,7 +249,7 @@ class TestGDNMISMetadata(CustomTestCase):
         metadata = build_gdn_mis_metadata(forward_batch)
 
         self.assertEqual(metadata.query_seq_lens_cpu, [4])
-        self.assertEqual(metadata.item_seq_lens_cpu, [3, 5, 1, 2, 1])
+        self.assertEqual(metadata.item_seq_lens_cpu, [2, 4, 1])
         torch.testing.assert_close(
             metadata.query_token_indices,
             torch.tensor([9, 10, 11, 12], dtype=torch.int64),
@@ -221,16 +264,25 @@ class TestGDNMISMetadata(CustomTestCase):
         )
         torch.testing.assert_close(
             metadata.item_token_indices,
-            torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15], dtype=torch.int64),
+            torch.tensor([1, 2, 4, 5, 6, 7, 14], dtype=torch.int64),
         )
         torch.testing.assert_close(
             metadata.item_cu_seqlens,
-            torch.tensor([0, 3, 8, 9, 11, 12], dtype=torch.int32),
+            torch.tensor([0, 2, 6, 7], dtype=torch.int32),
         )
         torch.testing.assert_close(
             metadata.item_request_indices,
-            torch.tensor([0, 0, 0, 1, 1], dtype=torch.int64),
+            torch.tensor([0, 0, 1], dtype=torch.int64),
         )
+
+        packed_output = torch.zeros(16, 1)
+        indices = metadata.item_token_indices
+        packed_output[indices, 0] = indices.float() + 1
+        pooled = pool_at_delimiter_positions(
+            data=packed_output, forward_batch=forward_batch, device=torch.device("cpu")
+        )
+        torch.testing.assert_close(pooled[0][1:], torch.tensor([[3.0], [8.0]]))
+        torch.testing.assert_close(pooled[1][1:], torch.tensor([[15.0]]))
 
     def test_rejects_sequence_lengths_beyond_input(self):
         forward_batch = SimpleNamespace(
