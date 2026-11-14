@@ -407,8 +407,9 @@ class MuseSpark1xFp4Experts(nn.Module):
         local_topk_ids = local_topk_ids.contiguous()
         topk_weights = topk_scores.to(torch.float32).contiguous()
 
+        # EP ranks see all token rows, but only a share of their routed experts.
         for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
-            if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
+            if num_tokens * topk / self.global_num_experts / block_size_m < 0.9:
                 break
 
         if num_tokens == 1 and topk <= 32 and expert_map is None:
