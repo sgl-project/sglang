@@ -130,6 +130,85 @@ class TestDefaultModelLoader(CustomTestCase):
                     startup_prefetch_active=True,
                 )
 
+    def test_filter_mtp_weights_keeps_requested_layer_and_remaps_to_zero(self):
+        base = torch.zeros(1)
+        mtp0 = torch.ones(1)
+        mtp1 = torch.full((1,), 2.0)
+        mtp2 = torch.full((1,), 3.0)
+        norm = torch.full((1,), 4.0)
+        weights = [
+            ("model.layers.0.self_attn.q_proj.weight", base),
+            ("model.mtp.layers.0.eh_proj.weight", mtp0),
+            ("model.mtp.layers.1.eh_proj.weight", mtp1),
+            ("model.mtp.layers.2.eh_proj.weight", mtp2),
+            ("model.norm.weight", norm),
+        ]
+
+        result = list(
+            DefaultModelLoader._filter_mtp_weights(iter(weights), "prefix.", 1)
+        )
+
+        self.assertEqual(
+            [name for name, _ in result],
+            [
+                "prefix.model.layers.0.self_attn.q_proj.weight",
+                "prefix.model.mtp.layers.0.eh_proj.weight",
+                "prefix.model.norm.weight",
+            ],
+        )
+        # Tensors pass through untouched (same objects, no copy).
+        self.assertIs(result[0][1], base)
+        self.assertIs(result[1][1], mtp1)
+        self.assertIs(result[2][1], norm)
+
+    def test_filter_mtp_weights_keeps_layer_zero_and_multi_digit_indices(self):
+        mtp0 = torch.zeros(1)
+        mtp10 = torch.ones(1)
+        weights = [
+            ("model.mtp.layers.10.eh_proj.weight", mtp10),
+            ("model.mtp.layers.0.eh_proj.weight", mtp0),
+        ]
+
+        result = list(DefaultModelLoader._filter_mtp_weights(iter(weights), "", 10))
+
+        self.assertEqual(
+            [name for name, _ in result],
+            ["model.mtp.layers.0.eh_proj.weight"],
+        )
+        self.assertIs(result[0][1], mtp10)
+
+    def test_filter_mtp_weights_yields_lazily(self):
+        pulls = []
+
+        def upstream():
+            for item in [
+                ("model.layers.0.weight", "a"),
+                ("model.mtp.layers.1.eh_proj.weight", "drop"),
+                ("model.mtp.layers.0.eh_proj.weight", "keep"),
+            ]:
+                pulls.append(item[0])
+                yield item
+
+        filtered = DefaultModelLoader._filter_mtp_weights(upstream(), "", 0)
+
+        # Building the filtered iterator must not pull anything upstream.
+        self.assertEqual(pulls, [])
+        self.assertEqual(next(filtered), ("model.layers.0.weight", "a"))
+        self.assertEqual(pulls, ["model.layers.0.weight"])
+        # Advancing past a dropped MTP layer pulls it (and only it) as well
+        # as the next kept weight, but nothing beyond that.
+        self.assertEqual(next(filtered), ("model.mtp.layers.0.eh_proj.weight", "keep"))
+        self.assertEqual(
+            pulls,
+            [
+                "model.layers.0.weight",
+                "model.mtp.layers.1.eh_proj.weight",
+                "model.mtp.layers.0.eh_proj.weight",
+            ],
+        )
+        with self.assertRaises(StopIteration):
+            next(filtered)
+
 
 class TestModelOptLoaderSelection(CustomTestCase):
     def test_every_modelopt_quantization_selects_the_modelopt_loader(self):
