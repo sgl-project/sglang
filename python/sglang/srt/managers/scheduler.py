@@ -6015,6 +6015,13 @@ class Scheduler(
         if self.deferred_responses.has_pending():
             self.deferred_responses.stream_released()
             time.sleep(0)
+        # Paused loops skip the batch getters and process_decode_queue, where
+        # HiCache acks are reaped, so a pending one would block flush_cache.
+        if (
+            self.disaggregation_mode != DisaggregationMode.DECODE
+            or self.enable_decode_hicache
+        ):
+            self._process_hicache_events(should_retry_storage_prefetch=False)
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
         else:
