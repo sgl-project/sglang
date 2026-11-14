@@ -488,6 +488,14 @@ immutable validation summaries are retained; changed or malformed inputs still
 take the original validation path. Oversized documents remain validatable without
 entering the caches. This does not cache costs, progress or scheduling outcomes.
 
+CPU prefix matching preserves the native `RadixKey` namespaces, limits, bigram
+boundaries and page rounding. For long shared signed-64-bit token prefixes it
+compares synchronous borrowed NumPy views instead of repeatedly copying slices.
+Short/divergent prefixes and unsupported representations use the native method.
+No view escapes the call and cache insertion, checkpointing and eviction remain
+owned by the native cache. Differential tests exercise the checked-out native
+class; this representation optimization does not approximate cache hits.
+
 Select the retention level before starting a new process. Record it in the run
 identity and provision storage for the artifacts actually requested. Do not
 change a running process's policy or delete its originals to adopt a new mode.

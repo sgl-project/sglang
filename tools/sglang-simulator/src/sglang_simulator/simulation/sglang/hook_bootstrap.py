@@ -21,6 +21,7 @@ from sglang_simulator.simulation.sglang import (
     mem_cache_allocator,
     mem_pool_host,
     model_runner,
+    radix_key,
     scheduler,
     unified_radix_cache,
 )
@@ -53,6 +54,7 @@ def install_simulator_hooks() -> None:
             cache_controller.C_HiCacheController,
             cache_controller.C_HybridCacheController,
             unified_radix_cache.C_UnifiedRadixCacheHook,
+            radix_key.C_RadixKeyHook,
             mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
             mem_pool_host.C_MHATokenToKVPoolHostHook,
             mem_pool_host.C_HostKVCacheHook,
