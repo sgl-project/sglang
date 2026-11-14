@@ -227,3 +227,87 @@ def convrot_int8_linear_prequant(
             out, xq, xs, weight_q, weight_scale, bias, group_size
         )
     return out
+
+
+def _run_convrot_int8_swiglu(out, x, weight_q, weight_scale, bias, group_size):
+    if (
+        convrot_int8_local_capability() == (12, 0)
+        and weight_q.dtype == torch.int8
+        and weight_q.is_contiguous()
+        and weight_q.shape[1] == x.shape[1]
+        and weight_q.data_ptr() % 16 == 0
+        and weight_scale.dtype == torch.float32
+        and weight_scale.is_contiguous()
+        and weight_scale.numel() == weight_q.shape[0]
+        and weight_q.device == weight_scale.device == x.device
+        and (
+            bias is None
+            or (
+                bias.dtype == torch.bfloat16
+                and bias.is_contiguous()
+                and bias.numel() == weight_q.shape[0]
+                and bias.device == x.device
+            )
+        )
+    ):
+        from sglang.kernels.ops.gemm.convrot_int8_swiglu import swiglu_prequant
+
+        xq, xs = convrot_rotate_quantize_activation(x, group_size)
+        swiglu_prequant(xq, xs, weight_q, weight_scale, bias, out)
+    else:
+        from sglang.kernels.ops.activation.activation import (
+            silu_and_mul_with_activation_rounding,
+        )
+
+        hidden = convrot_int8_fused_linear(x, weight_q, weight_scale, bias, group_size)
+        out.copy_(silu_and_mul_with_activation_rounding(hidden))
+
+
+@register_custom_op(op_name="convrot_int8_swiglu", mutates_args=["out"])
+def _convrot_int8_swiglu_op(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_size: int,
+) -> None:
+    _run_convrot_int8_swiglu(out, x, weight_q, weight_scale, bias, group_size)
+
+
+@debug_kernel_api
+def convrot_int8_swiglu(
+    x: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_size: int,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """ConvRot projection [gate | up] followed by BF16-rounded SiLU(gate) * up.
+
+    SM120 fuses the projection and activation without repacking the weights.
+    Other supported devices use the existing projection and activation ops.
+    """
+    if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_contiguous():
+        raise ValueError("x must be a contiguous BF16 [M, K] tensor")
+    if weight_q.ndim != 2 or weight_q.shape[0] % 32:
+        raise ValueError("SwiGLU weights must be [2 * N, K], with N a multiple of 16")
+    shape = (x.shape[0], weight_q.shape[0] // 2)
+    if out is None:
+        out = torch.empty(shape, device=x.device, dtype=torch.bfloat16)
+    elif (
+        out.shape != shape
+        or out.dtype != torch.bfloat16
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("out must be a contiguous BF16 [M, N] on the input device")
+    if x.shape[0] == 0:
+        return out
+    if torch.compiler.is_compiling():
+        _convrot_int8_swiglu_op(out, x, weight_q, weight_scale, bias, group_size)
+    else:
+        _run_convrot_int8_swiglu(out, x, weight_q, weight_scale, bias, group_size)
+    return out

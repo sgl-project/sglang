@@ -265,14 +265,14 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
                 raise ValueError(f"MiniMax H3 image does not support {name}")
         if server_args.minimax_h3_adaln_cache_path is not None:
             raise ValueError("MiniMax H3 image does not support an AdaLN cache")
-        online_quantizations = (None, "fp8", "mxfp8")
+        online_quantizations = (None, "fp8", "mxfp8", "convrot_int8")
         if server_args.quantization not in online_quantizations or any(
             name not in ("transformer", "text_encoder")
             or value not in online_quantizations
             for name, value in server_args.component_quantizations.items()
         ):
             raise ValueError(
-                "MiniMax H3 image supports online fp8/mxfp8 for the transformer "
+                "MiniMax H3 image supports online fp8/mxfp8/convrot_int8 for the transformer "
                 "and text_encoder; the image VAE retains native precision"
             )
         if server_args.lora_path is not None:
@@ -304,6 +304,16 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
                 "decode, local VAE and the image schedule"
             )
         self.vae_config.post_init()
+        transformer_quantization = server_args.component_quantizations.get(
+            "transformer", server_args.quantization
+        )
+        if transformer_quantization == "convrot_int8":
+            if server_args.minimax_h3_adaln_online:
+                raise ValueError(
+                    "MiniMax H3 image ConvRot INT8 requires "
+                    "--minimax-h3-adaln-online false"
+                )
+            server_args.minimax_h3_adaln_online = False
         self._configure_online_adaln(server_args)
         component_backend, _ = server_args.resolve_component_attention_backend(
             "transformer"

@@ -171,6 +171,38 @@ rounding and increases cold startup time. Graphs also work with layerwise
 offload; capture retains device buffers and needs more GPU memory than eager
 streaming. Eager remains the default.
 
+### ConvRot INT8 on RTX 50 series
+
+On Linux CUDA, you can quantize the original BF16 DiT and text encoder with
+ConvRot INT8 and stream their weights from host RAM. The vision tower and VAE
+keep their native precision. Install the source checkout and diffusion
+dependencies above; the JIT backend also requires `nvcc`.
+
+```bash
+SGLANG_DIFFUSION_CONVROT_INT8_BACKEND=jit \
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3-Image \
+  --num-gpus 1 \
+  --component-residency all=layerwise-offload \
+  --component-quantizations.transformer convrot_int8 \
+  --component-quantizations.text_encoder convrot_int8 \
+  --component-quantization-ignored-layers.text_encoder model.visual \
+  --component-attention-backends transformer=fa \
+  --minimax-h3-adaln-online false \
+  --allow-cudnn-tf32 false \
+  --allow-bf16-reduced-precision-reduction false \
+  --warmup-mode off
+```
+
+Use the normal generation and editing endpoints with the six-step schedule.
+On SM120, eligible BF16 ConvRot MLPs automatically fuse the gate/up projection
+and SwiGLU. Fusion preserves the existing INT8 path's rounding and weight
+layout; quantization itself changes the BF16 model's numerics.
+ConvRot uses retained AdaLN projections, so Auto selects
+`--minimax-h3-adaln-online false`; explicit online precomputation is rejected.
+See [ConvRot INT8](/docs/sglang-diffusion/quantization#convrot-int8)
+for backend and checkpoint details.
+
 ### Hardware recommendations
 
 The picker provides measured recipes for H200/B300, AMD Instinct, single-card RTX PRO 6000 and DGX Spark,

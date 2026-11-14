@@ -30,7 +30,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
     apply_convrot_int8_gelu_input,
     apply_convrot_int8_shared_input,
     apply_convrot_int8_shared_input_out,
+    apply_convrot_int8_swiglu_output,
     convrot_int8_fuses_gelu_input,
+    convrot_int8_fuses_swiglu_output,
     convrot_int8_shares_input,
 )
 
@@ -126,6 +128,19 @@ def test_shared_input_and_gelu_helpers_refuse_deferred_bias_and_lora(_load):
     assert not convrot_int8_fuses_gelu_input(deferred)
     assert not convrot_int8_fuses_gelu_input(bf16)
     assert not convrot_int8_fuses_gelu_input(wrapped)
+    with patch(
+        _LOAD_JIT_KERNEL.rsplit(".", 1)[0] + ".convrot_int8_local_capability",
+        return_value=(12, 0),
+    ):
+        assert convrot_int8_fuses_swiglu_output(plain)
+        assert not convrot_int8_fuses_swiglu_output(deferred)
+        assert not convrot_int8_fuses_swiglu_output(bf16)
+        assert not convrot_int8_fuses_swiglu_output(wrapped)
+    with patch(
+        _LOAD_JIT_KERNEL.rsplit(".", 1)[0] + ".convrot_int8_local_capability",
+        return_value=(9, 0),
+    ):
+        assert not convrot_int8_fuses_swiglu_output(plain)
 
 
 def _quantized_layer(
@@ -285,6 +300,82 @@ def _with_tp(monkeypatch, tp_size):
     monkeypatch.setattr(linear, "get_tp_group", lambda: _FakeTpGroup())
     monkeypatch.setattr(linear, "get_group_rank", lambda group: 0)
     monkeypatch.setattr(linear, "get_group_size", lambda group: tp_size)
+
+
+@patch(_LOAD_JIT_KERNEL)
+def test_swiglu_output_helper_preserves_collective_ownership(_load, monkeypatch):
+    from sglang.multimodal_gen.runtime.layers.linear import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+
+    _with_tp(monkeypatch, 2)
+    config = _jit_config()
+    column = ColumnParallelLinear(512, 1024, gather_output=False, quant_config=config)
+    gathered = ColumnParallelLinear(512, 1024, gather_output=True, quant_config=config)
+    row = RowParallelLinear(1024, 512, quant_config=config)
+    with patch(
+        _LOAD_JIT_KERNEL.rsplit(".", 1)[0] + ".convrot_int8_local_capability",
+        return_value=(12, 0),
+    ):
+        assert convrot_int8_fuses_swiglu_output(column)
+        assert not convrot_int8_fuses_swiglu_output(gathered)
+        assert not convrot_int8_fuses_swiglu_output(row)
+
+
+@requires_kernel
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_swiglu_output_preserves_local_gate_up_shards(monkeypatch, tp_size):
+    from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
+
+    _with_tp(monkeypatch, tp_size)
+    layer = MergedColumnParallelLinear(
+        512, [1024, 1024], params_dtype=torch.bfloat16, quant_config=_jit_config()
+    ).cuda()
+    torch.manual_seed(41)
+    with torch.no_grad():
+        layer.weight.normal_(std=0.02)
+        layer.bias.normal_()
+    layer.quant_method.process_weights_after_loading(layer)
+    x = torch.randn(2, 65, 512, device="cuda", dtype=torch.bfloat16)
+    gate, up = layer(x)[0].chunk(2, dim=-1)
+    expected = F.silu(gate) * up
+    actual = apply_convrot_int8_swiglu_output(layer, x)
+    assert actual.shape == (2, 65, 1024 // tp_size)
+    assert torch.equal(actual, expected)
+    with pytest.raises(ValueError, match="BF16 activations"):
+        apply_convrot_int8_swiglu_output(layer, x.half())
+
+
+@requires_kernel
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_h3_mlp_swiglu_matches_unfused_model_forward(monkeypatch, dtype):
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3
+
+    _with_tp(monkeypatch, 1)
+    mlp = minimax_h3.MiniMaxH3MLP(
+        SimpleNamespace(hidden_size=512, ffn_hidden_size=1024),
+        _jit_config(),
+        prefix="blocks.0.mlp",
+    ).cuda()
+    torch.manual_seed(19)
+    for layer in [mlp.fc1, mlp.fc2]:
+        with torch.no_grad():
+            layer.weight.normal_(std=0.02)
+        layer.quant_method.process_weights_after_loading(layer)
+    x = torch.randn(129, 512, device="cuda", dtype=dtype)
+    helper = minimax_h3.apply_convrot_int8_swiglu_output
+    with patch.object(
+        minimax_h3, "apply_convrot_int8_swiglu_output", wraps=helper
+    ) as call:
+        actual = mlp(x)
+        assert call.call_count == int(
+            dtype == torch.bfloat16 and torch.cuda.get_device_capability() == (12, 0)
+        )
+    monkeypatch.setattr(
+        minimax_h3, "convrot_int8_fuses_swiglu_output", lambda layer: False
+    )
+    assert torch.equal(actual, mlp(x))
 
 
 @patch(_LOAD_JIT_KERNEL)
