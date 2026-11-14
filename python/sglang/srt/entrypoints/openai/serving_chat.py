@@ -3010,6 +3010,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         request._response_parser_tool_grammar,
                         request._response_parser_grammar_start,
                     ),
+                    parallel_tool_calls=request.parallel_tool_calls,
                 )
 
             # Extract prompt_token_ids if requested
@@ -3224,6 +3225,7 @@ class OpenAIServingChat(OpenAIServingBase):
         history_tool_calls_cnt: int = 0,
         response_parser_prefix: str = "",
         constrained: bool = False,
+        parallel_tool_calls: bool = True,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -3240,6 +3242,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_choice=tool_choice,
                 prefix=response_parser_prefix,
                 constrained=constrained,
+                parallel_tool_calls=parallel_tool_calls,
             )
             detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
@@ -3723,6 +3726,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tool_choice=request.tool_choice,
                         prefix=request._response_parser_prefix,
                         constrained=constrained,
+                        parallel_tool_calls=request.parallel_tool_calls,
                     )
                     use_native_parser = probe.owns_tool_format()
                 if use_native_parser:
@@ -3736,6 +3740,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tokenizer=self.tokenizer_manager.tokenizer,
                     prefix=request._response_parser_prefix,
                     constrained=constrained,
+                    parallel_tool_calls=request.parallel_tool_calls,
                 )
 
         parser = parser_dict[index]

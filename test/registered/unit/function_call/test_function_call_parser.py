@@ -6302,5 +6302,64 @@ class TestToolCallParserNames(unittest.TestCase):
         )
 
 
+class TestParallelToolCallsFalse(unittest.TestCase):
+    """parallel_tool_calls=False must cap an unconstrained (tool_choice=auto)
+    turn at one tool call, in both the non-streaming and streaming paths."""
+
+    TEXT = (
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Hanoi"}}\n'
+        "</tool_call>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Tokyo"}}\n'
+        "</tool_call>"
+    )
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                ),
+            )
+        ]
+
+    def _stream(self, parallel_tool_calls):
+        parser = FunctionCallParser(
+            self.tools, "qwen25", parallel_tool_calls=parallel_tool_calls
+        )
+        calls = []
+        for i in range(0, len(self.TEXT), 7):
+            calls += parser.parse_stream_chunk(self.TEXT[i : i + 7])[1]
+        calls += parser.parse_stream_end()[1]
+        args = {}
+        for c in calls:
+            args[c.tool_index] = args.get(c.tool_index, "") + (c.parameters or "")
+        return args
+
+    def test_non_stream_keeps_only_first_call(self):
+        parser = FunctionCallParser(self.tools, "qwen25", parallel_tool_calls=False)
+        _, calls = parser.parse_non_stream(self.TEXT)
+        self.assertEqual([json.loads(c.parameters) for c in calls], [{"city": "Hanoi"}])
+
+    def test_non_stream_default_keeps_all_calls(self):
+        parser = FunctionCallParser(self.tools, "qwen25")
+        _, calls = parser.parse_non_stream(self.TEXT)
+        self.assertEqual(len(calls), 2)
+
+    def test_stream_keeps_only_first_call(self):
+        args = self._stream(parallel_tool_calls=False)
+        self.assertEqual(
+            {k: json.loads(v) for k, v in args.items()}, {0: {"city": "Hanoi"}}
+        )
+
+    def test_stream_default_keeps_all_calls(self):
+        self.assertEqual(sorted(self._stream(parallel_tool_calls=True)), [0, 1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -136,9 +136,15 @@ class FunctionCallParser:
         tool_choice=None,
         prefix: str = "",
         constrained: bool = False,
+        parallel_tool_calls: bool = True,
     ):
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        # Grammar constraints cap a turn at one call only for required/named
+        # tool_choice and strict tools; plain auto output is unconstrained, so
+        # parallel_tool_calls=False is also enforced on the parsed result.
+        self.parallel_tool_calls = parallel_tool_calls
+        self._single_call_index: Optional[int] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -222,6 +228,8 @@ class FunctionCallParser:
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
+        if not self.parallel_tool_calls:
+            tool_call_list = tool_call_list[:1]
         if tool_call_list or has_tool_call:
             return parsed_result.normal_text, tool_call_list
         else:
@@ -251,7 +259,15 @@ class FunctionCallParser:
             final_calls.extend(sp_result.calls)
             final_normal_text = sp_result.normal_text
 
-        return final_normal_text, final_calls
+        return final_normal_text, self._keep_first_call(final_calls)
+
+    def _keep_first_call(self, calls: list[ToolCallItem]) -> list[ToolCallItem]:
+        """Streaming items of one call share a tool_index; keep only the first."""
+        if self.parallel_tool_calls or not calls:
+            return calls
+        if self._single_call_index is None:
+            self._single_call_index = calls[0].tool_index
+        return [c for c in calls if c.tool_index == self._single_call_index]
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
@@ -262,7 +278,7 @@ class FunctionCallParser:
         if not self.tools and not self.detector.parses_without_tools():
             return "", []
         sp_result = self.detector.finish(self.tools)
-        return sp_result.normal_text, sp_result.calls
+        return sp_result.normal_text, self._keep_first_call(sp_result.calls)
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
