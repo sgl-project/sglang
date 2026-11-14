@@ -1,5 +1,6 @@
-"""End-to-end CUDA-graph coverage for linear and tree UNO decoding.
+"""End-to-end decode-graph coverage for linear and tree UNO decoding.
 
+On XPU it runs on the intel_xpu attention backend with XPU decode graphs.
 The test runs both modes on the same prompts. Linear UNO alternates
 LoRA-draft and clean-target variants in one graph runner. Tree UNO uses a
 private LoRA-draft runner before native EAGLE tree verification. Besides the
@@ -16,13 +17,14 @@ from unittest.mock import patch
 import requests
 from huggingface_hub import snapshot_download
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_xpu
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(
@@ -30,6 +32,9 @@ register_cuda_ci(
     stage="extra-a",
     runner_config="1-gpu-large",
 )
+register_xpu_ci(est_time=900, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
+
+_is_xpu = is_xpu()
 
 MODEL = "Qwen/Qwen3-8B"
 DEFAULT_UNO_LORA_REPO = "s-sahoo/uno-qwen3-8B"
@@ -42,6 +47,10 @@ MAX_NEW_TOKENS = 128
 # AR decode and UNO verification use different kernel shapes, so compare a
 # bounded greedy prefix instead of requiring full-sequence bitwise identity.
 PARITY_TOKENS = 32
+# XPU bf16 GEMMs are not batch-invariant, so AR's one-row decode and UNO's
+# F-row verify can flip a near-tie; AR alone flipped at a 0.25 gap on B60.
+# Same bound as SpecServerKit's decode-vs-prefill logprob_match_delta.
+XPU_NEAR_TIE_LOGPROB_GAP = 0.5
 # One LoRA draft forward plus one clean verification forward.
 FORWARDS_PER_UNO_CYCLE = 2
 PROMPTS = (
@@ -125,20 +134,39 @@ class TestUnoCudaGraph(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.adapter_path = _resolve_uno_lora_path()
 
-    def _server_args(self, config: _UnoConfig | None) -> list[str]:
-        args = [
-            "--dtype",
-            "bfloat16",
+    def _platform_args(self) -> list[str]:
+        if _is_xpu:
+            # The BMG cookbook decode setup. The 24 GB card needs a higher
+            # static fraction to hold the 16.4 GB model plus the 1.4 GB UNO
+            # LoRA pool.
+            return [
+                "--attention-backend",
+                "intel_xpu",
+                "--page-size",
+                "64",
+                "--cuda-graph-backend-decode",
+                "full",
+                "--mem-fraction-static",
+                "0.88",
+            ]
+        return [
             "--attention-backend",
             "fa3",
-            "--max-running-requests",
-            str(len(PROMPTS)),
             "--cuda-graph-max-bs-decode",
             str(len(PROMPTS)),
             "--mem-fraction-static",
             "0.7",
             "--page-size",
             "1",
+        ]
+
+    def _server_args(self, config: _UnoConfig | None) -> list[str]:
+        args = [
+            "--dtype",
+            "bfloat16",
+            *self._platform_args(),
+            "--max-running-requests",
+            str(len(PROMPTS)),
             "--disable-radix-cache",
             "--random-seed",
             "17",
@@ -160,7 +188,7 @@ class TestUnoCudaGraph(CustomTestCase):
             )
         return args
 
-    def _run_ar_reference(self) -> list[list[int]]:
+    def _run_ar_reference(self) -> tuple[list[list[int]], list | None]:
         process = None
         try:
             process = popen_launch_server(
@@ -169,10 +197,10 @@ class TestUnoCudaGraph(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=self._server_args(None),
             )
-            return self._run_greedy_output_ids()
+            return self._run_greedy(with_top2=_is_xpu)
         finally:
             if process is not None:
-                kill_process_tree(process.pid)
+                terminate_and_kill_process_tree(process)
 
     def _run_config(self, config: _UnoConfig) -> tuple[float, list[list[int]]]:
         process = None
@@ -183,29 +211,36 @@ class TestUnoCudaGraph(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=self._server_args(config),
             )
-            greedy_output_ids = self._run_greedy_output_ids()
+            # UNO rejects returned logprobs, so only AR records its top 2.
+            greedy_output_ids, _ = self._run_greedy(with_top2=False)
             tpf = self._run_generation_contract(config)
             return tpf, greedy_output_ids
         finally:
             if process is not None:
-                kill_process_tree(process.pid)
+                terminate_and_kill_process_tree(process)
 
-    def _run_greedy_output_ids(self) -> list[list[int]]:
+    def _run_greedy(self, *, with_top2: bool) -> tuple[list[list[int]], list | None]:
+        """Greedy output ids per prompt, plus per-position top-2
+        (logprob, token) pairs when ``with_top2``."""
         # A list-valued request can be admitted with different prefill batch
         # shapes across server launches. Run each parity prompt at BS1 so the
         # AR and UNO comparisons use the same execution shape.
         output_ids = []
+        top2 = [] if with_top2 else None
         for prompt in PROMPTS:
+            request = {
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": PARITY_TOKENS,
+                    "ignore_eos": True,
+                },
+            }
+            if with_top2:
+                request.update(return_logprob=True, top_logprobs_num=2)
             response = requests.post(
                 self.base_url + "/generate",
-                json={
-                    "text": prompt,
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": PARITY_TOKENS,
-                        "ignore_eos": True,
-                    },
-                },
+                json=request,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             )
             self.assertEqual(response.status_code, 200, response.text)
@@ -218,20 +253,57 @@ class TestUnoCudaGraph(CustomTestCase):
                 f"Wrong greedy output length for prompt {prompt!r}",
             )
             output_ids.append(result["output_ids"])
-        return output_ids
+            if with_top2:
+                top2.append(
+                    [
+                        [(logprob, token) for logprob, token, *_ in step]
+                        for step in result["meta_info"]["output_top_logprobs"]
+                    ]
+                )
+        return output_ids, top2
 
     def _assert_ar_parity(
         self,
         mode: str,
         actual: list[list[int]],
         expected: list[list[int]],
+        expected_top2: list | None,
     ) -> None:
-        for prompt, actual_ids, expected_ids in zip(PROMPTS, actual, expected):
-            self.assertEqual(
-                actual_ids,
-                expected_ids,
+        """Exact greedy parity, except that with ``expected_top2`` the first
+        divergence may be AR's runner-up at a near-tie (see
+        XPU_NEAR_TIE_LOGPROB_GAP); later tokens then differ legitimately."""
+        for index, (prompt, actual_ids, expected_ids) in enumerate(
+            zip(PROMPTS, actual, expected)
+        ):
+            message = (
                 f"{mode} UNO diverged from AR within the first "
-                f"{PARITY_TOKENS} tokens for prompt {prompt!r}",
+                f"{PARITY_TOKENS} tokens for prompt {prompt!r}"
+            )
+            divergence = next(
+                (
+                    position
+                    for position, (got, want) in enumerate(
+                        zip(actual_ids, expected_ids)
+                    )
+                    if got != want
+                ),
+                None,
+            )
+            if divergence is None or expected_top2 is None:
+                self.assertEqual(actual_ids, expected_ids, message)
+                continue
+            (best_logprob, _), (runner_up_logprob, runner_up) = expected_top2[index][
+                divergence
+            ]
+            self.assertEqual(
+                actual_ids[divergence],
+                runner_up,
+                f"{message}: position {divergence} is not AR's runner-up",
+            )
+            self.assertLessEqual(
+                best_logprob - runner_up_logprob,
+                XPU_NEAR_TIE_LOGPROB_GAP,
+                f"{message}: AR was not near a tie at position {divergence}",
             )
 
     def _run_generation_contract(self, config: _UnoConfig) -> float:
@@ -287,13 +359,13 @@ class TestUnoCudaGraph(CustomTestCase):
         return tpf
 
     def test_ar_parity_and_nontrivial_tpf(self):
-        ar_output_ids = self._run_ar_reference()
+        ar_output_ids, ar_top2 = self._run_ar_reference()
 
         linear_tpf, linear_output_ids = self._run_config(LINEAR_CONFIG)
-        self._assert_ar_parity("Linear", linear_output_ids, ar_output_ids)
+        self._assert_ar_parity("Linear", linear_output_ids, ar_output_ids, ar_top2)
 
         tree_tpf, tree_output_ids = self._run_config(TREE_CONFIG)
-        self._assert_ar_parity("Tree", tree_output_ids, ar_output_ids)
+        self._assert_ar_parity("Tree", tree_output_ids, ar_output_ids, ar_top2)
 
         print(f"UNO GSM8K sample: {linear_tpf=:.3f}, {tree_tpf=:.3f}")
 

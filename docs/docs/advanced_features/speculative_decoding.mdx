@@ -541,7 +541,7 @@ print(response.choices[0].message.content)
 
 ### Key requirements and limitations
 
-- UNO requires CUDA with FA3 for prefill and decode, tensor and pipeline parallel sizes of 1, and no DP attention or context parallelism.
+- UNO requires the same attention backend for prefill and decode: FA3 on CUDA, or `intel_xpu` or `triton` on Intel XPU. It also requires tensor and pipeline parallel sizes of 1, and no DP attention or context parallelism.
 - `--uno-lora-path` loads UNO's fixed internal adapter and cannot be combined with request-selectable Multi-LoRA serving.
 - UNO manages its own stochastic verification; do not set `--speculative-use-rejection-sampling`.
 - Grammar decoding, returned logprobs or hidden states, sampling penalties, `min_p`, logit bias, custom logit processors, strict thinking, and deterministic inference are not yet supported.
