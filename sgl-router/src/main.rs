@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, Context, Result};
+use axum::serve::ListenerExt;
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
@@ -472,14 +473,29 @@ async fn serve(
         })
     });
     let stop = grpc_stop.clone();
-    let mut result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal(sigterm, sigint, app_context, drain).await;
-            let _ = drain_tx.send(Some(Instant::now()));
-            stop.cancel();
-        })
-        .await
-        .context("axum serve");
+    let mut result = axum::serve(
+        listener.tap_io(|tcp_stream| {
+            // Accepted client sockets inherit Nagle's algorithm; a streamed
+            // chunk can then sit waiting for the peer's delayed ACK (>=40 ms
+            // on Linux), which showed up as a +40 ms TTFT tail on idle
+            // streaming requests (issue #46067). Worker sockets already run
+            // with TCP_NODELAY.
+            if let Err(err) = tcp_stream.set_nodelay(true) {
+                tracing::warn!(
+                    %err,
+                    "failed to set TCP_NODELAY on accepted client socket"
+                );
+            }
+        }),
+        app,
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal(sigterm, sigint, app_context, drain).await;
+        let _ = drain_tx.send(Some(Instant::now()));
+        stop.cancel();
+    })
+    .await
+    .context("axum serve");
     grpc_stop.cancel();
     if let Some(grpc) = grpc {
         let grpc_result = grpc
