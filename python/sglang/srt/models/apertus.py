@@ -403,6 +403,8 @@ class ApertusModel(nn.Module):
             if hasattr(layer_self_attn.attn, "k_scale"):
                 layer_self_attn.attn.k_scale = scaling_factor
                 layer_self_attn.attn.v_scale = scaling_factor
+                layer_self_attn.attn.k_scale_float = scaling_factor
+                layer_self_attn.attn.v_scale_float = scaling_factor
             else:
                 raise RuntimeError(
                     "Self attention has no KV cache scaling factor attribute!"
