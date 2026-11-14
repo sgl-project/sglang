@@ -175,15 +175,20 @@ class C_KVCacheConfiguratorHook(BaseHook):
                     except RuntimeError:
                         return 0
                     except ValueError as error:
-                        # New runtimes reject deliberately undersized SWA probes.
                         if "cannot hold even one request" not in str(error):
                             raise
                         return 0
                     return config.max_total_num_tokens
 
-                lower, upper = 0, 1
-                while resolved_tokens(upper) < target_tokens:
-                    lower, upper = upper, upper * 2
+                lower, upper = (0, 1)
+                for _ in range(64):
+                    if resolved_tokens(upper) >= target_tokens:
+                        break
+                    lower, upper = (upper, upper * 2)
+                else:
+                    raise ValueError(
+                        "Native KV pool cannot represent the requested capacity"
+                    )
                 while lower + 1 < upper:
                     middle = (lower + upper) // 2
                     if resolved_tokens(middle) < target_tokens:
