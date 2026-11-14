@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupState,
     NodeId,
 )
+from sglang.srt.utils.device import async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -166,6 +167,15 @@ class _OngoingBufferLoadBack(msgspec.Struct):
     device_indices: torch.Tensor
     load_transfers: list[PoolTransfer]
     load_contexts: list[BufferLoadBackContext]
+
+
+class _OwnershipCheck(msgspec.Struct):
+    """A load-back's slot-ownership comparison, run on the device and read
+    at the load-back's ack."""
+
+    mismatch: torch.Tensor
+    copied: torch.cuda.Event
+    violation: str
 
 
 class _AnchorLock(msgspec.Struct):
@@ -346,6 +356,8 @@ class BufferModePipeline:
         ] = {}
         self.staged_prefetches: dict[CacheRequestHandle, _StagedPrefetch] = {}
         self.ongoing_buffer_load_back: dict[int, _OngoingBufferLoadBack] = {}
+        # Device-side ownership checks of in-flight load-backs, by ack id.
+        self._ownership_checks: dict[int, _OwnershipCheck] = {}
         # FIFO intents (one per pool of a node) awaiting a D2H slot, and the
         # pools in flight per node (admission to storage ack).
         self.pending_write_queue: deque[_UnifiedBackupIntent] = deque()
@@ -684,8 +696,7 @@ class BufferModePipeline:
             self._queued_span_refs[span] = refs - 1
 
     def begin_insert_walk(self) -> None:
-        """Admit each node once per insert walk: the trigger chains every
-        unbacked ancestor, so a depth-d path is presented d(d+1)/2 times."""
+        """Admit each node once per insert walk, even if the walk's backups repeat it."""
         self._walk_admitted = set()
 
     def end_insert_walk(self) -> None:
@@ -1482,6 +1493,10 @@ class BufferModePipeline:
     def has_staged(self, request: CacheRequestHandle) -> bool:
         return request in self.staged_prefetches
 
+    def staged_prefix_end(self, request: CacheRequestHandle) -> int:
+        f = self.staged_prefetches.get(request)
+        return 0 if f is None else f.matched_len + f.num_tokens
+
     def prepare_staged_prefetch(self, req: Req) -> bool:
         """Rebuild the admission plan from this pass's joint component match."""
         req.staged_prefetch_plan = None
@@ -1917,21 +1932,52 @@ class BufferModePipeline:
             splice_base:span_end
         ]
         self.release_anchor_lock(request)
-        owned = match.device_prefix_len >= span_end and torch.equal(
-            canonical, device_indices
+        violation = (
+            "HiCache buffer load-back ownership violation "
+            f"req={f.request.rid}: "
+            f"insert prefix_len={insert_result.prefix_len} "
+            f"expected={splice_base}, matched={match.device_prefix_len} "
+            f"span_end={span_end} splice_base={splice_base}; "
+            f"the load-back's H2D may target freed slots"
         )
-        if not owned:
-            # Fail-stop: the insert freed or replaced slots the in-flight H2D
-            # still targets; continuing risks silent KV corruption.
-            raise RuntimeError(
-                "HiCache buffer load-back ownership violation "
-                f"req={f.request.rid}: "
-                f"insert prefix_len={insert_result.prefix_len} "
-                f"expected={splice_base}, matched={match.device_prefix_len} "
-                f"span_end={span_end} splice_base={splice_base}; "
-                f"in-flight H2D targets freed slots"
-            )
+        # Fail-stop before any H2D runs unless the insert appended the whole span.
+        if (
+            insert_result.prefix_len != splice_base
+            or match.device_prefix_len < span_end
+            or len(canonical) != len(device_indices)
+        ):
+            raise RuntimeError(violation)
+        self._check_ownership(load_back_id, canonical, device_indices, violation)
         return len(canonical), match.last_device_node
+
+    def _check_ownership(
+        self,
+        load_back_id: int,
+        canonical: torch.Tensor,
+        device_indices: torch.Tensor,
+        violation: str,
+    ) -> None:
+        """Compare the published rows with the H2D destinations, on CUDA with
+        pinned memory without waiting: the load-back's ack reads the result."""
+        if not device_indices.is_cuda:
+            if not torch.equal(canonical, device_indices):
+                raise RuntimeError(violation)
+            return
+        mismatch = async_d2h((canonical != device_indices).any())
+        copied = torch.cuda.Event()
+        # The H2D waits on start_loading's start_event, recorded later on this stream.
+        copied.record()
+        self._ownership_checks[load_back_id] = _OwnershipCheck(
+            mismatch, copied, violation
+        )
+
+    def _verify_ownership(self, load_back_id: int) -> None:
+        check = self._ownership_checks.pop(load_back_id, None)
+        if check is None:
+            return
+        check.copied.synchronize()
+        if check.mismatch.item():
+            raise RuntimeError(check.violation)
 
     def _ensure_full_capacity(self, load_tokens: int) -> bool:
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
@@ -2034,6 +2080,7 @@ class BufferModePipeline:
         f = self.ongoing_buffer_load_back.pop(ack_id, None)
         if f is None:
             return False
+        self._verify_ownership(ack_id)
         cache = self._cache
         cc = cache.cache_controller
 
