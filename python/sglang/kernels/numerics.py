@@ -1,24 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical primitives shared by bit-exact Triton kernels.
 
-The multiply and reciprocal-square-root primitives are inline asm on purpose:
-:func:`mul_rn_f32` is the opaque barrier that keeps LLVM from contracting it
-into an FMA with a following add, which is what lets the fused kernels stay
-bit-identical to the eager chain.
-
-Triton lowers ``tl.inline_asm_elementwise`` straight into LLVM inline asm, so
-the mnemonics must be the target assembler's own syntax. CUDA takes PTX with
-``f`` constraints; the AMD backend needs GCN mnemonics with ``v`` (VGPR)
-constraints. Handing the PTX form to AMD fails while assembling the kernel::
-
-    error: couldn't allocate output register for constraint 'f'
-
-and that aborts the process instead of raising, so it cannot be caught at the
-call site. AMD has one more wrinkle: there is no single instruction for an
-IEEE divide (LLVM does not expand the ``div.rn.f32`` pseudo-instruction inside
-inline asm), so :func:`div_rn_f32` uses Triton's own fp32 division there, which
-lowers to the full ``v_div_scale``/``v_rcp_f32``/``v_div_fixup_f32`` sequence
-because ``/`` carries no fast-math flags.
+``mul_rn_f32`` is inline asm so LLVM cannot contract it into an FMA with a
+following add, which keeps the fused kernels bit-identical to the eager chain.
+``tl.inline_asm_elementwise`` becomes LLVM inline asm verbatim, so the mnemonics
+have to match the target: CUDA takes PTX with ``f`` constraints, the AMD backend
+needs GCN mnemonics with ``v`` (VGPR) constraints and rejects the PTX form with
+``couldn't allocate output register for constraint 'f'``. AMD also has no
+inline-asm IEEE divide (LLVM will not expand the ``div.rn.f32`` pseudo
+instruction), so ``div_rn_f32`` uses Triton's ``/`` there.
 """
 
 import torch
@@ -27,7 +17,6 @@ import triton.language as tl  # type: ignore
 
 _FLT_MIN = tl.constexpr(1.1754943508222875e-38)
 
-# AMD GPUs reject the PTX constraint set described above (observed on gfx1151).
 _AMD = torch.version.hip is not None
 
 

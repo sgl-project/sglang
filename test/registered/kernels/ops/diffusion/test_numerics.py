@@ -1,13 +1,10 @@
-"""``sglang.kernels.numerics``: the inline-asm primitives the bit-exact Triton
-kernels are built on.
+"""``sglang.kernels.numerics``: the inline-asm primitives behind the bit-exact
+kernels.
 
-ROCm-only, because that is where the asm family changes. CUDA hands PTX to
-``tl.inline_asm_elementwise`` with ``f`` constraints; the AMD backend assembles
-GCN mnemonics and needs ``v`` (VGPR) constraints. Mixing the two fails while
-compiling the kernel, with ``couldn't allocate output register for constraint
-'f'`` -- an abort, not a Python exception, so nothing at the call site can
-catch it. Compiling each primitive below is the regression test; the
-assertions pin the results to torch's own arithmetic.
+ROCm-only: the CUDA build hands PTX to ``tl.inline_asm_elementwise``, while the
+AMD backend assembles GCN mnemonics with ``v`` constraints and rejects the PTX
+form with ``couldn't allocate output register for constraint 'f'``. Compiling
+each primitive is the regression test; the assertions pin it to torch's math.
 """
 
 import sys
