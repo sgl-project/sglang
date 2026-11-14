@@ -23,6 +23,7 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -219,18 +220,25 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 
+def dflash_verify_needs_logits_adjustment(sampling_info: SamplingBatchInfo) -> bool:
+    # apply_dflash_verify_logits_adjustments is a no-op unless this holds; verify
+    # paths that skip it (argmax-only, sparse support) rely on that to stay exact.
+    penalizer = sampling_info.penalizer_orchestrator
+    return (
+        sampling_info.has_custom_logit_processor
+        or (penalizer is not None and penalizer.is_required)
+        or sampling_info.grammar_mask is not None
+        or sampling_info.logit_bias is not None
+    )
+
+
 def apply_dflash_verify_logits_adjustments(
     *,
     next_token_logits: torch.Tensor,
-    sampling_info: Any,
+    sampling_info: Optional[SamplingBatchInfo],
     draft_token_num: int,
 ) -> None:
-    """Apply sampling-time logit adjustments for DFlash verify in place.
-
-    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
-    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
-    """
+    """Apply sampling-time logit adjustments for DFlash verify in place."""
     if sampling_info is None:
         return
     if next_token_logits.ndim != 2:
@@ -247,6 +255,9 @@ def apply_dflash_verify_logits_adjustments(
             f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
         )
 
+    if not dflash_verify_needs_logits_adjustment(sampling_info):
+        return
+
     if sampling_info.has_custom_logit_processor:
         apply_custom_logit_processor(
             next_token_logits,
@@ -254,10 +265,9 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
-    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    grammar_mask = getattr(sampling_info, "grammar_mask", None)
-    logit_bias = getattr(sampling_info, "logit_bias", None)
+    penalizer = sampling_info.penalizer_orchestrator
+    grammar_mask = sampling_info.grammar_mask
+    logit_bias = sampling_info.logit_bias
 
     logits_3d: Optional[torch.Tensor] = None
 
@@ -267,12 +277,7 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
-    if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or grammar_mask is not None:
+    if (penalizer is not None and penalizer.is_required) or grammar_mask is not None:
         linear_penalty = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
@@ -283,17 +288,6 @@ def apply_dflash_verify_logits_adjustments(
             linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
         )
         return
-
-    if acc_linear_penalties is not None:
-        if (
-            acc_linear_penalties.device != next_token_logits.device
-            or acc_linear_penalties.dtype != next_token_logits.dtype
-        ):
-            acc_linear_penalties = acc_linear_penalties.to(
-                device=next_token_logits.device,
-                dtype=next_token_logits.dtype,
-            )
-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
 
     if logit_bias is not None:
         if (
