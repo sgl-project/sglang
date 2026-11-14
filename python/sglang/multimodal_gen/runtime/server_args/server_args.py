@@ -3053,11 +3053,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
                 "W8A8; runs on SGLang's JIT-compiled fused ops on CC 9.0, 10.0, "
                 "12.0 and 12.1, else on comfy_kitchen; see "
-                "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND). Other methods "
-                "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
-                "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
-                "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
-                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (Ascend 950 series for mxfp4_npu)."
+                "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND), and for 'mxfp8' on every "
+                "platform but Ascend NPU and MPS: real block-scaled MXFP8 on Blackwell and "
+                "Intel XPU, the per-channel or per-tensor fp8 path elsewhere. Other "
+                "methods ('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp4_npu', "
+                "'modelslim', and 'mxfp8' on Ascend NPU) require a pre-quantized "
+                "checkpoint. Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
+                "'mxfp4_npu' targets Ascend NPU (Ascend 950 series)."
             ),
         )
         parser.add_argument(
