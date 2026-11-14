@@ -129,6 +129,8 @@ class TestV41IndexerArchGates(CustomTestCase):
             full = indexer.make_full_topk_indexer(
                 token_to_kv_pool=SimpleNamespace(),
                 req_to_token=torch.empty(0),
+                index_heads=64,
+                index_topk=512,
             )
             self.assertTrue(full.use_deep_gemm_prefill)
             self.assertTrue(full.use_deep_gemm_decode)
@@ -138,6 +140,8 @@ class TestV41IndexerArchGates(CustomTestCase):
             full = indexer.make_full_topk_indexer(
                 token_to_kv_pool=SimpleNamespace(),
                 req_to_token=torch.empty(0),
+                index_heads=64,
+                index_topk=512,
             )
             self.assertFalse(full.use_deep_gemm_prefill)
             self.assertFalse(full.use_deep_gemm_decode)

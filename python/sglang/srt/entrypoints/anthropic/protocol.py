@@ -262,6 +262,7 @@ class AnthropicThinkingParam(BaseModel):
     Mirrors the SDK's ``thinking_config_{enabled,disabled,adaptive}_param.py``
     variants. ``budget_tokens`` and ``display="omitted"``/``"updates"`` are
     accepted for SDK compatibility but not enforced; the serving layer logs them.
+    Some Anthropic-compatible clients omit ``budget_tokens`` on ``enabled``.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
@@ -272,11 +273,7 @@ class AnthropicThinkingParam(BaseModel):
     def _validate_thinking_shape(self):
         # Cross-field rules mirror the SDK's three discriminated variants.
         if self.type == "enabled":
-            if self.budget_tokens is None:
-                raise ValueError(
-                    "thinking.budget_tokens is required when thinking.type is 'enabled'"
-                )
-            if self.budget_tokens < 1024:
+            if self.budget_tokens is not None and self.budget_tokens < 1024:
                 raise ValueError(
                     "thinking.budget_tokens must be >= 1024 (got {})".format(
                         self.budget_tokens
