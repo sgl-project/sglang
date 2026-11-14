@@ -4162,8 +4162,16 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
-            self._check_late_layer_tail_readers(forward_batch, tail)
+            # None inside a HIP prefill CUDA graph: the late layers run every row.
+            # On CUDA the tail is required, so a missing one is a bug.
+            tail_metadata = attn_backend.tail_forward_metadata
+            if tail_metadata is None:
+                assert not (
+                    _is_cuda and attn_backend.enable_decoder_swa_bounded_replay
+                ), "CUDA prefill is missing the SWA tail"
+            else:
+                tail = tail_metadata.late_layer_tail
+                self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
             tail is not None
             and tail.scatter_indices is not None
@@ -5115,7 +5123,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            return get_attn_backend().tail_forward_metadata.late_layer_tail
+            attn_backend = get_attn_backend()
+            # None inside a HIP prefill CUDA graph: the late layers run every row.
+            # On CUDA the tail is required, so a missing one is a bug.
+            tail_metadata = attn_backend.tail_forward_metadata
+            if tail_metadata is None:
+                assert not (
+                    _is_cuda and attn_backend.enable_decoder_swa_bounded_replay
+                ), "CUDA prefill is missing the SWA tail"
+                return None
+            return tail_metadata.late_layer_tail
         return None
 
     def postprocess_cp_output(self, hidden_states, forward_batch):
