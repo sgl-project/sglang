@@ -8,10 +8,12 @@ import json
 import unittest
 
 import torch
+from transformers import AutoModelForCausalLM
 
 import sglang as sgl
 from sglang.benchmark.offline_throughput import BenchArgs, throughput_test
 from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -152,6 +154,48 @@ class TestSRTEngine(CustomTestCase):
             torch.allclose(out1, out2, atol=1e-5, rtol=1e-3),
             "Sync and async embeddings are not equal within tolerance",
         )
+
+    def test_9_engine_positional_embed_overrides(self):
+        # The embeddings decide the output: another prompt's embeddings over these
+        # ids give its tokens.
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        sampling_params = {"temperature": 0, "max_new_tokens": 16, "ignore_eos": True}
+        tokenizer = get_tokenizer(model_path)
+        input_ids = tokenizer.encode("The capital of France is")
+        other_ids = tokenizer.encode("Soup needs salt and also")
+        self.assertEqual(len(input_ids), len(other_ids))
+        embed_tokens = AutoModelForCausalLM.from_pretrained(
+            model_path
+        ).get_input_embeddings()
+        with torch.no_grad():
+            other_embeds = embed_tokens(torch.tensor(other_ids)).float()
+        overrides = PositionalEmbeds(
+            embeds=other_embeds, positions=list(range(len(other_ids)))
+        )
+
+        # Overrides always prefill eagerly, so the ids must too for equal outputs.
+        engine = sgl.Engine(
+            model_path=model_path, random_seed=42, disable_prefill_cuda_graph=True
+        )
+        plain = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
+        expected = engine.generate(input_ids=other_ids, sampling_params=sampling_params)
+        out1 = engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            positional_embed_overrides=overrides,
+        )
+        out2 = asyncio.get_event_loop().run_until_complete(
+            engine.async_generate(
+                input_ids=input_ids,
+                sampling_params=sampling_params,
+                positional_embed_overrides=overrides,
+            )
+        )
+        engine.shutdown()
+
+        self.assertNotEqual(expected["output_ids"], plain["output_ids"])
+        self.assertEqual(out1["output_ids"], expected["output_ids"])
+        self.assertEqual(out2["output_ids"], expected["output_ids"])
 
 
 if __name__ == "__main__":
