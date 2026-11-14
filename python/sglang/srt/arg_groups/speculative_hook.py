@@ -721,8 +721,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(attn_cp_size={cfg.attn_cp_size})."
             )
         if (
-            not _is_npu
-            and cfg.speculative_moe_a2a_backend is not None
+            cfg.speculative_moe_a2a_backend is not None
             and cfg.speculative_moe_a2a_backend != cfg.moe_a2a_backend
         ):
             raise ValueError(
@@ -1099,6 +1098,10 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         lambda: _load_draft_hf_config(cfg),
         draft_backend=cfg.speculative_draft_attention_backend,
         disaggregation_mode=cfg.disaggregation_mode,
+        disaggregation_transfer_backend=cfg.disaggregation_transfer_backend,
+        disaggregation_decode_host_receive_threshold=(
+            cfg.disaggregation_decode_host_receive_threshold
+        ),
         enable_unified_memory=cfg.enable_unified_memory,
         dcp_size=cfg.dcp_size,
     )

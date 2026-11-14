@@ -88,6 +88,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.rmsnorm_cast_before_weight_scale",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_cast_before_weight_bitexact:rmsnorm_cast_before_weight_scale_bitexact",
+        _CUDA,
+    ),
+    (
         "diffusion.rmsnorm_cast_before_weight_modulate",
         KernelBackend.TRITON,
         "norm.rmsnorm_cast_before_weight_bitexact:rmsnorm_cast_before_weight_modulate_bitexact",
@@ -358,6 +364,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA_SM100_PLUS,
     ),
     (
+        "diffusion.nomas_qk_norm_mrope",
+        KernelBackend.TRITON,
+        "rope.nomas_qk_norm_mrope_triton:fused_nomas_qk_norm_mrope",
+        _CUDA_SM100_PLUS,
+    ),
+    (
         "diffusion.ltx25_decoder_rope",
         KernelBackend.JIT,
         "rope.ltx25_decoder_rope_jit:fused_ltx25_decoder_rope",
@@ -409,12 +421,6 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         "diffusion.joint_qkv_cat",
         KernelBackend.TRITON,
         "layout.joint_qkv_cat_triton:joint_qkv_cat",
-        _CUDA,
-    ),
-    (
-        "diffusion.rmsnorm_preserve_reduction",
-        KernelBackend.TRITON,
-        "norm.rmsnorm_preserve_reduction:rmsnorm_preserve_reduction",
         _CUDA,
     ),
     (
@@ -705,7 +711,6 @@ _EXPORTS: dict[str, str] = {
     "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
     "can_use_flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
-    "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
     "channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
     "can_use_channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
@@ -726,9 +731,11 @@ _EXPORTS: dict[str, str] = {
     "validate_scale_shift": "norm.scale_residual_norm_cutedsl",
     "try_fused_scale_residual_norm_scale_shift_nvfp4": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "can_use_rmsnorm_cast_before_weight": "norm.rmsnorm_cast_before_weight_bitexact",
+    "can_use_rmsnorm_cast_before_weight_scale": "norm.rmsnorm_cast_before_weight_bitexact",
     "can_use_rmsnorm_cast_before_weight_modulate": "norm.rmsnorm_cast_before_weight_bitexact",
     "can_use_rmsnorm_cast_before_weight_rope": "norm.rmsnorm_cast_before_weight_bitexact",
     "rmsnorm_cast_before_weight_bitexact": "norm.rmsnorm_cast_before_weight_bitexact",
+    "rmsnorm_cast_before_weight_scale_bitexact": "norm.rmsnorm_cast_before_weight_bitexact",
     "rmsnorm_cast_before_weight_modulate_bitexact": "norm.rmsnorm_cast_before_weight_bitexact",
     "rmsnorm_cast_before_weight_rope_bitexact": "norm.rmsnorm_cast_before_weight_bitexact",
     "can_use_wan_norm_silu_post": "norm.wan_norm_silu_post",
@@ -773,6 +780,7 @@ _EXPORTS: dict[str, str] = {
     "timestep_embedding": "modulate.timestep_embedding_jit",
     "fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
     # Rotary embeddings and the QK-norm chains fused around them
+    "fused_nomas_qk_norm_mrope": "rope.nomas_qk_norm_mrope_triton",
     "try_fused_flux2_qkv_epilogue": "sglang.kernels.kda_kernels.flux2_qkv_epilogue_jit",
     "hunyuan_qkv_rope_pack": "rope.hunyuan_qkv_pack_triton",
     "joint_qkv_cat": "layout.joint_qkv_cat_triton",
