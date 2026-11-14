@@ -206,12 +206,12 @@ sglang serve \
   --port 30010
 ```
 
-Pure Ulysses4 could not keep the full pipeline resident on 80 GB H100s. Use
-`--tp-size 4 --ulysses-degree 1` when lower resident memory matters more than
-the last few percent of latency. FSDP remains a verified capacity option, but
-its per-block weight all-gathers do not make it the H100 speed default:
+Pure Ulysses4 cannot keep the full pipeline resident on 80 GB GPUs without
+AdaLN folding or an AdaLN cache. Enable `--adaln-fold` to shard the AdaLN
+projection weights across all four GPUs, saving **about 18.2 GiB per GPU**
+without changing the main DiT parallel layout.
 
-```bash 4×H100 FSDP capacity
+```bash 4×80 GB pure Ulysses4 with AdaLN folding
 sglang serve \
   --model-path MiniMaxAI/MiniMax-H3 \
   --model-variant fl2va \
@@ -219,7 +219,7 @@ sglang serve \
   --ulysses-degree 4 \
   --encoder-parallel auto \
   --performance-mode speed \
-  --use-fsdp-inference true \
+  --adaln-fold \
   --port 30010
 ```
 

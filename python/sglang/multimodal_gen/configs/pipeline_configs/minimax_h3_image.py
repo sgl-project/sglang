@@ -324,6 +324,7 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         # custom weights win.
         if (
             server_args.minimax_h3_adaln_online is None
+            and not server_args.adaln_fold
             and server_args.performance_mode == "auto"
             and server_args.transformer_weights_path is None
             and not server_args.component_paths.get("transformer")

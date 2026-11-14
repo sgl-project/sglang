@@ -386,6 +386,8 @@ class ServerArgs(DisaggServerArgsMixin):
     # (see --encoder-parallel); fold shards the weights at load time, so it is
     # mutually exclusive with dp/replicate for the lifetime of the model
     encoder_parallel: str = "auto"
+    # Replica-wide TP for AdaLN projections; currently MiniMax H3 only.
+    adaln_fold: bool = False
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -2557,6 +2559,15 @@ class ServerArgs(DisaggServerArgsMixin):
                 "composing with encoder TP (best batched throughput); "
                 "`replicate` disables both. The default is `auto`."
             ),
+        )
+        parser.add_argument(
+            "--adaln-fold",
+            action="store_true",
+            default=ServerArgs.adaln_fold,
+            help="Shard AdaLN projection weights across the pipeline replica, "
+            "independently of DiT TP. Currently supported only for MiniMax H3. "
+            "Requires a replica wider than DiT TP and divisible output widths. "
+            "Cannot be combined with an AdaLN cache.",
         )
         parser.add_argument(
             "--kv-gather-degree",

@@ -441,6 +441,17 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         checkpoint_key_filter: Callable[[str], bool] | None = (
             comfy_quant_key_filter if quant_spec.uses_comfy_layer_markers else None
         )
+        if component_server_args.adaln_fold:
+            if not is_minimax_h3:
+                raise ValueError(
+                    "--adaln-fold is currently supported only by MiniMax H3"
+                )
+            if (
+                component_server_args.minimax_h3_adaln_cache_path is not None
+                or component_server_args.minimax_h3_adaln_online
+            ):
+                raise ValueError("--adaln-fold cannot be combined with an AdaLN cache")
+            init_params["adaln_fold"] = True
         adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
         if adaln_cache_path is not None:
             if not is_minimax_h3:

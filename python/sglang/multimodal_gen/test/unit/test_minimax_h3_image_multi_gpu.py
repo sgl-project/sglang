@@ -27,6 +27,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
 
 TEXT_DIM = 24
 TINY_ARCH = dict(
+    audio_enabled=False,
     num_layers=2,
     token_refiner_num_layers=1,
     hidden_size=32,
@@ -55,6 +56,7 @@ CASES = {
 LAYOUTS = {
     "ulysses2": dict(tp=1, ulysses=2, cfg=1),
     "tp2": dict(tp=2, ulysses=1, cfg=1),
+    "ulysses2_fold": dict(tp=1, ulysses=2, cfg=1, adaln_fold=True),
 }
 # TP2 all-reduces bf16 partial products, so its latents differ from the
 # single-process ones by up to ~1e-4 on O(3) values (one bf16 ulp there is
@@ -76,7 +78,7 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _build_model(tp_size: int):
+def _build_model(tp_size: int, adaln_fold: bool = False):
     """A tiny real DiT whose full weights are crc32(name)-seeded on every rank;
     TP ranks load their shard of the same full tensor through the layer's own
     weight loader."""
@@ -87,14 +89,16 @@ def _build_model(tp_size: int):
     from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 
     arch = dataclasses.replace(MiniMaxH3DiTArchConfig(), **TINY_ARCH)
-    model = MiniMaxH3DiTModel(MiniMaxH3DiTConfig(arch_config=arch), hf_config={}).eval()
+    model = MiniMaxH3DiTModel(
+        MiniMaxH3DiTConfig(arch_config=arch), hf_config={}, adaln_fold=adaln_fold
+    ).eval()
     with torch.no_grad():
         for module_name, module in model.named_modules():
             for param_name, param in module.named_parameters(recurse=False):
                 name = f"{module_name}.{param_name}" if module_name else param_name
                 shape = list(param.shape)
                 if isinstance(module, ColumnParallelLinear):
-                    shape[0] *= tp_size
+                    shape[0] *= module.tp_size
                 elif isinstance(module, RowParallelLinear) and param_name == "weight":
                     shape[1] *= tp_size
                 values = _randn(name, *shape, scale=0.05)
@@ -185,7 +189,9 @@ def _worker(rank, world_size, port, layout, result_dir):
         ulysses_degree=layout["ulysses"],
     )
     try:
-        results = _run_cases(_build_model(layout["tp"]))
+        results = _run_cases(
+            _build_model(layout["tp"], adaln_fold=layout.get("adaln_fold", False))
+        )
         # Prove the loop ran under the requested groups, not a degenerate init.
         results["ctx"] = dict(
             tp=get_tp_world_size(),
@@ -235,10 +241,12 @@ def _assert_all_ranks_agree(results):
     torch.cuda.is_available(),
     reason="CPU-only weight-free test; it mixes CPU and CUDA tensors on GPU hosts",
 )
-@pytest.mark.parametrize("layout", ["ulysses2", "tp2"])
+@pytest.mark.parametrize("layout", ["ulysses2", "tp2", "ulysses2_fold"])
 def test_sharded_layouts_match_the_single_process_latents(tmp_path, reference, layout):
     results = _run_layout(tmp_path / layout, LAYOUTS[layout])
-    assert results[0]["ctx"] == LAYOUTS[layout]
+    assert results[0]["ctx"] == {
+        key: LAYOUTS[layout][key] for key in ("tp", "ulysses", "cfg")
+    }
     _assert_all_ranks_agree(results)
     assert _latent_keys(results[0]) == list(CASES)
     for case in CASES:

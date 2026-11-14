@@ -128,6 +128,12 @@ or pass `--minimax-h3-adaln-online false`, to avoid the rebuild cost. Other
 GPUs keep projection weights by default; explicit online precomputation is
 available through **Precompute**.
 
+Alternatively, enable `--adaln-fold` to shard AdaLN projection weights
+across the pipeline replica without changing the main DiT parallel layout.
+With pure Ulysses2, this saves **about 12.1 GiB per GPU** for standard BF16
+projection weights. Automatic online AdaLN precomputation is disabled when
+folding is enabled; do not combine folding with either AdaLN cache mode.
+
 `quality=lossless` is the default. It enables shared DiT and VAE QK-norm/RoPE
 fusion, uses cuDNN SDPA in the VAE with a backend fallback, and batches existing
 overlapping VAE decode tiles, with at most 128 samples per tile batch.
