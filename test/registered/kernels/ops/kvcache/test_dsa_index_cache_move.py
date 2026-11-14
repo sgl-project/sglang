@@ -10,7 +10,7 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -23,7 +23,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-s
 )
 @pytest.mark.parametrize("use_fp4_indexer", [False, True])
 def test_dsa_cache_move(source_slots, use_fp4_indexer):
-    with get_parallel().override(attn_dcp_size=1):
+    with get_context().override_server_args(), get_parallel().override(attn_dcp_size=1):
         pool = DSATokenToKVPool(
             size=256,
             page_size=64,

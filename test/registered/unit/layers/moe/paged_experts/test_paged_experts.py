@@ -1641,7 +1641,9 @@ class TestSizing(CustomTestCase):
             attn_dp_size=1,
         )
         exec_ = SimpleNamespace(
-            mamba=SimpleNamespace(enable_linear_replayssm_spec=False)
+            mamba=SimpleNamespace(
+                enable_linear_replayssm_spec=False, decode_state_free_radix=False
+            )
         )
         with (
             patch.object(kvc_mod, "get_schedule", return_value=sched),

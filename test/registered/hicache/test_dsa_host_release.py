@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,6 +18,7 @@ register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 class TestDSAHostRelease(CustomTestCase):
     def setUp(self):
+        self.enterContext(get_context().override_server_args())
         cm = get_parallel().override(attn_dcp_size=1)
         cm.__enter__()
         self.addCleanup(cm.__exit__, None, None, None)

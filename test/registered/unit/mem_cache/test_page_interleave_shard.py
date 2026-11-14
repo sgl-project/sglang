@@ -1411,6 +1411,7 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         self.assertTrue(res.rotation_tail_declined)
 
     def test_insert_decline_keeps_request_on_own_pages(self):
+        enter_scope(self, get_context().override_server_args())
         tree, freed = self._tree_with_spy()
         self._seed_chain(tree, list(range(8)), base=1)
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])

@@ -660,6 +660,11 @@ def test_pool_configurator_only_merges_dspark_target_cache(
         ),
         patch.object(
             config_mod,
+            "get_memory",
+            return_value=SimpleNamespace(enable_hisparse=False),
+        ),
+        patch.object(
+            config_mod,
             "get_model",
             return_value=SimpleNamespace(qsa_indexer_dtype="auto"),
         ),

@@ -24,6 +24,16 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+def setUpModule():
+    patcher = mock.patch.object(
+        scheduler_pp_mixin,
+        "get_disagg",
+        return_value=SimpleNamespace(disaggregation_mode="null"),
+    )
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 class _Stream:
     def __init__(self, name):
         self.name = name
@@ -73,6 +83,7 @@ class _Stage(SchedulerPPMixin):
     def __init__(self):
         self.device = "cpu"
         self.device_module = _Device()
+        self.scheduler_stage_metrics = None
 
 
 def _batch():

@@ -207,7 +207,8 @@ class TestMixedSWAKVBlockScales(CustomTestCase):
                     setattr(target, name, pool)
 
                 kv_args = KVArgs()
-                setup_state_kv_args(kv_args, _static_storage(target))
+                with get_context().override_server_args():
+                    setup_state_kv_args(kv_args, _static_storage(target))
 
                 expected_types = [StateType.SWA]
                 expected_infos = [swa_infos]
@@ -514,12 +515,12 @@ class TestDisaggregationWire(unittest.TestCase):
         for collapsed in (False, True):
             with self.subTest(collapsed=collapsed):
                 manager = object.__new__(MooncakeKVManager)
-                # No replicated single-entry draft layout: the MHA-like case.
+                # One draft KV entry the decode does not publish as replicated.
                 manager.kv_args = SimpleNamespace(
                     state_types=[],
-                    num_draft_entries=0,
-                    kv_layer_ids=[],
-                    kv_item_lens=[],
+                    num_draft_entries=1,
+                    kv_layer_ids=[0],
+                    kv_item_lens=[16],
                 )
                 manager.is_mla_backend = True
                 manager.is_hybrid_mla_backend = False
@@ -1281,7 +1282,8 @@ class TestDsaIndexKTokenBytes(unittest.TestCase):
                 pool.get_compress_tail_buf_infos = lambda: ([], [], [])
 
                 kv_args = KVArgs()
-                setup_state_kv_args(kv_args, _static_storage(pool))
+                with get_context().override_server_args():
+                    setup_state_kv_args(kv_args, _static_storage(pool))
 
                 self.assertEqual(kv_args.state_types, [StateType.DSA])
                 self.assertEqual(kv_args.dsa_index_k_token_bytes, expected)
@@ -1368,6 +1370,9 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
 
 
 class TestQwen4StateWire(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(get_context().override_server_args())
+
     @staticmethod
     def _qsa_pool(layer_id: int):
         pool = object.__new__(QSATokenToKVPool)
@@ -3075,6 +3080,9 @@ def _make_dsv4_draft(*, unified, mapping=None, swa_valid_from=None):
 
 
 class TestDSV4DraftStateRegistration(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(get_context().override_server_args())
+
     def test_draft_state_is_a_separate_component(self):
         mapping = torch.arange(16)
         cases = [

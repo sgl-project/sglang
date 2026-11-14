@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -77,7 +78,8 @@ class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
         # neither can be resliced by head; reject before any transfer.
         kv_args = KVArgs()
         kv_args.page_size = 4
-        setup_state_kv_args(kv_args, _static_storage(_make_k_only_pool()))
+        with get_context().override_server_args():
+            setup_state_kv_args(kv_args, _static_storage(_make_k_only_pool()))
         manager = object.__new__(CommonKVManager)
         manager.kv_args = kv_args
         manager.attn_tp_size = 4

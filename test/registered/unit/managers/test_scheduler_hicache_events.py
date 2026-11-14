@@ -21,6 +21,9 @@ from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
 )
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SchedulerStageMetricsRecorder,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -29,7 +32,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
     def setUp(self):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
-        s.scheduler_stage_metrics = None
+        s.scheduler_stage_metrics = SchedulerStageMetricsRecorder(enabled=False)
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False

@@ -271,6 +271,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                     )
 
                 owner = SimpleNamespace(
+                    config=SimpleNamespace(),
                     use_full_rank_gate=True,
                     _bfa_uses_block_fp8=block_fp8,
                     _bfa_uses_mxfp8=mxfp8,

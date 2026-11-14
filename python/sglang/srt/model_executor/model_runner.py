@@ -1357,7 +1357,7 @@ class ModelRunner:
         before any traffic.
         """
         max_m = envs.SGLANG_WARMUP_BF16_GEMM_MAX_M.get()
-        if max_m <= 0 or self.device != "cuda":
+        if max_m <= 0 or self.device != "cuda" or not current_platform.is_cuda():
             return
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.quantization.unquant import (
@@ -1374,6 +1374,7 @@ class ModelRunner:
             w = getattr(module, "weight", None)
             if (
                 isinstance(w, torch.Tensor)
+                and w.is_cuda
                 and w.dim() == 2
                 and w.dtype == torch.bfloat16
             ):

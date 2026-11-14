@@ -36,6 +36,7 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer
+from sglang.test.test_utils import published_topology
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
@@ -98,6 +99,7 @@ class TestHiSparseUnit(unittest.TestCase):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
         cls.tp_group = torch.distributed.group.WORLD
+        cls.enterClassContext(published_topology(role="scheduler"))
 
         from sglang.srt.mem_cache.pool_host.common import (
             ALLOC_MEMORY_FUNCS,

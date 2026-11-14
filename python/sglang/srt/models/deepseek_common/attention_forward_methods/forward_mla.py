@@ -39,6 +39,7 @@ from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
 from sglang.srt.lora.utils import kv_b_lora_correction
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -605,7 +606,7 @@ class DeepseekMLAForwardMixin:
                             if self.rotary_emb is None:
                                 get_token_to_kv_pool().set_mla_kv_buffer(
                                     self.attn_mqa,
-                                    forward_batch.out_cache_loc,
+                                    KVWriteLoc.for_batch(forward_batch),
                                     k_nope,
                                     k_pe,
                                 )

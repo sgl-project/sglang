@@ -69,8 +69,10 @@ def dcp_trtllm_sparse_attention(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
+    # False also skips the zero-KV-row fixup: every row must own a key.
+    need_lse: bool = True,
     **attention_kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     import flashinfer.decode
 
     rows, _, heads, _ = query.shape
@@ -84,7 +86,11 @@ def dcp_trtllm_sparse_attention(
             ),
             torch.empty((0, heads), dtype=torch.float32, device=query.device),
         )
-    lse = torch.empty((rows, heads), dtype=torch.float32, device=query.device)
+    lse = (
+        torch.empty((rows, heads), dtype=torch.float32, device=query.device)
+        if need_lse
+        else None
+    )
     workspace = attention_kwargs["workspace_buffer"]
     step = trtllm_rows_per_call(
         workspace_bytes=workspace.numel() * workspace.element_size(), heads=heads
@@ -95,25 +101,27 @@ def dcp_trtllm_sparse_attention(
     outputs = []
     for start in range(0, rows, step):
         end = min(start + step, rows)
-        output, _ = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        result = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query[start:end],
             block_tables=block_tables[start:end],
             seq_lens=seq_lens[start:end],
-            return_lse=True,
-            lse=lse[start:end],
+            return_lse=need_lse,
+            lse=lse[start:end] if need_lse else None,
             sparse_mla_top_k_lens=(
                 None if top_k_lens is None else top_k_lens[start:end]
             ),
             **attention_kwargs,
         )
+        output = result[0] if need_lse else result
         output = output.view(end - start, heads, -1)
-        fixup_zero_kv_rows(
-            output,
-            lse[start:end],
-            seq_lens[start:end],
-            cu_seqlens_q[: end - start + 1],
-            1,
-        )
+        if need_lse:
+            fixup_zero_kv_rows(
+                output,
+                lse[start:end],
+                seq_lens[start:end],
+                cu_seqlens_q[: end - start + 1],
+                1,
+            )
         outputs.append(output)
     output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return output.view(rows, 1, heads, -1), lse
