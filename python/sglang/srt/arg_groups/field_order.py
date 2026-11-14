@@ -559,9 +559,19 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "enable_fp4_indexer",
+    "paged_experts_enable_disk",
+    "disable_normalize_embedding",
+    "log_schedule_decisions",
+    "speculative_dspark_lm_head_dtype",
+    "speculative_dflash_draft_kv_ring",
+    "media_url_timeout",
+    "allow_local_media_files",
+    "layernorm_sp_min_tokens",
+    "paged_experts_host_memory_gb",
+    "_max_running_requests_explicitly_set",
     # Kimi-K3.1 additions, appended to keep existing positional slots
-    "pp_min_chunked_prefill_size",
-    "pp_chunk_overhead_tokens",
     "enable_flashmla_prefill_token_packing",
+    "enable_dsa_fp4_indexer",
 )
 # fmt: on

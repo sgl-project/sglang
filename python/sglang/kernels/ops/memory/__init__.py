@@ -80,7 +80,7 @@ register_kernel(
     KernelSpec(
         op="memory.small_field_copy",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.memory.small_field_copy:small_field_copy",
+        target="sglang.kernels.ops.memory.small_field_copy:SmallFieldCopyPlan",
         capabilities=CUDA_ONLY,
     )
 )

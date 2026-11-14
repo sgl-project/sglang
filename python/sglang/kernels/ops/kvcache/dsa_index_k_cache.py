@@ -111,7 +111,7 @@ class GetKAndS:
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
             page_size=pool.index_page_size,
-            index_head_dim=pool.index_head_dim,
+            index_head_dim=pool.index_key_bytes_per_token,
         )
 
 

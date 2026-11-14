@@ -98,7 +98,9 @@ class TestQwen35GDNPackedInProj(CustomTestCase):
         def linear(rows):
             return types.SimpleNamespace(
                 weight=torch.nn.Parameter(
-                    torch.arange(rows * 4, dtype=torch.bfloat16).reshape(rows, 4),
+                    torch.arange(rows * 4, dtype=torch.bfloat16, device="cuda").reshape(
+                        rows, 4
+                    ),
                     requires_grad=False,
                 ),
                 bias=None,

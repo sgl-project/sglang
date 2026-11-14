@@ -34,6 +34,7 @@ TOKENS = 3
 class _RecordingBackend:
     def __init__(self):
         self.calls = []
+        self.forward_metadata = None
 
     def forward(self, **kwargs):
         self.calls.append(kwargs)

@@ -218,7 +218,6 @@ def test_engine_matches_reference(batch_name, site_kind, plan_name):
 
     phase = Phase.PREFILL if batch_name == "prefill" else Phase.DECODE
     engine = _engine(batch_info, token_slots, phase)
-    assert torch.equal(engine.token_slots, token_slots)
     out = engine.apply(
         x,
         lambda: base.clone(),

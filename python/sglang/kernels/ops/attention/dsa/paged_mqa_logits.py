@@ -175,8 +175,7 @@ def aiter_paged_mqa_logits_verify(
         max_seq_len,
         Preshuffle=True,
         KVBlockSize=kv_block_size,
-        # Measured on MI350X at 3-8 requests x 8 rows: 10-25% over the default 2,
-        # and the kernel stays at 62-89 VGPRs, under the 4-wave cap of 128.
+        # 4 waves/EU beat the default 2 on MI350X verify; the kernel fits 128 VGPRs
         WavePerEU=4,
     )
     return logits

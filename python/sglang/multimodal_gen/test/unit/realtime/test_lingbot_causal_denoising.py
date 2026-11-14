@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits import (
     lingbot_world as lingbot_world_module,
 )
@@ -872,18 +873,56 @@ def test_lingbot_context_cache_update_skips_unused_projection(monkeypatch):
     assert kwargs["skip_final_projection"] is True
 
 
+class _ParallelLinear(torch.nn.Linear):
+    """nn.Linear returning (output, bias) like the parallel linear layers."""
+
+    def forward(self, x):
+        return super().forward(x), None
+
+
 def _fusable_qkv_block():
     block = object.__new__(CausalLingBotWorldTransformerBlock)
     torch.nn.Module.__init__(block)
-    block.to_q = torch.nn.Linear(4, 6, bias=True)
-    block.to_k = torch.nn.Linear(4, 6, bias=True)
-    block.to_v = torch.nn.Linear(4, 6, bias=True)
+    block.to_q = _ParallelLinear(4, 6, bias=True)
+    block.to_k = _ParallelLinear(4, 6, bias=True)
+    block.to_v = _ParallelLinear(4, 6, bias=True)
     block._qkv_fused = False
     return block
 
 
 def _qkv_reference(block, x):
-    return torch.cat([block.to_q(x), block.to_k(x), block.to_v(x)], dim=-1)
+    return torch.cat(
+        [layer(x)[0] for layer in (block.to_q, block.to_k, block.to_v)], dim=-1
+    )
+
+
+def _project_qkv(block, x, quality="lossless"):
+    request = SimpleNamespace(sampling_params=SimpleNamespace(quality=quality))
+    with set_forward_context(0, None, request):
+        return block._project_qkv(x)
+
+
+def test_lingbot_packed_qkv_gemm_serves_only_lossless_requests(monkeypatch):
+    block = _fusable_qkv_block()
+    block.fuse_qkv_projection()
+    linear = torch.nn.functional.linear
+    rows = []
+
+    def recording_linear(x, weight, bias=None):
+        rows.append(weight.shape[0])
+        return linear(x, weight, bias)
+
+    monkeypatch.setattr(torch.nn.functional, "linear", recording_linear)
+    x = torch.randn(3, 4)
+    for quality, gemm_rows in (
+        ("exact", [6, 6, 6]),
+        ("lossless", [18]),
+        ("high", [18]),
+    ):
+        rows.clear()
+        q, k, v = _project_qkv(block, x, quality)
+        assert rows == gemm_rows, quality
+    torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
 
 
 def test_lingbot_qkv_fusion_shares_storage_and_sees_weight_updates():
@@ -898,7 +937,7 @@ def test_lingbot_qkv_fusion_shares_storage_and_sees_weight_updates():
     x = torch.randn(3, 4)
     with torch.no_grad():
         block.to_k.weight.add_(1.0)  # in-place update, like a LoRA merge
-    q, k, v = block._project_qkv(x)
+    q, k, v = _project_qkv(block, x)
     torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
 
 
@@ -910,7 +949,7 @@ def test_lingbot_qkv_repack_follows_replaced_weights():
             layer.weight.data = torch.randn_like(layer.weight)
     block.repack_qkv_projection()
     x = torch.randn(3, 4)
-    q, k, v = block._project_qkv(x)
+    q, k, v = _project_qkv(block, x)
     torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
 
 
@@ -921,7 +960,7 @@ def test_lingbot_qkv_repacks_after_dtype_move():
     block.fuse_qkv_projection()
     block.to(dtype=torch.float64)
     x = torch.randn(3, 4, dtype=torch.float64)
-    q, k, v = block._project_qkv(x)
+    q, k, v = _project_qkv(block, x)
     torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
 
 
@@ -936,7 +975,7 @@ def test_lingbot_model_refresh_repacks_qkv_after_weight_swap():
             layer.weight.data = torch.randn_like(layer.weight)
     model.refresh_weight_derived_caches(weights_path=None)
     x = torch.randn(3, 4)
-    q, k, v = block._project_qkv(x)
+    q, k, v = _project_qkv(block, x)
     torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
 
 
@@ -969,7 +1008,7 @@ def test_lingbot_qkv_pack_is_freed_by_layerwise_release(monkeypatch):
     )
     x = torch.randn(3, 4)
     expected = _qkv_reference(block, x)
-    q, k, v = block._project_qkv(x)
+    q, k, v = _project_qkv(block, x)
     torch.testing.assert_close(torch.cat([q, k, v], dim=-1), expected)
     assert block._packed_qkv_params() is not None
 
@@ -984,7 +1023,7 @@ def test_lingbot_qkv_pack_is_freed_by_layerwise_release(monkeypatch):
     )
 
     manager.prefetch_layer(0, non_blocking=False)
-    q, k, v = block._project_qkv(x)
+    q, k, v = _project_qkv(block, x)
     torch.testing.assert_close(torch.cat([q, k, v], dim=-1), expected)
 
 

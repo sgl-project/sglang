@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
+    _reject_dflash_sliding_mla_draft_window,
     _resolve_dflash_draft_attention_backend,
 )
 from sglang.srt.platforms.interface import SRTPlatform
@@ -131,7 +132,7 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
                 return_value=(target_backend, target_backend),
             ),
             patch(
-                "sglang.srt.utils.hf_transformers.get_config",
+                "sglang.srt.hf_transformers.get_config",
                 return_value=config,
             ),
         ):
@@ -166,6 +167,35 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             ):
                 result = common.resolve_draft_worker_attention_backend()
             self.assertEqual(result, expected)
+
+
+def _mla_draft(layer_types, sliding_window=None):
+    return {
+        "num_hidden_layers": len(layer_types),
+        "dflash_config": {"attention_mode": "mla"},
+        "layer_types": list(layer_types),
+        "sliding_window": sliding_window,
+    }
+
+
+class TestRejectDflashSlidingMlaDraftWindow(CustomTestCase):
+    def _check(self, draft_backend, window_size, draft_cfg):
+        args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="draft",
+            speculative_num_draft_tokens=8,
+            speculative_draft_window_size=window_size,
+            speculative_draft_attention_backend=draft_backend,
+        )
+        with patch(f"{HOOK_MODULE}._load_draft_hf_config", return_value=draft_cfg):
+            _reject_dflash_sliding_mla_draft_window(args)
+
+    def test_any_sliding_layer_rejects_the_flag(self):
+        mixed = _mla_draft(["sliding_attention", "full_attention"], 1024)
+        with self.assertRaises(ValueError):
+            self._check("cutedsl_mla", 1024, mixed)
+        self._check("cutedsl_mla", 1024, _mla_draft(["full_attention"] * 7))
 
 
 if __name__ == "__main__":

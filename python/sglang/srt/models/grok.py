@@ -50,6 +50,7 @@ from sglang.srt.layers.rotary_embedding import (
     _yarn_get_mscale,
     get_rope,
 )
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -59,7 +60,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cpu, is_npu
+from sglang.srt.utils import is_cpu, is_npu
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -112,7 +113,7 @@ class Grok1MLP(nn.Module):
         if _is_cpu:
             x = torch.ops.sgl_kernel.gelu_and_mul_cpu(gate_up)
         else:
-            x, _ = gelu_and_mul_triton(gate_up)
+            x = gelu_and_mul_triton(gate_up)
         x, _ = self.down_proj(x)
         return x
 

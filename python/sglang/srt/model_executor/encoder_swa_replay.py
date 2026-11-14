@@ -4,7 +4,7 @@ from typing import Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.utils.common import async_h2d, is_pin_memory_available
+from sglang.srt.utils.device import async_h2d, is_pin_memory_available
 
 
 class FoldedExtend(msgspec.Struct, frozen=True):

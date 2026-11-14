@@ -6,7 +6,6 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_activation_cuda_cflags,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -18,16 +17,12 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
-    fast_math_flags = get_activation_cuda_cflags()
-    if not fast_math and not fast_math_flags:
-        return activation_module(dtype)
-    args = make_cpp_args(dtype, is_arch_support_pdl())
+def activation_module(dtype: torch.dtype, *, fast_math: bool) -> Module:
+    args = make_cpp_args(dtype, is_arch_support_pdl(), fast_math)
     return load_jit(
-        "activation" if fast_math else "rounded_activation",
+        "activation",
         *args,
         cuda_files=["elementwise/activation.cuh"],
-        extra_cuda_cflags=fast_math_flags if fast_math else [],
         cuda_wrappers=[
             ("run_activation", f"ActivationKernel<{args}>::run_activation"),
             (
@@ -63,7 +58,7 @@ def _run_activation_inplace(
     op_name: str, input: torch.Tensor, out: torch.Tensor
 ) -> None:
     hidden_size = input.shape[-1] // 2
-    module = activation_module(input.dtype)
+    module = activation_module(input.dtype, fast_math=True)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
     module.run_activation(input_2d, out_2d, op_name)
@@ -100,7 +95,7 @@ def _run_activation_filtered_inplace(
     expert_step: int,
 ) -> None:
     hidden_size = input.shape[-1] // 2
-    module = activation_module(input.dtype)
+    module = activation_module(input.dtype, fast_math=True)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
     module.run_activation_filtered(input_2d, out_2d, expert_ids, expert_step, op_name)
@@ -118,7 +113,7 @@ def _run_activation_sorted_filtered_inplace(
     num_valid_tokens: int,
 ) -> None:
     hidden_size = input.shape[-1] // 2
-    module = activation_module(input.dtype)
+    module = activation_module(input.dtype, fast_math=True)
     module.run_activation_sorted_filtered(
         input.view(-1, hidden_size * 2),
         out.view(-1, hidden_size),

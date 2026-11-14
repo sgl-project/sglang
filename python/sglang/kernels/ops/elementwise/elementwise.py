@@ -23,6 +23,7 @@ def _fused_sigmoid_mul_kernel(
     q_ptr=None,
     s_ptr=None,
     QUANT: tl.constexpr = False,
+    ROUND_SIGMOID: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
@@ -37,9 +38,11 @@ def _fused_sigmoid_mul_kernel(
     attn = tl.load(attn_output_ptr + attn_off, mask=mask, other=0.0).to(tl.float32)
 
     gate_off = pid_row * gate_stride_row + head * gate_stride_head + d
-    g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
-
-    result = attn * tl.sigmoid(g)
+    g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0)
+    sig = tl.sigmoid(g.to(tl.float32))
+    if ROUND_SIGMOID:
+        sig = sig.to(gate_ptr.dtype.element_ty).to(tl.float32)
+    result = attn * sig
     if QUANT:  # the block is one row: per-token FP8 as _per_token_group_quant_8bit
         y = tl.where(mask, result.to(output_ptr.dtype.element_ty).to(tl.float32), 0.0)
         y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
@@ -55,6 +58,7 @@ def fused_sigmoid_mul(
     gate: torch.Tensor,
     inplace: bool = False,
     quant: bool = False,
+    round_sigmoid: bool = False,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
@@ -69,6 +73,9 @@ def fused_sigmoid_mul(
     Supports strided gate: if gate is 3D (num_tokens, num_heads, head_dim)
     and attn_output is 2D (num_tokens, hidden_dim), the kernel reads gate
     via explicit strides without requiring a contiguous copy.
+
+    ``round_sigmoid`` rounds the sigmoid to the gate dtype before the multiply,
+    matching the two-op torch spelling bit for bit.
     """
     if gate.ndim == 3 and attn_output.ndim == 2:
         # Strided gate path: gate is 3D (num_tokens, num_heads, head_dim)
@@ -85,7 +92,12 @@ def fused_sigmoid_mul(
         hidden_dim = attn_output.shape[-1]
         num_tokens = attn_output.numel() // hidden_dim
         head_dim = hidden_dim
-        gate_stride_row = hidden_dim
+        # A 2D gate may be a column slice of a wider GEMM output.
+        if gate.ndim == 2:
+            assert gate.stride(1) == 1, "a 2D gate must have inner stride 1"
+            gate_stride_row = gate.stride(0)
+        else:
+            gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
 
     out = attn_output if inplace else torch.empty_like(attn_output)
@@ -106,6 +118,7 @@ def fused_sigmoid_mul(
         hidden_dim,
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
+        ROUND_SIGMOID=round_sigmoid,
         num_warps=4,
         **kwargs,
     )

@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import re
@@ -51,7 +52,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28

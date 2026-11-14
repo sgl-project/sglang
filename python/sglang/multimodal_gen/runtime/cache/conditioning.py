@@ -679,40 +679,62 @@ def cached_conditioning(fn):
 def cached_vae_encode(fn):
     """Cache the posterior, before sample()/mode() and latent normalization.
 
-    Distributed VAEs currently bypass this cache: their encoding methods can
-    run on an owner rank or a model-specific subgroup, unlike encoder TP.
+    Distributed VAEs bypass this cache unless the decorated method explicitly
+    guarantees rank-local computation. A cache hit must not skip collectives
+    that another rank still enters.
     """
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
         cache = _inference_cache(self)
-        if cache is None or (model_parallel_is_initialized() and get_world_size() > 1):
+        if cache is None or (
+            model_parallel_is_initialized()
+            and get_world_size() > 1
+            and not getattr(self, "conditioning_encode_is_rank_local", False)
+        ):
             return fn(self, *args, **kwargs)
-        # Tiling and slicing can change numerical results without changing x.
-        settings = {
-            name: value
-            for name, value in vars(self).items()
-            if name.startswith(
-                (
-                    "use_",
-                    "tile_",
-                    "blend_",
-                    "parallel_",
-                    "spatial_compression",
-                    "temporal_compression",
-                )
-            )
-            and type(value) in (int, float, bool, str, type(None))
-        }
         return cache.run(
             self,
             fn.__name__,
-            (args, settings),
+            (args, _vae_numeric_settings(self)),
             kwargs,
             lambda: fn(self, *args, **kwargs),
         )
 
     return wrapped
+
+
+def _vae_numeric_settings(vae):
+    # Tiling and slicing can change numerical results without changing x.
+    return {
+        name: value
+        for name, value in vars(vae).items()
+        if name.startswith(
+            (
+                "use_",
+                "tile_",
+                "blend_",
+                "parallel_",
+                "spatial_compression",
+                "temporal_compression",
+            )
+        )
+        and type(value) in (int, float, bool, str, type(None))
+    }
+
+
+def cached_vae_call(vae, method, args, compute, *, group=None):
+    """Cache a deterministic result derived from ``vae`` across requests.
+
+    When ``compute`` issues collectives, ``group`` must hold every rank that
+    runs it, so those ranks agree on hit or miss.
+    """
+    cache = _inference_cache(vae)
+    if cache is None:
+        return compute()
+    return cache.run(
+        vae, method, (args, _vae_numeric_settings(vae)), {}, compute, group
+    )
 
 
 class ConditioningEncoderMixin:

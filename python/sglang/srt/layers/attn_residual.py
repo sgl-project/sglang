@@ -16,7 +16,7 @@
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 import triton
@@ -24,10 +24,8 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.utils import is_cuda, is_hip, is_npu
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.attn_residual_hip import StagedRead
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -70,6 +68,8 @@ def get_cw(
     proj: ReplicatedLinear,
     norm: RMSNorm,
     dtype: torch.dtype = torch.float32,
+    *,
+    refresh: bool = False,
 ) -> torch.Tensor:
     """Cached product norm_weight ⊙ proj_weight (both [H]) in `dtype`.
 
@@ -80,9 +80,10 @@ def get_cw(
         cache = {}
         proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
-    if cw is None:
-        cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
-        cw = cache[dtype] = cw.to(dtype)
+    if cw is None or refresh:
+        # Refresh in place: captured graphs retain the original cache storage.
+        updated = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+        cw = cache[dtype] = bind_or_assign(cw, updated.to(dtype))
     return cw
 
 
@@ -454,6 +455,10 @@ class AttnResidual:
     One instance lives for one model forward pass.
     """
 
+    # ROCm: a read attn_residual_hip.gather_tail_read staged for the next
+    # forward() of its prefix (a StagedRead).
+    staged = None
+
     def __init__(
         self,
         hidden_states: torch.Tensor,
@@ -470,9 +475,6 @@ class AttnResidual:
         # Whether a write snapshotted only this rank's slice of the rows, which
         # leaves the bank's other rows stale on this rank.
         self.written_on_slice = False
-        # A read attn_residual_hip.gather_tail_read staged for the next
-        # forward() of its prefix.
-        self.staged: Optional[StagedRead] = None
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -510,19 +512,12 @@ class AttnResidual:
                 "a read of every row after a write of this rank's slice of "
                 "them would aggregate stale snapshots"
             )
-        staged, self.staged = self.staged, None
-        if (
-            staged is not None
-            and prefix_sum is None
-            and rows is None
-            and staged.score_proj is score_proj
-            and staged.wrote_bank == write
-            and staged.prefix.data_ptr() == hidden_states.data_ptr()
-            and staged.prefix.shape == hidden_states.shape
-        ):
-            if write:
-                self._count_write(rows)  # row nvb written in-kernel
-            return staged.normed, hidden_states
+        if is_hip() and self.staged is not None:
+            read = self.staged.take(
+                self, hidden_states, prefix_sum, score_proj, rows, write
+            )
+            if read is not None:
+                return read
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:

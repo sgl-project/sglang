@@ -12,14 +12,18 @@ then frees two kv-row segments that share the page holding 576.
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     _MambaRadixCacheV2TrackEntry,
 )
-from sglang.srt.managers.schedule_policy import PrefillAdder, mamba_prefill_chunk_grid
+from sglang.srt.managers.schedule_policy import (
+    CacheAwarePolicy,
+    PrefillAdder,
+    mamba_prefill_chunk_grid,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -143,10 +147,14 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
     one unaligned cut costs the request every checkpoint it would ever donate.
     """
 
-    def _floor(self, trunc_len: int, remaining: int, grid: int = CHUNK) -> int:
+    def _adder(self, grid: int = CHUNK, *, strict: bool = False) -> PrefillAdder:
         adder = object.__new__(PrefillAdder)
         adder.mamba_chunk_grid = grid
-        return adder.floor_chunked_tokens(trunc_len, remaining)
+        adder.strict_chunk_grid = strict
+        return adder
+
+    def _floor(self, trunc_len: int, remaining: int, grid: int = CHUNK) -> int:
+        return self._adder(grid).floor_chunked_tokens(trunc_len, remaining)
 
     def test_a_cut_is_rounded_down_onto_the_grid(self):
         self.assertEqual(self._floor(100, 8192), 64)
@@ -213,6 +221,91 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         ):
             scheduler.init_mamba_truncation_align()
         self.assertEqual(scheduler.truncation_align_size, 192)
+
+    def _window_tree(self, *, windows=(("swa", 512),), checkpoints=256):
+        # Specced to the real cache: the grid asks only what it defines.
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        tree = create_autospec(UnifiedRadixCache, instance=True)
+        tree.page_size = CHUNK
+        tree.window_sub_pools.return_value = windows
+        tree.window_checkpoint_interval.return_value = checkpoints
+        return tree
+
+    def _unified_grid(self, tree, *, unified=True):
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer",
+            dcp_size=1,
+            enable_unified_memory=unified,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            return mamba_prefill_chunk_grid(tree)
+
+    def test_unified_windows_behind_checkpoints_cut_on_the_grid(self):
+        # A prefill retires its window rows behind its latest checkpoint, and
+        # a chunk shorter than the grid takes none, so every cut lands on it.
+        self.assertEqual(self._unified_grid(self._window_tree()), CHUNK)
+        # No windows, no checkpoints (no prefix sharing), or no unified
+        # memory: the cut stays where the budget put it.
+        self.assertEqual(self._unified_grid(self._window_tree(windows=())), 1)
+        self.assertEqual(self._unified_grid(self._window_tree(checkpoints=0)), 1)
+        self.assertEqual(self._unified_grid(self._window_tree(), unified=False), 1)
+        self.assertEqual(self._unified_grid(None), 1)
+
+    def test_a_chunk_below_the_checkpoint_grid_is_refused_at_startup(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.truncation_align_size = None
+        scheduler.tree_cache = self._window_tree()
+        scheduler.chunked_prefill_size = CHUNK // 2
+        scheduler.disaggregation_mode = None
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer",
+            dcp_size=1,
+            enable_unified_memory=True,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            scheduler.init_mamba_truncation_align()
+            self.assertEqual(scheduler.truncation_align_size, CHUNK)
+            with self.assertRaisesRegex(ValueError, "checkpoint grid"):
+                scheduler.check_truncation_align_fits_chunk()
+
+    def test_a_continuation_never_runs_below_a_strict_grid(self):
+        """REGRESSION: where windows retire only behind checkpoints, a pass's
+        runtime limits (here a shortest-prefill reservation) must not cut a
+        continuing request below the checkpoint grid, nor starve it there."""
+        from sglang.srt.managers.schedule_batch import prefill_checkpoint_boundary
+        from sglang.srt.managers.schedule_policy import SchedulePolicy
+
+        policy = object.__new__(SchedulePolicy)
+        policy.policy = CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        adder = self._adder(strict=True)
+        prompt, prefix, chunks = 4096, 0, []
+        while prefix < prompt:
+            chunked = SimpleNamespace(
+                full_untruncated_fill_ids=[0] * prompt, prefix_len=prefix
+            )
+            arrival = SimpleNamespace(
+                origin_input_ids=[0] * 32, output_ids=[], num_matched_prefix_tokens=0
+            )
+            limit = policy.shortest_prefill_chunk_limit(chunked, [arrival], 64, 16)
+            self.assertEqual(limit, 32)
+            remaining = prompt - prefix
+            limit = adder.grid_continuation_limit(limit, remaining)
+            chunk = adder.floor_chunked_tokens(min(remaining, limit), remaining)
+            chunks.append(chunk)
+            prefix += chunk
+        self.assertEqual(set(chunks), {64})
+        self.assertTrue(
+            all(
+                prefill_checkpoint_boundary(i * 64, 64, CHUNK) is not None
+                for i in range(len(chunks))
+            )
+        )
+        # The last chunk may be shorter; without the strict grid the cut stays.
+        self.assertEqual(adder.grid_continuation_limit(32, 40), 40)
+        self.assertEqual(self._adder().grid_continuation_limit(32, 4096), 32)
 
     def test_every_chunk_of_a_cut_up_request_can_still_donate(self):
         # Walk a 100k prompt through chunks the scheduler cut to whatever the

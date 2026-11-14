@@ -393,33 +393,15 @@ impl PoolHitPolicy {
     }
 }
 
-/// Well-known pool names used as PoolTransfer identifiers.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+/// Pool names used as PoolTransfer identifiers. The tree core reads only the
+/// named variants; any other python PoolName passes through as `Other`.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub enum PoolName {
     #[default]
     Kv,
     Mamba,
     Swa,
-    AuxiliarySwa,
-    Indexer,
-    DeepseekV4C4,
-    DeepseekV4C4Indexer,
-    DeepseekV4C4IndexerScale,
-    DeepseekV4C128,
-    DeepseekV4C1,
-    DeepseekV4C1Indexer,
-    DeepseekV4C1IndexerScale,
-    DeepseekV4C2,
-    DeepseekV4C2Indexer,
-    DeepseekV4C2IndexerScale,
-    DeepseekV4C4Rope,
-    DeepseekV4C128Rope,
-    DeepseekV4C4State,
-    DeepseekV4C4IndexerState,
-    DeepseekV4C128State,
-    Draft,
-    DraftIndexer,
-    DraftSwa,
+    Other(Box<str>),
 }
 
 /// Result of a HiCache pool transfer.
@@ -1449,54 +1431,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
         (offset, self.arena.node(node_id).id, pinned_len)
-    }
-
-    /// Read-only twin of `match_prefix_helper_`: the length up to the deepest
-    /// node every component accepts, host-backed nodes included under HiCache.
-    /// No split, LRU refresh or access-tick update. A partial match into a node
-    /// counts only when FULL is the sole component; with auxiliary components
-    /// the split point would carry no state, so it is not a match boundary.
-    pub fn peek_prefix_len(&self, key: &K, namespace: KeyNamespaceRef<'_>) -> usize {
-        let aligned_key_len = key.atom_len() / self.page_size * self.page_size;
-        let mut validators: Vec<_> = self
-            .components
-            .iter()
-            .map(|component| component.create_match_validator(self, !self.enable_hicache))
-            .collect();
-        let full_only = self.components.len() == 1;
-        let mut node_id = self.arena.root();
-        let mut offset = 0;
-        let mut best_len = 0;
-        while offset < aligned_key_len {
-            let Some(child_id) = self.arena.child_on_page_in_namespace(
-                node_id,
-                namespace,
-                key.page_at(offset, self.page_size),
-            ) else {
-                break;
-            };
-            let child = self.arena.node(child_id);
-            if child.evicted() && !child.backuped() {
-                break;
-            }
-            let prefix_len = key.match_len(offset, &child.key, self.page_size);
-            // Every validator observes every node (stateful validators need the full walk).
-            let matched = validators
-                .iter_mut()
-                .fold(true, |acc, validator| validator(self, child_id) & acc);
-            if prefix_len < child.key.atom_len() {
-                if full_only && matched {
-                    best_len = offset + prefix_len;
-                }
-                break;
-            }
-            node_id = child_id;
-            offset += prefix_len;
-            if matched {
-                best_len = offset;
-            }
-        }
-        best_len
     }
 
     /// Build default validators in component order, without borrowing the core.
@@ -4502,12 +4436,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.arena.node(node_id).backuped())
     }
 
-    /// The node's accumulated match count, which write-through compares with its threshold.
-    pub fn node_hit_count(&self, node_id: NodeId) -> Result<i64, NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        Ok(self.arena.node(node_id).hit_count)
-    }
-
     /// Whether the node is a (default or named) root.
     pub fn is_root(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
@@ -5907,7 +5835,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// A node's accumulated match count.
     pub fn inspect_get_node_hit_count(&self, node_id: NodeId) -> Result<i64, NodeAccessError> {
-        self.node_hit_count(node_id)
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.arena.node(node_id).hit_count)
     }
 
     /// A node's in-flight write-through acknowledgement id.

@@ -57,7 +57,7 @@ The NVFP4 checkpoint fits a single 96 GB RTX PRO 6000 Blackwell (SM120) only wit
 - **Accuracy.** Full GSM8K, 1,319 questions, on the `lmsysorg/sglang:dev-qwen38-next-local` image, in two protocols. Chat completions API with thinking off, greedy, an 8,192-token budget, answer parsed from a final "The answer is N" line (the protocol of the DGX Spark rows, and the figure on the benchmark card): 96.9% for the MTP cell and 96.9% for the no-MTP cell (RadixArk export); 97.3% and 97.0% for the NVIDIA export. `python -m sglang.test.run_eval --eval-name gsm8k --num-examples 1319 --max-tokens 16384` (5-shot, greedy, last-number scorer, chat template with thinking on): 97.72% / 97.79% (RadixArk), 97.41% / 97.72% (NVIDIA). Measured on the `4ccff141db` build, which carries the #36811 and #38290 router fixes.
 - **Measured (1024-in / 256-out random prompts, `ignore_eos`).** MTP vs no-MTP at 1 request: TTFT 115 vs 116 ms median, TPOT 5.9 vs 11.4 ms, 148 vs 83 tok/s. At 16: TPOT 19.3 vs 25.6 ms, 613 vs 524 tok/s. No-MTP at 64: TPOT 55 ms, 861 tok/s, 3.4 req/s. ShareGPT chat (thinking off, ≤ 512 output tokens): 785 tok/s at 16-way with MTP, 1,258 tok/s at 64-way without. MTP accept length 3.3 of 4 on GSM8K / random prompts, 2.9 on long-form ShareGPT answers. On the `dev-qwen38-next-local` image (`4ccff141db`): 6.0 / 11.44 ms TPOT at 1 request (MTP / no MTP), 685 / 561 tok/s at 16, 909 tok/s at 64 without MTP, accept length 3.16.
 
-- **NVIDIA export (NVFP4 (NVDA)).** `nvidia/Qwen3.8-Flash-Next-NVFP4` runs on this card with the same shape, pools and flags as the RadixArk cells on the `lmsysorg/sglang:dev-qwen38-next-local` image (it carries the loader from [#38121](https://github.com/sgl-project/sglang/pull/38121); `qwen38flashnext` cannot load this export). Do not pass `--quantization`: the checkpoint resolves to `modelopt_mixed`. Low latency keeps the in-checkpoint MTP head: at TP=1 its fp8 block-scaled experts need no sharding, and #38121 runs them on triton under the `flashinfer_cutlass` pin. The RadixArk BF16 draft measured the same here (accept 3.33 vs 3.31, TPOT 18.5 vs 19.1 ms at 16), so the cell stays single-checkpoint. Verified on that image (`4ccff141db`): full GSM8K in the Accuracy bullet above; 6.02 ms TPOT at 1 request with MTP, 675 output tok/s at 16; 906 output tok/s at 64 without, the same as the RadixArk export. The smaller fp8 draft leaves a ~170k-token KV pool at 16 concurrent.
+- **NVIDIA export (NVFP4 (NVDA)).** `nvidia/Qwen3.8-Flash-Next-NVFP4` runs on this card with the same shape, pools and flags as the RadixArk cells on the `lmsysorg/sglang:dev-qwen38-next-local` image (it carries the loader from [#38121](https://github.com/sgl-project/sglang/pull/38121); `qwen38flashnext` cannot load this export). Do not pass `--quantization`: the checkpoint resolves to `modelopt_mixed`. Low latency keeps the in-checkpoint MTP head: at TP=1 its fp8 block-scaled experts need no sharding, and #38121 runs them on triton under the `flashinfer_cutlass` pin. The RadixArk BF16 draft measured the same here (accept 3.33 vs 3.31, TPOT 18.5 vs 19.1 ms at 16), so the cell stays single-checkpoint. Verified on that image (`4ccff141db`): full GSM8K in the Accuracy bullet above; 6.02 ms TPOT at 1 request with MTP, 675 output tok/s at 16; 906 output tok/s at 64 without, the same as the RadixArk export. The smaller fp8 draft leaves a ~170k-token KV pool at 16 concurrent. To shrink the draft further, add `--speculative-draft-model-quantization modelopt_fp4` (needs a build that includes [#48295](https://github.com/sgl-project/sglang/pull/48295); the `dev-qwen38-next-local` image ignores this flag): it converts the 512 block-FP8 MTP experts to NVFP4 while they load (the online path `--quantization modelopt_fp4` uses for FP8 checkpoints), and the draft then runs on the same `flashinfer_cutlass` NVFP4 MoE path as the target. In a TP=1 test on upstream main with 8 running requests (`--mem-fraction-static 0.94 --max-mamba-cache-size 40 --disable-radix-cache`), free memory after the draft load rose from 14.7 to 15.7 GB and the KV pool from 24,320 to 64,064 tokens, with GSM8K (200 questions, thinking off) at 97.0% vs 96.5% and MTP accept length 3.50 in both. The conversion is verified on RTX PRO 6000 and GB200; it is untested on GPUs without native NVFP4 MoE kernels, such as H100.
 
 </Accordion>
 
@@ -315,7 +315,7 @@ Carried over from Qwen3-Next and refined through the Qwen3.5–Qwen3.8 series: a
 
 **Context length:** 262,144 native, extensible to 1,000,000 tokens with YaRN. **License:** see [the model card's LICENSE](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
 
-**Recommended generation:** Qwen has not published sampling recommendations for this preview. SGLang applies the checkpoint's own `generation_config.json`, so leave `temperature` / `top_p` unset unless you have a measured reason not to.
+**Recommended generation:** Qwen publishes a preset per mode. For thinking mode use `temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`, `presence_penalty=0.0`, `repetition_penalty=1.0`; for instruct (non-thinking) mode use `temperature=0.7`, `top_p=0.80`, `top_k=20`, `min_p=0.0`, `presence_penalty=1.5`, `repetition_penalty=1.0`. The checkpoint's `generation_config.json` already ships the thinking preset (`temperature=1.0`, `top_k=20`, `top_p=0.95`), so leaving `temperature` / `top_p` unset is right for thinking mode — but it does not match the instruct preset, so set those values explicitly when you run with `enable_thinking: false`.
 
 Each precision is its own repository:
 
@@ -366,9 +366,9 @@ The `model` argument in the examples below is the BF16 repo id. Every precision 
 
 ### 2.1 Reasoning
 
-Qwen3.8-Flash-Next **always** reasons — thinking cannot be turned off. `--reasoning-parser auto` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) lets SGLang pick the matching parser from the checkpoint's chat template, and splits the thinking into `reasoning_content`, leaving `content` as the answer alone. The resolved name is logged at startup if you want to pin it explicitly later.
+Qwen3.8-Flash-Next **thinks by default**, but thinking can be turned off: set `"chat_template_kwargs": {"enable_thinking": false}` per request, or `--default-chat-template-kwargs '{"enable_thinking": false}'` server-wide. The template then pre-fills an empty `<think></think>` block, so generation starts directly at the answer.
 
-Depth is requested with `reasoning_effort`. Qwen documents `xhigh` (the default), `medium` and `low` for the hosted model; SGLang forwards whatever you pass into the checkpoint's chat template.
+`--reasoning-parser auto` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) picks the matching parser from the chat template and splits the thinking into `reasoning_content`. Depth is requested with `reasoning_effort`: `xhigh` (the default), `medium`, or `low` — other values are rejected, and it has no effect while thinking is disabled. Thinking blocks are preserved by default (`preserve_thinking: true`); set `"chat_template_kwargs": {"preserve_thinking": false}` to keep only the latest turn's.
 
 <Accordion title="Reasoning Example (Python)">
 
@@ -391,7 +391,8 @@ print("Answer:", msg.content)
 <Accordion title="Example Output">
 
 ```text Output
-Pending update — a sample transcript will be added here once the weights are public.
+Reasoning: We need answer simple arithmetic. Need compute 15% of 240. 0.15*240 = 36. Could show brief. Final concise.
+Answer: 15% of 240 is **36**.
 ```
 
 </Accordion>
@@ -400,7 +401,7 @@ Pending update — a sample transcript will be added here once the weights are p
 
 Add `--tool-call-parser auto` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. As with the reasoning parser, SGLang resolves the concrete detector from the chat template at startup. No Deploy cell sets it, so this is an opt-in: add the flag to the generated command, or flip the chip in the Playground.
 
-Because this model always thinks, the final assistant turn can put text in `reasoning_content` rather than `content` — print both so a bare `None` doesn't mislead you.
+With thinking on (the default), a generation that stops inside the reasoning block — for example at the `max_tokens` cap — leaves `content` empty and puts the partial reasoning in `reasoning_content`; with `enable_thinking: false` the answer lands in `content` directly. Print both so a bare `None` doesn't mislead you.
 
 <Accordion title="Tool Calling Example (Python)">
 
@@ -434,8 +435,11 @@ resp = client.chat.completions.create(
 )
 msg = resp.choices[0].message
 print("Reasoning:", getattr(msg, "reasoning_content", None))
-print("Content:", msg.content)
-print("Tool calls:", msg.tool_calls)
+print("Content:", repr(msg.content))
+print("Tool calls:", [
+    (tc.function.name, tc.function.arguments)
+    for tc in (msg.tool_calls or [])
+])
 ```
 
 </Accordion>
@@ -443,7 +447,9 @@ print("Tool calls:", msg.tool_calls)
 <Accordion title="Example Output">
 
 ```text Output
-Pending update — a sample transcript will be added here once the weights are public.
+Reasoning: The user wants to know the weather in Beijing. I have a tool to get the weather.
+Content: ''
+Tool calls: [('get_weather', '{"location": "Beijing"}')]
 ```
 
 </Accordion>

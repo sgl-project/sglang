@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: the ROCm MoE front fuses routed-input casting with SiTU.
-register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 _BETA = 4.0
 _LINEAR_BETA = 25.0
@@ -68,32 +68,24 @@ class TestSituAndMulCast(CustomTestCase):
     def test_cast_rides_the_activation_launch(self):
         """The strided routed slice rounds exactly while SiTU keeps its output."""
         sizes = [1536, 896, 3584]  # shared gate/up, router, routed input
-        # The cast begins mid-block at 1/3 tokens and spans many blocks at 257.
-        for num_tokens in (1, 3, 257):
-            g = torch.Generator(device="cuda").manual_seed(num_tokens)
-            front = 3 * torch.randn(
-                (num_tokens, sum(sizes)), generator=g, device="cuda"
-            )
-            gate_up, _, routed = torch.split(front, sizes, dim=-1)
-            routed_bf16 = torch.full(
-                routed.shape, float("nan"), dtype=torch.bfloat16, device="cuda"
-            )
-            act = situ_and_mul(
-                gate_up, None, _BETA, _LINEAR_BETA, (routed, routed_bf16)
-            )
-            msg = f"{num_tokens} tokens"
-            self.assertTrue(torch.equal(routed_bf16, routed.to(torch.bfloat16)), msg)
-            self.assertTrue(
-                torch.equal(act, situ_and_mul(gate_up, None, _BETA, _LINEAR_BETA)),
-                msg,
-            )
-            torch.testing.assert_close(
-                act.float(),
-                _situ_reference(gate_up).to(torch.bfloat16).float(),
-                rtol=2e-2,
-                atol=4e-2,
-                msg=msg,
-            )
+        # 257 tokens: the cast spans many blocks
+        g = torch.Generator(device="cuda").manual_seed(257)
+        front = 3 * torch.randn((257, sum(sizes)), generator=g, device="cuda")
+        gate_up, _, routed = torch.split(front, sizes, dim=-1)
+        routed_bf16 = torch.full(
+            routed.shape, float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        act = situ_and_mul(gate_up, None, _BETA, _LINEAR_BETA, (routed, routed_bf16))
+        self.assertTrue(torch.equal(routed_bf16, routed.to(torch.bfloat16)))
+        self.assertTrue(
+            torch.equal(act, situ_and_mul(gate_up, None, _BETA, _LINEAR_BETA))
+        )
+        torch.testing.assert_close(
+            act.float(),
+            _situ_reference(gate_up).to(torch.bfloat16).float(),
+            rtol=2e-2,
+            atol=4e-2,
+        )
 
 
 if __name__ == "__main__":

@@ -58,14 +58,11 @@
 namespace sglang::k3_a8w4 {
 
 typedef unsigned int u32;
-typedef unsigned short u16;
 typedef u32 u32x2 __attribute__((ext_vector_type(2)));
 typedef u32 u32x4 __attribute__((ext_vector_type(4)));
 typedef int i32x4 __attribute__((ext_vector_type(4)));
 typedef int i32x8 __attribute__((ext_vector_type(8)));
 typedef float f32x4 __attribute__((ext_vector_type(4)));
-
-#define K3A8W4_DEV __device__ __forceinline__
 
 constexpr int kKStep = 128;             // k of one MFMA
 constexpr int kTileBytes = 1024;        // one 16-row x 128-k MXFP4 tile in AITER's (16, 16) preshuffle
@@ -76,12 +73,12 @@ constexpr u32 kOffDrop = 0xFFFFFFFFu;   // an offset every SRD range check rejec
 // Buffer-resource memory ops. A voffset at or past num_records loads 0 or drops the store, so
 // padded rows cost no branch. The soffset is added to the address but not range-checked.
 // ---------------------------------------------------------------------------------------------
-K3A8W4_DEV __amdgpu_buffer_rsrc_t make_rsrc(const void* p, uint64_t bytes) {
+SGL_DEVICE __amdgpu_buffer_rsrc_t make_rsrc(const void* p, uint64_t bytes) {
   const u32 n = bytes > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)bytes;
   return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), 0, n, kSrdWord3);
 }
 
-K3A8W4_DEV u32x4 ld_b128(__amdgpu_buffer_rsrc_t r, u32 voff, u32 soff) {
+SGL_DEVICE u32x4 ld_b128(__amdgpu_buffer_rsrc_t r, u32 voff, u32 soff) {
   u32x4 v;
   asm volatile("buffer_load_dwordx4 %0, %1, %2, %3 offen"  // codespell:ignore offen
 
@@ -91,7 +88,7 @@ K3A8W4_DEV u32x4 ld_b128(__amdgpu_buffer_rsrc_t r, u32 voff, u32 soff) {
   return v;
 }
 
-K3A8W4_DEV u32 ld_b32(__amdgpu_buffer_rsrc_t r, u32 voff, u32 soff) {
+SGL_DEVICE u32 ld_b32(__amdgpu_buffer_rsrc_t r, u32 voff, u32 soff) {
   u32 v;
   asm volatile("buffer_load_dword %0, %1, %2, %3 offen"  // codespell:ignore offen
 
@@ -101,7 +98,7 @@ K3A8W4_DEV u32 ld_b32(__amdgpu_buffer_rsrc_t r, u32 voff, u32 soff) {
   return v;
 }
 
-K3A8W4_DEV void st_b32(__amdgpu_buffer_rsrc_t r, u32 v, u32 voff) {
+SGL_DEVICE void st_b32(__amdgpu_buffer_rsrc_t r, u32 v, u32 voff) {
   asm volatile("buffer_store_dword %0, %1, %2, 0 offen"  // codespell:ignore offen
                ::"v"(v),
                "v"(voff),
@@ -109,7 +106,7 @@ K3A8W4_DEV void st_b32(__amdgpu_buffer_rsrc_t r, u32 v, u32 voff) {
                : "memory");
 }
 
-K3A8W4_DEV void st_b8(__amdgpu_buffer_rsrc_t r, u32 v, u32 voff) {
+SGL_DEVICE void st_b8(__amdgpu_buffer_rsrc_t r, u32 v, u32 voff) {
   asm volatile("buffer_store_byte %0, %1, %2, 0 offen"  // codespell:ignore offen
                ::"v"(v),
                "v"(voff),
@@ -118,7 +115,7 @@ K3A8W4_DEV void st_b8(__amdgpu_buffer_rsrc_t r, u32 v, u32 voff) {
 }
 
 template <int N>
-K3A8W4_DEV void wait_vmcnt() {
+SGL_DEVICE void wait_vmcnt() {
   static_assert(N >= 0 && N <= 63, "vmcnt is a 6-bit field");
   asm volatile("s_waitcnt vmcnt(%c0)" ::"i"(N) : "memory");
 }
@@ -127,27 +124,27 @@ K3A8W4_DEV void wait_vmcnt() {
 // scheduled above the wait. Repeating one for each register of a group costs a satisfied
 // s_waitcnt apiece.
 template <int N>
-K3A8W4_DEV void guard(u32x4& v) {
+SGL_DEVICE void guard(u32x4& v) {
   asm volatile("s_waitcnt vmcnt(%c1)" : "+v"(v) : "n"(N) : "memory");
 }
 
 template <int N>
-K3A8W4_DEV void guard(u32& v) {
+SGL_DEVICE void guard(u32& v) {
   asm volatile("s_waitcnt vmcnt(%c1)" : "+v"(v) : "n"(N) : "memory");
 }
 
 // Only the LDS half of __syncthreads: the weight stream keeps flying through it.
-K3A8W4_DEV void lds_barrier() {
+SGL_DEVICE void lds_barrier() {
   asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
 }
 
-K3A8W4_DEV u32 to_sgpr(u32 v) {
+SGL_DEVICE u32 to_sgpr(u32 v) {
   return __builtin_amdgcn_readfirstlane(v);
 }
 
 // MI300-class parts deal workgroups to their eight XCDs round-robin. Re-linearising gives each
 // die a contiguous run of blocks, so one expert's m-blocks share one L2. A bijection on [0, live).
-K3A8W4_DEV int xcd_linear(int live) {
+SGL_DEVICE int xcd_linear(int live) {
   constexpr u32 kXcd = 8;
   const u32 lin = blockIdx.x;
   if (lin >= (u32)live) return -1;
@@ -158,7 +155,7 @@ K3A8W4_DEV int xcd_linear(int live) {
 
 // Weights are the MFMA A operand (fp4, cbsz 4), activations the B operand (fp8, blgp 0).
 template <int OPSEL_W, int OPSEL_A>
-K3A8W4_DEV f32x4 mfma_a8w4(u32x4 w, u32x4 a_lo, u32x4 a_hi, f32x4 c, u32 scale_w, u32 scale_a) {
+SGL_DEVICE f32x4 mfma_a8w4(u32x4 w, u32x4 a_lo, u32x4 a_hi, f32x4 c, u32 scale_w, u32 scale_a) {
   const i32x4 w4 = __builtin_bit_cast(i32x4, w);
   const i32x8 wv = __builtin_shufflevector(w4, w4, 0, 1, 2, 3, -1, -1, -1, -1);
   const i32x4 lo = __builtin_bit_cast(i32x4, a_lo), hi = __builtin_bit_cast(i32x4, a_hi);
@@ -173,36 +170,36 @@ K3A8W4_DEV f32x4 mfma_a8w4(u32x4 w, u32x4 a_lo, u32x4 a_hi, f32x4 c, u32 scale_w
 constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kFp8Max = 448.0f;
 
-K3A8W4_DEV float tanh_aiter(float x) {
+SGL_DEVICE float tanh_aiter(float x) {
   const float e = __builtin_amdgcn_exp2f(__builtin_fabsf(x) * (float)(-2.0 * 1.4426950408889634));
   const float t = (1.0f - e) * __builtin_amdgcn_rcpf(1.0f + e);
   return x > 0.0f ? t : -t;
 }
 
-K3A8W4_DEV float situ_v2(float g, float u, float beta, float inv_beta, float lbeta, float inv_lbeta) {
+SGL_DEVICE float situ_v2(float g, float u, float beta, float inv_beta, float lbeta, float inv_lbeta) {
   const float sg = __builtin_amdgcn_rcpf(1.0f + __builtin_amdgcn_exp2f(g * -kLog2e));
   const float a = (beta * tanh_aiter(g * inv_beta)) * sg;
   return (a * lbeta) * tanh_aiter(u * inv_lbeta);
 }
 
 // Biased exponent of the smallest power of two >= v, clamped to [1, 254].
-K3A8W4_DEV u32 e8m0_ceil(float v) {
+SGL_DEVICE u32 e8m0_ceil(float v) {
   const u32 b = __builtin_bit_cast(u32, v);
   int e = (int)((b >> 23) & 0xFF) + ((b & 0x7FFFFF) != 0 ? 1 : 0);
   e = e < 1 ? 1 : (e > 254 ? 254 : e);
   return (u32)e;
 }
 
-K3A8W4_DEV float rcp_pow2(u32 code) {
+SGL_DEVICE float rcp_pow2(u32 code) {
   return __builtin_bit_cast(float, (254u - code) << 23);
 }
 
-K3A8W4_DEV float clamp_fp8(float v) {
+SGL_DEVICE float clamp_fp8(float v) {
   return __builtin_fminf(__builtin_fmaxf(v, -kFp8Max), kFp8Max);
 }
 
 // Four in-range f32 -> four OCP E4M3 bytes, RNE.
-K3A8W4_DEV u32 fp8x4(float a, float b, float c, float d) {
+SGL_DEVICE u32 fp8x4(float a, float b, float c, float d) {
   const int lo = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
   return (u32)__builtin_amdgcn_cvt_pk_fp8_f32(c, d, lo, true);
 }
@@ -211,7 +208,7 @@ typedef __bf16 bf16x2 __attribute__((ext_vector_type(2)));
 typedef float f32x2 __attribute__((ext_vector_type(2)));
 
 // v_cvt_pk_bf16_f32: RNE under the default round mode.
-K3A8W4_DEV u32 bf16x2_rne(float lo, float hi) {
+SGL_DEVICE u32 bf16x2_rne(float lo, float hi) {
   return __builtin_bit_cast(u32, __builtin_convertvector((f32x2){lo, hi}, bf16x2));
 }
 
@@ -251,7 +248,7 @@ struct GateUpCfg {
 
 // LDS byte offset of 16-byte chunk c of row r in a 128-byte-per-row slab. XOR on the row's low
 // bits spreads the 16 rows an MFMA operand read touches over distinct bank groups.
-K3A8W4_DEV int a_slab_off(int r, int c) {
+SGL_DEVICE int a_slab_off(int r, int c) {
   return r * kKStep + ((c ^ (r & 7)) << 4);
 }
 
@@ -661,11 +658,11 @@ __global__ __launch_bounds__(NW * 64, 4) void down_ws_kernel(const DownParams p)
         o[j] = v;
       }
       *reinterpret_cast<u32x4*>(base + C::A_BYTES + tid * 16) = o;
-      const int tok = st_sid & 0xFFFFFF, slot = (int)((u32)st_sid >> 24);
+      const int tok = st_sid & 0xFFFFFF, topk_slot = (int)((u32)st_sid >> 24);
       const int prow = blk * BM + tid;
       const u32 yoff = ((u32)chunk * (u32)p.y_rows + (u32)prow) * (u32)C::BN * 2u;
       *reinterpret_cast<u32*>(base + C::A_BYTES + BM * 16 + tid * 4) = tok < p.T ? yoff : kOffDrop;
-      if (chunk == 0 && tok < p.T) p.pos[tok * p.topk + slot] = prow;
+      if (chunk == 0 && tok < p.T) p.pos[tok * p.topk + topk_slot] = prow;
     }
   };
 
@@ -757,8 +754,7 @@ __global__ __launch_bounds__(256) void reduce_kernel(
 #pragma unroll
   for (int s = 0; s < TOPK; ++s) {
     ws[s] = wt[s];
-    // chunked y is [N / chunk_cols][y_rows][chunk_cols]. The host always passes pos and chunk_cols;
-    // the unused fallbacks stay because dropping them reschedules this kernel (130 -> 164 VGPRs).
+    // y is [N / chunk_cols][y_rows][chunk_cols]; the never-taken pos / chunk_cols fallbacks keep VGPR use down
     row_off[s] = (pos ? (u32)pos[tok * TOPK + s] : (u32)(tok * TOPK + s)) * (u32)(chunk_cols ? chunk_cols : N) * 2u;
   }
   for (int c = threadIdx.x; c < N / 8; c += blockDim.x) {
@@ -787,11 +783,11 @@ __global__ __launch_bounds__(256) void reduce_kernel(
 // Host launchers.
 // ---------------------------------------------------------------------------------------------
 template <int BM, int NW, int NT>
-inline void launch_gateup(const GateUpParams& p, int max_blocks, hipStream_t stream) {
+inline void launch_gateup(const GateUpParams& p, hipStream_t stream) {
   using C = GateUpCfg<BM, NW, NT>;
   const int nblk_n = p.I / C::BN;
   const size_t lds = 2 * C::SLAB_BYTES + (size_t)(p.K / 512) * BM * 16;
-  hipLaunchKernelGGL((gateup_kernel<BM, NW, NT>), dim3(max_blocks * nblk_n), dim3(C::NTHR), lds, stream, p);
+  hipLaunchKernelGGL((gateup_kernel<BM, NW, NT>), dim3(p.max_blocks * nblk_n), dim3(C::NTHR), lds, stream, p);
 }
 
 template <int BM, int NW, int KS>
@@ -901,18 +897,17 @@ struct K3A8W4MoE {
     p.lbeta = static_cast<float>(linear_beta);
     p.inv_lbeta = static_cast<float>(1.0 / linear_beta);
     const auto stream = LaunchKernel::resolve_device(device_.unwrap());
-    const int blocks = static_cast<int>(B_.unwrap());
     // A workgroup covers 4 waves x 2 tiles x 16 inter columns.
     RuntimeCheck(p.I % 128 == 0, "inter must be a multiple of 128, got ", p.I);
     switch (block_m) {
       case 16:
-        k3_a8w4::launch_gateup<16, 4, 2>(p, blocks, stream);
+        k3_a8w4::launch_gateup<16, 4, 2>(p, stream);
         break;
       case 32:
-        k3_a8w4::launch_gateup<32, 4, 2>(p, blocks, stream);
+        k3_a8w4::launch_gateup<32, 4, 2>(p, stream);
         break;
       case 64:
-        k3_a8w4::launch_gateup<64, 4, 2>(p, blocks, stream);
+        k3_a8w4::launch_gateup<64, 4, 2>(p, stream);
         break;
       default:
         RuntimeCheck(false, "block_m must be 16, 32 or 64, got ", block_m);

@@ -169,12 +169,12 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
 
     def test_support_triton_is_the_regression_being_guarded(self):
         from sglang.srt.platforms.interface import PlatformCapabilities
-        from sglang.srt.utils.common import support_triton
+        from sglang.srt.utils.triton_utils import support_triton
 
         # This is why a base-only read is not merely imprecise: the unset field
         # reads as "supported".
         with mock.patch(
-            "sglang.srt.utils.common.current_platform",
+            "sglang.srt.utils.triton_utils.current_platform",
             SimpleNamespace(capabilities=PlatformCapabilities(supports_triton=True)),
         ):
             self.assertTrue(support_triton(None))

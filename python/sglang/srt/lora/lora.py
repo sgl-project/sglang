@@ -26,11 +26,11 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
-from sglang.srt.utils.hf_transformers import AutoConfig
 
 # Matches both per-expert keys ("...experts.0.<module>...") and shared-outer
 # keys ("...experts.<module>..."), while excluding "shared_experts." (where the
@@ -141,33 +141,42 @@ class LoRAAdapter(nn.Module):
         return self._moe_is_gated_by_layer.get(layer_id) is False
 
     def initialize_weights(self):
+        from sglang.srt.lora.utils import get_normalized_target_modules
+
         model_path = self.config.path
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
 
         # Get normalized target modules for filtering
+        normalized_target_modules = get_normalized_target_modules(
+            self.config.target_modules
+        )
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
-            self._process_weight(name, loaded_weight)
+            self._process_weight(name, loaded_weight, normalized_target_modules)
 
         self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
-        for name, tensor in tensors.items():
-            self._process_weight(name, tensor)
-
-        self._normalize_weights()
-
-    def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
         normalized_target_modules = get_normalized_target_modules(
             self.config.target_modules
         )
+        for name, tensor in tensors.items():
+            self._process_weight(name, tensor, normalized_target_modules)
 
+        self._normalize_weights()
+
+    def _process_weight(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        normalized_target_modules: set[str],
+    ):
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.
         if "unembed_tokens" in name:
@@ -462,7 +471,12 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
+        from sglang.srt.lora.utils import PRESERVED_LORA_TARGET_NAMES
+
         for weight_name in weight_names:
+            if any(f".{name}." in weight_name for name in PRESERVED_LORA_TARGET_NAMES):
+                # The attention output gate has no up_proj to stack with.
+                continue
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")

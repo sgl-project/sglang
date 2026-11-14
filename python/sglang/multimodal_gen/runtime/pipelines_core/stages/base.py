@@ -100,10 +100,6 @@ class PipelineStage(StageDedupMixin, ABC):
         """Logs a warning message with the stage name as a prefix."""
         logger.warning(f"[{self.__class__.__name__}] {msg}", *args)
 
-    def log_error(self, msg, *args):
-        """Logs an error message with the stage name as a prefix."""
-        logger.error(f"[{self.__class__.__name__}] {msg}", *args)
-
     def log_debug(self, msg, *args):
         """Logs a debug message with the stage name as a prefix."""
         logger.debug(f"[{self.__class__.__name__}] {msg}", *args)

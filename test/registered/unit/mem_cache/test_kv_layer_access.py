@@ -1,6 +1,8 @@
 """A layer's reads and writes through its router's `KVLayer` address the storage, and
 write at the ids, that the pool's own per-layer methods do: a plain pool's, the static
-window composite's (full and window sides) and the hybrid-linear composite's."""
+window composite's (full and window sides) and the hybrid-linear composite's. The
+router's window predicates keep apart the cases backends used to tell apart by pool
+class."""
 
 import unittest
 from types import SimpleNamespace
@@ -8,6 +10,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     KVWriteLoc,
@@ -20,9 +23,10 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import target_kv_pool_view
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 _DEV = "cuda"
+_SWA = IdSpaceKind.SLIDING_WINDOW
 
 
 def _plain_pool():
@@ -38,7 +42,7 @@ def _plain_pool():
     )
 
 
-def _swa_pool():
+def _swa_pool(swa_ids=(0, 2), full_ids=(1, 3)):
     return SWAKVPool(
         size=32,
         size_swa=16,
@@ -46,13 +50,13 @@ def _swa_pool():
         dtype=torch.bfloat16,
         head_num=2,
         head_dim=8,
-        swa_attention_layer_ids=[0, 2],
-        full_attention_layer_ids=[1, 3],
+        swa_attention_layer_ids=list(swa_ids),
+        full_attention_layer_ids=list(full_ids),
         device=_DEV,
     )
 
 
-def _hybrid_linear_pool():
+def _hybrid_linear_pool(**kwargs):
     return HybridLinearKVPool(
         size=32,
         dtype=torch.bfloat16,
@@ -62,6 +66,7 @@ def _hybrid_linear_pool():
         full_attention_layer_ids=[1, 3],
         device=_DEV,
         mamba_pool=None,
+        **kwargs,
     )
 
 
@@ -75,13 +80,17 @@ _POOLS = {
 def _write_loc():
     # Different full and window ids, so a write at the wrong side's ids shows.
     loc = torch.tensor([3, 7, 11], device=_DEV)
-    return KVWriteLoc(loc, swa_loc=torch.tensor([2, 5, 9], device=_DEV))
+    return KVWriteLoc(
+        loc,
+        window_locs={SWAKVPool.WINDOW_SUB_POOL: torch.tensor([2, 5, 9], device=_DEV)},
+    )
 
 
 class TestKVLayerAccess(CustomTestCase):
     def test_reads_address_what_the_pool_reads(self):
         for name, (make, layer_ids) in _POOLS.items():
             pool = make()
+            self.assertEqual(pool.layer_router.layer_ids(), layer_ids, name)
             for layer_id in layer_ids:
                 with self.subTest(pool=name, layer_id=layer_id):
                     kv = pool.layer_router.read(layer_id)
@@ -159,7 +168,14 @@ class TestKVLayerAccess(CustomTestCase):
                         rope = torch.full((1, 1, 2), 3.0, dtype=pool.dtype, device=_DEV)
                         layer = SimpleNamespace(layer_id=layer_id)
                         kv.store_mla(
-                            layer, KVWriteLoc(loc, window_loc, full_loc), nope, rope
+                            layer,
+                            KVWriteLoc(
+                                loc,
+                                full_loc=full_loc,
+                                window_locs={SWAKVPool.WINDOW_SUB_POOL: window_loc},
+                            ),
+                            nope,
+                            rope,
                         )
                         expected = torch.zeros_like(buffer)
                         slot = (
@@ -168,6 +184,46 @@ class TestKVLayerAccess(CustomTestCase):
                         expected[slot] = torch.cat((nope, rope), dim=-1)[0]
                         self.assertTrue(torch.equal(buffer, expected))
                         self.assertEqual(layer.layer_id, layer_id)
+
+    def test_hybrid_linear_mla_reaches_its_view_without_rewriting_the_layer(self):
+        """The MLA write and read address the full view's layer by its local
+        index while `RadixAttention.layer_id` stays the model's layer id."""
+        with get_parallel().override(
+            dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0
+        ):
+            pool = _hybrid_linear_pool(use_mla=True, kv_lora_rank=4, qk_rope_head_dim=2)
+            layer = SimpleNamespace(layer_id=3)
+            loc = torch.tensor([5], device=_DEV)
+            nope = torch.full((1, 1, 4), 2.0, dtype=torch.bfloat16, device=_DEV)
+            rope = torch.full((1, 1, 2), 3.0, dtype=torch.bfloat16, device=_DEV)
+            pool.set_mla_kv_buffer(layer, loc, nope, rope)
+            self.assertEqual(layer.layer_id, 3)
+            written = pool.full_kv_pool.kv_buffer[1][5].flatten().tolist()
+            self.assertEqual(written, [2.0] * 4 + [3.0] * 2)
+            self.assertEqual(pool.full_kv_pool.kv_buffer[0].abs().sum().item(), 0)
+            got_nope, got_rope = pool.get_mla_kv_buffer(layer, loc)
+            self.assertTrue(torch.equal(got_nope, nope))
+            self.assertTrue(torch.equal(got_rope, rope))
+
+    def test_window_predicates(self):
+        """A window sub-pool may exist with no layer routed to it (a full-only
+        draft over a hybrid pool): `sub_pool` and `routes_to` must disagree
+        there, as the pool-class check and its layer-count variant did."""
+        cases = {
+            "window layers": (_swa_pool(swa_ids=(0,), full_ids=(1,)), True, True),
+            "no window layers": (_swa_pool(swa_ids=(), full_ids=(0,)), True, False),
+            "plain": (_plain_pool(), False, False),
+        }
+        for name, (pool, has_window, routes_window) in cases.items():
+            with self.subTest(pool=name):
+                router = pool.layer_router
+                self.assertEqual(router.sub_pool(_SWA) is not None, has_window)
+                self.assertEqual(router.routes_to(_SWA), routes_window)
+                kv = router.layer(0)
+                self.assertEqual(kv.route.sub_pool == _SWA, routes_window)
+        plain = cases["plain"][0].layer_router.layer(1)
+        self.assertIs(plain.view, cases["plain"][0])
+        self.assertEqual(plain.view_layer_id, 1)
 
     def test_a_composite_marks_its_owner_and_a_plain_pool_is_plain(self):
         swa = _swa_pool().layer_router

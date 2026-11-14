@@ -9,18 +9,23 @@ Covers:
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import torch
 
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
-from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.embed_types import (
+    PositionalEmbeds,
+    validate_positional_embed_overrides,
+)
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -50,6 +55,73 @@ class TestPositionalEmbeds(CustomTestCase):
     def test_length_mismatch_raises(self):
         with self.assertRaises(ValueError):
             PositionalEmbeds(embeds=[_vec()], positions=[0, 1])
+
+
+# ========================================================================
+# validate_positional_embed_overrides
+# ========================================================================
+
+
+class TestValidatePositionalEmbedOverrides(CustomTestCase):
+    def _validate(self, value):
+        validate_positional_embed_overrides(value, hidden_size=HIDDEN_DIM)
+
+    def test_model_hidden_size_mismatch_raises(self):
+        pe = PositionalEmbeds(embeds=[torch.zeros(HIDDEN_DIM + 3)], positions=[0])
+        with self.assertRaises(ValueError) as ctx:
+            self._validate(pe)
+        msg = str(ctx.exception)
+        self.assertIn("hidden_dim", msg)
+        self.assertIn(str(HIDDEN_DIM), msg)
+        self.assertIn(str(HIDDEN_DIM + 3), msg)
+
+
+class TestCreateTokenizedObjectEmbedOverrideValidation(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_generate_and_embedding_requests_reject_malformed_overrides(self):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.preferred_sampling_params = None
+        manager.sampling_params_class = SamplingParams
+        manager.tokenizer = None
+        manager.model_config = SimpleNamespace(
+            hidden_size=HIDDEN_DIM,
+            vocab_size=128,
+        )
+        manager.fake_bootstrap_room_counter = 0
+        manager.rid_to_state = {
+            "test-rid": SimpleNamespace(time_stats=MagicMock()),
+        }
+        malformed_overrides = {"embeds": [[1.0] * HIDDEN_DIM], "positions": [0]}
+        requests = (
+            GenerateReqInput(
+                input_ids=[1, 2],
+                rid="test-rid",
+                sampling_params={},
+                positional_embed_overrides=malformed_overrides,
+            ),
+            EmbeddingReqInput(
+                input_ids=[1, 2],
+                rid="test-rid",
+                sampling_params={},
+                positional_embed_overrides=malformed_overrides,
+            ),
+        )
+
+        for request in requests:
+            with self.subTest(request_type=type(request).__name__):
+                with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
+                    manager._create_tokenized_object(request, "hello", [1, 2])
+
+
+class TestPositionalEmbedsRank(CustomTestCase):
+    def test_three_dim_embeds_rejected(self):
+        # Passes the length and hidden-dim checks but breaks the scheduler scatter.
+        with self.assertRaisesRegex(ValueError, "must be 2-D"):
+            PositionalEmbeds(embeds=torch.zeros(1, 1, HIDDEN_DIM), positions=[0])
 
 
 # ========================================================================

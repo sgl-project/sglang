@@ -9,20 +9,13 @@ import torch
 from sglang.kernels.ops.attention.fla.kda import chunk_kda
 from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
 from sglang.srt.layers.attention.linear.kernels import kda_triton
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 SLOTS = 40
-
-
-def _is_gfx950() -> bool:
-    return bool(
-        torch.version.hip
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_properties().gcnArchName.split(":", 1)[0] == "gfx950"
-    )
 
 
 def _inputs(lengths, heads=4, seed=42) -> dict[str, torch.Tensor]:
@@ -77,6 +70,8 @@ def _reference(inputs, **track):
 
 
 def _hip(inputs, lower_bound=-5.0, **kwargs):
+    if "extend_seq_lens_cpu" not in kwargs:
+        kwargs["extend_seq_lens_cpu"] = inputs["query_start_loc"].diff().tolist()
     return kda_gfx950_prefill.extend(
         *_args(inputs),
         ssm_states=inputs["ssm_states"],
@@ -88,12 +83,49 @@ def _hip(inputs, lower_bound=-5.0, **kwargs):
         beta_is_raw=True,
         return_intermediate_states="track_state" in kwargs
         or "track_ssm_h_src" in kwargs,
-        extend_seq_lens_cpu=inputs["query_start_loc"].diff().tolist(),
         **kwargs,
     )
 
 
-@unittest.skipUnless(_is_gfx950(), "gfx950 KDA prefill requires MI35x")
+def _padded(inputs, lengths, num_seqs, num_tokens):
+    """A breakable prefill graph's view of ``inputs``: ``num_seqs`` sequences and
+    ``num_tokens`` tokens, the tail being empty PAD_SLOT_ID sequences and junk
+    tokens, with the state pool framed by one guard row on each side."""
+    total, pad = sum(lengths), num_seqs - len(lengths)
+    heads = inputs["q"].shape[2]
+    padded = {}
+    for name in ("q", "k", "v", "g", "beta"):
+        junk = torch.randn(
+            (1, num_tokens - total, *inputs[name].shape[2:]), device="cuda"
+        )
+        padded[name] = torch.cat([inputs[name], junk.to(inputs[name].dtype)], dim=1)
+    padded["A_log"], padded["dt_bias"] = inputs["A_log"], inputs["dt_bias"]
+    pool = torch.randn(SLOTS + 2, heads, 128, 128, device="cuda")
+    pool[1:-1] = inputs["ssm_states"]
+    padded["pool"], padded["ssm_states"] = pool, pool[1:-1]
+    padded["cache_indices"] = torch.cat(
+        [inputs["cache_indices"], torch.full((pad,), -1, device="cuda").int()]
+    )
+    padded["query_start_loc"] = torch.cat(
+        [inputs["query_start_loc"], torch.full((pad,), total, device="cuda").int()]
+    )
+    return padded
+
+
+def _hip_padded(padded, **kwargs):
+    # chunk_indices marks the call as a padded graph batch; the kernel ignores it
+    return _hip(
+        padded,
+        extend_seq_lens_cpu=None,
+        chunk_indices=torch.zeros(1, 2, dtype=torch.int32, device="cuda"),
+        **kwargs,
+    )
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and is_gfx95_supported(),
+    "gfx950 KDA prefill requires MI35x",
+)
 class TestGfx950KDAPrefill(CustomTestCase):
     def _assert_close(self, actual, expected, inputs, actual_inputs, expected_inputs):
         torch.testing.assert_close(
@@ -138,7 +170,6 @@ class TestGfx950KDAPrefill(CustomTestCase):
         inputs = _inputs((193, 137))
         self.assertIsNone(_hip(inputs, lower_bound=None))
         self.assertIsNone(_hip(inputs, is_spec_decode=True))
-        self.assertIsNone(_hip(inputs, chunk_indices=torch.zeros(1, 2, device="cuda")))
         # unaligned tracking without a snapshot buffer needs the per-chunk h
         self.assertIsNone(
             _hip(inputs, track_ssm_h_src=torch.ones(1, device="cuda").long())
@@ -215,6 +246,98 @@ class TestGfx950KDAPrefill(CustomTestCase):
                 )
                 torch.testing.assert_close(
                     actual_track, expected_track, rtol=2e-2, atol=3e-2
+                )
+
+    @torch.inference_mode()
+    def test_padded_graph_batch_matches_triton(self):
+        """A captured batch pads with empty PAD_SLOT_ID (-1) sequences and junk
+        tokens; the real sequences must match Triton and no other state row may
+        change."""
+        for lengths, num_seqs, num_tokens, chunks in (
+            ((300, 200), 40, 768, None),  # rank-sorted sequence lookup (N <= 64)
+            ((300, 200), 128, 768, (2, 1)),
+            ((1024,), 128, 2048, (5,)),
+            ((1500, 400, 7), 128, 2048, (20, 3, 0)),
+        ):
+            with self.subTest(lengths=lengths, sequences=num_seqs, track=bool(chunks)):
+                inputs = _inputs(lengths, heads=12)
+                expected_inputs = _clone(inputs)
+                padded = _padded(_clone(inputs), lengths, num_seqs, num_tokens)
+                pool = padded["pool"].clone()
+                track = {}
+                if chunks:
+                    idx = torch.tensor(chunks, device="cuda", dtype=torch.int64)
+                    expected_track = torch.zeros(
+                        len(lengths), 12, 128, 128, device="cuda"
+                    )
+                    actual_track = torch.zeros(num_seqs, 12, 128, 128, device="cuda")
+                    pad_idx = torch.full((num_seqs - len(lengths),), -1, device="cuda")
+                    track = dict(
+                        track_state=actual_track,
+                        track_chunk_idx=torch.cat([idx, pad_idx]),
+                    )
+                    expected = _reference(
+                        expected_inputs, track_state=expected_track, track_chunk_idx=idx
+                    )[0]
+                else:
+                    expected = _reference(expected_inputs)
+                actual = _hip_padded(padded, **track)
+                if chunks:
+                    actual = actual[0]
+                torch.cuda.synchronize()
+                total = sum(lengths)
+                torch.testing.assert_close(
+                    actual[:, :total].float(), expected.float(), rtol=2e-2, atol=3e-2
+                )
+                torch.testing.assert_close(
+                    padded["ssm_states"],
+                    expected_inputs["ssm_states"],
+                    rtol=2e-2,
+                    atol=3e-2,
+                )
+                selected = torch.zeros(SLOTS + 2, dtype=torch.bool, device="cuda")
+                selected[inputs["cache_indices"].long() + 1] = True
+                self.assertTrue(torch.equal(padded["pool"][~selected], pool[~selected]))
+                if chunks:
+                    torch.testing.assert_close(
+                        actual_track[: len(lengths)],
+                        expected_track,
+                        rtol=2e-2,
+                        atol=3e-2,
+                    )
+
+    def test_padded_batch_replays_in_a_cuda_graph(self):
+        num_seqs, num_tokens = 128, 1024
+        static = _padded(_inputs((512,), heads=12), (512,), num_seqs, num_tokens)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream), torch.inference_mode():
+            _hip_padded(static)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph), torch.inference_mode():
+            static_out = _hip_padded(static)
+        for lengths in ((700,), (120, 300, 50)):
+            with self.subTest(lengths=lengths), torch.inference_mode():
+                inputs = _inputs(lengths, heads=12, seed=len(lengths))
+                fresh = _padded(_clone(inputs), lengths, num_seqs, num_tokens)
+                for name in ("q", "k", "v", "g", "beta", "cache_indices"):
+                    static[name].copy_(fresh[name])
+                static["query_start_loc"].copy_(fresh["query_start_loc"])
+                static["ssm_states"].copy_(inputs["ssm_states"])
+                # the graph captured the first batch's gate parameters
+                eager_inputs = _clone(inputs)
+                eager_inputs["A_log"] = static["A_log"]
+                eager_inputs["dt_bias"] = static["dt_bias"]
+                expected = _hip(eager_inputs)
+                graph.replay()
+                torch.cuda.synchronize()
+                total = sum(lengths)
+                torch.testing.assert_close(
+                    static_out[:, :total], expected, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    static["ssm_states"], eager_inputs["ssm_states"], rtol=0, atol=0
                 )
 
 

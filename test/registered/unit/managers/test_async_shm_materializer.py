@@ -256,7 +256,7 @@ class AsyncShmMaterializerTest(CustomTestCase):
             server_args=None,
             model_config=None,
             max_recv_per_poll=-1,
-            stream_output=Mock(),
+            request_retirer=Mock(),
             get_last_batch=lambda: None,
             rust_server_mode=False,
             async_shm_materializer=coordinator,

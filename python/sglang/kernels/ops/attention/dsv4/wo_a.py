@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Sequence
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -25,7 +25,6 @@ def _jit_module(max_tokens: int, groups: int) -> Module:
         cuda_files=["deepseek_v4/wo_a_fused.cuh"],
         cuda_wrappers=[("run", f"wo_a_fused_run<{max_tokens}, {groups}>")],
         extra_cuda_cflags=["-O3"],
-        extra_ldflags=[f"-L{cuda_stubs_dir()}", "-lcuda"],
     )
 
 

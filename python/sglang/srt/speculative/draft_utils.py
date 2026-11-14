@@ -3,7 +3,7 @@ from typing import Optional
 
 from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     cpu_has_amx_support,
     is_blackwell,
     is_cpu,
@@ -114,6 +114,7 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
+            "ernie55": self._create_ernie55_decode_backend,
         }
 
         return self._create_backend(
@@ -144,6 +145,7 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
+            "ernie55": self._create_ernie55_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -455,6 +457,22 @@ class DraftBackendFactory:
             DeepseekV4MultiStepBackend(
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             ),
+        )
+
+    def _create_ernie55_decode_backend(self):
+        from sglang.srt.layers.attention.ernie55_backend import (
+            Ernie5_5MultiStepBackend,
+        )
+
+        return "ernie55", Ernie5_5MultiStepBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_ernie55_prefill_backend(self):
+        from sglang.srt.layers.attention.ernie55_backend import Ernie5_5AttnBackend
+
+        return "ernie55", Ernie5_5AttnBackend(
+            self.draft_model_runner, skip_prefill=False
         )
 
     def _create_flashinfer_prefill_backend(self):

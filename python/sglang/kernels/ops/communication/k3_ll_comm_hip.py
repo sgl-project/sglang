@@ -18,10 +18,10 @@ if TYPE_CHECKING:
 WORLD_SIZE: int = 8
 # The largest graphed target verify (64 requests x 6 rows); must match kMaxRows.
 MAX_ROWS: int = 384
-# Per region: 2 epochs x world x rows x lines-per-row x 16 B (8 payload bytes a
-# line). The kernels hardcode the region order and line counts.
-_LINES_PER_ROW = (2 * 7168 // WORLD_SIZE // 8,)  # gather read: an H / 8 bf16 slice
-_SCRATCH_BYTES: int = sum(2 * WORLD_SIZE * MAX_ROWS * n * 16 for n in _LINES_PER_ROW)
+# 2 epochs x world x rows x lines-per-row x 16 B (8 payload bytes a line); the kernel
+# hardcodes the line count of the gather read's H / 8 bf16 slice
+_GATHER_LINES_PER_ROW = 2 * 7168 // WORLD_SIZE // 8
+_SCRATCH_BYTES: int = 2 * WORLD_SIZE * MAX_ROWS * _GATHER_LINES_PER_ROW * 16
 
 
 class LLComm(NamedTuple):

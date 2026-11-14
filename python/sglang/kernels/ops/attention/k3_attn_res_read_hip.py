@@ -24,9 +24,8 @@ if TYPE_CHECKING:
 HIDDEN_SIZE: int = 7168
 SLICE_SIZE: int = HIDDEN_SIZE // WORLD_SIZE
 MAX_NVB: int = 8
-# Must match kTailK / kTailSplits in the kernel.
+# must match kTailK in the kernel
 TAIL_LATENT: int = 3584
-TAIL_SPLITS: int = 7
 
 
 @cache_once

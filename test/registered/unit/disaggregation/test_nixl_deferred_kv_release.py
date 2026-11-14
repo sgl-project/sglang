@@ -38,6 +38,7 @@ def _manager(
 ) -> NixlKVManager:
     manager = NixlKVManager.__new__(NixlKVManager)
     manager.customized_info_enabled = False
+    manager.enable_kv_packing = False
     manager.enable_deferred_decode_kv_release = enabled
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()

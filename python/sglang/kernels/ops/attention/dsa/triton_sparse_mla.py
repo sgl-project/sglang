@@ -16,7 +16,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import fp8_ds_mla_row_width
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_core_count, is_gfx95_supported, print_info_once
@@ -87,7 +89,7 @@ def _as_scaled_fp8_kv(
     kv_dim = kv.shape[-1]
     if kv.dtype == torch.bfloat16 or kv_dim == d_v + d_tail:
         return kv, False
-    scaled_dim = d_v + 4 * (d_v // 128) + 2 * d_tail
+    scaled_dim = fp8_ds_mla_row_width(d_v, d_tail)
     if kv_dim != scaled_dim:
         raise ValueError(
             f"Triton sparse MLA expects a {d_v + d_tail}-wide raw or "
@@ -129,13 +131,6 @@ def _load_kv_tail(
     return tl.load(tail_ptr, mask=valid[:, None], other=0.0)
 
 
-@functools.lru_cache(maxsize=None)
-def _async_copy_is_harmful_on_device(device: int) -> bool:
-    properties = torch.cuda.get_device_properties(device)
-    arch = getattr(properties, "gcnArchName", "") or ""
-    return arch.split(":", 1)[0] in _ASYNC_COPY_OFF_ARCHES
-
-
 def _async_copy_is_harmful() -> bool:
     try:
         from triton import knobs
@@ -152,7 +147,8 @@ def _async_copy_is_harmful() -> bool:
     if not torch.cuda.is_available():
         return False
 
-    return _async_copy_is_harmful_on_device(torch.cuda.current_device())
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch in _ASYNC_COPY_OFF_ARCHES
 
 
 @contextlib.contextmanager
@@ -239,7 +235,7 @@ def _sparse_mla_block_k(kv: torch.Tensor) -> int:
     )
 
 
-def _decode_block_k(kv: torch.Tensor, kv_scaled: bool) -> int:
+def _scaled_kv_block_k(kv: torch.Tensor, kv_scaled: bool) -> int:
     # gfx950 with scaled-FP8 (fp8_ds_mla) KV: 64-key tiles spill scratch, 32-key tiles
     # do not (1.4-2.1x faster at 8-384 rows, measured on MI350X, K3.1).
     block_k = _sparse_mla_block_k(kv)
@@ -339,12 +335,12 @@ def _prune_configs(configs, named_args, **kwargs):
     """Drop wasteful configs and retain the established FP8 search space."""
     topk = named_args["topk"]
     max_block_n = _sparse_mla_block_k(named_args["kv_ptr"])
-    # num_warps=1 spills ~4 KB of scratch a lane on gfx950 (16 head rows x 576 fp32),
-    # and launching it in the serving autotune pins that scratch on every queue.
-    if is_gfx95_supported():
-        candidates = [c for c in configs if c.num_warps >= 2]
-    else:
-        candidates = configs
+    candidates = configs
+    if kwargs["KV_SCALED"] and is_gfx95_supported():
+        # num_warps=1 spills ~4 KB of scratch a lane on gfx950 (16 head rows x 576
+        # fp32), and launching it in the serving autotune pins that scratch on
+        # every queue.
+        candidates = [c for c in candidates if c.num_warps >= 2]
     if kwargs["USE_FP8_DOT"]:
         candidates = [
             c
@@ -1174,7 +1170,7 @@ def _triton_sparse_mla_fwd_splitk(
     q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
     BLOCK_H = 16
-    BLOCK_K = _sparse_mla_block_k(kv)
+    BLOCK_K = _scaled_kv_block_k(kv, kv_scaled)
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H
     num_cu = _cu_count(q_nope.device)
@@ -1208,7 +1204,6 @@ def _triton_sparse_mla_fwd_splitk(
         # gate, since narrowing only paid off in this configuration.
         i32_page_safe = _page_offsets_fit_i32(kv.shape[0], kv_dim)
         i32_page_tuned = optimize_gfx950_fp8 and fused_num_warps == 2 and topk >= 2048
-        fused_block_k = _decode_block_k(kv, kv_scaled)
         _sparse_mla_fused_kernel[(seq, n_head_blocks)](
             q_nope,
             q_rope,
@@ -1234,7 +1229,7 @@ def _triton_sparse_mla_fwd_splitk(
             STORE_LSE=return_lse,
             USE_TOPK_LENGTH=use_topk_length,
             BLOCK_H=BLOCK_H,
-            BLOCK_K=fused_block_k,
+            BLOCK_K=BLOCK_K,
             USE_I64_PAGE=not (i32_page_safe and i32_page_tuned),
             PIPE_STAGES=1 if use_topk_length else 3,
             num_warps=fused_num_warps,
@@ -1242,7 +1237,6 @@ def _triton_sparse_mla_fwd_splitk(
         )
         return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
-    BLOCK_K = _decode_block_k(kv, kv_scaled)
     tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
     active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
         tiles_per_split * BLOCK_K
@@ -1312,11 +1306,7 @@ def _triton_sparse_mla_fwd_splitk(
 # ---------------------------------------------------------------------------
 
 
-# Verify-sized batches (target verify at TP8: bs x 6 rows) of [16, 512] rows go to the gfx950
-# HIP kernel's split-K form (MI355X, 12 heads, top-2048, us Triton -> HIP: 24 rows 28.6 -> 20.5,
-# 96 rows 89.5 -> 31.2, 192 rows 239 -> 46.3, 288 rows 103 (single-CTA HIP) -> 70.8); at 6 / 12
-# rows the Triton split-K is faster (12.8 / 17.8 vs 18.4 / 19.5), and above 512 the single-CTA
-# HIP kernel fills the GPU on its own.
+# 16..512 verify rows take the gfx950 HIP split-K (faster on MI355X); fewer stay on Triton split-K
 _HIP_SPLIT_MIN_ROWS = 16
 _HIP_SPLIT_MAX_ROWS = 512
 

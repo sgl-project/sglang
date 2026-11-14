@@ -116,7 +116,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         # A pure-window model keeps no full-attention prefix in LMCache.
         params.tree_slots = tuple(
             slot
-            for slot in storage.tree_slots(window_reaches=params.draft_window_reaches)
+            for slot in storage.tree_slots()
             if not (is_pure_swa and slot.family == TREE_TOKEN)
         )
         return LMCacheUnifiedRadixCache(
@@ -192,7 +192,7 @@ def create_unified_radix_cache(
         allocator,
         shape=_static_tree_shape(ctx, allocator),
     )
-    tree_slots = list(storage.tree_slots(window_reaches=params.draft_window_reaches))
+    tree_slots = list(storage.tree_slots())
     if ctx.is_hybrid_ssm and get_exec().mamba.decode_state_free_radix:
         # A PD decode tree keeps FULL KV only: prefill sends every request's
         # final state, so no tree-held state is ever read.

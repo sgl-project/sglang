@@ -40,10 +40,8 @@ from sglang.srt.speculative.uno_utils import (
     sample_uno_candidates,
     sample_uno_clean_root,
 )
-from sglang.srt.utils.common import (
-    get_available_gpu_memory,
-    log_info_on_rank0,
-)
+from sglang.srt.utils.device import get_available_gpu_memory
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch

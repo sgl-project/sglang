@@ -1,8 +1,9 @@
 """DSA DCP resolves unset backends to the platform's DCP path."""
 
+import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups.model_overrides.deepseek_v2 import _dsa_dcp_overrides
 from sglang.srt.arg_groups.overrides import _check_dsa_backend_constraints
@@ -36,24 +37,36 @@ def _backends(overrides):
 
 class TestDsaDcpBackendDefaults(CustomTestCase):
     def test_hip_defaults_to_triton(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True)):
+        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True, is_npu=False)):
             self.assertEqual(
                 _backends(_dsa_dcp_overrides(_cfg())), ("triton", "triton")
             )
 
     def test_cuda_defaults_to_trtllm(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=False)):
+        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=False, is_npu=False)):
             self.assertEqual(
                 _backends(_dsa_dcp_overrides(_cfg())), ("trtllm", "trtllm")
             )
 
     def test_explicit_backend_is_kept(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True)):
+        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True, is_npu=False)):
             overrides = _dsa_dcp_overrides(_cfg(dsa_decode_backend="triton"))
         self.assertEqual(_backends(overrides), ("triton", None))
 
     def test_no_dcp_sets_nothing(self):
         self.assertEqual(_dsa_dcp_overrides(_cfg(dcp_size=1)), {})
+
+    def test_npu_pd_dcp_uses_native_backend(self):
+        platform = SimpleNamespace(is_hip=False, is_npu=True)
+        with patch(_PLATFORM, return_value=platform):
+            overrides = _dsa_dcp_overrides(
+                _cfg(
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend="ascend",
+                )
+            )
+        self.assertNotIn("dsa_prefill_backend", overrides)
+        self.assertNotIn("dsa_decode_backend", overrides)
 
 
 class TestDsaDcpBackendConstraints(CustomTestCase):
@@ -79,6 +92,29 @@ class TestDsaDcpBackendConstraints(CustomTestCase):
         _check_dsa_backend_constraints(
             "fp8_e4m3", "tilelang", "tilelang", hip=True, dcp_size=1
         )
+
+
+class TestDcpPushCombineOnHip(CustomTestCase):
+    def test_hip_keeps_the_a2a_reduce(self):
+        """ROCm never builds the push plane: its VMM IPC exchange hung MI355X DCP8 startup."""
+        from sglang.srt.layers.dcp import comm
+
+        carv2 = SimpleNamespace(
+            CustomAllReduceV2=Mock(side_effect=AssertionError("push plane built"))
+        )
+        group = SimpleNamespace(world_size=8, cpu_group=None)
+        with (
+            patch.object(comm, "_is_hip", True),
+            patch("torch.cuda.current_device", return_value=0),
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.distributed.device_communicators.custom_all_reduce_v2": carv2
+                },
+            ),
+        ):
+            comm.init_dcp_push_combine(group, num_heads=96)
+        self.assertIsNone(comm._PUSH_COMBINE_COMM)
 
 
 if __name__ == "__main__":

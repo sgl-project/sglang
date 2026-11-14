@@ -149,9 +149,6 @@ def k3_latent_tail_partials(
     latent: torch.Tensor,
     norm_weight: torch.Tensor,
     up_weight: torch.Tensor,
-    *,
-    # measured on MI350X (N = 896, HBM weights) against 16
-    block_n: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The tail GEMM of up_weight's [N, L] rows, split over L: per chunk k,
     part[k] = bf16(latent * norm_weight)[:, chunk] @ up_weight[:, chunk].T
@@ -164,6 +161,7 @@ def k3_latent_tail_partials(
         (PARTIAL_SPLITS, M, N), dtype=torch.float32, device=latent.device
     )
     sq = torch.empty((PARTIAL_SPLITS, M), dtype=torch.float32, device=latent.device)
+    block_n = 32  # beats 16 on MI350X (N = 896, HBM weights)
     _latent_tail_partial_kernel[(triton.cdiv(N, block_n), PARTIAL_SPLITS)](
         latent,
         norm_weight,
@@ -210,17 +208,13 @@ def k3_latent_tail(
     up_weight: torch.Tensor,
     shared: torch.Tensor,
     prefix: Optional[torch.Tensor],
-    *,
-    out: Optional[torch.Tensor] = None,
-    block_n: int = 32,
-    block_k: int = 512,
 ) -> torch.Tensor:
     """[prefix +] shared + rmsnorm(latent) @ up_weight.T for M <= MAX_TOKENS rows."""
     M, L = latent.shape
     H = up_weight.shape[0]
-    if out is None:
-        out = torch.empty((M, H), dtype=shared.dtype, device=latent.device)
-    # Measured on MI350X at the TP8 K3 shape (L=3584, H=7168), weights from HBM.
+    out = torch.empty((M, H), dtype=shared.dtype, device=latent.device)
+    # tuned on MI350X at the TP8 K3 shape (L=3584, H=7168), weights from HBM
+    block_n, block_k = 32, 512
     num_warps, waves_per_eu = (2, 2) if M == 1 else (4, 0)
     _latent_tail_kernel[(triton.cdiv(H, block_n),)](
         latent,

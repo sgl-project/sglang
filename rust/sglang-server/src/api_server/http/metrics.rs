@@ -90,6 +90,8 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: Default::default(),
                     metrics: frontend,
+                    request_log: None,
+                    generate_validator: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(

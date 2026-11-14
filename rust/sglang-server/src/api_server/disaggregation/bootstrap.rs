@@ -3,7 +3,7 @@
 //! topology, the PD router tracks per-room dp ranks; the wire format is Python-owned parity.
 //! Mounted on the prefill api listener (bootstrap port = api port) before `init_disaggregation`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,15 @@ struct PrefillServerInfo {
     kv_layout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dsv41_spec_layout: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec_kv_layout: Option<serde_json::Value>,
+    /// The PD state entries every pipeline stage registers alike; omitted
+    /// when there are none, as a server that predates them answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_wire: Option<serde_json::Value>,
+    /// Each stage's state entries, by stage, when the stages differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_wires: Option<Vec<Option<serde_json::Value>>>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
     stores_to_linker: bool,
@@ -113,6 +122,10 @@ struct Topology {
     kv_cache_dtype: Option<String>,
     kv_layout: Option<String>,
     dsv41_spec_layout: Option<serde_json::Value>,
+    spec_kv_layout: Option<serde_json::Value>,
+    /// Each pipeline stage's PD state entries (`state_wire`), as its ranks
+    /// registered them; every rank of a stage registers the same ones.
+    state_wire_by_stage: BTreeMap<i64, Option<serde_json::Value>>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
     stores_to_linker: Option<bool>,
@@ -138,6 +151,49 @@ impl Topology {
     fn is_ready(&self) -> bool {
         self.expected()
             .is_some_and(|expected| self.registered_count >= expected)
+    }
+
+    /// The state entries every pipeline stage registers alike, if so (Python
+    /// `_state_wire`).
+    fn state_wire(&self) -> Option<serde_json::Value> {
+        let mut wires = self.state_wire_by_stage.values();
+        let first = wires.next()?;
+        if wires.all(|wire| wire == first) {
+            first.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Each stage's state entries, by stage, when the stages differ; None when
+    /// no stage registers any (Python `_state_wires`).
+    fn state_wires(&self) -> Option<Vec<Option<serde_json::Value>>> {
+        let any = self
+            .state_wire_by_stage
+            .values()
+            .any(|wire| wire.as_ref().is_some_and(truthy));
+        if !any || self.state_wire().is_some() {
+            return None;
+        }
+        let last = *self.state_wire_by_stage.keys().next_back()?;
+        Some(
+            (0..=last)
+                .map(|stage| self.state_wire_by_stage.get(&stage).cloned().flatten())
+                .collect(),
+        )
+    }
+}
+
+/// Python truthiness of a JSON value: null, false, zero and empty strings,
+/// lists and objects are false.
+fn truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64() != Some(0.0),
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
     }
 }
 
@@ -165,6 +221,8 @@ struct Route {
     kv_layout: Option<String>,
     #[serde(default)]
     dsv41_spec_layout: Option<serde_json::Value>,
+    #[serde(default)]
+    spec_kv_layout: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "parse_int_opt")]
     prefill_http_port: Option<i64>,
     #[serde(default)]
@@ -173,6 +231,10 @@ struct Route {
     enable_dsa_cache_layer_split: Option<bool>,
     #[serde(default)]
     stores_to_linker: Option<bool>,
+    /// The rank's PD state entries (Python `state_wire(kv_args)`); absent from
+    /// a rank that registers none.
+    #[serde(default)]
+    state_wire: Option<serde_json::Value>,
 }
 
 async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
@@ -191,14 +253,28 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
     // Copy-on-write update. `rcu` may re-run the closure under write
     // contention, so it only reads `body` and clones what it stores.
     let mut layout_mismatch = false;
+    let mut spec_mismatch = false;
+    let mut state_wire_mismatch = false;
     state.topology.rcu(|current| {
         let mut topo = (**current).clone();
         layout_mismatch =
             topo.registered_count > 0 && topo.dsv41_spec_layout != body.dsv41_spec_layout;
-        if layout_mismatch {
+        spec_mismatch = topo.spec_kv_layout.is_some()
+            && body.spec_kv_layout.is_some()
+            && topo.spec_kv_layout != body.spec_kv_layout;
+        state_wire_mismatch = topo
+            .state_wire_by_stage
+            .get(&body.pp_rank)
+            .is_some_and(|wire| *wire != body.state_wire);
+        if layout_mismatch || spec_mismatch || state_wire_mismatch {
             return topo;
         }
         topo.dsv41_spec_layout = body.dsv41_spec_layout.clone();
+        if topo.spec_kv_layout.is_none() {
+            topo.spec_kv_layout = body.spec_kv_layout.clone();
+        }
+        topo.state_wire_by_stage
+            .insert(body.pp_rank, body.state_wire.clone());
         topo.attn_tp_size.get_or_insert(body.attn_tp_size);
         topo.attn_cp_size.get_or_insert(body.attn_cp_size);
         topo.dp_size.get_or_insert(dp_size);
@@ -238,6 +314,18 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         return json_error(
             StatusCode::BAD_REQUEST,
             "DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
+        );
+    }
+    if spec_mismatch {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Speculative KV layout differs across prefill ranks",
+        );
+    }
+    if state_wire_mismatch {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "PD state entries differ across the ranks of one pipeline stage",
         );
     }
 
@@ -297,6 +385,11 @@ async fn route_get(
             kv_cache_dtype: topo.kv_cache_dtype.clone(),
             kv_layout: topo.kv_layout.clone(),
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
+            spec_kv_layout: topo.spec_kv_layout.clone(),
+            // No state entries are stated as none, as a server that predates
+            // them answers, so an older decode reads a dense prefill's answer.
+            state_wire: topo.state_wire().filter(truthy),
+            state_wires: topo.state_wires().filter(|wires| !wires.is_empty()),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             stores_to_linker: topo.stores_to_linker.unwrap_or(false),
@@ -487,6 +580,8 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         (
             crate::runtime::start(cfg, None).expect("start runtime"),
@@ -583,6 +678,128 @@ mod tests {
         let (_, body) = request(addr, "GET", SENTINEL, None);
         let info: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(info["dsv41_spec_layout"], layout);
+    }
+
+    #[test]
+    fn spec_kv_layout_rank_compatibility() {
+        let (_rt, addr) = start_on_free_port();
+        let layout = serde_json::json!({
+            "algorithm": "DSPARK", "num_draft_entries": 6, "dspark_block_size": 4
+        });
+        let body = put_route(serde_json::json!({"pp_size": 2, "spec_kv_layout": layout}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+
+        let incompatible = put_route(serde_json::json!({
+            "pp_size": 2, "pp_rank": 1,
+            "spec_kv_layout": {"algorithm": "DSPARK", "num_draft_entries": 7},
+        }));
+        assert_eq!(request(addr, "PUT", "/route", Some(&incompatible)).0, 400);
+        assert_eq!(request(addr, "GET", SENTINEL, None).0, 503);
+
+        let draftless = put_route(serde_json::json!({"pp_size": 2, "pp_rank": 1}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&draftless)).0, 200);
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["spec_kv_layout"], layout);
+    }
+
+    /// A window entry as Python's `state_wire(kv_args)` states it: (state
+    /// type, sub-pool, window tail).
+    fn wire(sub_pool: &str, tail: i64) -> serde_json::Value {
+        serde_json::json!([["swa", sub_pool, tail]])
+    }
+
+    fn sentinel_info(addr: SocketAddr) -> serde_json::Value {
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// The prefill's state entries reach the decode through the topology
+    /// sentinel as Python's server answers them: `state_wire` when every stage
+    /// registers the same entries, `state_wires` by stage when they differ,
+    /// neither when no stage registers any.
+    #[test]
+    fn state_wire_round_trips_through_the_sentinel() {
+        let (_rt, addr) = start_on_free_port();
+        let body = put_route(serde_json::json!({"state_wire": wire("window_4096", 4096)}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        let info = sentinel_info(addr);
+        assert_eq!(info["state_wire"], wire("window_4096", 4096));
+        assert!(info.get("state_wires").is_none(), "{info}");
+
+        let (_rt, addr) = start_on_free_port();
+        for (pp_rank, state_wire) in [(0, wire("window_4096", 4096)), (1, wire("window_512", 512))]
+        {
+            let body = put_route(serde_json::json!({
+                "pp_size": 2, "pp_rank": pp_rank, "state_wire": state_wire,
+            }));
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        }
+        let info = sentinel_info(addr);
+        assert!(info.get("state_wire").is_none(), "{info}");
+        assert_eq!(
+            info["state_wires"],
+            serde_json::json!([wire("window_4096", 4096), wire("window_512", 512)])
+        );
+
+        // A stage registering no entries is null in its slot.
+        let (_rt, addr) = start_on_free_port();
+        let stage0 = put_route(serde_json::json!({"pp_size": 2, "pp_rank": 0}));
+        let stage1 = put_route(serde_json::json!({
+            "pp_size": 2, "pp_rank": 1, "state_wire": wire("window_512", 512),
+        }));
+        for body in [stage0, stage1] {
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        }
+        let info = sentinel_info(addr);
+        assert!(info.get("state_wire").is_none(), "{info}");
+        assert_eq!(
+            info["state_wires"],
+            serde_json::json!([null, wire("window_512", 512)])
+        );
+
+        // A dense prefill registers no state entries (or an empty list): the
+        // sentinel states neither field, so a decode reads it as a peer that
+        // predates them.
+        for registered in [None, Some(serde_json::json!([]))] {
+            let (_rt, addr) = start_on_free_port();
+            let body = match &registered {
+                None => put_route(serde_json::json!({})),
+                Some(wire) => put_route(serde_json::json!({"state_wire": wire})),
+            };
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+            let info = sentinel_info(addr);
+            assert!(info.get("state_wire").is_none(), "{info}");
+            assert!(info.get("state_wires").is_none(), "{info}");
+        }
+    }
+
+    /// Every rank of one pipeline stage must register the same state entries:
+    /// a rank that disagrees is refused and not counted, as in Python.
+    #[test]
+    fn conflicting_state_wire_in_one_stage_is_refused() {
+        let (_rt, addr) = start_on_free_port();
+        let rank0 = put_route(serde_json::json!({
+            "attn_tp_size": 2, "attn_tp_rank": 0, "state_wire": wire("window_4096", 4096),
+        }));
+        assert_eq!(request(addr, "PUT", "/route", Some(&rank0)).0, 200);
+        for other in [wire("window_512", 512), serde_json::Value::Null] {
+            let rank1 = put_route(serde_json::json!({
+                "attn_tp_size": 2, "attn_tp_rank": 1, "state_wire": other,
+            }));
+            let (status, body) = request(addr, "PUT", "/route", Some(&rank1));
+            assert_eq!(status, 400, "{body}");
+            assert!(body.contains("PD state entries differ"), "{body}");
+        }
+        // The refused rank is not registered.
+        assert_eq!(request(addr, "GET", SENTINEL, None).0, 503);
+        let rank1 = put_route(serde_json::json!({
+            "attn_tp_size": 2, "attn_tp_rank": 1, "state_wire": wire("window_4096", 4096),
+        }));
+        assert_eq!(request(addr, "PUT", "/route", Some(&rank1)).0, 200);
+        assert_eq!(sentinel_info(addr)["state_wire"], wire("window_4096", 4096));
     }
 
     /// System-dp topology derivation: with `system_dp_size > 1` the dp axis

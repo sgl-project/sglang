@@ -393,7 +393,7 @@ def install_monokernel_forward(
         )
     )
     if not any(is_registered for _, is_registered, _, _ in lookups):
-        # A draft model may have no registered spec, or another target's.
+        # A draft model may have no registered spec.
         logger.info("monokernel: %s: the normal forward", why)
         return
     reasons = [

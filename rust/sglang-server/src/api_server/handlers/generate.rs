@@ -16,10 +16,17 @@ use crate::utils::error::Error;
 use super::handle::{
     CoreHandle, ExpectedResponse, LastOutput, RuntimeCall, translate_runtime_error,
 };
-use crate::api_server::core::{CoreError, CoreEvent, InFlight, RequestMetrics, prefetch};
+use crate::api_server::core::{
+    BodySnapshot, CoreError, CoreEvent, InFlight, LoggedHeaders, OpenAiRequest, RawBody,
+    ReceivedAs, RequestMetrics, RequestRecord, prefetch,
+};
 
 impl CoreHandle {
-    pub(crate) async fn generate(&self, request: GenerateRequest) -> Result<CoreCall, CoreError> {
+    pub(crate) async fn generate(
+        &self,
+        request: GenerateRequest,
+        received: ReceivedAs,
+    ) -> Result<CoreCall, CoreError> {
         // Counted from admission, media prefetch included: the drain waits
         // for it.
         let in_flight = self.inner.drain.track();
@@ -27,8 +34,59 @@ impl CoreHandle {
             .inner
             .generations
             .register(request.rid.clone(), self.inner.abort_tx.clone());
-        self.generate_registered(request, generation, in_flight)
+        self.generate_registered(request, received, generation, in_flight)
             .await
+    }
+
+    /// A native `/generate` body as the request log and the crash dump see
+    /// it, captured before the adapter merges launch-time defaults into it;
+    /// `None` when neither is on.
+    /// `raw` is the body as received, for a body that came over HTTP.
+    pub(crate) fn snapshot_body(
+        &self,
+        body: &serde_json::Value,
+        raw: Option<RawBody>,
+        headers: &http::HeaderMap,
+    ) -> Option<BodySnapshot> {
+        self.inner
+            .request_log
+            .as_ref()?
+            .snapshot_body(body, raw, headers)
+    }
+
+    /// The whitelisted headers a built request's log lines carry.
+    pub(crate) fn logged_headers(&self, headers: &http::HeaderMap) -> LoggedHeaders {
+        match &self.inner.request_log {
+            Some(log) => log.logged_headers(headers),
+            None => LoggedHeaders::default(),
+        }
+    }
+
+    /// Whether OpenAI requests get their own request-log line.
+    pub(crate) fn logs_openai_requests(&self) -> bool {
+        self.inner
+            .request_log
+            .as_ref()
+            .is_some_and(|log| log.logs_openai_requests())
+    }
+
+    /// Log an OpenAI request's raw `body` as received (from level 2).
+    pub(crate) fn log_openai_request(
+        &self,
+        request: OpenAiRequest,
+        body: &[u8],
+        headers: &http::HeaderMap,
+    ) {
+        if let Some(log) = &self.inner.request_log {
+            log.openai_received(request, body, headers);
+        }
+    }
+
+    /// The crash dump's requests (see
+    /// [`RequestLog::crash_dump_snapshot`](crate::api_server::core::RequestLog::crash_dump_snapshot));
+    /// `None` without `--crash-dump-folder`.
+    pub(crate) fn crash_dump_snapshot(&self) -> Option<Vec<u8>> {
+        self.inner.request_log.as_ref()?.crash_dump_snapshot()
     }
 
     /// Register a generation under the public ID `rid` before its request
@@ -51,24 +109,30 @@ impl CoreHandle {
     pub(crate) async fn generate_pending(
         &self,
         request: GenerateRequest,
+        received: ReceivedAs,
         pending: PendingGeneration,
     ) -> Result<CoreCall, CoreError> {
         debug_assert!(
             pending.generation.rid == request.rid,
             "the request claims its hold"
         );
-        self.generate_registered(request, pending.generation, pending.in_flight)
+        self.generate_registered(request, received, pending.generation, pending.in_flight)
             .await
     }
 
     async fn generate_registered(
         &self,
         mut request: GenerateRequest,
+        received: ReceivedAs,
         mut generation: Generation,
         in_flight: InFlight,
     ) -> Result<CoreCall, CoreError> {
         let created_at = Instant::now();
         self.set_default_priority(&mut request);
+        let record = self
+            .receive(std::slice::from_ref(&request), received, false, true)
+            .pop();
+        self.validate(std::slice::from_ref(&request))?;
         tokio::select! {
             biased;
             cancellation = generation.cancelled() => {
@@ -83,7 +147,7 @@ impl CoreHandle {
         let metrics = self.request_metrics(&request, created_at);
         self.submit_generation(request, generation)
             .await
-            .map(|runtime| self.generation_call(runtime, metrics, Some(in_flight)))
+            .map(|runtime| self.generation_call(runtime, metrics, record, Some(in_flight)))
     }
 
     /// Submit core-owned work without exposing it through the public Abort
@@ -93,10 +157,14 @@ impl CoreHandle {
     pub(super) async fn generate_internal(
         &self,
         mut request: GenerateRequest,
+        received: ReceivedAs,
         log_metrics: bool,
     ) -> Result<CoreCall, CoreError> {
         let created_at = Instant::now();
         self.set_default_priority(&mut request);
+        let record = self
+            .receive(std::slice::from_ref(&request), received, false, log_metrics)
+            .pop();
         // Counted from admission, media prefetch included: the drain waits
         // for it. The health probe is not a client request; the drain never
         // waits for it.
@@ -108,7 +176,22 @@ impl CoreHandle {
             .flatten();
         self.submit(RequestKind::Generate(Box::new(request)))
             .await
-            .map(|runtime| self.generation_call(runtime, metrics, in_flight))
+            .map(|runtime| self.generation_call(runtime, metrics, record, in_flight))
+    }
+
+    /// Python logs a request once it is normalized, before tokenization or
+    /// media preprocessing; one record per request follows it to the end.
+    fn receive(
+        &self,
+        requests: &[GenerateRequest],
+        received: ReceivedAs,
+        batch: bool,
+        log_metrics: bool,
+    ) -> Vec<RequestRecord> {
+        match &self.inner.request_log {
+            Some(log) => log.receive(requests, received, batch, log_metrics),
+            None => Vec::new(),
+        }
     }
 
     /// Prepare the group before submitting any surviving request. Explicit
@@ -118,6 +201,7 @@ impl CoreHandle {
     pub(crate) async fn generate_batch(
         &self,
         mut requests: Vec<GenerateRequest>,
+        received: ReceivedAs,
     ) -> Result<Vec<CoreCall>, CoreError> {
         let created_at = Instant::now();
         if requests.is_empty() {
@@ -126,6 +210,17 @@ impl CoreHandle {
         for request in &mut requests {
             self.set_default_priority(request);
         }
+        // A body is a batch here even with one item (a list); the core's own
+        // requests are one only when they are several.
+        let batch = matches!(received, ReceivedAs::Body(_)) || requests.len() > 1;
+        let mut records = self
+            .receive(&requests, received, batch, true)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        records.resize_with(requests.len(), || None);
+        // One refused item refuses the batch before any item is prepared.
+        self.validate(&requests)?;
         // Counted from admission, media prefetch included (see `generate`).
         let in_flight: Vec<InFlight> = requests.iter().map(|_| self.inner.drain.track()).collect();
         let mut generations: Vec<_> = requests
@@ -151,13 +246,16 @@ impl CoreHandle {
         .await?;
 
         let mut calls = Vec::with_capacity(requests.len());
-        for ((request, generation), in_flight) in
-            requests.into_iter().zip(generations).zip(in_flight)
+        for (((request, generation), in_flight), record) in requests
+            .into_iter()
+            .zip(generations)
+            .zip(in_flight)
+            .zip(records)
         {
             let rid = request.rid.clone();
             let metrics = self.request_metrics(&request, created_at);
             let call = match self.submit_generation(request, generation).await {
-                Ok(call) => self.generation_call(call, metrics, Some(in_flight)),
+                Ok(call) => self.generation_call(call, metrics, record, Some(in_flight)),
                 // Cancellation may happen during preparation or while waiting
                 // for intake. Keep this slot without rolling back siblings.
                 Err(CoreError::Cancelled(_)) => {
@@ -193,12 +291,15 @@ impl CoreHandle {
         &self,
         runtime: RuntimeCall,
         metrics: Option<RequestMetrics>,
+        record: Option<RequestRecord>,
         in_flight: Option<InFlight>,
     ) -> CoreCall {
         CoreCall::new(
             runtime,
             self.inner.metadata.weight_version.clone(),
+            Some(self.inner.dp_rank),
             metrics,
+            record,
             in_flight,
         )
     }
@@ -219,6 +320,53 @@ impl CoreHandle {
     ) -> Option<RequestMetrics> {
         let metrics = self.inner.metrics.as_ref()?;
         Some(metrics.start_request(request, created_at))
+    }
+
+    /// Each of a client's requests, before any media prefetch: the DP rank it
+    /// names ([`Self::check_routed_dp_rank`]), then the launch's
+    /// [`crate::GenerateValidator`]; the first refusal is the error.
+    fn validate(&self, requests: &[GenerateRequest]) -> Result<(), CoreError> {
+        requests
+            .iter()
+            .try_for_each(|request| self.check_routed_dp_rank(request.routed_dp_rank))?;
+        let Some(validator) = &self.inner.generate_validator else {
+            return Ok(());
+        };
+        requests
+            .iter()
+            .try_for_each(|request| validator.validate(request))
+            .map_err(CoreError::InvalidArgument)
+    }
+
+    /// Python `TokenizerManager.generate_request`'s `routed_dp_rank` check:
+    /// rank 0 of a single-rank deployment is ignored, a rank outside the
+    /// deployment's `[0, dp_size)` is refused. Then this listener's own: it
+    /// feeds only its own DP rank's scheduler, so it refuses a request naming
+    /// another. The HTTP generation routes hand such a request to that rank's
+    /// listener before it gets here (`http::dp_relay`); one that still
+    /// arrives (over gRPC, or with no listener known for the rank) fails
+    /// rather than run on the wrong rank.
+    fn check_routed_dp_rank(&self, rank: Option<i64>) -> Result<(), CoreError> {
+        let Some(rank) = rank else {
+            return Ok(());
+        };
+        let dp_size = i64::from(self.inner.metadata.deployment_info.dp_size.max(1));
+        if dp_size == 1 && rank == 0 {
+            return Ok(());
+        }
+        if !(0..dp_size).contains(&rank) {
+            return Err(CoreError::InvalidArgument(format!(
+                "routed_dp_rank={rank} out of range [0, {dp_size})"
+            )));
+        }
+        let own = self.inner.dp_rank;
+        if rank != i64::from(own) {
+            return Err(CoreError::InvalidArgument(format!(
+                "routed_dp_rank={rank} names DP rank {rank}, which this listener (DP rank \
+                 {own}) does not serve; send the request to DP rank {rank}'s listener"
+            )));
+        }
+        Ok(())
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
@@ -245,11 +393,14 @@ impl CoreHandle {
 pub(crate) struct CoreCall {
     runtime: RuntimeCall,
     events_finished: bool,
-    /// The launch weight version, stamped on every output (see
-    /// [`CoreOutput::weight_version`](crate::api_server::core::CoreOutput)).
+    /// The launch weight version and this listener's DP rank, stamped on
+    /// every output (see [`CoreOutput`](crate::api_server::core::CoreOutput)).
     weight_version: Option<Arc<str>>,
+    dp_rank: Option<u32>,
     /// Observes every runtime item as the call receives it.
     metrics: Option<RequestMetrics>,
+    /// Logs the request's `Finish` and keeps its crash-dump entry.
+    record: Option<RequestRecord>,
     /// Holds the drain open while this client request is alive.
     _in_flight: Option<InFlight>,
 }
@@ -258,14 +409,21 @@ impl CoreCall {
     fn new(
         runtime: RuntimeCall,
         weight_version: Option<Arc<str>>,
+        dp_rank: Option<u32>,
         metrics: Option<RequestMetrics>,
+        mut record: Option<RequestRecord>,
         in_flight: Option<InFlight>,
     ) -> Self {
+        if let Some(record) = &mut record {
+            record.admit();
+        }
         Self {
             runtime,
             events_finished: false,
             weight_version,
+            dp_rank,
             metrics,
+            record,
             _in_flight: in_flight,
         }
     }
@@ -273,6 +431,9 @@ impl CoreCall {
     fn observe(&mut self, item: Option<&ResponseItem>) {
         if let Some(metrics) = &mut self.metrics {
             metrics.observe(item);
+        }
+        if let (Some(record), Some(item)) = (&mut self.record, item) {
+            record.observe(item);
         }
     }
 
@@ -294,6 +455,8 @@ impl CoreCall {
                 last_output: LastOutput::default(),
                 abort_deadline: None,
             },
+            None,
+            None,
             None,
             None,
             None,
@@ -370,13 +533,22 @@ impl CoreCall {
             None,
             None,
             None,
+            None,
+            None,
         )
     }
 
     fn generation_event(&self, item: ResponseItem) -> CoreEvent {
         let mut event = generation_event(item);
-        if let CoreEvent::Delta(output) | CoreEvent::Finished(output) = &mut event {
+        let output = match &mut event {
+            CoreEvent::Delta(output) | CoreEvent::Finished(output) => Some(output),
+            // A status abort's output ends a native stream as a normal frame.
+            CoreEvent::Failed(CoreError::RuntimeRejected { output, .. }) => Some(&mut **output),
+            CoreEvent::Failed(_) => None,
+        };
+        if let Some(output) = output {
             output.weight_version = self.weight_version.clone();
+            output.dp_rank = self.dp_rank;
         }
         event
     }
@@ -758,10 +930,13 @@ mod tests {
         let harness = Harness::unbounded(8);
         let mut call = harness
             .handle
-            .generate(GenerateRequest {
-                rid: Rid::from_client("public-id"),
-                ..Default::default()
-            })
+            .generate(
+                GenerateRequest {
+                    rid: Rid::from_client("public-id"),
+                    ..Default::default()
+                },
+                ReceivedAs::without_headers(),
+            )
             .await
             .unwrap();
         assert_eq!(call.public_id(), "public-id");
@@ -826,9 +1001,14 @@ mod tests {
                     ..Default::default()
                 },
                 metrics: Some(metrics.clone()),
+                request_log: None,
+                generate_validator: None,
             },
         );
-        let mut call = handle.generate(GenerateRequest::default()).await.unwrap();
+        let mut call = handle
+            .generate(GenerateRequest::default(), ReceivedAs::without_headers())
+            .await
+            .unwrap();
         let request = accept_intake(intake_rx.recv().unwrap());
         let RequestKind::Generate(generate) = &request.kind else {
             unreachable!()
@@ -866,10 +1046,13 @@ mod tests {
         let harness = Harness::unbounded(8);
         let mut call = harness
             .handle
-            .generate(GenerateRequest {
-                rid: "plain-abort".into(),
-                ..Default::default()
-            })
+            .generate(
+                GenerateRequest {
+                    rid: "plain-abort".into(),
+                    ..Default::default()
+                },
+                ReceivedAs::without_headers(),
+            )
             .await
             .unwrap();
         let request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -916,10 +1099,13 @@ mod tests {
             let harness = Harness::unbounded(8);
             let mut call = harness
                 .handle
-                .generate(GenerateRequest {
-                    rid: Rid::from_client(client_rid),
-                    ..Default::default()
-                })
+                .generate(
+                    GenerateRequest {
+                        rid: Rid::from_client(client_rid),
+                        ..Default::default()
+                    },
+                    ReceivedAs::without_headers(),
+                )
                 .await
                 .unwrap();
             let internal = call.runtime.rid.as_str().to_owned();
@@ -970,16 +1156,19 @@ mod tests {
 
         let submitter = tokio::spawn(async move {
             handle
-                .generate_batch(vec![
-                    GenerateRequest {
-                        rid: "accepted".into(),
-                        ..Default::default()
-                    },
-                    GenerateRequest {
-                        rid: "rejected".into(),
-                        ..Default::default()
-                    },
-                ])
+                .generate_batch(
+                    vec![
+                        GenerateRequest {
+                            rid: "accepted".into(),
+                            ..Default::default()
+                        },
+                        GenerateRequest {
+                            rid: "rejected".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ReceivedAs::without_headers(),
+                )
                 .await
         });
 
@@ -1026,12 +1215,54 @@ mod tests {
         };
 
         assert!(matches!(
-            handle.generate(request).await,
+            handle.generate(request, ReceivedAs::without_headers()).await,
             Err(CoreError::InvalidArgument(message))
                 if message == "Image count 2 exceeds limit 1 per request."
         ));
         assert!(intake_rx.try_recv().is_err());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// A call dropped after TM intake accepted it keeps its request for a
+    /// crash dump: `CoreCall::new` admits the record.
+    #[tokio::test]
+    async fn dropped_call_keeps_its_request_for_the_crash_dump() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let handle = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
+                metadata: CoreMetadata::default(),
+                metrics: None,
+                request_log: Some(crate::api_server::core::RequestLog::for_test(None, true)),
+                generate_validator: None,
+            },
+        );
+        let call = handle
+            .generate(
+                GenerateRequest {
+                    rid: Rid::from_client("gone"),
+                    text: Some("hi".into()),
+                    ..Default::default()
+                },
+                ReceivedAs::without_headers(),
+            )
+            .await
+            .unwrap();
+        let _request = accept_intake(intake_rx.recv().unwrap());
+        drop(call);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&handle.crash_dump_snapshot().unwrap()).unwrap();
+        assert_eq!(snapshot["unfinished"], serde_json::json!([]));
+        assert_eq!(snapshot["finished"][0]["rid"], "gone");
     }
 
     fn public_request(rid: &str) -> GenerateRequest {
@@ -1060,7 +1291,11 @@ mod tests {
                     request
                 })
                 .collect();
-            let mut batch = Box::pin(harness.handle.generate_batch(requests));
+            let mut batch = Box::pin(
+                harness
+                    .handle
+                    .generate_batch(requests, ReceivedAs::without_headers()),
+            );
             assert!(futures::poll!(batch.as_mut()).is_pending());
             // Hold the media response open so cancellation happens during
             // preprocessing, not after the request reaches intake.
@@ -1110,9 +1345,10 @@ mod tests {
         let (intake_tx, intake_rx) = flume::bounded(0);
         let (abort_tx, abort_rx) = flume::unbounded();
         let handle = test_handle(intake_tx, abort_tx, 8);
-        let mut batch = Box::pin(
-            handle.generate_batch(["A", "B", "C"].into_iter().map(public_request).collect()),
-        );
+        let mut batch = Box::pin(handle.generate_batch(
+            ["A", "B", "C"].into_iter().map(public_request).collect(),
+            ReceivedAs::without_headers(),
+        ));
         assert!(futures::poll!(batch.as_mut()).is_pending());
         let first = accept_intake(intake_rx.recv_async().await.unwrap());
         assert_eq!(first.rid.client_facing(), "A");
@@ -1158,12 +1394,12 @@ mod tests {
         let harness = Harness::unbounded(8);
         let mut first = harness
             .handle
-            .generate(public_request("same"))
+            .generate(public_request("same"), ReceivedAs::without_headers())
             .await
             .unwrap();
         let mut second = harness
             .handle
-            .generate(public_request("same"))
+            .generate(public_request("same"), ReceivedAs::without_headers())
             .await
             .unwrap();
         let old_a = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1178,7 +1414,7 @@ mod tests {
 
         let new = harness
             .handle
-            .generate(public_request("same"))
+            .generate(public_request("same"), ReceivedAs::without_headers())
             .await
             .unwrap();
         let new_request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1202,7 +1438,7 @@ mod tests {
         let harness = Harness::unbounded(8);
         let mut call = harness
             .handle
-            .generate(public_request("queued"))
+            .generate(public_request("queued"), ReceivedAs::without_headers())
             .await
             .unwrap();
         assert!(harness.handle.abort(Some("queued"), CancelledError));
@@ -1227,7 +1463,8 @@ mod tests {
             let (intake_tx, intake_rx) = flume::bounded(0);
             let (abort_tx, abort_rx) = flume::unbounded();
             let handle = test_handle(intake_tx, abort_tx, 8);
-            let mut submit = Box::pin(handle.generate(public_request("blocked")));
+            let mut submit =
+                Box::pin(handle.generate(public_request("blocked"), ReceivedAs::without_headers()));
             assert!(futures::poll!(submit.as_mut()).is_pending());
             assert!(handle.abort(Some("blocked"), ending));
             match (ending, submit.await) {
@@ -1260,7 +1497,10 @@ mod tests {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::bounded(0);
         let handle = test_handle(intake_tx, abort_tx, 8);
-        let mut call = handle.generate(public_request("raced")).await.unwrap();
+        let mut call = handle
+            .generate(public_request("raced"), ReceivedAs::without_headers())
+            .await
+            .unwrap();
         let TmEvent::Intake { request, admission } = intake_rx.recv().unwrap() else {
             panic!("expected intake");
         };
@@ -1297,7 +1537,11 @@ mod tests {
             let mut request = public_request("held");
             let pending = pending.claim(&mut request);
             let handle = harness.handle.clone();
-            let call = tokio::spawn(async move { handle.generate_pending(request, pending).await });
+            let call = tokio::spawn(async move {
+                handle
+                    .generate_pending(request, ReceivedAs::without_headers(), pending)
+                    .await
+            });
             let submitted = accept_intake(harness.intake_rx.recv_async().await.unwrap());
             assert!(Generations::notify(
                 detached,
@@ -1321,7 +1565,7 @@ mod tests {
         assert_eq!(request.rid.client_facing(), "other");
         let mut call = harness
             .handle
-            .generate_pending(request, pending)
+            .generate_pending(request, ReceivedAs::without_headers(), pending)
             .await
             .unwrap();
         assert!(harness.intake_rx.try_recv().is_err());
@@ -1378,7 +1622,11 @@ mod tests {
             ..Default::default()
         };
         let handle = harness.handle.clone();
-        let call = tokio::spawn(async move { handle.generate(request).await });
+        let call = tokio::spawn(async move {
+            handle
+                .generate(request, ReceivedAs::without_headers())
+                .await
+        });
         tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
             .await
             .unwrap();
@@ -1418,7 +1666,11 @@ mod tests {
         let mut request = public_request("held");
         let held = held.claim(&mut request);
         let handle = harness.handle.clone();
-        let call = tokio::spawn(async move { handle.generate_pending(request, held).await });
+        let call = tokio::spawn(async move {
+            handle
+                .generate_pending(request, ReceivedAs::without_headers(), held)
+                .await
+        });
         let _admitted = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         let call = call.await.unwrap().expect("the held request is admitted");
         assert!(ended().await.is_err());
@@ -1449,9 +1701,12 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: Some(metrics.clone()),
+                request_log: None,
+                generate_validator: None,
             },
         );
-        let mut submit = Box::pin(handle.generate(public_request("blocked")));
+        let mut submit =
+            Box::pin(handle.generate(public_request("blocked"), ReceivedAs::without_headers()));
         assert!(futures::poll!(submit.as_mut()).is_pending());
         assert!(handle.abort(Some("blocked"), AbortFinishReason));
         let mut call = submit.await.unwrap();
@@ -1483,7 +1738,7 @@ mod tests {
             let harness = Harness::unbounded(8);
             let mut call = harness
                 .handle
-                .generate(public_request("held"))
+                .generate(public_request("held"), ReceivedAs::without_headers())
                 .await
                 .unwrap();
             let request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1543,7 +1798,7 @@ mod tests {
         let harness = Harness::unbounded(8);
         let mut call = harness
             .handle
-            .generate(public_request("done"))
+            .generate(public_request("done"), ReceivedAs::without_headers())
             .await
             .unwrap();
         let request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1558,7 +1813,7 @@ mod tests {
 
         let call = harness
             .handle
-            .generate(public_request("dropped"))
+            .generate(public_request("dropped"), ReceivedAs::without_headers())
             .await
             .unwrap();
         let request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1574,8 +1829,16 @@ mod tests {
         let mut decode = Box::pin(harness.handle.detokenize(vec![1], true));
         assert!(futures::poll!(decode.as_mut()).is_pending());
         let decoder = accept_intake(harness.intake_rx.recv().unwrap());
-        let a = harness.handle.generate(public_request("a")).await.unwrap();
-        let b = harness.handle.generate(public_request("b")).await.unwrap();
+        let a = harness
+            .handle
+            .generate(public_request("a"), ReceivedAs::without_headers())
+            .await
+            .unwrap();
+        let b = harness
+            .handle
+            .generate(public_request("b"), ReceivedAs::without_headers())
+            .await
+            .unwrap();
         let req_a = accept_intake(harness.intake_rx.recv().unwrap());
         let req_b = accept_intake(harness.intake_rx.recv().unwrap());
         assert!(harness.handle.abort(None, CancelledError));
@@ -1593,7 +1856,7 @@ mod tests {
         assert!(!harness.handle.abort(None, CancelledError));
         let future = harness
             .handle
-            .generate(public_request("future"))
+            .generate(public_request("future"), ReceivedAs::without_headers())
             .await
             .unwrap();
         let request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1606,7 +1869,7 @@ mod tests {
         let harness = Harness::unbounded(8);
         let mut call = harness
             .handle
-            .generate(public_request("buffered"))
+            .generate(public_request("buffered"), ReceivedAs::without_headers())
             .await
             .unwrap();
         let request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1669,11 +1932,115 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            let error = harness.handle.generate(request).await.err().unwrap();
+            let error = harness
+                .handle
+                .generate(request, ReceivedAs::without_headers())
+                .await
+                .err()
+                .unwrap();
             assert_eq!(error.http_status().as_u16(), status, "{source}");
             assert_eq!(error.to_string(), message);
         }
         assert!(harness.intake_rx.try_recv().is_err());
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// Python's `routed_dp_rank` check, then the listener's own: under DP a
+    /// listener admits its own rank and refuses the others, single requests
+    /// and batches alike; without DP rank 0 is ignored and the rest refused.
+    #[tokio::test]
+    async fn routed_dp_rank_admits_only_the_listener_rank() {
+        let handle = |dp_size, dp_rank| {
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let handle = CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Vec::new(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: CoreMetadata {
+                        deployment_info: crate::message::config::DeploymentInfo {
+                            dp_size,
+                            dp_rank,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                },
+            );
+            (handle, intake_rx)
+        };
+        let request = |rank: Option<i64>| GenerateRequest {
+            routed_dp_rank: rank,
+            ..Default::default()
+        };
+        fn refusal<T>(result: Result<T, CoreError>) -> String {
+            let error = result.err().expect("refused");
+            assert_eq!(error.kind(), CoreErrorKind::InvalidArgument);
+            error.to_string()
+        }
+        for (dp_size, dp_rank, admitted, refused) in [
+            // No DP: Python ignores rank 0.
+            (
+                0,
+                None,
+                vec![None, Some(0)],
+                vec![(1, "out of range [0, 1)")],
+            ),
+            (1, Some(0), vec![Some(0)], vec![(-1, "out of range [0, 1)")]),
+            (
+                2,
+                Some(1),
+                vec![None, Some(1)],
+                vec![
+                    (2, "routed_dp_rank=2 out of range [0, 2)"),
+                    (-1, "out of range [0, 2)"),
+                    (
+                        0,
+                        "names DP rank 0, which this listener (DP rank 1) does not serve",
+                    ),
+                ],
+            ),
+        ] {
+            let (handle, intake_rx) = handle(dp_size, dp_rank);
+            for rank in admitted {
+                let call = handle
+                    .generate(request(rank), ReceivedAs::without_headers())
+                    .await;
+                assert!(call.is_ok(), "dp_size {dp_size}: {rank:?} admitted");
+                accept_intake(intake_rx.recv_async().await.unwrap());
+            }
+            for (rank, message) in refused {
+                let single = handle
+                    .generate(request(Some(rank)), ReceivedAs::without_headers())
+                    .await;
+                assert!(
+                    refusal(single).contains(message),
+                    "dp_size {dp_size}: {rank}"
+                );
+                let batch = handle
+                    .generate_batch(
+                        vec![request(Some(rank)), request(Some(rank))],
+                        ReceivedAs::without_headers(),
+                    )
+                    .await;
+                assert!(
+                    refusal(batch).contains(message),
+                    "dp_size {dp_size}: {rank}"
+                );
+            }
+            assert!(
+                intake_rx.try_recv().is_err(),
+                "nothing refused was submitted"
+            );
+        }
     }
 }

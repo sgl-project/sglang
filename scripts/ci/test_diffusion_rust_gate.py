@@ -64,9 +64,11 @@ class TestDiffusionRustGate(unittest.TestCase):
         caller = jobs["call-multimodal-gen-tests"]
         self.assertNotIn("rust-ext-build", caller["needs"])
         self.assertNotIn("rust_ext_artifact", caller["with"])
-        callee = (ROOT / ".github/workflows/pr-test-multimodal-gen.yml").read_text()
-        self.assertNotIn("download-rust-ext", callee)
-        self.assertNotIn("rust_ext_artifact", callee)
+        for workflow in ("pr-test-multimodal-gen.yml", "_diffusion-pr-test-stage.yml"):
+            with self.subTest(workflow=workflow):
+                callee = (ROOT / ".github/workflows" / workflow).read_text()
+                self.assertNotIn("download-rust-ext", callee)
+                self.assertNotIn("rust_ext_artifact", callee)
 
     def test_installer_preserves_srt_fallback(self):
         source = (ROOT / "scripts/ci/cuda/ci_install_dependency.sh").read_text()

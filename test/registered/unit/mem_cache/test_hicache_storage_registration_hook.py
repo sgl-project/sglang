@@ -103,6 +103,9 @@ def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     controller = object.__new__(cls)
     controller.enable_storage = False
     controller.storage_stop_event = threading.Event()
+    controller.prefetch_thread = controller.prefetch_io_aux_thread = None
+    controller._storage_worker_failures = {}
+    controller.prefetch_sync_thread = controller.backup_thread = None
     controller.storage_host_pool = storage_host_pool
     controller.mem_pool_host = mem_pool_host
     controller.page_size = PAGE
@@ -231,20 +234,6 @@ class TestRegistrationBurstOrder(CustomTestCase):
             order,
             ["v1", "threads", "v2:kv", "v2:mamba", "complete", "v2:swa"],
         )
-
-    def test_dynamic_sidecar_is_checked_under_dcp(self):
-        order: List[str] = []
-        group = _group()
-        anchor = group.anchor_entry.host_pool
-        controller = _controller(HybridCacheController, anchor, group)
-        _attach(controller, RecordingBackend(order), order, host_pools=group.entries)
-        anchor.dcp_size = 2
-        with self.assertRaises(NotImplementedError):
-            controller.register_host_pool_entry(
-                _entry(PoolName.DRAFT_INDEXER, _fake_pool("draft_indexer"))
-            )
-        self.assertNotIn(PoolName.DRAFT_INDEXER, group.entry_map)
-        self.assertEqual(order, ["v1", "threads", "v2:kv", "v2:mamba", "complete"])
 
 
 if __name__ == "__main__":

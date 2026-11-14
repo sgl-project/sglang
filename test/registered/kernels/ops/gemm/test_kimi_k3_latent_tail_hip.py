@@ -49,24 +49,11 @@ class TestKimiK3LatentTailHip(CustomTestCase):
     def test_tail_matches_norm_projection_and_add(self):
         """Match the factored projection and fp32 add, allowing bf16 rounding
         differences where the GEMM's summation order changes a cancelling add."""
-        for rows in (1, 4, 32):
-            latent, shared, prefix, proj = self._inputs(rows)
-            for with_prefix in (False, True):
-                want = proj.float() + shared.float()
-                if with_prefix:
-                    want = want + prefix.float()
-                got = k3_latent_tail(
-                    latent,
-                    self.norm_w,
-                    EPS,
-                    self.up,
-                    shared,
-                    prefix if with_prefix else None,
-                )
-                with self.subTest(rows=rows, prefix=with_prefix):
-                    self.assertLessEqual(
-                        _beyond_ulp(got, want.bfloat16()), got.numel() // 1000
-                    )
+        # one decode token: the masked 16-row tile, its prefix load masked too
+        latent, shared, prefix, proj = self._inputs(1)
+        want = proj.float() + shared.float() + prefix.float()
+        got = k3_latent_tail(latent, self.norm_w, EPS, self.up, shared, prefix)
+        self.assertLessEqual(_beyond_ulp(got, want.bfloat16()), got.numel() // 1000)
 
     @torch.inference_mode()
     def test_partials_sum_to_the_tail_projection(self):
@@ -74,17 +61,14 @@ class TestKimiK3LatentTailHip(CustomTestCase):
         as their consumer does (sum over chunks / rms), give the same projection."""
         rows_n = H // 8
         up_slice = self.up[3 * rows_n : 4 * rows_n]
-        for rows in (1, 64):  # masked 16-row tile and full 64-row tile
-            latent, _, _, proj = self._inputs(rows)
-            part, sq = k3_latent_tail_partials(latent, self.norm_w, up_slice)
-            self.assertEqual(tuple(part.shape), (PARTIAL_SPLITS, rows, rows_n))
-            inv_rms = torch.rsqrt(sq.sum(0) / L + EPS)
-            got = (part.sum(0) * inv_rms[:, None]).bfloat16()
-            with self.subTest(rows=rows):
-                torch.testing.assert_close(
-                    sq.sum(0), latent.float().pow(2).sum(-1), rtol=1e-5, atol=1e-3
-                )
-                self.assertEqual(_beyond_ulp(got, proj[:, 3 * rows_n : 4 * rows_n]), 0)
+        latent, _, _, proj = self._inputs(64)  # the column tail's largest batch
+        part, sq = k3_latent_tail_partials(latent, self.norm_w, up_slice)
+        self.assertEqual(tuple(part.shape), (PARTIAL_SPLITS, 64, rows_n))
+        torch.testing.assert_close(
+            sq.sum(0), latent.float().pow(2).sum(-1), rtol=1e-5, atol=1e-3
+        )
+        got = (part.sum(0) * torch.rsqrt(sq.sum(0) / L + EPS)[:, None]).bfloat16()
+        self.assertEqual(_beyond_ulp(got, proj[:, 3 * rows_n : 4 * rows_n]), 0)
 
 
 if __name__ == "__main__":

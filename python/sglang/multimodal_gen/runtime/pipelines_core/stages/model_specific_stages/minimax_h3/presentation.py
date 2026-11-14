@@ -158,6 +158,47 @@ def minimax_h3_ref2va_presentation(
     )
 
 
+def minimax_h3_image_presentation(
+    tokenizer: Any,
+    *,
+    prompt: str,
+    image_token_counts: Sequence[int],
+    get_rope_index: Any,
+    image_grid_thw: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Build the image-release Qwen input: per reference ``Picture i: `` and
+    its image block, then the prompt.
+
+    Each text segment is right-truncated to 4096 tokens; the ids are
+    right-padded with 0 to a multiple of 8. mRoPE positions come from
+    ``get_rope_index`` over the unpadded ids when images are present (padding
+    rows repeat the last position) and over the padded ids for text-only
+    input. An empty input returns no rows and no positions.
+
+    Returns ``(padded_ids, effective_tags, positions)``.
+    """
+    presentation = _Presentation()
+    for index, count in enumerate(image_token_counts, start=1):
+        presentation.text(_text_ids(tokenizer, f"Picture {index}: ")[:4096])
+        presentation.vision(_vision_block_ids(tokenizer, IMAGE_PAD, count))
+    presentation.text(_text_ids(tokenizer, prompt)[:4096])
+    ids, tags = presentation.build()
+    if not ids.numel():
+        return ids, tags, None
+    padded = torch.cat((ids, ids.new_zeros(-ids.numel() % 8)))
+    rope_ids = ids if image_grid_thw is not None else padded
+    positions, _ = get_rope_index(
+        rope_ids[None],
+        image_grid_thw=image_grid_thw,
+        attention_mask=torch.ones_like(rope_ids[None]),
+    )
+    padding = padded.numel() - rope_ids.numel()
+    positions = torch.cat(
+        (positions, positions[..., -1:].expand(-1, -1, padding)), dim=-1
+    )
+    return padded, tags, positions.to(device="cpu", dtype=torch.int64).contiguous()
+
+
 def _as_int_list(value: int | Sequence[int] | None, *, name: str) -> list[int]:
     if value is None:
         return []
@@ -303,6 +344,7 @@ def minimax_h3_ref2va_video_presentation(
 
 
 __all__ = [
+    "minimax_h3_image_presentation",
     "minimax_h3_multi_image_presentation",
     "minimax_h3_ref2va_presentation",
     "minimax_h3_ref2va_video_presentation",

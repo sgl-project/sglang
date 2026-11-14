@@ -220,9 +220,7 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.activation == "situ":
             from aiter.ops.flydsl.moe_common import GateMode
 
-            # The quant method passes INTERLEAVE in fused_moe_kwargs when it
-            # preshuffled w13 GU-interleaved (A8W4 / A16W4). AITER's mxmoe stage1
-            # honors gate_mode, so forcing SEPARATED there computes garbage.
+            # setdefault: a GU-interleaved w13 passes INTERLEAVE in fused_moe_kwargs
             extra.setdefault("gate_mode", GateMode.SEPARATED.value)
             if self.config.gemm1_alpha is not None:
                 extra["beta"] = float(self.config.gemm1_alpha)

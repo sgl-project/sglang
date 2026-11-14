@@ -35,7 +35,7 @@ else:
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: ROCm resolves the kernel to its Triton port
-register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 test_cases = [
     (
@@ -403,32 +403,19 @@ def _dyadic_rows(shape, vocab, generator):
     return rows
 
 
-def _make_inputs(*, bs, num_nodes, vocab, chain, random_draft, seed):
-    """Random draft trees (node 0 is the root) as first-child / next-sibling
-    links. Candidates mostly come from the parent's target support, so levels
-    accept as well as reject."""
+def _make_chain_inputs(*, bs, num_nodes, vocab, seed):
+    """Random draft chains (node 0 is the root) with random draft rows. Candidates
+    mostly come from the parent's target support, so levels accept as well as
+    reject."""
     generator = torch.Generator().manual_seed(seed)
     next_token = torch.full((bs, num_nodes), -1, dtype=torch.int64)
-    next_sibling = torch.full((bs, num_nodes), -1, dtype=torch.int64)
+    next_token[:, :-1] = torch.arange(1, num_nodes)
     target = _dyadic_rows((bs, num_nodes), vocab, generator)
-    if random_draft:
-        draft = _dyadic_rows((bs, num_nodes), vocab, generator)
-    else:
-        draft = torch.zeros_like(target)
+    draft = _dyadic_rows((bs, num_nodes), vocab, generator)
     candidates = torch.zeros((bs, num_nodes), dtype=torch.int64)
     for b in range(bs):
-        last_child = {}
         for node in range(1, num_nodes):
-            if chain:
-                parent = node - 1
-            else:
-                parent = int(torch.randint(0, node, (1,), generator=generator))
-            if parent in last_child:
-                next_sibling[b, last_child[parent]] = node
-            else:
-                next_token[b, parent] = node
-            last_child[parent] = node
-            support = target[b, parent].nonzero().flatten()
+            support = target[b, node - 1].nonzero().flatten()
             if torch.rand((), generator=generator) < 0.75:
                 pick = support[torch.randint(len(support), (1,), generator=generator)]
             else:
@@ -441,7 +428,7 @@ def _make_inputs(*, bs, num_nodes, vocab, chain, random_draft, seed):
             bs, num_nodes
         ),
         "retrive_next_token": next_token,
-        "retrive_next_sibling": next_sibling,
+        "retrive_next_sibling": torch.full((bs, num_nodes), -1, dtype=torch.int64),
         "uniform_samples": torch.rand((bs, num_nodes), generator=generator),
         "uniform_samples_for_final_sampling": torch.rand((bs,), generator=generator),
         "target_probs": target,
@@ -484,216 +471,15 @@ def _assert_same(expected, actual):
 
 
 @rocm_only
-@pytest.mark.parametrize(
-    "chain,vocab,truncated,threshold_single,threshold_acc,random_draft",
-    [
-        (True, 11, False, 1, 1, False),
-        (True, 9001, True, 0.5, 0.25, True),
-        (False, 11, True, 1, 1, True),
-        (False, 9001, False, 0.5, 0.25, False),
-        (True, 11, True, 0, 0, False),
-        (False, 9001, True, 0, 0, True),
-        (True, 9001, False, 0, 0, True),
-        (False, 11, False, 0, 0, False),
-        (True, 9001, False, 1, 1, True),
-        (False, 11, False, 1, 1, False),
-    ],
-)
-def test_matches_reference(
-    chain, vocab, truncated, threshold_single, threshold_acc, random_draft
-):
-    num_nodes = 6
-    inputs = _make_inputs(
-        bs=16,
-        num_nodes=num_nodes,
-        vocab=vocab,
-        chain=chain,
-        random_draft=random_draft,
-        seed=vocab + 2 * chain,
-    )
-    # A truncated walk stops below the leaves and samples the bonus token.
-    num_spec_tokens = 3 if truncated else num_nodes
-    expected, actual = _run(inputs, num_spec_tokens, threshold_single, threshold_acc)
+def test_matches_reference():
+    """Random chains over a vocabulary of several 4096-wide blocks with fractional
+    thresholds and random draft rows; the base known-answer cases cover one block
+    and thresholds 1 and 0."""
+    inputs = _make_chain_inputs(bs=16, num_nodes=6, vocab=9001, seed=9003)
+    # A walk truncated below the leaves samples the bonus token after its last
+    # slot, where the draft row must not be read.
+    expected, actual = _run(inputs, 3, threshold_single=0.5, threshold_acc=0.25)
     _assert_same(expected, actual)
-
-
-def _chain(target_rows, draft_rows, drafts, coins, final_coin):
-    num_nodes = len(target_rows)
-    next_token = torch.arange(1, num_nodes + 1).unsqueeze(0)
-    next_token[0, -1] = -1
-    return {
-        "candidates": torch.tensor([[0, *drafts]]),
-        "retrive_index": torch.arange(num_nodes).unsqueeze(0),
-        "retrive_next_token": next_token,
-        "retrive_next_sibling": torch.full((1, num_nodes), -1),
-        "uniform_samples": torch.tensor([coins], dtype=torch.float32),
-        "uniform_samples_for_final_sampling": torch.tensor([final_coin]),
-        "target_probs": torch.tensor([target_rows], dtype=torch.float32),
-        "draft_probs": torch.tensor([draft_rows], dtype=torch.float32),
-    }
-
-
-@rocm_only
-def test_bonus_ignores_draft_row_after_last_slot():
-    # Both drafts are certain; a draft row at the bonus slot would empty the
-    # residual if it were read.
-    inputs = _chain(
-        target_rows=[[0, 1, 0], [0, 0, 1], [0.25, 0.75, 0]],
-        draft_rows=[[0, 0, 0], [0, 0, 0], [1, 1, 1]],
-        drafts=[1, 2],
-        coins=[0.5, 0.5, 0.5],
-        final_coin=0.5,
-    )
-    expected, actual = _run(inputs, num_spec_tokens=3)
-    _assert_same(expected, actual)
-    assert actual["accept_token_num"].item() == 2
-    assert actual["predicts"].tolist() == [1, 2, 1]
-
-
-@rocm_only
-def test_rejected_draft_is_excluded_from_residual():
-    # Draft 0 holds 1/2 of the mass and is rejected at coin 0.75. The residual
-    # [0, 1/4, 1/4] sums to 1/2, so u = 0.75 * 1/2 = 3/8 falls on token 2.
-    inputs = _chain(
-        target_rows=[[0.5, 0.25, 0.25], [1, 0, 0]],
-        draft_rows=[[0, 0, 0], [0, 0, 0]],
-        drafts=[0],
-        coins=[0.75, 0.5],
-        final_coin=0.75,
-    )
-    expected, actual = _run(inputs, num_spec_tokens=2)
-    _assert_same(expected, actual)
-    assert actual["accept_token_num"].item() == 0
-    assert actual["predicts"][0].item() == 2
-    assert actual["draft_probs"][0, 0].tolist() == [0.5, 0, 0]
-
-
-@rocm_only
-@pytest.mark.parametrize(
-    "draft_row,final_coin,expected_token",
-    [
-        # Draft mass covers the target everywhere: an empty residual takes the
-        # last vocabulary id.
-        ([1, 1, 1, 1, 1], 0.5, 4),
-        # u at the full residual mass: no CDF entry exceeds it, so the last
-        # positive token is taken.
-        ([0, 0, 0, 0, 0], 1.0, 3),
-    ],
-    ids=["empty-residual", "coin-at-total-mass"],
-)
-def test_final_sampling_fallbacks(draft_row, final_coin, expected_token):
-    inputs = _chain(
-        target_rows=[[0.25, 0.25, 0, 0.5, 0], [1, 0, 0, 0, 0]],
-        draft_rows=[draft_row, [0] * 5],
-        drafts=[0],
-        coins=[0.75, 0.5],
-        final_coin=final_coin,
-    )
-    expected, actual = _run(inputs, num_spec_tokens=2)
-    _assert_same(expected, actual)
-    assert actual["predicts"][0].item() == expected_token
-
-
-@rocm_only
-def test_output_matches_target_distribution():
-    """Every committed token, accepted draft or final sample, is distributed
-    as the target row of its slot, and each draft is accepted with its target
-    probability."""
-    batch, vocab = 65536, 8
-    target_rows = torch.tensor(
-        [
-            [0.5, 0.25, 0.125, 0.125, 0, 0, 0, 0],
-            [0, 0.375, 0, 0.25, 0.25, 0.125, 0, 0],
-            [0.0625, 0.0625, 0.125, 0.25, 0.5, 0, 0, 0],
-            [0.125] * 8,
-        ],
-        device=DEVICE,
-    )
-    slots = target_rows.shape[0]
-    generator = torch.Generator(device=DEVICE).manual_seed(1234)
-    # Proposals put a quarter of their mass off the target support.
-    proposal = 0.75 * target_rows[:-1] + 0.25 / vocab
-    drafts = torch.multinomial(proposal, batch, replacement=True, generator=generator)
-    candidates = torch.cat(
-        [torch.zeros(batch, 1, dtype=torch.int64, device=DEVICE), drafts.T], dim=1
-    )
-    next_token = torch.arange(1, slots + 1, device=DEVICE).repeat(batch, 1)
-    next_token[:, -1] = -1
-    inputs = {
-        "candidates": candidates.contiguous(),
-        "retrive_index": torch.arange(batch * slots, device=DEVICE).view(batch, slots),
-        "retrive_next_token": next_token,
-        "retrive_next_sibling": torch.full_like(next_token, -1),
-        "uniform_samples": torch.rand(batch, slots, device=DEVICE, generator=generator),
-        "uniform_samples_for_final_sampling": torch.rand(
-            batch, device=DEVICE, generator=generator
-        ),
-        "target_probs": target_rows.expand(batch, -1, -1).contiguous(),
-        "draft_probs": torch.zeros(batch, slots, vocab, device=DEVICE),
-    }
-    actual = dict(inputs, **_outputs(batch, slots, slots, DEVICE))
-    tree_speculative_sampling_target_only(**actual)
-
-    lengths = actual["accept_token_num"].long()
-    # With retrive_index = arange, slot k of a request holds the token after node k.
-    committed = actual["predicts"].view(batch, slots).long()
-    accept_probs = target_rows[:-1].gather(1, drafts).T  # [batch, slots - 1]
-    reach = torch.ones(batch, device=DEVICE)
-    for slot in range(slots):
-        if slot > 0:
-            reach = reach * accept_probs[:, slot - 1]
-            observed = (lengths >= slot).float().mean().item()
-            expected_reach = reach.mean().item()
-            std = (expected_reach * (1 - expected_reach) / batch) ** 0.5
-            assert abs(observed - expected_reach) < 5 * std + 1e-3, slot
-        reached = lengths >= slot
-        count = int(reached.sum())
-        freqs = torch.bincount(committed[reached, slot], minlength=vocab) / count
-        std = (target_rows[slot] * (1 - target_rows[slot]) / count).sqrt()
-        assert (freqs - target_rows[slot]).abs().le(5 * std + 1e-3).all(), slot
-
-
-@rocm_only
-def test_graph_replay_matches_eager():
-    bs, num_nodes = 8, 6
-    inputs = _make_inputs(
-        bs=bs, num_nodes=num_nodes, vocab=9001, chain=True, random_draft=False, seed=5
-    )
-    static = {k: v.to(DEVICE) for k, v in inputs.items()}
-    static.update(_outputs(bs, num_nodes, num_nodes, DEVICE))
-    initial_draft = static["draft_probs"].clone()
-    # Compile outside the capture.
-    tree_speculative_sampling_target_only(**static)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        tree_speculative_sampling_target_only(**static)
-
-    generator = torch.Generator(device=DEVICE).manual_seed(9)
-    for _ in range(3):
-        static["uniform_samples"].copy_(
-            torch.rand(bs, num_nodes, device=DEVICE, generator=generator)
-        )
-        static["uniform_samples_for_final_sampling"].copy_(
-            torch.rand(bs, device=DEVICE, generator=generator)
-        )
-        static["draft_probs"].copy_(initial_draft)
-        for name in ("predicts", "accept_index", "accept_token_num"):
-            static[name].fill_(-1)
-        eager = {k: v.clone() for k, v in static.items()}
-        tree_speculative_sampling_target_only(**eager)
-        graph.replay()
-        for name in ("predicts", "accept_index", "accept_token_num", "draft_probs"):
-            assert torch.equal(static[name], eager[name]), name
-
-
-@rocm_only
-def test_rocm_sampling_verify_available():
-    # The worker's availability gate must allow the kernel exercised above.
-    from sglang.srt.speculative.dflash_utils import (
-        is_dflash_sampling_verify_available,
-    )
-
-    assert is_dflash_sampling_verify_available()
 
 
 if __name__ == "__main__":

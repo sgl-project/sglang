@@ -13,17 +13,15 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import (
-    is_flashinfer_available,
-    log_info_on_rank0,
-    set_weight_attrs,
-)
-from sglang.srt.utils.common import next_power_of_2, print_warning_once
+from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
+from sglang.srt.utils.log_utils import print_warning_once
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
@@ -240,6 +238,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
 
         self._fp8.process_weights_after_loading(layer)
+        layer.use_cuda_mxfp4_decode_moe = False
 
         if getattr(layer, "_mega_moe_weights_built", False):
             return
@@ -341,6 +340,20 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
         self._register_static_scale_ones(layer)
         torch.cuda.empty_cache()
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            cuda_mxfp4_decode_moe_supported,
+        )
+
+        # apply() calls flashinfer with its default SwiGLU and the per-expert clamp
+        layer.use_cuda_mxfp4_decode_moe = cuda_mxfp4_decode_moe_supported(
+            layer,
+            "swiglu",
+            layer.w2_weight.shape[2] * 2,  # after the 128 padding
+            routed_hidden_size(layer),
+            with_bias=False,
+            precision=self.flashinfer_mxfp4_moe_precision,
+        )
 
     def _register_static_scale_ones(self, layer: Module) -> None:
         device = layer.w13_weight.device
@@ -459,9 +472,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         else:
             raise NotImplementedError(f"Unsupported mxfp4 moe precision: {precision}")
 
+        from sglang.kernels.ops.moe import mxfp4_decode_moe
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             _make_deferred_finalize_output,
             is_deferred_finalize_enabled,
+            run_cuda_mxfp4_decode_moe,
             trtllm_moe_enable_pdl,
         )
 
@@ -475,8 +490,13 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             deferred_output_shape = num_tokens > 32
         else:
             deferred_output_shape = 96 < num_tokens <= 384
+        use_cuda_decode_moe = (
+            layer.use_cuda_mxfp4_decode_moe
+            and not bypassed
+            and num_tokens <= mxfp4_decode_moe.MAX_TOKENS
+        )
         symm_output = None
-        if not defer_finalize or deferred_output_shape:
+        if not defer_finalize or (deferred_output_shape and not use_cuda_decode_moe):
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
@@ -495,6 +515,25 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if input_ready is not None:
             # The op launches the routing kernel, so the join must precede it.
             torch.cuda.current_stream().wait_event(input_ready)
+
+        if use_cuda_decode_moe:
+            output = run_cuda_mxfp4_decode_moe(
+                x_quant,
+                x_scale,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+                activation="swiglu",
+                activation_constants=(self.moe_runner_config.swiglu_limit,),
+                expert_offset=layer.moe_ep_rank * num_local_experts,
+                out=None if defer_finalize else symm_output,
+            )
+            return StandardCombineInput(
+                hidden_states=symm_output if output is None else output
+            )
 
         result = moe_call(
             **routing,
@@ -582,7 +621,7 @@ def register_fused_all_reduce_comm(
 ) -> None:
     """Hand a push plane to the fusion kernels, once per process: the TP group's
     own, or with ``max_push_size`` a dedicated push-only plane of that slot size
-    and ``max_push_blocks`` row counters. Must run before graph capture;
+    and ``max_push_blocks`` default launch width. Must run before graph capture;
     unregistered means everything runs unfused."""
     global _fused_all_reduce_comm
     if _fused_all_reduce_comm is not None:
@@ -622,8 +661,8 @@ def register_fused_all_reduce_comm(
 
 def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     """Whether the registered push plane can stage ``[num_tokens, hidden_dim]``
-    BF16 rows: one slot holds them and each row owns a push phase counter. The
-    384 ceiling is the bench-validated range of the fused collective family.
+    BF16 rows in one slot. The 384 ceiling is the bench-validated range of the
+    fused collective family.
 
     The deferred-finalize handle type carries its own numeric contract (every
     producer folds the routed scaling; no consumer rescales)."""
@@ -632,8 +671,6 @@ def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     comm = _fused_all_reduce_comm
     if comm is None or comm.world_size != get_parallel().tp_size:
         return False
-    return (
-        num_tokens <= 384
-        and num_tokens <= comm.config.num_push_blocks
-        and all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)
+    return num_tokens <= 384 and all_reduce_fusion.fits_push_slot(
+        comm.max_push_size, num_tokens, hidden_dim
     )

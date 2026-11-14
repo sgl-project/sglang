@@ -24,6 +24,7 @@ DEVICE = "cuda"
 # name -> (experts, topk, scoring, groups, topk_groups, logits dtype)
 CONFIGS = {
     "deepseek_v3": (256, 8, "sigmoid", 8, 4, torch.float32),
+    "ling_3_1_flash": (512, 8, "sigmoid", 8, 4, torch.float32),
     "kimi_k2": (384, 8, "sigmoid", 1, 1, torch.float32),
     "glm4_5": (160, 8, "sigmoid", 1, 1, torch.float32),
     "glm5": (256, 8, "sigmoid", 1, 1, torch.float32),

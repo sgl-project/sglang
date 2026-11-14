@@ -349,6 +349,10 @@ class MegakernelBinding:
             )
         return ForwardView(backend, self._seal_cache)
 
+    def prefill_view(self) -> ForwardView:
+        """The view for an eager prefill step, without graph-static decode metadata."""
+        return self.forward_view(forward_batch=None)
+
     def preparation_view(self, pool: Any, req_pool: Any) -> PreparationView:
         if not getattr(pool, "use_mla", False) or not hasattr(pool, "mamba_pool"):
             return PreparationView()

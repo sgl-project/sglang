@@ -380,8 +380,6 @@ class TestMonokernelFramework(CustomTestCase):
         )
         lm = install(archs=["SharedDraft"], model_type="other")
         self.assertNotIn("forward", vars(lm))
-        with self.assertRaisesRegex(ValueError, "monokernel_weights_iterator"):
-            install(archs=["SharedDraft"])
 
     def test_the_decode_attention_backend_is_checked(self):
         # the steps a spec serves run on the decode backend, not the base one

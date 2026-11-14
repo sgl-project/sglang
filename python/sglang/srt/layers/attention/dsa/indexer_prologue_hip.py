@@ -7,8 +7,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.fp4_index_hip import indexer_q_fp4_head_gate
 from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
+from sglang.srt.layers.attention.dsa import dsa_indexer_hip
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.runtime_context import get_exec
 
 
 def make_rocm_nope_prologue(indexer) -> Optional[RocmNoPEPrologue]:
@@ -18,14 +22,19 @@ def make_rocm_nope_prologue(indexer) -> Optional[RocmNoPEPrologue]:
         and indexer.bf16_head_gate
         and indexer.head_dim == indexer.block_size == 128
     ):
-        return RocmNoPEPrologue()
+        return RocmNoPEPrologue(
+            mono_k_norm=aiter_can_use_preshuffle_paged_mqa()
+            and get_exec().kernel.enable_amd_monokernel
+        )
     return None
 
 
 class RocmNoPEPrologue:
-    def __init__(self) -> None:
+    def __init__(self, mono_k_norm: bool = False) -> None:
         # [wk | weights_proj] after merge_k_gate; the two weights become its views
         self.k_gate_weight: Optional[torch.Tensor] = None
+        # the monokernel's index-K store may apply k_norm itself (fuse_index_k_norm)
+        self.mono_k_norm = mono_k_norm
 
     def merge_k_gate(self, indexer) -> None:
         if not (
@@ -57,9 +66,10 @@ class RocmNoPEPrologue:
         forward_batch,
         layer_id: int,
         act_quant,
-        fuse_k_norm: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """fuse_k_norm: the index-K store applies k_norm (the monokernel's)."""
+        fuse_k_norm = self.mono_k_norm and dsa_indexer_hip.fuse_index_k_norm(
+            indexer, forward_batch
+        )
         # a monokernel plugin that already ran wk, weights_proj and wq_b hands
         # their outputs in (_mono_pre)
         pre = indexer.__dict__.get("_mono_pre")
@@ -78,13 +88,19 @@ class RocmNoPEPrologue:
                     [indexer.head_dim, indexer.n_heads], dim=-1
                 )
             query = indexer.wq_b(q_lora)[0]
-        indexer._store_index_k_cache(
-            forward_batch,
-            layer_id,
-            key if fuse_k_norm else indexer.k_norm(key),
-            act_quant=act_quant,
-            prenorm=fuse_k_norm,
-        )
+        if fuse_k_norm:
+            # key is k_norm's input; the fused store applies k_norm
+            dsa_indexer_hip.store_index_k_prenorm(indexer, forward_batch, layer_id, key)
+        else:
+            indexer._store_index_k_cache(
+                forward_batch, layer_id, indexer.k_norm(key), act_quant=act_quant
+            )
+        if indexer.fp4_index_k:
+            return indexer_q_fp4_head_gate(
+                query.view(-1, indexer.n_heads, indexer.head_dim),
+                gate,
+                indexer.softmax_scale,
+            )
         return indexer_q_quant_head_gate(
             query.view(-1, indexer.n_heads, indexer.head_dim),
             gate,

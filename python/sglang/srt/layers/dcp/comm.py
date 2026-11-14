@@ -40,7 +40,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import is_fi_a2a_supported
+from sglang.srt.utils.device import is_fi_a2a_supported
 
 logger = logging.getLogger(__name__)
 
@@ -182,11 +182,9 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     # keeping every rank's wire dtype/count unchanged.
     reorder_dtype = None
     if (
-        (
-            get_platform().is_hip
-            or (get_platform().is_sm100 and gathered_kv_a.numel() >= 64 * 1024 * 1024)
-        )
+        get_platform().is_sm100
         and kv_a.dtype == torch.uint8
+        and gathered_kv_a.numel() >= 64 * 1024 * 1024
         and kv_a.shape[-1] % 4 == 0
     ):
         reorder_dtype = torch.int64 if kv_a.shape[-1] % 8 == 0 else torch.int32
@@ -557,9 +555,11 @@ def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
     global _PUSH_COMBINE_COMM
     from sglang.srt.environ import envs
 
-    if _PUSH_COMBINE_COMM is not None or cp_group.world_size == 1:
+    # ROCm keeps the a2a reduce: this push plane's HIP VMM IPC exchange stalled
+    # MI355X DCP8 startup for minutes and left the node's RCCL degraded
+    if _is_hip or _PUSH_COMBINE_COMM is not None or cp_group.world_size == 1:
         return
-    if not envs.SGLANG_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
+    if not envs.SGLANG_ENABLE_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
         return
     from sglang.kernels.ops.attention import dcp_push_combine as pc
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (

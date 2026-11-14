@@ -93,7 +93,7 @@ class TestTheGgufArm(_ModelSourceCase):
             return resolved
 
         return mock.patch(
-            "sglang.srt.utils.hf_transformers.resolve_hf_gguf_reference",
+            "sglang.srt.hf_transformers.resolve_hf_gguf_reference",
             side_effect=_resolve,
         )
 

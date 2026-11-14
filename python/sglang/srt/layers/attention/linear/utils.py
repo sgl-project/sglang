@@ -7,7 +7,7 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.log_utils import rank0_log
 
 if TYPE_CHECKING:
     pass
@@ -93,10 +93,14 @@ def resolve_linear_attn_backends(
         mamba.linear_attn_prefill_backend or prefill_default or base
     )
 
-    # Unset verify follows decode (flashinfer -> its recurrent kernel, else triton).
+    # Unset verify follows decode for backends with their own verify kernel.
     verify = mamba.linear_attn_verify_backend
     if verify is None:
-        verify = decode.value if decode.is_flashinfer() else "triton"
+        verify = (
+            decode.value
+            if decode.is_flashinfer() or decode.is_intel_xpu()
+            else "triton"
+        )
 
     backends = LinearAttnBackends(
         decode=decode, prefill=prefill, verify=LinearAttnKernelBackend(verify)
@@ -143,7 +147,7 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
     """
     import torch
 
-    from sglang.srt.utils.common import (
+    from sglang.srt.layers.dp_attention import (
         get_cuda_graph_max_batch_size,
         get_eager_max_batch_size,
     )

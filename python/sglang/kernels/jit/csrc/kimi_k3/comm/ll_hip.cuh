@@ -52,7 +52,8 @@ SGL_DEVICE uint4 ll_payload(const uint4& a, const uint4& b) {
 
 SGL_DEVICE uint32_t next_flag(const int32_t* epochs, int slot) {
   const uint32_t flag = static_cast<uint32_t>(epochs[slot]) + 1u;
-  return flag == 0u ? 1u : flag;  // 0 is the zeroed scratch
+  // 0 is the zeroed scratch; wrap to 2 so the epoch half (flag & 1) still alternates
+  return flag == 0u ? 2u : flag;
 }
 
 // Workgroup barrier for LDS only. __syncthreads() also waits out the wave's vmcnt, i.e.

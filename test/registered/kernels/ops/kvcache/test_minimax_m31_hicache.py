@@ -12,9 +12,11 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+# backend-specific: the HIP build of the NVFP4 host pool's page-row transfer kernel.
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _indices(pages):
@@ -26,7 +28,19 @@ def _indices(pages):
 
 
 @pytest.mark.parametrize("layout", ["layer_first", "page_first", "page_first_direct"])
-@pytest.mark.parametrize("backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "kernel",
+        pytest.param(
+            "direct",
+            marks=pytest.mark.skipif(
+                torch.version.hip is not None,
+                reason="the ROCm sgl_kernel build has no direct range-copy op",
+            ),
+        ),
+    ],
+)
 def test_nvfp4_async_hicache_round_trip(layout, backend):
     layer_num = 2
     pool = MiniMaxM3Nvfp4KVPool(

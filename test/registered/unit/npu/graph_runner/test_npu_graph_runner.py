@@ -1,5 +1,6 @@
 """CPU regression coverage for NPU backend policies used by the common runner."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -150,6 +151,93 @@ def test_dsa_replay_does_not_request_host_lengths():
         result = backend.replay("key", object())
     assert result is backend._outputs["key"]
     graph.replay.assert_called_once_with()
+
+
+@pytest.mark.parametrize("needs_cpu_seq_lens", [True, False])
+@pytest.mark.parametrize(
+    "dflash,dspark", [(False, False), (True, False), (False, True)]
+)
+def test_replay_respects_attention_cpu_length_capability(
+    needs_cpu_seq_lens, dflash, dspark
+):
+    backend, _, attention = make_backend(dflash=dflash, dspark=dspark, width=3)
+    attention.needs_cpu_seq_lens = needs_cpu_seq_lens
+    graph = SimpleNamespace(replay=mock.Mock())
+    backend._graphs = {"key": graph}
+    backend._outputs = {"key": "device-output"}
+    backend.replay_with_input_update = mock.Mock(return_value="host-output")
+    verify = dflash or dspark
+    lengths = [13, 14] if verify else [10, 11]
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: verify),
+        seq_lens_cpu=torch.tensor(lengths) if needs_cpu_seq_lens else None,
+        seq_lens=torch.tensor([10, 11]),
+    )
+    with (
+        mock.patch.object(mod, "is_deepseek_dsa", return_value=False),
+        mock.patch.object(mod, "is_deepseek_v4", return_value=False),
+        mock.patch.object(
+            mod.envs.SGLANG_NPU_USE_FIAS_V2_BSND, "get", return_value=False
+        ),
+        mock.patch.object(
+            torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")
+        ),
+    ):
+        output = backend.replay("key", batch)
+    if needs_cpu_seq_lens:
+        assert output == "host-output"
+        backend.replay_with_input_update.assert_called_once_with(
+            "key",
+            seq_lens=lengths + [0, 0],
+            attr_name="actual_seq_lengths_kv",
+            attr_type=[],
+        )
+        graph.replay.assert_not_called()
+    else:
+        assert output == "device-output"
+        graph.replay.assert_called_once_with()
+        backend.replay_with_input_update.assert_not_called()
+
+
+def test_device_length_graph_loads_inputs_and_slices_output_without_host_update():
+    backend, runner, attention = make_backend(dspark=True, width=7, bs=1, raw_bs=1)
+    attention.needs_cpu_seq_lens = False
+    runner.model_runner.device_timer = None
+    runner.model_context = nullcontext
+    runner.load_batch = mock.Mock()
+    runner._replay_graph_key = "key"
+    runner.raw_num_token = 7
+    runner.is_dllm = False
+    runner._process_output_after_replay = lambda output, batch: output
+    runner.backend = backend
+    graph = SimpleNamespace(replay=mock.Mock())
+    backend._graphs = {"key": graph}
+    backend._outputs = {
+        "key": runner_mod.LogitsProcessorOutput(
+            next_token_logits=None, hidden_states=torch.ones(8, 16)
+        )
+    }
+    backend.prepare_replay = mock.Mock(return_value=False)
+    backend.replay_with_input_update = mock.Mock(
+        side_effect=AssertionError("unexpected host update")
+    )
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(name="TARGET_VERIFY"), seq_lens_cpu=None
+    )
+    with (
+        mock.patch.object(
+            torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")
+        ),
+        mock.patch.object(runner_mod, "device_timer_ctx", return_value=nullcontext()),
+        mock.patch.object(
+            runner_mod.envs.SGLANG_LOG_DECODE_GRAPH_KEY, "get", return_value=False
+        ),
+    ):
+        actual = runner.execute(batch)
+    runner.load_batch.assert_called_once_with(batch, None)
+    graph.replay.assert_called_once_with()
+    backend.replay_with_input_update.assert_not_called()
+    assert actual.hidden_states.shape == (7, 16)
 
 
 def test_common_replay_builds_host_payload_but_dsa_skips_host_update():

@@ -82,8 +82,8 @@ SGL_DEVICE floatx4 mfma(bf16x8 a, bf16x8 b, floatx4 c) {
   return __builtin_amdgcn_mfma_f32_16x16x32_bf16(a, b, c, 0, 0, 0);
 }
 
-constexpr int kBufferConfig = 0x00020000;
-constexpr int kXcds = 8;  // gfx950 raw buffer descriptor word 3
+constexpr int kBufferConfig = 0x00020000;  // gfx950 raw buffer descriptor word 3
+constexpr int kXcds = 8;
 
 // Max / sum with the lanes 32 and 16 apart, without going through LDS.
 SGL_DEVICE float xmax32(float x) {
@@ -185,8 +185,8 @@ __global__ __launch_bounds__(kThreads) void sparse_mla_prefill_kernel(const Para
   // were loaded before the DMAs of the tile we wait for.
   int vq[kStages];
 #pragma unroll
-  for (int t = 0; t < kStages - 1; ++t)
-    if (t < ntiles) issue_kv(t, load_idx(t));
+  for (int j = 0; j < kStages - 1; ++j)
+    if (j < ntiles) issue_kv(j, load_idx(j));
 #pragma unroll
   for (int r = 0; r < kStages; ++r)
     vq[r] = load_idx(kStages - 1 + r);

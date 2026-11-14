@@ -12,6 +12,7 @@ try:
 except ImportError:
     torch_varlen_attn = None
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -359,7 +360,7 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             # in rounding. The BCG scope includes warmup, priming FA4 for capture.
             if not is_in_breakable_cuda_graph():
                 context = get_forward_context_or_none()
-                if context is not None and context.quality in ("lossless", "high"):
+                if context is not None and quality_allows(context.quality, "lossless"):
                     return True
             short_side, long_side = sorted((query.shape[1], key.shape[1]))
             return short_side >= 128 or long_side < 128

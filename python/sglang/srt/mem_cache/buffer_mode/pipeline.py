@@ -29,7 +29,7 @@ import logging
 from array import array
 from collections import deque
 from dataclasses import replace
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 import torch
@@ -39,12 +39,12 @@ from sglang.srt.managers.cache_controller import HICACHE_WRITE_STAGING_POOL_FRAC
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
-    EvictParams,
     InitLoadBackParams,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -181,7 +181,7 @@ def validate_buffer_only_stack(
     swa_component: Optional[SWAComponent],
     storage_prefetch_threshold: int = 256,
     *,
-    auxiliary_swa_component: Optional[SWAComponent] = None,
+    further_window_components: Sequence[SWAComponent] = (),
 ) -> None:
     """Post-assembly buffer-mode fences.
 
@@ -209,7 +209,7 @@ def validate_buffer_only_stack(
                 f"source={spec.indices_from_pool}, source_slots={source_size}."
             )
     window_pools = []
-    for component in (swa_component, auxiliary_swa_component):
+    for component in (swa_component, *further_window_components):
         if component is None:
             continue
         pool = component._swa_kv_pool_host
@@ -283,13 +283,13 @@ class BufferModePipeline:
         write_backlog_cap: int,
         max_context_len: int = 0,
         *,
-        auxiliary_swa_component: Optional[SWAComponent] = None,
+        further_window_components: Sequence[SWAComponent] = (),
     ):
         self._cache = cache
         self._swa_component = swa_component
-        self._auxiliary_swa_component = auxiliary_swa_component
+        # Window slots beyond the tree's first, each with its own host pool.
+        self._further_window_components = tuple(further_window_components)
         self._swa_tail_only = envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.get()
-        self._mamba_request_end_only = envs.SGLANG_HICACHE_MAMBA_REQUEST_END_ONLY.get()
         # Metadata-only pending-write backlog cap, measured in unique FULL
         # snapshot spans; beyond it new spans are dropped at admission.
         self.write_backlog_cap = write_backlog_cap
@@ -333,22 +333,8 @@ class BufferModePipeline:
     # Opt-in: a backup stores only the SWA window ending at its node, the one
     # a prefetch ending there restores, instead of the node's every SWA page.
     _swa_tail_only: bool = False
-    _mamba_request_end_only: bool = False
-    _insert_is_request_end: Optional[bool] = None
-    _insert_key_len: int = 0
-
-    def _should_backup_mamba(self, node_id: NodeId) -> bool:
-        if self._insert_is_request_end is None:
-            return True  # Preserve direct/manual backups without request context.
-        if not self._insert_is_request_end:
-            return False
-        # BackupKV also visits ancestors; only the actual endpoint qualifies.
-        (path,) = self._cache.tree_core.collect_path_info([node_id])
-        return bool(path) and path[-1].path_end == self._insert_key_len
 
     def reset(self) -> None:
-        self._insert_is_request_end = None
-        self._insert_key_len = 0
         # Load pipeline: hits awaiting a staging grant (park-and-retry),
         # enqueue-time prefix context, completed prefetches staged until
         # prefill admission, and load-backs in flight (keyed by synthetic
@@ -383,7 +369,7 @@ class BufferModePipeline:
     def _swa_components(self):
         return (
             component
-            for component in (self._swa_component, self._auxiliary_swa_component)
+            for component in (self._swa_component, *self._further_window_components)
             if component is not None
         )
 
@@ -630,7 +616,7 @@ class BufferModePipeline:
     @staticmethod
     def _pool_order(pool: PoolName) -> tuple[bool, str]:
         # KV first, then a fixed order: every rank must admit identically.
-        return (pool != PoolName.KV, pool.value)
+        return (pool != PoolName.KV, str(pool))
 
     def _write_intents(
         self, snapshot: BufferBackupSnapshot
@@ -697,35 +683,13 @@ class BufferModePipeline:
         else:
             self._queued_span_refs[span] = refs - 1
 
-    def begin_insert_walk(
-        self, *, is_request_end: Optional[bool] = None, key_len: int = 0
-    ) -> None:
+    def begin_insert_walk(self) -> None:
         """Admit each node once per insert walk: the trigger chains every
         unbacked ancestor, so a depth-d path is presented d(d+1)/2 times."""
         self._walk_admitted = set()
-        self._insert_is_request_end = is_request_end
-        self._insert_key_len = key_len
-
-    def on_insert_complete(self, result: InsertResult) -> None:
-        """Retry a formerly intermediate checkpoint when it becomes an endpoint."""
-        if (
-            not self._mamba_request_end_only
-            or self._insert_is_request_end is not True
-            or result.rotation_tail_declined
-        ):
-            return
-        # An endpoint retry must obey the write policy without counting a new hit.
-        cache = self._cache
-        if cache.is_write_back:
-            return
-        node_id = result.last_device_node
-        if cache.tree_core.node_hit_count(node_id) >= cache.write_through_threshold:
-            self.enqueue_backup_intent(node_id)
 
     def end_insert_walk(self) -> None:
         self._walk_admitted = None
-        self._insert_is_request_end = None
-        self._insert_key_len = 0
 
     def enqueue_backup_intent(self, node_id: NodeId) -> None:
         """Queue one intent per pool with something to write; rejected intents
@@ -757,12 +721,6 @@ class BufferModePipeline:
         page_size = self._cache.page_size
         span = (snapshot.node_id, len(snapshot.key))
         for pool, keys in intents:
-            if (
-                pool == PoolName.MAMBA
-                and self._mamba_request_end_only
-                and not self._should_backup_mamba(node_id)
-            ):
-                continue
             if pool in pending:
                 continue
             intent_tokens = len(keys) * page_size
@@ -831,14 +789,14 @@ class BufferModePipeline:
         (prepare_prefetch allocates its window here and a failed alloc
         forfeits the whole prefetch), plus a 10% burst absorber mirroring
         live_cap."""
-        window_pages = 0
-        if pool_name == PoolName.SWA and self._swa_component is not None:
-            window_pages = self._swa_component.full_window_pages
-        elif (
-            pool_name == PoolName.AUXILIARY_SWA
-            and self._auxiliary_swa_component is not None
-        ):
-            window_pages = self._auxiliary_swa_component.full_window_pages
+        window_pages = next(
+            (
+                component.full_window_pages
+                for component in self._swa_components()
+                if component.pool_name == pool_name
+            ),
+            0,
+        )
         return max(window_pages * host_pool.page_size, host_pool.size // 10)
 
     def _validate_backup_intent(
@@ -917,11 +875,6 @@ class BufferModePipeline:
                 keys = dict(self._write_intents(piece)).get(intent.pool)
                 if not keys:
                     continue  # covered since admission
-                if intent.pool == PoolName.MAMBA and self._mamba_request_end_only:
-                    # A split must not turn one admitted endpoint checkpoint
-                    # into additional intermediate-state writes.
-                    if any(key not in intent.keys for key in keys):
-                        continue
                 repaired = _UnifiedBackupIntent(
                     snapshot=piece, pool=intent.pool, keys=list(keys)
                 )
@@ -1209,7 +1162,7 @@ class BufferModePipeline:
             list(entry.keys_by_pool[PoolName.KV]) if intent.pool == PoolName.KV else []
         )
         prefix_keys = snapshot.prefix_keys
-        if intent.pool in (PoolName.SWA, PoolName.AUXILIARY_SWA):
+        if intent.pool in {c.pool_name for c in self._swa_components()}:
             keys = entry.keys_by_pool[intent.pool]
             skipped_pages = len(snapshot.hash_values) - len(keys)
             if skipped_pages > 0:
@@ -1256,17 +1209,23 @@ class BufferModePipeline:
             )
         return list(merged.values())
 
-    def finish_storage_write_ack(self, operation_id: int) -> None:
+    def finish_storage_write_ack(
+        self, operation_id: int, written_pages: Optional[int] = None
+    ) -> None:
         """Storage ack (rank-synced drain): free the staging and feed each
-        written pool's beliefs unconditionally, keeping admission
-        TP-deterministic under per-rank backend failures."""
+        carried pool's beliefs with the written prefix. ``written_pages`` is
+        the rank-agreed written prefix of the operation's KV chain (None: a
+        write with no KV evidence, every key counts); feeding the same prefix
+        on every rank keeps admission TP-deterministic under per-rank backend
+        failures. The in-flight marks are dropped for the whole span, so an
+        un-backed tail reads as absent until a later write-through covers it."""
         entry = self.ongoing_backup.pop(operation_id, None)
         if entry is None:
             return
         beliefs = self._cache.storage_existence_cache
         for pool, keys in entry.keys_by_pool.items():
             pool_beliefs = beliefs.pool(pool)
-            pool_beliefs.add(keys)
+            pool_beliefs.add(keys if written_pages is None else keys[:written_pages])
             pool_beliefs.untrack_inflight(keys)
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= entry.occupied_units
@@ -1555,13 +1514,26 @@ class BufferModePipeline:
             )
             self._refetch_staged(f)
             return False
+        head_end = self._window_head_end(f)
+        if joint_len < head_end:
+            # Only the joint match vouches that the head is still resident: the
+            # hold pins FULL, not SWA.
+            logger.warning(
+                "HiCache staged prefetch deferred req=%s reason=window_head "
+                "joint=%d head_end=%d",
+                req.rid,
+                joint_len,
+                head_end,
+            )
+            self._refetch_staged(f)
+            return False
         self._set_request_device_prefix(req, key, matched_len, node_id)
         plan = self._build_staged_prefetch_plan(f, key, matched_len)
         if plan is None:
             self._resolve_device_covered(req)
             return True
+        # Each window's host hit is read off the plan (`window_host_hit_lengths`).
         req.host_hit_length = plan.full_tokens
-        req.swa_host_hit_length = plan.window_tokens(ComponentType.SWA)
         req.mamba_host_hit_length = plan.mamba_slots
         # The device alone serves only this pass's joint match; the rest of the
         # span, fetched FULL or resident FULL the aux tail unlocks, is storage's.
@@ -1570,6 +1542,19 @@ class BufferModePipeline:
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = plan
         return True
+
+    def _window_head_end(self, f: _StagedPrefetch) -> int:
+        span_end = f.matched_len + f.num_tokens
+        head_end = 0
+        for component in self._swa_components():
+            staged_tokens = sum(
+                len(t.host_indices)
+                for t in f.aux_xfers
+                if t.name == component.pool_name and t.host_indices is not None
+            )
+            if 0 < staged_tokens < component.full_window_pages * self._cache.page_size:
+                head_end = max(head_end, span_end - staged_tokens)
+        return head_end
 
     def _set_request_device_prefix(
         self, req: Req, key: RadixKey, matched_len: int, node_id: NodeId
@@ -1621,13 +1606,20 @@ class BufferModePipeline:
             # The device already covers every pool's remaining demand.
             return None
         return StagedPrefetchPlan(
-            f.operation_id, key, matched_len, full_tokens, windows, mamba_slots
+            f.operation_id,
+            key,
+            matched_len,
+            full_tokens,
+            windows,
+            mamba_slots,
+            window_sub_pools={
+                ct: self._cache.window_sub_pool_of_slot(ct) for ct in windows
+            },
         )
 
     def _resolve_device_covered(self, req: Req) -> None:
         req.host_hit_length = 0
-        req.swa_host_hit_length = 0
-        req.matched_auxiliary_swa_host_hit_length = 0
+        req.matched_window_host_hit_lengths = {}
         req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
         self.release_staged_hold(req.cache_request_handle, reason="device_covered")
@@ -1803,13 +1795,8 @@ class BufferModePipeline:
         assert plan is not None, f"staged prefetch was not planned for {req.rid}"
         assert f.operation_id == plan.operation_id
         assert (f.extra_key, f.cache_salt) == (req.extra_key, req.cache_salt)
-        assert (
-            req.host_hit_length,
-            req.swa_host_hit_length,
-            req.mamba_host_hit_length,
-        ) == (
+        assert (req.host_hit_length, req.mamba_host_hit_length) == (
             plan.full_tokens,
-            plan.window_tokens(ComponentType.SWA),
             plan.mamba_slots,
         ), f"staged load-back budget changed for {req.rid}"
 
@@ -1901,6 +1888,7 @@ class BufferModePipeline:
                         cache._apply_cache_action(action)
                 offset += end - start
             component.restore_buffer_mapping(torch.cat(full_parts), window_dev)
+        cache.name_loaded_window_rows_by_owner(state.load_transfers)
 
         insert_result = self._insert_loaded_prefix(
             state, req, plan, prefix_indices=prefix_indices
@@ -1931,20 +1919,14 @@ class BufferModePipeline:
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
         # counts evictable pages, but cc.load draws from free slots only.
         cache = self._cache
-        if cache.supports_swa():
-            avail = cache.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = cache.token_to_kv_pool_allocator.available_size()
-        if avail < load_tokens:
-            needed = load_tokens - avail
-            cache.evict_for_alloc(EvictParams(num_tokens=needed))
+        allocator = cache.token_to_kv_pool_allocator
+
+        def available() -> int:
             if cache.supports_swa():
-                avail = cache.token_to_kv_pool_allocator.full_available_size()
-            else:
-                avail = cache.token_to_kv_pool_allocator.available_size()
-            if avail < load_tokens:
-                return False
-        return True
+                return allocator.full_available_size()
+            return allocator.available_size()
+
+        return owner_rows_ready(cache, allocator, load_tokens, available)
 
     def _allocate_and_queue_load_back(
         self,

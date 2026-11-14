@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _resolve_dflash_mla_draft_window
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import resolve_mla_draft_compact_window
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -143,6 +144,13 @@ class TestResolveDflashMlaDraftWindowHook(CustomTestCase):
                 self.assertIsNone(
                     resolution_result(args, "speculative_draft_window_size")
                 )
+
+    def test_rocm_triton_under_dcp_drops_the_window(self):
+        # ROCm's triton reads the draft's rows by position under DCP, as above
+        draft_cfg = _mla_draft(["sliding_attention"] * 5, 1024)
+        with override_platform(is_hip=True):
+            args = self._run("triton", 16, draft_cfg)
+        self.assertIsNone(resolution_result(args, "speculative_draft_window_size"))
 
     def test_other_backends_keep_the_window(self):
         draft_cfg = _mla_draft(["sliding_attention"] * 5, 1024)

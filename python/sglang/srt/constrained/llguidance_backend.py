@@ -144,6 +144,10 @@ class GuidanceGrammar(BaseGrammarObject):
         if self.ll_matcher.is_stopped() and token in self.eos_tokens:
             self.finished = True
             return
+        # consume_token leaves the matcher in a sticky error state on reject;
+        # validate first so a rejected token raises with the state untouched.
+        if self.ll_matcher.validate_tokens([token]) == 0:
+            raise ValueError(f"Tokens not accepted: {token}")
         self.ll_matcher.consume_token(token)
         self._check_err()
 

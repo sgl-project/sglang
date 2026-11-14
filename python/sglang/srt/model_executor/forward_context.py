@@ -46,6 +46,10 @@ class ForwardContext:
     attn_backend: AttentionBackend
     # Resolve after batch preparation; captured calls retain the static buffer.
     moe_num_token_non_padded: Optional[Callable[[], Optional[torch.Tensor]]] = None
+    # A TBO child's rows within its parent batch; None outside a TBO child.
+    tbo_parent_token_range: Optional[tuple[int, int]] = None
+    # This DP rank's first parent row when the child's MoE sees gathered rows.
+    tbo_parent_dp_offset: Optional[int] = None
 
 
 _current: Optional[ForwardContext] = None
