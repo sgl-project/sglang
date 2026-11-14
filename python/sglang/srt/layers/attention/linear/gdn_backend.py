@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -55,9 +56,18 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.log_utils import rank0_log
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 
@@ -345,6 +355,57 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
+
+
+_AITER_GDN_CONV_UNAVAILABLE = False
+
+
+def _aiter_gdn_prefill_conv():
+    """AITER's FlyDSL prefill causal conv, or None if it cannot be used.
+
+    Opt-in on gfx950: SGLANG_USE_AITER plus SGLANG_AITER_GDN_CONV. It implements
+    the same ``causal_conv1d_fn`` contract (one output, ``conv_states`` updated in
+    place), mapping channels to lanes instead of going through an implicit GEMM.
+    Measured on MI355X at ISL 32768 it is ~1.8x the Triton prefill convolution.
+    """
+    global _AITER_GDN_CONV_UNAVAILABLE
+    if _AITER_GDN_CONV_UNAVAILABLE:
+        return None
+    # Validated and tuned on gfx950 (MI355X) only; other archs keep Triton.
+    if not (
+        _is_hip
+        and is_gfx95_supported()
+        and envs.SGLANG_USE_AITER.get()
+        and envs.SGLANG_AITER_GDN_CONV.get()
+    ):
+        _AITER_GDN_CONV_UNAVAILABLE = True
+        return None
+    try:
+        from aiter.ops.flydsl.causal_conv1d_flydsl import (
+            causal_conv1d_prefill_flydsl_fn,
+        )
+    except ImportError:
+        logger.info(
+            "aiter FlyDSL prefill conv unavailable; keeping the Triton convolution"
+        )
+        _AITER_GDN_CONV_UNAVAILABLE = True
+        return None
+    return causal_conv1d_prefill_flydsl_fn
+
+
+def _prefill_causal_conv1d(*args, **kwargs):
+    """Dispatch the GDN prefill convolution, falling back to Triton.
+
+    The AITER kernel raises on shapes or dtypes it does not cover rather than
+    degrading silently, so an unsupported batch simply lands on Triton here.
+    """
+    fn = _aiter_gdn_prefill_conv()
+    if fn is not None:
+        try:
+            return fn(*args, **kwargs)
+        except ValueError as exc:
+            logger.debug("aiter FlyDSL prefill conv declined this batch: %s", exc)
+    return causal_conv1d_fn(*args, **kwargs)
 
 
 def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
@@ -1195,8 +1256,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
         block_table = self.forward_metadata.conv_block_table
-        conv_kwargs = {"block_table": block_table} if block_table is not None else {}
-        return causal_conv1d_fn(
+        if block_table is not None:
+            # The block-table launch is Triton-only; the AITER conv never sees it.
+            conv_fn = causal_conv1d_fn
+            conv_kwargs = {"block_table": block_table}
+        else:
+            conv_fn = _prefill_causal_conv1d
+            conv_kwargs = {}
+        return conv_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
