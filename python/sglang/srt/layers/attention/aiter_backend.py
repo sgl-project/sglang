@@ -34,6 +34,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
     resolve_window_kv_pool,
 )
 from sglang.srt.layers.attention.graph_variants import SeqLenBucketGraphVariants
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -646,6 +650,7 @@ class AiterAttnBackend(AttentionBackend):
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
     deterministic_prefill_max_q: Optional[int] = None
+    _kv_shard_pool = None
 
     def __init__(
         self,
@@ -802,6 +807,7 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
+        self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
 
         # sliding window attention. Resolve the SWA pool rather than reading it
         # straight off the active pool: a frozen-KV MTP draft worker's active
@@ -3353,6 +3359,17 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     paged_kv_view=paged_kv_view,
                 )
+
+        # A sharded extend reads the gathered scratch rows.
+        if self._kv_shard_pool is not None and prepare_kv_shard_forward(
+            self._kv_shard_pool, self.req_to_token, forward_batch
+        ):
+            kv_indices = self.forward_metadata.kv_indices
+            self.forward_metadata.kv_indices = (
+                self._kv_shard_pool.translate_loc_to_scratch(kv_indices).to(
+                    kv_indices.dtype
+                )
+            )
 
     def _plan_dcp_decode_metadata(
         self,
