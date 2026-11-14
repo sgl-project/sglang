@@ -45,7 +45,19 @@ class MistralLarge3EagleModel(DeepseekV2Model):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            input_embeds = self.embed_tokens(input_ids)
+            input_embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                assert input_embeds is not None
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                input_embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
+            if input_embeds is None:
+                input_embeds = self.embed_tokens(input_ids)
         input_embeds, _ = self.fc(
             torch.cat((input_embeds, forward_batch.spec_info.hidden_states), dim=-1)
         )
