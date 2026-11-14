@@ -39,6 +39,23 @@ def version_cmp(v1, v2, op="eq"):
     return op_func(version.parse(v1), version.parse(v2))
 
 
+def move_to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if tensor.device == device:
+        return tensor
+    elif tensor.device.type == "xpu" and device.type == "xpu":
+        # A direct XPU-to-XPU copy waits for both devices' queues and serializes them;
+        # staging through pinned host memory keeps the two devices running concurrently.
+        staged = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+        staged.copy_(tensor, non_blocking=True)
+        ready = torch.xpu.Event()
+        ready.record(torch.xpu.current_stream(tensor.device))
+        torch.xpu.current_stream(device).wait_event(ready)
+        with torch.xpu.device(device):
+            return staged.to(device, non_blocking=True)
+    else:
+        return tensor.to(device, non_blocking=True)
+
+
 def _copy_right_aligned_prefix_bnsd(destination, source, lengths):
     prefix_width = source.shape[2]
     for batch_index, length in enumerate(lengths):
@@ -632,6 +649,8 @@ class NEOChatModel(PreTrainedModel):
             past_key_values=past_key_values,
             update_cache=False,
             use_cache=True,
+            exist_image_gen_tokens=True,
+            exist_non_image_gen_tokens=False,
         )
 
         if self.use_pixel_head:
@@ -673,6 +692,8 @@ class NEOChatModel(PreTrainedModel):
                     outputs.last_hidden_state[:, -image_token_num:].view(B, L, -1)
                 ).view(B, L, -1)
 
+        # x_pred is on the last device when the decoder is split over several.
+        z, t = move_to_device(z, x_pred.device), move_to_device(t, x_pred.device)
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
         return v_pred
 
@@ -814,7 +835,8 @@ class NEOChatModel(PreTrainedModel):
             past_key_values_condition, prefix_hidden_states = self._t2i_prefix_forward(
                 input_ids_condition, indexes_condition, attention_mask_condition_prefix
             )
-            device = prefix_hidden_states.device
+            # The decoder output lives on its last device when it is split over several.
+            device = self.device
             dtype = prefix_hidden_states.dtype
             del prefix_hidden_states
         past_key_values_uncondition = None
@@ -878,7 +900,8 @@ class NEOChatModel(PreTrainedModel):
         # init noise image tokens
         grid_h = image_size[1] // self.patch_size
         grid_w = image_size[0] // self.patch_size
-        grid_hw = torch.tensor([[grid_h, grid_w]] * batch_size, device=device)
+        # Host-side, so the per-step patch-position setup never waits on the device.
+        grid_hw = torch.tensor([[grid_h, grid_w]] * batch_size)
 
         noise_scale = self.noise_scale
         if self.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
@@ -1027,7 +1050,7 @@ class NEOChatModel(PreTrainedModel):
             else:
                 v_pred = v_pred_condition
 
-            z = z + (t_next - t) * v_pred
+            z = z + (t_next - t) * move_to_device(v_pred, z.device)
 
             image_prediction = self.unpatchify(
                 z, self.patch_size * merge_size, image_size[1], image_size[0]

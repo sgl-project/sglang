@@ -110,9 +110,14 @@ def fused_rope_rotate_half_bitexact(
     Bit-exact vs the eager chunk/neg/cat/mul/add chain.
     """
     if not (
-        x.is_cuda and x.dtype is torch.bfloat16 and x.ndim == 4 and x.is_contiguous()
+        x.device.type in ("cuda", "xpu")
+        and x.dtype is torch.bfloat16
+        and x.ndim == 4
+        and x.is_contiguous()
     ):
-        raise RuntimeError("rotate-half RoPE expects contiguous BF16 CUDA [B, S, H, D]")
+        raise RuntimeError(
+            "rotate-half RoPE expects contiguous BF16 CUDA or XPU [B, S, H, D]"
+        )
     batch, seq_len, heads, head_dim = x.shape
     if cos.ndim not in (2, 4):
         raise RuntimeError("cos must have shape [B * S, rot_dim] or [B, S, 1, rot_dim]")
@@ -134,7 +139,7 @@ def fused_rope_rotate_half_bitexact(
     half = rot // 2
     out = torch.empty_like(x)
     tail = head_dim - rot
-    with torch.cuda.device(device):
+    with torch.get_device_module(device).device(device):
         _rope_rotate_half_kernel[(batch * seq_len,)](
             out,
             x,

@@ -49,10 +49,10 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         if loaded_modules is not None and {"model", "tokenizer"} <= set(loaded_modules):
             return loaded_modules
 
-        if server_args.num_gpus != 1:
+        if server_args.num_gpus != (server_args.tp_size or 1):
             raise ValueError(
-                "SenseNovaU1Pipeline currently supports num_gpus=1. "
-                "Native tensor/pipeline parallelism is not implemented yet."
+                "SenseNovaU1Pipeline parallelizes with tensor parallelism only; "
+                f"set --tp-size to --num-gpus ({server_args.num_gpus})."
             )
         modules = load_model_and_tokenizer(self.model_path, server_args)
         logger.info("Loaded SenseNova-U1 model from %s", self.model_path)
