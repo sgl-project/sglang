@@ -83,6 +83,8 @@ sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" 
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
+# `Frame` and `SizeHint` for a lazily read test body that declares its length.
+http-body = "1"
 # `Router::oneshot` for handler-level router tests.
 tower = { version = "0.5", features = ["util"] }
 # Paused virtual time for deadline tests.
