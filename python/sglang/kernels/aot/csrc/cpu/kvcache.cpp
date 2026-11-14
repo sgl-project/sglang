@@ -107,11 +107,28 @@ void store_cache_cpu(
       "store_cache_cpu: input tensors must have the same dtype");
   const auto index_dtype = indices.scalar_type();
   TORCH_CHECK(index_dtype == at::kLong || index_dtype == at::kInt, "indices must be int64 or int32");
+  TORCH_CHECK(v_cache.size(0) == num_pages, "store_cache_cpu: k_cache and v_cache must have the same number of pages");
 
   // dtype : [bfloat16, float16, uint8] for fp8 KV stored as uint8
   // index_dtype : [int64, int32]
   AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::ScalarType::Byte, dtype, "store_cache_cpu", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "store_cache_cpu_index", [&] {
+      // indices select the destination pool row; validate the whole batch
+      // against the page count before any row pointer is formed (throwing
+      // inside the at::parallel_for worker threads is not safe).
+      const index_t* __restrict__ indices_ptr = indices.data_ptr<index_t>();
+      for (int64_t bs = 0; bs < batch_size; ++bs) {
+        const int64_t idx = static_cast<int64_t>(indices_ptr[bs]);
+        TORCH_CHECK(
+            idx >= 0 && idx < num_pages,
+            "store_cache_cpu: indices[",
+            bs,
+            "] = ",
+            idx,
+            " is out of range [0, ",
+            num_pages,
+            ")");
+      }
       store_cache_kernel_impl<scalar_t, index_t>(
           k.data_ptr<scalar_t>(),
           v.data_ptr<scalar_t>(),
