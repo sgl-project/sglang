@@ -61,9 +61,9 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     enter_late_layer_dp,
     exit_late_layer_dp,
 )
-from sglang.srt.models.deepseek_v4_mhc import HcState
+from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
 from sglang.srt.runtime_context import get_flags, get_parallel
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
@@ -122,14 +122,28 @@ bcg_tail_kv_store = eager_on_graph(True)(_tail_kv_store)
 def _flatten_state(state: HcState):
     """The state's row tensors, whether ``pre`` is among them, and the inverse.
     The normed input and mix stats are dropped (the first tail layer rebuilds
-    them), so every step keys the same graphs."""
-    assert isinstance(state.streams, torch.Tensor), "tail graphs are CUDA only"
+    them), so every step keys the same graphs. Out of the HIP fused boundary the
+    streams are the previous layer's outstanding post, its four row tensors."""
     has_pre = state.pre is not None
-    leaves = [state.streams, state.pre] if has_pre else [state.streams]
+    if isinstance(state.streams, HcPending):
+        streams = list(state.streams)
+        assert all(isinstance(t, torch.Tensor) for t in streams), streams
+        num_streams = len(streams)
 
-    def rebuild(tensors: List[torch.Tensor]) -> HcState:
-        return HcState(tensors[0], tensors[1] if has_pre else None)
+        def rebuild(tensors: List[torch.Tensor]) -> HcState:
+            return HcState(
+                HcPending(*tensors[:num_streams]),
+                tensors[num_streams] if has_pre else None,
+            )
 
+    else:
+        assert isinstance(state.streams, torch.Tensor), type(state.streams)
+        streams = [state.streams]
+
+        def rebuild(tensors: List[torch.Tensor]) -> HcState:
+            return HcState(tensors[0], tensors[1] if has_pre else None)
+
+    leaves = streams + [state.pre] if has_pre else streams
     return leaves, has_pre, rebuild
 
 
@@ -157,7 +171,8 @@ class DecoderReplayTail:
         max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
         if not (
             model.tail_writes_source_kv
-            and is_cuda()
+            # HIP's late-layer DP re-layout is not wired through the tail graphs.
+            and (is_cuda() or (is_hip() and get_parallel().attn_dp_size == 1))
             and max_rows > 0
             # Borrowed graph-pool storage forbids capturing mid-serving.
             and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
@@ -553,6 +568,11 @@ class DecoderReplayTail:
 
     @contextmanager
     def _break_context(self, tail_batch: ForwardBatch):
+        # A backend whose captured KV store reads its target by address points it
+        # at the step's live tail rows, padding rows at the dummy slot.
+        prepare_store = getattr(get_attn_backend(), "prepare_decoder_tail_store", None)
+        if prepare_store is not None:
+            prepare_store(tail_batch.global_num_token_non_padded_cpu)
         outer = get_tc_piecewise_forward_context()
         if outer is not None:
             # Nested in a prefill-graph break: swap only the batch the breaks read.
@@ -593,6 +613,15 @@ class DecoderReplayTail:
         capture_dspark: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
         """The graphs' body; mirrors the model loop past the tail switch."""
+        if not is_cuda():
+            return self._layer_stack_hip(
+                state,
+                positions=positions,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                forward_batch=forward_batch,
+                capture_dspark=capture_dspark,
+            )
         model = self._model
         aux: List[torch.Tensor] = []
         residual_batch.start(forward_batch)
@@ -633,6 +662,59 @@ class DecoderReplayTail:
             )
         finally:
             residual_batch.clear(forward_batch)
+        state = state.materialized(model.layers[self._layer_ids[-1]].hc_cfg)
+        return state.residual, state.pre, aux
+
+    def _layer_stack_hip(
+        self,
+        state: HcState,
+        *,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        forward_batch: ForwardBatch,
+        capture_dspark: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
+        """The HIP model loop past the tail switch: the fused mHC boundary keeps a
+        layer's FFN post pending for the next one, never past the last layer."""
+        from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+        from sglang.srt.models.deepseek_v4_platform_stage import (
+            forward_layer_fused_boundary,
+        )
+
+        model = self._model
+        aux: List[torch.Tensor] = []
+        for i in self._layer_ids:
+            layer = model.layers[i]
+            assert layer.engram is None
+            if capture_dspark and i in model.dspark_layers_to_capture:
+                # The draft head reads the attention input of its target layers.
+                aux.append(mhc_stream_mean(state.residual))
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                if layer.hc_boundary_fused:
+                    state = forward_layer_fused_boundary(
+                        model,
+                        i,
+                        state,
+                        positions=positions,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_ids_global=input_ids_global,
+                        capture_dspark=capture_dspark,
+                    )
+                else:
+                    state = layer.forward_hc_pre_from_prev(
+                        positions=positions,
+                        state=state,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_ids_global=input_ids_global,
+                    )
         state = state.materialized(model.layers[self._layer_ids[-1]].hc_cfg)
         return state.residual, state.pre, aux
 
