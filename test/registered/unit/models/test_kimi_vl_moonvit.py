@@ -60,5 +60,30 @@ def test_learnable_2d_pos_emb_evicts_oldest_inference_cache_entry(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("use_host_grid", [True, False])
+def test_temporal_pooling_preserves_spatial_blocks_in_mixed_batch(use_host_grid):
+    grids = [(1, 4, 6), (3, 6, 9)]
+    generator = torch.Generator().manual_seed(13)
+    clips = [torch.randn(t, h, w, 5, generator=generator) for t, h, w in grids]
+    outputs = kimi_vl_moonvit.tpool_patch_merger(
+        torch.cat([clip.flatten(0, 2) for clip in clips]),
+        torch.tensor(grids),
+        merge_kernel_size=(2, 3),
+        grid_thw_list=grids if use_host_grid else None,
+    )
+    assert len(outputs) == len(clips)
+    for clip, output in zip(clips, outputs):
+        _, height, width, channels = clip.shape
+        frame = clip.mean(dim=0)
+        expected = torch.stack(
+            [
+                frame[h : h + 2, w : w + 3].reshape(6, channels)
+                for h in range(0, height, 2)
+                for w in range(0, width, 3)
+            ]
+        )
+        torch.testing.assert_close(output, expected)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
