@@ -707,6 +707,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             track_rows=track_rows,
+            num_real_seqs=forward_batch._original_batch_size,
         )
         if track_rows is None and forward_batch.mamba_track_indices is not None:
             meta.track_dst[: forward_batch.batch_size].copy_(
