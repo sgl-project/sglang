@@ -72,6 +72,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
@@ -92,6 +93,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -411,10 +413,11 @@ def _copy_grouped_qkv_tp_shard(
     return True
 
 
-def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSNorm:
-    # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
-    # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
-    # reduction, matching that accumulation semantic.
+def _norm(
+    size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE
+) -> nn.RMSNorm | RMSNorm:
+    if current_platform.is_npu():
+        return RMSNorm(size, eps=eps).to(dtype=dtype)
     return nn.RMSNorm(size, eps=eps, dtype=dtype)
 
 
@@ -425,7 +428,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _modulate_rmsnorm_scale_shift(
     x: torch.Tensor,
-    norm: nn.RMSNorm,
+    norm: nn.RMSNorm | RMSNorm,
     shift: torch.Tensor,
     scale: torch.Tensor,
     indices: torch.Tensor,
@@ -441,6 +444,7 @@ def _modulate_rmsnorm_scale_shift(
     """
     if (
         fused
+        and not current_platform.is_npu()
         and x.dtype == dtype == _BF16_DTYPE
         and norm.weight is not None
         and can_use_rmsnorm_indexed_scale_shift(x, norm.weight, shift, scale, indices)
@@ -540,10 +544,12 @@ _ATEN_HEAD_RMSNORM = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm")
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: nn.RMSNorm | RMSNorm,
+    k_norm: nn.RMSNorm | RMSNorm,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if current_platform.is_npu():
+        return q_norm(q), k_norm(k)
     if (
         q.is_cuda
         and q.dtype == _BF16_DTYPE
@@ -671,8 +677,8 @@ _ATEN_HEAD_RMSNORM_ROPE = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm + RoPE"
 def _apply_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: nn.RMSNorm | RMSNorm,
+    k_norm: nn.RMSNorm | RMSNorm,
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
@@ -685,7 +691,8 @@ def _apply_qk_norm_rope(
         )
 
     if (
-        q_norm.eps is not None
+        not current_platform.is_npu()
+        and q_norm.eps is not None
         and k_norm.eps is not None
         and not torch.compiler.is_compiling()
         and can_use_aten_head_rmsnorm(q, q_norm.weight)
@@ -1725,6 +1732,7 @@ class MiniMaxH3MLP(nn.Module):
         self.reuse_fc1_activation = quant_config is None or (
             quant_config.get_name() == "gguf"
         )
+        self._npu_swiglu = SiluAndMul() if current_platform.is_npu() else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not isinstance(x, tuple) and x.device.type == "mps":
@@ -1743,7 +1751,14 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        if (
+            self._npu_swiglu is not None
+            and hidden.device.type == "npu"
+            and hidden.dtype in (torch.float16, torch.bfloat16)
+        ):
+            hidden = self._npu_swiglu(hidden)
+        else:
+            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
 
@@ -1840,15 +1855,16 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
     ) -> torch.Tensor:
-        x = x + self.attn(
+        h = self.attn(
             self.norm1(x),
             rope_cache=None,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        x = x + self.mlp(self.norm2(x))
-        return x
+        # Round the residual sum before normalization, as in the reference.
+        x = x + h
+        return x + self.mlp(self.norm2(x))
 
 
 class MiniMaxH3TokenRefiner(nn.Module):
