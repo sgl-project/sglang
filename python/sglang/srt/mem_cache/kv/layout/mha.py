@@ -444,7 +444,6 @@ class MHAView(MHAKVView):
                 v_buf,
                 loc,
                 dcp_kv_mask,
-                n,
                 h,
                 d,
                 128,
