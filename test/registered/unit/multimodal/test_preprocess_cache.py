@@ -525,6 +525,28 @@ class TestMultimodalPreprocessCache(unittest.TestCase):
         cache.complete_miss(new, b"new")
         self.assertEqual(cache.get("key"), b"new")
 
+    def test_estimate_cache_size_counts_all_providers_with_temporary_items(self):
+        class _Provider:
+            def __init__(self, nbytes: int):
+                self.tensor = torch.zeros(nbytes, dtype=torch.uint8)
+
+            def cache_size_items(self):
+                return (self.tensor,)
+
+        providers = [_Provider(1024) for _ in range(8)]
+        self.assertGreaterEqual(estimate_cache_size_bytes(providers), 8 * 1024)
+
+        provider_map = {f"img-{i}": _Provider(1024) for i in range(8)}
+        self.assertGreaterEqual(estimate_cache_size_bytes(provider_map), 8 * 1024)
+
+    def test_estimate_cache_size_deduplicates_shared_tensor_storage(self):
+        base = torch.zeros(1024, dtype=torch.uint8)
+        views = [base, base[:256], base[256:512]]
+        self.assertEqual(
+            estimate_cache_size_bytes(views),
+            estimate_cache_size_bytes(base),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
