@@ -39,7 +39,9 @@ class TestCFGGating(CustomTestCase):
             guidance_rescale=0,
             do_classifier_free_guidance=True,
             is_cfg_negative=False,
-            sampling_params=SimpleNamespace(cfg_gate_step=cfg_gate_step),
+            sampling_params=SimpleNamespace(
+                cfg_gate_step=cfg_gate_step, quality="lossless"
+            ),
         )
 
     def _make_gate_state(self, gate_step=1, model_id=None, delta=None):
@@ -63,6 +65,7 @@ class TestCFGGating(CustomTestCase):
         calls = []
 
         def fake_predict_noise(**kwargs):
+            self.assertEqual(get_forward_context().quality, "lossless")
             calls.append("neg" if batch.is_cfg_negative else "pos")
             timestep = kwargs["timestep"]
             timestep_value = float(timestep.item())
@@ -189,11 +192,13 @@ class TestCFGGating(CustomTestCase):
     def test_model_switch_invalidates_cached_delta(self):
         stage = DenoisingStage.__new__(DenoisingStage)
         batch = self._make_batch()
+        batch.sampling_params.quality = "exact"
         server_args = self._make_server_args()
         policy = CFGPolicy().build(batch, {}, {}, {})
         calls = []
 
         def fake_predict_noise(**kwargs):
+            self.assertEqual(get_forward_context().quality, "exact")
             calls.append("neg" if batch.is_cfg_negative else "pos")
             value = 3.0 if batch.is_cfg_negative else 10.0
             return torch.tensor([value])

@@ -1,13 +1,11 @@
 """Unit tests for ReqTimeStats.
 
-ReqTimeStatsBase.__setstate__ rebases perf_counter fields onto the receiving
-process's clock anchor. Rebasing a field that was never stamped (0.0) turns
-the sentinel into a tiny epsilon (sender_diff - receiver_diff), which defeats
-== 0.0 / > 0.0 "was this stamped?" checks downstream. Concretely, a PD decode
-server never stamps prefill_finished_time locally; if the sentinel arrives at
-the tokenizer as an epsilon, first-token bookkeeping mistakes it for a real
-stamp and the TTFT / inter-token-latency histograms record ~node-uptime-sized
-garbage samples.
+SchedulerReqTimeStats.to_output_time_stats converts perf_counter stamps to
+wall-clock for the tokenizer. A field that was never stamped (0.0) must arrive
+as None, not as a converted value, or "was this stamped?" checks downstream
+fail. Concretely, a PD decode server never stamps prefill_finished_time
+locally; if the sentinel arrived as a real stamp, first-token bookkeeping would
+record ~node-uptime-sized garbage TTFT / inter-token-latency samples.
 
 The same "was this stamped?" rule governs the gen_ai.latency.* span attrs: the
 ones derived from finished_time are only emitted once it is stamped, and
@@ -19,31 +17,47 @@ import pickle
 import unittest
 from unittest import mock
 
+import msgspec
+
 import sglang.srt.observability.req_time_stats as rts
 from sglang.srt.observability.trace import SpanAttributes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
-    def test_two_hop_round_trip(self):
-        src = rts.SchedulerReqTimeStats()
-        src.enable_metrics = True
-        src.wait_queue_entry_time = 123.456
-        src.prefill_finished_time = 0.0
+def _round_trip(
+    time_stats: rts.SchedulerOutputTimeStats,
+) -> rts.SchedulerOutputTimeStats:
+    """The time stats as the tokenizer receives them over either IPC codec."""
+    time_stats = pickle.loads(pickle.dumps(time_stats))
+    return msgspec.msgpack.decode(
+        msgspec.msgpack.encode(time_stats), type=rts.SchedulerOutputTimeStats
+    )
+
+
+def _meta_info(stats: rts.SchedulerReqTimeStats) -> dict:
+    return _round_trip(stats.to_output_time_stats()).to_meta_info()
+
+
+class TestOutputTimeStatsKeepUnsetStamps(CustomTestCase):
+    def test_unset_stamp_stays_unset(self):
+        stats = rts.SchedulerReqTimeStats(enable_metrics=True)
+        stats.forward_entry_time = 123.456
+        stats.prefill_finished_time = 0.0
 
         with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
-            blob = pickle.dumps(src)
-        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_005.0):
-            hop1 = pickle.loads(blob)
-            blob2 = pickle.dumps(hop1)
-        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_009.0):
-            hop2 = pickle.loads(blob2)
+            sent = _round_trip(stats.to_output_time_stats())
 
-        self.assertEqual(hop2.prefill_finished_time, 0.0)
-        self.assertAlmostEqual(hop2.wait_queue_entry_time, 123.456 - 9.0)
+        self.assertIsNone(sent.prefill_finished_time)
+        self.assertNotIn("prefill_finished_time", sent.to_meta_info())
+        self.assertAlmostEqual(sent.forward_entry_time, 1_000_123.456)
+
+    def test_metrics_disabled_sends_no_time_stats(self):
+        stats = rts.SchedulerReqTimeStats()
+        stats.forward_entry_time = 123.456
+        self.assertIsNone(stats.to_output_time_stats())
 
 
 class TestOutputMetaInfo(CustomTestCase):
@@ -210,22 +224,9 @@ class TestQueueTimeAcrossRetraction(CustomTestCase):
         stats = self._stats()
         self._retract_once(stats)
 
-        self.assertAlmostEqual(stats.convert_to_output_meta_info()["queue_time"], 0.6)
+        self.assertAlmostEqual(_meta_info(stats)["queue_time"], 0.6)
         with mock.patch.object(rts, "SGLANG_TEST_REQUEST_TIME_STATS", True):
             self.assertIn("queue_duration=600.00ms", stats.convert_to_duration())
-
-    def test_queue_time_survives_clock_rebase_across_hops(self):
-        stats = self._stats()
-        self._retract_once(stats)
-
-        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
-            blob = pickle.dumps(stats)
-        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_005.0):
-            blob = pickle.dumps(pickle.loads(blob))
-        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_009.0):
-            tokenizer_side = pickle.loads(blob)
-
-        self.assertAlmostEqual(tokenizer_side.get_queueing_time(), 0.6)
 
     def test_prefill_chunks_do_not_extend_queue_time(self):
         stats = self._stats()
@@ -297,35 +298,25 @@ class TestStorageAdmissionWait(CustomTestCase):
                     clock.return_value = ts
                     observe(ready)
                     if not ready:
-                        self.assertNotIn(
-                            output_key, stats.convert_to_output_meta_info()
-                        )
-                self.assertAlmostEqual(
-                    stats.convert_to_output_meta_info()[output_key], 0.3
-                )
+                        self.assertNotIn(output_key, _meta_info(stats))
+                self.assertAlmostEqual(_meta_info(stats)[output_key], 0.3)
 
-    def test_zero_missing_and_open_intervals_survive_serialization(self):
+    def test_zero_and_open_intervals_survive_serialization(self):
         stats = self._stats()
         stats.observe_storage_prefetch_ready(True)
         stats.observe_storage_staging_ready(True)
-        zero = pickle.loads(pickle.dumps(stats)).convert_to_output_meta_info()
+        zero = _meta_info(stats)
         self.assertEqual(zero["storage_prefetch_wait"], 0.0)
         self.assertEqual(zero["storage_staging_wait"], 0.0)
 
         with mock.patch.object(rts.time, "perf_counter", return_value=100.1):
             stats.observe_storage_prefetch_ready(False)
             stats.observe_storage_staging_ready(False)
-        incomplete = pickle.loads(pickle.dumps(stats)).convert_to_output_meta_info()
+        incomplete = _meta_info(stats)
         self.assertNotIn("storage_prefetch_wait", incomplete)
         self.assertNotIn("storage_staging_wait", incomplete)
 
-        legacy = rts.SchedulerReqTimeStats()
-        legacy.__setstate__({"has_timing_data": True, "queue_duration_s": 1.0})
-        missing = pickle.loads(pickle.dumps(legacy)).convert_to_output_meta_info()
-        self.assertNotIn("storage_prefetch_wait", missing)
-        self.assertNotIn("storage_staging_wait", missing)
-
-    def test_overlap_retraction_clock_rebase_and_retry(self):
+    def test_overlap_retraction_and_retry(self):
         stats = self._stats()
         with mock.patch.object(
             rts.time, "perf_counter", side_effect=[100.1, 100.2, 100.4, 100.5]
@@ -341,12 +332,7 @@ class TestStorageAdmissionWait(CustomTestCase):
             stats.observe_storage_prefetch_ready(True)
         stats.set_forward_entry_time(101.5)
 
-        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
-            blob = pickle.dumps(stats)
-        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_005.0):
-            blob = pickle.dumps(pickle.loads(blob))
-        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_009.0):
-            meta = pickle.loads(blob).convert_to_output_meta_info()
+        meta = _meta_info(stats)
         self.assertAlmostEqual(meta["storage_prefetch_wait"], 0.5)
         self.assertAlmostEqual(meta["storage_staging_wait"], 0.4)
         self.assertAlmostEqual(meta["queue_time"], 1.1)
@@ -355,7 +341,7 @@ class TestStorageAdmissionWait(CustomTestCase):
             stats.observe_storage_staging_ready(False)
         stats.reset_prefill_retry_time()
         stats.set_wait_queue_entry_time(103.0)
-        meta = stats.convert_to_output_meta_info()
+        meta = _meta_info(stats)
         self.assertEqual(meta["storage_prefetch_wait"], 0.0)
         self.assertEqual(meta["storage_staging_wait"], 0.0)
 
@@ -373,9 +359,8 @@ class TestStorageAdmissionWait(CustomTestCase):
             stats.observe_storage_prefetch_ready(True)
             stats.observe_storage_staging_ready(False)
             stats.observe_storage_staging_ready(True)
-            meta = stats.convert_to_output_meta_info()
-            self.assertNotIn("storage_prefetch_wait", meta)
-            self.assertNotIn("storage_staging_wait", meta)
+            self.assertIsNone(stats.storage_prefetch_wait_s)
+            self.assertIsNone(stats.storage_staging_wait_s)
 
 
 if __name__ == "__main__":
