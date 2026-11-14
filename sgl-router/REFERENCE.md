@@ -474,10 +474,18 @@ flags make it cheaper:
   special tokens with no overlapping added-token spellings. Unsafe candidates
   are excluded; if none remain, encoding proceeds without the cache.
 
-On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
-a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
-case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
-backend and cache state. `/metrics` exposes only
+Encoding a ~69K-token DeepSeek-V4 chat's text as one string, `hf` takes ~40 ms,
+`fast` ~4 ms, and a new turn on a cached history ~0.2 ms. The DeepSeek fixtures
+check every case under `hf`, `fast`, and `fast` with L1.
+
+DeepSeek-V4 and V4.1 chats themselves encode as rendered segments: control
+tokens with the added vocabulary, message text without it. Under `fast` the
+router's fastokens tokenizer encodes the segments; under any other backend the
+processor's own HF checkpoint tokenizer does. Segmented encodes bypass the L1
+cache, so `--tokenizer-l1-cache-mb` does not speed up these chats, and their
+tokens count as `encoded`.
+
+Startup logs report the resolved backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
 how much tokenization work the cache reuses.
 

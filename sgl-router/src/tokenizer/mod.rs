@@ -169,9 +169,12 @@ impl TokenizerRegistry {
             .ok();
         match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
+                // fastokens encodes rendered segments as the processor's HF tokenizer does.
+                let router_encodes_segments = me.stats.backend() == stats::EncodeBackend::Fast;
                 let formatter = formatter
                     .with_defaults(&m.default_chat_template_kwargs)
-                    .with_prompt_affixes(me.prompt_affixes.as_ref());
+                    .with_prompt_affixes(me.prompt_affixes.as_ref())
+                    .with_router_segment_encoding(router_encodes_segments);
                 me.chat_model.always_thinks = formatter.always_thinks();
                 me.chat_model.reasoning_toggle =
                     formatter
@@ -379,6 +382,39 @@ mod tests {
             proxy: crate::config::ProxyConfig::default(),
             router_inflight_load: crate::config::InflightLoadConfig::default(),
         }
+    }
+
+    /// DeepSeek prompts encode on the router's tokenizer only over fastokens; the
+    /// HF backend cannot encode segments, so it keeps the processor's own encode.
+    /// Both must produce the same ids.
+    #[test]
+    fn deepseek_encodes_on_the_router_tokenizer_only_with_fast() {
+        let model = "deepseek-ai/DeepSeek-V4.1-Flash";
+        let request = serde_json::json!({"messages": [
+            {"role": "user", "content": "<｜User｜> 你好，世界 123456 'ſ 🚀"},
+        ]});
+        let mut ids = Vec::new();
+        for (backend, routed) in [
+            (crate::config::TokenizerBackend::Fast, true),
+            (crate::config::TokenizerBackend::Hf, false),
+        ] {
+            let mut c = cfg();
+            c.model.id = model.into();
+            c.model.tokenizer_path = Some("tests/fixtures/deepseek_v41_mini/tokenizer.json".into());
+            c.model.tokenizer.backend = backend;
+            let registry = TokenizerRegistry::load_from_config(&c).unwrap();
+            let entry = registry
+                .formatters
+                .get(model)
+                .expect("a DeepSeek formatter");
+            assert_eq!(
+                entry.formatter.router_encodes_deepseek(),
+                routed,
+                "{backend:?}"
+            );
+            ids.push(registry.encode_chat(model, &request).expect("prompt ids"));
+        }
+        assert_eq!(ids[0], ids[1]);
     }
 
     #[test]
