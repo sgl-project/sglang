@@ -572,6 +572,7 @@ POSITIONAL_FIELD_ORDER = (
     "layernorm_sp_min_tokens",
     "hybrid_cache_checkpoints_level",
     "disaggregation_max_top_logprobs_num",
+    "shortest_prefill_aging_factor",
     "indexer_kv_cache_dtype",
 )
 # fmt: on
