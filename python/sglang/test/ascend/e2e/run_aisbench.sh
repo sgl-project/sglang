@@ -24,6 +24,8 @@ show_usage() {
     echo "  --request_rate      Request rate for prefix cache test (default: 0)"
     echo "  --repeat_rate       Repeat rate for prefix cache test (default: 0)"
     echo "  --dp                Data parallelism for prefix cache test (default: 2)"
+    echo "  --seed              Dataset random seed for prefix cache test (optional)"
+    echo "  --warmup-requests   Native aisbench warmup requests before measurement (default: 0)"
     echo "  --generation-kwargs Custom generation kwargs dict string (overrides defaults based on mode)"
     echo "                      Example: 'dict(temperature=0.5, top_k=10, top_p=0.95, seed=None, repetition_penalty=1.03)'"
     echo ""
@@ -51,6 +53,8 @@ INTERNAL_TEMPLATE_DIR="/root/.cache/.cache/aisbench_auto_tools_prefix-master"
 REQUEST_RATE=0
 REPEAT_RATE=0
 DP=1
+SEED=""
+WARMUP_REQUESTS=0
 
 GENERATION_KWARGS=""
 
@@ -126,6 +130,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dp)
             DP="$2"
+            shift 2
+            ;;
+        --seed)
+            SEED="$2"
+            shift 2
+            ;;
+        --warmup-requests)
+            WARMUP_REQUESTS="$2"
             shift 2
             ;;
         -h|--help)
@@ -600,6 +612,13 @@ EOF
             # stdin (absent in CI) and aborts. Patch the disposable copy.
             sed -i "s/from_pretrained(tokenizer_path)/from_pretrained(tokenizer_path, trust_remote_code=True)/" "${DEST_COPY_DIR}"/*.py
 
+            # The toolkit pins --num-warmups 0 in its aisbench perf command.
+            # Raise it to the requested count so aisbench's native warmup
+            # absorbs the first long-context decode after a fresh server start.
+            if [ "${WARMUP_REQUESTS:-0}" -gt 0 ]; then
+                sed -i "s/--num-warmups 0/--num-warmups ${WARMUP_REQUESTS}/" "${DEST_COPY_DIR}/aisbench_test.py"
+            fi
+
             echo "===== [Mode] Prefix Cache Test (Hit Rate: $REPEAT_RATE) ====="
             echo "Use dataset: ${DATASET_NAME}, dataset_file: ${dataset_file}"
             echo "Input tokens: ${INPUT_LEN} | Output tokens: ${OUTPUT_LEN} | Batch size: ${BATCH_SIZE} | Prompts num: ${NUM_PROMPTS}"
@@ -616,6 +635,9 @@ EOF
             # The toolkit opens default_api.py relative to the cwd and writes
             # temp artifacts there, so run from inside the copied toolkit dir.
             PREFIX_TEST_CMD="cd ${INTERNAL_TEMPLATE_DIR} && python3 aisbench_test.py --input_len ${INPUT_LEN} --output_len ${OUTPUT_LEN} --data_num ${NUM_PROMPTS} --concurrency ${BATCH_SIZE} --request_rate ${REQUEST_RATE} --dataset_type prefix_cache --repeat_rate ${TOOLKIT_REPEAT_RATE} --prefix_test --dp ${DP}"
+            if [ -n "$SEED" ]; then
+                PREFIX_TEST_CMD="${PREFIX_TEST_CMD} --seed ${SEED}"
+            fi
             echo "Executing: ${PREFIX_TEST_CMD}"
 
             source ${PYTHON_ENV_FOR_AISBENCH}/bin/activate
