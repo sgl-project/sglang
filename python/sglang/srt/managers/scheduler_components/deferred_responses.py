@@ -85,7 +85,7 @@ class DeferredResponses:
 
     def abort(self, recv_req: AbortReq) -> None:
         for rid, (req, completion) in list(self.held.items()):
-            if recv_req.abort_all or rid.startswith(recv_req.rid):
+            if recv_req.abort_all or rid == recv_req.rid:
                 del self.held[rid]
                 try:
                     completion.cancel()
