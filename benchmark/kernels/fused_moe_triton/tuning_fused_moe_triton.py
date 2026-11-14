@@ -376,7 +376,12 @@ class BenchmarkWorker:
 
 def main(args: argparse.Namespace):
     server_args = ServerArgs(
-        model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
+        model_path=args.model,
+        tp_size=args.tp_size,
+        ep_size=args.ep_size,
+        # ServerArgs resolution reads the HF config, which needs this flag for
+        # checkpoints that ship custom modeling code (e.g. LLaDA2MoeModelLM).
+        trust_remote_code=True,
     )
 
     model_config = get_model_config(
