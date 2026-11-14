@@ -135,6 +135,19 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
+    # DSPARK configuration, kept in sync with the decode node: the PD prefill
+    # worker prunes the draft to context-KV injection, and both peers must
+    # register the same target + draft state sub-pools.
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
 ]
 
 # Decode node launch arguments.
