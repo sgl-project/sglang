@@ -1142,8 +1142,11 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return result = [(2,4),(6,7)]
         """
         mask = input_ids == mm_token_id
-        start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
-        end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
+        if mask.numel() == 0:
+            return []
+        padded = torch.nn.functional.pad(mask, (1, 1), value=False)
+        start_positions = (mask & ~padded[:-2]).nonzero(as_tuple=True)[0]
+        end_positions = (mask & ~padded[2:]).nonzero(as_tuple=True)[0]
         return list(zip(start_positions.tolist(), end_positions.tolist()))
 
     @staticmethod
