@@ -89,13 +89,18 @@ def hipcc_path():
 
 
 def build_gfx950_module(src: str, prefix: str) -> ctypes.c_void_p:
-    """Compile ``src`` for gfx950 with hipcc into a fresh temp dir and load it.
+    """Compile ``src`` for gfx950 with hipcc into a fresh temp dir and load it."""
+    return build_hip_module(src, prefix, "gfx950")
+
+
+def build_hip_module(src: str, prefix: str, arch: str) -> ctypes.c_void_p:
+    """Compile ``src`` for ``arch`` (e.g. gfx942) with hipcc into a fresh temp dir and load it.
 
     Raises OSError / subprocess.CalledProcessError (with text stderr) when hipcc
     fails, and RuntimeError when the code object does not load.
     """
     co = os.path.join(tempfile.mkdtemp(prefix=prefix), "k.co")
-    cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, src]
+    cmd = [hipcc_path(), "--genco", f"--offload-arch={arch}", "-O3", "-o", co, src]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
     mod = ctypes.c_void_p()
     check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "hipModuleLoad")
