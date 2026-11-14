@@ -752,6 +752,31 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertFalse(runner.can_run_graph(forward_batch))
 
 
+class TestExtendForwardKwargs(CustomTestCase):
+    def test_input_embeds_take_the_model_dtype(self):
+        """A fixed bfloat16 would reach the layers of a model that runs another dtype."""
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                runner = ModelRunner.__new__(ModelRunner)
+                runner.support_pp = False
+                runner.is_generation = True
+                runner.dtype = dtype
+                batch = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=1,
+                    input_ids=torch.arange(2),
+                    input_embeds=torch.zeros(2, 8, dtype=torch.float32),
+                    req_pool_indices=torch.tensor([0]),
+                    seq_lens=torch.tensor([2]),
+                    out_cache_loc=torch.arange(2),
+                    seq_lens_sum=2,
+                )
+
+                kwargs = runner._extend_forward_kwargs(batch, pp_proxy_tensors=None)
+
+                self.assertEqual(kwargs["input_embeds"].dtype, dtype)
+
+
 class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
     @staticmethod
     def _runner(counter, is_full_backend=True):
