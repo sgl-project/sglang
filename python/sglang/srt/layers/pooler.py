@@ -312,7 +312,10 @@ class CrossEncodingPooler(nn.Module):
     ) -> EmbeddingPoolerOutput:
         """Pools sentence pair scores from the hidden_states."""
 
-        prompt_lens = forward_batch.extend_seq_lens
+        # Python slice bounds must not read a CUDA scalar for every request.
+        prompt_lens = forward_batch.extend_seq_lens_cpu
+        if prompt_lens is None:
+            prompt_lens = forward_batch.extend_seq_lens.tolist()
 
         offset = 0
         pooled_data_lst = []
