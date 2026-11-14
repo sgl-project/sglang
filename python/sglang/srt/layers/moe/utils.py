@@ -226,6 +226,9 @@ class _MoeRunnerBackendPredicates:
     def is_flashinfer_cutedsl(self):
         return self.value == MoeRunnerBackend.FLASHINFER_CUTEDSL.value
 
+    def is_flashinfer_cutile(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_CUTILE.value
+
     def is_flashinfer_megamoe(self):
         return self.value == MoeRunnerBackend.FLASHINFER_MEGAMOE.value
 
@@ -281,6 +284,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_CUTILE = "flashinfer_cutile"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUTLASS = "cutlass"
     MARLIN = "marlin"

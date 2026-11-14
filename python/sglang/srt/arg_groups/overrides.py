@@ -1704,6 +1704,17 @@ def _dp_lm_head_validation(view: Any) -> dict:
 def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     """Resolve MoE runner backends from quantization."""
     moe_runner_backend = view.moe_runner_backend
+    # Only the M3.1 NVFP4 scheme builds the cuTile runner; any other quant method
+    # would ignore the flag and silently run its own backend.
+    if (
+        moe_runner_backend == "flashinfer_cutile"
+        and view.quantization != "minimax_m3_nvfp4"
+    ):
+        raise ValueError(
+            "--moe-runner-backend flashinfer_cutile supports only "
+            "--quantization minimax_m3_nvfp4 (MiniMax-M3.1 NVFP4 experts), got "
+            f"{view.quantization!r}."
+        )
     if view.quantization == "nvfp4_online":
         use_megamoe_w4a16 = (
             view.moe_a2a_backend == "flashinfer_megamoe"
