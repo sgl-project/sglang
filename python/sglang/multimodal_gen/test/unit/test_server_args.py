@@ -174,21 +174,15 @@ class TestServerArgsColdImport(unittest.TestCase):
 
 
 class TestPlatformLifecycleHooks(unittest.TestCase):
-    def test_server_args_runs_platform_preparation_hooks(self):
-        with (
-            patch.object(
-                current_platform, "apply_server_args_defaults"
-            ) as apply_defaults,
-            patch.object(
-                current_platform, "prepare_attention_backend"
-            ) as prepare_attention,
-        ):
+    def test_server_args_applies_platform_defaults(self):
+        with patch.object(
+            current_platform, "apply_server_args_defaults"
+        ) as apply_defaults:
             server_args = _from_dict_without_model_resolution(
                 {"model_path": "test/model"}
             )
 
         apply_defaults.assert_called_once_with(server_args)
-        prepare_attention.assert_called_once_with(server_args)
 
 
 class _CudaPlatformTestCase(unittest.TestCase):

@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 
 def load_mindiesd_quant_attention() -> Callable[..., torch.Tensor]:
-    """Load the optional SDK before NPU initialization configures custom OPP paths."""
+    """Load the optional SDK and check its public quantized attention API."""
     try:
         from mindiesd import quant_attention
     except ImportError as error:
@@ -250,27 +250,8 @@ class AscendFAMetadataBuilder(AttentionMetadataBuilder):
 class AscendFABackend(AttentionBackend):
     @staticmethod
     def prepare_for_server_args(server_args: "ServerArgs") -> None:
-        # Inspect the config without changing the normal ServerArgs parsing flow.
         config = server_args.attention_backend_config or {}
-        if isinstance(config, str):
-            config = server_args._parse_attention_backend_config(config)
-        if "precision" not in config or config["precision"] == "bf16":
-            return
-
-        components, roles = server_args._split_component_attention_backends(
-            server_args.component_attention_backends,
-            server_args.component_attention_backend_roles,
-        )
-        backends = [server_args.attention_backend, *components.values()]
-        backends.extend(
-            backend for entries in roles.values() for backend in entries.values()
-        )
-        if any(
-            backend is None
-            or server_args._normalize_attention_backend_name(backend) == "fa"
-            for backend in backends
-        ):
-            # Load before device queries so workers inherit the custom OPP paths.
+        if config.get("precision") not in (None, "bf16"):
             load_mindiesd_quant_attention()
 
     @staticmethod

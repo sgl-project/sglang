@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
     AscendFAMetadata,
     AscendFAMetadataBuilder,
     AscendQuantAttention,
-    load_mindiesd_quant_attention,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
@@ -423,11 +422,20 @@ def test_capabilities_and_lse(adapter):
 
 @pytest.mark.parametrize("missing", [True, False])
 def test_missing_sdk_or_api(monkeypatch, missing):
+    from sglang.multimodal_gen.runtime import server_args
+
     monkeypatch.setitem(
         sys.modules, "mindiesd", None if missing else ModuleType("mindiesd")
     )
+    monkeypatch.setattr(
+        server_args,
+        "get_global_server_args",
+        lambda: SimpleNamespace(attention_backend_config={"precision": "fp8"}),
+    )
     with pytest.raises(ImportError, match="MindIE-SD"):
-        load_mindiesd_quant_attention()
+        NPUPlatformBase.get_attn_backend_cls_str(
+            AttentionBackendEnum.FA, 128, torch.bfloat16
+        )
 
 
 def test_only_fa_is_registered():
@@ -440,40 +448,39 @@ def test_only_fa_is_registered():
 
 
 @pytest.mark.parametrize(
-    "global_backend,components,roles,config,enabled,expected",
+    "selected_backend,config,expected",
     [
-        (None, {}, {}, {}, False, False),
-        ("fa", {}, {}, {}, True, False),
-        ("fa", {}, {}, {"precision": "bf16"}, True, False),
-        ("fa", {}, {}, {"precision": "fp8"}, False, True),
-        ("fa3", {}, {}, {"precision": "mxfp4"}, False, True),
-        (None, "transformer=fa", {}, {"precision": "fp8"}, False, True),
-        (None, '{"transformer.self":"fa"}', {}, {"precision": "mxfp8"}, False, True),
-        (None, {}, {"transformer": {"self": "fa"}}, {"precision": "fp8"}, False, True),
-        ("torch_sdpa", {}, {}, {"precision": "fp8"}, False, False),
-        ("torch_sdpa", {"transformer": "fa"}, {}, {"precision": "mxfp8"}, False, True),
+        (AttentionBackendEnum.FA, None, False),
+        (AttentionBackendEnum.FA, {}, False),
+        (AttentionBackendEnum.FA, {"precision": "bf16"}, False),
+        (AttentionBackendEnum.FA, {"precision": "fp8"}, True),
+        (AttentionBackendEnum.FA, {"precision": "mxfp8"}, True),
+        (AttentionBackendEnum.FA, {"precision": "mxfp4"}, True),
+        (AttentionBackendEnum.TORCH_SDPA, {"precision": "fp8"}, False),
+        (None, {"precision": "fp8"}, False),
     ],
 )
-def test_early_sdk_loading_covers_all_selection_forms(
-    monkeypatch, global_backend, components, roles, config, enabled, expected
+def test_fa_selection_loads_sdk_only_for_quantization(
+    monkeypatch, selected_backend, config, expected
 ):
+    from sglang.multimodal_gen.runtime import server_args
     from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
-    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-    args = ServerArgs.__new__(ServerArgs)
-    args.attention_backend = global_backend
-    args.attention_backend_config = config
-    args.component_attention_backends = components
-    args.component_attention_backend_roles = roles
-    monkeypatch.setattr(
-        ascend_fa.envs, "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", enabled
-    )
+    get_args = Mock(return_value=SimpleNamespace(attention_backend_config=config))
+    if config is None:
+        get_args.side_effect = ValueError("Global sgl_diffusion args is not set.")
+    monkeypatch.setattr(server_args, "get_global_server_args", get_args)
     loader = Mock()
     monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
-    NPUPlatformBase().prepare_attention_backend(args)
+    backend = NPUPlatformBase.get_attn_backend_cls_str(
+        selected_backend, 128, torch.bfloat16
+    )
     assert loader.call_count == int(expected)
-    assert args.component_attention_backends == components
-    assert args.component_attention_backend_roles == roles
+    assert backend.endswith(
+        "AscendFABackend"
+        if selected_backend == AttentionBackendEnum.FA
+        else "SDPABackend"
+    )
 
 
 def test_invalid_adapter_layout_or_head_size(adapter):
@@ -806,7 +813,8 @@ def test_unaligned_mxfp8_batch_uses_independent_sequences(adapter):
 
 
 @pytest.mark.parametrize("form", ["json", "pairs", "json_file", "yaml_file"])
-def test_early_config_parsing_supports_all_cli_forms(monkeypatch, form):
+def test_sdk_loading_uses_parsed_cli_config(monkeypatch, form):
+    from sglang.multimodal_gen.runtime import server_args
     from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -823,16 +831,14 @@ def test_early_config_parsing_supports_all_cli_forms(monkeypatch, form):
         monkeypatch.setattr(os.path, "exists", lambda path: path == raw)
         monkeypatch.setattr("builtins.open", mock_open(read_data=contents))
     args = ServerArgs.__new__(ServerArgs)
-    args.attention_backend = "fa"
-    args.attention_backend_config = raw
-    args.component_attention_backends = {}
-    args.component_attention_backend_roles = {}
+    args.attention_backend_config = args._parse_attention_backend_config(raw)
     loader = Mock()
     monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
-    NPUPlatformBase().prepare_attention_backend(args)
-    # Preloading must not bypass the normal string -> addict.Dict conversion.
-    assert args.attention_backend_config == raw
-    assert args._parse_attention_backend_config(raw) == {
+    monkeypatch.setattr(server_args, "get_global_server_args", lambda: args)
+    NPUPlatformBase.get_attn_backend_cls_str(
+        AttentionBackendEnum.FA, 128, torch.bfloat16
+    )
+    assert args.attention_backend_config == {
         "precision": "fp8",
         "fp8_fa_mode": "C8V16_TILING512",
         "head_chunk_size": 4,
@@ -909,7 +915,6 @@ def make_server_args(monkeypatch):
         ("get_available_gpu_memory", 80),
         ("enable_dit_layerwise_offload_by_default", True),
         ("apply_server_args_defaults", None),
-        ("prepare_attention_backend", None),
     ):
         monkeypatch.setattr(
             current_platform, name, lambda *args, result=result, **kwargs: result
@@ -922,35 +927,6 @@ def make_server_args(monkeypatch):
             return ServerArgs.from_dict(options)
 
     return build
-
-
-def test_mindiesd_loads_before_parameter_adjustment(monkeypatch, make_server_args):
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-    from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
-    adjust = ServerArgs._adjust_parameters
-    load_sdk = Mock()
-    monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", load_sdk)
-    monkeypatch.setattr(
-        current_platform,
-        "prepare_attention_backend",
-        NPUPlatformBase().prepare_attention_backend,
-    )
-
-    def check_then_adjust(args):
-        # Parameter adjustment can query device memory and initialize NPU.
-        load_sdk.assert_called_once()
-        return adjust(args)
-
-    monkeypatch.setattr(ServerArgs, "_adjust_parameters", check_then_adjust)
-    make_server_args(
-        {
-            "model_path": "test/model",
-            "attention_backend": "fa",
-            "attention_backend_config": {"precision": "fp8"},
-        }
-    )
 
 
 @pytest.mark.parametrize(

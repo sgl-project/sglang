@@ -141,10 +141,6 @@ class Platform:
         """Apply defaults before argument normalization and validation."""
         pass
 
-    def prepare_attention_backend(self, server_args: ServerArgs) -> None:
-        """Prepare optional attention dependencies before device initialization."""
-        pass
-
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend

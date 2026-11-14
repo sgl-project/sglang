@@ -3,7 +3,7 @@
 
 import os
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 
@@ -16,9 +16,6 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 
 
 def device_id_to_physical_device_id(device_id: int) -> int:
@@ -42,13 +39,6 @@ class NPUPlatformBase(Platform):
     device_type: str = "npu"
     dispatch_key: str = "NPU"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
-
-    def prepare_attention_backend(self, server_args: "ServerArgs") -> None:
-        from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
-            AscendFABackend,
-        )
-
-        AscendFABackend.prepare_for_server_args(server_args)
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -124,6 +114,18 @@ class NPUPlatformBase(Platform):
         dtype: torch.dtype,
     ) -> str:
         if selected_backend == AttentionBackendEnum.FA:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+                AscendFABackend,
+            )
+            from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+            try:
+                server_args = get_global_server_args()
+            except ValueError:
+                # Standalone native FA does not require global server arguments.
+                pass
+            else:
+                AscendFABackend.prepare_for_server_args(server_args)
             logger.info("Using Ascend Flash Attention backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
 
