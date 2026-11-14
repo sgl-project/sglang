@@ -49,6 +49,8 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+# Tail of each request's context inserted into the trie once its prefill ends.
+NGRAM_EXTEND_PROMPT_WINDOW = 1024
 
 
 def _derive_tree_links(
@@ -155,6 +157,8 @@ class NGRAMWorker(BaseSpecWorker):
         return None
 
     def clear_cache_pool(self):
+        # Drain queued inserts first, or they land after the reset.
+        self.ngram_corpus.synchronize()
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
 
@@ -403,15 +407,28 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=self.draft_token_num,
         )
 
+    def _insert_extend_prompt_tails(self, batch: ScheduleBatch) -> None:
+        """Seed the trie with each request's context once its prefill finishes."""
+        batch_tokens = []
+        for req in batch.reqs:
+            # A middle chunk would re-insert the same tail on every chunk.
+            if req is batch.chunked_req:
+                continue
+            # Unpadded: multimodal pad values are cache identities, not tokens.
+            tail = list(req.output_ids[-NGRAM_EXTEND_PROMPT_WINDOW:])
+            need = NGRAM_EXTEND_PROMPT_WINDOW - len(tail)
+            if need > 0:
+                tail = list(req.origin_input_ids_unpadded[-need:]) + tail
+            if tail:
+                batch_tokens.append(tail)
+        if batch_tokens:
+            self.ngram_corpus.batch_put(batch_tokens)
+
     def _update_ngram_corpus(self, batch: ScheduleBatch):
+        # Prompt context is inserted at extend by _insert_extend_prompt_tails.
         batch_tokens = []
         i, stride = 0, self.draft_token_num
         for req in batch.reqs:
-            # FIXME: Whether to insert 'extend' into the cache or not, after testing,
-            # there is not much difference, so we will not insert it for now.
-            # if batch.forward_mode.is_extend():
-            #     put_ids = req.origin_input_ids + req.output_ids
-            # else:
             prev_tokens = self.prev_token_ids[
                 i * stride : i * stride + self.prev_accept_lens[i]
             ]
@@ -566,6 +583,8 @@ class NGRAMWorker(BaseSpecWorker):
             batch_result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
+            if batch.forward_mode.is_extend():
+                self._insert_extend_prompt_tails(batch)
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

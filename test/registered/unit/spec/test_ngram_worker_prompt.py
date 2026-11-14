@@ -1,6 +1,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import torch
@@ -82,6 +83,18 @@ class TestNgramWorkerPrompt(CustomTestCase):
                         req.output_ids.append(6)
                     self.assertEqual(req.origin_input_ids, padded)
                     self.assertEqual(list(req.origin_input_ids_unpadded), [1, 2, 3])
+
+    def test_extend_inserts_unpadded_tail_after_last_chunk(self):
+        req = Req("mm", "", array("q", [1, 2, 3]), SamplingParams())
+        req.origin_input_ids = array("q", [1, 1 << 60, 2, 3])
+        other = Req("text", "", array("q", [4, 5]), SamplingParams())
+        for chunked_req, expected in [(req, [[4, 5]]), (None, [[1, 2, 3], [4, 5]])]:
+            worker = object.__new__(NGRAMWorker)
+            worker.ngram_corpus = MagicMock()
+            worker._insert_extend_prompt_tails(
+                SimpleNamespace(reqs=[req, other], chunked_req=chunked_req)
+            )
+            worker.ngram_corpus.batch_put.assert_called_once_with(expected)
 
 
 if __name__ == "__main__":
