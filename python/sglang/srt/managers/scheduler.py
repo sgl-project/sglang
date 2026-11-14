@@ -4810,6 +4810,11 @@ class Scheduler(
             return None, running_batch
 
         can_run_set = set(can_run_list)
+        if self.enable_unified_cache_external_linker:
+            # The adder has taken each admitted request's lock; requests it
+            # rejected keep their publication hold for the next attempt.
+            for req in can_run_list:
+                self.tree_cache.linker.adopt_prefetch(req)
         retries = self.tree_cache.storage_prefetch_retries
         if self.enable_hicache_storage and retries is not None:
             for req in can_run_list:

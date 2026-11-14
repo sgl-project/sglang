@@ -206,6 +206,29 @@ def _swa_allocator(swa_req_ring):
 
 
 class TestMooncakePrefetch(CustomTestCase):
+    def test_lookup_runs_on_dedicated_worker(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.load_mode = "prefetch"
+        linker.lookup_queue = Queue()
+        linker.lookup = MagicMock(return_value=[1, 3])
+        linker.lookup_thread = threading.Thread(target=linker.lookup_thread_func)
+        linker.lookup_thread.start()
+
+        def stop():
+            linker.lookup_queue.put(None)
+            linker.lookup_thread.join(5)
+            assert not linker.lookup_thread.is_alive()
+
+        self.addCleanup(stop)
+
+        future = linker.submit_lookup(
+            "rid", [PoolTransfer(name=PoolName.KV, keys=["page"])]
+        )
+
+        assert future is not None
+        assert future.result(timeout=5) == [1, 3]
+        linker.lookup.assert_called_once()
+
     def _linker(self, read):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.load_mode = "prefetch"
@@ -327,7 +350,9 @@ class TestMooncakePrefetch(CustomTestCase):
 
 
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete"):
+    def _fixture(
+        self, *, swa=False, mamba=False, policy="wait_complete", request_aware=False
+    ):
         cfg = CacheConfig(
             page_size=1 if mamba else 2,
             components=(ComponentType.FULL,)
@@ -345,15 +370,35 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             backend.pools[PoolName.SWA] = object()
         backend.load_mode = "prefetch"
         backend.prefetch_policy = policy
+        backend.lookup_futures = []
         backend.prefetch_futures = []
+
+        def submit_lookup(rid, transfers):
+            future = Future()
+            backend.lookup_futures.append(future)
+            return future
 
         def submit(transfers):
             future = Future()
             backend.prefetch_futures.append(future)
             return future
 
+        backend.submit_lookup = MagicMock(side_effect=submit_lookup)
         backend.prefetch = MagicMock(side_effect=submit)
         backend.lookup = MagicMock(wraps=backend.lookup)
+        if request_aware:
+            backend.request_prefetch = True
+            backend.submit_prefetch_lookup = MagicMock(
+                side_effect=lambda context, transfers: submit_lookup(
+                    context.request.rid, transfers
+                )
+            )
+            backend.prefetch_request = MagicMock(
+                side_effect=lambda request, transfers: submit(transfers)
+            )
+            backend.cancel_prefetch_request = MagicMock()
+            backend.release_prefetch_request = MagicMock()
+            backend.poll_prefetch = MagicMock()
         backend.restorable = list(range(1, 6 // cfg.page_size + 1))
         with get_context().override_server_args(
             hicache_storage_prefetch_policy="best_effort",
@@ -370,6 +415,9 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             lambda: [
                 f.set_result(False) for f in backend.prefetch_futures if not f.done()
             ]
+        )
+        self.addCleanup(
+            lambda: [f.set_result([]) for f in backend.lookup_futures if not f.done()]
         )
         return cache, backend, self._request(), allocator
 
@@ -407,8 +455,10 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 free + cache.mamba_evictable_size() + cache.mamba_protected_size() == 20
             )
 
-    def _enqueue(self, cache, req):
+    def _enqueue(self, cache, req, *, complete_lookup=True):
         # Exercise the real scheduler hook without simulating its entire loop.
+        backend = cache.linker.cache_linker
+        submitted = len(backend.lookup_futures)
         scheduler = SimpleNamespace(
             enable_unified_cache_external_linker=True,
             enable_hicache_storage=False,
@@ -416,6 +466,314 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             tree_cache=cache,
         )
         Scheduler._prefetch_kvcache(scheduler, req)
+        if complete_lookup and len(backend.lookup_futures) > submitted:
+            backend.lookup_futures[-1].set_result(list(backend.restorable))
+            cache.linker.check_prefetch_events()
+
+    def test_prefetch_lookup_is_non_blocking_and_allocates_only_after_hit(self):
+        cache, backend, req, allocator = self._fixture()
+        available = allocator.available_size()
+
+        self._enqueue(cache, req, complete_lookup=False)
+
+        assert len(backend.lookup_futures) == 1
+        assert not backend.lookup.called
+        assert not backend.prefetch_futures
+        assert allocator.available_size() == available
+        assert not cache.check_prefetch_progress(req.cache_request_handle)
+
+        backend.lookup_futures[0].set_result(list(backend.restorable))
+        cache.linker.check_prefetch_events()
+
+        assert len(backend.prefetch_futures) == 1
+        assert allocator.available_size() == available - 6
+
+    def test_default_submit_lookup_keeps_lookup_only_backends_prefetching(self):
+        for lookup_fails in (False, True):
+            with self.subTest(lookup_fails=lookup_fails):
+                cache, backend, req, allocator = self._fixture()
+                # Use the base-class default, as a lookup()+prefetch() backend does.
+                del backend.submit_lookup
+                if lookup_fails:
+                    backend.lookup.side_effect = RuntimeError("lookup failed")
+                self._enqueue(cache, req)
+                backend.lookup.assert_called_once()
+                cache.linker.check_prefetch_events()
+                if lookup_fails:
+                    assert not cache.linker.prefetches
+                    assert not backend.prefetch_futures
+                    assert allocator.available_size() == 32
+                else:
+                    assert len(backend.prefetch_futures) == 1
+                    backend.prefetch_futures[0].set_result(True)
+                    cache.linker.check_prefetch_events()
+                    assert self._match(cache, req).device_prefix_len == 6
+                self._assert_balanced(cache, allocator)
+
+    def test_request_lookup_allocates_after_completion_and_holds_publication(self):
+        cache, backend, req, allocator = self._fixture(request_aware=True)
+        handle = req.cache_request_handle
+        self._enqueue(cache, req, complete_lookup=False)
+        context = backend.submit_prefetch_lookup.call_args.args[0]
+        assert context.request == handle
+        assert context.token_ids == req.origin_input_ids.tobytes()
+        assert (context.local_hit_tokens, context.max_restore_tokens) == (0, 6)
+        assert not backend.submit_lookup.called and not backend.lookup.called
+        cache.check_hicache_events()
+        assert allocator.available_size() == 32
+        backend.prefetch_request.assert_not_called()
+        backend.lookup_futures[0].set_result([1, 2, 3])
+        cache.check_hicache_events()
+        assert allocator.available_size() == 26
+        assert self._match(cache, req).device_prefix_len == 0
+        backend.prefetch_futures[0].set_result(True)
+        cache.check_hicache_events()
+        assert self._match(cache, req).device_prefix_len == 6
+        assert cache.full_protected_size() == 6
+        backend.poll_prefetch.assert_called()
+        backend.release_prefetch_request.assert_called_once_with(handle)
+        with self.assertRaisesRegex(RuntimeError, "admitted request lock"):
+            cache.linker.adopt_prefetch(req)
+        # Admission takes the real tree lock before the publication hold drops.
+        req.init_next_round_input(cache, cow_mamba=False)
+        lock = cache.inc_lock_ref(req.last_node).to_dec_params()
+        req.lock = lock
+        cache.linker.adopt_prefetch(req)
+        assert not cache.linker.prefetch_holds
+        assert cache.full_protected_size() == 6
+        cache.dec_lock_ref(req.last_node, lock)
+        req.lock = None
+        assert cache.full_protected_size() == 0
+        self._assert_balanced(cache, allocator)
+
+    def test_release_request_drops_an_unadmitted_publication_hold(self):
+        cache, backend, req, allocator = self._fixture(request_aware=True)
+        self._enqueue(cache, req)
+        backend.prefetch_futures[0].set_result(True)
+        cache.check_hicache_events()
+        assert cache.full_protected_size() == 6
+        cache.linker.release_request(req.cache_request_handle)
+        assert not cache.linker.prefetch_holds
+        assert cache.full_protected_size() == 0
+        backend.release_prefetch_request.assert_called_once_with(
+            req.cache_request_handle
+        )
+        self._assert_balanced(cache, allocator)
+
+    def test_new_attempt_drops_only_the_previous_publication_hold(self):
+        cache, backend, old, allocator = self._fixture(request_aware=True)
+        self._enqueue(cache, old)
+        backend.prefetch_futures[0].set_result(True)
+        cache.check_hicache_events()
+        new = self._request(attempt=1)
+        self._enqueue(cache, new)
+        assert not cache.linker.prefetch_holds
+        assert cache.full_protected_size() == 0
+        backend.release_prefetch_request.assert_called_once_with(
+            old.cache_request_handle
+        )
+        self._assert_balanced(cache, allocator)
+
+    def test_superseded_attempt_is_released_by_its_own_handle_once(self):
+        cache, backend, old, allocator = self._fixture(request_aware=True)
+        self._enqueue(cache, old, complete_lookup=False)
+        assert backend.lookup_futures[0].set_running_or_notify_cancel()
+        new = self._request(attempt=1)
+        self._enqueue(cache, new, complete_lookup=False)
+        backend.cancel_prefetch_request.assert_called_once_with(
+            old.cache_request_handle
+        )
+        backend.lookup_futures[1].set_result([1, 2, 3])
+        cache.linker.check_prefetch_events()
+        assert backend.prefetch_request.call_args.args[0] == new.cache_request_handle
+        backend.prefetch_futures[0].set_result(True)
+        cache.linker.check_prefetch_events()
+        assert self._match(cache, new).device_prefix_len == 6
+        assert list(cache.linker.prefetch_holds) == [new.cache_request_handle]
+        backend.release_prefetch_request.assert_called_once_with(
+            new.cache_request_handle
+        )
+        backend.lookup_futures[0].set_result([1, 2, 3])
+        cache.linker.check_prefetch_events()
+        assert backend.prefetch_request.call_count == 1
+        assert backend.release_prefetch_request.call_args_list == [
+            call(new.cache_request_handle),
+            call(old.cache_request_handle),
+        ]
+        assert not cache.linker.prefetches
+        assert list(cache.linker.prefetch_holds) == [new.cache_request_handle]
+        self._assert_balanced(cache, allocator)
+
+    def test_cancel_running_lookup_waits_for_terminal_completion(self):
+        cache, backend, req, allocator = self._fixture(request_aware=True)
+        handle = req.cache_request_handle
+        self._enqueue(cache, req, complete_lookup=False)
+        assert backend.lookup_futures[0].set_running_or_notify_cancel()
+        cache.linker.release_request(handle)
+        backend.cancel_prefetch_request.assert_called_once_with(handle)
+        cache.check_hicache_events()
+        assert handle in cache.linker.prefetches
+        assert allocator.available_size() == 32
+        backend.release_prefetch_request.assert_not_called()
+        backend.lookup_futures[0].set_result([3])
+        cache.check_hicache_events()
+        backend.prefetch_request.assert_not_called()
+        backend.release_prefetch_request.assert_called_once_with(handle)
+        assert not cache.linker.prefetches
+        self._assert_balanced(cache, allocator)
+
+    def test_cancel_running_restore_does_not_free_slots_or_publish(self):
+        cache, backend, req, allocator = self._fixture(request_aware=True)
+        handle = req.cache_request_handle
+        self._enqueue(cache, req)
+        write = backend.prefetch_futures[0]
+        assert write.set_running_or_notify_cancel()
+        cache.linker.release_request(handle)
+        cache.check_hicache_events()
+        assert allocator.available_size() == 26
+        assert self._match(cache, req).device_prefix_len == 0
+        backend.release_prefetch_request.assert_not_called()
+        write.set_result(True)
+        cache.check_hicache_events()
+        assert allocator.available_size() == 32
+        assert self._match(cache, req).device_prefix_len == 0
+        assert not cache.linker.prefetch_holds
+        backend.release_prefetch_request.assert_called_once_with(handle)
+        self._assert_balanced(cache, allocator)
+
+    def test_request_lookup_failure_releases_without_device_allocation(self):
+        cache, backend, req, allocator = self._fixture(request_aware=True)
+        self._enqueue(cache, req, complete_lookup=False)
+        backend.lookup_futures[0].set_exception(RuntimeError("lookup failed"))
+        cache.check_hicache_events()
+        assert not cache.linker.prefetches
+        backend.prefetch_request.assert_not_called()
+        backend.release_prefetch_request.assert_called_once_with(
+            req.cache_request_handle
+        )
+        assert allocator.available_size() == 32
+        self._assert_balanced(cache, allocator)
+
+    def test_rank_agreement_truncates_or_ends_the_lookup_once(self):
+        for common_pages in (0, 1):
+            with self.subTest(common_pages=common_pages):
+                cache, backend, req, allocator = self._fixture(request_aware=True)
+                handle = req.cache_request_handle
+                self._enqueue(cache, req, complete_lookup=False)
+                backend.lookup_futures[0].set_result([1, 2, 3])
+
+                def reduce(value, op, common_pages=common_pages):
+                    # A peer rank restores only `common_pages` of the 3-page tail.
+                    if value.numel() == 4:
+                        value[common_pages + 1 :] = 0
+
+                cache._all_reduce_attn_groups = reduce
+                cache.linker.check_prefetch_events()
+                if common_pages == 0:
+                    backend.prefetch_request.assert_not_called()
+                    assert not cache.linker.prefetches
+                    assert allocator.available_size() == 32
+                else:
+                    transfers = backend.prefetch_request.call_args.args[1]
+                    assert len(transfers[0].device_indices) == 2
+                    assert allocator.available_size() == 30
+                    backend.release_prefetch_request.assert_not_called()
+                    backend.prefetch_futures[0].set_result(True)
+                    cache.linker.check_prefetch_events()
+                    assert self._match(cache, req).device_prefix_len == 2
+                backend.release_prefetch_request.assert_called_once_with(handle)
+                self._assert_balanced(cache, allocator)
+
+    def test_partial_rejection_keeps_backend_ownership_until_terminal(self):
+        for stage, rejecting in product(("lookup", "load"), ("local", "peer")):
+            with self.subTest(stage=stage, rejecting=rejecting):
+                cache, backend, req, allocator = self._fixture(request_aware=True)
+                handle = req.cache_request_handle
+                # One-element reductions run in this order: lookup accepted,
+                # lookup ready, load accepted. A rejecting peer zeroes one.
+                peer = SimpleNamespace(calls=0, reject=1 if stage == "lookup" else 3)
+
+                def reduce(value, op, peer=peer):
+                    if value.numel() == 1:
+                        peer.calls += 1
+                        if peer.calls == peer.reject:
+                            value.zero_()
+
+                def running(submit):
+                    def wrapped(*args):
+                        future = submit(*args)
+                        assert future.set_running_or_notify_cancel()
+                        return future
+
+                    return wrapped
+
+                if rejecting == "peer":
+                    cache._all_reduce_attn_groups = reduce
+                    mock = (
+                        backend.submit_prefetch_lookup
+                        if stage == "lookup"
+                        else backend.prefetch_request
+                    )
+                    mock.side_effect = running(mock.side_effect)
+                elif stage == "lookup":
+                    backend.submit_prefetch_lookup.side_effect = RuntimeError("full")
+                else:
+                    backend.prefetch_request.side_effect = None
+                    backend.prefetch_request.return_value = None
+                self._enqueue(cache, req, complete_lookup=stage == "load")
+                owned = not (stage == "lookup" and rejecting == "local")
+                if owned:
+                    backend.cancel_prefetch_request.assert_called_once_with(handle)
+                else:
+                    backend.cancel_prefetch_request.assert_not_called()
+                if rejecting == "peer":
+                    # The local operation keeps running after the common verdict.
+                    cache.linker.check_prefetch_events()
+                    assert handle in cache.linker.prefetches
+                    assert allocator.available_size() == (
+                        32 if stage == "lookup" else 26
+                    )
+                    backend.release_prefetch_request.assert_not_called()
+                    if stage == "lookup":
+                        backend.lookup_futures[0].set_result([1, 2, 3])
+                    else:
+                        backend.prefetch_futures[0].set_result(True)
+                cache.linker.check_prefetch_events()
+                assert not cache.linker.prefetches
+                assert self._match(cache, req).device_prefix_len == 0
+                assert allocator.available_size() == 32
+                if stage == "lookup":
+                    backend.prefetch_request.assert_not_called()
+                if owned:
+                    backend.release_prefetch_request.assert_called_once_with(handle)
+                else:
+                    backend.release_prefetch_request.assert_not_called()
+                self._assert_balanced(cache, allocator)
+
+    def test_reset_and_close_finish_quiesced_requests_without_publication(self):
+        for operation, phase in product(("reset", "close"), ("lookup", "load", "hold")):
+            with self.subTest(operation=operation, phase=phase):
+                cache, backend, req, allocator = self._fixture(request_aware=True)
+                self._enqueue(cache, req, complete_lookup=phase != "lookup")
+                if phase == "hold":
+                    backend.prefetch_futures[0].set_result(True)
+                    cache.linker.check_prefetch_events()
+                    assert cache.full_protected_size() == 6
+
+                def quiesce():
+                    # Backend contract: every handed-out future is done on return.
+                    for future in backend.lookup_futures + backend.prefetch_futures:
+                        future.cancel()
+
+                setattr(backend, operation, MagicMock(side_effect=quiesce))
+                getattr(cache.linker, operation)()
+                assert not cache.linker.prefetches
+                assert not cache.linker.prefetch_holds
+                assert cache.full_protected_size() == 0
+                backend.release_prefetch_request.assert_called_once_with(
+                    req.cache_request_handle
+                )
+                self._assert_balanced(cache, allocator)
 
     def test_timeout_config_overrides_legacy_including_empty_object(self):
         cache, backend, _, _ = self._fixture()
@@ -698,7 +1056,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 backend.restorable = [1, 2, 3]
                 self._enqueue(cache, req)
                 self._enqueue(cache, req)
-                assert backend.lookup.call_count == 2
+                assert backend.submit_lookup.call_count == 2
                 assert len(backend.prefetch_futures) == 1
                 backend.prefetch_futures[-1].set_result(True)
                 cache.check_hicache_events()
@@ -711,6 +1069,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         cache.linker.load_mode = backend.load_mode = "layer_wise"
         req.init_next_round_input(cache)
         lookup_count = backend.lookup.call_count
+        assert not backend.submit_lookup.called
         available = allocator.available_size()
         self._enqueue(cache, req)
         assert backend.lookup.call_count == lookup_count
