@@ -127,6 +127,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
+from sglang.srt.models.kimi_k3_rocm_moe import TunedFrontGemm, build_tuned_front_gemm
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -560,6 +561,8 @@ class KimiK3MoE(nn.Module):
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
+        # AITER tuned BF16 GEMM for the three-way merged front; set at merge time.
+        self._tuned_front: Optional[TunedFrontGemm] = None
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -857,6 +860,9 @@ class KimiK3MoE(nn.Module):
                 "writes do not refresh. Restart with SGLANG_K3_SHARDED_MOE=0 "
                 "to allow online updates."
             )
+        # _fused_front is the only reader; skip the AITER probe when it never runs.
+        if _is_hip and self._eligible_for_fused_front:
+            self._tuned_front = build_tuned_front_gemm(weight=self._front_w)
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1530,15 +1536,20 @@ class KimiK3MoE(nn.Module):
         """Read hidden_states once through the merged [H, gate_up + E + latent]
         weight: the shared experts' gate_up, the router logits and the routed
         input."""
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
+        num_tokens = hidden_states.shape[0]
+        # The tuned GEMM writes bf16; _front_fp32 is always False on HIP.
+        if self._tuned_front is not None and self._tuned_front.covers(num_tokens):
+            fused = self._tuned_front(hidden_states, self._front_w)
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
-        if hidden_states.shape[0] > 1 and _is_hip and not _aiter_k3_opt:
+        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
             # off an fp32 front the cast allocates the dense buffer, so the
