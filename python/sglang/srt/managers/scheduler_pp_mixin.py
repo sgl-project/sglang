@@ -1331,7 +1331,11 @@ class SchedulerPPMixin:
             # no consumer reads, and storing it would seed the next verify
             # round with a token the model never emitted. The decode rounds
             # relay their own state, so the future_map stash is skipped.
-            if batch.contains_last_prefill_chunk:
+            # A mixed chunk is the exception: its decode rows each sampled a
+            # real token and dropped their tree, so they need a fresh root
+            # too. The chunked row rides along and is filtered out with its
+            # request before any verify round reads it.
+            if batch.contains_last_prefill_chunk or batch.forward_mode.is_mixed():
                 from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 
                 fwd_batch = (
