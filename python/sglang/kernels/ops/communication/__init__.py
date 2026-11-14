@@ -38,6 +38,7 @@ for _mod, _fn in [
     ("sp_collective", "reduce_scatter_pull"),
     ("sp_collective", "all_gather"),
     ("sp_collective", "all_gather_direct"),
+    ("sp_collective", "all_gather_multi"),
     ("attn_res_collective", "attn_res_fused_pull_rs"),
     ("attn_res_collective", "attn_res_fused_direct_ag"),
     ("gemm_ag", "gather_add3"),

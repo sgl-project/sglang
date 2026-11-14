@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 class Tuning(NamedTuple):
     num_blocks: int
     block_size: int
+    unroll: int = 1
 
 
 class Dispatch(NamedTuple):
@@ -158,6 +159,7 @@ def _jit_module(world_size: int) -> Module:
             ("reduce_scatter_pull", f"{cls}::reduce_scatter_pull"),
             ("all_gather", f"{cls}::all_gather"),
             ("all_gather_direct", f"{cls}::all_gather_direct"),
+            ("all_gather_multi", f"{cls}::all_gather_multi"),
         ],
         extra_cuda_cflags=["-O3"],
     )
@@ -204,6 +206,7 @@ def _reduce_scatter_pull_op(
     input_mc_ptr: int,
     num_blocks: int,
     block_size: int,
+    unroll: int,
 ) -> None:
     _jit_module(world_size).reduce_scatter_pull(
         _COMMS.get(world_size),
@@ -214,6 +217,7 @@ def _reduce_scatter_pull_op(
         input_mc_ptr,
         num_blocks,
         block_size,
+        unroll,
     )
 
 
@@ -242,6 +246,7 @@ def _all_gather_direct_op(
     output_mc_ptr: int,
     num_blocks: int,
     block_size: int,
+    unroll: int,
 ) -> None:
     _jit_module(world_size).all_gather_direct(
         _COMMS.get(world_size),
@@ -250,6 +255,31 @@ def _all_gather_direct_op(
         output_mc_ptr,
         num_blocks,
         block_size,
+        unroll,
+    )
+
+
+@register_custom_op(mutates_args=["outputs"])
+def _all_gather_multi_op(
+    world_size: int,
+    inputs: list[torch.Tensor],
+    outputs: list[torch.Tensor],
+    mc_ptrs: list[int],
+    num_blocks: int,
+    block_size: int,
+    unroll: int,
+) -> None:
+    pad = 4 - len(inputs)
+    _jit_module(world_size).all_gather_multi(
+        _COMM_MAP[world_size],
+        inputs[0].view(-1),
+        *([t.data_ptr() for t in inputs] + [0] * pad),
+        *(list(mc_ptrs) + [0] * pad),
+        *([t.numel() * t.element_size() for t in inputs] + [0] * pad),
+        len(inputs),
+        num_blocks,
+        block_size,
+        unroll,
     )
 
 
@@ -293,6 +323,7 @@ def reduce_scatter_pull(
         input_mc_ptr,
         tuning.num_blocks,
         tuning.block_size,
+        tuning.unroll,
     )
     return output
 
@@ -329,5 +360,18 @@ def all_gather_direct(
         output_mc_ptr,
         tuning.num_blocks,
         tuning.block_size,
+        tuning.unroll,
     )
     return output
+
+
+def all_gather_multi(
+    world_size: int,
+    inputs: list[torch.Tensor],
+    outputs: list[torch.Tensor],
+    mc_ptrs: list[int],
+    *,
+    tuning: Tuning = DEFAULT_TUNING,
+) -> list[torch.Tensor]:
+    _all_gather_multi_op(world_size, inputs, outputs, mc_ptrs, *tuning)
+    return outputs
