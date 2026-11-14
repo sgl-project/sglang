@@ -64,6 +64,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
     get_device,
@@ -399,8 +400,9 @@ class TensorWrapper:
     """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
 
     def __init__(self, tensor):
-        # Ensure tensor is on CPU and contiguous
-        if tensor.is_cuda:
+        # Ensure tensor is on CPU and contiguous. Only CUDA/NPU tensors are
+        # moved; CPU tensors are left untouched.
+        if tensor.device.type in ("cuda", "npu"):
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
@@ -1584,7 +1586,7 @@ class MMEncoder:
                         copied += n
                 offset += num_tokens
 
-            torch.cuda.current_stream(self.device).synchronize()
+            current_platform.synchronize()
             return mm_embedding
         finally:
             if hit_view_hashes:
@@ -1634,7 +1636,7 @@ class MMEncoder:
             offset += num_tokens
 
         self.mm_global_cache.wait_load_to_device(copy_handles)
-        torch.cuda.current_stream(mm_embedding.device).synchronize()
+        current_platform.synchronize()
         return mm_embedding
 
     async def _compute_global_cache_embedding(
@@ -2205,8 +2207,8 @@ class MMEncoder:
 
             # transfer_sync bypasses CUDA streams, so GPU writes (forward and the
             # per-request clones) must land before /send reads the buffers.
-            if keep_on_gpu and mm_embedding.is_cuda:
-                torch.cuda.current_stream(mm_embedding.device).synchronize()
+            if keep_on_gpu and mm_embedding.device.type in ("cuda", "npu"):
+                current_platform.synchronize()
             self._stage_embedding_batch(staged_embeddings)
             return results
         except BaseException:

@@ -4,10 +4,12 @@ import threading
 import unittest
 from queue import Queue
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.mem_cache import embedding_cache_controller
 from sglang.srt.mem_cache.embedding_cache_controller import (
     EmbeddingCacheController,
     EmbeddingCacheEntry,
@@ -341,7 +343,7 @@ class TestStoreToPool(unittest.TestCase):
         ctrl = _make_controller(num_pages=8, dim=4, page_size=2)
         tensor = torch.empty((2, 4), dtype=torch.float32)
 
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "CUDA or NPU"):
             ctrl.store_to_pool_async(["h"], [tensor], Modality.IMAGE)
 
     def test_wait_store_isolates_failed_copy_and_waits_for_the_rest(self):
@@ -372,6 +374,182 @@ class TestStoreToPool(unittest.TestCase):
         self.assertNotIn("failed", ctrl.entries)
         self.assertEqual(ctrl.entries["last"].state, EntryState.READY)
         self.assertEqual(ctrl.vision_pool.allocator.free_pages, 2)
+
+
+class _FakeDeviceTensor:
+    """Stand-in for a device tensor so the D2H path can be tested without a device."""
+
+    def __init__(self, device, shape=(2, 4)):
+        self.device = torch.device(device)
+        self.ndim = len(shape)
+        self.shape = shape
+        self.recorded_stream = None
+
+    def detach(self):
+        return self
+
+    def reshape(self, *shape):
+        return self
+
+    def is_contiguous(self):
+        return True
+
+    def record_stream(self, stream):
+        self.recorded_stream = stream
+
+    def __getitem__(self, key):
+        return self
+
+
+class TestDeviceAgnosticCopyPath(unittest.TestCase):
+    """The D2H staging path must dispatch on the tensor device, not on CUDA."""
+
+    def test_copy_tensor_to_pool_dispatches_on_npu_device(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        entry = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=2,
+            dim=4,
+            page_runs=ctrl.vision_pool.allocator.allocate(2, 2),
+            state=EntryState.FILLING,
+        )
+        ctrl.entries["h"] = entry
+        tensor = _FakeDeviceTensor("npu:0")
+
+        producer_stream = MagicMock()
+        copy_stream = MagicMock()
+        device_module = MagicMock()
+        device_module.current_stream.return_value = producer_stream
+        event = MagicMock()
+
+        with (
+            mock.patch.object(
+                embedding_cache_controller.torch,
+                "get_device_module",
+                return_value=device_module,
+            ) as get_device_module,
+            mock.patch.object(
+                embedding_cache_controller, "create_device_event", return_value=event
+            ) as create_device_event,
+            mock.patch.object(
+                embedding_cache_controller,
+                "device_stream_context",
+                return_value=MagicMock(),
+            ) as device_stream_context,
+            mock.patch.object(ctrl, "_get_copy_stream", return_value=copy_stream),
+            mock.patch.object(ctrl, "_copy_embedding_page_runs"),
+        ):
+            handle = ctrl._copy_tensor_to_pool(tensor, entry, ctrl.vision_pool)
+
+        get_device_module.assert_called_once_with(torch.device("npu:0"))
+        device_module.current_stream.assert_called_once_with(torch.device("npu:0"))
+        create_device_event.assert_called_once_with(torch.device("npu:0"))
+        device_stream_context.assert_called_once_with(copy_stream)
+        copy_stream.wait_stream.assert_called_once_with(producer_stream)
+        self.assertIs(tensor.recorded_stream, copy_stream)
+        event.record.assert_called_once_with(copy_stream)
+        self.assertEqual(handle.device, torch.device("npu:0"))
+
+    def test_load_to_device_async_dispatches_on_npu_device(self):
+        """The H2D cache-hit path (host pool -> NPU) must dispatch on the
+        tensor device and run the copy on the side copy stream."""
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        src = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        _insert_ready_entry(ctrl, "h", src)
+
+        dst = _FakeDeviceTensor("npu:0")
+        copy_stream = MagicMock()
+        event = MagicMock()
+
+        with (
+            mock.patch.object(
+                embedding_cache_controller, "create_device_event", return_value=event
+            ) as create_device_event,
+            mock.patch.object(
+                embedding_cache_controller,
+                "device_stream_context",
+                return_value=MagicMock(),
+            ) as device_stream_context,
+            mock.patch.object(ctrl, "_get_copy_stream", return_value=copy_stream),
+            mock.patch.object(
+                embedding_cache_controller,
+                "_build_host_device_transfer_plan",
+                side_effect=lambda *args, **kwargs: ([0], [0], [2]),
+            ),
+        ):
+            copied = {}
+
+            def fake_copy_(other, non_blocking=False):
+                copied["non_blocking"] = non_blocking
+                copied["src"] = other
+
+            def fake_page_runs_copy(*args, **kwargs):
+                # dst is our fake tensor; emulate _copy_embedding_page_runs'
+                # per-slice copy_ fallback with the single-run plan above.
+                dst = kwargs["dst"]
+                dst[0:2].copy_ = fake_copy_
+
+            with mock.patch.object(
+                ctrl,
+                "_copy_embedding_page_runs",
+                side_effect=fake_page_runs_copy,
+            ):
+                handle = ctrl.load_to_device_async("h", dst, dst_token_offset=0)
+
+        self.assertIsNotNone(handle)
+        create_device_event.assert_called_once_with(torch.device("npu:0"))
+        device_stream_context.assert_called_once_with(copy_stream)
+        event.record.assert_called_once_with(copy_stream)
+        self.assertEqual(handle.device, torch.device("npu:0"))
+        self.assertEqual(handle.entry_hash, "h")
+        # The READY entry stays pinned until wait_load_to_device().
+        self.assertEqual(ctrl.entries["h"].ref_count, 1)
+
+        event.synchronize = MagicMock()
+        ctrl.wait_load_to_device([handle])
+        event.synchronize.assert_called_once_with()
+        self.assertEqual(ctrl.entries["h"].ref_count, 0)
+        self.assertIn("h", ctrl.vision_pool.evictable)
+
+    def test_load_to_device_async_copies_pool_data_on_cpu_equivalent_path(self):
+        """Verify the resulting embedding: on a CPU host pool the same H2D
+        copy path must reproduce the stored pool pages in the destination.
+        The copy-stream cache is pre-seeded and the stream context is
+        stubbed (torch.cpu.Stream lacks .device on some torch versions), so
+        the data path (transfer plan, page-run copies, event, pin/unpin)
+        runs unmocked."""
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        src = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        _insert_ready_entry(ctrl, "h", src)
+
+        class _NullDeviceStreamContext:
+            def __init__(self, stream):
+                pass
+
+            def __enter__(self):
+                pass
+
+            def __exit__(self, *exc):
+                return False
+
+        ctrl._copy_streams["cpu"] = torch.cpu.Stream()
+        dst = torch.zeros((2, 4), dtype=torch.float32)
+        with mock.patch.object(
+            embedding_cache_controller,
+            "device_stream_context",
+            _NullDeviceStreamContext,
+        ):
+            handle = ctrl.load_to_device_async("h", dst, dst_token_offset=0)
+        self.assertIsNotNone(handle)
+
+        ctrl.wait_load_to_device([handle])
+        self.assertTrue(torch.equal(dst, src))
+
+    def test_load_to_device_async_missing_entry_returns_none(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+
+        self.assertIsNone(ctrl.load_to_device_async("missing", torch.zeros((2, 4)), 0))
 
 
 def _insert_ready_entry(ctrl, mm_hash, tensor, modality=Modality.IMAGE):

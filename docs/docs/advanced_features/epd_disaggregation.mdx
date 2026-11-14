@@ -91,6 +91,7 @@ Notes:
 
 - This cache is for **multimodal encoder embeddings**, not the language model KV cache.
 - The feature currently uses Mooncake as the shared backing store.
+- It works on NVIDIA CUDA and Ascend NPU. The host staging path resolves the device module (`torch.cuda` or `torch.npu`) for its copy streams and events, so no CUDA-specific setup is required on Ascend.
 - It can be enabled regardless of which `--encoder-transfer-backend` you use.
 - It is most relevant for EPD or encoder-disaggregated VLM deployments where the same images are likely to appear across requests or instances.
 
