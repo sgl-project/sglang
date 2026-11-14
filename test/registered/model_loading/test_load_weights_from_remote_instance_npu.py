@@ -26,6 +26,8 @@ import torch.multiprocessing as mp
 import sglang as sgl
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_HEADERS_FOR_TEST,
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -136,6 +138,8 @@ def init_process_seed(
             str(rank),
             "--tp-size",
             str(tp_size),
+            "--admin-api-key",
+            ADMIN_API_KEY_FOR_TEST,
         ),
     )
     torch.npu.synchronize()
@@ -150,6 +154,7 @@ def init_process_seed(
                     "name": parameter_name,
                     "truncate_size": truncate_size,
                 },
+                headers=ADMIN_HEADERS_FOR_TEST,
             ).json()
         )
     param_queue.put((f"seed_params", seed_params))
@@ -204,6 +209,7 @@ def init_process_dst(
             remote_instance_weight_loader_send_weights_group_ports=ports,
             load_format="remote_instance",
             remote_instance_weight_loader_backend=remote_instance_loader_backend,
+            admin_api_key=ADMIN_API_KEY_FOR_TEST,
         )
     else:
         host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
@@ -236,6 +242,8 @@ def init_process_dst(
                 "remote_instance",
                 "--remote-instance-weight-loader-backend",
                 remote_instance_loader_backend,
+                "--admin-api-key",
+                ADMIN_API_KEY_FOR_TEST,
             ),
         )
     torch.npu.synchronize()
@@ -251,6 +259,7 @@ def init_process_dst(
             else requests.get(
                 f"{url}/get_weights_by_name",
                 json={"name": parameter_name, "truncate_size": truncate_size},
+                headers=ADMIN_HEADERS_FOR_TEST,
             ).json()
         )
 

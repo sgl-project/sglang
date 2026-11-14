@@ -71,10 +71,17 @@ Currently there is **no automatic partial rollback** across DP ranks (see TODO i
 
 The examples below assume your SGLang HTTP server is at `http://127.0.0.1:30000`.
 
+These are admin endpoints: the server must be launched with `SGLANG_ADMIN_API_KEY` set (or `--admin-api-key`), and every call must carry that key as a bearer token (`--api-key` is not accepted). If the server has no admin key configured, the calls return HTTP 403. Set `SGLANG_ADMIN_API_KEY` to that key in the shell that sends the calls:
+
+```bash Command
+export SGLANG_ADMIN_API_KEY=<your-admin-api-key>
+```
+
 ### 3.1 Query current storage backend status
 
 ```bash Command
-curl -s http://127.0.0.1:30000/hicache/storage-backend
+curl -s http://127.0.0.1:30000/hicache/storage-backend \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 Example response:
@@ -89,6 +96,7 @@ Example response:
 ### 3.2 Attach (enable) a storage backend
 ```bash Command
 curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H 'Content-Type: application/json' \
   -d '{
     "hicache_storage_backend": "mooncake"
@@ -97,6 +105,7 @@ curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
 
 ```bash Command
 curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H 'Content-Type: application/json' \
   -d '{
     "hicache_storage_backend": "mooncake",
@@ -114,7 +123,8 @@ Notes:
 ### 3.3 Detach (disable) the storage backend
 
 ```bash Command
-curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend
+curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 Notes:

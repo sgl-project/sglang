@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import re
 import shutil
 import sys
@@ -605,13 +606,22 @@ def discover_trace_targets(
     return selected, load_server_args(trace_dir)
 
 
+def sglang_admin_headers() -> Dict[str, str]:
+    """SGLang's profiler endpoints require the server's admin key."""
+    admin_api_key = os.environ.get("SGLANG_ADMIN_API_KEY")
+    return {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
+
+
 def post_json(
-    url: str, payload: Optional[dict] = None, timeout: float = 60.0
+    url: str,
+    payload: Optional[dict] = None,
+    timeout: float = 60.0,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Optional[dict]:
     req = request.Request(
         url=url,
         data=(None if payload is None else json.dumps(payload).encode("utf-8")),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
         method="POST",
     )
     with request.urlopen(req, timeout=timeout) as response:
@@ -873,7 +883,11 @@ def build_remote_profiler_start_payload(
 
 def stop_remote_profiler(url: str, framework: str) -> None:
     try:
-        post_json(url.rstrip("/") + "/stop_profile", timeout=300.0)
+        post_json(
+            url.rstrip("/") + "/stop_profile",
+            timeout=300.0,
+            headers=sglang_admin_headers() if framework == "sglang" else None,
+        )
     except Exception as exc:
         raise RuntimeError(
             f"Failed to stop {framework_display_name(framework)} profiler via "
@@ -1010,7 +1024,7 @@ def run_sglang_profiler(
     req = request.Request(
         url.rstrip("/") + "/start_profile",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **sglang_admin_headers()},
     )
     with request.urlopen(req, timeout=300.0):
         pass

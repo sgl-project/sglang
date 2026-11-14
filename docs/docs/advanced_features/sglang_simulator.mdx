@@ -46,6 +46,7 @@ export SGLANG_USE_CPU_ENGINE=1
 export CUDA_VISIBLE_DEVICES=""
 export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
 export SGLANG_SIMULATOR_OUTPUT_DIR=/tmp/sglang-simulator-quickstart
+export SGLANG_ADMIN_API_KEY=<key>
 
 python3 -m sglang_simulator.simulation.sglang.launch_server \
   --model-path tools/sglang-simulator/test/assets/qwen3-8b \
@@ -58,11 +59,12 @@ python3 -m sglang_simulator.simulation.sglang.launch_server \
 
 ## Send a workload
 
-In another terminal, export the same output directory and run the simulator-aware serving benchmark from the repository root:
+In another terminal, export the same output directory and admin key and run the simulator-aware serving benchmark from the repository root:
 
 ```bash
 export PYTHONPATH="$PWD/tools/sglang-simulator/src:$PWD/python"
 export SGLANG_SIMULATOR_OUTPUT_DIR=/tmp/sglang-simulator-quickstart
+export SGLANG_ADMIN_API_KEY=<key>
 
 python3 benchmark/simulator/bench_serving.py \
   --simulator-mode offline \

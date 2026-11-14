@@ -29,6 +29,8 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_HEADERS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -231,6 +233,8 @@ class LoRAUpdateServerTestSession:
             "--mem-fraction-static",
             str(MEM_FRACTION_STATIC),
             "--disable-radix-cache",
+            "--admin-api-key",
+            ADMIN_API_KEY_FOR_TEST,
         ]
         if self.enable_lora:
             other_args.append("--enable-lora")
@@ -279,6 +283,7 @@ class LoRAUpdateServerTestSession:
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/load_lora_adapter",
             json={"lora_name": lora_name, "lora_path": lora_path, "pinned": pinned},
+            headers=ADMIN_HEADERS_FOR_TEST,
         )
         if expected_error:
             self.testcase.assertEqual(response.status_code, 400, response.text)
@@ -293,6 +298,7 @@ class LoRAUpdateServerTestSession:
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/unload_lora_adapter",
             json={"lora_name": lora_name},
+            headers=ADMIN_HEADERS_FOR_TEST,
         )
         self._assert_loaded(response)
 

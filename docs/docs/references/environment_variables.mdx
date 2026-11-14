@@ -2271,6 +2271,11 @@ MPS and does not read them.
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ADMIN_API_KEY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The admin API key when <code>--admin-api-key</code> is not given (the flag wins). The bundled clients (<code>sglang.profiler</code>, <code>bench_serving</code>, <code>send_one</code>, <code>configure_logging</code>, ...) send it to the admin endpoints too.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TIMEOUT_KEEP_ALIVE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>HTTP keep-alive timeout (seconds).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>5</code></td>

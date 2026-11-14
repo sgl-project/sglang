@@ -13,46 +13,46 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use crate::api_server::handlers::ADMIN_KEY_MISSING;
 use crate::message::config::ApiKeys;
 
-/// The served routes Python marks `@auth_level(AuthLevel.ADMIN_OPTIONAL)`;
-/// every other route is `NORMAL`. None of them is `ADMIN_FORCE`. The DP
-/// control relay carries those same operations, so it needs their key too.
-const ADMIN_OPTIONAL_PATHS: &[&str] = &[
-    crate::api_server::core::FORWARD_PEER_PATH,
-    "/flush_cache",
+/// The served routes Python marks `@auth_level(AuthLevel.ADMIN_FORCE)`.
+const ADMIN_FORCE_PATHS: &[&str] = &[
     "/start_profile",
     "/stop_profile",
     "/weights_checker",
-    "/abort_request",
     "/hicache/storage-backend",
+];
+
+/// The served routes Python marks `@auth_level(AuthLevel.ADMIN_OPTIONAL)`;
+/// every remaining route is `NORMAL`. The DP control relay carries the
+/// operations of both admin levels, and refuses the forced ones itself.
+const ADMIN_OPTIONAL_PATHS: &[&str] = &[
+    crate::api_server::core::FORWARD_PEER_PATH,
+    "/flush_cache",
+    "/abort_request",
     "/hicache/storage-backend/clear",
 ];
 
-/// Wrap `app` in the key check. Python installs its middleware only when a
-/// key is configured, so without one `app` is returned untouched.
+/// Wrap `app` in the key check. It applies without keys too: the forced
+/// admin routes are refused unless an admin key is configured.
 pub(super) fn apply(app: Router, keys: &ApiKeys) -> Router {
-    match configured(keys) {
-        Some(keys) => app.layer(axum::middleware::from_fn_with_state(keys, check)),
-        None => app,
-    }
+    app.layer(axum::middleware::from_fn_with_state(
+        Arc::new(keys.clone()),
+        check,
+    ))
 }
 
 /// Key the fallback of `app`, a router merged from keyed and open routes (the
 /// merge keeps an open fallback): an unknown path needs the API key, as in
 /// Python, where unmatched paths are `NORMAL`.
 pub(super) fn guard_fallback(app: Router, keys: &ApiKeys) -> Router {
-    match configured(keys) {
-        Some(keys) => app.fallback(
-            (|| async { StatusCode::NOT_FOUND })
-                .layer(axum::middleware::from_fn_with_state(keys, check)),
-        ),
-        None => app,
-    }
-}
-
-fn configured(keys: &ApiKeys) -> Option<Arc<ApiKeys>> {
-    (keys.api_key.is_some() || keys.admin_api_key.is_some()).then(|| Arc::new(keys.clone()))
+    app.fallback(
+        (|| async { StatusCode::NOT_FOUND }).layer(axum::middleware::from_fn_with_state(
+            Arc::new(keys.clone()),
+            check,
+        )),
+    )
 }
 
 async fn check(State(keys): State<Arc<ApiKeys>>, request: Request, next: Next) -> Response {
@@ -60,29 +60,44 @@ async fn check(State(keys): State<Arc<ApiKeys>>, request: Request, next: Next) -
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    if allowed(request.method(), request.uri().path(), authorization, &keys) {
-        next.run(request).await
-    } else {
-        (
+    match decide(request.method(), request.uri().path(), authorization, &keys) {
+        Decision::Allowed => next.run(request).await,
+        Decision::Unauthorized => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Unauthorized" })),
         )
-            .into_response()
+            .into_response(),
+        Decision::AdminKeyMissing => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": ADMIN_KEY_MISSING })),
+        )
+            .into_response(),
     }
 }
 
-/// Python's `decide_request_auth` for the `NORMAL` and `ADMIN_OPTIONAL`
-/// levels.
-fn allowed(method: &Method, path: &str, authorization: Option<&str>, keys: &ApiKeys) -> bool {
+#[derive(Debug, PartialEq)]
+enum Decision {
+    Allowed,
+    Unauthorized,
+    AdminKeyMissing,
+}
+
+/// Python's `decide_request_auth`.
+fn decide(method: &Method, path: &str, authorization: Option<&str>, keys: &ApiKeys) -> Decision {
     // Probes and scrapes never carry a key.
     if method == Method::OPTIONS
         || path.starts_with("/health")
         || path.starts_with("/ready")
         || path.starts_with("/metrics")
     {
-        return true;
+        return Decision::Allowed;
     }
-    let required = if ADMIN_OPTIONAL_PATHS.contains(&path) {
+    let required = if ADMIN_FORCE_PATHS.contains(&path) {
+        match keys.admin_api_key.as_deref() {
+            Some(key) => Some(key),
+            None => return Decision::AdminKeyMissing,
+        }
+    } else if ADMIN_OPTIONAL_PATHS.contains(&path) {
         // The admin key when configured (the API key then does not unlock
         // these), else the API key.
         keys.admin_api_key.as_deref().or(keys.api_key.as_deref())
@@ -90,7 +105,16 @@ fn allowed(method: &Method, path: &str, authorization: Option<&str>, keys: &ApiK
         // The API key alone; the admin key does not unlock these.
         keys.api_key.as_deref()
     };
-    required.is_none_or(|key| bearer_matches(authorization, key))
+    if required.is_none_or(|key| bearer_matches(authorization, key)) {
+        Decision::Allowed
+    } else {
+        Decision::Unauthorized
+    }
+}
+
+#[cfg(test)]
+fn allowed(method: &Method, path: &str, authorization: Option<&str>, keys: &ApiKeys) -> bool {
+    decide(method, path, authorization, keys) == Decision::Allowed
 }
 
 /// `Authorization: Bearer <key>`, the scheme case-insensitive and the token
@@ -141,6 +165,19 @@ mod tests {
             (None, None, "/flush_cache", [true, true, true, true]),
             (Some(API), None, "/generate", [false, false, true, false]),
             (Some(API), None, "/flush_cache", [false, false, true, false]),
+            (None, None, "/start_profile", [false, false, false, false]),
+            (
+                Some(API),
+                None,
+                "/hicache/storage-backend",
+                [false, false, false, false],
+            ),
+            (
+                None,
+                Some(ADMIN),
+                "/weights_checker",
+                [false, false, false, true],
+            ),
             (None, Some(ADMIN), "/generate", [true, true, true, true]),
             (
                 None,
@@ -214,6 +251,10 @@ mod tests {
         assert!(allowed(&Method::OPTIONS, "/generate", None, &both));
         // Unknown paths are NORMAL, as Python's unmatched routes.
         assert!(!allowed(&Method::GET, "/nope", None, &both));
+        assert_eq!(
+            decide(&Method::POST, "/stop_profile", None, &keys(Some(API), None)),
+            Decision::AdminKeyMissing
+        );
     }
 
     #[test]

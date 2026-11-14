@@ -26,17 +26,25 @@ Apart from the OpenAI compatible APIs, the SGLang Runtime also provides its nati
 
 We mainly use `requests` to test these APIs in the following examples. You can also use `curl`.
 
+Admin endpoints such as `/update_weights_from_disk` and the `/*_expert_distribution_record` APIs answer HTTP 403 unless the server is launched with `SGLANG_ADMIN_API_KEY=<key>` set (or `--admin-api-key <key>`) and the request carries `Authorization: Bearer <key>` (`--api-key` does not unlock them). Once an admin key is set, `/flush_cache` requires it as well.
+
 ## Launch A Server
 
 ```python Example
+import os
+
 from sglang.test.doc_patch import launch_server_cmd
 from sglang.utils import wait_for_server, print_highlight, terminate_process
 
+os.environ["SGLANG_ADMIN_API_KEY"] = "your-admin-api-key"
 server_process, port = launch_server_cmd(
     "python3 -m sglang.launch_server --model-path qwen/qwen2.5-0.5b-instruct --host 0.0.0.0 --log-level warning"
 )
 
 wait_for_server(f"http://localhost:{port}", process=server_process)
+
+# Sent with the admin endpoints below
+admin_headers = {"Authorization": f"Bearer {os.environ['SGLANG_ADMIN_API_KEY']}"}
 ```
 
 ## Generate (text generation model)
@@ -134,13 +142,14 @@ Parameters:
 
 ```bash Command
 # With timeout (wait up to 30s for idle state)
-curl -s -X POST "http://127.0.0.1:30000/flush_cache?timeout=30"
+curl -s -X POST "http://127.0.0.1:30000/flush_cache?timeout=30" \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 ```python Example
 url = f"http://localhost:{port}/flush_cache"
 
-response = requests.post(url)
+response = requests.post(url, headers=admin_headers)
 print_highlight(response.text)
 ```
 
@@ -156,7 +165,7 @@ SGLang support `update_weights_from_disk` API for continuous evaluation during t
 url = f"http://localhost:{port}/update_weights_from_disk"
 data = {"model_path": "qwen/qwen2.5-0.5b-instruct"}
 
-response = requests.post(url, json=data)
+response = requests.post(url, json=data, headers=admin_headers)
 print_highlight(response.text)
 assert response.json()["success"] is True
 assert response.json()["message"] == "Succeeded to update model weights."
@@ -168,7 +177,7 @@ assert response.json()["message"] == "Succeeded to update model weights."
 url = f"http://localhost:{port}/update_weights_from_disk"
 data = {"model_path": "qwen/qwen2.5-0.5b-instruct-wrong"}
 
-response = requests.post(url, json=data)
+response = requests.post(url, json=data, headers=admin_headers)
 response_json = response.json()
 print_highlight(response_json)
 assert response_json["success"] is False
@@ -372,7 +381,10 @@ wait_for_server(f"http://localhost:{port}", process=expert_record_server_process
 ```
 
 ```python Example
-response = requests.post(f"http://localhost:{port}/start_expert_distribution_record")
+response = requests.post(
+    f"http://localhost:{port}/start_expert_distribution_record",
+    headers=admin_headers,
+)
 print_highlight(response)
 
 url = f"http://localhost:{port}/generate"
@@ -381,10 +393,16 @@ data = {"text": "What is the capital of France?"}
 response = requests.post(url, json=data)
 print_highlight(response.json())
 
-response = requests.post(f"http://localhost:{port}/stop_expert_distribution_record")
+response = requests.post(
+    f"http://localhost:{port}/stop_expert_distribution_record",
+    headers=admin_headers,
+)
 print_highlight(response)
 
-response = requests.post(f"http://localhost:{port}/dump_expert_distribution_record")
+response = requests.post(
+    f"http://localhost:{port}/dump_expert_distribution_record",
+    headers=admin_headers,
+)
 print_highlight(response)
 ```
 

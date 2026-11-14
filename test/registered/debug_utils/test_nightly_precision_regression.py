@@ -37,6 +37,8 @@ import torch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_HEADERS_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
     is_in_ci,
@@ -615,6 +617,8 @@ def _run_server_and_dump(
         "--disable-radix-cache",
         "--flashinfer-allreduce-fusion-backend",
         PRECISION_FUSION_BACKEND,
+        "--admin-api-key",
+        ADMIN_API_KEY_FOR_TEST,
     ]
 
     proc = popen_launch_server(
@@ -632,6 +636,7 @@ def _run_server_and_dump(
                 "filter": dumper_filter,
                 "cleanup_previous": True,
             },
+            headers=ADMIN_HEADERS_FOR_TEST,
             timeout=60,
         ).raise_for_status()
 

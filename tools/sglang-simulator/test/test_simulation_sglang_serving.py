@@ -14,6 +14,7 @@ ASSETS = Path(__file__).parent / "assets"
 SGLANG_ROOT = Path(__file__).parents[3]
 BENCH_SERVING = SGLANG_ROOT / "benchmark" / "simulator" / "bench_serving.py"
 EXAMPLES = Path(__file__).parent.parent / "examples"
+ADMIN_API_KEY = "sk-admin-for-test"
 
 SIM_CONFIGS = {
     "aisimulate_sol": EXAMPLES / "sim_configs" / "aisimulate_sol.json",
@@ -56,6 +57,7 @@ class SGLangServingRunner:
             "--max-running-requests",
             "8",
             "--disable-overlap-schedule",
+            f"--admin-api-key={ADMIN_API_KEY}",
         ]
         self.server_proc = subprocess.Popen(cmd, env=env, preexec_fn=os.setsid)
         for _ in range(120):
@@ -92,6 +94,7 @@ class SGLangServingRunner:
             "--num-prompts=3",
             "--disable-tqdm",
             "--profile",
+            f"--admin-api-key={ADMIN_API_KEY}",
             f"--output-file={output_file}",
         ]
         if request_rate is not None:

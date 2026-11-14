@@ -213,7 +213,8 @@ python3 -m sglang.benchmark.serving \
 - `--disable-ignore-eos`: pass through EOS behavior (varies by backend)
 - `--warmup-requests N`: run warmup requests with short output first (default 1)
 - `--flush-cache`: call `/flush_cache` (sglang) before main run
-- `--profile`: call `/start_profile` and `/stop_profile` (requires server to enable profiling, e.g., `SGLANG_TORCH_PROFILER_DIR`)
+- `--profile`: call `/start_profile` and `/stop_profile` (requires server to enable profiling, e.g., `SGLANG_TORCH_PROFILER_DIR`, and an admin key via `SGLANG_ADMIN_API_KEY` or `--admin-api-key`)
+- `--admin-api-key KEY`: the SGLang server's admin key (default: `SGLANG_ADMIN_API_KEY`); required by `--profile`, and sent by `--flush-cache` when given
 - `--lora-name name1 name2 ...`: randomly pick one per request and pass to backend (e.g., `lora_path` for sglang)
 - `--tokenize-prompt`: send integer IDs instead of text (currently supports `--backend sglang` only)
 
@@ -226,6 +227,8 @@ export OPENAI_API_KEY=sk-...yourkey...
 ```
 
 The script will add `Authorization: Bearer $OPENAI_API_KEY` automatically for OpenAI-compatible routes.
+
+SGLang's `/start_profile` and `/stop_profile` are admin endpoints: they only work when the server is launched with an admin key (`SGLANG_ADMIN_API_KEY` or `--admin-api-key`), so `--profile` needs the same key, read from `SGLANG_ADMIN_API_KEY` or passed as `--admin-api-key`. Once the server has an admin key, `/flush_cache` requires it too, and `--flush-cache` sends it the same way.
 
 ### Metrics explained
 

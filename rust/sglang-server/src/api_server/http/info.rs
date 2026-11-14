@@ -54,11 +54,11 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 /// encoded output. Errors are plain text so the relaying side can carry the
 /// message into its own merged error.
 async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    // Without an admin key, `HiCacheManager` refuses attach and detach before
-    // relaying them, so only a request sent straight to this route carries
-    // one; refuse it too, or the peer route would bypass that refusal.
+    // Without an admin key the forced admin routes refuse before relaying,
+    // so only a request sent straight to this route carries their message;
+    // refuse it too, or the peer route would bypass that refusal.
     if state.server_args.api_keys.admin_api_key.is_none()
-        && forwarded_tag(&body).is_some_and(|tag| HICACHE_ADMIN_TAGS.contains(&tag.as_str()))
+        && forwarded_tag(&body).is_some_and(|tag| ADMIN_FORCE_TAGS.contains(&tag.as_str()))
     {
         return super::hicache::admin_key_missing();
     }
@@ -73,10 +73,12 @@ async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) ->
     }
 }
 
-/// The forwarded control messages of a HiCache attach and detach.
-const HICACHE_ADMIN_TAGS: &[&str] = &[
+/// The forwarded control messages of the routes in `auth::ADMIN_FORCE_PATHS`.
+const ADMIN_FORCE_TAGS: &[&str] = &[
     "AttachHiCacheStorageReqInput",
     "DetachHiCacheStorageReqInput",
+    "CheckWeightsReqInput",
+    "ProfileReq",
 ];
 
 /// A forwarded control message's type tag, the first element of its array.

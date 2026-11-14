@@ -30,6 +30,8 @@ pytestmark = pytest.mark.filterwarnings(
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_HEADERS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -311,6 +313,8 @@ def _run_server_and_generate(
         "--disable-cuda-graph",
         "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
+        "--admin-api-key",
+        ADMIN_API_KEY_FOR_TEST,
     ]
     if extra_server_args:
         server_args.extend(extra_server_args)
@@ -330,6 +334,7 @@ def _run_server_and_generate(
                 "filter": DUMPER_FILTER,
                 "cleanup_previous": True,
             },
+            headers=ADMIN_HEADERS_FOR_TEST,
         ).raise_for_status()
 
         resp = requests.post(

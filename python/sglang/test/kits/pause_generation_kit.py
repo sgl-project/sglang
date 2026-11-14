@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+from sglang.test.test_utils import ADMIN_HEADERS_FOR_TEST
+
 _REQUEST_TIMEOUT = 180
 
 
@@ -54,6 +56,7 @@ class PauseResumeInPlaceMixin:
                     url + "/pause_generation",
                     json={"mode": "in_place"},
                     timeout=30,
+                    headers=ADMIN_HEADERS_FOR_TEST,
                 ).raise_for_status()
 
             time.sleep(0.5)
@@ -83,6 +86,7 @@ class PauseResumeInPlaceMixin:
                     url + "/continue_generation",
                     json={},
                     timeout=30,
+                    headers=ADMIN_HEADERS_FOR_TEST,
                 ).raise_for_status()
 
             completed = 0

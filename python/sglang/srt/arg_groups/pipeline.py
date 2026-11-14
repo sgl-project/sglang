@@ -56,6 +56,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # others from them (e.g. `--lora-paths` turning on `enable_lora`).
     run_hook(validate_rust_server_unsupported_args, server_args)
     from sglang.srt.arg_groups.serving_hook import (
+        handle_admin_api_key_env,
         handle_asr_validation,
         handle_crash_dump_env,
         handle_debug_utils,
@@ -74,6 +75,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_watermark_config,
     )
 
+    # Before any hook reads admin_api_key (the gRPC check in handle_deprecated_args).
+    run_hook(handle_admin_api_key_env, server_args)
     run_hook(handle_return_hidden_states_mode, server_args)
     run_hook(handle_media_url_security, server_args)
     run_hook(handle_watermark_config, server_args)
