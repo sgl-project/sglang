@@ -35,8 +35,9 @@ PP_ROUTED_EXPERTS_KEY = "routed_experts"
 
 def _is_scattered_a2a_backend() -> bool:
     """Return whether routed tokens are scattered across attention-TP ranks."""
-    backend = get_moe_a2a_backend()
-    return backend.is_deepep() or backend.is_deepep_v2() or backend.is_ascend_ops()
+    # Every A2A backend routes on DP-local rows, as in
+    # is_moe_input_scattered_across_dp_ranks.
+    return not get_moe_a2a_backend().is_none()
 
 
 class RoutedExpertsCapturer(BaseTopkCapturer):
