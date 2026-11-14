@@ -659,7 +659,11 @@ class MoriKVManager(CommonKVManager):
             # conclude_transfer downgrades to Failed when a failure was recorded
             # while this chunk was in flight, and applies the same status locally
             # and on the wire.
-            self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
+            self.conclude_transfer(
+                bootstrap_room=room,
+                status=KVPoll.Success,
+                counts_self=self.enable_deferred_decode_kv_release,
+            )
         return True
 
     def _wait_for_chunk_completion(
