@@ -18,6 +18,10 @@ class MusaDeviceMixin(CudaDeviceMixin):
     def get_torch_distributed_backend_str(self) -> str:
         return "mccl"
 
+    def get_vmm_backend_class(self) -> None:
+        # CudaVmmBackend calls the CUDA driver API, which this platform does not provide
+        return None
+
 
 class MusaSRTPlatform(MusaDeviceMixin, SRTPlatform):
     """Default in-tree MUSA SRT platform."""

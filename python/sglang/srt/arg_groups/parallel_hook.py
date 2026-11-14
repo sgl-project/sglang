@@ -472,6 +472,11 @@ def handle_dwdp(server_args: Any):
     assert not cfg.enable_two_batch_overlap, (
         "DWDP's prefetch event protocol does not support two-batch overlap"
     )
+    # fused shared experts append a row to every expert shard, which overruns the
+    # composite VA window each rank owns
+    assert not cfg.enforce_shared_experts_fusion, (
+        "DWDP is incompatible with --enforce-shared-experts-fusion"
+    )
 
     if cfg.disaggregation_mode == "null":
         logger.warning(
@@ -517,10 +522,22 @@ def handle_dwdp(server_args: Any):
 
     envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.set(True)
 
+    # prefetch syncs and remaps on the host between layers, which a graph replay skips;
+    # raw fields hold what the user asked for, before model defaults are declared
+    requested_graphs = {
+        server_args.cuda_graph_backend_decode,
+        server_args.cuda_graph_backend_prefill,
+    } - {None, Backend.DISABLED}
+    assert server_args.cuda_graph_config is None and not requested_graphs, (
+        "DWDP runs without CUDA graphs; drop --cuda-graph-config and "
+        "--cuda-graph-backend-decode/prefill"
+    )
     declare_resolution(
         server_args,
         "_handle_dwdp",
         disable_cuda_graph=True,
+        cuda_graph_backend_decode=Backend.DISABLED,
+        cuda_graph_backend_prefill=Backend.DISABLED,
     )
 
     logger.info(
