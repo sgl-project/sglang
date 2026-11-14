@@ -801,7 +801,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.is_draft_worker = is_draft_worker
 
         self.custom_mem_pool = None
+        self._create_buffers()
+        self._finalize_allocation_log(size)
 
+    def _create_buffers(self):
+        """Allocate the stacked (layer-first) KV / indexer cache buffers."""
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             if self.enable_sparsity_driven_kv_offload:
@@ -810,7 +814,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             elif self.use_combined_kv_buffer:
                 self.kv_buffer = torch.zeros(
                     (
-                        layer_num,
+                        self.layer_num,
                         self.size // self.page_size + self.kv_page_padding,
                         self.page_size,
                         1,
@@ -825,7 +829,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             else:
                 self.k_buffer = torch.zeros(
                     (
-                        layer_num,
+                        self.layer_num,
                         self.size // self.page_size + self.kv_page_padding,
                         self.page_size,
                         1,
@@ -836,7 +840,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
                 self.v_buffer = torch.zeros(
                     (
-                        layer_num,
+                        self.layer_num,
                         self.size // self.page_size + self.kv_page_padding,
                         self.page_size,
                         1,
@@ -877,8 +881,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
                         self.index_head_dim, self.device
                     )
-
-        self._finalize_allocation_log(size)
 
     def _mla_buffer_info(self):
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
@@ -970,9 +972,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
+        offset = self._kv_local_offset(layer_id)
         return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+            self.k_buffer[offset],
+            self.v_buffer[offset],
         )
 
     def get_combined_kv_buffer(self, layer_id: int):
@@ -1002,18 +1005,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
+        buffer = self.k_buffer[self._kv_local_offset(layer_id)]
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return buffer.view(self.dtype)
+        return buffer
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
+        buffer = self.v_buffer[self._kv_local_offset(layer_id)]
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return buffer.view(self.dtype)
+        return buffer
 
     def get_index_k_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -1029,6 +1034,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_indexer_slot(self, layer_id: int) -> int:
         return self.indexer_layer_id_to_slot[layer_id]
+
+    def _kv_local_offset(self, layer_id: int) -> int:
+        """Row index of ``layer_id`` in the batched k/v buffers.
+
+        Subclasses that reorganize the per-layer buffer layout (e.g. CP layer
+        split) override this instead of duplicating every indexing site.
+        """
+        return layer_id - self.start_layer
 
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -1128,7 +1141,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
-                self.k_buffer[layer_id - self.start_layer].view(
+                self.k_buffer[self._kv_local_offset(layer_id)].view(
                     -1, 1, self.kv_cache_dim
                 ),
                 loc.view(-1, 1),
@@ -1169,12 +1182,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             return
 
         torch_npu.npu_scatter_nd_update_(
-            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
+            self.k_buffer[self._kv_local_offset(layer_id)].view(
+                -1, 1, self.kv_lora_rank
+            ),
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
         torch_npu.npu_scatter_nd_update_(
-            self.v_buffer[layer_id - self.start_layer].view(
+            self.v_buffer[self._kv_local_offset(layer_id)].view(
                 -1, 1, self.qk_rope_head_dim
             ),
             loc.view(-1, 1),
@@ -1204,7 +1219,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             src = values.contiguous().view(-1, num_tiles, tile_size).view(-1, tile_size)
             torch_npu.npu_scatter_nd_update_(dst, indices, src)
 
-        offset = layer_id - self.start_layer
+        offset = self._kv_local_offset(layer_id)
         scatter(self.k_buffer[offset], cache_k, self.kv_lora_rank)
         scatter(self.v_buffer[offset], cache_v, self.qk_rope_head_dim)
 
@@ -1265,9 +1280,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_cpu_offload_layer_buffers(self, local_layer_id):
         # flatten(page, slot) also works for the zero-width packed V placeholder.
+        layer_id = local_layer_id + self.start_layer
         buffers = [
-            self.k_buffer[local_layer_id].flatten(0, 1),
-            self.v_buffer[local_layer_id].flatten(0, 1),
+            self.k_buffer[self._kv_local_offset(layer_id)].flatten(0, 1),
+            self.v_buffer[self._kv_local_offset(layer_id)].flatten(0, 1),
         ]
         slot = self.indexer_layer_id_to_slot.get(local_layer_id + self.start_layer)
         if slot is not None:
