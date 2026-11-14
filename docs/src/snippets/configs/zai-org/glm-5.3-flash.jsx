@@ -726,7 +726,9 @@ sgl-eval run gsm8k \\
   ],
 
   cells: [
-    // The first cell seeds both widgets on a fresh page load.
+    // The first cell seeds both widgets on a fresh page load. B300 prefills in
+    // 16384-token chunks, but MLA prefill graphs are captured only up to 8192
+    // tokens by default, so the cap is raised to keep full chunks on the graph.
     {
       match: { hw: "b300", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
@@ -741,6 +743,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--cuda-graph-max-bs-prefill 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
