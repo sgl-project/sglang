@@ -292,11 +292,17 @@ class TestChatTemplateCache(CustomTestCase):
         return self.chat._render_and_encode_chat_template(**kwargs)
 
     def test_cache_hit_reuses_render_encode_and_returns_an_owned_id_list(self):
-        first = self._render()
-        first[0].append(99)
-        second = self._render()
+        first_ids, first_entry = self._render(has_media=True)
+        self.assertEqual(
+            self.chat._decode_chat_prompt(first_ids, first_entry), "decoded"
+        )
+        first_ids.append(99)
+        second_ids, second_entry = self._render(has_media=True)
 
-        self.assertEqual(second, ([11, 12], "decoded"))
+        self.assertEqual(second_ids, [11, 12])
+        self.assertEqual(
+            self.chat._decode_chat_prompt(second_ids, second_entry), "decoded"
+        )
         self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
         self.tokenizer_manager.tokenizer.encode.assert_called_once()
         self.tokenizer_manager.tokenizer.decode.assert_called_once()
@@ -311,6 +317,15 @@ class TestChatTemplateCache(CustomTestCase):
             3,
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 3)
+
+    def test_cache_preserves_tokenizer_id_range(self):
+        for token_id in (2**31, -101):
+            with self.subTest(token_id=token_id):
+                self.tokenizer_manager.tokenizer.encode.return_value = [token_id]
+                messages = [{"role": "user", "content": str(token_id)}]
+                for _ in range(2):
+                    ids, _ = self._render(messages=messages)
+                    self.assertEqual(ids, [token_id])
 
     def test_cache_key_tracks_tokenizer_chat_template_updates(self):
         self.tokenizer_manager.tokenizer.chat_template = "template-v1"
@@ -1782,6 +1797,51 @@ class ServingChatTestCase(CustomTestCase):
                 else:
                     self.assertEqual(adapted.text, "rendered prompt")
                     self.assertIsNone(adapted.input_ids)
+
+    def test_text_only_prompt_is_decoded_only_when_sent_as_text(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        tokenizer = self.tm.tokenizer
+        tokenizer.apply_chat_template.side_effect = lambda messages, **_: "".join(
+            m["content"] for m in messages
+        )
+        tokenizer.encode.side_effect = lambda text, **_: [ord(c) for c in text]
+        tokenizer.decode.side_effect = lambda ids, **_: "".join(map(chr, ids))
+
+        adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.assertEqual(adapted.input_ids, [ord(c) for c in "Hi?"])
+        tokenizer.decode.assert_not_called()
+
+        tokenizer.encode.reset_mock()
+        adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.assertEqual(adapted.input_ids, [ord(c) for c in "Hi?"])
+        tokenizer.encode.assert_not_called()
+        tokenizer.decode.assert_not_called()
+
+        self.tm.model_config.hf_config.architectures = [
+            "MossVLForConditionalGeneration"
+        ]
+        continuation = ChatCompletionRequest(
+            model="x",
+            messages=[
+                *self.basic_req.messages,
+                {"role": "assistant", "content": "Yes"},
+            ],
+            continue_final_message=True,
+        )
+        for request, expected in (
+            (continuation, "Hi?Yes"),
+            (self.basic_req, "Hi?"),
+            (self.basic_req, "Hi?"),
+        ):
+            adapted, _ = self.chat._convert_to_internal_request(request)
+            self.assertEqual(adapted.text, expected)
+            self.assertIsNone(adapted.input_ids)
+        self.assertEqual(tokenizer.decode.call_count, 2)
 
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
