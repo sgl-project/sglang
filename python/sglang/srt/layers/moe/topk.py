@@ -14,9 +14,10 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import IntEnum, auto
 from typing import (
     TYPE_CHECKING,
@@ -275,6 +276,8 @@ class TopKConfig:
     allow_routed_experts_capture: bool = True
     # Lazy materialization still needs the producer's solver and capture slot.
     layer_id: Optional[int] = None
+    # Logits already encode the simulated experts, so routing must not override them.
+    routing_simulation_encoded: bool = False
     _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -419,61 +422,86 @@ class PackedTopKOutput(NamedTuple):
 
 
 @triton.jit
-def _simulate_balanced_routing_kernel(
-    topk_ids_ptr,
-    topk_weights_ptr,
+def _simulated_expert_ids(
+    t,
+    j,
     num_experts,
     step,
     num_ranks,
     experts_per_rank,
     deal_offset,
-    inv_k,
     seed,
     token_shard_rank,
     num_token_shards,
-    stride_im,
-    stride_ik,
-    stride_wm,
-    stride_wk,
-    num_non_padded_ptr,
-    to_physical_map_ptr,
-    logical_count_ptr,
-    num_duplicates,
-    ep_rank,
+    num_groups,
+    topk_group,
+    group_size,
+    group_period,
+    group_step,
+    in_group_step,
+    slots_per_group,
+    extra_slots,
+    group_rotation,
+    ranks_per_group,
+    group_phase_offset,
     K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
     RANDOM: tl.constexpr,
-    HAS_NON_PADDED: tl.constexpr = False,
-    HAS_PHYSICAL_MAP: tl.constexpr = False,
+    GROUPED: tl.constexpr,
 ):
-    """One program per token: overwrite its top-k row with a balanced expert
-    assignment and uniform ``1/k`` weights, in a single launch — so the
-    benchmark override barely perturbs routing/MoE timing vs. the non-simulated
-    path (instead of the ~5-7 small elementwise ops it replaces).
+    """Global expert ids ``[BLOCK_K]`` for token ``t``'s slots ``j``.
 
-    Shapes:
-    - ``topk_ids_ptr``: ``[num_tokens, K]`` (row-major; strides passed in),
-      overwritten in place
-    - ``topk_weights_ptr``: ``[num_tokens, K]`` (row-major; strides passed in),
-      overwritten in place
+    Ungrouped: round-robin deals slot ``d = t * K + j + deal_offset`` to EP rank
+    ``d % num_ranks`` and to expert ``(d // num_ranks) % experts_per_rank`` in it;
+    uniform is a random per-token base spread by ``step``.
 
-    ``RANDOM=False`` is the deterministic round-robin: slot ``d = t * K + j +
-    deal_offset`` goes to EP rank ``d % num_ranks`` and to expert ``(d //
-    num_ranks) % experts_per_rank`` within that rank, so consecutive slots land
-    on consecutive ranks. ``deal_offset`` folds in the layer offset and the
-    per-shard rotation computed by the wrapper. ``RANDOM=True`` is a random
-    per-token base (uniform, balanced in expectation; ``seed`` is a kernel arg,
-    so it is baked at CUDA-graph capture and replays stay balanced) spread by
-    ``step``; it is the only path that reads ``token_shard_rank`` /
-    ``num_token_shards``, to seed scattered DP shards differently. Both emit
-    global logical expert ids; ``HAS_PHYSICAL_MAP`` then maps them to physical
-    slots with the replica pick of DeepGEMM's MegaGate (``(ep_rank + t * 23333)
-    % logical_count``), otherwise the remap happens later in
-    ``_post_process_topk_ids``."""
-    t = tl.program_id(0)
-    j = tl.arange(0, BLOCK_K)
-    mask = j < K
-    if RANDOM:
+    Grouped (a router keeping ``topk_group`` of ``num_groups`` expert groups): slot
+    ``j`` is the ``q = j // topk_group``-th expert in the token's ``p = j %
+    topk_group``-th group, so a token spans at most ``topk_group`` groups.
+    Round-robin starts the group window of shard-local token ``t`` at ``(a *
+    topk_group + a // group_period) % num_groups`` for ``a = (t +
+    group_phase_offset) % num_groups``, rotated by ``group_rotation`` (the layer):
+    in any ``num_groups`` consecutive tokens of one shard each group takes each
+    window position once, so it receives exactly ``K`` slots whatever the other
+    shards hold. Those slots are dealt in order over the group's experts,
+    alternating over the ``ranks_per_group`` EP ranks that share the group; shards
+    interleave their deal blocks, so equal shards tile the deal. Uniform picks a
+    random first group and in-group bases, with strides that keep groups and
+    experts distinct."""
+    if GROUPED:
+        p = j % topk_group
+        q = j // topk_group
+        if RANDOM:
+            global_t = t * num_token_shards + token_shard_rank
+            offset = global_t * (topk_group + 1)
+            first_group = (tl.rand(seed, offset + 0 * j) * num_groups).to(tl.int32)
+            in_group_base = (tl.rand(seed, offset + 1 + p) * group_size).to(tl.int32)
+            group = (first_group + p * group_step) % num_groups
+            expert = (in_group_base + q * in_group_step) % group_size
+        else:
+            # One period of starts covers every group, and its order is cyclic, so
+            # any num_groups consecutive tokens start once at each group. The phase
+            # is shard-local, so each shard balances on its own; numbering tokens
+            # globally pins every shard to a few windows when the shard count
+            # shares a factor with num_groups.
+            phase = (t + group_phase_offset) % num_groups
+            window = (phase * topk_group + phase // group_period) % num_groups
+            # The layer rotates group labels and the in-group deal, not the token
+            # phase, so every layer keeps batch 0's alignment.
+            group = (window + p + group_rotation) % num_groups
+            deal = (
+                ((t // num_groups) * num_token_shards + token_shard_rank) * K
+                + p * slots_per_group
+                + tl.minimum(p, extra_slots)
+                + q
+                + group_rotation
+            )
+            # Consecutive slots of a group alternate over the EP ranks sharing it.
+            experts_per_group_rank = group_size // ranks_per_group
+            expert = (deal % ranks_per_group) * experts_per_group_rank + (
+                deal // ranks_per_group
+            ) % experts_per_group_rank
+        gid = group * group_size + expert
+    elif RANDOM:
         global_t = t * num_token_shards + token_shard_rank
         base = (tl.rand(seed, global_t) * num_experts).to(tl.int32)
         gid = (base + j * step) % num_experts
@@ -482,6 +510,85 @@ def _simulate_balanced_routing_kernel(
         gid = (deal % num_ranks) * experts_per_rank + (
             deal // num_ranks
         ) % experts_per_rank
+    return gid
+
+
+@triton.jit
+def _simulate_balanced_routing_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    stride_im,
+    stride_ik,
+    stride_wm,
+    stride_wk,
+    inv_k,
+    num_non_padded_ptr,
+    to_physical_map_ptr,
+    logical_count_ptr,
+    num_duplicates,
+    ep_rank,
+    # From here on in _simulated_routing_launch_args order.
+    seed,
+    num_experts,
+    step,
+    num_ranks,
+    experts_per_rank,
+    deal_offset,
+    token_shard_rank,
+    num_token_shards,
+    num_groups,
+    topk_group,
+    group_size,
+    group_period,
+    group_step,
+    in_group_step,
+    slots_per_group,
+    extra_slots,
+    group_rotation,
+    ranks_per_group,
+    group_phase_offset,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    RANDOM: tl.constexpr,
+    GROUPED: tl.constexpr,
+    HAS_NON_PADDED: tl.constexpr = False,
+    HAS_PHYSICAL_MAP: tl.constexpr = False,
+):
+    """One program per token: overwrite its ``[num_tokens, K]`` top-k row in place
+    with simulated ids and ``1/k`` weights in a single launch, so the benchmark
+    override barely perturbs routing/MoE timing. Ids are global logical ids;
+    ``HAS_PHYSICAL_MAP`` then maps them to physical slots with the replica pick of
+    DeepGEMM's MegaGate (``(ep_rank + t * 23333) % logical_count``), otherwise the
+    remap happens later in ``_post_process_topk_ids``."""
+    t = tl.program_id(0)
+    j = tl.arange(0, BLOCK_K)
+    mask = j < K
+    gid = _simulated_expert_ids(
+        t,
+        j,
+        num_experts,
+        step,
+        num_ranks,
+        experts_per_rank,
+        deal_offset,
+        seed,
+        token_shard_rank,
+        num_token_shards,
+        num_groups,
+        topk_group,
+        group_size,
+        group_period,
+        group_step,
+        in_group_step,
+        slots_per_group,
+        extra_slots,
+        group_rotation,
+        ranks_per_group,
+        group_phase_offset,
+        K,
+        RANDOM,
+        GROUPED,
+    )
     w = tl.full((BLOCK_K,), inv_k, tl.float32)
     if HAS_PHYSICAL_MAP:
         count = tl.load(logical_count_ptr + gid, mask=mask, other=1)
@@ -499,9 +606,201 @@ def _simulate_balanced_routing_kernel(
     tl.store(topk_weights_ptr + t * stride_wm + j * stride_wk, w, mask=mask)
 
 
+@triton.jit
+def _encode_simulated_logits_kernel(
+    logits_ptr,
+    stride_lm,
+    target_logit,
+    other_logit,
+    # From here on to GROUPED in _simulated_routing_launch_args order.
+    seed,
+    num_experts,
+    step,
+    num_ranks,
+    experts_per_rank,
+    deal_offset,
+    token_shard_rank,
+    num_token_shards,
+    num_groups,
+    topk_group,
+    group_size,
+    group_period,
+    group_step,
+    in_group_step,
+    slots_per_group,
+    extra_slots,
+    group_rotation,
+    ranks_per_group,
+    group_phase_offset,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    RANDOM: tl.constexpr,
+    GROUPED: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """One program per token: write its ``[num_experts]`` logits row so that an
+    in-kernel router selects exactly the simulated experts (``target_logit``) over
+    the others (``other_logit``)."""
+    t = tl.program_id(0)
+    j = tl.arange(0, BLOCK_K)
+    gid = _simulated_expert_ids(
+        t,
+        j,
+        num_experts,
+        step,
+        num_ranks,
+        experts_per_rank,
+        deal_offset,
+        seed,
+        token_shard_rank,
+        num_token_shards,
+        num_groups,
+        topk_group,
+        group_size,
+        group_period,
+        group_step,
+        in_group_step,
+        slots_per_group,
+        extra_slots,
+        group_rotation,
+        ranks_per_group,
+        group_phase_offset,
+        K,
+        RANDOM,
+        GROUPED,
+    )
+    gid = tl.where(j < K, gid, -1)
+    e = tl.arange(0, BLOCK_E)
+    is_target = tl.max((e[:, None] == gid[None, :]).to(tl.int32), axis=1) > 0
+    value = tl.where(is_target, target_logit, other_logit)
+    tl.store(
+        logits_ptr + t * stride_lm + e,
+        value.to(logits_ptr.dtype.element_ty),
+        mask=e < num_experts,
+    )
+
+
 # Per-launch seed for the uniform (RANDOM=True) path: varies across eager calls so
 # the random base differs, while being baked at CUDA-graph capture (graph-safe).
 _simulate_uniform_seed = 0
+
+
+def simulated_routing_groups(topk_config: TopKConfig) -> Optional[Tuple[int, int]]:
+    """``(num_expert_group, topk_group)`` when the router keeps only some expert
+    groups, so simulated sets must too; None when every expert set is reachable."""
+    if (
+        topk_config.use_grouped_topk
+        and topk_config.topk_group < topk_config.num_expert_group
+    ):
+        return topk_config.num_expert_group, topk_config.topk_group
+    return None
+
+
+def _simulated_routing_launch_args(
+    *,
+    num_experts: int,
+    k: int,
+    random: bool,
+    num_ranks: int,
+    layer_id: Optional[int],
+    token_shard_rank: int,
+    num_token_shards: int,
+    seed: Optional[int],
+    groups: Optional[Tuple[int, int]],
+) -> Tuple:
+    """Launch arguments shared by both simulation kernels, in kernel order: ``seed``,
+    ``_simulated_expert_ids``' scalars, then ``K, BLOCK_K, RANDOM, GROUPED``. The
+    kernels take them positionally: Triton binds keyword arguments ~5 us slower."""
+    global _simulate_uniform_seed
+    if random and seed is None:
+        seed = _simulate_uniform_seed
+        _simulate_uniform_seed += 1
+    elif seed is None:
+        seed = 0
+    return (seed,) + _simulated_routing_layer_args(
+        num_experts=num_experts,
+        k=k,
+        random=random,
+        num_ranks=num_ranks,
+        layer_offset=0 if layer_id is None else layer_id,
+        token_shard_rank=token_shard_rank,
+        num_token_shards=num_token_shards,
+        groups=groups,
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _simulated_routing_layer_args(
+    *,
+    num_experts: int,
+    k: int,
+    random: bool,
+    num_ranks: int,
+    layer_offset: int,
+    token_shard_rank: int,
+    num_token_shards: int,
+    groups: Optional[Tuple[int, int]],
+) -> Tuple:
+    """The launch arguments after ``seed``: fixed per layer and shard layout, so
+    cached rather than recomputed every launch."""
+    assert 0 <= token_shard_rank < num_token_shards
+    assert num_ranks >= 1 and num_experts % num_ranks == 0, (num_experts, num_ranks)
+    experts_per_rank = num_experts // num_ranks
+    # Rank rotation keeps different shards' partial tail blocks off the same
+    # ranks; the expert rotation (a multiple of num_ranks, so it leaves the
+    # rank untouched) keeps small batches from piling every shard's slots onto
+    # the same one or two experts of each rank.
+    rank_rotation = (
+        token_shard_rank * max(num_ranks, num_token_shards)
+    ) // num_token_shards
+    expert_rotation = token_shard_rank * num_ranks
+    num_groups, topk_group = (1, 1) if groups is None else groups
+    if num_experts % num_groups or not 0 < topk_group <= num_groups:
+        raise ValueError(
+            f"Simulated routing cannot keep {topk_group} of {num_groups} groups "
+            f"over {num_experts} experts."
+        )
+    group_size = num_experts // num_groups
+    slots_per_group, extra_slots = divmod(k, topk_group)
+    max_slots_per_group = slots_per_group + (extra_slots > 0)
+    if max_slots_per_group > group_size:
+        raise ValueError(
+            f"Simulated routing cannot place top-{k} in {topk_group} groups of "
+            f"{group_size} experts."
+        )
+    ranks_per_group = (
+        num_ranks // num_groups
+        if num_ranks > num_groups and num_ranks % num_groups == 0
+        else 1
+    )
+    # Spreads shards' starting windows, so small batches cover every group.
+    group_phase_offset = (
+        token_shard_rank * max(num_groups, num_token_shards) // num_token_shards
+    ) % num_groups
+    return (
+        num_experts,
+        max(num_experts // k, 1),  # step
+        num_ranks,
+        experts_per_rank,
+        layer_offset + rank_rotation + expert_rotation,  # deal_offset
+        token_shard_rank,
+        num_token_shards,
+        num_groups,
+        topk_group,
+        group_size,
+        num_groups // math.gcd(num_groups, topk_group),  # group_period
+        num_groups // topk_group,  # group_step
+        max(group_size // max_slots_per_group, 1),  # in_group_step
+        slots_per_group,
+        extra_slots,
+        layer_offset,  # group_rotation
+        ranks_per_group,
+        group_phase_offset,
+        k,  # K
+        triton.next_power_of_2(k),  # BLOCK_K
+        random,  # RANDOM
+        groups is not None,  # GROUPED
+    )
 
 
 def _simulate_balanced_routing(
@@ -520,6 +819,7 @@ def _simulate_balanced_routing(
     to_physical_map: Optional[torch.Tensor] = None,
     logical_count: Optional[torch.Tensor] = None,
     ep_rank: int = 0,
+    groups: Optional[Tuple[int, int]] = None,
 ) -> None:
     """Benchmark-only fused override (in place): replace ``topk_ids`` with a
     balanced expert assignment and ``topk_weights`` with ``1/k`` using a single
@@ -533,13 +833,13 @@ def _simulate_balanced_routing(
     the global token batch (scattered DP, and attention-TP slices under
     sequence sharding); the defaults describe one gathered buffer.
 
-    Round-robin deals each shard's slots ``t * k + j`` over the ``num_ranks``
-    EP ranks in order, with shard ``r`` starting at rank ``r`` (spread evenly
-    when there are fewer shards than ranks) and at expert ``r`` within every
-    rank. Nothing cross-shard is read, so the result is the same under eager,
-    CUDA-graph replay and two-batch overlap. Per-EP-rank load: a shard's own
-    load differs by at most one slot across ranks, and is exact when its
-    ``tokens * k`` is a multiple of ``num_ranks``; the total over shards is
+    Ungrouped round-robin deals each shard's slots ``t * k + j`` over the
+    ``num_ranks`` EP ranks in order, with shard ``r`` starting at rank ``r``
+    (spread evenly when there are fewer shards than ranks) and at expert ``r``
+    within every rank. Nothing cross-shard is read, so the result is the same
+    under eager, CUDA-graph replay and two-batch overlap. Per-EP-rank load: a
+    shard's own load differs by at most one slot across ranks, and is exact when
+    its ``tokens * k`` is a multiple of ``num_ranks``; the total over shards is
     exact when every shard is, or when all shards hold equal counts and the
     shard count is a multiple of ``num_ranks``, and otherwise differs by at
     most one slot per shard whose ``tokens * k`` leaves a remainder. Balance is
@@ -548,58 +848,51 @@ def _simulate_balanced_routing(
     when ``to_physical_map`` (``[num_experts, dup]`` int32) and
     ``logical_count`` (``[num_experts]`` int32) are given.
 
+    ``groups=(num_expert_group, topk_group)`` (see ``simulated_routing_groups``)
+    keeps each token within ``topk_group`` groups. Round-robin then gives each
+    group exactly ``k`` slots in any ``num_expert_group`` consecutive tokens of a
+    shard, independent of other shards (shards start at spread-out windows; the
+    layer id rotates the groups). Slots are dealt in order over the group's
+    experts, with shards interleaving their deal blocks: per-expert load is exact
+    once a group's slots are a multiple of its expert count, with a single shard
+    or with equal shards of whole ``num_expert_group``-token cycles. When EP ranks
+    split groups, a group's slots alternate over its ranks, which then split those
+    ``k`` slots exactly when their count divides ``k`` (within one slot
+    otherwise); with one group per rank a token reaches at most ``topk_group``
+    ranks.
+
     ``seed`` is exposed for deterministic tests; production calls use a
     per-launch seed.
     """
-    global _simulate_uniform_seed
     num_tokens, k = topk_ids.shape
     if num_tokens == 0 or k == 0:
         return
-    assert 0 <= token_shard_rank < num_token_shards
-    assert num_ranks >= 1 and num_experts % num_ranks == 0, (num_experts, num_ranks)
-    experts_per_rank = num_experts // num_ranks
-    # Rank rotation keeps different shards' partial tail blocks off the same
-    # ranks; the expert rotation (a multiple of num_ranks, so it leaves the
-    # rank untouched) keeps small batches from piling every shard's slots onto
-    # the same one or two experts of each rank.
-    rank_rotation = (
-        token_shard_rank * max(num_ranks, num_token_shards)
-    ) // num_token_shards
-    expert_rotation = token_shard_rank * num_ranks
-    deal_offset = (
-        (0 if layer_id is None else layer_id) + rank_rotation + expert_rotation
-    )
-    if random and seed is None:
-        seed = _simulate_uniform_seed
-        _simulate_uniform_seed += 1
-    elif seed is None:
-        seed = 0
     _simulate_balanced_routing_kernel[(num_tokens,)](
         topk_ids,
         topk_weights,
-        num_experts,
-        max(num_experts // k, 1),
-        num_ranks,
-        experts_per_rank,
-        deal_offset,
-        weight_scale / k,
-        seed,
-        token_shard_rank,
-        num_token_shards,
         topk_ids.stride(0),
         topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
+        weight_scale / k,
         num_token_non_padded if num_token_non_padded is not None else topk_ids,
         to_physical_map if to_physical_map is not None else topk_ids,
         logical_count if logical_count is not None else topk_ids,
         to_physical_map.shape[1] if to_physical_map is not None else 1,
         ep_rank,
-        K=k,
-        BLOCK_K=triton.next_power_of_2(k),
-        RANDOM=random,
-        HAS_NON_PADDED=num_token_non_padded is not None,
-        HAS_PHYSICAL_MAP=to_physical_map is not None,
+        *_simulated_routing_launch_args(
+            num_experts=num_experts,
+            k=k,
+            random=random,
+            num_ranks=num_ranks,
+            layer_id=layer_id,
+            token_shard_rank=token_shard_rank,
+            num_token_shards=num_token_shards,
+            seed=seed,
+            groups=groups,
+        ),
+        num_token_non_padded is not None,  # HAS_NON_PADDED
+        to_physical_map is not None,  # HAS_PHYSICAL_MAP
     )
 
 
@@ -641,6 +934,42 @@ def _can_bypass_trtllm_routing(config: TopKConfig) -> bool:
     if method == RoutingMethodType.Sigmoid:
         return config.scoring_func == "sigmoid" and not config.renormalize
     return False
+
+
+# Finite, so softmax never meets inf - inf; sigmoid(-64) and exp(-64) are below
+# 2e-28, so non-targets get zero weight in fp32, and 64 is exact in bf16.
+_SIMULATED_LOGIT_MAGNITUDE = 64.0
+
+
+class SimulatedLogitEncoding(NamedTuple):
+    """Router logits whose in-kernel routing selects the simulated experts."""
+
+    target_logit: float
+    other_logit: float
+    top_k: int
+    groups: Optional[Tuple[int, int]]
+
+
+def _simulated_logit_values(k: int) -> Tuple[float, float]:
+    """``(target_logit, other_logit)`` for top-``k``; see ``simulated_logit_encoding``."""
+    target = -math.log(k - 1) if k > 1 else _SIMULATED_LOGIT_MAGNITUDE
+    return target, -_SIMULATED_LOGIT_MAGNITUDE
+
+
+def simulated_logit_encoding(config: TopKConfig) -> SimulatedLogitEncoding:
+    """Targets at -ln(k - 1) and the rest at -64: any router that ranks experts by
+    a monotone score of their own logit selects the targets. Softmax routers and
+    renormalized sigmoid routers weight each target exactly 1/k, since all targets
+    share one logit. A sigmoid router without renormalization weights each target
+    sigmoid(-ln(k - 1)), which is 1/k only up to rounding the logit to the logits
+    dtype: in bf16, k=8 gives 0.12506 instead of 0.125."""
+    target_logit, other_logit = _simulated_logit_values(config.top_k)
+    return SimulatedLogitEncoding(
+        target_logit=target_logit,
+        other_logit=other_logit,
+        top_k=config.top_k,
+        groups=simulated_routing_groups(config),
+    )
 
 
 # -------------------------------- TopK ---------------------------------------
@@ -745,6 +1074,12 @@ class TopK(BaseFusedOp):
             allow_routed_experts_capture=allow_routed_experts_capture
             and not self.is_draft,
         )
+        # In-kernel routing formats get logits that route to the simulated experts.
+        self._routing_simulated = routing_simulation_enabled()
+        self._simulated_zero_bias: Optional[torch.Tensor] = None
+        self._simulated_config: Optional[TopKConfig] = None
+        # The live config's attribute values the cached simulated config was built from.
+        self._simulated_source: Tuple = ()
 
     def routing_inputs(self):
         return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
@@ -796,6 +1131,51 @@ class TopK(BaseFusedOp):
         else:
             output_format = TopKOutputFormat.STANDARD
         self.topk_config.output_format = output_format
+
+    def _simulated_topk_config(self) -> TopKConfig:
+        """The live config with a zero bias and the encoded marker. Rebuilt only when
+        a field of the live config is reassigned, so edits after bind (e.g. the draft
+        capture opt-out) carry over without a rebuild on every forward."""
+        config = self.topk_config
+        source = tuple(vars(config).values())
+        cached = self._simulated_source
+        if len(source) == len(cached) and all(
+            now is then for now, then in zip(source, cached)
+        ):
+            return self._simulated_config
+        bias = config.correction_bias
+        zero = self._simulated_zero_bias
+        if bias is not None and (
+            zero is None
+            or zero.shape != bias.shape
+            or zero.dtype != bias.dtype
+            or zero.device != bias.device
+        ):
+            zero = self._simulated_zero_bias = torch.zeros_like(bias)
+        simulated = replace(
+            config,
+            correction_bias=None if bias is None else zero,
+            routing_simulation_encoded=True,
+        )
+        previous = self._simulated_config
+        if previous is not None:
+            # Keyed on the zero bias, so a stale entry is recomputed, not reused.
+            simulated._correction_bias_dtype_cache = (
+                previous._correction_bias_dtype_cache
+            )
+            simulated._correction_bias_cache_key = previous._correction_bias_cache_key
+        self._simulated_config = simulated
+        self._simulated_source = source
+        return simulated
+
+    def _encode_simulated_logits(self, router_logits: torch.Tensor) -> torch.Tensor:
+        return encode_simulated_router_logits(
+            router_logits,
+            encoding=simulated_logit_encoding(self.topk_config),
+            layer_id=self.layer_id,
+            # The bypass path hands on only the encoded logits.
+            in_place=True,
+        )
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
         if self.enable_waterfill and self.waterfill_balancer is None:
@@ -889,10 +1269,14 @@ class TopK(BaseFusedOp):
             router_logits_partials = None
 
         if output_format == TopKOutputFormat.BYPASSED:
+            topk_config = self.topk_config
+            if self._routing_simulated:
+                router_logits = self._encode_simulated_logits(router_logits)
+                topk_config = self._simulated_topk_config()
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 raw_router_logits=router_logits,
-                topk_config=self.topk_config,
+                topk_config=topk_config,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=(
                     expert_location_dispatch_info if requires_remapping else None
@@ -2394,10 +2778,36 @@ else:
 
 
 def routing_simulation_enabled() -> bool:
-    return (
-        envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-        or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-    )
+    uniform = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+    round_robin = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    if uniform and round_robin:
+        raise ValueError(
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
+        )
+    return uniform or round_robin
+
+
+def _simulation_token_shards() -> Tuple[int, int]:
+    """``(token_shard_rank, num_token_shards)`` of the rows this rank routes."""
+    parallel = get_parallel()
+    if not is_moe_input_scattered_across_dp_ranks():
+        # Gathered MoE presents one global token buffer to every rank, so
+        # its routing must remain identical across those replicas.
+        return 0, 1
+    token_shard_rank = parallel.attn_dp_rank
+    num_token_shards = parallel.attn_dp_size
+    forward = get_forward()
+    if forward.attn_tp_sequence_sharded or forward.attn_input_scattered:
+        # This forward routes attention-TP-local rows (sequence-sharded
+        # attention TP, or the layer-boundary attention input scatter):
+        # each attention-TP rank holds its own slice of the DP shard, so
+        # it is a shard of its own rather than a replica of its peers.
+        token_shard_rank = (
+            token_shard_rank * parallel.attn_tp_size + parallel.attn_tp_rank
+        )
+        num_token_shards *= parallel.attn_tp_size
+    return token_shard_rank, num_token_shards
 
 
 def apply_routing_simulation(
@@ -2408,47 +2818,29 @@ def apply_routing_simulation(
     num_routed_topk: int,
     top_k: int,
     layer_id: Optional[int],
+    groups: Optional[Tuple[int, int]],
     num_token_non_padded: Optional[torch.Tensor] = None,
     weight_scale: float = 1.0,
     to_physical_map: Optional[torch.Tensor] = None,
     logical_count: Optional[torch.Tensor] = None,
 ) -> None:
-    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     # Benchmark-only: override gating with a balanced expert assignment (so
     # dummy/random benchmark tokens don't skew MoE load) via a single fused
     # Triton kernel — one launch instead of the ~5-7 small elementwise ops it
     # replaces, to minimize timing perturbation. Do NOT use in production.
-    parallel = get_parallel()
-    if is_moe_input_scattered_across_dp_ranks():
-        token_shard_rank = parallel.attn_dp_rank
-        num_token_shards = parallel.attn_dp_size
-        forward = get_forward()
-        if forward.attn_tp_sequence_sharded or forward.attn_input_scattered:
-            # This forward routes attention-TP-local rows (sequence-sharded
-            # attention TP, or the layer-boundary attention input scatter):
-            # each attention-TP rank holds its own slice of the DP shard, so
-            # it is a shard of its own rather than a replica of its peers.
-            token_shard_rank = (
-                token_shard_rank * parallel.attn_tp_size + parallel.attn_tp_rank
-            )
-            num_token_shards *= parallel.attn_tp_size
-    else:
-        # Gathered MoE presents one global token buffer to every rank, so
-        # its routing must remain identical across those replicas.
-        token_shard_rank, num_token_shards = 0, 1
-
     override_topk_ids, override_topk_weights = topk_ids, topk_weights
     if num_routed_topk < top_k:
         # Only the routed columns are simulated; a fused shared-expert
         # column keeps the id and weight the router gave it.
         override_topk_ids = topk_ids[:, :num_routed_topk]
         override_topk_weights = topk_weights[:, :num_routed_topk]
+    token_shard_rank, num_token_shards = _simulation_token_shards()
     _simulate_balanced_routing(
         override_topk_ids,
         override_topk_weights,
         num_experts,
-        random=simulate_uniform_experts,
-        num_ranks=parallel.moe_ep_size,
+        random=envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get(),
+        num_ranks=get_parallel().moe_ep_size,
         layer_id=layer_id,
         token_shard_rank=token_shard_rank,
         num_token_shards=num_token_shards,
@@ -2456,8 +2848,70 @@ def apply_routing_simulation(
         weight_scale=weight_scale,
         to_physical_map=to_physical_map,
         logical_count=logical_count,
-        ep_rank=parallel.moe_ep_rank if to_physical_map is not None else 0,
+        ep_rank=get_parallel().moe_ep_rank if to_physical_map is not None else 0,
+        groups=groups,
     )
+
+
+def encode_simulated_router_logits(
+    router_logits: torch.Tensor,
+    *,
+    encoding: SimulatedLogitEncoding,
+    layer_id: int,
+    seed: Optional[int] = None,
+    in_place: bool = False,
+) -> torch.Tensor:
+    """Benchmark-only: logits like ``router_logits`` (same shape and dtype) that
+    route, in-kernel, to the experts ``apply_routing_simulation`` would pick.
+    ``in_place`` overwrites ``router_logits`` when its rows are contiguous, for
+    callers that discard the raw logits."""
+    if in_place and router_logits.stride(-1) == 1:
+        encoded = router_logits
+    else:
+        encoded = torch.empty_like(router_logits, memory_format=torch.contiguous_format)
+    num_tokens, num_experts = router_logits.shape
+    if num_tokens == 0:
+        return encoded
+    token_shard_rank, num_token_shards = _simulation_token_shards()
+    _encode_simulated_logits_kernel[(num_tokens,)](
+        encoded,
+        encoded.stride(0),
+        encoding.target_logit,
+        encoding.other_logit,
+        *_simulated_routing_launch_args(
+            num_experts=num_experts,
+            k=encoding.top_k,
+            random=envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get(),
+            num_ranks=get_parallel().moe_ep_size,
+            layer_id=layer_id,
+            token_shard_rank=token_shard_rank,
+            num_token_shards=num_token_shards,
+            seed=seed,
+            groups=encoding.groups,
+        ),
+        triton.next_power_of_2(num_experts),  # BLOCK_E
+    )
+    return encoded
+
+
+def encode_router_logits_from_topk_ids(
+    topk_ids: torch.Tensor, *, num_experts: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Benchmark-only: ``[num_tokens, num_experts]`` logits whose in-kernel routing
+    selects exactly ``topk_ids``' experts (already simulated, logical ids), with the
+    weights of ``simulated_logit_encoding``. Negative ids select nothing."""
+    num_tokens, k = topk_ids.shape
+    target_logit, other_logit = _simulated_logit_values(k)
+    # The extra column absorbs negative (padded) ids, so every write is in bounds.
+    hits = torch.zeros(
+        (num_tokens, num_experts + 1), dtype=torch.bool, device=topk_ids.device
+    )
+    columns = torch.where(topk_ids < 0, num_experts, topk_ids).long()
+    hits.scatter_(1, columns, True)
+    logits = torch.full(
+        (num_tokens, num_experts), other_logit, dtype=dtype, device=topk_ids.device
+    )
+    return logits.masked_fill_(hits[:, :num_experts], target_logit)
 
 
 def is_routed_scaling_factor_fused_in_topk(topk_config: TopKConfig) -> bool:
@@ -2473,6 +2927,17 @@ def is_routed_scaling_factor_fused_in_topk(topk_config: TopKConfig) -> bool:
         topk_config.scoring_func == "sqrtsoftplus"
         and topk_config.custom_routing_function is None
     )
+
+
+def simulated_routing_weight_scale(topk_config: TopKConfig) -> float:
+    """Scale on simulated ``1/k`` weights: the routed scale when routing folds it in
+    and the epilogue skips it, matching what in-kernel routers apply."""
+    if (
+        topk_config.routed_scaling_factor is not None
+        and is_routed_scaling_factor_fused_in_topk(topk_config)
+    ):
+        return topk_config.routed_scaling_factor
+    return 1.0
 
 
 def fused_shared_expert_weight(
@@ -2868,14 +3333,11 @@ def select_experts(
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
 
-    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-    simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-    if simulate_uniform_experts and simulate_round_robin_experts:
-        raise ValueError(
-            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
-            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
-        )
-    routing_overridden = simulate_uniform_experts or simulate_round_robin_experts
+    # Encoded logits already route to the simulated experts; overriding again would
+    # reseed uniform mode and pick different ones.
+    routing_overridden = (
+        routing_simulation_enabled() and not topk_config.routing_simulation_encoded
+    )
 
     if router_logits_partials is not None and not (
         _use_aiter
@@ -3146,6 +3608,8 @@ def select_experts(
             num_routed_topk=num_routed_topk,
             top_k=top_k,
             layer_id=layer_id,
+            groups=simulated_routing_groups(topk_config),
+            weight_scale=simulated_routing_weight_scale(topk_config),
         )
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
@@ -3183,8 +3647,7 @@ def can_postprocess_precomputed_topk(topk_config: TopKConfig) -> bool:
     return (
         _is_cuda
         and topk_config.num_shared_topk_slots == 0
-        and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-        and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        and not routing_simulation_enabled()
     )
 
 

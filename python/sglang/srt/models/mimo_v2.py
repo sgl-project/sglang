@@ -507,8 +507,6 @@ class MiMoV2MoE(nn.Module):
             and not self._uses_expert_remap
             and not get_exec().features.enable_return_routed_experts
             and get_exec().moe.expert_distribution_recorder_mode is None
-            and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-            and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
             and uses_mxfp4_runner
             and get_moe_a2a_backend().is_none()
             and self.experts.quant_method.configure_bypassed_topk(self.topk.topk_config)

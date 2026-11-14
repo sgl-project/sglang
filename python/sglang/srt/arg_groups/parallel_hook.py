@@ -811,6 +811,18 @@ def handle_eplb_and_dispatch(server_args: Any):
             "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
         )
 
+    # Both replace the router's choice, and fake would randomize the logits that
+    # the simulation encodes for in-kernel routers.
+    if cfg.ep_dispatch_algorithm == "fake" and (
+        envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    ):
+        raise ValueError(
+            "--ep-dispatch-algorithm fake cannot be combined with "
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS / SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS; "
+            "both replace the router's expert choice."
+        )
+
     if cfg.enable_eplb and cfg.ep_join_mode != "scale":
         assert resolved_view(server_args).ep_size > 1
 

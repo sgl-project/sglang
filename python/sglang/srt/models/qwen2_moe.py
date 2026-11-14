@@ -76,6 +76,7 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputChecker,
     capture_routed_experts_if_allowed,
     is_expert_remapping_enabled,
+    routing_simulation_enabled,
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -265,8 +266,7 @@ def _smallm_router_topk_output(block, hidden_states):
             and sw.shape == (1, 4096)
             and gw.is_contiguous()
             and sw.is_contiguous()
-            and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-            and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            and not routing_simulation_enabled()
             and not is_expert_remapping_enabled()
         )
     if (

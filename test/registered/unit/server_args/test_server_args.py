@@ -555,6 +555,28 @@ class TestPrepareServerArgs(CustomTestCase):
             with self.subTest(mode=mode):
                 handle_eplb_and_dispatch(make_args(mode))
 
+    def test_fake_dispatch_rejects_simulated_routing(self):
+        def make_args(algorithm):
+            return ServerArgs(
+                model_path="dummy",
+                tp_size=2,
+                ep_size=2,
+                ep_dispatch_algorithm=algorithm,
+            )
+
+        for flag in (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS,
+            envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS,
+        ):
+            with flag.override(True):
+                with (
+                    self.subTest(flag=flag.name),
+                    self.assertRaisesRegex(ValueError, "cannot be combined"),
+                ):
+                    handle_eplb_and_dispatch(make_args("fake"))
+                handle_eplb_and_dispatch(make_args("dynamic"))
+        handle_eplb_and_dispatch(make_args("fake"))
+
     def test_instanttensor_requires_cuda_device(self):
         for device in ("cpu", "xpu", "npu", "musa", "hpu", "mps"):
             with (

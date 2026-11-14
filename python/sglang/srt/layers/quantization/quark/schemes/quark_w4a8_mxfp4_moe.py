@@ -505,7 +505,11 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 aiter_w4a8_gfx1250_forward,
             )
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-            from sglang.srt.layers.moe.topk import TopKOutputChecker
+            from sglang.srt.layers.moe.topk import (
+                TopKOutputChecker,
+                encode_router_logits_from_topk_ids,
+                routing_simulation_enabled,
+            )
 
             topk_output = dispatch_output.topk_output
             if TopKOutputChecker.format_is_bypassed(topk_output):
@@ -514,6 +518,14 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             else:
                 _, topk_ids, router_logits = topk_output
                 top_k = topk_ids.shape[-1]
+                if routing_simulation_enabled():
+                    # These kernels route from the logits and ignore topk_ids, so
+                    # the simulated ids must be encoded into the logits.
+                    router_logits = encode_router_logits_from_topk_ids(
+                        topk_ids,
+                        num_experts=router_logits.shape[-1],
+                        dtype=router_logits.dtype,
+                    )
             x = dispatch_output.hidden_states
             if x.shape[-1] != self.hidden_size:
                 x = x[..., : self.hidden_size]
