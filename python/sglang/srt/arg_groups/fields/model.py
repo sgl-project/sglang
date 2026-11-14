@@ -224,6 +224,19 @@ class Model(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    indexer_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Quantization recipe for the DSA lightning-indexer KV cache "
+                "(Ascend NPU only). None disables the quantized indexer cache "
+                'and keeps the default indexer behavior. "int8" stores the '
+                "indexer keys in INT8 with FP16 scales to speed up the "
+                "lightning indexer."
+            ),
+            choices=["int8"],
+        ),
+    ] = None
     qsa_indexer_dtype: A[
         str,
         Arg(

@@ -46,18 +46,18 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type):
+def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
-            torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device),
+            torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
         )
     rotated = x @ hadamard
     quantized, scale = torch_npu.npu_dynamic_quant(
         rotated.reshape(-1, 128), dst_type=dst_type
     )
-    return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
+    return quantized.reshape(x.shape), scale.to(scale_type).reshape(x.shape[:-1])
 
 
 def plan_indexer_query_shard(
@@ -438,7 +438,10 @@ class DSANPUIndexerMixin:
             )
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
+                k,
+                pool.indexer_hadamard_128,
+                pool.index_k_store_dtype,
+                pool.index_k_scale_dtype,
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
@@ -508,6 +511,10 @@ class DSANPUIndexerMixin:
             and forward_batch.attn_cp_metadata is not None
             and not use_quant_indexer
         ):
+            if use_quant_indexer:
+                raise RuntimeError(
+                    "DSANPUIndexerMixin.do_npu_cp_balance_indexer is not implemented for quantized indexer cache"
+                )
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
@@ -539,13 +546,23 @@ class DSANPUIndexerMixin:
                 query, query_scale = _quantize_npu_indexer_activation(
                     query,
                     pool.indexer_hadamard_128,
-                    pool.dtype,
+                    pool.index_k_store_dtype,
+                    pool.index_k_scale_dtype,
                 )
+
+                if pool.index_k_store_dtype == torch.int8:
+                    # INT8 keys require FP16 weights
+                    op_weights = weights.to(torch.float16)
+                    # torch_npu.npu_quant_lightning_indexer is not working
+                    # for int8 cache in case of custom_ops imported
+                else:
+                    op_weights = weights
+
                 # custom_ops can replace the torch_npu alias with a different schema.
                 topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
                     query=query,
                     key=past_key_states,
-                    weights=weights,
+                    weights=op_weights,
                     query_dequant_scale=query_scale,
                     key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
                     actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
