@@ -156,6 +156,35 @@ class TestCpuOffloader(CustomTestCase):
             # invoke it after the offloaded layer's functional_call has returned.
             torch.testing.assert_close(attention.indexer(inputs), expected_indexer)
 
+    def test_v1_offloads_only_accessed_submodule(self) -> None:
+        """V1 must honor submodule_accessor, keep the rest of the layer on device,
+        and serve device weights to layer code that skips the submodule's forward."""
+
+        class Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Linear(3, 3)
+                self.experts = nn.Linear(3, 3)
+
+            def forward(self, x):
+                # Like MoE paths that call experts.forward_impl / run_moe_core directly.
+                return F.linear(self.attn(x), self.experts.weight, self.experts.bias)
+
+        with torch.no_grad():
+            layers = [Layer().to(self.device) for _ in range(2)]
+            inputs = torch.randn(2, 3, device=self.device)
+            expected = [layer(inputs) for layer in layers]
+
+            wrapped = OffloaderV1(cpu_offload_max_bytes=1024**2).wrap_modules(
+                iter(layers), submodule_accessor=lambda layer: layer.experts
+            )
+
+            self.assertEqual([id(m) for m in wrapped], [id(m) for m in layers])
+            for layer, want in zip(wrapped, expected):
+                self.assertEqual(layer.attn.weight.device, inputs.device)
+                self.assertEqual(layer.experts.weight.device.type, "cpu")
+                torch.testing.assert_close(layer(inputs), want)
+
     def test_cpu_offloaded_gemma_weight_fills_device_buffer(self) -> None:
         norm = GemmaRMSNorm(16).to(self.device)
         norm = OffloaderV1(cpu_offload_max_bytes=1024**2).maybe_offload_to_cpu(norm)
