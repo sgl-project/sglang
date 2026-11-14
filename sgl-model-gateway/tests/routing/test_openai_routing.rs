@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -679,6 +679,57 @@ async fn test_openai_router_chat_completion_with_mock() {
     assert_eq!(chat_response["object"], "chat.completion");
     assert_eq!(chat_response["model"], "gpt-3.5-turbo");
     assert!(!chat_response["choices"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_openai_router_forwards_sglang_rid_to_external_worker() {
+    let received_payload = Arc::new(Mutex::new(None));
+    let handler_payload = Arc::clone(&received_payload);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(payload): Json<serde_json::Value>| {
+            let handler_payload = Arc::clone(&handler_payload);
+            async move {
+                *handler_payload.lock().unwrap() = Some(payload);
+                Json(json!({
+                    "id": "chatcmpl-rid",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-3.5-turbo",
+                    "choices": [],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let ctx = crate::common::test_app::create_test_app_context().await;
+    crate::common::test_app::register_external_worker(&ctx, &format!("http://{address}"), None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
+
+    let response = router
+        .route_chat_with_sglang_rid(
+            None,
+            &create_minimal_chat_request(),
+            None,
+            Some("nbe-cutoff-request-id"),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        received_payload
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|payload| payload.get("rid"))
+            .and_then(serde_json::Value::as_str),
+        Some("nbe-cutoff-request-id")
+    );
+    server.abort();
 }
 
 /// Test full E2E flow with Axum server
