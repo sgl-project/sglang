@@ -130,7 +130,7 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. Select the tab for the weights you downloaded, then run the script inside the
-container. The two variants differ only in `--quantization modelslim`, which selects the W8A8 checkpoint.
+container. Set `MODEL_PATH` to the checkpoint for the selected tab: the BF16 checkpoint for BF16, or the W8A8 checkpoint for W8A8. The W8A8 command also sets `--quantization modelslim` to load the ModelSlim-quantized weights. These examples target Qwen3.6-27B on A3 Series; validate and adjust the configuration before applying it to a different model, NPU generation, or workload.
 
 <Tabs>
   <Tab title="BF16">
