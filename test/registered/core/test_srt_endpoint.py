@@ -640,6 +640,15 @@ class TestSRTEndpoint(CustomTestCase):
             f"Expected some tokens to be different from {biased_token_id} in second response, but got {unbiased_tokens}",
         )
 
+    def test_clear_hicache_storage_without_hierarchical_cache(self):
+        response = requests.post(
+            self.base_url + "/hicache/storage-backend/clear", timeout=10
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.text, "Failed to clear hierarchical cache storage backend.\n"
+        )
+
     def test_get_server_info_concurrent(self):
         """Make sure the concurrent get_server_info doesn't crash the server."""
         tp = ThreadPoolExecutor(max_workers=30)
