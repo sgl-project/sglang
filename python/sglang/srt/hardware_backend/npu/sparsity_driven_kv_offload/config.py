@@ -40,37 +40,6 @@ def use_fused_sparse_kv_offload() -> bool:
     return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
 
 
-def use_pd_split_kv() -> bool:
-    """Select split host storage only for explicitly enabled PD decode."""
-    if not (
-        envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.get()
-        and use_fused_sparse_kv_offload()
-        and envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
-    ):
-        return False
-    disagg = get_disagg()
-    if disagg.disaggregation_mode != "decode":
-        return False
-    prefill_backend, decode_backend = attention_backends()
-    if (prefill_backend, decode_backend) != ("ascend", "ascend"):
-        raise ValueError("PD split KV requires the Ascend attention backend.")
-    parallel = get_parallel()
-    if parallel.pp_size != 1 or parallel.attn_cp_size != 1 or parallel.dcp_enabled:
-        raise ValueError("PD split KV requires PP=1 and context parallelism disabled.")
-    if disagg.enable_pd_role_switch:
-        raise ValueError("PD split KV does not support PD role switching.")
-    if disagg.disaggregation_transfer_backend not in ("ascend", "mooncake"):
-        raise ValueError(
-            "PD split KV requires the Ascend or Mooncake transfer backend."
-        )
-    if (
-        disagg.disaggregation_transfer_backend in ("ascend", "mooncake")
-        and disagg.disaggregation_decode_host_receive_threshold < 1
-    ):
-        raise ValueError("PD split KV requires host receive threshold 1.")
-    return True
-
-
 def is_sparsity_driven_kv_offload_enabled(
     *,
     model_config: ModelConfig,
@@ -105,13 +74,25 @@ def is_sparsity_driven_kv_offload_enabled(
         )
     if not use_fused_sparse_kv_offload():
         return True
-    if get_disagg().disaggregation_mode == "prefill":
+    disagg = get_disagg()
+    if disagg.disaggregation_mode == "prefill":
         # Prefill publishes native KV pages; fused offload belongs to decode.
         return False
     if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
         raise ValueError(
             "Native LIM integration currently requires PP=1 and DCP disabled."
         )
+    if disagg.disaggregation_mode == "decode":
+        if get_parallel().attn_cp_size != 1:
+            raise ValueError("PD split KV requires context parallelism disabled.")
+        if disagg.enable_pd_role_switch:
+            raise ValueError("PD split KV does not support PD role switching.")
+        if disagg.disaggregation_transfer_backend not in ("ascend", "mooncake"):
+            raise ValueError(
+                "PD split KV requires the Ascend or Mooncake transfer backend."
+            )
+        if disagg.disaggregation_decode_host_receive_threshold < 1:
+            raise ValueError("PD split KV requires host receive threshold 1.")
     algorithm = (get_spec().speculative_algorithm or "NONE").upper()
     if algorithm != "NONE" and (
         algorithm not in ("EAGLE", "NEXTN") or get_spec().speculative_eagle_topk != 1

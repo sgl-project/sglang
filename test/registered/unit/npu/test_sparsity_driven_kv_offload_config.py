@@ -8,7 +8,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_cell_size,
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
-    use_pd_split_kv,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -35,78 +34,61 @@ def _glm_indexer_types():
 
 
 class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
-    def test_pd_split_kv_transport_and_data_parallelism(self):
+    def test_fused_pd_decode_transport_and_parallelism(self):
         from sglang.srt.environ import envs
 
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
-        parallel = SimpleNamespace(
-            nnodes=1,
-            pp_size=1,
-            attn_cp_size=1,
-            dcp_enabled=False,
-            dp_size=1,
-            attn_dp_size=1,
-        )
+        parallel = SimpleNamespace(pp_size=1, attn_cp_size=1, dcp_enabled=False)
         disagg = SimpleNamespace(
             disaggregation_mode="decode",
             enable_pd_role_switch=False,
             disaggregation_transfer_backend="ascend",
             disaggregation_decode_host_receive_threshold=1,
         )
+
+        def enabled():
+            return is_sparsity_driven_kv_offload_enabled(
+                model_config=_make_glm51_model_config(), use_mla_backend=True
+            )
+
         with (
-            envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.override(True),
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             patch(prefix + "is_npu", return_value=True),
             patch(prefix + "attention_backends", return_value=("ascend", "ascend")),
             patch(prefix + "get_disagg", return_value=disagg),
             patch(prefix + "get_parallel", return_value=parallel),
-            patch(prefix + "get_schedule", return_value=SimpleNamespace(page_size=128)),
+            patch(
+                prefix + "get_schedule",
+                return_value=SimpleNamespace(max_running_requests=8),
+            ),
+            patch(
+                prefix + "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="NONE"),
+            ),
         ):
             for backend in ("ascend", "mooncake"):
                 disagg.disaggregation_transfer_backend = backend
-                for mode in ("null", "prefill", "decode"):
-                    disagg.disaggregation_mode = mode
-                    for dp_size, attn_dp_size in ((1, 1), (2, 1), (2, 2)):
-                        parallel.dp_size, parallel.attn_dp_size = dp_size, attn_dp_size
-                        with self.subTest(
-                            backend=backend, mode=mode, dp=dp_size, attn_dp=attn_dp_size
-                        ):
-                            self.assertEqual(use_pd_split_kv(), mode == "decode")
-
-            disagg.disaggregation_decode_host_receive_threshold = 0
-            for backend in ("ascend", "mooncake"):
-                disagg.disaggregation_transfer_backend = backend
-                with (
-                    self.subTest(backend=backend),
-                    self.assertRaisesRegex(ValueError, "host receive threshold"),
-                ):
-                    use_pd_split_kv()
-            disagg.disaggregation_decode_host_receive_threshold = 1
-            with patch.object(parallel, "nnodes", 2):
-                self.assertTrue(use_pd_split_kv())
-            with patch(
-                prefix + "get_schedule", return_value=SimpleNamespace(page_size=64)
-            ):
-                for mode in ("prefill", "decode"):
-                    disagg.disaggregation_mode = mode
-                    with self.subTest(mode=mode):
-                        self.assertEqual(use_pd_split_kv(), mode == "decode")
+                self.assertTrue(enabled())
             for obj, attribute, value, message in (
                 (disagg, "disaggregation_transfer_backend", "fake", "transfer backend"),
+                (
+                    disagg,
+                    "disaggregation_decode_host_receive_threshold",
+                    0,
+                    "host receive threshold",
+                ),
                 (parallel, "pp_size", 2, "PP=1"),
                 (parallel, "attn_cp_size", 2, "context parallelism"),
-                (parallel, "dcp_enabled", True, "context parallelism"),
+                (parallel, "dcp_enabled", True, "DCP disabled"),
                 (disagg, "enable_pd_role_switch", True, "role switching"),
             ):
-                previous = getattr(obj, attribute)
                 with (
                     self.subTest(attribute=attribute),
                     patch.object(obj, attribute, value),
                 ):
                     with self.assertRaisesRegex(ValueError, message):
-                        use_pd_split_kv()
-                self.assertEqual(getattr(obj, attribute), previous)
+                        enabled()
 
     def test_fused_prefill_keeps_native_pool_without_changing_legacy(self):
         from sglang.srt.environ import envs
@@ -114,7 +96,12 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
         model = _make_glm51_model_config()
         model.hf_config.index_topk = 2048
-        disagg = SimpleNamespace(disaggregation_mode="prefill")
+        disagg = SimpleNamespace(
+            disaggregation_mode="prefill",
+            enable_pd_role_switch=False,
+            disaggregation_transfer_backend="ascend",
+            disaggregation_decode_host_receive_threshold=1,
+        )
         with (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
@@ -127,7 +114,9 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             ),
             patch(
                 prefix + "get_parallel",
-                return_value=SimpleNamespace(pp_size=1, dcp_enabled=False),
+                return_value=SimpleNamespace(
+                    pp_size=1, attn_cp_size=1, dcp_enabled=False
+                ),
             ),
             patch(
                 prefix + "get_spec",

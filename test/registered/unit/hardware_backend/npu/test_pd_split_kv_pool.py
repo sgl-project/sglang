@@ -2,10 +2,12 @@ import ast
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,6 +35,42 @@ def _make_pool():
 
 
 class TestPDSplitKVPool(CustomTestCase):
+    def test_pool_allocation_follows_fused_role(self):
+        from sglang.srt.environ import envs
+
+        prefix = "sglang.srt.hardware_backend.npu.memory_pool_npu."
+        for fused, mode, draft, native in (
+            (True, "decode", False, False),
+            (True, "null", False, False),
+            (True, "prefill", False, True),
+            (True, "decode", True, True),
+            (False, "prefill", False, False),
+            (False, "decode", True, False),
+        ):
+            with (
+                self.subTest(fused=fused, mode=mode, draft=draft),
+                envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+                envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(fused),
+                get_context().override_server_args(disaggregation_mode=mode),
+                get_parallel().override(attn_dcp_rank=0),
+                patch(prefix + "get_bool_env_var", return_value=False),
+                patch.object(NPUMLATokenToKVPool, "_finalize_allocation_log"),
+            ):
+                pool = NPUMLATokenToKVPool(
+                    size=128,
+                    page_size=128,
+                    dtype=torch.bfloat16,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    layer_num=1,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    index_head_dim=128,
+                    is_draft_worker=draft,
+                )
+                self.assertEqual(pool.k_buffer is not None, native)
+                self.assertEqual(pool.v_buffer is not None, native)
+
     def test_native_combined_export_uses_upstream_layout(self):
         pool = _make_pool()
         pool.use_combined_kv_buffer = True

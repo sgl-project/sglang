@@ -16,9 +16,6 @@ from sglang.kernels.ops.attention.npu_copy_sfa import (
     load_copy_sfa_operator,
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    use_pd_split_kv,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
     make_fused_prefill_plan,
     prepare_prefill_gather_rows,
@@ -26,7 +23,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -160,7 +157,6 @@ class FusedSparseKVCacheManager:
         )
         self.cache_capacity = self.device_cache_size
         self._copy_sfa_operator = load_copy_sfa_operator()
-        split_host = use_pd_split_kv()
 
         # Allocate exactly the persistent shapes reserved by the plan.
         try:
@@ -187,14 +183,13 @@ class FusedSparseKVCacheManager:
         # Host KV buffer
         # [bs, ctx_len, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.dev_ptr_list: list[int] = []
 
         # Radix prefixes use native physical token IDs. Keep host payloads in that
         # same address space; request slots own only bounded HBM residency maps.
         host_kv_shape = self.budget.host_kv_spec.shape
         device_id = torch.npu.current_device()
 
-        if split_host:
+        if get_disagg().disaggregation_mode == "decode":
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
                 MemFabricKVPool,
             )
@@ -207,8 +202,10 @@ class FusedSparseKVCacheManager:
                 device=self.device,
                 group=get_parallel().attn_tp_group,
             )
-            self.host_k_buffer, self.host_v_buffer = self.host_pool.buffers
-            self.dev_ptr_list = [x.data_ptr() for x in self.host_k_buffer]
+            self.dev_ptr_list, self.rope_dev_ptr_list = (
+                [x.data_ptr() for x in component]
+                for component in self.host_pool.buffers
+            )
         else:
             self.host_pool = ShmSplitKVPool(
                 shape=host_kv_shape,
@@ -218,13 +215,8 @@ class FusedSparseKVCacheManager:
                 device_id=device_id,
                 name=f"host_kv_pool_{id(paged_kv_cache)}_rank_{device_id}",
             )
-            self.host_k_buffer, self.host_v_buffer = self.host_pool.buffers
-            self.dev_ptr_list = self.host_pool.dev_ptrs[0]
-        self.rope_dev_ptr_list = (
-            [x.data_ptr() for x in self.host_v_buffer]
-            if split_host
-            else self.host_pool.dev_ptrs[1]
-        )
+            self.dev_ptr_list, self.rope_dev_ptr_list = self.host_pool.dev_ptrs
+        self.host_k_buffer, self.host_v_buffer = self.host_pool.buffers
         logger.info(
             "Sparse KV host buffers: layout=split, CKV=%s, KPE=%s, pool=%s",
             tuple(self.host_k_buffer[0].shape),

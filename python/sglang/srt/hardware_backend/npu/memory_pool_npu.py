@@ -676,30 +676,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
-            and not (is_draft_worker and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get())
+            and not (
+                envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+                and (is_draft_worker or get_disagg().disaggregation_mode == "prefill")
+            )
         )
         if (
-            not is_draft_worker
-            and envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.get()
-            and self.enable_sparsity_driven_kv_offload
-        ):
-            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-                use_pd_split_kv,
+            self.enable_sparsity_driven_kv_offload
+            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+            and get_disagg().disaggregation_mode == "decode"
+            and (
+                (kv_lora_rank, qk_rope_head_dim, page_size) != (512, 64, 128)
+                or dtype != torch.bfloat16
+                or modelslim_cache_layout is not None
+                or self.use_fia_nz
             )
-
-            if use_pd_split_kv():
-                if (
-                    (kv_lora_rank, qk_rope_head_dim, page_size) != (512, 64, 128)
-                    or dtype != torch.bfloat16
-                    or modelslim_cache_layout is not None
-                    or self.use_fia_nz
-                ):
-                    raise ValueError(
-                        "Ascend PD split KV requires row-major BF16 MLA with "
-                        "512/64 features and page size 128."
-                    )
-                if get_disagg().disaggregation_mode == "prefill":
-                    self.enable_sparsity_driven_kv_offload = False
+        ):
+            raise ValueError(
+                "Ascend PD split KV requires row-major BF16 MLA with "
+                "512/64 features and page size 128."
+            )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
         if index_head_dim is None:
@@ -999,12 +995,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             scale.view(-1, 1),
         )
 
-    def _get_pd_split_host_pool(self):
-        return getattr(getattr(self, "sparse_kv_manager", None), "host_pool", None)
-
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
-        host_pool = self._get_pd_split_host_pool()
+        host_pool = getattr(getattr(self, "sparse_kv_manager", None), "host_pool", None)
         if host_pool is not None and not host_pool.supports_pd_export:
             # Colocated SHM device mappings are not MF PD registrations.
             host_pool = None

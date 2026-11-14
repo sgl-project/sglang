@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager im
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 
 K = 2048
 
@@ -158,6 +159,9 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
     spec = SimpleNamespace(speculative_eagle_topk=1, speculative_num_draft_tokens=Q)
     try:
         with ExitStack() as stack:
+            stack.enter_context(
+                get_context().override_server_args(disaggregation_mode="null")
+            )
             stack.enter_context(
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec)
             )

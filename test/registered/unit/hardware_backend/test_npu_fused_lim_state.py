@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     sparse_query_width,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -355,6 +356,7 @@ class TestLIMState(CustomTestCase):
             return tensor, tensor.data_ptr(), tensor.data_ptr()
 
         with (
+            get_context().override_server_args(disaggregation_mode="null"),
             patch.object(
                 fused_manager,
                 "load_copy_sfa_operator",
