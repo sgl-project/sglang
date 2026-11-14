@@ -137,7 +137,10 @@ impl SglangService for GrpcService {
         request.apply_absent_defaults();
         let stream = request.stream.unwrap_or(false);
         let (mut payloads, is_batch) = into_requests(request, &self.config.generation_policy)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            .map_err(|error| {
+                tracing::warn!(%error, "rejected request");
+                Status::invalid_argument(error.to_string())
+            })?;
         client_max_new_tokens.mark(&mut payloads);
         // Python starts its request clock after normalization and before
         // tokenization / multimodal preprocessing; `e2e_latency` measures from
@@ -406,6 +409,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             Self {
@@ -717,33 +721,47 @@ mod tests {
     }
 
     /// A runtime failure after admission is this request's in-stream error item
-    /// (the SSE error frame's twin), not an RPC status; the call is disarmed.
+    /// (the SSE error frame's twin, `type` and `retryable` included), not an
+    /// RPC status; the call is disarmed.
     #[tokio::test]
     async fn runtime_failure_rides_the_stream_as_an_error_item() {
-        let harness = Harness::new(1, false, Duration::from_secs(1));
-        let mut stream = harness
-            .service
-            .generate(Request::new(ids_request(&[1], None)))
-            .await
-            .unwrap()
-            .into_inner();
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        intake
-            .sink
-            .try_send(ResponseItem::Error(crate::utils::error::Error::Validation(
-                "bad sampling".into(),
-            )))
-            .unwrap();
+        use crate::utils::error::Error;
+        for (failure, code, kind, retryable) in [
+            (
+                Error::Validation("bad sampling".into()),
+                400,
+                "invalid_request_error",
+                false,
+            ),
+            (
+                Error::Internal("bad state".into()),
+                500,
+                "internal_error",
+                true,
+            ),
+        ] {
+            let harness = Harness::new(1, false, Duration::from_secs(1));
+            let mut stream = harness
+                .service
+                .generate(Request::new(ids_request(&[1], None)))
+                .await
+                .unwrap()
+                .into_inner();
+            let intake = harness.next_generation().await;
+            assert!(intake.admission.try_accept());
+            intake.sink.try_send(ResponseItem::Error(failure)).unwrap();
 
-        let error = stream_error(stream.next().await.unwrap().unwrap());
-        assert_eq!(error.index, None);
-        let body = error.error.unwrap();
-        assert_eq!(body.code, 400);
-        assert!(body.message.contains("bad sampling"));
-        assert!(stream.next().await.is_none());
-        drop(stream);
-        assert!(harness.abort_rx.try_recv().is_err());
+            let error = stream_error(stream.next().await.unwrap().unwrap());
+            assert_eq!(error.index, None);
+            let body = error.error.unwrap();
+            assert_eq!(body.code, code);
+            assert!(body.message.contains("bad "), "{}", body.message);
+            assert_eq!(body.r#type.as_deref(), Some(kind));
+            assert_eq!(body.retryable, Some(retryable));
+            assert!(stream.next().await.is_none());
+            drop(stream);
+            assert!(harness.abort_rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
@@ -812,6 +830,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
@@ -827,12 +846,13 @@ mod tests {
     }
 
     /// Normalization failures end the RPC before anything is submitted, with the
-    /// status that mirrors the HTTP 400.
+    /// status that mirrors the HTTP 400, and are logged once with the reason.
     #[tokio::test]
     async fn malformed_request_is_rejected_before_submission() {
         let harness = Harness::new(1, false, Duration::from_secs(1));
         let mut both = text_request("prompt", "both");
         both.input_ids = Some(one_token_ids(&[1]));
+        let logs = crate::utils::logging::capture_logs();
         let error = harness
             .service
             .generate(Request::new(both))
@@ -841,6 +861,11 @@ mod tests {
             .expect("text and input_ids together must be rejected");
         assert_eq!(error.code(), Code::InvalidArgument);
         assert!(error.message().contains("text"));
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(error.message())),
+            "{rejections:?}"
+        );
 
         let error = harness
             .service
@@ -853,7 +878,8 @@ mod tests {
     }
 
     /// The launch's generate validator refuses a batch whole, as on HTTP: no
-    /// item reaches the scheduler, the valid one included.
+    /// item reaches the scheduler, the valid one included. The refusal is
+    /// logged once.
     #[tokio::test]
     async fn generate_validator_refuses_the_whole_batch_before_submission() {
         let (intake_tx, intake_rx) = flume::unbounded();
@@ -872,6 +898,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+                abort_hook: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
@@ -884,6 +911,7 @@ mod tests {
             }),
             ..Default::default()
         };
+        let logs = crate::utils::logging::capture_logs();
         let error = service
             .generate(Request::new(request))
             .await
@@ -891,6 +919,11 @@ mod tests {
             .expect("the validator must refuse the batch");
         assert_eq!(error.code(), Code::InvalidArgument);
         assert_eq!(error.message(), "top_logprobs_num 2");
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains("top_logprobs_num 2")),
+            "{rejections:?}"
+        );
         assert!(intake_rx.is_empty());
     }
 

@@ -23,9 +23,9 @@ use crate::utils::{
     fsm::{Event, RequestState, ValidationOutcome},
 };
 
-/// Longest client-supplied rid accepted. It keys the detok table and travels on
-/// every chunk, so its length is a recurring cost; Python mints 32-byte uuid hex.
-pub(super) const MAX_RID_LEN: usize = 128;
+/// Longest client-supplied rid accepted, in UTF-8 bytes. Namespaced caller IDs
+/// can exceed a UUID; keep their per-step wire and detokenizer-table cost bounded.
+pub(super) const MAX_RID_LEN: usize = 256;
 
 /// Intake FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -144,9 +144,11 @@ impl Intake {
     /// terminal frame and a hung connection. Python cannot hit this because it
     /// validates before `rid_to_state[obj.rid] = state`.
     fn fail(&self, req: &mut Request, err: Error, registered: bool) {
-        // Expected request, capacity, and cancellation outcomes would spam.
+        // Capacity and cancellation outcomes are expected and would spam.
         if err.is_server_fault() {
             tracing::error!(rid = %req.rid, error = %err, "intake rejected request");
+        } else if let Some(reason) = err.client_fault_reason() {
+            tracing::warn!(rid = %req.rid, error = %reason, "rejected request");
         }
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(ResponseItem::Error(err)); // client may be gone
@@ -308,20 +310,9 @@ impl Intake {
                         continue;
                     }
                     let rid = req.rid.clone();
-                    match self.senders.tokenizer_tx.send(req) {
-                        Ok(()) => {
-                            self.request_states.insert(rid, state);
-                        }
-                        Err(err) => {
-                            // Pool gone (workers exited); flume hands the request back.
-                            let mut req = err.into_inner();
-                            // Past `Received`, so registration happened.
-                            self.fail(
-                                &mut req,
-                                Error::Internal("tokenizer pool gone".into()),
-                                true,
-                            );
-                        }
+                    // Past `Received`, so registration happened.
+                    if self.send_to_tokenizer_pool(req, true /* registered */) {
+                        self.request_states.insert(rid, state);
                     }
                     return;
                 }
@@ -442,15 +433,27 @@ impl Intake {
     /// through the request's own sink. It was never registered with a detok
     /// shard, so a failure here has nothing to deregister.
     fn push_tokenize_to_pool(&self, req: Request) {
-        if let Err(err) = self.senders.tokenizer_tx.send(req) {
-            // Pool gone (workers exited); flume hands the request back.
-            let mut req = err.into_inner();
-            self.fail(
-                &mut req,
-                Error::Internal("tokenizer pool gone".into()),
-                false, /* registered */
-            );
-        }
+        self.send_to_tokenizer_pool(req, false /* registered */);
+    }
+
+    /// Hand a request to the tokenizer pool without waiting, as the mm hop
+    /// does: a full pool queue back-pressures like a full to_scheduler
+    /// channel (`QueueFull`). Parking this thread instead would stall every
+    /// request on the rank, and the pool returns its work to this thread's
+    /// inbox, so with both queues full the two would wait on each other.
+    /// Returns whether the pool took it; otherwise the request is failed.
+    fn send_to_tokenizer_pool(&self, req: Request, registered: bool) -> bool {
+        // Flume hands the request back on either failure.
+        let (err, mut req) = match self.senders.tokenizer_tx.try_send(req) {
+            Ok(()) => return true,
+            Err(flume::TrySendError::Full(req)) => (Error::QueueFull, req),
+            // Pool gone (workers exited).
+            Err(flume::TrySendError::Disconnected(req)) => {
+                (Error::Internal("tokenizer pool gone".into()), req)
+            }
+        };
+        self.fail(&mut req, err, registered);
+        false
     }
 
     /// Push a bare control request onto the ordinary to_scheduler ring (never
