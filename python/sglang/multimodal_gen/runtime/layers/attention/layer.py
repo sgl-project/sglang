@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
+    fp8_ulysses_attention,
     ring_attn,
     uncached_a2a_staging,
 )
@@ -1544,6 +1545,10 @@ class USPAttention(nn.Module):
             and get_ring_parallel_world_size() == 1
             and not self.enable_packed_qkv_input_a2a
         ):
+            if self.backend == AttentionBackendEnum.FP8_FA_SM120:
+                out = fp8_ulysses_attention(self.attn_impl, q, k, v)
+                if out is not None:
+                    return out
 
             def attend(q_group, k_group, v_group):
                 return self.attn_impl.forward(

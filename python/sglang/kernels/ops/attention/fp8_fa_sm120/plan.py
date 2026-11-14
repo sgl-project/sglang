@@ -83,11 +83,12 @@ class Workspace(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def _allocate_workspace(q):
-    sequence = q.shape[0]
-    heads = q.shape[1]
+    return _allocate_workspace_for(q.shape[0], q.shape[1], q.device)
+
+
+def _allocate_workspace_for(sequence, heads, device):
     padded_queries = (sequence + QUERY_TILE - 1) // QUERY_TILE * QUERY_TILE
     padded_keys = (sequence + KEY_TILE - 1) // KEY_TILE * KEY_TILE
-    device = q.device
     return Workspace(
         q_fp8=torch.empty(
             (heads, padded_queries, HEAD_DIM), device=device, dtype=torch.float8_e4m3fn
@@ -100,7 +101,9 @@ def _allocate_workspace(q):
         ),
         scales=torch.empty((3, heads), device=device, dtype=torch.float32),
         maximums=torch.zeros((3, heads), device=device, dtype=torch.float32),
-        output=torch.empty(q.shape, device=device, dtype=torch.bfloat16),
+        output=torch.empty(
+            (sequence, heads, HEAD_DIM), device=device, dtype=torch.bfloat16
+        ),
         lse=torch.empty((heads, sequence), device=device, dtype=torch.float32),
     )
 
@@ -127,20 +130,40 @@ def fp8_attention(q, k, v, softmax_scale=None):
 def _fp8_attention(q, k, v, softmax_scale, block_scaled_mma):
     # block_scaled_mma is not a user option: the output is bit-equal either way.
     scale = validate_inputs(q, k, v, softmax_scale)
-    kernel_scale = cutlass.Float32(scale)
-    key = (*kernel_key(q), block_scaled_mma)
 
-    with torch.cuda.device(q.device):
-        workspace = _allocate_workspace(q)
+    def prepare(workspace):
+        fused_prepare(
+            q=q.permute(1, 0, 2),
+            k=k.permute(1, 0, 2),
+            v=v.permute(1, 0, 2),
+            workspace=workspace,
+        )
+
+    return run_prepared(
+        q.shape[0], q.shape[1], q.device, scale, prepare, block_scaled_mma
+    )
+
+
+def run_prepared(sequence, heads, device, scale, prepare, block_scaled_mma=True):
+    """Run the kernel on a fresh workspace that ``prepare(workspace)`` fills.
+
+    ``prepare`` writes the E4M3 Q/K/V buffers and the [3, heads] scales; returns
+    (output [sequence, heads, 128] BF16, lse [heads, sequence] FP32).
+    """
+    kernel_scale = cutlass.Float32(scale)
+    key = (sequence, heads, device.index, block_scaled_mma)
+
+    with torch.cuda.device(device):
+        workspace = _allocate_workspace_for(sequence, heads, device)
         views = _kernel_views(workspace)
-        stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
         compiled = _KERNEL_CACHE.get(key)
         if compiled is None:
             logger.info(
                 "fp8_fa_sm120 attention: compiling for S=%d H=%d (once per shape)",
-                q.shape[0],
-                q.shape[1],
+                sequence,
+                heads,
             )
             compiled = cute.compile(
                 fp8_attention_host,
@@ -151,11 +174,6 @@ def _fp8_attention(q, k, v, softmax_scale, block_scaled_mma):
             )
             _KERNEL_CACHE[key] = compiled
 
-        fused_prepare(
-            q=q.permute(1, 0, 2),
-            k=k.permute(1, 0, 2),
-            v=v.permute(1, 0, 2),
-            workspace=workspace,
-        )
+        prepare(workspace)
         compiled(*views, kernel_scale, stream)
     return workspace.output, workspace.lse

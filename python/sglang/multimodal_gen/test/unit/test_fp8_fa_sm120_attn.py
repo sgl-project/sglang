@@ -234,3 +234,52 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# (world, local rows): an even split, and a gathered length that pads both the
+# 128-row query tile and the 32-key tile.
+@pytest.mark.parametrize("world,rows", [(4, 1024), (2, 1052)])
+def test_ulysses_fp8_exchange_matches_gathered_attention(world, rows):
+    """Each emulated rank's FP8 exchange gives the bytes of fp8_attention on the
+    gathered rows of its heads, the result of the BF16 exchange."""
+    from sglang.kernels.ops.attention.fp8_fa_sm120 import fp8_attention
+    from sglang.kernels.ops.attention.fp8_fa_sm120.ulysses import (
+        fp8_ulysses_attention,
+        quantize_shard,
+    )
+
+    q, k, v = _fused_qkv_views(world * rows, seed=7)
+    shards = [
+        (
+            q[r * rows : (r + 1) * rows],
+            k[r * rows : (r + 1) * rows],
+            v[r * rows : (r + 1) * rows],
+        )
+        for r in range(world)
+    ]
+    # the all-reduce: per-head amax of each operand over every rank's rows
+    global_max = torch.stack([t.float().abs().amax(dim=(0, 2)) for t in (q, k, v)])
+
+    def all_reduce_max(t):
+        t.copy_(global_max)
+
+    sends = [quantize_shard(*shard, world, all_reduce_max)[1] for shard in shards]
+    local_heads = HEADS // world
+    for rank in range(world):
+        received = torch.stack([sends[p][rank] for p in range(world)])
+        output = fp8_ulysses_attention(
+            *shards[rank],
+            world=world,
+            rank=rank,
+            all_reduce_max=all_reduce_max,
+            all_to_all=lambda send: received.view(torch.uint8).view(world, -1),
+            softmax_scale=SOFTMAX_SCALE,
+        )
+        heads = slice(rank * local_heads, (rank + 1) * local_heads)
+        expected, _ = fp8_attention(
+            q[:, heads].contiguous(),
+            k[:, heads].contiguous(),
+            v[:, heads].contiguous(),
+            softmax_scale=SOFTMAX_SCALE,
+        )
+        assert torch.equal(output, expected), rank
