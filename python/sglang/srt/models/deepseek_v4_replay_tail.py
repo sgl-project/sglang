@@ -12,6 +12,7 @@ rank's rows from the pre-forward exchange.
 from __future__ import annotations
 
 import copy
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
@@ -68,6 +69,8 @@ from sglang.srt.utils import is_cuda
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 _in_replay_tail = False
 
@@ -151,6 +154,7 @@ class DecoderReplayTail:
         self._static_ids_global: dict[torch.dtype, torch.Tensor] = {}
         # Older, smaller sets stay alive for the graphs that write and read them.
         self._bridge_buffers: dict[tuple, List[List[Optional[torch.Tensor]]]] = {}
+        self._logged_uncaptured_break = False
 
     @classmethod
     def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
@@ -309,10 +313,12 @@ class DecoderReplayTail:
         capture_dspark: bool,
         dp_rows: Optional[List[int]] = None,
         out_rows: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
+        may_capture: bool = True,
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]]:
         """Returns views of graph buffers valid until the next replay, cut to
         ``out_rows`` rows. Under DP every rank replays the bucket of the largest
-        ``dp_rows``."""
+        ``dp_rows``. Returns None when the graph is missing and ``may_capture``
+        is false."""
         if forward_batch.forward_mode.is_idle():
             # An idle DP rank runs the extend's graph, with no rows of its own.
             forward_batch = copy.copy(forward_batch)
@@ -373,7 +379,7 @@ class DecoderReplayTail:
             finally:
                 exit_late_layer_dp(batch, saved)
 
-        residual, pre, *aux = self.runner.run(
+        outputs = self.runner.run(
             key=(capture_dspark, has_pre, layout, gather_ids),
             live=live,
             forward_batch=forward_batch,
@@ -392,7 +398,11 @@ class DecoderReplayTail:
                 is forward_batch.global_num_token_non_padded
                 else None
             ),
+            may_capture=may_capture,
         )
+        if outputs is None:
+            return None
+        residual, pre, *aux = outputs
         return residual, pre, aux
 
     def run_idle(
@@ -418,6 +428,18 @@ class DecoderReplayTail:
             capture_dspark=capture_dspark,
             dp_rows=dp_rows,
             out_rows=state.residual.shape[0],
+        )
+
+    def _log_uncaptured_break(self, num_rows: int) -> None:
+        if self._logged_uncaptured_break:
+            return
+        self._logged_uncaptured_break = True
+        logger.warning(
+            "%s for %d rows is not captured and some DP rank's prefill graph "
+            "keeps its tail inline this step; running the tail eagerly until a "
+            "step where every rank breaks out (logged once).",
+            self.runner.label,
+            num_rows,
         )
 
     def _run_layers_eagerly(
@@ -695,7 +717,7 @@ def _tail_layers_in_prefill_graph(
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> None:
-    # The tail captures its row-bucket graphs on first use.
+    # Its row-bucket graphs capture behind TP-group barriers.
     note_rank_barrier_in_prefill_graph()
     backend = get_attn_backend()
     saved, forward_batch = _enter_eager_tail_in_prefill_graph(
@@ -744,15 +766,21 @@ def _tail_layers_in_prefill_graph(
         )
         # Capture stream and pool are busy while the prefill graphs capture.
         runner = tail_layers.runner
+        outputs = None
         if (
             not get_flags().dp.capturing_prefill_graph
             and runner.warm
             and tail_layers._can_capture_moe_bound(forward_batch)
             and runner.bucket_rows(max(dp_rows) if dp else num_rows) is not None
         ):
-            residual, pre, aux = tail_layers.run(**kwargs)
-        else:
-            residual, pre, aux = tail_layers._run_layers_eagerly(**kwargs)
+            outputs = tail_layers.run(
+                **kwargs, may_capture=get_flags().dp.every_rank_reaches_rank_barrier
+            )
+            if outputs is None:
+                tail_layers._log_uncaptured_break(num_rows)
+        if outputs is None:
+            outputs = tail_layers._run_layers_eagerly(**kwargs)
+        residual, pre, aux = outputs
         tail_layers._write_bridge(
             bridge_key, block_rows, bridge, outputs=[residual, pre, *aux]
         )

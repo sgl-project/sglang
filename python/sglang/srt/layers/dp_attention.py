@@ -977,7 +977,7 @@ def note_rank_barrier_in_prefill_graph() -> None:
     """For breaks that capture graphs of their own behind TP-group barriers."""
     dp = get_flags().dp
     if dp.capturing_prefill_graph:
-        dp.prefill_graph_has_rank_barrier = True
+        dp.prefill_graph_shape_has_rank_barrier = True
 
 
 def _dp_gather(
