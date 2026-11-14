@@ -1499,6 +1499,19 @@ class Scheduler(
         self._prefill_decode_interval_remaining -= 1
         return True
 
+    def _negotiate_prefill_delayer_while_deferring(self) -> None:
+        # A DP peer below prefill_decode_interval_min_bs does not defer and runs
+        # the delayer's all-gather; join it with nothing to prefill.
+        if (
+            self.prefill_delayer is None
+            or not self.require_mlp_sync
+            or self.prefill_decode_interval_min_bs == 0
+        ):
+            return
+        PrefillDelayerSinglePassExecutor(
+            self.prefill_delayer, token_usage=0.0
+        ).finalize(actual_prefill_bs=0)
+
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
             return
@@ -4336,6 +4349,7 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm(running_batch, staged)
         elif self._should_defer_prefill(running_batch):
             new_batch = None
+            self._negotiate_prefill_delayer_while_deferring()
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
