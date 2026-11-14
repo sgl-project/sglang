@@ -196,6 +196,7 @@ class TestServerInfoTransportParity(CustomTestCase):
             "api_key": "api-secret",
             "admin_api_key": "admin-secret",
             "ssl_keyfile_password": "ssl-secret",
+            "hicache_storage_backend_extra_config": '{"secret_key": "s3-secret"}',
         }
         for config in (None, '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'):
             with self.subTest(kv_events_config=config):
