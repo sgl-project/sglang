@@ -526,6 +526,10 @@ class FutureMap:
     def make_staged_spec_input(self, future_indices: torch.Tensor):
         """Build the relay handle for a request leaving HiSparse staging."""
         self.flush_deferred_relay()
+        if self.spec_algo.is_dflash():
+            from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+            return DFlashDraftInputV2.create_staged_input(future_indices, self.device)
         if not (self.spec_algo.is_eagle() or self.spec_algo.is_standalone()):
             raise RuntimeError(
                 "HiSparse staging only supports EAGLE-family speculative inputs."
@@ -569,6 +573,19 @@ class FutureMap:
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
+            return
+        if self.spec_algo.is_dflash():
+            # DFLASH relays only the bonus tokens (the next round's anchor);
+            # the draft input's other fields are populated in-round.
+            from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+            dflash_input: DFlashDraftInputV2 = batch.spec_info
+            if dflash_input is None or dflash_input.future_indices is None:
+                return
+            indices = dflash_input.future_indices
+            if indices.shape[0] == 0:
+                return
+            dflash_input.bonus_tokens = self.output_tokens_buf[indices]
             return
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
