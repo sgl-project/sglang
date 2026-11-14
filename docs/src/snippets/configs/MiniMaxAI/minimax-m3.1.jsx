@@ -801,10 +801,13 @@ const cfg = {
         "--port {{PORT}}",
       ],
     },
+    // AgentX at 48 and 64 sessions on MI355X: GSM8K 96.59 at 64. Registered pageable host
+    // pools fault at the first HiCache write, so HSA_USERPTR_FOR_PAGED_MEM=0 allocates them
+    // with hipHostMalloc (#42553); 180 GB per rank fits two servers per host.
     {
       match: { hw: "mi355x", variant: "flash", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-      warn: AMD_HICACHE_NOTE,
-      env: ["SGLANG_USE_AITER=1"],
+      verified: true,
+      env: ["SGLANG_USE_AITER=1", "HSA_USERPTR_FOR_PAGED_MEM=0"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -813,7 +816,6 @@ const cfg = {
         "--tp 4",
         "--speculative-algorithm DSPARK",
         "--speculative-use-block-verification",
-        "--speculative-draft-kv-cache-dtype fp8_e4m3",
         "--cuda-graph-backend-prefill breakable",
         "--fp8-gemm-backend aiter",
         "--chunked-prefill-size 32768",
@@ -822,6 +824,8 @@ const cfg = {
         "--mem-fraction-static 0.8",
         "--tokenizer-worker-num 8",
         "--enable-hierarchical-cache",
+        "--hicache-size 180",
+        "--hicache-write-policy write_back",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

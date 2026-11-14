@@ -1,4 +1,5 @@
 import dataclasses
+from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
 
@@ -36,6 +37,24 @@ class LTX25SamplingParams(LTX2SamplingParams):
     # The schedule is pinned by the pipeline config; this only keeps the
     # reported step count honest.
     num_inference_steps: int = 8
+
+    # The two-stage pipeline generates at half resolution and refines back up;
+    # its default is the official two-stage canvas. 960x544 above is the
+    # one-stage default, and two-stage cannot halve it: LTX2HalveResolutionStage
+    # needs each side to be a multiple of 64. The warmup builder reads this too.
+    two_stage_default_size: ClassVar[tuple[int, int]] = (1920, 1088)
+
+    def _adjust(self, server_args: Any) -> None:
+        from sglang.multimodal_gen.runtime.server_args import (
+            is_ltx2_two_stage_pipeline_name,
+        )
+
+        explicit = getattr(self, "_explicit_fields", None) or set()
+        if is_ltx2_two_stage_pipeline_name(
+            getattr(server_args, "pipeline_class_name", None)
+        ) and not explicit & {"width", "height"}:
+            self.width, self.height = self.two_stage_default_size
+        super()._adjust(server_args)
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:

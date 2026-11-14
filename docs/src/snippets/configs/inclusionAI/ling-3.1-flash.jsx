@@ -168,7 +168,6 @@ export const config = {
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -180,7 +179,6 @@ export const config = {
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -193,7 +191,6 @@ export const config = {
     {
       match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -206,7 +203,6 @@ export const config = {
     {
       match: { hw: "h800", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -219,7 +215,6 @@ export const config = {
     {
       match: { hw: "h100", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -255,7 +250,6 @@ export const config = {
     {
       match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -267,7 +261,6 @@ export const config = {
     {
       match: { hw: "h800", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -279,7 +272,6 @@ export const config = {
     {
       match: { hw: "h100", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",

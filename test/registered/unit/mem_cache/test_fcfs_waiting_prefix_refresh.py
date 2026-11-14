@@ -87,11 +87,11 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         # Isolate the scheduler clock from the radix cache's recency timestamps.
         with patch("sglang.srt.managers.schedule_policy.time", create=True) as clock:
             clock.monotonic.return_value = 100.0
-            policy.calc_priority(queue)
+            queue = policy.calc_priority(queue)
             if second_refresh_time is not None:
                 cache.touch_prefix(RadixKey(array("q", NEWER_PREFIX)))
                 clock.monotonic.return_value = second_refresh_time
-                policy.calc_priority(queue)
+                queue = policy.calc_priority(queue)
         cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         return [
             cache.match_prefix(

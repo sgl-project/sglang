@@ -210,10 +210,23 @@ def topk_among_blocks(
     room = lens[:, None] - blocks64 * block_size
     drop = (offsets[None, None, :] >= room[:, :, None]) | (blocks64 < 0)[:, :, None]
     candidates.masked_fill_(drop, -torch.inf)
-    flat = candidates.flatten(1)
-    top = flat.topk(min(k, flat.shape[1]), dim=-1, sorted=False)
+    return candidate_topk(candidates.flatten(1), blocks64, k, block_size)
+
+
+def candidate_topk(
+    scores: torch.Tensor,
+    blocks: torch.Tensor,
+    k: int,
+    block_size: int = CANDIDATE_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Top-k masked candidate-column scores as request-local positions, -1 padded."""
+    if scores.shape[1] == 0:
+        return torch.full(
+            (scores.shape[0], k), -1, dtype=torch.int64, device=scores.device
+        )
+    top = scores.topk(min(k, scores.shape[1]), dim=-1, sorted=False)
     block_of_pick = top.indices // block_size
-    picked = blocks64.gather(1, block_of_pick) * block_size + (
+    picked = blocks.to(torch.int64).gather(1, block_of_pick) * block_size + (
         top.indices - block_of_pick * block_size
     )
     picked = picked.masked_fill(top.values == -torch.inf, -1)

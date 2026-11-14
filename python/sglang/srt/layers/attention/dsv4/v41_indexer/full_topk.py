@@ -1,5 +1,5 @@
 """The full top-k of the ratio-1/2 index layers outside the candidate scheme:
-DeepGEMM on SM100, torch elsewhere."""
+DeepGEMM on SM100+, torch elsewhere."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.deep_select import (
     is_deep_select_supported,
     topk_page_transform,
 )
+from sglang.kernels.ops.attention.dsa.litetopk_prefill import fp4_indexer_topk
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
@@ -23,6 +24,7 @@ from .scoring import (
     get_deep_gemm_prefill_data,
     prefill_requests,
     select_decode,
+    sharded_dense_prefill_topk,
     write_prefill,
 )
 from .types import (
@@ -33,6 +35,15 @@ from .types import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+    from .scoring import DeepGEMMPrefillData
+
+
+def _lite_topk_wins(num_rows: int, max_len: int) -> bool:
+    """Whether LiteTopK beats the dense path on a chunk of ``num_rows`` query rows scored by this rank."""
+    # LiteTopK needs rows x keys to fill the GPU: with few rows a CTA per 4 rows scans the whole key range and the
+    # dense path wins. Rows of at most 6144 keys make every block dense (no sampling), where LiteTopK wins at any size.
+    return (num_rows >= 512 and num_rows * max_len >= 1 << 26) or max_len <= 6144
+
 
 class FullTopKIndexer:
     def __init__(
@@ -42,10 +53,12 @@ class FullTopKIndexer:
         req_to_token: torch.Tensor,
         use_deep_gemm_prefill: bool,
         use_deep_gemm_decode: bool,
+        use_prefill_lite_topk: bool = False,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        self.use_prefill_lite_topk = use_prefill_lite_topk
         self.use_deep_gemm_decode = use_deep_gemm_decode
         self.use_deep_select_decode = (
             not use_deep_gemm_decode and is_deep_select_supported()
@@ -68,11 +81,60 @@ class FullTopKIndexer:
         data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
+        out = inputs.out_raw_indices[: data.num_rows]
+        shard = inputs.row_shard
+        if self.use_prefill_lite_topk and _lite_topk_wins(
+            data.num_rows if shard is None else shard.rows_per_rank(data.num_rows),
+            max(data.lens_per_request),
+        ):
+            if shard is None:
+                self._prefill_lite_topk(inputs, data, out)
+            else:
+                local = out.new_full(
+                    (shard.rows_per_rank(data.num_rows), out.shape[1]), -1
+                )
+                local_data = data.narrow(shard.local_rows(data.num_rows))
+                self._prefill_lite_topk(
+                    inputs, local_data, local[: local_data.num_rows]
+                )
+                out.copy_(shard.gather(local, data.num_rows))
+            data.write_page_indices(inputs)
+            return
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
             inputs.layer_id, data.k_slots
         )
-        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+        if shard is None:
+            dense_prefill_topk(data, kv, out=out)
+        else:
+            sharded_dense_prefill_topk(data, kv, out=out, shard=shard)
         data.write_page_indices(inputs)
+
+    def _prefill_lite_topk(
+        self,
+        inputs: PrefillInputs,
+        data: DeepGEMMPrefillData,
+        out: torch.Tensor,
+    ) -> None:
+        """Request-local compressed positions into ``out`` from the fp4 indexer + bf16 top-k."""
+        # The indexer's scale tensor map needs a multiple of 4 keys: pad with slot 0, past every row's range.
+        slots = data.k_slots
+        pad = -slots.shape[0] % 4
+        if pad:
+            slots = torch.cat([slots, slots[:1].expand(pad)])
+        kv_fp4, kv_sf = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+            inputs.layer_id, slots
+        )
+        fp4_indexer_topk(
+            data.q_fp4,
+            data.q_sf,
+            data.weights.to(torch.bfloat16),
+            kv_fp4,
+            kv_sf,
+            data.request_starts,
+            data.request_starts + data.compress_lens,
+            out.shape[1],
+            out=out,
+        )
 
     def _torch_prefill(self, inputs: PrefillInputs) -> None:
         requests = prefill_requests(
@@ -91,7 +153,7 @@ class FullTopKIndexer:
             topk_plans = metadata.topk_metadata_chunks
             assert not metadata.use_topk_v2 or topk_plans is not None
             for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
-                q, lens, table = data.paged_logits_args(metadata, rows)
+                q, lens, table, indices = data.paged_logits_args(metadata, rows)
                 logits = deep_gemm_fp4_paged_mqa_logits(
                     q,
                     data.k_cache,
@@ -100,6 +162,7 @@ class FullTopKIndexer:
                     table,
                     plan,
                     metadata.max_compressed_seq_len,
+                    indices=indices,
                 )
                 # TODO(dark): add bf16 topk
                 topk_transform_paged_from_metadata(
@@ -112,7 +175,7 @@ class FullTopKIndexer:
                     ),
                 )
             return
-        q, lens, table = data.paged_logits_args(metadata)
+        q, lens, table, indices = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
             q,
             data.k_cache,
@@ -121,6 +184,7 @@ class FullTopKIndexer:
             table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            indices=indices,
         )
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(

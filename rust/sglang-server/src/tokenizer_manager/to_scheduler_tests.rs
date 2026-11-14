@@ -5,6 +5,7 @@ use crate::message::buffers::{Buffer, BufferData, find};
 use crate::message::request::{GenerateRequest, TokenizeInput};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
+use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
 use crate::utils::fsm::{AfterTokenize, RequestState};
 use crate::utils::shm::{shm_path, unique_name};
@@ -151,6 +152,50 @@ fn every_abort_source_deregisters_and_stops_the_scheduler() {
     }
 }
 
+/// An `/abort_request` for a request the scheduler has keeps its detok entry,
+/// so the scheduler's terminal output still reaches the client, and queues
+/// behind the request on the request ring. On a full ring it falls back to
+/// the reserved lane and drops the entry, like any other abort.
+#[test]
+fn request_abort_keeps_the_sink_and_queues_behind_the_request() {
+    for (cap, keeps_sink) in [(2, true), (1, false)] {
+        let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
+        let (to_scheduler_tx, consumer) = to_scheduler(cap);
+        let request_ring = to_scheduler_tx.clone();
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let mut intake = Intake::new(
+            flume::unbounded().1,
+            flume::unbounded().1,
+            Senders {
+                tok_manager_tx: flume::unbounded().0,
+                abort_tx: flume::unbounded().0,
+                tokenizer_tx: flume::unbounded().0,
+                detokenizer_tx: vec![detok_tx],
+            },
+            to_scheduler_tx,
+            test_limits(),
+            test_mm(flume::unbounded().0, true),
+            sd_rx,
+        );
+        assert!(request_ring.try_push(SchedulerRequest {
+            header: b"request".to_vec().into(),
+            buffers: Vec::new(),
+        }));
+
+        intake.on_abort(AbortSource::Request("x".into()));
+
+        let headers: Vec<_> = consumer.drain(8).into_iter().map(|m| m.header).collect();
+        assert_eq!(headers.len(), 2, "cap {cap}");
+        assert_eq!(
+            headers[usize::from(!keeps_sink)],
+            b"request"[..],
+            "cap {cap}: the abort queues behind the request only on the request ring"
+        );
+        assert_eq!(detok_rx.try_recv().is_err(), keeps_sink, "cap {cap}");
+    }
+}
+
 /// A context ceiling high enough that only a test which sets one on purpose
 /// can reach it. `context_len` is mandatory now, so "no ceiling" has to be a
 /// large number rather than `None`; kept well below `u64::MAX` so the
@@ -170,7 +215,6 @@ fn test_limits() -> Limits {
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
         enable_return_hidden_states: false,
-        default_priority: None,
     }
 }
 
@@ -186,28 +230,6 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
             sampling_params,
             ..Default::default()
         })),
-    }
-}
-
-/// An unset priority takes the configured default; an explicit one is kept
-/// (Python `_set_default_priority`).
-#[test]
-fn unset_priority_takes_the_default() {
-    let limits = Limits {
-        default_priority: Some(0),
-        ..test_limits()
-    };
-    for (sent, want) in [(None, Some(0)), (Some(-2), Some(-2))] {
-        let mut req = generate_req(1, SamplingParams::default());
-        let RequestKind::Generate(g) = &mut req.kind else {
-            unreachable!()
-        };
-        g.priority = sent;
-        validate(&mut req, &limits).unwrap();
-        let RequestKind::Generate(g) = &req.kind else {
-            unreachable!()
-        };
-        assert_eq!(g.priority, want);
     }
 }
 
@@ -699,6 +721,54 @@ fn abort_deregisters_and_bypasses_request_ring_capacity() {
     assert_eq!(consumer.drain(8).len(), 2, "both aborts must be delivered");
 }
 
+/// A one-way control message is never retried, so a full request ring must
+/// not drop it: it takes the reserved lane and its sender learns it is queued.
+#[test]
+fn one_way_control_bypasses_request_ring_capacity() {
+    let (producer, consumer) = to_scheduler(1);
+    assert!(producer.try_push(SchedulerRequest {
+        header: bytes::Bytes::from_static(b"filler"),
+        buffers: Vec::new(),
+    }));
+    let (tm_tx, tm_rx) = flume::unbounded();
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+    std::mem::forget(abort_tx);
+    let intake = Intake::new(
+        tm_rx,
+        abort_rx,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![flume::unbounded().0],
+        },
+        producer,
+        test_limits(),
+        test_mm(flume::unbounded().0, true),
+        sd_rx,
+    );
+    let (queued, queued_rx) = tokio::sync::oneshot::channel();
+    tm_tx
+        .send(TmEvent::OneWay {
+            control: ControlRequest::FreezeGCReq(crate::message::io_struct::FreezeGCReq::new(
+                "freeze".into(),
+                None,
+            )),
+            queued,
+        })
+        .unwrap();
+    drop(tm_tx);
+    intake.run();
+
+    assert!(matches!(queued_rx.blocking_recv(), Ok(Ok(()))));
+    let pushed = consumer.drain(8);
+    assert_eq!(pushed.len(), 2, "the full ring must not drop the message");
+    let header = rmpv::decode::read_value(&mut &pushed[0].header[..]).unwrap();
+    assert_eq!(header[0].as_str(), Some("FreezeGCReq"));
+}
+
 /// The rid keys the detok table and rides on every chunk of every decode step,
 /// so an unbounded client-supplied one is a recurring cost, not a one-off.
 #[test]
@@ -793,6 +863,49 @@ fn out_of_vocab_input_ids_rejected() {
         Err(_) => {}
         Ok(DetokMsg::Deregister { .. }) => {}
         Ok(_) => panic!("out-of-vocab request must not be admitted"),
+    }
+}
+
+/// A request refused as the client's fault logs why once, with its rid, as
+/// Python's `[http_server] Error:` line does, and the client reads the bare
+/// message, as Python's `ValueError` text: an intake check, and media the MM
+/// pool refused (which hands the request back failed, unlogged).
+#[test]
+fn client_rejection_logs_its_reason_and_answers_unprefixed() {
+    let (mut intake, _detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
+    let mut out_of_vocab = generate_req(23, SamplingParams::default());
+    if let RequestKind::Generate(g) = &mut out_of_vocab.kind {
+        g.input_ids = Some(vec![2_000_000_000]);
+    }
+    let mut refused_media = generate_req(24, SamplingParams::default());
+    refused_media.state =
+        RequestState::Failed(Error::Encode(MediaError::Client("bad media".into())));
+    for (mut req, rid, reason) in [
+        (
+            out_of_vocab,
+            "rid=23",
+            "input_ids contains out-of-vocabulary",
+        ),
+        (refused_media, "rid=24", "bad media"),
+    ] {
+        let (tx, mut rx) = mpsc::channel(8);
+        req.sink = ResponseSink::Local(tx);
+        let logs = crate::utils::logging::capture_logs();
+        intake.drive(req);
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+            panic!("the client must get the rejection");
+        };
+        let message = err.client_fault_reason().expect("the client's fault");
+        assert!(message.starts_with(reason), "{message}");
+        let rejections = logs.rejections();
+        assert!(
+            matches!(
+                rejections.as_slice(),
+                [line] if line.contains("WARN") && line.contains(rid)
+                    && line.ends_with(&format!("error={message}"))
+            ),
+            "{rejections:?}"
+        );
     }
 }
 
@@ -945,6 +1058,79 @@ fn tokenize_pool_gone_deregisters() {
         "pool-gone hand-off must deregister rid 21",
     );
     assert!(detok_rx.try_recv().is_err(), "no further shard messages");
+}
+
+/// A full tokenizer pool queue rejects instead of parking intake, as a full
+/// mm pool does: a text generate request (registered, so deregistered) and a
+/// `Tokenize` request (never registered) both fail with `QueueFull`.
+#[test]
+fn full_tokenizer_pool_rejects_without_blocking_intake() {
+    let (tok_tx, tok_rx) = flume::bounded(1);
+    tok_tx
+        .send(generate_req(1, SamplingParams::default()))
+        .unwrap();
+    let (detok_tx, detok_rx) = flume::unbounded();
+    let (to_scheduler_tx, consumer) = to_scheduler(16);
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let mut intake = Intake::new(
+        flume::unbounded().1,
+        flume::unbounded().1,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: tok_tx,
+            detokenizer_tx: vec![detok_tx],
+        },
+        to_scheduler_tx,
+        test_limits(),
+        test_mm(flume::unbounded().0, true),
+        sd_rx,
+    );
+    let (generate_tx, mut generate_rx) = mpsc::channel(8);
+    let mut generate = generate_req(2, SamplingParams::default());
+    generate.sink = ResponseSink::Local(generate_tx);
+    if let RequestKind::Generate(g) = &mut generate.kind {
+        g.input_ids = None;
+        g.text = Some("hi".into());
+    }
+    let (tokenize_tx, mut tokenize_rx) = mpsc::channel(8);
+    let tokenize = Request {
+        rid: "3".into(),
+        state: RequestState::Received,
+        sink: ResponseSink::Local(tokenize_tx),
+        kind: RequestKind::Tokenize(TokenizeInput::Text {
+            text: "hi".into(),
+            add_special_tokens: false,
+        }),
+    };
+    // On its own thread, so a blocking hand-off fails the test, not hangs it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        intake.drive(generate);
+        intake.drive(tokenize);
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("intake must not wait on a full tokenizer pool");
+
+    for rx in [&mut generate_rx, &mut tokenize_rx] {
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+            panic!("expected a terminal error frame");
+        };
+        assert!(matches!(err, Error::QueueFull), "{err}");
+    }
+    assert!(
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "2")
+    );
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "2"));
+    assert!(
+        detok_rx.try_recv().is_err(),
+        "the tokenize request was never registered"
+    );
+    assert_eq!(tok_rx.len(), 1, "only the filler reached the pool");
+    assert!(consumer.drain(16).is_empty(), "nothing queued");
 }
 
 /// The mm pool gone (receiver dropped) hands the request back: rejected with
@@ -1102,6 +1288,37 @@ fn abort_while_in_mm_pool_drops_on_return() {
     assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
 }
 
+/// A request whose client left while it was in the mm pool, and whose media
+/// then failed as the server's fault, is dropped on return without a log line:
+/// the client's abort is not a server failure (the worker logs nothing either).
+#[test]
+fn abort_while_in_mm_pool_then_server_fault_is_not_logged() {
+    let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = mm_pretokenized_req("mm-left");
+    req.sink = ResponseSink::Local(tx);
+    intake.drive(req);
+    let mut req = mm_rx.try_recv().expect("sent to the mm pool");
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    intake.on_abort(AbortSource::Guard("mm-left".to_string().into()));
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Deregister { .. })
+    ));
+
+    req.state
+        .apply(Event::Error(Error::Encode(MediaError::Server(
+            "video decode: out of memory".into(),
+        ))))
+        .unwrap();
+    let logs = crate::utils::logging::capture_logs();
+    intake.drive(req);
+    assert_eq!(logs.text(), "");
+    assert!(rx.try_recv().is_err(), "no frame for a client that left");
+    assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
+    assert!(consumer.drain(16).is_empty());
+}
+
 /// The same for the tokenizer stage: an abort while the request is in the
 /// tokenizer pool drops it on return, before any scheduler submission.
 #[test]
@@ -1152,6 +1369,7 @@ fn abort_while_in_tokenizer_pool_drops_on_return() {
 #[test]
 fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
     let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+    let queued_after = std::time::Instant::now();
     intake.drive(mm_pretokenized_req("mm-1"));
 
     // The whole request is in the pool, in `Encoding`; nothing on the channel yet.
@@ -1175,6 +1393,8 @@ fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
         mm.image_data.first().and_then(|item| item.source()),
         Some("data:image/jpeg;base64,xxxx")
     );
+    // The processor learns when the request queued for a worker.
+    assert!(mm.admission.queued_at.is_some_and(|at| at >= queued_after));
     assert!(consumer.drain(16).is_empty(), "in the pool, not queued");
 
     // The worker returns the final expanded ids -> pushed to the channel.
@@ -1268,7 +1488,9 @@ fn mm_failure_rejects_returned_request() {
 
     let mut req = mm_rx.try_recv().expect("sent to the mm pool");
     req.state
-        .apply(Event::Error(Error::Encode("bad image".into())))
+        .apply(Event::Error(Error::Encode(MediaError::Client(
+            "bad image".into(),
+        ))))
         .unwrap();
     intake.drive(req);
     assert!(

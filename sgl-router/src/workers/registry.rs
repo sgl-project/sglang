@@ -175,17 +175,41 @@ impl WorkerRegistry {
     }
 
     /// Workers eligible for selection; excludes prefills still awaiting a bootstrap port.
+    ///
+    /// Fails open: when EVERY eligible worker's breaker is shut, it closes them
+    /// all and returns the whole pool. With nowhere healthier to send the
+    /// request, ejection only turns "might fail on a suspect worker" into
+    /// "certainly fails with `no_healthy_workers`" for all traffic. The breakers
+    /// are closed (not just bypassed) because dispatch re-checks `allow()`; if
+    /// the workers really are down, the next failures reopen them.
     pub fn healthy_workers_for(&self, model: &ModelId) -> Vec<Arc<Worker>> {
         // Use `would_allow` (non-mutating) for filtering — `allow()` would
         // claim a half-open probe slot for every enumerated candidate,
         // starving the worker that the policy actually picks. The probe
         // is claimed at dispatch time by `forward_*_to` in
         // [`crate::proxy`].
-        self.workers_for(model)
+        let eligible: Vec<Arc<Worker>> = self
+            .workers_for(model)
             .into_iter()
             .filter(|w| !w.awaiting_bootstrap_port())
+            .collect();
+        let healthy: Vec<Arc<Worker>> = eligible
+            .iter()
             .filter(|w| w.breaker.would_allow())
-            .collect()
+            .cloned()
+            .collect();
+        if healthy.is_empty() && !eligible.is_empty() {
+            tracing::warn!(
+                model = %model,
+                workers = eligible.len(),
+                "every worker's circuit breaker is open; failing open to the whole pool",
+            );
+            for w in &eligible {
+                w.breaker.reset();
+            }
+            return eligible;
+        }
+        healthy
     }
 
     pub fn workers_for_mode(&self, model: &ModelId, mode: WorkerMode) -> Vec<Arc<Worker>> {
@@ -393,6 +417,39 @@ mod tests {
             "only the worker with a non-Open breaker should survive",
         );
         assert_eq!(healthy[0].id, WorkerId("ok".into()));
+    }
+
+    /// Fail-open: when every worker's breaker is Open, `healthy_workers_for`
+    /// returns the whole pool and closes the breakers so dispatch's `allow()`
+    /// admits them, instead of `no_healthy_workers` for all traffic.
+    #[test]
+    fn all_breakers_open_fails_open_to_whole_pool() {
+        use crate::health::circuit_breaker::CircuitBreakerConfig;
+        use std::num::NonZeroU32;
+        use std::time::Duration;
+
+        let r = WorkerRegistry::default();
+        for id in ["a", "b"] {
+            let _ = r.add_with_cb(
+                spec(id, WorkerMode::Plain, &["m"]),
+                Some(CircuitBreakerConfig {
+                    threshold: NonZeroU32::new(1).unwrap(),
+                    cool_down: Duration::from_secs(30),
+                }),
+                WireProtocol::default(),
+            );
+            r.get(&WorkerId(id.into()))
+                .unwrap()
+                .breaker
+                .record_failure();
+        }
+        let healthy = r.healthy_workers_for(&ModelId("m".into()));
+        assert_eq!(healthy.len(), 2, "every worker comes back");
+        assert!(
+            healthy.iter().all(|w| w.breaker.allow()),
+            "fail-open must close the breakers so dispatch admits them",
+        );
+        assert!(r.healthy_workers_for(&ModelId("absent".into())).is_empty());
     }
 
     /// PD prefill/decode workers and plain workers cannot coexist on the

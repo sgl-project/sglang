@@ -34,27 +34,15 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.phi4mm_audio import AudioEmbedding
+from sglang.srt.multimodal.modality import Modality
 
 logger = logging.getLogger(__name__)
-
-SIGLIP_NAME = "siglip-so400m-patch14-448"
-VISION_ENCODER_TO_PROCESSING_CONFIG = {
-    "siglip-so400m-patch14-448": {
-        "vit_image_size": 448,
-        "vit_patch_size": 14,
-        "token_compression_factor": 2,
-    },
-}
 
 
 class Phi4MMImageEncoder(nn.Module):

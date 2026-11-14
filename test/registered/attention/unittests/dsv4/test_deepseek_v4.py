@@ -18,7 +18,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
     DSV4_PAGE_SIZE,
@@ -511,6 +511,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.hisparse_coordinator = hisparse_coordinator
+        backend.dsv4_prefill_backend = "auto"
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -529,17 +530,32 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     def test_snapshot_builds_cache_only_for_sparse_prefill(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from sglang.srt.layers.attention.dsv4.metadata import (
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
-        for num_qo_tokens, builds in (
-            (_LARGE_INDEXER_QUERY_THRESHOLD, False),
-            (_LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
+        # MLP sync padding: the batch carries 4 rows past the metadata's real rows.
+        for backend_choice, num_qo_tokens, padded, builds in (
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD, False, False),
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD + 1, False, True),
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD, True, False),
+            ("cutedsl_h16", 1, False, False),
+            ("cutedsl_h16", _LARGE_INDEXER_QUERY_THRESHOLD, False, False),
+            ("cutedsl_h16", _LARGE_INDEXER_QUERY_THRESHOLD + 1, False, True),
         ):
-            with self.subTest(num_qo_tokens=num_qo_tokens):
+            with self.subTest(
+                backend=backend_choice, num_qo_tokens=num_qo_tokens, padded=padded
+            ):
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    _original_forward_mode=None,
+                    tbo_parent_token_range=None,
+                    positions=torch.zeros(num_qo_tokens + (4 if padded else 0)),
+                )
                 backend = self._make_prefill_backend()
+                if padded:
+                    backend.forward_metadata.real_num_tokens = num_qo_tokens
+                backend.dsv4_prefill_backend = backend_choice
                 build = backend._build_sparse_prefill_chunk_cache
 
                 with (
@@ -549,10 +565,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                         return_value=SimpleNamespace(is_sm120=False),
                     ),
                 ):
-                    shared_read_ends = backend.resolve_prefill_shared_read_ends(
-                        batch,
-                        num_qo_tokens=num_qo_tokens,
-                    )
+                    shared_read_ends = backend.resolve_prefill_shared_read_ends(batch)
 
                 metadata = backend.forward_metadata
                 if builds:
@@ -568,16 +581,11 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
     def test_prefill_snapshot_skips_layers_reading_live_tables(self):
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            _LARGE_INDEXER_QUERY_THRESHOLD,
-        )
 
         batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
         backend = self._make_prefill_backend(hisparse_coordinator=object())
 
-        shared_read_ends = backend.resolve_prefill_shared_read_ends(
-            batch, num_qo_tokens=_LARGE_INDEXER_QUERY_THRESHOLD + 1
-        )
+        shared_read_ends = backend.resolve_prefill_shared_read_ends(batch)
 
         self.assertIs(shared_read_ends, SharedReadEnds.UNKNOWN)
         backend._build_sparse_prefill_chunk_cache.assert_not_called()
@@ -730,6 +738,46 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             trtllm._check_trtllm_query_rows(64)
             with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
                 trtllm._check_trtllm_query_rows(65)
+
+    def test_trtllm_kv_counter_buffer_is_sized_by_query_rows_and_shared(self):
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        buffers = {}
+        sizing_calls = []
+
+        def fake_bytes(batch_size, num_qo_heads, sm_count):
+            sizing_calls.append((batch_size, num_qo_heads, sm_count))
+            return batch_size * num_qo_heads * 4
+
+        def fake_get_buffer(name, factory):
+            # Same contract as runtime_context.get_buffer: build only on a miss.
+            if name not in buffers:
+                buffers[name] = factory()
+            return buffers[name]
+
+        with (
+            mock.patch.object(trtllm, "_trtllm_semaphore_rows", 0),
+            mock.patch.object(trtllm, "get_buffer", side_effect=fake_get_buffer),
+            mock.patch.object(
+                trtllm, "get_trtllm_gen_multi_ctas_kv_counter_bytes", fake_bytes
+            ),
+            mock.patch.object(trtllm, "get_device_sm_count", return_value=148),
+        ):
+            trtllm._reserve_trtllm_query_rows(8192)
+            first = trtllm._get_trtllm_kv_counter_buffer(16, torch.device("cpu"))
+            # FlashInfer's default sizes by request count; this must use rows.
+            self.assertEqual(sizing_calls, [(8192, 16, 148)])
+            self.assertEqual(first.numel(), 8192 * 16 * 4)
+            self.assertEqual(first.dtype, torch.uint8)
+            self.assertFalse(first.any())
+            # One persistent buffer per head count, reused across launches.
+            self.assertIs(
+                trtllm._get_trtllm_kv_counter_buffer(16, torch.device("cpu")), first
+            )
+            self.assertEqual(len(sizing_calls), 1)
+            other = trtllm._get_trtllm_kv_counter_buffer(64, torch.device("cpu"))
+            self.assertIsNot(other, first)
+            self.assertEqual(other.numel(), 8192 * 64 * 4)
 
     def test_sparse_prefill_kv_buffer_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (

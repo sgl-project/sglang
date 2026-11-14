@@ -297,6 +297,10 @@ jobs:
         env:
           TEST_COMMAND: ${{ matrix.test_command }}
         run: |
+          # Run through the multimodal-gen CI's pytest runner so a rerun gets the
+          # same retries of failed items as CI (performance checks are noisy).
+          # Stop starting retries after 50 minutes, as the CI jobs do.
+          export SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 3000 ))
           cmds=()
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
@@ -310,10 +314,11 @@ jobs:
             cmd="${cmds[$idx]}"
             echo ""
             echo "."
-            echo "Begin ($i/$total): python3 -m pytest $cmd -x"
+            echo "Begin ($i/$total): pytest $cmd (multimodal-gen runner)"
             echo "."
             file_start=$SECONDS
-            if ! python3 -m pytest $cmd -x; then
+            if ! python3 -c 'import sys; from sglang.multimodal_gen.test.runner.pytest_runner import run_pytest; sys.exit(run_pytest(sys.argv[2:], junit_xml_path=sys.argv[1])[0])' \
+                "$RUNNER_TEMP/rerun-test-$idx.xml" $cmd; then
               failed+=("$cmd")
             fi
             elapsed=$(( SECONDS - file_start ))

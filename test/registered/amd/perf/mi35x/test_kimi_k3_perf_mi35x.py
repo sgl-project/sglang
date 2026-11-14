@@ -5,13 +5,9 @@ Day-0 recipe as the accuracy test (sgl-project/sglang#32548), so the two are
 directly comparable and a perf regression cannot be confused with a config
 difference.
 
-This runs as the step after the eval inside nightly-8-gpu-mi35x-kimi-k3-rocm720
-rather than as a job of its own, which is how every other combined accuracy plus
-performance job in that workflow is arranged. Sharing the job means the 1.56 TB
-checkpoint is already in the container cache, and it takes one 8-GPU MI35x slot
-instead of two on a runner scarce enough that the difference is real wall time.
-Step ordering also supplies the gate for free: a failed eval fails the job, so
-this never measures throughput on a build that got the tokens wrong.
+Not scheduled: this ran as the perf step of the Kimi-K3 MI35x nightly job,
+which now runs Kimi-K3.1-Pro accuracy and perf instead. Run it by hand to
+measure Kimi-K3 throughput on MI35x.
 
 #32548 reports the reference numbers to compare against: 102.5 tok/s/GPU at
 concurrency 2 rising to 612.3 at concurrency 32, non-speculative.

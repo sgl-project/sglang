@@ -30,6 +30,7 @@ from sglang.test.kernels.deepseek_v4.common import (
 )
 
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _is_xpu = is_xpu()
 if _is_xpu:
@@ -140,6 +141,82 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     torch.testing.assert_close(q_fp4.view(torch.uint8), ref_fp4)
     torch.testing.assert_close(q_sf, ref_sf)
     torch.testing.assert_close(weights_out.squeeze(-1), weight.float() * weight_scale)
+
+
+def _index_q_inputs(tokens: int, heads: int, kind: str, gen: torch.Generator):
+    shape = (tokens, heads, HEAD_DIM)
+    device = get_device()
+    x = torch.randn(shape, device=device, generator=gen)
+    if kind == "row_scales":
+        x = x * torch.exp(
+            torch.randn(tokens, heads, 1, device=device, generator=gen) * 6
+        )
+    elif kind == "sparse":
+        x = x * (torch.rand(shape, device=device, generator=gen) < 0.1)
+    elif kind == "tiny":
+        # Below both fp4 amax floors.
+        x = x * 1e-30
+    elif kind == "grid_ties":
+        grid = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0], device=device)
+        x = x.sign() * grid[torch.randint(0, 8, shape, device=device, generator=gen)]
+    elif kind == "extreme":
+        # Per-row scales across the whole bf16 exponent range, subnormals included.
+        exponent = torch.randint(
+            -150, 126, (tokens, heads, 1), device=device, generator=gen
+        )
+        x = x * torch.exp2(exponent.float())
+    elif kind == "nonfinite":
+        u = torch.rand(shape, device=device, generator=gen)
+        x = torch.where(u < 0.003, float("inf"), x)
+        x = torch.where((u >= 0.003) & (u < 0.006), float("-inf"), x)
+        x = torch.where((u >= 0.006) & (u < 0.009), float("nan"), x)
+    x = x.bfloat16()
+    if kind == "sparse":
+        # Signed zeros: the packer clears the -0 code.
+        negative = torch.rand(shape, device=device, generator=gen) < 0.5
+        x = torch.where((x == 0) & negative, -0.0, x).bfloat16()
+    positions = torch.randint(0, 200000, (tokens,), device=device, generator=gen)
+    head_weights = (
+        torch.randn(tokens, heads, device=device, generator=gen) * 3
+    ).bfloat16()
+    return x, positions, head_weights
+
+
+@pytest.mark.skipif(
+    _is_xpu
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] != 10,
+    reason="Only SM100-family GPUs take the block kernel; elsewhere both calls use the warp kernel",
+)
+@pytest.mark.parametrize(
+    "kind",
+    ["normal", "row_scales", "sparse", "tiny", "grid_ties", "extreme", "nonfinite"],
+)
+@pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
+def test_index_q_rope_pack_prefill_matches_decode_kernel(kind, pos_dtype) -> None:
+    """Calls of >= 8192 (token, head) rows take the one-thread-per-fp4-block kernel
+    on SM100-family GPUs; 128-token calls keep the warp-per-row kernel. Both must
+    write the same bytes."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
+        index_q_rope_pack_weights,
+    )
+
+    heads, tokens = 32, 4100
+    gen = torch.Generator(device=get_device()).manual_seed(0)
+    freqs = torch.randn(200000, 32, 2, device=get_device(), generator=gen)
+    freqs = (freqs / freqs.norm(dim=-1, keepdim=True)).flatten(1).contiguous()
+    x, positions, head_weights = _index_q_inputs(tokens, heads, kind, gen)
+    positions = positions.to(pos_dtype)
+
+    def call(rows: slice):
+        return index_q_rope_pack_weights(
+            x[rows], freqs, positions[rows], head_weights[rows], 0.0625
+        )
+
+    whole = call(slice(None))
+    parts = [call(slice(i, i + 128)) for i in range(0, tokens, 128)]
+    for j, name in enumerate(("payload", "scale", "weights")):
+        assert torch.equal(whole[j], torch.cat([p[j] for p in parts])), name
 
 
 def _make_logits_case(rows: int, heads: int, width: int, seed: int = 719):
@@ -407,6 +484,61 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
                 )
 
 
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio,masked", [(1, False), (2, True)])
+def test_fp4_paged_logits_balanced_matches_per_row_replay(heads, ratio, masked):
+    """One long verify group among short rows: the balanced split and the per-row grid
+    must produce the same bits for every visible score, across graph replays."""
+    from sglang.kernels.ops.attention.dsv4 import fp4_indexer
+
+    batch, width = 40, 20000
+    q, weights, slots, lens, table = _make_logits_case(batch, heads, width)
+    capacity = 32768
+    req = (torch.arange(batch, device=q.device) // 6).to(torch.int32)
+    # Positions past ``width`` map to slot 0, so a length past max_len stays readable.
+    req_table = torch.zeros(
+        (req.max().item() + 1, capacity * ratio), device=q.device, dtype=torch.int32
+    )
+    req_table[req.long(), : width * ratio : ratio] = (slots * ratio).to(torch.int32)
+    lengths = torch.zeros(batch, device=q.device, dtype=torch.int32)
+    candidate_mask = (
+        torch.rand(batch, capacity, device=q.device) > 0.3 if masked else None
+    )
+    args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
+
+    def score(balanced):
+        if balanced:
+            return fp4_index_logits_paged(*args, candidate_mask)
+        with patch.object(fp4_indexer, "_PAGED_BALANCED_MAX_BATCH", 0):
+            return fp4_index_logits_paged(*args, candidate_mask)
+
+    for _ in range(3):
+        fp4_index_logits_paged(*args, candidate_mask)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp4_index_logits_paged(*args, candidate_mask)
+    for step, long_len in enumerate([width, 0, 1, 129, 20000 - 63, width]):
+        short = torch.tensor([0, 1, 63, 64, 65, 127, 128, 3000], device=q.device)
+        lengths.copy_(short[torch.arange(batch, device=q.device) % 8].to(torch.int32))
+        lengths[6 * (step % 6) : 6 * (step % 6) + 6] = long_len
+        lengths[-1] = capacity + 7  # past max_len: clamped, not read past the table
+        q.neg_()
+        graph.replay()
+        expected = score(False)
+        visible = (
+            torch.arange(capacity, device=q.device)[None, :]
+            < lengths.clamp(max=capacity)[:, None]
+        )
+        assert torch.equal(
+            actual[visible].view(torch.int32), expected[visible].view(torch.int32)
+        )
+        assert torch.equal(
+            score(True)[visible].view(torch.int32), expected[visible].view(torch.int32)
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="Hopper paged indexer dispatch",
@@ -573,106 +705,29 @@ def test_hopper_indexer_backends_replay(ratio):
                 assert (out.raw_indices[batch] == -1).all().item()
 
 
-@pytest.mark.parametrize("rows", [0, 1, 32, 129])
-@pytest.mark.parametrize("topk", [0, 1, 65, 512])
-@pytest.mark.parametrize("write_raw", [False, True])
-def test_flat_indexer_finalization_replay(rows, topk, write_raw):
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import finish_flat_indexer_topk
+@pytest.mark.parametrize(
+    "bs,n,bpp",
+    [(1024, 2049, 4), (1024, 2049, 2), (3, 17, 2), (0, 10, 4), (5, 9, 3)],
+)
+def test_expand_index_page_table_matches_cpu(bs, n, bpp):
+    """The GPU expansion is bitwise the torch expression the CPU path runs; bpp 3
+    stays on torch."""
+    from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 
-    torch.manual_seed(81 + rows + topk)
-    indices = torch.randint(
-        0, 2048, (rows, topk + 8), device="cuda", dtype=torch.int32
-    )[:, :topk]
-    slots = torch.randperm(2048, device="cuda").to(torch.int64)
-    starts = torch.randint(0, 128, (rows,), device="cuda", dtype=torch.int32)
-    pages = torch.full((rows + 1, topk + 8), 12345, device="cuda", dtype=torch.int32)
-    raw = torch.full_like(pages, 12345) if write_raw else None
-
-    def run():
-        finish_flat_indexer_topk(indices, slots, starts, pages, raw)
-
-    for _ in range(3):
-        run()
-    graph = None
-    if rows and topk:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run()
-    for step in range(3):
-        indices.copy_(
-            torch.randint(0, 2048, indices.shape, device="cuda", dtype=torch.int32)
+    def expand(t):
+        return expand_index_page_table(
+            t, full_page_size=64 * bpp, compress_ratio=1, index_page_size=64
         )
-        indices[:, step::7] = -1 - step
-        indices[:, 2::11] = torch.iinfo(torch.int32).max
-        if step == 1:
-            indices.fill_(-1)
-        slots.copy_(slots.roll(17))
-        starts.add_(1)
-        pages.fill_(12345)
-        if raw is not None:
-            raw.fill_(12345)
-        if graph is not None:
-            graph.replay()
-        else:
-            run()
-        sentinel = torch.iinfo(torch.int32).max
-        selected = indices.masked_fill(indices < 0, sentinel).sort(-1).values
-        chosen = selected != sentinel
-        expected_pages = torch.full_like(pages, 12345)
-        expected_pages[:rows, :topk] = torch.where(
-            chosen, slots[selected.clamp_max(slots.numel() - 1)], -1
-        ).int()
-        torch.testing.assert_close(pages, expected_pages, rtol=0, atol=0)
-        if raw is not None:
-            expected_raw = torch.full_like(raw, 12345)
-            expected_raw[:rows, :topk] = torch.where(
-                chosen, selected - starts[:, None], -1
-            )
-            torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
 
-
-@pytest.mark.parametrize("write_raw", [False, True])
-def test_flat_indexer_slot_count_does_not_recompile(write_raw):
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-        _finish_flat_indexer_topk_kernel,
-    )
-
-    rows, topk = 32, 512
-    torch.manual_seed(95)
-    indices = torch.randint(0, 8192, (rows, topk), device="cuda", dtype=torch.int32)
-    indices[:, 0] = -3
-    indices[:, 1] = torch.iinfo(torch.int32).max
-    starts = torch.arange(rows, device="cuda", dtype=torch.int32)
-    pages = torch.empty_like(indices)
-    raw = torch.empty_like(indices) if write_raw else None
-    hashes = set()
-    for num_slots in (1, 17, 64, 65, 129, 2048, 8192):
-        slots = torch.arange(num_slots, device="cuda", dtype=torch.int64) * 3 + 7
-        compiled = _finish_flat_indexer_topk_kernel[(rows,)](
-            indices,
-            slots,
-            starts,
-            pages,
-            raw,
-            topk,
-            num_slots,
-            indices.stride(0),
-            pages.stride(0),
-            raw.stride(0) if raw is not None else 0,
-            write_raw,
-            topk,
-            num_warps=4,
-        )
-        hashes.add(compiled.hash)
-        sentinel = torch.iinfo(torch.int32).max
-        selected = indices.masked_fill(indices < 0, sentinel).sort(-1).values
-        chosen = selected != sentinel
-        expected = torch.where(chosen, slots[selected.clamp_max(num_slots - 1)], -1)
-        torch.testing.assert_close(pages, expected.int(), rtol=0, atol=0)
-        if raw is not None:
-            expected_raw = torch.where(chosen, selected - starts[:, None], -1)
-            torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
-    assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
+    torch.manual_seed(bs + n + bpp)
+    t = torch.randint(0, 1 << 20, (2 * bs, n), device=get_device(), dtype=torch.int32)
+    if bs and n >= 8:
+        t[:, -3:] = -1
+        t[0, :4] = t.new_tensor([2**31 - 1, 2**30, 2**29 + 7, -(2**31)])
+    for table in (t[:bs], t[::2]):
+        out = expand(table)
+        assert out.dtype == torch.int32
+        assert torch.equal(out.cpu(), expand(table.cpu()))
 
 
 if __name__ == "__main__":

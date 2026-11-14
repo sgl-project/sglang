@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import model_config_of
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
     get_exec,
@@ -246,7 +246,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             torch.cuda.synchronize()
 
             # Get expert location metadata for CPU expert mapping
-            from sglang.srt.eplb.expert_location_dispatch import (
+            from sglang.srt.eplb.expert_location import (
                 get_global_expert_location_metadata,
             )
 

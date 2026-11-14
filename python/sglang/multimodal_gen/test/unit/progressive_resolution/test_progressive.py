@@ -17,11 +17,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     compute_stage_transitions,
     find_transition_steps,
     is_progressive_resolution_mode,
+    pack_2x2_latent,
     reset_scheduler_at_step,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
-    _flux_pack,
-    _flux_unpack,
+    unpack_2x2_latent,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux_2 import (
     Flux2ProgressiveDenoisingStage,
@@ -32,10 +30,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     Ideogram4ProgressiveDenoisingStage,
     _ideogram4_pack,
     _ideogram4_unpack,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
-    _qwen_image_pack,
-    _qwen_image_unpack,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.spectral_ops import (
     dct_2d,
@@ -351,14 +345,9 @@ class TestLatentAdapters(unittest.TestCase):
     def test_flux_and_qwen_patchify_roundtrip(self):
         x = torch.arange(1 * 16 * 8 * 12, dtype=torch.float32).reshape(1, 16, 8, 12)
 
-        for name, pack, unpack in (
-            ("flux", _flux_pack, _flux_unpack),
-            ("qwen_image", _qwen_image_pack, _qwen_image_unpack),
-        ):
-            with self.subTest(adapter=name):
-                packed = pack(x, 8, 12)
-                self.assertEqual(packed.shape, (1, (8 // 2) * (12 // 2), 64))
-                torch.testing.assert_close(unpack(packed, 8, 12), x)
+        packed = pack_2x2_latent(x, 8, 12)
+        self.assertEqual(packed.shape, (1, (8 // 2) * (12 // 2), 64))
+        torch.testing.assert_close(unpack_2x2_latent(packed, 8, 12), x)
 
     def test_flux2_row_major_roundtrip(self):
         x = torch.arange(2 * 4 * 3 * 5, dtype=torch.float32).reshape(2, 4, 3, 5)

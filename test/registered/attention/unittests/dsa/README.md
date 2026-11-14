@@ -66,7 +66,7 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 - **`Unsupported {forward_batch.forward_mode=}`** — `forward_extend`
   fall-through asserts `False` (`dsa_backend.py:629`) for anything not in
   `is_decode_or_idle` / `is_extend()` (incl. `MIXED`, `DRAFT_EXTEND`,
-  `TARGET_VERIFY`, `SPLIT_PREFILL`, `DLLM_EXTEND`) / `is_draft_extend(include_v2=True)`.
+  `TARGET_VERIFY`, `DLLM_EXTEND`) / `is_draft_extend(include_v2=True)`.
 - **PCG/BCG split-op extend on the MHA_ONE_SHOT dense fallback path** —
   structurally incompatible with `unified_attention_with_output`. DSA's
   dense fallback passes K as concatenated `prefix + extend` (shape

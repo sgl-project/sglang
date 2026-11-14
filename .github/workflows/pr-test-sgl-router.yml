@@ -13,12 +13,19 @@ name: PR Test (sgl-router)
 #
 #   * `push` on `main` keeps firing so post-merge runs still record
 #     against the default branch.
+#
+#   * No `labeled` trigger, as in `pr-test.yml` and `pr-test-extra.yml`:
+#     every label event (`highest-priority`, `keep-open`, ...) would
+#     join the concurrency group below, cancel the tiers in progress and
+#     start them over from scratch. Adding `run-ci` after a push takes a
+#     rerun (`/tag-and-rerun-ci`, or a manual rerun of the failed gate),
+#     which the live label gate in `pr-gate.yml` then passes.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 concurrency:
@@ -58,6 +65,7 @@ jobs:
               - 'rust/Cargo.toml'
               - 'rust/sglang-processor/**'
               - 'rust/sglang-api-types/**'
+              - 'rust/sglang-runtime-v1-types/**'
               - 'proto/**'
               - '.github/workflows/pr-test-sgl-router.yml'
               - 'docker/sgl-router.Dockerfile'
@@ -151,6 +159,13 @@ jobs:
       - name: cargo clippy
         working-directory: sgl-router
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # The opt-in `fips` feature (aws-lc-rs FIPS module) is cfg-gated code
+      # no other job compiles. aws-lc-fips-sys builds with cmake, Go and
+      # clang, which the GitHub-hosted Ubuntu image ships.
+      - name: cargo clippy (fips feature)
+        working-directory: sgl-router
+        run: cargo clippy --locked --all-targets --features fips -- -D warnings
 
       - name: cargo fmt
         working-directory: sgl-router
@@ -358,8 +373,8 @@ jobs:
           cargo build --locked --release --workspace
 
       # Install SGLang from the local checkout in editable mode (no PyPI
-      # version pin) — mirrors `pr-test-rust.yml` so the router e2e runs
-      # against whatever SGLang version is on the branch. Replaces the
+      # version pin) so the router e2e runs against whatever SGLang version
+      # is on the branch. Replaces the
       # previous `pip install sglang[srt]==X.Y.Z` pin, which forced the
       # e2e to test against a stale wheel and would silently miss any
       # new ServerArgs field (e.g. `disaggregation_mode` /

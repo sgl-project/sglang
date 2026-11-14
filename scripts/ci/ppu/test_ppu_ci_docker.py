@@ -191,7 +191,9 @@ class TestPPUCIDocker(CustomTestCase):
         self.home.mkdir()
         self.runner_temp = self.root / "runner temp"
         self.runner_temp.mkdir()
-        self.models = [self.root / name for name in ("target", "eagle3", "dflash")]
+        self.models = [
+            self.root / name for name in ("target", "eagle3", "dflash", "mla", "small")
+        ]
         for model in self.models:
             model.mkdir()
             (model / "config.json").write_text("{}")
@@ -228,6 +230,8 @@ class TestPPUCIDocker(CustomTestCase):
             PPU_CI_TARGET_MODEL_PATH=str(self.models[0]),
             PPU_CI_EAGLE3_MODEL_PATH=str(self.models[1]),
             PPU_CI_DFLASH_MODEL_PATH=str(self.models[2]),
+            PPU_CI_MLA_MODEL_PATH=str(self.models[3]),
+            PPU_CI_SMALL_MODEL_PATH=str(self.models[4]),
             PPU_CI_EVAL_CACHE=str(self.cache),
         )
         os.mkfifo(self.root / "ready.fifo")
@@ -491,9 +495,11 @@ class TestPPUCIDocker(CustomTestCase):
             "/models/target": self.models[0],
             "/models/eagle3": self.models[1],
             "/models/dflash": self.models[2],
+            "/models/mla": self.models[3],
+            "/models/small": self.models[4],
             "/eval-cache": self.cache,
         }
-        self.assertEqual(len(mounts), 7)
+        self.assertEqual(len(mounts), 9)
         for target, source in expected.items():
             self.assertIn(f"type=bind,source={source},target={target},readonly", mounts)
         private = next(mount for mount in mounts if "target=/artifacts" in mount)
@@ -526,8 +532,7 @@ class TestPPUCIDocker(CustomTestCase):
         step = next(
             step
             for step in workflow["jobs"]["ppu-sanity"]["steps"]
-            if step.get("name")
-            == "Run both speculative sanity files in isolated Docker"
+            if step.get("name") == "Run the PPU model sanity suite in isolated Docker"
         )
         env = {
             **self.env,

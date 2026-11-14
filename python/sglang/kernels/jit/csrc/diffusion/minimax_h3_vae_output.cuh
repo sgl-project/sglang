@@ -247,7 +247,7 @@ struct TemporalBlendWriteKernel {
     auto H = SymbolicSize{"height"};
     auto W = SymbolicSize{"width"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     if constexpr (kVectorized) {
       TensorMatcher({B, C, Tp, H, W})
           .with_strides({-1, -1, -1, -1, 1})
@@ -366,7 +366,7 @@ struct DenormClampKernel {
     auto H = SymbolicSize{"height"};
     auto W = SymbolicSize{"width"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     if constexpr (kVectorized) {
       TensorMatcher({B, 3, T, H, W})
           .with_strides({-1, -1, -1, -1, 1})

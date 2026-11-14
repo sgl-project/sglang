@@ -88,7 +88,7 @@ struct AlignSingleTokenKernel {
     auto One_ = SymbolicSize{"one"};
     auto K_ = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({One_, K_}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
     if constexpr (kWriteInactivePrefixCount) {

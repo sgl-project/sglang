@@ -16,6 +16,7 @@ namespace device::marlin {
 template <
     typename scalar_t,                   // compute dtype, half or nv_float16
     const host::ScalarTypeId w_type_id,  // weight ScalarType id
+    const host::ScalarTypeId s_type_id,  // weight scale ScalarType id
     const int threads,                   // number of threads in a threadblock
     const int thread_m_blocks,           // number of 16x16 blocks in the m
                                          // dimension (batchsize) of the

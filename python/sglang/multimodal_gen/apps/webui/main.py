@@ -4,10 +4,8 @@ from sglang.multimodal_gen.apps.webui.minimax_h3 import (
     is_minimax_h3,
     run_minimax_h3_webui,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     prepare_request,

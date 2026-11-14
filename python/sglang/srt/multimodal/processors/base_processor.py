@@ -23,17 +23,17 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessor
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
+from sglang.srt.multimodal.media_io import (
+    configure_media_url_security,
+    media_url_security_config,
+)
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.multimodal_processor_mixin import (
     MultimodalProcessorMixin,
     _tokenizer_of,
@@ -56,10 +56,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_serving,
 )
-from sglang.srt.utils import (
-    envs,
-    logger,
-)
+from sglang.srt.utils import envs, logger
 
 
 @dataclasses.dataclass
@@ -219,6 +216,12 @@ def _forget_parent_executor_wakeups():
     concurrent.futures.process._threads_wakeups.clear()
 
 
+def _init_cpu_worker(media_url_policy: tuple) -> None:
+    _forget_parent_executor_wakeups()
+    # A spawned worker starts from the default media policy, not the server's.
+    configure_media_url_security(*media_url_policy)
+
+
 class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
     # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
@@ -238,6 +241,9 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     # Artifact-based processors may keep their prompt/M-RoPE fast path even
     # when artifact retention is disabled.
     uses_media_artifacts_without_cache = False
+    # Placeholder tokens that the loader matches per modality; a processor without
+    # them reads media its own way, so callers cannot tell which media it reads.
+    mm_tokens: Optional[MultimodalSpecialTokens] = None
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -265,6 +271,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             or int(os.environ.get("SGLANG_IO_WORKERS", 0)),
             allowed_media_domains=get_mm().allowed_media_domains,
             media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
+            media_url_timeout=get_mm().media_url_timeout,
+            allow_local_media_files=get_mm().allow_local_media_files,
         )
         MultimodalProcessorMixin._initialize_processor(
             self, hf_config, _processor, processor_config=processor_config
@@ -288,8 +296,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             max_entries=8192,
         )
         self.trust_mm_content_hashes = bool(get_mm().trust_mm_content_hashes)
-        # The fingerprint is needed only to build artifact keys. Avoid inspecting
-        # processor state when this processor will never retain artifacts.
+        # Compute lazily once for both preprocess and encoder-cache identities.
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
@@ -407,7 +414,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-            initializer=_forget_parent_executor_wakeups,
+            initializer=_init_cpu_worker,
+            initargs=(media_url_security_config(),),
         )
 
     def _replace_broken_cpu_executor(
@@ -755,28 +763,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
         pass
-
-    def get_estimated_frames_list(self, image_data):
-        """
-        estimate the total frame count from all visual input
-        """
-        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
-
-        # Before processing inputs
-        if not image_data or len(image_data) == 0:
-            return []
-        estimated_frames_list = []
-        for image in image_data:
-            if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:") :]
-                decoder = VideoDecoderWrapper(path)
-                num_frames = len(decoder)
-            else:
-                # For images, each contributes one frame
-                num_frames = 1
-            estimated_frames_list.append(num_frames)
-
-        return estimated_frames_list
 
     @classmethod
     def _all_mm_data_is_preprocessed(cls, *data_lists):
@@ -1224,6 +1210,9 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 "modality",
                 "hash",
                 "pad_value",
+                "pad_values",
+                "identity",
+                "processor_fingerprint",
                 "offsets",
             ):
                 # metadata fields need explicit handling, skip generic item.set
@@ -1493,7 +1482,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                         feature=feature,
                         format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
                         offsets=dict_item.pop("offsets", None),
-                        # Trusted media identity for KV trie reuse and KV-event hashes.
+                        # Legacy hint; actual tensor contents determine cache identity.
                         hash=dict_item.pop("hash", None),
                         model_specific_data=dict_item,
                     )
@@ -1566,8 +1555,29 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         *,
         images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
-        """Apply model-specific item reshaping while features are still tensors."""
+        """Bind model configuration before optional model-specific reshaping."""
+        self._bind_cache_namespaces(mm_items)
         return mm_items
+
+    def _bind_cache_namespaces(self, mm_items: List[MultimodalDataItem]) -> bool:
+        if self.processor_fingerprint is None:
+            self.processor_fingerprint = build_processor_fingerprint(
+                self, self.hf_config
+            )
+        changed = False
+        for item in mm_items:
+            changed |= item.bind_processor_fingerprint(self.processor_fingerprint)
+        return changed
+
+    def finalize_cache_identities(self, output: MultimodalProcessorOutput) -> None:
+        """Common frontend boundary, including model-specific processor paths."""
+        if (
+            self._bind_cache_namespaces(output.mm_items)
+            and output.padded_input_ids is not None
+        ):
+            output.padded_input_ids = output.build_padded_input_ids(
+                output.input_ids, output.mm_items
+            )
 
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]

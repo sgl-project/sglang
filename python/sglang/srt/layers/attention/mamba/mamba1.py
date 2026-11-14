@@ -59,9 +59,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 

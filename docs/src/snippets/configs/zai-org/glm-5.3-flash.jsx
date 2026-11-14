@@ -279,7 +279,7 @@ export const config = {
 `# Low Latency speed rows whose notes mention SGLANG_SIMULATE_ACC_LEN=3 were served
 # with it to pin the accept length; that number is throughput evidence only. Never
 # run accuracy against it.
-python3 -m sglang.bench_serving \\
+python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -905,6 +905,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -985,6 +986,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1155,6 +1157,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1296,6 +1299,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1345,6 +1349,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1441,6 +1446,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

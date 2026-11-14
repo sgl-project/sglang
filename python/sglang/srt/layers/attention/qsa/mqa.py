@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.device import is_hip
 
 try:
     import flashinfer.comm  # noqa: F401

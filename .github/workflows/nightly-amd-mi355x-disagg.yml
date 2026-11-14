@@ -2,11 +2,11 @@ name: Nightly Test (AMD MI355X Disagg)
 
 # Self-hosted runners on the amd-sglang login node salloc two or four MI355X
 # nodes and run the Docker harness (prefill + decode over MORI, a standalone
-# load balancer, then an sglang.bench_serving concurrency sweep) via
+# load balancer, then an sglang.benchmark.serving concurrency sweep) via
 # scripts/ci/slurm/launch_mi355x.sh.
 on:
   schedule:
-    - cron: '0 7 * * *'
+    - cron: '0 4 * * *'  # 12:00 UTC+8
   workflow_dispatch:
     inputs:
       image:
@@ -149,6 +149,15 @@ jobs:
       max-parallel: 2
       matrix: ${{ fromJson(needs.setup.outputs.matrix-2n) }}
     env: &mi355x-env
+      # Cluster config for the pit2 amd-sglang nodes. The runner host sets none
+      # of these; this file is the only place they are defined.
+      CLUSTER: spur
+      SLURM_PARTITION: amd-sglang
+      SLURM_ACCOUNT: amd-sglang
+      SLURM_QOS: amd-sglang-qos
+      # Node-local HF hub cache on every compute node, read-only in containers.
+      # Loading from /share_nfs is too slow (16-24 min for a 1.5 TB checkpoint).
+      HF_CACHE: /var/tmp/sglang-ci/model_coverage
       FRAMEWORK: sglang
       HW: mi355x
       MODEL: ${{ matrix.config.model }}
@@ -163,9 +172,12 @@ jobs:
       # launch + cleanup steps read it directly. Do NOT set it here from
       # ${{ runner.name }} -- the `runner` context is not available in job-level
       # env and makes the whole workflow file invalid.
-      # Shared-NFS HuggingFace cache dir; the launcher resolves the live snapshot
-      # via refs/main. Per-model value comes from nightly-configs.yaml model_path.
-      MODEL_PATH: ${{ matrix.config.model_path }}
+      # launch_mi355x.sh's default TIME_LIMIT (02:30:00) is sized for the
+      # heaviest EP16 4-node sweep. A 2-node 1P1D leg normally finishes in
+      # 20-35 minutes, so give it a tighter cap: a stuck leg then frees its
+      # nodes for the rest of the queue much sooner. 4n/EP16 keeps the
+      # launcher's own default.
+      TIME_LIMIT: ${{ github.job == 'nightly-mi355x-2n' && '01:00:00' || '02:30:00' }}
 
     steps: &mi355x-steps
       - name: Checkout code
@@ -191,15 +203,29 @@ jobs:
           STALE_JOBS=$(squeue --noheader --format="%i %200j" | grep -F "mi355x-ci-${RUNNER_NAME}-" | awk '{print $1}' || true)
           if [ -n "$STALE_JOBS" ]; then
             echo "Cancelling stale jobs for ${RUNNER_NAME}: $STALE_JOBS"
+            # Servers are detached (-d on spur) docker containers, so scancel
+            # alone leaves them holding GPU memory. Reap them by name first.
+            for job in $STALE_JOBS; do
+              NODES=$(scontrol show job "$job" 2>/dev/null | tr ' ' '\n' | sed -n 's/^NodeList=//p' | tr ',' '\n' | grep -vx '(null)' || true)
+              for node in $NODES; do
+                ssh -o BatchMode=yes -o ConnectTimeout=10 -n "$node" \
+                  'docker rm -f mi355x_prefill mi355x_decode mi355x_bench' \
+                  >/dev/null 2>&1 || true
+              done
+            done
             scancel $STALE_JOBS
           fi
+
+      - name: Reclaim old runner diagnostics and check disk headroom
+        timeout-minutes: 2
+        run: python3 scripts/ci/slurm/runner_disk_preflight.py
 
       - name: Launch MI355X benchmark
         timeout-minutes: 180
         env:
-          # Manual dispatch input wins; otherwise use the latest image resolved
-          # by the setup job; otherwise the launcher falls back to the recipe default.
-          IMAGE_OVERRIDE: ${{ inputs.image != '' && inputs.image || needs.setup.outputs.image }}
+          # The only source of the image: the dispatch input, else the latest
+          # image (or the pinned fallback) resolved by the setup job.
+          IMAGE: ${{ inputs.image != '' && inputs.image || needs.setup.outputs.image }}
         run: bash scripts/ci/slurm/launch_mi355x.sh
 
       - name: Pack logs
@@ -222,18 +248,14 @@ jobs:
             exit 0
           fi
 
-          STAGING_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/log-staging.XXXXXX")"
-          trap 'rm -rf "$STAGING_DIR"' EXIT
-          for log_file in "${LOG_FILES[@]}"; do
-            cp -a "$LOG_DIR/$log_file" "$STAGING_DIR/$log_file" || true
-          done
-          tar czf "$LOG_BUNDLE" -C "$STAGING_DIR" .
+          # The launcher has finished writing. Archive directly to avoid a
+          # second full copy of the logs counting against the runner's quota.
+          tar czf "$LOG_BUNDLE" -C "$LOG_DIR" -- "${LOG_FILES[@]}"
           echo "Packed ${#LOG_FILES[@]} log file(s) -> $LOG_BUNDLE"
 
       - name: Process results
         if: always()
         run: |
-          pip install tabulate pyyaml -q
           for result_file in ${{ github.workspace }}/${RESULT_FILENAME}_*.json; do
             [ -f "$result_file" ] || continue
             basename_file=$(basename "$result_file")
@@ -246,6 +268,7 @@ jobs:
           done
 
       - name: Upload results
+        id: upload-results
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -255,6 +278,10 @@ jobs:
             ${{ github.workspace }}/*_logs.tar.gz
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Remove uploaded log bundle
+        if: always() && steps.upload-results.outcome == 'success'
+        run: rm -f -- "${GITHUB_WORKSPACE}/${RESULT_FILENAME}_logs.tar.gz"
 
       - name: Clean up Slurm jobs on failure/cancel
         if: failure() || cancelled()
