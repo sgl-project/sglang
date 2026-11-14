@@ -388,20 +388,42 @@ class IpcA2AMultiState:
             torch.cuda.synchronize()
         self.staging.clear()
         self.pools.clear()
+        if torch.cuda.is_available():
+            torch.cuda.ipc_collect()
+
+    def _release_shared(self) -> None:
+        """Free the buffers just dropped on every rank; a group collective.
+
+        A shared block outlives its last local reference until each peer has
+        closed its mapping, and then only when the IPC limbo is collected.
+        """
+        torch.cuda.synchronize()
+        dist.barrier(group=self.group)
+        torch.cuda.ipc_collect()
 
     def _share(self, t: torch.Tensor, group) -> list[torch.Tensor]:
         """Every member's `t`, peers' re-opened in the LOCAL device context
-        (a mapping is only dereferenceable from the context that opened it)."""
+        (a mapping is only dereferenceable from the context that opened it).
+
+        Each peer gets its own handle: torch counts one reference per handle and
+        frees `t` only once that count is back to zero, so one handle opened by
+        world - 1 peers never frees it (every dropped pool or staging buffer
+        stayed allocated)."""
         from torch.multiprocessing.reductions import reduce_tensor
 
+        mine = [
+            None if member == self.rank else reduce_tensor(t)
+            for member in range(self.world)
+        ]
         handles: list = [None] * self.world
-        dist.all_gather_object(handles, reduce_tensor(t), group=group)
+        dist.all_gather_object(handles, mine, group=group)
         dev = torch.cuda.current_device()
         out = []
-        for member, (fn, args) in enumerate(handles):
+        for member, theirs in enumerate(handles):
             if member == self.rank:
                 out.append(t)
                 continue
+            fn, args = theirs[self.rank]
             args = list(args)
             for i, v in enumerate(args):
                 if isinstance(v, torch.device):
@@ -481,6 +503,7 @@ class IpcA2AMultiState:
             # queued copies may still target the evicted peer mappings
             torch.cuda.synchronize()
             self.staging.popitem(last=False)
+            self._release_shared()
         self.staging[key] = value
 
     def pipelined_attention(
@@ -617,6 +640,7 @@ class IpcA2AMultiState:
                 torch.cuda.synchronize()
                 del self.pools[q.dtype]
                 pool = None
+                self._release_shared()
             if check is not None:
                 reference = sequential()
             pool = self.pools[q.dtype] = _PipelinePool(self, q.dtype, *sizes)
