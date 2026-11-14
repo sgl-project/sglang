@@ -17,6 +17,10 @@ export const config = {
 
   latencyPercentile: "P50",
 
+  accuracyLabels: [
+    ["gsm8k_pct", "GSM8K", "%"],
+  ],
+
   supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x"],
 
   variants: [

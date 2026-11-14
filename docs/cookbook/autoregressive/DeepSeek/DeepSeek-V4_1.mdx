@@ -69,8 +69,20 @@ Pick your hardware + recipe to generate the launch command:
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4_1.jsx";
+import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4_1-benchmarks.jsx";
 
-<Deployment config={config} agenticLink="agentic-long-context-deployment" />
+<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
+
+<Note>
+  The original Flash checkpoint has B200 and B300 benchmarks from
+  [dhruvrnaik's report #41946](https://github.com/sgl-project/sglang/issues/41946),
+  using four GPUs with TP4/EP4. Each speed value is the median of three runs
+  after two warmups. Latency is the per-run **mean**, not P50; throughput counts
+  input plus output tokens per GPU. GSM8K uses all 1,319 questions, zero-shot,
+  greedy decoding and thinking off. These measurements do not cover Flash-1017,
+  other hardware or other evaluation suites. The report includes pinned image
+  and model revisions, commands and raw runs.
+</Note>
 
 
 ## Playground
