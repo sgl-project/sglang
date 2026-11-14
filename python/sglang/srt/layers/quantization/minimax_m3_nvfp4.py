@@ -6,7 +6,11 @@ from typing import Any
 
 import torch
 
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsFusedMoEMethod,
 )
@@ -23,6 +27,18 @@ if _is_hip:
     from sglang.srt.layers.quantization import minimax_m3_nvfp4_hip as _hip
 
 logger = logging.getLogger(__name__)
+
+_CUTILE_WEIGHT_UPDATE_ERROR = (
+    "Online weight updates are not supported with flashinfer_cutile: prepared "
+    "NVFP4 weights cannot be restored to the checkpoint layout. Restart the "
+    "engine to load a different checkpoint."
+)
+
+_CUTILE_WEIGHT_EXPORT_ERROR = (
+    "Weight export is not supported with flashinfer_cutile: prepared NVFP4 "
+    "expert weights cannot be serialized as a complete checkpoint. Use the "
+    "original checkpoint instead."
+)
 
 
 class MiniMaxM3Nvfp4Config(Fp8Config):
@@ -121,7 +137,12 @@ class MiniMaxM3Nvfp4Config(Fp8Config):
 
 
 class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
-    """MegaMoE and TRT-LLM experts on Blackwell, requantized on gfx950, Marlin W4A16 elsewhere."""
+    """Select an expert backend for MiniMax's compressed-tensors NVFP4 weights.
+
+    cuTile and Marlin are explicit options on SM12x. Existing paths use
+    MegaMoE/TRT-LLM on Blackwell, requantized experts on gfx950, or Marlin
+    W4A16 elsewhere.
+    """
 
     # Cleared because __init__ below supplies a non-Blackwell expert path.
     requires_blackwell = False
@@ -130,12 +151,30 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         super().__init__()
         # Marlin's kernels are CUDA-only; gfx950 requantizes the experts at load
         platform = get_platform()
-        self.requantizes_experts = platform.is_hip and platform.is_gfx95
+        backend = get_moe_runner_backend()
+        self.use_flashinfer_cutile = backend.is_flashinfer_cutile()
+        self.requantizes_experts = (
+            platform.is_hip and platform.is_gfx95 and not self.use_flashinfer_cutile
+        )
         # Marlin unpacks the packed NVFP4 weights in-register and multiplies on
         # bf16 tensor cores, keeping the 4-bit footprint without FP4 hardware.
-        self.use_marlin = not platform.is_blackwell and not self.requantizes_experts
+        # SM12x is also Blackwell, but an explicit Marlin request must reach
+        # this portable path rather than the SM100-only expert implementations.
+        # Keep automatic selection and other Blackwell architectures unchanged.
+        self.use_marlin = (
+            (
+                not platform.is_blackwell
+                or (
+                    platform.device_sm in (120, 121)
+                    and backend == MoeRunnerBackend.MARLIN
+                )
+            )
+            and not self.requantizes_experts
+            and not self.use_flashinfer_cutile
+        )
         self.use_flashinfer_trtllm = (
-            not self.use_marlin
+            not self.use_flashinfer_cutile
+            and not self.use_marlin
             and get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self.use_mega_moe_prefill = (
@@ -144,6 +183,7 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         if (
             not self.use_marlin
             and not self.requantizes_experts
+            and not self.use_flashinfer_cutile
             and not self.use_flashinfer_trtllm
             and not get_moe_a2a_backend().is_megamoe()
         ):
@@ -162,6 +202,36 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         # Compressed-tensors loaders do not perform the ModelOpt W31 remap.
         return False
 
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs: object,
+    ) -> None:
+        super().create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
+        if self.use_flashinfer_cutile:
+            # Register these restrictions before preparing or dropping any
+            # parameters. Updater/exporter preflight checks inspect the model's
+            # modules, so every rank rejects before loading, writing or sending
+            # weights, even if the execution pack has not been built yet.
+            setattr(layer, "_derived_weight_cache_error", _CUTILE_WEIGHT_UPDATE_ERROR)
+            setattr(layer, "_weight_export_error", _CUTILE_WEIGHT_EXPORT_ERROR)
+            # Dynamic-activation checkpoints may omit these scales. Set their
+            # defaults before loading, so explicit checkpoint values still win
+            # and unsupported non-unit values are rejected during preparation.
+            layer.get_parameter("w13_input_global_scale").fill_(1.0)
+            layer.get_parameter("w2_input_global_scale").fill_(1.0)
+
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
         if self.requantizes_experts:
@@ -171,6 +241,12 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
 
             self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+        elif self.use_flashinfer_cutile:
+            from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
+
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTILE, moe_runner_config
+            )
         elif self.use_flashinfer_trtllm:
             import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm  # noqa: F401
             from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
@@ -251,6 +327,40 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             global_num_experts=global_num_experts,
         )
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        # Keep the initial loading path legal, but never let a reload consume
+        # parameters that preparation replaced with the execution weight pack.
+        if self.use_flashinfer_cutile and hasattr(self, "cutile_quant_info"):
+            raise RuntimeError(_CUTILE_WEIGHT_UPDATE_ERROR)
+        super().restore_weights_before_loading(layer)
+
+    def _process_cutile_weights(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutile import (
+            prepare_flashinfer_cutile_nvfp4_weights,
+        )
+
+        if hasattr(self, "cutile_quant_info"):
+            raise RuntimeError(_CUTILE_WEIGHT_UPDATE_ERROR)
+        self.cutile_quant_info = prepare_flashinfer_cutile_nvfp4_weights(
+            layer=layer, config=self.moe_runner_config
+        )
+        # Release checkpoint-layout copies only after preparation succeeds.
+        # The pack owns the execution tensors outside nn.Module's parameter
+        # traversal. Parameter-based CPU offload is therefore rejected at
+        # startup, and the model-owned markers reject online updates and exports
+        # before they could mutate weights or serialize an incomplete checkpoint.
+        # Memory saver must preserve these allocations through its CPU backup;
+        # this backend cannot reload the discarded checkpoint layout in place.
+        for name in (
+            "w13_weight_packed",
+            "w2_weight_packed",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        ):
+            layer.register_parameter(name, None)
+        setattr(layer, "_mega_moe_nvfp4", False)
+        setattr(layer, "_mega_moe_weights_built", False)
+
     def _process_trtllm_weights(self, layer: torch.nn.Module) -> None:
         if self.use_mega_moe_prefill:
             _set_mega_moe_alphas(layer)
@@ -280,6 +390,9 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             return
         if self.use_marlin:
             self._process_marlin_weights(layer)
+            return
+        if self.use_flashinfer_cutile:
+            self._process_cutile_weights(layer)
             return
         if self.use_flashinfer_trtllm:
             self._process_trtllm_weights(layer)
@@ -319,6 +432,8 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             return _hip.apply_requantized_experts(self, layer, dispatch_output)
         if self.use_marlin:
             return self.runner.run(dispatch_output, self.get_marlin_quant_info(layer))
+        if self.use_flashinfer_cutile:
+            return self.runner.run(dispatch_output, self.cutile_quant_info)
         if self.use_flashinfer_trtllm:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,

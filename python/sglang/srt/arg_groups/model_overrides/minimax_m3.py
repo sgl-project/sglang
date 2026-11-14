@@ -55,6 +55,28 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         quant_resolved = quant_method
 
     if quant_resolved == "minimax_m3_nvfp4":
+        backend = cfg.moe_runner_backend
+        if backend == "flashinfer_cutile" or (
+            backend == "marlin" and get_platform().device_sm in (120, 121)
+        ):
+            if get_platform().device_sm not in (120, 121):
+                raise ValueError(f"M3.1 NVFP4 {backend} requires SM120 or SM121")
+            if cfg.speculative_algorithm is not None:
+                raise ValueError(
+                    f"M3.1 NVFP4 {backend} does not yet support speculative decoding"
+                )
+            if cfg.moe_a2a_backend != "none":
+                raise ValueError(
+                    f"M3.1 NVFP4 {backend} requires --moe-a2a-backend none"
+                )
+            if cfg.page_size not in (None, 128):
+                raise ValueError("M3.1 NVFP4 requires --page-size 128")
+            # SM12x satisfies is_blackwell, but the MegaMoE and packed-KV
+            # defaults below are SM100-only. Both explicit SM12x backends use
+            # ordinary TP dispatch; preserve attention and KV for platform
+            # resolution instead of forcing the SM100 defaults.
+            overrides["page_size"] = 128
+            return overrides
         if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError("M3.1 NVFP4 only supports DSPARK or DFLASH speculation")
         if get_platform().is_hip:
