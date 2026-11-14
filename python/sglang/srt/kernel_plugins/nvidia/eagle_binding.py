@@ -9,8 +9,9 @@ megakernel never gets one, nor a schedule batch.
 
 - A covered target step gets the running forward's ``EagleForwardView`` as
   ``Step.view``: the full-attention and GDN metadata, read from the hybrid attention
-  backend, and the KV and mamba pools. The step takes the replaced forward's
-  arguments as they are.
+  backend, the KV and mamba pools, and the pools' layers (``parts``), whose
+  ``wait_layer`` a megakernel calls before it reads a layer a host load-back may
+  still be bringing in. The step takes the replaced forward's arguments as they are.
 - The EAGLE entries (spec.ENTRIES) get the structs below, built by SGLang from its
   own buffers. A draft model's ``draft_loop`` runs the whole draft decode loop of a
   served draft graph (model steps, token selection, any exchange between steps), and
@@ -36,7 +37,7 @@ from typing import Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.decl import KV_PART, STATE_PART
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 
@@ -46,6 +47,10 @@ TOLERATED_CALLABLES = (
     # them once, never per step
     "EagleBinding.tp_device_group",
     "EagleBinding.tp_cpu_group",
+    # the pools' layers: a megakernel waits for a layer's host load-back before it
+    # reads the layer, as the pools' own getters do
+    "LayerStateView.wait_layer",
+    "LayerStateView.read",
     "sglang.kernels.ops",  # SGLang's kernel ops
     "the replaced model's modules, weights and quant methods",
 )
@@ -116,6 +121,9 @@ class AttnStepMetadata(msgspec.Struct, frozen=True):
 
 
 class GdnStepMetadata(msgspec.Struct, frozen=True):
+    """state_indices and track_indices are the forward's resolved state slots (its
+    forward_state_slots): the request table may already be reused while it runs."""
+
     # [bs] mamba slot per request (conv and temporal rows), pad_slot_id if padded
     state_indices: torch.Tensor
     query_start_loc: torch.Tensor  # [bs + 1] int32
@@ -123,16 +131,48 @@ class GdnStepMetadata(msgspec.Struct, frozen=True):
     intermediate_indices: torch.Tensor
     pad_slot_id: int
     track_indices: Optional[torch.Tensor]  # [bs] track slot per request
+    # [bs] bool: the requests whose state this step checkpoints to its track slot
+    track_mask: Optional[torch.Tensor] = None
+
+
+class LayerStateView(msgspec.Struct, frozen=True):
+    """The pool's layers, for a megakernel that reads them inside its own kernels.
+
+    ``wait_layer`` waits, as the pool's own getters do, until a layer-wise host
+    load-back (hierarchical cache) has brought the layer's part in; ``read`` waits
+    too and returns the part's view and the id its per-layer methods take."""
+
+    _router: Any  # the pool's KVLayerRouter
+
+    def wait_layer(self, layer_id: int, part: str = KV_PART) -> None:
+        self._router.read(layer_id, part)
+
+    def read(self, layer_id: int, part: str = KV_PART) -> tuple[Any, int]:
+        layer = self._router.read(layer_id, part)
+        return layer.view, layer.view_layer_id
+
+    def part_view(self, part: str) -> Optional[Any]:
+        return self._router.part_view(part)
+
+    def part_indices(self, part: str) -> dict[int, int]:
+        return self._router.part_indices(part)
+
+    def layer_ids(self) -> tuple[int, ...]:
+        return self._router.layer_ids()
 
 
 class EagleForwardView(msgspec.Struct, frozen=True):
     """The running forward's attention data; built at capture for a graph step, so
     its tensors are the ones the graph replays."""
 
-    attn: AttnStepMetadata  # the full-attention layers'
+    # the full-attention layers': AttnStepMetadata, or the struct the backend's
+    # megakernel_step_view returns (attn_step_view)
+    attn: msgspec.Struct
     gdn: Optional[GdnStepMetadata]  # None for a model without GDN layers (the draft)
-    kv: KvPoolBuffers
+    # KvPoolBuffers, or the struct the backend's megakernel_pool_view returns
+    kv: msgspec.Struct
     mamba: Optional[MambaPoolBuffers]  # None for a model without GDN layers
+    parts: Optional[LayerStateView] = None
 
 
 class LinearPrefillBuffers(msgspec.Struct, frozen=True):
@@ -172,6 +212,27 @@ class LinearPrefillView(msgspec.Struct, frozen=True):
     num_state_checkpoints: int
     state_checkpoint_every_n_tokens: int
     output: Optional[torch.Tensor] = None
+    # the full-attention layers' step data (attn_step_view) and the pools' layers
+    attn: Optional[msgspec.Struct] = None
+    parts: Optional[LayerStateView] = None
+    # [bs] each request's cached prefix length: > 0 resumes from its state slot
+    extend_prefix_lens: Optional[torch.Tensor] = None
+    # per tracked request: the chunk whose state the track checkpoints, and the
+    # batch row of a chunk-unaligned one in a kernel's track-state snapshot
+    track_chunk_idx: Optional[torch.Tensor] = None
+    track_ssm_h_batch_src: Optional[torch.Tensor] = None
+    # While a breakable prefill graph captures or replays a bucket: the backend's
+    # static tables (GDNPrefillGraphMetadata for GDN).
+    prefill_graph_metadata: Optional[msgspec.Struct] = None
+
+
+class EaglePreparationView(msgspec.Struct, frozen=True):
+    """The pools a build's prepare reads, once they exist and before any capture:
+    the views a forward hands over, and the request table's rows (row 0 pads)."""
+
+    mamba: Optional[MambaPoolBuffers]  # None for a model without GDN layers
+    parts: LayerStateView
+    num_request_rows: int
 
 
 class EagleDraftLoopIO(msgspec.Struct, frozen=True):
@@ -264,27 +325,29 @@ class EagleBinding:
     def page_size(self) -> int:
         return get_schedule().page_size
 
-    def forward_view(self) -> EagleForwardView:
+    def forward_view(self, forward_batch: Optional[Any] = None) -> EagleForwardView:
         """The view of the forward running now."""
         backend = get_attn_backend()
         full, linear = split_backend(backend)
         return EagleForwardView(
-            attn=attn_step_metadata(full),
-            gdn=None if linear is None else gdn_step_metadata(linear),
+            attn=attn_step_view(full, forward_batch),
+            gdn=None if linear is None else gdn_step_metadata(linear, forward_batch),
             kv=self._read("kv", self._kv, backend),
             mamba=None if linear is None else self._read("mamba", self._mamba, backend),
+            parts=self._read("parts", self._parts, backend),
         )
 
-    def prefill_view(self) -> LinearPrefillView:
+    def prefill_view(self, forward_batch: Optional[Any] = None) -> LinearPrefillView:
         """Publish the active prefill's tensors without speculative pool readers."""
         backend = get_attn_backend()
-        _, linear = split_backend(backend)
+        full, linear = split_backend(backend)
         if linear is None:
             raise RuntimeError(
                 "linear prefill view requires a linear-attention backend"
             )
         meta = linear.forward_metadata
         kernel = linear.kernel_dispatcher.extend_kernel
+        graph = getattr(linear, "prefill_graph_metadata", None)
         return LinearPrefillView(
             state=self._read("prefill", self._prefill, backend),
             query_start_loc=meta.query_start_loc,
@@ -292,7 +355,7 @@ class EagleBinding:
             conv_block_table=getattr(meta, "conv_block_table", None),
             kernel_id=int(type(kernel).__name__ == "TritonGDNKernel"),
             requires_contiguous_state=linear.requires_contiguous_prefill_state,
-            is_graph=getattr(linear, "prefill_graph_metadata", None) is not None,
+            is_graph=graph is not None,
             has_mis=getattr(linear, "mis_metadata", None) is not None,
             has_track=meta.has_mamba_track_mask,
             track_conv_indices=meta.track_conv_indices,
@@ -305,11 +368,34 @@ class EagleBinding:
             state_checkpoint_cu_starts=meta.state_checkpoint_cu_starts,
             num_state_checkpoints=meta.num_state_checkpoints,
             state_checkpoint_every_n_tokens=meta.state_checkpoint_every_n_tokens,
+            attn=attn_step_view(full, forward_batch),
+            parts=self._read("parts", self._parts, backend),
+            extend_prefix_lens=(
+                None if forward_batch is None else forward_batch.extend_prefix_lens
+            ),
+            track_chunk_idx=meta.track_chunk_idx,
+            track_ssm_h_batch_src=meta.track_ssm_h_batch_src,
+            prefill_graph_metadata=graph,
+        )
+
+    def preparation_view(self, model_runner: Any) -> EaglePreparationView:
+        """The pools as a build's prepare sees them, sealed as a forward's are."""
+        backend = model_runner.attn_backend
+        linear = split_backend(backend)[1]
+        return EaglePreparationView(
+            mamba=None if linear is None else self._read("mamba", self._mamba, backend),
+            parts=self._read("parts", self._parts, backend),
+            num_request_rows=model_runner.req_to_token_pool.req_to_token.shape[0],
         )
 
     def assert_live(self) -> None:
         backend = get_attn_backend()
-        readers = {"kv": self._kv, "mamba": self._mamba, "prefill": self._prefill}
+        readers = {
+            "kv": self._kv,
+            "mamba": self._mamba,
+            "prefill": self._prefill,
+            "parts": self._parts,
+        }
         for name, sealed in self._sealed.items():
             if _identity(readers[name](backend)) != sealed:
                 raise RuntimeError(
@@ -322,11 +408,12 @@ class EagleBinding:
             self._sealed[name] = _identity(self._pools[name])
         return self._pools[name]
 
-    def _kv(self, backend: Any) -> KvPoolBuffers:
+    def _kv(self, backend: Any) -> msgspec.Struct:
+        full = split_backend(backend)[0]
+        if hasattr(full, "megakernel_pool_view"):
+            return full.megakernel_pool_view()
         return kv_pool_buffers(
-            pool=backend.token_to_kv_pool,
-            backend=split_backend(backend)[0],
-            model=self._model,
+            pool=backend.token_to_kv_pool, backend=full, model=self._model
         )
 
     def _prefill(self, backend: Any) -> LinearPrefillBuffers:
@@ -341,6 +428,9 @@ class EagleBinding:
     def _mamba(self, backend: Any) -> MambaPoolBuffers:
         return mamba_pool_buffers(backend.token_to_kv_pool)
 
+    def _parts(self, backend: Any) -> LayerStateView:
+        return LayerStateView(backend.token_to_kv_pool.layer_router)
+
 
 def split_backend(backend: Any) -> tuple[Any, Optional[Any]]:
     """(full-attention backend, GDN backend or None) of a model's attention backend."""
@@ -351,6 +441,15 @@ def split_backend(backend: Any) -> tuple[Any, Optional[Any]]:
     if isinstance(backend, HybridLinearAttnBackend):
         return backend.full_attn_backend, backend.linear_attn_backend
     return backend, None
+
+
+def attn_step_view(backend: Any, forward_batch: Optional[Any]) -> msgspec.Struct:
+    """A full-attention backend's step data: its own struct when it offers
+    ``megakernel_step_view(forward_batch)`` (and then ``megakernel_pool_view()``
+    for its pool), declared next to the backend; else the TRT-LLM MHA metadata."""
+    if hasattr(backend, "megakernel_step_view"):
+        return backend.megakernel_step_view(forward_batch)
+    return attn_step_metadata(backend)
 
 
 def attn_step_metadata(backend: Any) -> AttnStepMetadata:
@@ -366,7 +465,9 @@ def attn_step_metadata(backend: Any) -> AttnStepMetadata:
     )
 
 
-def gdn_step_metadata(backend: Any) -> GdnStepMetadata:
+def gdn_step_metadata(
+    backend: Any, forward_batch: Optional[Any] = None
+) -> GdnStepMetadata:
     """A GDN backend's metadata of the current target verify step."""
     metadata = backend.forward_metadata
     return GdnStepMetadata(
@@ -377,6 +478,7 @@ def gdn_step_metadata(backend: Any) -> GdnStepMetadata:
         intermediate_indices=backend.verify_intermediate_state_indices,
         pad_slot_id=backend.pad_slot_id,
         track_indices=metadata.mamba_track_indices,
+        track_mask=None if forward_batch is None else forward_batch.mamba_track_mask,
     )
 
 

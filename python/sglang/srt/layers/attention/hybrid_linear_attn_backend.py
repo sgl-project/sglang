@@ -83,6 +83,8 @@ class MambaAttnBackendBase(AttentionBackend):
     # Most sequences the prefill graph tables hold (larger batches replay no
     # graph); set at init by backends whose supports_prefill_graph_extend holds.
     prefill_graph_max_seqs: int
+    # Whether the captured extend waits on HiCache load events itself.
+    prefill_graph_waits_on_load_events: bool = False
 
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
@@ -1327,6 +1329,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
             and linear_attn_backend.supports_prefill_graph_extend()
             and not full_attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+        self.breakable_cuda_graph_replay_waits_for_loads = (
+            self.use_captured_forward_metadata_for_breakable_cuda_graph
+            and not linear_attn_backend.prefill_graph_waits_on_load_events
         )
         if self.use_captured_forward_metadata_for_breakable_cuda_graph:
             self.prefill_cuda_graph_max_batch_size = (

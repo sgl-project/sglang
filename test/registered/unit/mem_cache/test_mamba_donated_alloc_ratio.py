@@ -574,6 +574,7 @@ class TestPPMambaPoolSizing(CustomTestCase):
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=0,
+            extra_mamba_cache_bytes_per_request_row=0,
             fused_entry_bytes=lambda name: (
                 fused_state_entry if name == "mamba" else None
             ),
@@ -635,7 +636,9 @@ class TestPPMambaPoolSizing(CustomTestCase):
 
 class TestExtraMambaCacheSizing(CustomTestCase):
     @staticmethod
-    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+    def _size(
+        extra_bytes, *, row_bytes=0, pp_size=1, dp_size=1, draft_tokens=None, **schedule
+    ):
         from sglang.srt import runtime_context as rc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
@@ -647,6 +650,8 @@ class TestExtraMambaCacheSizing(CustomTestCase):
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
+            extra_mamba_cache_bytes_per_request_row=row_bytes,
+            _req_pool_pre_alloc_size=lambda: 3,
             allocate_intermediate_ssm=True,
             fused_entry_bytes=lambda name: None,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
@@ -671,6 +676,20 @@ class TestExtraMambaCacheSizing(CustomTestCase):
     def test_auto_capacity_reserves_backend_state(self):
         self.assertEqual(self._size(0), (9, 80 << 20))
         self.assertEqual(self._size(4 << 20), (4, 80 << 20))
+
+    def test_request_row_state_is_charged_once_per_request_row(self):
+        """A megakernel's request-scoped state costs its bytes per request-table row
+        (live requests, the padding row, a PD decode's pre-allocation rows), not per
+        state slot."""
+        mib = 1 << 20
+        for dp_size in (1, 2):
+            with self.subTest(dp=dp_size):
+                rows = 8 // dp_size + 1 + 3
+                slots, remaining = self._size(
+                    0, row_bytes=mib, dp_size=dp_size, max_running_requests=8
+                )
+                self.assertEqual(slots, (40 - rows - 4) // 4)
+                self.assertEqual(remaining, (120 - rows - 4 * (slots + 1)) * mib)
 
     def test_fixed_capacity_charges_padding_and_partitioned_state(self):
         for pp_size in (1, 2):

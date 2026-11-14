@@ -643,6 +643,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
+    # Set by supports_prefill_graph_extend when the tables are for an external
+    # prefill body that runs the FlashInfer core itself.
+    prefill_graph_flashinfer: bool = False
+    _fi_graph_cp_single: bool = True
 
     def _create_kernel_dispatcher(self, backends):
         return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
@@ -688,27 +692,85 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def _prefill_graph_extend_supported(self) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
             get_prefill_num_tokens_to_capture,
+            has_external_prefill_body,
         )
 
         mamba_cache = self.state_pool.mamba_cache
-        capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
-        supported = (
+        capture_tokens = get_prefill_num_tokens_to_capture(
+            get_exec().graph.cuda_graph_config.prefill.bs or []
+        )
+        common = (
             is_cuda()
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
             and not self.enable_mis
             # The track plan's h rows assume the delta-rule chunk size.
             and self.mamba_chunk_size == FLA_CHUNK_SIZE
             and all(conv.is_contiguous() for conv in mamba_cache.conv)
             and mamba_cache.temporal.is_contiguous()
-            and buckets_keep_chunk_o_block_size(
-                get_prefill_num_tokens_to_capture(capture_tokens)
-            )
         )
+        how = "on"
+        if isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel):
+            supported = common and buckets_keep_chunk_o_block_size(capture_tokens)
+        elif envs.SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER.get():
+            # SGLang's chain has no FlashInfer core: only an external body runs it.
+            if not has_external_prefill_body(self._model_runner.model):
+                reason = "no external prefill body runs the FlashInfer core"
+            elif not common:
+                reason = "needs CUDA, no MIS, chunk size 64 and a contiguous pool"
+            else:
+                reason = self._flashinfer_graph_unsupported_reason()
+            supported = reason is None
+            if supported:
+                self._enable_flashinfer_graph()
+                how = (
+                    "on (FlashInfer tables for the external prefill body, "
+                    f"up to {self.prefill_graph_max_seqs} sequences)"
+                )
+            else:
+                rank0_log(f"GDN extend graph: FlashInfer unsupported here ({reason})")
+        else:
+            supported = False
         rank0_log(
             "GDN prefill extend inside breakable prefill CUDA graphs: "
-            + ("on" if supported else "unsupported here, layers keep breaking")
+            + (how if supported else "unsupported here, layers keep breaking")
         )
         return supported
+
+    def _flashinfer_graph_unsupported_reason(self) -> Optional[str]:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        temporal = self.state_pool.mamba_cache.temporal
+        if not isinstance(extend_kernel, FlashInferGDNKernel):
+            return f"extend kernel is {type(extend_kernel).__name__}"
+        if torch.cuda.get_device_capability()[0] != 10:
+            return "validated on SM10x only"
+        if temporal.dtype != torch.bfloat16:
+            return f"SSM state dtype {temporal.dtype}, validated with bfloat16"
+        # FlashInfer writes the pool in place through 32-byte aligned pointers.
+        layer_bytes = temporal.stride(0) * temporal.element_size()
+        if temporal.data_ptr() % 32 or layer_bytes % 32:
+            return "SSM pool is not 32-byte aligned per layer"
+        # Checkpoints come every 64 tokens; the eager plan uses the cache chunk.
+        cache_chunk = mamba_cache_chunk_size()
+        if get_exec().mamba.enable_mamba_extra_buffer and cache_chunk != FLA_CHUNK_SIZE:
+            return f"mamba cache chunk {cache_chunk} != {FLA_CHUNK_SIZE}"
+        return None
+
+    def _enable_flashinfer_graph(self) -> None:
+        self.prefill_graph_flashinfer = True
+        self.prefill_graph_max_seqs = min(
+            self.req_to_token_pool.size,
+            envs.SGLANG_GDN_PREFILL_GRAPH_FLASHINFER_MAX_SEQS.get(),
+        )
+        num_v_heads = self.state_pool.mamba_cache.temporal.shape[-3]
+        # FlashInfer's own split on SM10x takes CP only while sequences x heads x 4
+        # < SMs, so with many heads per rank one sequence runs on the non-CP kernel.
+        self._fi_graph_cp_single = (
+            num_v_heads * 4
+            < torch.cuda.get_device_properties(self.device).multi_processor_count
+        )
 
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
@@ -725,6 +787,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
+            flashinfer=self.prefill_graph_flashinfer,
+            flashinfer_cp_single=self._fi_graph_cp_single,
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
@@ -1253,6 +1317,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         tables, so every launch grid depends only on the bucket. Rows past the
         batch belong to no sequence; chunk_fwd_o leaves them zero."""
         meta = self.prefill_graph_metadata
+        if meta.flashinfer is not None:
+            raise RuntimeError(
+                "a FlashInfer GDN extend is captured only in an external prefill body"
+            )
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal

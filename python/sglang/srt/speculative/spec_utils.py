@@ -19,6 +19,10 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func,
 )
+from sglang.kernels.plugin_kernels.nvidia.spec import (
+    RecurrentCommitIO,
+    SupportsRecurrentCommit,
+)
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -29,6 +33,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import built_megakernel
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
@@ -1106,6 +1111,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
+    if not batch.token_to_kv_pool_allocator.state.tracks_decode_state:
+        # Only the states an extend writes may reach the prefix cache.
+        batch.mamba_track_indices = batch.mamba_track_mask = None
+        return
     track_positions = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
@@ -1231,6 +1240,41 @@ def commit_mamba_states_after_verify(
         )
     else:
         last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
+
+    built = built_megakernel(model_runner.model)
+    if built is not None and isinstance(built, SupportsRecurrentCommit):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            commit_ple_states_after_verify,
+        )
+
+        if state_slots is None:
+            state_slots = model_runner.attn_backend.forward_state_slots(
+                bs, batch.mamba_track_indices
+            )
+        working = state_slots.working[:bs]
+        track = None
+        if batch.mamba_track_indices is not None:
+            track = state_slots.track[:bs]
+        io = RecurrentCommitIO(
+            state_slots=working,
+            track_slots=track,
+            request_rows=batch.req_pool_indices[:bs],
+            accept_lens=accept_lens,
+            last_step=last_correct_step_indices,
+            track_steps=mamba_steps_to_track,
+            draft_token_num=draft_token_num,
+            src_indices_raw=src_indices_raw,
+        )
+        if built.commit_recurrent_state(io):
+            commit_ple_states_after_verify(
+                model_runner.token_to_kv_pool.layer_router,
+                working,
+                last_correct_step_indices,
+                track,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )
+            return
 
     replay_state_indices = replay_track_indices = None
     if mamba_pool is not None and (
@@ -1396,7 +1440,10 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+    if (
+        get_exec().mamba.enable_mamba_extra_buffer_lazy
+        and batch.token_to_kv_pool_allocator.state.tracks_decode_state
+    ):
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             mamba_track_grid(batch.tree_cache.page_size),

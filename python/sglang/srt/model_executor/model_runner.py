@@ -80,7 +80,10 @@ from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.kernel_plugins.amd.binding import (
     install_monokernel_forward,
 )
-from sglang.srt.kernel_plugins.nvidia.binding import install_megakernel
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    install_megakernel,
+    megakernel_state,
+)
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager, context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -684,6 +687,7 @@ class ModelRunner:
         # The replica count that shares this KV budget is the deployment's, not
         # the one a draft scope reports; the pool is allocated outside any scope,
         # so the PP width comes from the runner's own group.
+        own_state = megakernel_state(self.model)
         self.kv_cache_configurator = KVCacheConfigurator(
             device=self.device,
             gpu_id=self.gpu_id,
@@ -717,6 +721,13 @@ class ModelRunner:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=self.draft_model_idx,
+            extra_mamba_cache_bytes_per_req=(
+                0 if own_state is None else own_state.state_bytes_per_slot
+            ),
+            extra_mamba_cache_bytes_per_request_row=(
+                0 if own_state is None else own_state.state_bytes_per_request_row
+            ),
+            allocate_intermediate_ssm=own_state is None or own_state.keeps_draft_ssm,
         )
 
     def init_mindspore_runner(self):
@@ -2042,6 +2053,16 @@ class ModelRunner:
                     state_ids.ids(forward_batch.mamba_cow_src_indices),
                     state_ids.ids(forward_batch.mamba_cow_dst_indices),
                 )
+        own_state = self.token_to_kv_pool_allocator.state.own_state
+        if own_state is not None:
+            # A megakernel's own recurrent state restarts from the checkpoint this
+            # extend writes: here, on the forward stream, graphed extend or not.
+            own_state.reset_state_slots(
+                self.runner_ids.state_ids(pool.state_sub_pool).ids(
+                    pool.get_mamba_indices(forward_batch.req_pool_indices)
+                ),
+                forward_batch.req_pool_indices,
+            )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None

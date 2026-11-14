@@ -169,6 +169,121 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
 
+class _Fold:  # a megakernel's draft step fold, recording what it was handed
+    def __init__(self):
+        self.calls = []
+
+    def finalize(self, logits, positions, draft_tokens, column, mrope_positions):
+        self.calls.append((logits, column, mrope_positions))
+        positions.add_(1)
+        if mrope_positions is not None:
+            mrope_positions.add_(1)
+        draft_tokens[:, column] = column
+        bs = positions.shape[0]
+        return torch.ones(bs, 1), torch.full((bs, 1), column, dtype=torch.long)
+
+
+class TestEagleDraftStepFold(CustomTestCase):
+    """A megakernel's draft step fold replaces the topk-1 finalize and the M-RoPE
+    add of a greedy chain's draft steps; its forwards see it; otherwise, and without
+    an offered fold, SGLang's own finalize runs."""
+
+    def run_round(self, fold, *, mrope=True, return_logprob=False, bs=2):
+        steps = 3
+        worker = object.__new__(EagleDraftWorker)
+        worker.topk, worker.speculative_num_steps = 1, steps
+        worker.hot_token_id = None
+        worker.index_share_for_mtp_iteration = False
+        worker.seed_dsa_topk_from_draft_extend = False
+        worker._topk1_parents_prealloc = torch.zeros(8, steps, dtype=torch.long)
+        worker._topk1_score_indices_prealloc = torch.zeros(8, steps, dtype=torch.long)
+        worker.draft_attn_backend = SimpleNamespace(attn_backends=[object()] * steps)
+        seen, logits = [], []
+
+        def forward(fb):
+            seen.append(fb.draft_step_fold)
+            logits.append(torch.randn(bs, 16))
+            out = SimpleNamespace(next_token_logits=logits[-1], hidden_states=None)
+            return SimpleNamespace(logits_output=out)
+
+        worker.draft_runner = SimpleNamespace(
+            canary_manager=None,
+            forward=forward,
+            model_config=SimpleNamespace(
+                model_is_mrope=mrope,
+                hf_config=SimpleNamespace(architectures=["Qwen4ExpForCausalLMMTP"]),
+            ),
+        )
+        positions = torch.arange(bs)
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            out_cache_loc=torch.zeros(bs * steps, dtype=torch.long),
+            positions=positions,
+            mrope_positions=torch.zeros(3, bs, dtype=torch.long),
+            mm_input_embeds=None,
+            return_logprob=return_logprob,
+            draft_step_fold=fold,
+            spec_info=SimpleNamespace(
+                topk_p=torch.ones(bs, 1),
+                topk_index=torch.zeros(bs, 1, dtype=torch.long),
+                hidden_states=torch.zeros(bs, 4),
+            ),
+        )
+
+        def postprocess(logits, positions, draft_tokens, column):
+            positions.add_(1)
+            return torch.ones(bs, 1), torch.zeros(bs, 1, dtype=torch.long)
+
+        stock = MagicMock(side_effect=postprocess)
+        spec = SimpleNamespace(speculative_use_rejection_sampling=False)
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.forward_context",
+                side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+            ),
+            patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", True),
+            patch("sglang.srt.speculative.eagle_worker_v2.get_spec", lambda: spec),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.draft_topk1_postprocess", stock
+            ),
+        ):
+            out = worker.draft_forward(fb)
+        return SimpleNamespace(
+            out=out, fb=fb, seen=seen, logits=logits, stock=stock, positions=positions
+        )
+
+    def test_the_fold_finalizes_every_draft_step(self):
+        fold = _Fold()
+        r = self.run_round(fold)
+        # each draft forward sees the round's fold
+        self.assertEqual(r.seen, [fold, fold])
+        self.assertEqual([c[1] for c in fold.calls], [1, 2])
+        self.assertEqual([c[0] for c in fold.calls], r.logits)
+        self.assertTrue(all(c[2] is r.fb.mrope_positions for c in fold.calls))
+        r.stock.assert_not_called()
+        # the fold advanced positions and M-RoPE once a step; the loop added nothing
+        self.assertEqual(r.positions.tolist(), [2, 3])
+        self.assertEqual(r.fb.mrope_positions.tolist(), [[2, 2]] * 3)
+        self.assertEqual(r.out[2][:, 1:].tolist(), [[1, 2], [1, 2]])
+        self.assertIs(r.fb.draft_step_fold, fold)  # the capture's fold is kept
+
+    def test_without_m_rope_the_fold_gets_none(self):
+        fold = _Fold()
+        self.run_round(fold, mrope=False)
+        self.assertEqual([c[2] for c in fold.calls], [None, None])
+
+    def test_stock_finalize_without_a_fold_or_with_logprobs(self):
+        fold = _Fold()
+        for offered, logprob in ((None, False), (fold, True)):
+            r = self.run_round(offered, return_logprob=logprob)
+            self.assertEqual(r.seen, [None, None])
+            self.assertEqual(r.stock.call_count, 2)
+            self.assertEqual(r.fb.mrope_positions.tolist(), [[2, 2]] * 3)
+            self.assertIs(r.fb.draft_step_fold, offered)
+        self.assertEqual(fold.calls, [])
+
+
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):
         # The adaptive state-machine paths write live spec switches through

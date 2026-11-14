@@ -754,13 +754,53 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
 class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
     @staticmethod
-    def _runner(counter, is_full_backend=True):
+    def _runner(counter, is_full_backend=True, captured_pool_reads=False):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = is_full_backend
         runner.model_runner = SimpleNamespace(
-            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter),
+            attn_backend=SimpleNamespace(
+                breakable_cuda_graph_replay_waits_for_loads=captured_pool_reads
+            ),
+            model=torch.nn.Module(),
         )
         return runner
+
+    @staticmethod
+    def _waits(runner, counter):
+        """Whether a replay waits for the last layer of an in-flight load."""
+        counter.set_consumer(counter.update_producer())
+        waiter = threading.Thread(target=runner._wait_for_layer_loads, daemon=True)
+        waiter.start()
+        waiter.join(timeout=0.2)
+        waited = waiter.is_alive()
+        for layer in range(counter.num_layers):
+            counter.complete(0, layer)
+        waiter.join(timeout=5)
+        assert not waiter.is_alive()
+        return waited
+
+    def test_breakable_replay_waits_when_the_graph_reads_the_pools(self):
+        """A breakable replay of a captured linear extend without load events, or
+        of an external prefill body, reads the pools inside the graph: it waits
+        for every layer's load-back first; otherwise it keeps the overlap."""
+        for captured_pool_reads, external_body, waits in (
+            (False, False, False),
+            (True, False, True),
+            (False, True, True),
+        ):
+            with self.subTest(
+                captured_pool_reads=captured_pool_reads, external_body=external_body
+            ):
+                counter = LayerWiseLoadCounter(num_layers=3)
+                runner = self._runner(
+                    counter,
+                    is_full_backend=False,
+                    captured_pool_reads=captured_pool_reads,
+                )
+                if external_body:
+                    runner_module.set_external_prefill_body(runner.model_runner.model)
+                self.assertEqual(self._waits(runner, counter), waits)
 
     def test_replay_waits_for_every_layer_of_an_inflight_load(self):
         """Replay skips per-layer waits, so it must not start while the batch's

@@ -235,6 +235,16 @@ def _resolve_transformer_layer_model(model: torch.nn.Module) -> torch.nn.Module:
     return layer_model
 
 
+def set_external_prefill_body(model: torch.nn.Module) -> None:
+    """Mark that the transformer body prefill graphs capture comes from outside the
+    model (a kernel plugin's): it reads the pools and runs linear cores in-graph."""
+    model.__dict__["_external_prefill_body"] = True
+
+
+def has_external_prefill_body(model: torch.nn.Module) -> bool:
+    return model.__dict__.get("_external_prefill_body", False)
+
+
 def _build_layer_model_forward_kwargs(
     layer_model: torch.nn.Module,
     forward_batch: ForwardBatch,
@@ -2468,8 +2478,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _wait_for_layer_loads(self) -> None:
         # Full replay skips the pool accessors. BCG's dynamic KDA waits do not
-        # cover Full graph's KV/state reads, so Full still needs this barrier.
-        if not self._is_full_backend:
+        # cover Full graph's KV/state reads, so Full still needs this barrier;
+        # so does a BCG replay of an external body or another captured linear extend.
+        if not (
+            self._is_full_backend
+            or has_external_prefill_body(self.model_runner.model)
+            or self.model_runner.attn_backend.breakable_cuda_graph_replay_waits_for_loads
+        ):
             return
         counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
         if counter is not None and counter.consumer_index >= 0:

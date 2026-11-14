@@ -481,6 +481,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # KDA gets graph padding explicitly and never uses ReplaySSM's host-seqlen
     # force-flush path.
     needs_cpu_seq_lens: bool = False
+    # Its captured extend binds live HiCache load events (hicache_graph_events).
+    prefill_graph_waits_on_load_events: bool = True
 
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.

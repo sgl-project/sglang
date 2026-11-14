@@ -249,6 +249,9 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+    # Whether such a capture reads pool layers inside the graph without waiting on
+    # HiCache load events, so a replay first waits for every layer's load-back.
+    breakable_cuda_graph_replay_waits_for_loads: bool = False
     # Most requests one replay of that captured metadata can carry (None: no
     # bound). Fixed at init: the dp-attention replay vote checks it too.
     prefill_cuda_graph_max_batch_size: Optional[int] = None

@@ -1930,6 +1930,13 @@ class Envs:
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # With the FlashInfer GDN prefill kernel and an external prefill body that runs
+    # its core (a kernel plugin's), breakable prefill graphs build the FlashInfer
+    # tables (gdn_prefill_graph.GDNFlashInferGraphTables) instead of breaking.
+    SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER = EnvBool(False)
+    # Static sequence rows of the captured non-CP FlashInfer call; each unused row
+    # costs about 10 us per layer, and batches with more sequences run eagerly.
+    SGLANG_GDN_PREFILL_GRAPH_FLASHINFER_MAX_SEQS = EnvInt(8)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

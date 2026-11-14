@@ -1555,6 +1555,7 @@ class TestDeclaredParts(CustomTestCase):
                         hf_config=Qwen3NextConfig(full_attention_interval=4),
                         linear_attn_registry_result=None,
                     ),
+                    model=torch.nn.Module(),
                     req_to_token_pool=req,
                     token_to_kv_pool=pool,
                     runner_ids=RunnerIds(
