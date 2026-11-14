@@ -103,6 +103,14 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Record Miles image and imported source revisions
+        run: |
+          image_id=$(docker inspect --format '{{.Image}}' "${CI_CONTAINER_NAME:-ci_sglang}")
+          docker image inspect --format 'Image ID={{.Id}} RepoDigests={{json .RepoDigests}}' "$image_id"
+          bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
+            -e PYTHONPATH=/root/miles:/sgl-workspace/sglang/python:/opt/tilelang \
+            python3 /sglang-checkout/scripts/ci/amd/record_miles_environment.py --workflow-sha "$GITHUB_SHA"
+
       - name: Run miles CI suite ${{ matrix.suite }}
         timeout-minutes: 180
         run: |
