@@ -54,6 +54,10 @@ class BaseIndexerMetadata(ABC):
         Return: (tokens, ), (tokens, ) int32, k_start and k_end in kv cache(token,xxx) for each token.
         """
 
+    def get_indexer_kvcache_start_cpu(self) -> Optional[torch.Tensor]:
+        """k_start of get_indexer_kvcache_range on the host, or None to have it read back."""
+        return None
+
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         """
         Return: seq lens for each batch.
@@ -128,6 +132,9 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.attn_metadata.indexer_k_start_end
+
+    def get_indexer_kvcache_start_cpu(self) -> Optional[torch.Tensor]:
+        return self.attn_metadata.indexer_k_start_cpu
 
     def get_indexer_seq_len(self) -> torch.Tensor:
         return self.attn_metadata.indexer_seq_lens

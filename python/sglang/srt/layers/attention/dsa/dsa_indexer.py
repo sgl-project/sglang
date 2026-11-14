@@ -1858,6 +1858,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return topk_result
 
         ks, ke = metadata.get_indexer_kvcache_range()
+        ks_cpu = metadata.get_indexer_kvcache_start_cpu()
 
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
@@ -1951,8 +1952,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             with self._with_real_sm_count():
                 if _is_gfx95_supported:
                     logits = dsa_indexer_hip.ragged_mqa_logits(
-                        self, q_fp8[:q_offset], weights[:q_offset], kv_fp8, ks, ke
-                    )
+                        self, q_fp8[:q_offset], weights[:q_offset], kv_fp8, ks, ke,
+                        ks_cpu=ks_cpu,
+                    )  # fmt: skip
                 elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
@@ -2031,6 +2033,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     logits_chunk = dsa_indexer_hip.ragged_mqa_logits(
                         self, q_fp8[start:end], weights[start:end], kv_fp8,
                         ks[start:end], ke[start:end], metadata,
+                        ks_cpu=None if ks_cpu is None else ks_cpu[start:end],
                     )  # fmt: skip
                 elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits

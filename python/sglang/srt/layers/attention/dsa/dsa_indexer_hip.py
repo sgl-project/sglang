@@ -574,6 +574,7 @@ def ragged_mqa_logits(
     ks: torch.Tensor,
     ke: torch.Tensor,
     metadata=None,
+    ks_cpu: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """gfx950 prefill logits of the rows ``q`` over the gathered index-K ``kv_fp8``:
     the MXFP4 kernel for FP4 keys (with the batch's schedules, fp4_logits_plans, when
@@ -583,7 +584,7 @@ def ragged_mqa_logits(
 
         plans = None if metadata is None else fp4_logits_plans(metadata)
         return fp4_index_hip.fp4_ragged_mqa_logits(
-            q, weights, indexer.softmax_scale, kv_fp8, ks, ke, plans
+            q, weights, indexer.softmax_scale, kv_fp8, ks, ke, plans, ks_cpu=ks_cpu
         )
     kv, scale = kv_fp8
     # clean_logits=False: the top-k transform masks invalid positions via ks/ke
