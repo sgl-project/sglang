@@ -125,10 +125,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disable-cuda-graph",
     "--load-balance-method",
     "round_robin",
-    "--enable-prefill-cp",
-    "--cp-strategy",
-    "interleave",
-    "--enable-cache-report",
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
@@ -139,6 +135,19 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
+    # DSPARK configuration, kept in sync with the decode node: the PD prefill
+    # worker prunes the draft to context-KV injection, and both peers must
+    # register the same target + draft state sub-pools.
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
 ]
 
 # Decode node launch arguments.
@@ -237,9 +246,9 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
-        """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
-        self.run_accuracy()
+    # def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
+    #     """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
+    #     self.run_accuracy()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""

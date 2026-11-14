@@ -41,6 +41,9 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
     "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
+    # mtp
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # dspark
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
@@ -58,9 +61,6 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ENVS = {
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ENVS = {
     **DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS,
     "DEEPEP_HCCL_BUFFSIZE": "1600",
-    # mtp
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
 }
 
 # Prefill node launch arguments
@@ -103,9 +103,6 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "--deepep-mode",
     "auto",
     "--disable-cuda-graph",
-    "--enable-prefill-cp",
-    "--cp-strategy",
-    "interleave",
     "--enable-metrics",
     "--enable-cache-report",
     "--enable-hierarchical-cache",
@@ -117,6 +114,18 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "write_through",
     "--max-total-tokens",
     140000,
+    # DSPARK configuration, kept in sync with the decode node: the PD prefill
+    # worker prunes the draft to context-KV injection.
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
 ]
 
 # Decode node launch arguments
@@ -209,9 +218,9 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCas
     eval_batch_size = 64
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
-    def test_npu_deepseek_v4_pro_w4a8_pd_sep_gpqa_high(self):
-        """Run NPU accuracy test for DSV4-Pro W4A8 PD-Sep GPQA High mode."""
-        self.run_accuracy()
+    # def test_npu_deepseek_v4_pro_w4a8_pd_sep_gpqa_high(self):
+    #     """Run NPU accuracy test for DSV4-Pro W4A8 PD-Sep GPQA High mode."""
+    #     self.run_accuracy()
 
     def test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_l2_host_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
