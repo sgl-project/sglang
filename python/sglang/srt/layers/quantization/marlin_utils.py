@@ -211,20 +211,63 @@ def check_marlin_supports_shape(
     return True, None
 
 
-def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
-    output_size_per_partition = (
-        getattr(layer, "output_size_per_partition", None) or layer.output_size
-    )
-    input_size_per_partition = (
-        getattr(layer, "input_size_per_partition", None) or layer.input_size
-    )
+def _resolve_layer_marlin_partition_sizes(layer: LinearBase) -> tuple[int, int]:
+    output_size_per_partition = getattr(layer, "output_size_per_partition", None)
+    input_size_per_partition = getattr(layer, "input_size_per_partition", None)
 
+    if output_size_per_partition is None or input_size_per_partition is None:
+        from sglang.srt.distributed.utils import get_group_rank_size
+        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+        _, tp_size = get_group_rank_size(getattr(layer, "tp_group", None))
+
+        if output_size_per_partition is None:
+            if isinstance(layer, ColumnParallelLinear) and tp_size:
+                output_size_per_partition = layer.output_size // tp_size
+            else:
+                output_size_per_partition = layer.output_size
+
+        if input_size_per_partition is None:
+            if isinstance(layer, RowParallelLinear) and tp_size:
+                input_size_per_partition = layer.input_size // tp_size
+            else:
+                input_size_per_partition = layer.input_size
+
+    return output_size_per_partition, input_size_per_partition
+
+
+def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
+    output_size_per_partition, input_size_per_partition = (
+        _resolve_layer_marlin_partition_sizes(layer)
+    )
     return check_marlin_supports_shape(
         output_size_per_partition=output_size_per_partition,
         input_size_per_partition=input_size_per_partition,
         input_size=layer.input_size,
         group_size=group_size,
     )[0]
+
+
+def verify_marlin_supports_layer(
+    layer: LinearBase, group_size: int, prefix: str = ""
+) -> None:
+    output_size_per_partition, input_size_per_partition = (
+        _resolve_layer_marlin_partition_sizes(layer)
+    )
+    try:
+        verify_marlin_supports_shape(
+            output_size_per_partition=output_size_per_partition,
+            input_size_per_partition=input_size_per_partition,
+            input_size=layer.input_size,
+            group_size=group_size,
+        )
+    except ValueError as e:
+        layer_desc = f"Layer '{prefix}'" if prefix else f"Layer {layer}"
+        raise ValueError(
+            f"{layer_desc} is quantized but incompatible with GPTQMarlin: {e} "
+            "If this layer is unquantized in the checkpoint, exclude it in "
+            "quantization_config.dynamic."
+        ) from e
 
 
 def check_moe_marlin_supports_layer(
