@@ -113,12 +113,6 @@ if HAS_RUNAI_MODEL_STREAMER:
 temp_dir = tempfile.gettempdir()
 
 
-class DisabledTqdm(tqdm):
-    def __init__(self, *args, **kwargs):
-        kwargs["disable"] = True
-        super().__init__(*args, **kwargs)
-
-
 def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     lock_dir = cache_dir or temp_dir
     model_name_or_path = str(model_name_or_path)
@@ -280,23 +274,8 @@ def safetensors_weights_iterator(
 
 
 def _load_pt_file(bin_file: str, device: str) -> dict:
-    """Load a PyTorch checkpoint file, handling legacy tar format.
-
-    PyTorch 2.6 changed the default of weights_only from False to True.
-    Legacy tar format files cannot be loaded with weights_only=True.
-    This function tries weights_only=True first, then falls back to False
-    for legacy tar format files from trusted sources (HuggingFace Hub).
-    """
-    try:
-        return torch.load(bin_file, map_location=device, weights_only=True)
-    except RuntimeError as e:
-        if "legacy .tar format" in str(e):
-            logger.warning(
-                "Loading %s with weights_only=False (legacy tar format)",
-                os.path.basename(bin_file),
-            )
-            return torch.load(bin_file, map_location=device, weights_only=False)
-        raise
+    """Load a PyTorch checkpoint file with weights_only=True (no pickle execution)."""
+    return torch.load(bin_file, map_location=device, weights_only=True)
 
 
 def pt_weights_iterator(

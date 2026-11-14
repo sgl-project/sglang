@@ -12,8 +12,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.utils import wait_for_server
 
-register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3", nightly=True)
-register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3-cann910", nightly=True)
+register_npu_ci(est_time=1800, suite="full-perf-16-npu-a3", nightly=True)
 
 # Environment variables for DSV4-Flash single-node PD-mix deployment.
 DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
@@ -31,7 +30,6 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "96",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",

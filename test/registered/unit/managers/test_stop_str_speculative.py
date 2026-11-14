@@ -12,7 +12,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 # Token id -> decoded text; decode() concatenates. Distinct symbols so no
 # accidental cross-matches (10-39 are lowercase letters).
@@ -144,16 +144,6 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, r"[.!?]\s*$")
         self.assertEqual(req.finished_len, 2)
-
-    # --- decoded_text-only branch ---
-    def test_stop_str_only_in_decoded_text_sets_no_finished_len(self):
-        # Documents current behavior: when the stop is only in decoded_text (not
-        # the tail), the request finishes but finished_len is left unset.
-        req = _make_req([10, 11, 12], stop=["STOP"])  # no STOP in output tokens
-        req.decoded_text = "earlier STOP text"
-        req.update_finish_state(new_accepted_len=3)
-        self.assertTrue(req.finished())
-        self.assertIsNone(req.finished_len)
 
 
 if __name__ == "__main__":

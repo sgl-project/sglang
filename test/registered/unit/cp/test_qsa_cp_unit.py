@@ -16,10 +16,11 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnB
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import zigzag
 from sglang.srt.layers.cp.base import ContextParallelStrategyKind
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import routed
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
@@ -131,7 +132,7 @@ def test_qsa_model_forward_prefetches_exact_kv_before_indexer(
         is_qsa=True,
         layer_id=7,
         alt_stream=None,
-        _qsa_prefill_topk_bridge=None,
+        _qsa_prefill_topk_bridges=[],
         _prepare_attn_stage=lambda value, *args: value,
         _prepare_qkv_gate=prepare,
         indexer=indexer,
@@ -191,9 +192,10 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     row_ends = (positions[local_rows] + 1).to(torch.int32) // 2
     pool = SimpleNamespace(qsa_compressed_dtype=compressed_dtype)
     metadata = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         pending_ring_slots=torch.arange(8),
         get_token_to_batch_idx=lambda: torch.zeros(8, dtype=torch.int32),
+        prefill_max_row_keys=lambda *_: None,
         get_prefill_mqa_inputs=lambda *args, **kwargs: (
             compressed_keys,
             row_starts,
@@ -223,7 +225,9 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         qsa_indexer, "cp_materialize_global_token_order", gather_raw_keys
     )
 
-    def score_queries(q, k, starts, ends, query_positions, sequence_lengths):
+    def score_queries(
+        q, k, starts, ends, query_positions, sequence_lengths, max_row_keys=None
+    ):
         # Use the same operand check as GPU scoring; the CPU reference otherwise
         # accepts mixed dtypes and would conceal the FP8 compatibility failure.
         assert _scoring_dtype(q, k) == compressed_dtype
@@ -266,8 +270,6 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     )
     torch.testing.assert_close(actual, expected)
     indexer._use_fused_prep.assert_not_called()
-    # Sizing the RoPE cache reads positions.max() on the host: a device sync per layer.
-    assert indexer.apply_rope.call_args.kwargs["ensure_cos_sin_cache"] is False
     update = indexer.update_key_state_and_compress.call_args
     torch.testing.assert_close(update.args[0], hidden.unsqueeze(1))
     assert update.kwargs["state_stored"] is False
@@ -375,7 +377,8 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
             "zero prefix needs no cache read"
         )
     backend = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
+        kv_layers=pool.layer_router,
         _pad_extend_output=QwenSparseAttnBackend._pad_extend_output,
         # Per-forward metadata: row i of the slot table is request i's row.
         _resolve_metadata=lambda forward_batch: SimpleNamespace(
@@ -504,8 +507,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     torch.testing.assert_close(v_cache.float(), initial_v.float(), equal_nan=True)
 
 
-@pytest.mark.parametrize("ensure_cos_sin_cache", [False, True])
-def test_qsa_apply_rope_cache_sizing_is_optional(ensure_cos_sin_cache):
+def test_qsa_apply_rope_does_not_size_rope_cache():
     class Sized(Exception):
         pass
 
@@ -518,10 +520,9 @@ def test_qsa_apply_rope_cache_sizing_is_optional(ensure_cos_sin_cache):
             SimpleNamespace(rotary_emb=rotary_emb),
             torch.arange(4),
             torch.zeros(4, 1, 4),
-            ensure_cos_sin_cache=ensure_cos_sin_cache,
         )
-    # Sizing reads positions.max() on the host: the CP path must skip it.
-    assert rotary_emb._ensure_cos_sin_cache_length.called is ensure_cos_sin_cache
+    # Sizing reads positions.max() on the host; the load-time reservation covers it.
+    rotary_emb._ensure_cos_sin_cache_length.assert_not_called()
 
 
 def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch):
