@@ -56,6 +56,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -103,6 +105,10 @@ class _MockTemplateManager:
 class ServingEmbeddingTestCase(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
+        # The serving layer reads the published config, as in a real server.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.tokenizer_manager = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.serving_embedding = OpenAIServingEmbedding(

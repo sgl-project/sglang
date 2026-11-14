@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
@@ -22,6 +23,7 @@ register_cpu_ci(est_time=7, suite="stage-b-test-cpu-intel")
 SERVED_MODEL_NAME = "test-model"
 # An exact served name that itself contains a colon.
 URI_MODEL_NAME = "s3://bucket/model"
+LOADED_ADAPTER = "sql-expert"
 
 
 class MockTokenizerManager:
@@ -31,6 +33,9 @@ class MockTokenizerManager:
         self.server_args = MagicMock(spec=ServerArgs)
         self.server_args.enable_lora = enable_lora
         self.served_model_name = SERVED_MODEL_NAME
+        self.lora_registry = LoRARegistry(
+            [LoRARef(lora_name=LOADED_ADAPTER, lora_path=f"/adapters/{LOADED_ADAPTER}")]
+        )
 
 
 class ConcreteServingBase(OpenAIServingBase):
@@ -53,7 +58,7 @@ class TestLoRAModelParameter(CustomTestCase):
         # `isinstance` guard, and there is no bag to answer from otherwise.
         reset_context()
         self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        publish(ServerArgs(model_path="dummy", enable_lora=True), role="tokenizer")
         self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
         self.serving = ConcreteServingBase(self.tokenizer_manager)
 
@@ -62,6 +67,32 @@ class TestLoRAModelParameter(CustomTestCase):
             self.serving._parse_model_parameter("llama-3.1-8B"), ("llama-3.1-8B", None)
         )
         self.assertIsNone(self.serving._resolve_lora_path("llama-3.1-8B", None))
+
+    def test_bare_loaded_adapter_name_selects_the_adapter(self):
+        """/v1/models lists a loaded adapter under its bare name; sending that
+        name as `model` must run the adapter, not silently serve the base."""
+        self.assertEqual(
+            self.serving._parse_model_parameter(LOADED_ADAPTER),
+            (SERVED_MODEL_NAME, LOADED_ADAPTER),
+        )
+        self.assertEqual(
+            self.serving._resolve_lora_path(LOADED_ADAPTER, "python-expert"),
+            LOADED_ADAPTER,
+        )
+
+    def test_bare_adapter_name_is_ignored_without_lora(self):
+        reset_context()
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.assertEqual(
+            self.serving._parse_model_parameter(LOADED_ADAPTER), (LOADED_ADAPTER, None)
+        )
+
+    def test_served_model_name_wins_over_a_same_named_adapter(self):
+        self.tokenizer_manager.served_model_name = LOADED_ADAPTER
+        self.assertEqual(
+            self.serving._parse_model_parameter(LOADED_ADAPTER), (LOADED_ADAPTER, None)
+        )
+        self.assertIsNone(self.serving._resolve_lora_path(LOADED_ADAPTER, None))
 
     def test_explicit_lora_path_string(self):
         self.assertEqual(
