@@ -2342,14 +2342,17 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         #   K: (num_blocks, H, D_k // X, page, X)  V: (num_blocks, H, page // X, D_v, X),
         #   X = 16 / dtype_bytes — AITER-only (ignored elsewhere, no consumer kernel).
         # HND and vectorized_5d are mutually exclusive; HND takes precedence.
-        self.use_hnd = envs.SGLANG_USE_HND_KVCACHE.get()
+        self.use_hnd = (
+            kv_cache_layout == "hnd"
+            if kv_cache_layout is not None
+            else envs.SGLANG_USE_HND_KVCACHE.get()
+        )
         self.use_native_move_kv_cache = envs.SGLANG_NATIVE_MOVE_KV_CACHE.get()
-        if kv_cache_layout is not None:
+        if kv_cache_layout is not None and not self.use_hnd:
             # Explicit physical-layout selector wins over the platform default.
             # This is a label only; layouts that change buffer identity (e.g. the
             # page-granularity envelope) live in a dedicated pool subclass
             # (PageMajorMHATokenToKVPool) rather than in branches here.
-            self.use_hnd = False
             self.kv_cache_layout = kv_cache_layout
         elif self.use_hnd:
             total_slots = self.size + self.page_size
