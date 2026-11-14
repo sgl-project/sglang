@@ -128,6 +128,33 @@ class TestNpugraphExBackend(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "decode NPU graph"):
                 validation_hook.check_server_args(object())
 
+    def test_check_server_args_reads_an_unresolved_graph_config(self):
+        """cuda_graph_config is None until the resolution pipeline fills it."""
+        from sglang.srt.arg_groups import validation_hook
+
+        os.environ["SGLANG_NPU_ENABLE_STATIC_KERNEL"] = "1"
+        cfg = types.SimpleNamespace(
+            ep_join_mode=None,
+            dp_size=1,
+            tp_size=1,
+            pp_size=1,
+            nnodes=1,
+            pp_max_micro_batch_size=None,
+            device="npu",
+            enable_torch_compile=True,
+            disable_cuda_graph=False,
+            cuda_graph_config=None,
+        )
+        with (
+            mock.patch.object(validation_hook, "resolving_view", return_value=cfg),
+            mock.patch.dict(
+                sys.modules,
+                {"sglang.srt.hardware_backend.npu.compile_backend": backend_module},
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "decode NPU graph"):
+                validation_hook.check_server_args(object())
+
 
 if __name__ == "__main__":
     unittest.main()
