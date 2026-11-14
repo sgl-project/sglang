@@ -27,6 +27,13 @@ implementation. The adapter inherits AITER's cache writes, metadata
 construction and graph lifecycle. Calls outside the kernel's contract, such as
 attention softcapping, delegate to AITER with a one-time warning.
 
+`SGLANG_TLX_PHASES` selects the attention phases that run on uTLX; AITER runs
+the rest. The phases are `decode` (decode and speculative verification),
+`prefill_window` (sliding-window prefill), `prefill_short` and `prefill_long`
+(full-attention prefill below and from 1024 query tokens). The default,
+`decode,prefill_window,prefill_short`, keeps long full-attention prefill on
+AITER, whose kernel is faster there on gfx1250.
+
 The backend needs `--page-size` 16, 64 or 128 (other values default to 16) and
 the AITER runtime. It does not support MLA, the vectorized 5D AITER KV layout
 or deterministic inference. It is not a draft backend: speculative decoding
@@ -35,8 +42,8 @@ for DFlash2. A model monokernel that bypasses the attention backend also
 bypasses this integration.
 
 Muse Spark MXFP4 with DFlash2 at TP8 on MI450 matches AITER's GSM8K accuracy
-with this backend. Kernel latencies vary by shape; this backend does not
-promise a gain for every prefill or decode workload.
+with this backend. Kernel latencies vary by shape; the default phases route
+each one to the faster kernel measured at Muse Spark's TP8 shapes.
 
 ## Validation
 

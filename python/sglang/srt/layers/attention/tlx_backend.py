@@ -18,11 +18,15 @@ import logging
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
 logger = logging.getLogger(__name__)
 
 TLX_PAGE_SIZES = (16, 64, 128)
+TLX_PHASES = ("decode", "prefill_window", "prefill_short", "prefill_long")
+# AITER's full-attention prefill is faster on gfx1250 from about 1024 query tokens.
+LONG_PREFILL_MIN_Q = 1024
 
 
 class TlxAttnBackend(AiterAttnBackend):
@@ -51,7 +55,18 @@ class TlxAttnBackend(AiterAttnBackend):
             inspect.signature(unified_attention).parameters
         )
         self._tlx_unsupported_reason = unsupported_reason
+        self._tlx_phases = frozenset(
+            phase.strip()
+            for phase in envs.SGLANG_TLX_PHASES.get().split(",")
+            if phase.strip()
+        )
+        unknown = sorted(self._tlx_phases - set(TLX_PHASES))
+        if unknown:
+            raise ValueError(
+                f"SGLANG_TLX_PHASES has unknown phases {unknown}; choose from {TLX_PHASES}"
+            )
         self._tlx_fallback_reasons = set()
+        self._tlx_routed_phases = set()
         self._tlx_dispatched = set()
         super().__init__(model_runner, force_unified_attention=True, **kwargs)
         # Both would send every call to AITER; fail instead of running it silently.
@@ -67,6 +82,12 @@ class TlxAttnBackend(AiterAttnBackend):
             )
 
     def _run_unified_attention(self, **kwargs):
+        phase = self._phase(kwargs)
+        if phase not in self._tlx_phases:
+            if phase not in self._tlx_routed_phases:
+                logger.info("uTLX attention routes %s to AITER", phase)
+                self._tlx_routed_phases.add(phase)
+            return super()._run_unified_attention(**kwargs)
         # AITER-only tuning arguments have no uTLX equivalent; keep AITER for them.
         extra = sorted(kwargs.keys() - self._tlx_parameters)
         reason = (
@@ -81,6 +102,15 @@ class TlxAttnBackend(AiterAttnBackend):
             logger.warning("uTLX attention falls back to AITER: %s", reason)
             self._tlx_fallback_reasons.add(reason)
         return super()._run_unified_attention(**kwargs)
+
+    @staticmethod
+    def _phase(kwargs):
+        max_seqlen_q = kwargs["max_seqlen_q"]
+        if max_seqlen_q <= 16:
+            return "decode"
+        if kwargs["window_size"][0] >= 0:
+            return "prefill_window"
+        return "prefill_long" if max_seqlen_q >= LONG_PREFILL_MIN_Q else "prefill_short"
 
     def _log_dispatch(self, kwargs):
         # Host-side metadata only; under graph capture this runs once per captured shape.
