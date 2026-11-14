@@ -369,6 +369,8 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.enable_staging = False
         mgr.enable_kv_packing = False
         mgr._kv_packers = []
+        mgr._cp_slice_pack_buffers = []
+        mgr.state_tp_size = 1
         mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)
@@ -641,6 +643,8 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.decode_kv_args_table["agent"].decode_tp_size = 2
         mgr.enable_kv_packing = True
         mgr._kv_packers = ["packer0", "packer1"]
+        mgr._cp_slice_pack_buffers = [SimpleNamespace(), SimpleNamespace()]
+        mgr.state_tp_size = 2
         events = []
 
         def send_packed(*, packer, peer_name, src_pages, dst_pages, handles):
@@ -666,6 +670,50 @@ class TestNixlTransferWorker(CustomTestCase):
             mgr.transfer_worker(queue, worker_index=1)
 
         self.assertEqual(events, ["packer1", "packed", "aux", KVPoll.Success])
+
+    def test_cp_head_slice_packing_and_fallback(self):
+        for has_buffer, poisoned, state_tp, expected in [
+            (True, False, 2, "packed"),
+            (True, True, 2, "slice"),
+            (True, False, 4, "slice"),
+            (False, False, 2, "slice"),
+        ]:
+            with self.subTest(
+                has_buffer=has_buffer, poisoned=poisoned, state_tp=state_tp
+            ):
+                room = 27
+                mgr = self._make_manager(room)
+                mgr.decode_kv_args_table["agent"].decode_tp_size = 2
+                mgr.state_tp_size = state_tp
+                buffer = SimpleNamespace(nixl_poisoned=poisoned)
+                mgr._cp_slice_pack_buffers = [buffer] if has_buffer else []
+                events = []
+
+                def send_packed(peer, src, dst, scratch, handles):
+                    self.assertIs(scratch, buffer)
+                    handles.append("packed")
+
+                mgr.send_kvcache_slice_packed = MagicMock(side_effect=send_packed)
+                mgr.send_kvcache_slice = MagicMock(return_value="slice")
+                mgr.send_aux = MagicMock(return_value="aux")
+                mgr.agent.check_xfer_state = lambda handle: (
+                    events.append(handle) or "DONE"
+                )
+                mgr.send_kv_status_message.side_effect = lambda **kw: events.append(
+                    kw["status"]
+                )
+
+                self._run_worker_once(
+                    mgr, self._make_chunk(room, [1], is_last_chunk=True)
+                )
+
+                self.assertEqual(events, [expected, "aux", KVPoll.Success])
+                self.assertEqual(
+                    mgr.send_kvcache_slice_packed.call_count, int(expected == "packed")
+                )
+                self.assertEqual(
+                    mgr.send_kvcache_slice.call_count, int(expected == "slice")
+                )
 
     def test_failed_handle_never_emits_success(self):
         room = 25
