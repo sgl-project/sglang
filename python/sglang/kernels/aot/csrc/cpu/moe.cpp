@@ -990,6 +990,24 @@ at::Tensor fused_experts_cpu(
     fill_stub(total_cnts + begin, 0, end - begin);
   });
 
+  // moe_align_block_size indexes per-expert count/cumsum/offset rows with
+  // topk_ids; any id outside [0, E) reads/writes out of bounds. Validate
+  // before the first expert indexing happens.
+  {
+    const int32_t* __restrict topk_ids_ptr = topk_ids_.data_ptr<int32_t>();
+    for (int64_t i = 0; i < numel; ++i) {
+      TORCH_CHECK(
+          topk_ids_ptr[i] >= 0 && topk_ids_ptr[i] < E,
+          "fused_experts_cpu: topk_ids[",
+          i,
+          "] = ",
+          topk_ids_ptr[i],
+          " is out of range [0, ",
+          E,
+          ")");
+    }
+  }
+
   // align experts index
   int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
       sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
