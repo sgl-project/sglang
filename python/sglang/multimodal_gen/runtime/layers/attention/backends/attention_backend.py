@@ -100,6 +100,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class AttentionImpl(ABC, Generic[T]):
+    # Whether forward() reads Q/K/V through explicit strides. False means the
+    # caller must hand it packed rows, so the Ulysses exchange has to copy its
+    # interleaved [.., 3 * head_size] output apart first.
+    accepts_strided_qkv: bool = False
+
     @abstractmethod
     def __init__(
         self,
