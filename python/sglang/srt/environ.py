@@ -433,6 +433,8 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
     # Scheduler: report the mamba state pool full to lazy tracking-slot alloc, so each boundary evicts first
     SGLANG_TEST_MAMBA_LAZY_POOL_FULL = EnvBool(False)
+    # Mamba2 SSD chunk-scan test: re-measure that the configs excluded as wrong still are on this GPU
+    SGLANG_TEST_MAMBA_SSD_DIAGNOSE = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when eviction reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
