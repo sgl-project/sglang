@@ -107,7 +107,7 @@ def render_inkling_messages(
     tml = load_tml_renderers(spec)
     media_marker = f"sglang-inkling-media-{uuid.uuid4().hex}:"
     oss_messages, media_kinds = _to_oss_messages(messages, media_marker)
-    tools = _tools_for_choice(tools, tool_choice)
+    tools = _tools_for_choice(tools=tools, tool_choice=tool_choice)
     effort = (
         INKLING_DEFAULT_REASONING_EFFORT
         if reasoning_effort is None
@@ -117,9 +117,13 @@ def render_inkling_messages(
         _leading_system_count(oss_messages), _thinking_effort_message(effort)
     )
     if tools:
-        instruction = _tool_choice_instruction(tool_choice, parallel_tool_calls)
+        instruction = _tool_choice_instruction(
+            tool_choice=tool_choice, parallel_tool_calls=parallel_tool_calls
+        )
         if instruction is not None:
-            oss_messages[0] = _with_appended_text(oss_messages[0], instruction)
+            oss_messages[0] = _with_appended_text(
+                message=oss_messages[0], text=instruction
+            )
         oss_messages.insert(0, _tool_declare_message(tools))
     native = [
         _resolve_media(message, tml.chat, media_marker, media_kinds)
@@ -254,6 +258,7 @@ def _thinking_effort_message(effort: float) -> dict[str, Any]:
 
 
 def _tools_for_choice(
+    *,
     tools: Sequence[Mapping[str, Any]] | None,
     tool_choice: str | Mapping[str, Any] | None,
 ) -> Sequence[Mapping[str, Any]] | None:
@@ -271,7 +276,7 @@ def _tools_for_choice(
 
 
 def _tool_choice_instruction(
-    tool_choice: str | Mapping[str, Any] | None, parallel_tool_calls: bool
+    *, tool_choice: str | Mapping[str, Any] | None, parallel_tool_calls: bool
 ) -> str | None:
     name = _chosen_function_name(tool_choice)
     if name is not None:
@@ -298,7 +303,7 @@ def _chosen_function_name(tool_choice: str | Mapping[str, Any] | None) -> str | 
     return name
 
 
-def _with_appended_text(message: Mapping[str, Any], text: str) -> dict[str, Any]:
+def _with_appended_text(*, message: Mapping[str, Any], text: str) -> dict[str, Any]:
     content = message.get("content")
     if isinstance(content, str) and content:
         content = f"{content}\n\n{text}"
@@ -334,7 +339,12 @@ def _spans_to_input_ids(spans: Sequence[Any], tml: SimpleNamespace) -> list[int]
         if isinstance(span, tml.chat.EncodedTextTokenSpan):
             input_ids.extend(span.tokens)
         elif isinstance(span, tml.chat.ImageAssetPointerTokenSpan):
-            _append_media_placeholder(input_ids, span.location, tml)
+            _append_media_placeholder(
+                input_ids,
+                location=span.location,
+                tokenizer=tml.tokenizer,
+                unused_special_ids=tml.unused_special_ids,
+            )
         else:
             raise ValueError(
                 f"unexpected TMLv0 span in Inkling prompt: {type(span).__name__}"
@@ -343,17 +353,20 @@ def _spans_to_input_ids(spans: Sequence[Any], tml: SimpleNamespace) -> list[int]
 
 
 def _append_media_placeholder(
-    input_ids: list[int], location: str, tml: SimpleNamespace
+    input_ids: list[int],
+    *,
+    location: str,
+    tokenizer: Any,
+    unused_special_ids: frozenset[int],
 ) -> None:
     if location.startswith(_IMAGE_LOCATION_PREFIX):
         input_ids.append(IMAGE_TOKEN_ID)
         return
-    tokenizer = tml.tokenizer
     audio_input, audio_end = (
         tokenizer.encode_special(_special_name(token))
         for token in (CONTENT_AUDIO_INPUT, AUDIO_END)
     )
-    if {audio_input, audio_end} & tml.unused_special_ids:
+    if {audio_input, audio_end} & unused_special_ids:
         raise ValueError("This Inkling checkpoint does not accept audio input")
     # tml-renderers DMel-encodes audio at render time, so audio rides in an image
     # slot and gets the MM processor's audio framing here.

@@ -96,8 +96,8 @@ class InklingOutputParser:
         return delta.build()
 
     def abort(self, token_ids: Sequence[int] = ()) -> InklingOutputDelta:
-        """Parses tokens generated before an abort without finalizing, so an open
-        call is never completed into an executable one."""
+        # Parses tokens generated before an abort without finalizing, so an open
+        # call is never completed into an executable one.
         if self._finished:
             return InklingOutputDelta()
         self._finished = True
@@ -241,8 +241,8 @@ class InklingOutputParser:
         elif isinstance(update, chat.StreamingContent):
             if self._model_authored:
                 self._emit_text(
-                    update.content.text,
-                    delta,
+                    text=update.content.text,
+                    delta=delta,
                     thinking=isinstance(update.content, chat.Thinking),
                 )
                 self._streamed += update.content.text
@@ -260,8 +260,8 @@ class InklingOutputParser:
         elif isinstance(content, (chat.Text, chat.Thinking)):
             if content.text.startswith(self._streamed):
                 self._emit_text(
-                    content.text[len(self._streamed) :],
-                    delta,
+                    text=content.text[len(self._streamed) :],
+                    delta=delta,
                     thinking=isinstance(content, chat.Thinking),
                 )
             self._release_held_reasoning(delta)
@@ -274,7 +274,7 @@ class InklingOutputParser:
             else:
                 delta.content.append(self._payload_text())
 
-    def _emit_text(self, text: str, delta: _DeltaBuilder, *, thinking: bool) -> None:
+    def _emit_text(self, *, text: str, delta: _DeltaBuilder, thinking: bool) -> None:
         if not (self._separate_reasoning and thinking):
             delta.content.append(text)
         elif self._hold_reasoning:
@@ -326,7 +326,9 @@ class InklingOutputParser:
                 self._release_held_reasoning(delta)
         elif kind_id == self._thinking_id:
             if text.startswith(self._streamed):
-                self._emit_text(text[len(self._streamed) :], delta, thinking=True)
+                self._emit_text(
+                    text=text[len(self._streamed) :], delta=delta, thinking=True
+                )
         else:
             emitted = "" if self._held_reasoning else self._streamed
             if text.startswith(emitted):
