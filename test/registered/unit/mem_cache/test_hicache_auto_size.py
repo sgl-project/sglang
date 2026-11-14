@@ -5,13 +5,20 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.configs.inkling import (
+    InklingConvCacheParams,
+    InklingConvStateShape,
+    InklingStateDType,
+)
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MambaPool, MHATokenToKVPool
+from sglang.srt.mem_cache.ple_state_pool import NGramPool
 from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_context, get_memory
@@ -138,6 +145,62 @@ class TestHiCacheAutoSize(CustomTestCase):
             page_size=2,
         )
         self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
+
+    def test_mamba_state_is_sized_by_what_its_host_pool_mirrors(self):
+        """The estimate must cover every byte the Mamba host pool mirrors, packed draft
+        layers and side states registered after the pool, and no spec scratch."""
+
+        def make_pool(layer_ids, draft_tokens=None):
+            return MambaPool(
+                size=8,
+                spec_state_size=8,
+                cache_params=InklingConvCacheParams(
+                    shape=InklingConvStateShape(conv=[(2, 2)], temporal=(2, 2, 2)),
+                    layers=list(layer_ids),
+                    dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
+                ),
+                mamba_layer_ids=list(layer_ids),
+                speculative_num_draft_tokens=draft_tokens,
+                device="cpu",
+            )
+
+        target = make_pool([0, 1], draft_tokens=4)
+        target.register_slot_state(
+            NGramPool(size=8, context_len=3, eos_token_id=0, device="cpu")
+        )
+        draft = make_pool([2])
+        kv = _leaf(
+            Mock(
+                spec=MHATokenToKVPool,
+                host_capacity_bytes=None,
+                get_kv_size_bytes=Mock(return_value=(512, 512)),
+            )
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=True),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=kv),
+                storage=None,
+                state=SimpleNamespace(pool=target),
+            ),
+            page_size=1,
+            mtp_draft_mamba_pools=(draft,),
+        )
+        host = MambaPoolHost(
+            target.get_device_pool_infos()[0].buffer_info,
+            2,
+            0,
+            device_capacity=target.size,
+            pin_memory=False,
+            layout="page_first",
+            mtp_draft_buffer_infos=[draft.get_device_pool_infos()[0].buffer_info],
+        )
+        self.addCleanup(host.destroy)
+        self.assertEqual(
+            sizing._estimate_hicache_bytes(params, None),
+            1024 + target.size * host.size_per_token,
+        )
 
     def test_default_ratio_fits_host_budget_and_pools_book_it(self):
         """With only --enable-hierarchical-cache the default ratio shrinks to the

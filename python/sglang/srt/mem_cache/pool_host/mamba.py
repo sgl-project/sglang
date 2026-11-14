@@ -432,18 +432,10 @@ class MambaPoolHost(HostKVCache):
         return len(indices)
 
     def get_size_per_token(self):
-        conv_total_size = sum(
-            conv_elem_size * self.conv_dtype.itemsize
-            for conv_elem_size in self.conv_state_elem_sizes
+        return sum(
+            info.checkpoint_bytes_per_slot()
+            for info in (self.buffer_info, *self.mtp_draft_buffer_infos)
         )
-        temporal_size = self.temporal_state_elem_size * self.temporal_dtype.itemsize
-        # Side-state rows are per-slot, not per-layer: each entry is already a
-        # single layer's view, so its own row size is added once.
-        side_size = sum(
-            state[0].numel() * state.element_size()
-            for state in self.slot_state_device_tensors
-        )
-        return (conv_total_size + temporal_size) * self.num_mamba_layers + side_size
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()

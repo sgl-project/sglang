@@ -105,7 +105,11 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MHABufferInfo
+    from sglang.srt.mem_cache.device_pool_info import (
+        DevicePoolInfo,
+        MambaStateBufferInfo,
+        MHABufferInfo,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -1114,12 +1118,33 @@ class MambaPool:
         self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
         self._warmup_fused_copy_slot_kernel()
 
+    @property
+    def host_capacity_bytes(self) -> int:
+        # Host bytes per device capacity, counting side states registered after
+        # __init__; spec verify scratch and ReplaySSM rings are device-only.
+        capacity = (
+            self.size
+            if self.host_capacity_tokens is None
+            else self.host_capacity_tokens
+        )
+        return capacity * self._checkpoint_buffer_info().checkpoint_bytes_per_slot()
+
+    def _checkpoint_buffer_info(self) -> MambaStateBufferInfo:
+        from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+
+        return MambaStateBufferInfo(
+            temporal=self.mamba_cache.temporal,
+            conv=tuple(self.mamba_cache.conv),
+            extra_checkpoint_buffers=tuple(
+                buffer
+                for sibling in self._slot_siblings
+                for _, buffer, _, _ in sibling.iter_transfer_state_entries()
+            ),
+        )
+
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
         """Checkpoint buffers for host transfer, excluding speculative work space."""
-        from sglang.srt.mem_cache.device_pool_info import (
-            DevicePoolInfo,
-            MambaStateBufferInfo,
-        )
+        from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
         return (
@@ -1127,15 +1152,7 @@ class MambaPool:
                 pool_name=PoolName.MAMBA,
                 indices_from_pool=PoolName.MAMBA,
                 layer_ids=tuple(self.mamba_layer_ids),
-                buffer_info=MambaStateBufferInfo(
-                    temporal=self.mamba_cache.temporal,
-                    conv=tuple(self.mamba_cache.conv),
-                    extra_checkpoint_buffers=tuple(
-                        buffer
-                        for sibling in self._slot_siblings
-                        for _, buffer, _, _ in sibling.iter_transfer_state_entries()
-                    ),
-                ),
+                buffer_info=self._checkpoint_buffer_info(),
             ),
         )
 

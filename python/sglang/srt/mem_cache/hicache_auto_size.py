@@ -93,6 +93,8 @@ def _estimate_hicache_bytes(
     total = _pool_bytes(pool)
     if params.req_to_token_pool.holds_state_slots:
         total += _leaf_bytes(params.token_to_kv_pool_allocator.state.pool)
+    # Packed draft state rides in the target's Mamba host slots.
+    total += sum(_leaf_bytes(draft) for draft in params.mtp_draft_mamba_pools)
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools

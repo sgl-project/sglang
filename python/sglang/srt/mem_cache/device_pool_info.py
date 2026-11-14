@@ -6,6 +6,7 @@ layer routing and transfers. This first consumer describes Mamba checkpoints.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from enum import Enum
 
@@ -62,6 +63,19 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 raise ValueError(
                     f"Mamba buffer.device={buffer.device}, expected {self.temporal.device}"
                 )
+
+    def checkpoint_bytes_per_slot(self) -> int:
+        """Host bytes one checkpoint slot takes: every layer's conv and temporal
+        state, plus one row of each extra buffer."""
+        layer_bytes = sum(
+            math.prod(buffer.shape[2:]) * buffer.element_size()
+            for buffer in (*self.conv, self.temporal)
+        )
+        extra_bytes = sum(
+            math.prod(buffer.shape[1:]) * buffer.element_size()
+            for buffer in self.extra_checkpoint_buffers
+        )
+        return layer_bytes * self.temporal.shape[0] + extra_bytes
 
 
 class IndexKeyLayout(Enum):

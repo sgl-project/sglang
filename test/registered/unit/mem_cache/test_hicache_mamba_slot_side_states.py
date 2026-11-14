@@ -83,6 +83,11 @@ def _make_pools(with_side_state: bool):
     host.buffer_info = MambaStateBufferInfo(
         temporal=device_pool.mamba_cache.temporal,
         conv=tuple(device_pool.mamba_cache.conv),
+        extra_checkpoint_buffers=tuple(
+            state
+            for sibling in device_pool._slot_siblings
+            for _, state, _, _ in sibling.iter_transfer_state_entries()
+        ),
     )
     host.page_size = 1
     host.layout = "page_first"
@@ -97,11 +102,7 @@ def _make_pools(with_side_state: bool):
     host.conv_dtype = conv[0].dtype
     host.temporal_dtype = temporal.dtype
     host.dtype = host.conv_dtype
-    host.slot_state_device_tensors = [
-        state
-        for sibling in device_pool._slot_siblings
-        for _, state, _, _ in sibling.iter_transfer_state_entries()
-    ]
+    host.slot_state_device_tensors = list(host.buffer_info.extra_checkpoint_buffers)
     host.slot_state_buffers = [
         torch.zeros((NUM_HOST_SLOTS,) + tuple(state.shape[1:]), dtype=state.dtype)
         for state in host.slot_state_device_tensors

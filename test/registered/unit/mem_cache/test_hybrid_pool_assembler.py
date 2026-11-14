@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.ple_state_pool import NGramPool
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -2178,6 +2179,128 @@ class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
                 ),
             ):
                 self.assertEqual(hybrid_pool_assembler._state_host_layout(), expected)
+
+
+class TestMambaHostShare(CustomTestCase):
+    def test_explicit_size_weighs_mamba_by_what_its_host_pool_mirrors(self):
+        """--hicache-size gives the Mamba host pool the share of the bytes it mirrors:
+        draft layers and side states registered after the pool, never spec scratch."""
+
+        def make_pool(layer_ids, draft_tokens=None):
+            return MambaPool(
+                size=8,
+                spec_state_size=8,
+                cache_params=InklingConvCacheParams(
+                    shape=InklingConvStateShape(conv=[(2, 2)], temporal=(2, 2, 2)),
+                    layers=list(layer_ids),
+                    dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
+                ),
+                mamba_layer_ids=list(layer_ids),
+                speculative_num_draft_tokens=draft_tokens,
+                device="cpu",
+            )
+
+        mamba_pool = make_pool([0, 1], draft_tokens=4)
+        mamba_pool.register_slot_state(
+            NGramPool(size=8, context_len=3, eos_token_id=0, device="cpu")
+        )
+        drafts = (make_pool([2]),)
+        kv = MHATokenToKVPool(
+            size=8,
+            page_size=1,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        kv_bytes = sum(kv.get_kv_size_bytes())
+        allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
+        params = SimpleNamespace(
+            page_size=1,
+            mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=drafts,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                swa_attn_allocator=allocator, state_slots=allocator
+            ),
+            tp_cache_group=None,
+            pp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+        )
+        memory = SimpleNamespace(
+            hicache_size=1e-5,
+            hicache_ratio=2,
+            hicache_mem_layout="page_first_direct",
+            hicache_write_policy="write_through",
+            hicache_io_backend="direct",
+            hicache_host_memory_mode="cache",
+            enable_unified_memory=False,
+        )
+        for tri_pool in (False, True):
+            with (
+                self.subTest(tri_pool=tri_pool),
+                patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+                patch.object(
+                    hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+                ),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "build_kv_host_pool",
+                    return_value=SimpleNamespace(
+                        layer_num=1,
+                        layout="page_first_direct",
+                        page_size=1,
+                        device="cpu",
+                        size=17,
+                        logical_size=17,
+                        can_use_write_back_jit=False,
+                    ),
+                ) as build_kv_host_pool,
+                patch.object(
+                    hybrid_pool_assembler,
+                    "build_mamba_host_pool",
+                    wraps=hybrid_pool_assembler.build_mamba_host_pool,
+                ) as build_mamba_host_pool,
+                patch.object(
+                    hybrid_pool_assembler,
+                    "MambaPoolHost",
+                    partial(MambaPoolHost, pin_memory=False),
+                ),
+                patch.object(hybrid_pool_assembler, "HybridCacheController"),
+            ):
+                common = dict(
+                    params=params,
+                    mamba_pool=mamba_pool,
+                    full_layer_mapping={0: 0},
+                    start_layer=0,
+                    load_cache_event=None,
+                    storage_backend=None,
+                )
+                if tri_pool:
+                    group, _ = hybrid_pool_assembler.build_hybrid_mamba_swa_stack(
+                        **common,
+                        full_kv_pool=kv,
+                        swa_kv_pool=kv,
+                        swa_layer_mapping={1: 0},
+                    )
+                else:
+                    group, _, _ = hybrid_pool_assembler.build_hybrid_mamba_stack(
+                        **common, kv_pool=kv
+                    )
+                host = group.entry_map[PoolName.MAMBA].host_pool
+                self.addCleanup(host.destroy)
+                mirrored_bytes = host.size_per_token * mamba_pool.size
+                self.assertLess(
+                    mirrored_bytes,
+                    sum(pool.get_kv_size_bytes() for pool in (mamba_pool, *drafts)),
+                )
+                kv_share = build_kv_host_pool.call_args_list[0].kwargs["host_size"]
+                mamba_share = build_mamba_host_pool.call_args.kwargs["host_size"]
+                self.assertAlmostEqual(
+                    mamba_share / kv_share, mirrored_bytes / kv_bytes
+                )
 
 
 class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
