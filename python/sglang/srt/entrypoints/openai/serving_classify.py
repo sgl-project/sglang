@@ -99,22 +99,29 @@ class OpenAIServingClassify(OpenAIServingBase):
                         return f"All items in input list must be strings"
                     if not item.strip():
                         return f"Input at index {i} cannot be empty or whitespace only"
-            elif isinstance(first_item, int):
+            elif isinstance(first_item, int) and not isinstance(first_item, bool):
                 # List of integers (token IDs)
                 for i, item in enumerate(input):
-                    if not isinstance(item, int):
-                        return f"All items in input list must be integers"
+                    if not isinstance(item, int) or isinstance(item, bool):
+                        return "All items in input list must be integers"
                     if item < 0:
                         return f"Token ID at index {i} must be non-negative"
-        return None
+            else:
+                return "Input list items must be strings or integers"
+            return None
+
+        return "Input must be a string or a list of strings or integers"
 
     def _get_id2label_mapping(self) -> Optional[Dict[int, str]]:
         """Get id2label mapping from model config."""
         try:
             hf_config = self.tokenizer_manager.model_config.hf_config
             # Check for id2label in hf_config
-            if hf_config.id2label:
-                return hf_config.id2label
+            if getattr(hf_config, "id2label", None):
+                return {
+                    int(k) if isinstance(k, str) and k.isdigit() else k: v
+                    for k, v in hf_config.id2label.items()
+                }
             # Check for num_labels and create default mapping if needed
             if hasattr(hf_config, "num_labels") and hf_config.num_labels:
                 num_labels = hf_config.num_labels
@@ -162,14 +169,22 @@ class OpenAIServingClassify(OpenAIServingBase):
             prompt_tokens += meta_info.get("prompt_tokens", 0)
             total_latency += meta_info.get("e2e_latency", 0.0)
 
-            if embedding:
+            if embedding is not None and len(embedding) > 0:
                 try:
-                    embedding_tensor = torch.tensor(embedding, dtype=torch.float32)
+                    embedding_tensor = torch.as_tensor(embedding, dtype=torch.float32)
                     probs = F.softmax(embedding_tensor, dim=0).tolist()
 
-                    predicted_class = torch.argmax(embedding_tensor).item()
+                    predicted_class = int(torch.argmax(embedding_tensor).item())
 
-                    label = self.id2label[predicted_class]
+                    if self.id2label:
+                        label = self.id2label.get(
+                            predicted_class,
+                            self.id2label.get(
+                                str(predicted_class), f"LABEL_{predicted_class}"
+                            ),
+                        )
+                    else:
+                        label = f"LABEL_{predicted_class}"
 
                 except Exception as e:
                     logger.error(f"Error processing embedding for item {i}: {e}")
