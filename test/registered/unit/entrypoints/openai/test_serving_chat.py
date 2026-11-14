@@ -3191,6 +3191,23 @@ class ServingChatTestCase(CustomTestCase):
                         {"city": "Beijing"},
                     )
 
+    def test_dsv32_handles_continue_final_message_only_assistant(self):
+        """A lone continued assistant leaves a valid generation prompt."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv32"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "assistant", "content": "partial answer"}],
+            continue_final_message=True,
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        encode_calls = self.chat.tokenizer_manager.tokenizer.encode.call_args_list
+        rendered = " ".join(str(call.args[0]) for call in encode_calls)
+        assert "<｜Assistant｜></think>" in rendered
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 
