@@ -45,6 +45,56 @@ class DsaGraphVariants:
         return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
 
 
+def k3_mla_verify_max_kv_len(
+    forward_batch: ForwardBatch, num_draft_tokens: int
+) -> Optional[int]:
+    """Longest verify KV length from the host mirror, or None without one (a
+    device max would sync every step)."""
+    seq_lens_cpu = forward_batch.seq_lens_cpu
+    if (
+        seq_lens_cpu is None
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.numel() == 0
+    ):
+        return None
+    return int(seq_lens_cpu.max()) + num_draft_tokens
+
+
+def select_k3_mla_verify_kernel(
+    forward_batch: ForwardBatch, num_draft_tokens: int
+) -> str:
+    """AITER's host pick of the K3 verify kernel; HipKittens serves any length, so
+    it is the pick when the host lengths are missing."""
+    from aiter.mla_verify import MLA_VERIFY_HK, select_mla_verify_kernel
+
+    max_kv_len = k3_mla_verify_max_kv_len(forward_batch, num_draft_tokens)
+    if max_kv_len is None:
+        return MLA_VERIFY_HK
+    return select_mla_verify_kernel(forward_batch.batch_size, max_kv_len)
+
+
+@dataclass(frozen=True)
+class K3MlaVerifyGraphVariants:
+    """One target-verify graph per AITER MLA verify kernel (Gluon, HipKittens)."""
+
+    num_draft_tokens: int
+    capture_labels: ClassVar[tuple[str, ...]] = ("gluon", "hk")
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        return select_k3_mla_verify_kernel(forward_batch, self.num_draft_tokens)
+
+
+def create_k3_mla_verify_graph_variants(
+    attn_backend, capture_forward_mode
+) -> Optional[K3MlaVerifyGraphVariants]:
+    if not capture_forward_mode.is_target_verify():
+        return None
+    backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    if not getattr(backend, "use_k3_mla_verify", False):
+        return None
+    return K3MlaVerifyGraphVariants(backend.num_draft_tokens)
+
+
 class SeqLenBucketGraphVariants(msgspec.Struct, frozen=True):
     """Graphs keyed by the batch's longest request: the first bucket whose limit
     covers it, else the fallback, which must serve any length."""
