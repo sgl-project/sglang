@@ -333,10 +333,20 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
-    if "DiffusionGemmaForBlockDiffusion" in runner.model_config.hf_config.architectures:
+    architectures = runner.model_config.hf_config.architectures
+    if "DiffusionGemmaForBlockDiffusion" in architectures:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
         return TritonAttnBackend(runner, dllm_fa4=True)
+    if (
+        "NemotronLabsDiffusionModel" in architectures
+        and get_exec().dllm.dllm_algorithm is not None
+    ):
+        from sglang.srt.layers.attention.nemotron_labs_diffusion_backend import (
+            NemotronLabsDiffusionAttentionBackend,
+        )
+
+        return NemotronLabsDiffusionAttentionBackend(runner)
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )
