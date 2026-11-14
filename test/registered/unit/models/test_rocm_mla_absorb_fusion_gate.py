@@ -7,9 +7,10 @@ where all of them hold. A term quietly dropped would route a shape the kernel
 does not implement, and the wrong answer would look like a plausible one.
 
 The gfx95 caller carries one further term, ``not q_replicate_active``, which
-needs a ForwardBatch to evaluate and so is not part of that predicate.
+is computed in prepare and so is not part of that predicate.
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -25,13 +26,28 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=21, suite="base-a-test-cpu")
 
-_CAN_FUSE = forward_mla_rocm._can_fuse_bmm_rope_cat_and_cache
+_CAN_FUSE_GATE = forward_mla_rocm._can_fuse_bmm_rope_cat_and_cache
 _ABSORB_CONFIG = forward_mla_rocm._absorb_bmm_config
+
+
+_MXFP4_MAX_TOKENS = forward_mla_rocm._FUSED_FP4_BMM_ROPE_CACHE_MAX_TOKENS
+
+
+def _CAN_FUSE(attn):
+    # FP8 terms ignore the forward mode, capture state and token count; the caller
+    # gates the mode.
+    return _CAN_FUSE_GATE(
+        attn,
+        forward_mode=ForwardMode.EXTEND,
+        is_capture_mode=False,
+        num_tokens=_MXFP4_MAX_TOKENS + 1,
+    )
 
 
 def _attn(**overrides):
@@ -57,6 +73,11 @@ class TestFusedAbsorbGate(CustomTestCase):
         self._saved = forward_mla_rocm._use_aiter_gfx95
         forward_mla_rocm._use_aiter_gfx95 = True
         self.addCleanup(setattr, forward_mla_rocm, "_use_aiter_gfx95", self._saved)
+        kill_switch = mock.patch.object(
+            forward_mla_rocm, "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", True
+        )
+        kill_switch.start()
+        self.addCleanup(kill_switch.stop)
 
     def test_dcp_turns_it_off(self):
         """DCP decode all-gathers q_nope_out, which this path never produces.
@@ -87,6 +108,15 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
+        for module_flag, broken in (
+            ("_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", False),
+            ("_SGLANG_EXPERIMENTAL_LORA_OPTI", True),
+        ):
+            with (
+                self.subTest(term=module_flag),
+                mock.patch.object(forward_mla_rocm, module_flag, broken),
+            ):
+                self.assertFalse(_CAN_FUSE(_attn()))
 
 
 class TestAbsorbBmmConfig(CustomTestCase):
@@ -121,6 +151,220 @@ class TestAbsorbBmmConfig(CustomTestCase):
     def test_large_row_count_falls_back(self):
         self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
         self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
+
+
+class TestMxfp4ProjectionFusionGate(CustomTestCase):
+    """The MXFP4 w_kc branch of ``_can_fuse_bmm_rope_cat_and_cache``."""
+
+    def _make_attn(self):
+        # Deliberately no q_lora_rank or v_head_dim: the kernel is key-side only,
+        # so a gate that read either would raise AttributeError here.
+        return SimpleNamespace(
+            current_attention_backend="aiter",
+            use_dsa=False,
+            use_deep_gemm_bmm=False,
+            dcp_size=1,
+            kv_b_proj=SimpleNamespace(set_lora=False),
+            _skip_rope_for_dsa_tilelang_fused=lambda: False,
+            w_kc=torch.empty(1, dtype=torch.uint8),
+            w_scale_k=torch.empty(1),
+            rotary_emb=object(),
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+        )
+
+    def _make_decode_batch(self):
+        return SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    @contextlib.contextmanager
+    def _aiter_gfx95_env(self):
+        with (
+            mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True),
+            mock.patch.object(
+                forward_mla_rocm, "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", True
+            ),
+            get_parallel().override(dcp_enabled=False),
+        ):
+            yield
+
+    def _can_fuse(self, attn, forward_batch, is_capture_mode=True, num_tokens=1):
+        return _CAN_FUSE_GATE(
+            attn,
+            forward_mode=forward_batch.forward_mode,
+            is_capture_mode=is_capture_mode,
+            num_tokens=num_tokens,
+        )
+
+    def test_each_term_alone_turns_it_off(self):
+        """Prefill keeps the split path, as do layouts the kernel lacks: DSA caches,
+        DCP's all-gathered q_nope_out, LoRA or deep-gemm absorbs, NoPE layers.
+        Every term shared with the FP8 branch is broken on an MXFP4 attn too."""
+        forward_batch = self._make_decode_batch()
+        with self._aiter_gfx95_env():
+            self.assertTrue(self._can_fuse(self._make_attn(), forward_batch))
+            self.assertFalse(
+                self._can_fuse(
+                    self._make_attn(),
+                    SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+                )
+            )
+            for name, broken in (
+                # Shared with the FP8 branch.
+                ("dcp_size", 2),
+                ("rotary_emb", None),
+                ("use_deep_gemm_bmm", True),
+                ("kv_b_proj", SimpleNamespace(set_lora=True)),
+                # MXFP4 only.
+                ("use_dsa", True),
+                ("w_scale_k", None),
+                # Not MXFP4: dispatch leaves this branch.
+                ("w_kc", torch.empty(1, dtype=torch.float8_e4m3fn)),
+                ("w_kc", torch.empty(1, dtype=torch.bfloat16)),
+            ):
+                with self.subTest(term=name, broken=broken):
+                    attn = self._make_attn()
+                    setattr(attn, name, broken)
+                    self.assertFalse(self._can_fuse(attn, forward_batch))
+            for module_flag, broken in (
+                ("_use_aiter_gfx95", False),
+                ("_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", False),
+                ("_SGLANG_EXPERIMENTAL_LORA_OPTI", True),
+            ):
+                with (
+                    self.subTest(term=module_flag),
+                    mock.patch.object(forward_mla_rocm, module_flag, broken),
+                ):
+                    self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
+            with (
+                self.subTest(term="dcp_enabled"),
+                get_parallel().override(dcp_enabled=True),
+            ):
+                self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
+
+    def test_projection_fusion_gate_targets_aiter_graph_decode(self):
+        attn = self._make_attn()
+        forward_batch = self._make_decode_batch()
+
+        with self._aiter_gfx95_env():
+            self.assertTrue(self._can_fuse(attn, forward_batch))
+
+            attn.current_attention_backend = "flashinfer"
+            self.assertFalse(self._can_fuse(attn, forward_batch))
+
+    def test_fuses_only_graph_decode_up_to_the_token_bound(self):
+        """Eager decode keeps the split path at every size: only graph decode is
+        validated end to end. Above the bound the fused grid is slower than the
+        split launches, so larger captured batches run split too."""
+        forward_batch = self._make_decode_batch()
+        with self._aiter_gfx95_env():
+            for is_capture_mode, num_tokens, fused in (
+                (False, 1, False),
+                (False, _MXFP4_MAX_TOKENS, False),
+                (True, 1, True),
+                (True, _MXFP4_MAX_TOKENS, True),
+                (True, _MXFP4_MAX_TOKENS + 1, False),
+            ):
+                with self.subTest(
+                    is_capture_mode=is_capture_mode, num_tokens=num_tokens
+                ):
+                    self.assertEqual(
+                        self._can_fuse(
+                            self._make_attn(),
+                            forward_batch,
+                            is_capture_mode=is_capture_mode,
+                            num_tokens=num_tokens,
+                        ),
+                        fused,
+                    )
+
+    def test_projection_fusion_gate_requires_power_of_two_shapes(self):
+        """fused_fp4_bmm_rope_cat_and_cache_mla tiles kv_lora_rank and
+        qk_rope_head_dim as unmasked ``tl.arange`` tiles and quantizes the BMM K
+        dim in 32-wide MXFP4 groups.  None of that is asserted kernel-side, so a
+        merely-divisible-looking shape (384 is a multiple of 128, 96 a multiple
+        of 32) must still be rejected here or the kernel reads out of bounds.
+        """
+        forward_batch = self._make_decode_batch()
+
+        with self._aiter_gfx95_env():
+            for field, value in (
+                ("kv_lora_rank", 384),
+                ("qk_nope_head_dim", 96),
+                ("qk_nope_head_dim", 16),
+                ("qk_nope_head_dim", 512),
+                ("qk_rope_head_dim", 48),
+            ):
+                with self.subTest(field=field, value=value):
+                    attn = self._make_attn()
+                    setattr(attn, field, value)
+                    self.assertFalse(self._can_fuse(attn, forward_batch))
+
+
+class TestFusedAbsorbQDtype(CustomTestCase):
+    """Gluon MLA decode (bh16bn128) reads bf16 Q at 12 local heads, so with an FP8
+    cache the MXFP4 fused kernel must emit bf16 Q there, as the split path does.
+    The FP8 w_kc kernel feeds DSA, which keeps FP8 Q at any head count."""
+
+    def _q_out_dtype(self, num_heads, kv_cache_dtype, w_kc_dtype=torch.uint8):
+        is_mxfp4 = w_kc_dtype == torch.uint8
+        attn = SimpleNamespace(
+            kv_cache_dtype=kv_cache_dtype,
+            current_attention_backend="aiter" if is_mxfp4 else "dsa",
+            w_kc=torch.empty(num_heads, 4, 2, dtype=w_kc_dtype),
+            w_scale_k=torch.empty(num_heads, 4, 1, dtype=torch.uint8),
+            w_scale=torch.empty(1),
+            rotary_emb=SimpleNamespace(
+                cos_cache=None, sin_cache=None, is_neox_style=False
+            ),
+            attn_mqa=SimpleNamespace(layer_id=0, k_scale=None),
+        )
+        q_nope = torch.empty(3, num_heads, 4, dtype=torch.bfloat16)
+        fp4_kernel = mock.Mock()
+        fp8_kernel = mock.Mock()
+        kv_pool = mock.Mock()
+        with (
+            mock.patch.object(
+                forward_mla_rocm,
+                "fused_fp4_bmm_rope_cat_and_cache_mla",
+                fp4_kernel,
+                create=True,
+            ),
+            mock.patch.object(
+                forward_mla_rocm,
+                "fused_fp8_bmm_rope_cat_and_cache_mla",
+                fp8_kernel,
+                create=True,
+            ),
+            mock.patch.object(
+                forward_mla_rocm, "get_token_to_kv_pool", return_value=kv_pool
+            ),
+        ):
+            forward_mla_rocm._fused_bmm_rope_cat_and_cache(
+                attn,
+                q_nope=q_nope,
+                q_pe=None,
+                k_nope=None,
+                k_pe=None,
+                positions=None,
+                out_cache_loc=torch.zeros(3, dtype=torch.int64),
+            )
+        kernel, unused = (
+            (fp4_kernel, fp8_kernel) if is_mxfp4 else (fp8_kernel, fp4_kernel)
+        )
+        unused.assert_not_called()
+        return kernel.call_args.kwargs["q_out_dtype"]
+
+    def test_fp8_cache_with_12_heads_keeps_bf16_q(self):
+        self.assertEqual(self._q_out_dtype(12, "fp8_e4m3"), torch.bfloat16)
+        self.assertEqual(self._q_out_dtype(8, "fp8_e4m3"), forward_mla_rocm.fp8_dtype)
+        self.assertEqual(self._q_out_dtype(12, "auto"), torch.bfloat16)
+
+    def test_fp8_w_kc_keeps_fp8_q_at_12_heads(self):
+        self.assertEqual(
+            self._q_out_dtype(12, "fp8_e4m3", w_kc_dtype=torch.float8_e4m3fn),
+            forward_mla_rocm.fp8_dtype,
+        )
 
 
 _ROPE_HEAD_DIM = 64
