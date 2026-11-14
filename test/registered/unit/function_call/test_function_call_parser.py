@@ -2441,6 +2441,62 @@ class TestQwen3CoderDetector(unittest.TestCase):
             schema, '[1.5,1e3,"NaN","Infinity"]', [1.5, 1000.0, "NaN", "Infinity"]
         )
 
+    def test_values_not_representable_in_json_remain_strings(self):
+        """Plain number/array/object values must not produce invalid argument JSON."""
+        number = {"type": "number"}
+        numbers = {"type": "array", "items": number}
+        for schema, raw in (
+            (number, "inf"),
+            (number, "nan"),
+            (number, "-Infinity"),
+            (number, "1e999"),
+            (numbers, "[1.5, NaN, 3.0]"),
+            (numbers, "[1e999]"),
+            ({"type": "object"}, '{"max": Infinity}'),
+            # ast.literal_eval reaches types JSON has no notion of.
+            ({"type": "array", "items": {"type": "integer"}}, "{1, 2, 3}"),
+        ):
+            self._check_structured_union_value(schema, raw, raw)
+
+    def test_json_representable_values_are_still_converted(self):
+        """Ordinary values must keep their converted type."""
+        for schema, raw, expected in (
+            ({"type": "number"}, "5", 5),
+            ({"type": "number"}, "5.5", 5.5),
+            ({"type": "number"}, "1e3", 1000.0),
+            ({"type": "array", "items": {"type": "number"}}, "[1.5, 2]", [1.5, 2]),
+            ({"type": "object"}, '{"max": 3}', {"max": 3}),
+        ):
+            self._check_structured_union_value(schema, raw, expected)
+
+    def test_unrepresentable_value_keeps_the_other_calls(self):
+        """A value json.dumps rejects must not discard the calls around it."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="record",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "array", "items": {"type": "integer"}}
+                        },
+                    },
+                ),
+            )
+        ]
+        call = (
+            "<tool_call><function=record><parameter=value>"
+            "{value}</parameter></function></tool_call>"
+        )
+        text = call.format(value="[1, 2]") + call.format(value="{1, 2, 3}")
+        result = Qwen3CoderDetector().detect_and_parse(text, tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(
+            [json.loads(c.parameters) for c in result.calls],
+            [{"value": [1, 2]}, {"value": "{1, 2, 3}"}],
+        )
+
     def test_union_validation_errors_preserve_tool_calls(self):
         """Invalid or recursive schemas must preserve strings in both parse modes."""
         for branch in (

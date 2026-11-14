@@ -18,6 +18,15 @@ def _call(name, params):
     return f"<tool_call>\n<function={name}>\n{body}</function>\n</tool_call>"
 
 
+def _strict_json(payload):
+    """Parse like a strict reader: json.loads accepts NaN/Infinity, JSON does not."""
+
+    def reject(constant):
+        raise AssertionError(f"arguments are not valid JSON: {constant}")
+
+    return json.loads(payload, parse_constant=reject)
+
+
 def _assemble(detector, chunks, tools):
     text, calls = [], {}
     for chunk in chunks:
@@ -44,6 +53,7 @@ class TestGraniteToolCallDetector(CustomTestCase):
                             "days": {"type": "integer"},
                             "verbose": {"type": "boolean"},
                             "tags": {"type": "array"},
+                            "limit": {"type": "number"},
                         },
                     },
                 ),
@@ -107,6 +117,24 @@ class TestGraniteToolCallDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "\n\nanswer\n")
         streamed, _ = _assemble(GraniteToolCallDetector(), list(text), self.tools)
         self.assertEqual(streamed, "\n\nanswer\n")
+
+    def test_values_not_representable_in_json_remain_strings(self):
+        """A value JSON cannot hold keeps the model's text, so a tool call's
+        arguments stay valid JSON in both modes."""
+        for name, raw in (
+            ("limit", "inf"),
+            ("limit", "1e999"),
+            ("tags", "[1.5, NaN, 3.0]"),
+            ("tags", "{1, 2, 3}"),
+        ):
+            with self.subTest(parameter=name, value=raw):
+                text = _call("get_weather", [(name, raw)])
+                result = GraniteToolCallDetector().detect_and_parse(text, self.tools)
+                self.assertEqual(_strict_json(result.calls[0].parameters), {name: raw})
+                _, streamed = _assemble(
+                    GraniteToolCallDetector(), list(text), self.tools
+                )
+                self.assertEqual(_strict_json(streamed[0]["args"]), {name: raw})
 
     def test_registered_as_granite_toolcall_parser(self):
         self.assertIs(
