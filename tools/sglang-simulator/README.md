@@ -40,6 +40,9 @@ matching official SGLang image.
 
 ### Estimator SDK
 
+The estimator SDK is optional. Replay with an explicit `max_total_tokens` does
+not import it, including when the KNN fallback is selected.
+
 Install the AISimulate estimator SDK in a compatible environment:
 
 ```bash
@@ -47,7 +50,7 @@ pip install -e "tools/sglang-simulator[aisimulate]"
 ```
 
 The extra pins `aisimulate==0.13.0`. The official wheels require Python
-3.11–3.13 and cover Linux x86_64/aarch64 and macOS arm64. This release exposes
+3.11-3.13 and cover Linux x86_64/aarch64 and macOS arm64. This release exposes
 the modern `aisimulate.sdk` namespace.
 
 AISimulate 0.13.0 requires NumPy>=2.1,<3, replacing the NumPy 1.26.4 pin
@@ -63,7 +66,8 @@ No old-package uninstall is needed in a fresh environment.
 
 Use the `aisimulate` predictor name for the existing static op-level path,
 including phase scale factors.
-The shared memory-estimation path also uses this SDK for ML/replay predictors.
+The default memory-estimation path also uses this SDK for ML/replay predictors.
+An explicit token capacity or the optional resource budget below avoids that path.
 
 #### Migrating from AIConfigurator
 
@@ -139,6 +143,216 @@ AISimulate environment with the real SDK installed.
 
 ## Serving mode
 
+### Closed-loop workloads
+
+In a closed-loop workload, request completion or a tool timer determines the next
+request. The **workload driver** owns these dependencies, its dataset parser,
+concurrency, warmup, and stopping conditions. The **simulator** owns model request
+scheduling, cache state, and predicted execution time. No dataset schema or agent
+framework is required by the server.
+
+Coordination is independent of the latency predictor. AISimulate (the existing
+AIConfigurator integration), ML, and replay use the same request/clock boundary.
+The predictor supplies execution durations; the coordinator owns causal
+advancement and request lifecycle.
+
+```text
+workload driver -- Ready / Submit / Cancel --> coordinator
+                <-- Grant / virtual time ---      |
+                                                   v
+predictor -- batch duration --> SGLang scheduler -- HTTP / timing metadata
+```
+
+Clients can use either existing execution mode:
+
+| | `BLOCKING`: real time | `OFFLINE` with coordinator: fast-forward |
+|---|---|---|
+| Client | An ordinary HTTP workload driver. | A driver using the coordinator protocol. |
+| Timing | Predicted batch latency is spent sleeping; client timers use real time. | Client and server advance virtual time together. |
+| Metrics | Client measurements include HTTP, tokenization, and scheduling overhead. | The driver uses simulator timestamps. |
+
+Both paths use the same scheduler, cache, and latency predictor. The model output
+is synthetic: the driver must supply response history and workload dependencies
+when replaying a trace. These runs do not evaluate generated answers or agents
+choosing tools from model output. Results depend on the predictor data;
+the bundled replay table is an example, not a hardware performance calibration.
+
+#### Real-time HTTP clients
+
+Start a small example server from the repository root:
+
+```bash
+export SGLANG_USE_CPU_ENGINE=1
+export CUDA_VISIBLE_DEVICES=""
+export SGLANG_SIMULATOR_OUTPUT_MODE=BLOCKING
+unset SGLANG_SIMULATOR_COORDINATOR
+
+python3 -m sglang_simulator.simulation.sglang.launch_server \
+  --model-path tools/sglang-simulator/test/assets/qwen3-8b \
+  --tokenizer-path tools/sglang-simulator/examples/assets/tokenizer \
+  --chat-template chatml \
+  --sim-config-path tools/sglang-simulator/examples/sim_configs/replay.json \
+  --max-total-tokens 8192 \
+  --disable-overlap-schedule \
+  --skip-server-warmup \
+  --port 30000
+```
+
+Point an HTTP driver at `http://127.0.0.1:30000`. It can use `/generate` or the
+OpenAI-compatible API and issue dependent requests after responses and tool
+waits. No coordinator integration is needed. Requests can run concurrently, but
+a five-second tool wait takes five real seconds. For actual traces, replace the
+example model configuration and tokenizer and set cache capacity for the workload.
+Compare client wall-time metrics separately from simulator logical-time metrics.
+
+#### Fast-forward clients
+
+Restart the server with the same launch command and these environment settings:
+
+```bash
+export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
+export SGLANG_SIMULATOR_COORDINATOR=tcp://127.0.0.1:30001
+```
+
+Run the two-request example:
+
+```bash
+python3 tools/sglang-simulator/examples/closed_loop.py --tool-delay 5
+```
+
+The tool delay advances virtual time without sleeping. For parallel branches
+and a join, restart the server and run
+`python3 tools/sglang-simulator/examples/fork_join.py --tool-delay 5`.
+Both examples use `/generate`; see [the example guide](examples/README.md) to
+adapt the event loop to another dataset. OpenAI HTTP/SSE requests use the same
+protocol by including `rid` in the body. One server handles one run; restarting
+gives the next run a clean clock and cache.
+
+Plain `OFFLINE` cannot account for a client's future requests or tool waits.
+Use `BLOCKING` for clients without coordinator support. Coordination itself
+requires `OFFLINE`.
+
+`SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT` configures the scheduler bridge's
+physical driver/payload wait budget in seconds (default `30`). Values must be
+finite and strictly positive; invalid values fail initialization. If a client
+legitimately needs more wall time to consume an HTTP/SSE terminal response before
+its next `Ready`, set an explicit budget, for example
+`SGLANG_SIMULATOR_COORDINATOR_WALL_TIMEOUT=600` to align with a 600-second client
+budget. This does not change virtual deadlines, cost predictions or protocol
+ordering. An absent driver still fails when the configured budget expires.
+
+#### Driver contract
+
+The protocol uses conservative event synchronization: the server advances only
+when the driver has accounted for all work at the current virtual time. The
+transport is JSON over a loopback ZeroMQ REQ/REP connection, separate from HTTP.
+[`AsyncCoordinatorClient`](src/sglang_simulator/simulation/client.py) implements
+the exchange; it does not execute workloads.
+
+The adapter interface is `AsyncCoordinatorClient` and the `Ready`, `Submit`,
+`Cancel`, `Grant`, and `Terminal` message types in
+[`simulation.coordinator`](src/sglang_simulator/simulation/coordinator.py).
+The server-side `Coordinator`, scheduler bridge, and native request objects are
+implementation details; workload adapters should not depend on them.
+
+Protocol version 1 has two messages:
+
+| Message | Fields |
+|---|---|
+| `Ready` | Stable `run_id`, sequential `round` starting at 0, ordered `operations` (`{"type":"submit","rid":"..."}` or `{"type":"cancel","rid":"..."}`), optional `next_wakeup_ns`, and `finished`. A cancel may include `reason`. |
+| `Grant` | Matching `run_id` and `round`, `now_ns`, `terminals` (`rid`, `kind`, `at_ns`, optional `reason`), and `status` (`CONTINUE`, `FINISHED`, or `ERROR` with `error`). Terminal kinds are `COMPLETED`, `CANCELLED`, and `ERROR`. |
+
+Both carry `protocol_version: 1`; only one `Ready` may be outstanding. All times
+are integer nanoseconds relative to the run. The earliest pending client timer
+is `next_wakeup_ns`; omit it when no timer is pending. Each round follows these rules:
+
+1. Process current completions and timers, including work their callbacks create.
+   Start HTTP requests concurrently with `Ready`; its submits form the input
+   barrier, so the server waits for every active submitted payload before advancing.
+2. Read `Grant` and consume HTTP results for its completed requests before
+   releasing dependent work. A timer-only grant needs no HTTP result; other
+   requests may remain pending across rounds. Do not wait for all pending HTTP
+   requests before sending the next `Ready`, or release dependencies on HTTP
+   arrival alone.
+3. When stopping, submit required cancels and set `finished`. Continue consuming
+   terminals and sending finished rounds until `FINISHED` confirms native cleanup.
+
+Use unique, equal-length request IDs within a run: SGLang's native cancellation
+matches ID prefixes. The HTTP pool must admit every request in a round without
+waiting for earlier responses; the examples use a dedicated unlimited aiohttp
+pool and control workload concurrency explicitly. Protocol watchdogs use real
+time to detect failures. They do not advance simulated time, and a timed-out
+exchange must not be retried on the same run.
+
+The initial scope is one local driver and scheduler, text generation with
+ordinary radix cache, and completion-triggered workflows. HiCache, PD, explicit
+sessions, LoRA, speculative decoding, and asynchronous grammar are rejected.
+Coordinated runs preserve native `--prefill-decode-interval` countdowns when the
+runtime exposes the validated cadence helper and schedule-pass surfaces. A
+cadence-only pass with pending native work consumes no modeled forward time:
+it neither advances the clock nor grants a future client timer. Unsupported
+native cadence surfaces fail before coordinator binding. Other compatibility
+guards, including speculative decoding, DP attention and overlapping execution,
+remain unchanged.
+
+Phase deadlines are driver-owned virtual timers; native wall-time waiting/running
+timeouts must be disabled. HTTP/SSE transport and predictor execution time do not
+contribute to virtual CPU overhead. Unmodeled frontend/CPU costs are zero.
+Predicted batch durations must be positive at nanosecond resolution; a zero-cost
+fallback is rejected rather than allowing an endless workload at one timestamp.
+
+Startup generation warmup is skipped. The driver may perform workload/cache
+warmup, then start its measurement window without resetting cache state. Warmup
+requests and time must be excluded from benchmark results.
+Administrative resets and profiling requests are rejected. Harness-specific
+phase scheduling and metric aggregation remain in that harness's adapter.
+
+#### Output and metrics
+
+For fixed-length trace replay, request the desired output length with
+`ignore_eos: true`. Prompt lengths depend on the supplied tokenizer and chat
+template; use actual server token and cache counts for metrics. Trace-declared
+lengths and synthetic output text do not establish cache reuse by themselves.
+
+Coordinated `/generate` responses include a timing snapshot under
+`meta_info.sglang_simulator`. Streaming chat (`/v1/chat/completions`, `n=1`)
+emits the same snapshot as an additional SSE event before each native content output:
+
+```text
+event: sglang_simulator
+data: {"version":1,"rid":"request0","arrival_ns":0,"first_token_ns":10000000,"last_token_ns":30000000,"commit_ns":30000000,"terminal_ns":30000000,"prompt_tokens":7,"completion_tokens":3,"cached_tokens":0}
+```
+
+All times are integer nanoseconds relative to the coordinated run. Arrival is
+the `Submit` time; first/last token times are native visible-token commits after
+the modeled batch finishes. `commit_ns` is the current result's commit time.
+`terminal_ns` is null until native completion; first/last are null until a token
+is committed. A result with no new tokens leaves first/last unchanged. Counts
+come from native prompt, visible output and cache state; cache reporting is
+enabled automatically for coordinated runs.
+
+Snapshots use constant space per request and preserve first/last times when
+streaming chunks are coalesced or emitted less frequently. They do not contain
+per-token timestamps, so they support TTFT, completion latency and mean TPOT,
+not per-token ITL percentiles. The initial empty role chunk can precede the first
+snapshot. For streaming chat metrics, request `stream_options: {"include_usage": true}`
+and validate the terminal snapshot against final usage before consuming `[DONE]`.
+Non-streaming `/generate` returns its snapshot and counts in the JSON response.
+Cancellation before a token commit retains the native abort response.
+
+The ordinary HTTP path is covered by `test_simulation_blocking_agentic.py`;
+`test_simulation_blocking_pacing.py` checks cache-load response timing.
+Focused coordinator tests are `test_simulation_coordinator.py`,
+`test_simulation_timing_metadata.py`, `test_simulation_coordinated_bridge.py`, and
+`test_simulation_coordinated_serving.py` (replay). The real AISimulate SOL/SILICON
+and HTTP integration is `test_simulation_coordinated_aisimulate.py`; it compares
+identical virtual timelines and token usage with and without HTTP delivery delay.
+This group requires the installed AISimulate extra and does not replace SDK
+execution with skips or synthetic costs. Run test files in separate processes,
+as simulator hooks cache configuration at import time.
+
+### Timestamped serving workloads
+
 Choose a fresh output directory and export it in the server terminal before
 starting the server:
 
@@ -193,11 +407,137 @@ Set the real deployment topology under `scheduler` in `--sim-config-path`. That
 topology drives predictor and cache-resource modeling without launching physical
 parallel workers.
 
+CPU-only DSpark simulation keeps packed KV value payloads on PyTorch `meta`
+tensors. Native shapes and dtypes remain available without allocating the unused
+KV values. Integer page allocators, request state and logical token capacities
+remain on CPU; this payload storage choice does not change predicted costs or
+admit accuracy.
+
 Other server options are normal SGLang command-line arguments. For direct Python
 integration, see
 [`test_simulation_sglang_runner.py`](test/test_simulation_sglang_runner.py); for the
 process/HTTP path, see
 [`test_simulation_sglang_serving.py`](test/test_simulation_sglang_serving.py).
+
+## Optional committed-output ledger
+
+Iteration records retain their complete JSONL representation in
+`iteration.jsonl`. During a profile window, the scheduler compresses these
+records into an exclusive `.iteration-*.spool` file in the configured output
+directory and keeps only small metric summaries in memory. Provision disk space
+for the spool and final exports; select an output directory on disk for long
+CPU simulations. This changes evidence storage, not virtual costs or progress.
+The spool is removed after a successful export and profile reset. Export or
+spool-write failures preserve it for diagnosis and must not be treated as a
+completed profile.
+
+For long runs, explicitly set `SGLANG_SIMULATOR_EVIDENCE_COMPRESSION=gzip`
+to export `iteration.jsonl.gz` instead. Decompression recovers the unchanged
+JSONL records; metrics and virtual execution are unaffected. The default is
+`none`, retaining `iteration.jsonl`. For native evaluated-cost evidence, an
+explicit path ending in `.gz` selects complete concatenated gzip members,
+one per original JSONL row. Its reported byte count and SHA-256 cover the
+uncompressed JSONL, explicitly identified by `digest_scope`. Artifact custody
+must additionally hash the actual compressed file. An interrupted or failed
+stream is still incomplete and cannot establish successful execution.
+
+For repeated large evidence documents, install this project's optional `zstd`
+extra (`pip install '.[zstd]'`) and explicitly set
+`SGLANG_SIMULATOR_EVIDENCE_COMPRESSION=zstd`. This selects checksummed Zstandard
+frames for the private iteration spool and exports `iteration.jsonl.zst`.
+Use a native evaluated-cost evidence path ending in `.zst` to select one complete,
+checksummed Zstandard frame per original JSONL row. Concatenated frames retain
+completed evaluated rows when a later write fails. The default and existing
+plain/gzip formats remain available without the optional dependency.
+
+Both codecs recover the original JSONL bytes, including row order. Evaluated
+metrics continue to hash and count the uncompressed stream; separately hash
+the compressed artifact for custody. A reader must decode every frame and
+validate its checksum and the uncompressed SHA/size before admitting evidence.
+Record the selected source and codec for each new run. Preserve earlier source
+files, failed spools and compressed identities; never reinterpret an older
+artifact as a different codec. Provision for the spool and final export to
+coexist, and measure peak use before selecting a smaller run budget. Codec
+tests establish storage equivalence, not workload accuracy or successful E2E.
+
+For metrics-only runs, explicitly set `SGLANG_SIMULATOR_EVIDENCE_LEVEL=metrics`
+in the container environment. The default is `full`. Metrics-only mode retains
+the numeric iteration summaries used by metric reduction, request statistics,
+and any separately enabled token-event ledger, while omitting the verbose
+iteration spool/export and native evaluated-cost file (even if its path was
+configured). Metrics explicitly mark those artifacts as omitted by policy;
+the absence does not establish independent per-step cost verification.
+Prediction, request progress, scheduling, and validation of each SDK result
+still run normally. Client-side raw request/response and protocol recording
+are controlled separately by the selected client configuration.
+
+To also avoid constructing verbose CPU evidence, set
+`SGLANG_SIMULATOR_METRICS_CPU_DETAIL=off` together with metrics retention. Its
+default is `on`. The native public-SDK adapter then uses the same family-prepared
+numeric cost API and preserves phase costs and causal progress. It passes the
+initialization-verified runtime profile by digest inside each step, restores the
+exact original profile at the SDK boundary, and parses only the current immutable
+step once. Detailed query records, source classifications and full cost digests
+are unavailable in this mode; it is intended for final-metric runs rather than
+per-stage audits. Token-event and retirement recording remain separately opt-in.
+
+Canonical metadata validation uses independent bounded caches for immutable run
+profiles, request sampling recipes and changing execution documents. Batch growth
+cannot evict a run profile through unrelated request or execution entries. Only
+immutable validation summaries are retained; changed or malformed inputs still
+take the original validation path. Oversized documents remain validatable without
+entering the caches. This does not cache costs, progress or scheduling outcomes.
+
+CPU prefix matching preserves the native `RadixKey` namespaces, limits, bigram
+boundaries and page rounding. For long shared signed-64-bit token prefixes it
+compares synchronous borrowed NumPy views instead of repeatedly copying slices.
+Short/divergent prefixes and unsupported representations use the native method.
+No view escapes the call and cache insertion, checkpointing and eviction remain
+owned by the native cache. Differential tests exercise the checked-out native
+class; this representation optimization does not approximate cache hits.
+
+Select the retention level before starting a new process. Record it in the run
+identity and provision storage for the artifacts actually requested. Do not
+change a running process's policy or delete its originals to adopt a new mode.
+Use `full` when downstream acceptance requires complete regional-cost and
+committed-step evidence; a metrics-only run cannot satisfy that contract.
+
+For coordinated OFFLINE runs, set
+`SGLANG_SIMULATOR_TOKEN_EVENTS=/absolute/path/to/token_events.jsonl` to retain
+native visible output-token commits. The parent directory must exist and the
+file must be new. With the variable unset, the recorder is disabled and does no
+file I/O. Recording does not change virtual batch costs or scheduling.
+
+The JSONL stream starts with
+`{"event":"start","version":1,"clock":"virtual_ns"}`. Each output-producing
+batch writes an `output_commit` containing integer `at_ns` and `commits` entries
+with `rid`, zero-based `output_index`, and positive incremental `token_count`.
+Counts come from native visible output progression, including the first prefill
+token and multi-token commits. Empty/chunk-only/aborted results add no tokens.
+Previously committed tokens remain in the stream when their request is later
+cancelled. This measures output, not speculative or cancelled computation whose
+tokens were discarded before becoming visible.
+
+Only successful coordinator completion writes a `finish` footer containing
+`run_id`, integer `at_ns`, `status: "FINISHED"`, and `total_output_tokens`.
+Interrupted or failed streams have no success footer and must not be treated as
+complete results. Writes are flushed per batch; a write failure aborts the
+coordinated run. Existing files are never overwritten.
+
+The ledger contains no workload phases. A caller supplies exact integer virtual
+phase boundaries and request ownership separately. For fixed-duration throughput,
+sum the selected profiling requests' commits in `[start_ns, start_ns + duration_ns)`
+and divide by that configured duration, retaining output from requests later
+cancelled. Exclude warmup by request ownership as well as time: warmup completion
+and profiling start can share a timestamp. Report grace-period output and successful
+request latency cohorts separately. An early-ended measurement is incomplete and
+must not be presented as a full-duration throughput point. Legacy request statistics'
+requested `output_length` are not a substitute for this ledger.
+
+The AgentX reference output-token throughput counts output from successful
+profiling requests over their observed earliest-start/latest-end span. It uses a
+different output cohort and denominator; report it separately from fixed-window
+committed throughput.
 
 ## Simulation modes
 
@@ -272,6 +612,7 @@ Supported predictors:
 | `aisimulate` | Operator and module performance-database estimation. |
 | `ml` | A trained sklearn-compatible 18-feature latency model. |
 | `replay` | Exact or nearest-neighbor batch-composition replay. |
+| `simopus` | Public SimOpus forward latency; the optional [native staged route](docs/simopus-native.md) keeps source and progress scope explicit. |
 
 Relative predictor paths are resolved from the simulator configuration location.
 Environment variables in paths use `${NAME}` syntax.
@@ -325,3 +666,156 @@ Runtime changes should also be validated in a matching official SGLang image
 with both `OFFLINE` and `BLOCKING` modes. Predictor changes should report
 step-level error, and scheduler or cache changes should compare request latency,
 throughput, and prefix-cache reuse against measured traces.
+
+### Explicit CPU bootstrap
+
+CPU compatibility is active only when both `SGLANG_SIMULATOR_BOOTSTRAP=1`
+and `SGLANG_USE_CPU_ENGINE=1` are set by the simulator worker entry point.
+It keeps native quantization configuration validation, while avoiding physical
+accelerator discovery and import-time AITER loading for dummy model execution.
+Without both flags, the CPU bootstrap wrappers remain inactive. The separate
+Quark change defers its optional AITER import until the quantization call in all
+execution modes; that call keeps its original arguments, result and dependency
+error. This changes import timing without replacing the quantizer.
+
+Explicit CPU simulation also defaults `SGLANG_TIMEOUT_KEEP_ALIVE` to 3600 real
+seconds. The native five-second idle lifetime can close a pooled HTTP connection
+while a virtual-time client performs slow CPU work between requests. Explicit
+user values are preserved. This finite transport setting does not change the
+simulated benchmark horizon, workload or metric clock.
+
+The CPU pool plumbing translates an explicit logical token capacity to the
+native pool byte budget. Its bounded search rejects unreachable layouts rather
+than spinning indefinitely, preserving native sizing and rounding.
+
+### Packed KV metadata on CPU
+
+The CPU simulator preserves the native packed-KV geometry and allocation state.
+Unused model-value buffers are allocated on `meta`; integer allocators, logical
+capacity, request/window state and the pool's CPU device remain native. Packed
+factories see their original dimensions, including nested initializations, and
+exceptions restore the enclosing geometry/device context. Ordinary pools retain
+their existing compact payload behavior. The optimization is guarded by the
+explicit CPU simulator flags and does not patch a real GPU model's KV payload.
+
+### Source-bound native ADP1 provider
+
+The optional [native provider](docs/simopus-native.md) executes V4.1 Flash
+stages through the public SimOpus SDK and retains SGLang request/KV ownership.
+This layer includes the explicit SourceGolden351 progress policy and rejects
+unsupported topologies. It does not require the ordinary R1 latency provider
+or automatic SDK KV budgeting.
+
+### Optional SimOpus model-forward provider
+
+Select `predictor.name: "simopus"` to estimate ordinary DeepSeek-R1 forwards
+through the public SimOpus SDK. Install a compatible SDK separately and use the
+[explicit R1 example](examples/sim_configs/simopus_deepseek_r1_mi355x_eager.json)
+with the complete matching systems data, model revision and SDK revision.
+
+The adapter snapshots CPU batch metadata before the runner mutates it, converts
+SDK milliseconds to simulator seconds, and preserves query failures and result
+provenance. Unselected providers do not import SimOpus. This route does not
+require a coordinator or automatic KV budgeting and does not implement native
+speculative stages.
+
+Contract checks run without model execution. The HTTP checks in
+`test/test_simopus_e2e.py` require Linux, SGLang, the real SDK,
+`SIMOPUS_E2E_SYSTEMS_ROOT` and `SIMOPUS_E2E_MODEL_PATH`; missing inputs are reported
+as skipped rather than presented as integration evidence.
+
+The compatible SDK must expose `PerfDatabase.stack_sha256`. The adapter records
+that original stack digest through the SDK; it never opens a slice metadata path
+or selects a storage format. Directory and SQLite data therefore use the same
+initialization and provenance contract.
+
+### Optional SDK resource budget
+
+`memory_budget.provider: "simopus"` selects a separate structural resource
+estimate for the declared target deployment. It does not select the latency
+predictor: replay, ML or another predictor can use this budget independently.
+The configuration pins the SDK revision, model identity and an explicit policy.
+Unsupported layouts fail rather than falling back to host memory or guessed
+capacity. An explicit `--max-total-tokens` takes precedence and does not load
+the resource SDK. With no `memory_budget`, existing target capacity estimation
+is unchanged. Successful optional budgets are included in `metrics.json` with
+their resource, policy and topology provenance.
+
+#### Replay with an independent resource budget
+
+[`replay_simopus_budget.json`](examples/sim_configs/replay_simopus_budget.json)
+combines the existing replay table with an SDK resource budget for Qwen3-8B.
+It needs the CPU bootstrap and shared SDK loader, not the SimOpus latency or
+native staged provider. Install the simulator and a SimOpus SDK build exposing
+`build_model_resources` and `estimate_memory_budget`; AISimulate is not required
+for this example. The replay table and its 1 ms miss fallback are demonstration
+latencies, not measured model performance.
+
+From the repository root, create a local configuration pinned to the SDK that
+is actually installed. Keep it beside the example so its relative replay-table
+path remains valid:
+
+```bash
+python3 - <<'PY'
+import json
+import re
+from pathlib import Path
+
+import simopus
+
+source = Path("tools/sglang-simulator/examples/sim_configs/replay_simopus_budget.json")
+config = json.loads(source.read_text())
+revision = simopus.__revision__
+assert re.fullmatch(r"[0-9a-f]{40}", revision), "Install a revision-stamped SDK build"
+config["memory_budget"]["provider_revision"] = revision
+source.with_name("replay_simopus_budget.local.json").write_text(
+    json.dumps(config, indent=2) + "\n"
+)
+PY
+
+SGLANG_USE_CPU_ENGINE=1 CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" \
+python3 -m sglang_simulator.simulation.sglang.launch_server \
+  --model-path "$PWD/tools/sglang-simulator/test/assets/qwen3-8b" \
+  --tokenizer-path "$PWD/tools/sglang-simulator/examples/assets/tokenizer" \
+  --sim-config-path tools/sglang-simulator/examples/sim_configs/replay_simopus_budget.local.json \
+  --max-running-requests 8 --disable-overlap-schedule --page-size 1 \
+  --skip-server-warmup --device cpu --port 30000
+```
+
+Do **not** pass `--max-total-tokens`: it deliberately bypasses automatic sizing.
+The local model fixture supplies configuration without downloading weights;
+`model_revision: null` makes no Hugging Face revision claim. The SDK records its
+configuration SHA and resource digest. For an actual local Qwen3-8B checkpoint,
+use its model/tokenizer directories and set `memory_budget.model_revision` to
+that checkpoint's full commit rather than inventing a revision for the fixture.
+The checked-in example pins the SDK revision used by its resource integration
+test; the preparation command above explicitly replaces that pin for your build.
+
+`GET /server_info` reports the selected `max_total_num_tokens`. After a profiled
+request, `metrics.json.memory_budget` records the same capacity and SDK/model/
+policy/topology provenance. This is a capacity simulation, not a physical OOM
+guarantee; speculative, sliding-window and other unsupported pool layouts still
+fail explicitly.
+
+### Optional native retirement evidence
+
+Set `SGLANG_SIMULATOR_EXECUTION_EVENTS` to a fresh writable JSONL path to export
+the coordinated scheduler's actual processed results. The stream records its
+virtual-clock identity, each result's request IDs and retirement time, and a
+prefix byte count/SHA256. Only the coordinator's drained `FINISHED` grant writes
+the success footer. Failure or interruption closes the stream without sealing it.
+Evaluated phase costs are separate evidence and never become retirement events.
+
+The writer retains a hash, counters and one bounded record on the Python heap;
+it does not retain request histories or token payloads. Export errors propagate.
+This stream is independent of verbose iteration retention, so a client may use
+`SGLANG_SIMULATOR_EVIDENCE_LEVEL=metrics` while preserving original request-to-native
+execution evidence. Neither the observer nor retention mode changes the modeled
+clock, native result, cost, progress policy or workload horizon.
+
+The coordinated scheduler waits for both the control socket and the native
+tokenizer payload socket when the latter is a ZMQ socket. Incoming HTTP payloads
+can wake the existing admission loop immediately; a control-only polling timeout
+does not delay their receipt. Unsupported receiver proxies retain bounded polling.
+This changes only wall-clock waiting: the native receiver, admission ordering,
+virtual clock, cancellation and result commitment remain the same owners.

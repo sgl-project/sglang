@@ -48,3 +48,41 @@ python3 benchmark/simulator/bench_serving.py \
 
 The timestamp trace uses the simulator-owned Autobench JSONL contract. Its
 `timestamp` values are request-arrival times in milliseconds.
+
+## Closed-loop drivers
+
+Start the CPU example server in the main README's
+[closed-loop guide](../README.md#closed-loop-workloads), using `OFFLINE` and
+`SGLANG_SIMULATOR_COORDINATOR=tcp://127.0.0.1:30001`. From the repository root:
+
+```bash
+python3 tools/sglang-simulator/examples/closed_loop.py --tool-delay 5
+```
+
+This sends a request, waits five virtual seconds, then sends its dependent
+request. Restart the server to run the fork/join example:
+
+```bash
+python3 tools/sglang-simulator/examples/fork_join.py --tool-delay 5
+```
+
+Its workflow is `root → tool timer → {left, right} → join`. The branches have
+different output lengths, so the driver must handle separate completion events
+and submit the join only after both branches finish. The simulator determines
+completion times from its scheduler and latency predictor.
+
+These are explicit event loops built on `AsyncCoordinatorClient`, with ordinary
+HTTP for model requests. To use another dataset:
+
+1. Parse its records into request bodies, dependencies, and tool delays in the
+   driver. Preserve recorded history when subsequent prompts depend on it.
+2. At each grant, consume the matching completed HTTP results, update dependency
+   state, and submit newly runnable requests. Keep other HTTP requests pending.
+3. Register the earliest workload timer in `Ready`, and finish only after all
+   work and cancellation cleanup have drained.
+
+No server change or shared dataset format is needed. A larger harness can keep
+its existing scheduler and implement the same
+[driver contract](../README.md#driver-contract) in an adapter. The server models
+request execution; parsing a dataset, choosing branches, separating warmup, and
+aggregating workload metrics remain client responsibilities.
