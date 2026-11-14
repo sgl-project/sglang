@@ -5806,6 +5806,48 @@ class TestGemma4Detector(unittest.TestCase):
                         )
         return normal_text, tool_calls_by_index
 
+    def test_null_and_exponent_values_round_trip(self):
+        """The Gemma 4 chat template renders None as null and small or large
+        floats in exponent form; both used to come back as JSON strings."""
+        text = (
+            "<|tool_call>call:calculate{exact:true,limit:null,tolerance:1e-05,"
+            "values:[0,-0.5,1E+21,null],x:-3,y:2.5}<tool_call|>"
+        )
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="calculate", parameters={"type": "object", "properties": {}}
+                ),
+            )
+        ]
+        expected = {
+            "exact": True,
+            "limit": None,
+            "tolerance": 1e-05,
+            "values": [0, -0.5, 1e21, None],
+            "x": -3,
+            "y": 2.5,
+        }
+
+        result = self.detector.detect_and_parse(text, tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), expected)
+
+        streamed = Gemma4Detector().parse_streaming_increment(text, tools)
+        self.assertEqual(
+            json.loads("".join(call.parameters for call in streamed.calls)), expected
+        )
+
+    def test_non_numeric_bare_values_stay_strings(self):
+        """Words containing "e" and spellings float() accepts must not become
+        numbers, and overflow must not serialize as the invalid token Infinity."""
+        for value in ("e5", "true_value", "nan", "inf", "Infinity", "1e999", "1_0e2"):
+            self.assertEqual(_parse_gemma4_value(value), value)
+
+        text = "<|tool_call>call:get_weather{location:1e999}<tool_call|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.calls[0].parameters, '{"location": "1e999"}')
+
     def test_streaming_multiple_tool_calls(self):
         """Test streaming with two consecutive tool calls."""
         extra_tools = self.tools + [
