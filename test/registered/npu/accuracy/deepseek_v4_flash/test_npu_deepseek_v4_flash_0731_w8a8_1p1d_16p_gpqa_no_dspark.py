@@ -27,7 +27,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
-    "FORCE_DRAFT_MODEL_NON_QUANT": "1",
     "SGLANG_DSV4_FP4_EXPERTS": "False",
     "SGLANG_OPT_FUSE_WQA_WKV": "0",
     "SGLANG_OPT_BF16_FP32_GEMM_ALGO": "torch",
@@ -35,16 +34,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-    # mtp
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "USE_NPU_MOE_GATING_TOP_K": "1",
-    "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
-    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
-    "SGLANG_DSPARK_QUANT_AUDIT": "1",
-    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
-    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
@@ -109,7 +98,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--chunked-prefill-size",
     131072,
     "--dp-size",
-    8,
+    4,
     "--enable-dp-attention",
     "--tokenizer-worker-num",
     16,
@@ -128,7 +117,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-prefill-cp",
     "--cp-strategy",
     "interleave",
-    "--enable-cache-report",
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
@@ -139,18 +127,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
-    # DSPARK configuration, kept in sync with the decode node: the PD prefill
-    # worker prunes the draft to context-KV injection.
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
 ]
 
 # Decode node launch arguments.
@@ -194,16 +170,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     3,
     4,
     5,
-    6,
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
     6,
 ]
 

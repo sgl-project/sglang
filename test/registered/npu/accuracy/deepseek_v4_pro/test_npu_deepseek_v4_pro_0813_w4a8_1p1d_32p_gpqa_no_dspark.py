@@ -26,7 +26,6 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     # skip gpu branch
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
-    "FORCE_DRAFT_MODEL_NON_QUANT": "1",
     "SGLANG_DSV4_FP4_EXPERTS": "True",
     "SGLANG_OPT_FUSE_WQA_WKV": "0",
     "SGLANG_OPT_BF16_FP32_GEMM_ALGO": "torch",
@@ -41,11 +40,6 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
     "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
-    # mtp
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    # dspark
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
@@ -117,18 +111,6 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "write_through",
     "--max-total-tokens",
     140000,
-    # DSPARK configuration, kept in sync with the decode node: the PD prefill
-    # worker prunes the draft to context-KV injection.
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
 ]
 
 # Decode node launch arguments
@@ -168,16 +150,6 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS = [
     1,
     2,
     8,
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
     "--enable-metrics",
 ]
 

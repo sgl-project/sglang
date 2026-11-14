@@ -125,7 +125,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disable-cuda-graph",
     "--load-balance-method",
     "round_robin",
-    "interleave",
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
