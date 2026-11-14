@@ -8,7 +8,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     add_unified_child,

@@ -8,10 +8,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackStrategy,
     _apply_stack_result,
     _DeepSeekV4Strategy,
-    _DsaStrategy,
+    _KvStrategy,
     _MambaStrategy,
     _MiniMaxSparseStrategy,
-    _PlainKvStrategy,
     _select_strategy,
     _SwaStrategy,
     register_stack_strategy,
@@ -23,7 +22,13 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _mock_kvcache(cls):
-    return MagicMock(spec=cls)
+    kvcache = MagicMock(spec=cls)
+    kvcache.start_layer, kvcache.layer_num = 0, 1
+    kvcache.full_kv_pool, kvcache.swa_kv_pool = MagicMock(), MagicMock()
+    kvcache.layers_mapping, kvcache.full_attention_layer_id_mapping = {}, {}
+    # Routed as the class routes its own pools: its sub-pools and views.
+    kvcache.layer_router = cls._build_layer_router(kvcache)
+    return kvcache
 
 
 FULL = ComponentType.FULL
@@ -61,7 +66,7 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
 
         kvcache = _mock_kvcache(DSATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
-        self.assertIsInstance(strategy, _DsaStrategy)
+        self.assertIsInstance(strategy, _KvStrategy)
 
     def test_minimax_sparse(self):
         from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -114,14 +119,14 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
 
         kvcache = _mock_kvcache(MHATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
-        self.assertIsInstance(strategy, _PlainKvStrategy)
+        self.assertIsInstance(strategy, _KvStrategy)
 
     def test_mla_routes_to_plain(self):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
         kvcache = _mock_kvcache(MLATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
-        self.assertIsInstance(strategy, _PlainKvStrategy)
+        self.assertIsInstance(strategy, _KvStrategy)
 
     def test_unknown_combo_raises(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -163,7 +168,7 @@ class TestApplyStackResult(unittest.TestCase):
         cache.components = {ct: MagicMock() for ct in component_types}
         return cache
 
-    def test_skips_req_to_token_counter_when_flag_false(self):
+    def test_state_reads_do_not_wait_when_the_stack_keeps_no_state(self):
         cache = self._fake_cache([FULL])
         kvcache = MagicMock()
         params = MagicMock()
@@ -172,15 +177,37 @@ class TestApplyStackResult(unittest.TestCase):
             cache_controller=MagicMock(),
             component_host_pools={FULL: MagicMock()},
             sidecars=[],
-            register_req_to_token_counter=False,
+            loads_state_layer_wise=False,
             pools_desc="KV",
         )
 
         _apply_stack_result(cache, kvcache, params, result)
 
         kvcache.register_layer_transfer_counter.assert_called_once()
-        params.req_to_token_pool.register_layer_transfer_counter.assert_not_called()
+        kvcache.layer_router.load_parts_layer_wise.assert_not_called()
         cache.register_sidecar_pool.assert_not_called()
+
+    def test_state_reads_wait_on_the_kv_counter_when_the_stack_loads_state(self):
+        cache = self._fake_cache([FULL])
+        kvcache = MagicMock()
+        params = MagicMock()
+        controller = MagicMock()
+        result = StackBuildResult(
+            host_pool_group=MagicMock(),
+            cache_controller=controller,
+            component_host_pools={FULL: MagicMock()},
+            sidecars=[],
+            loads_state_layer_wise=True,
+            pools_desc="KV + MAMBA",
+        )
+
+        _apply_stack_result(cache, kvcache, params, result)
+
+        # One owner: the counter goes on the KV pool alone.
+        kvcache.register_layer_transfer_counter.assert_called_once_with(
+            controller.layer_done_counter
+        )
+        kvcache.layer_router.load_parts_layer_wise.assert_called_once_with()
 
 
 if __name__ == "__main__":

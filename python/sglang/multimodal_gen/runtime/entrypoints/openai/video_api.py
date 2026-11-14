@@ -21,10 +21,10 @@ from fastapi import (
 from fastapi.responses import FileResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
     maybe_enhance_prompt,
 )
@@ -43,14 +43,19 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     flatten_extra_params,
     get_declared_request_extra_fields,
     merge_image_input_list,
+    parse_form_extra_value,
     process_generation_batch,
     request_extra_value,
     request_field_value,
     request_model_kwargs,
     resolve_sampling_params_cls,
-    sanitize_upload_filename,
-    save_image_to_path,
+    save_first_input_image,
+    select_output_variant,
     temp_dir_if_disabled,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_cancel import (
+    CancelDeliveryError,
+    publish_cancel,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
     VIDEO_PROGRESS,
@@ -102,15 +107,6 @@ async def shutdown_video_jobs() -> None:
             await task
 
 
-def _parse_form_extra_value(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except Exception:
-        return value
-
-
 _MULTIPART_EXTRA_FORM_FIELDS = (
     "attention_backend_override",
     "cache_dit_params",
@@ -152,7 +148,7 @@ def _merge_multipart_extra_form_fields(
 ) -> None:
     for key in _multipart_extra_form_keys(sampling_params_cls):
         if key in raw_form:
-            extra_from_form[key] = _parse_form_extra_value(raw_form[key])
+            extra_from_form[key] = parse_form_extra_value(raw_form[key])
 
 
 def _multipart_video_extras(
@@ -338,44 +334,6 @@ def _video_job_from_sampling(
     }
 
 
-async def _save_first_input_image(
-    image_sources,
-    request_id: str,
-    uploads_dir: str,
-    *,
-    prefer_remote_source: bool = False,
-) -> str | None:
-    """Save the first input image from a list of sources and return its path."""
-    image_list = merge_image_input_list(image_sources)
-    if not image_list:
-        return None
-    image = image_list[0]
-
-    os.makedirs(uploads_dir, exist_ok=True)
-
-    filename = image.filename if hasattr(image, "filename") else "url_image"
-    safe_name = sanitize_upload_filename(filename, "url_image")
-    target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
-    return await save_image_to_path(
-        image,
-        target_path,
-        prefer_remote_source=prefer_remote_source,
-        uploads_root=uploads_dir,
-    )
-
-
-async def _upload_and_cleanup_videos(paths: list[str]) -> list[str | None]:
-    results = await asyncio.gather(
-        *(cloud_storage.upload_and_cleanup(path) for path in paths),
-        return_exceptions=True,
-    )
-    # join every upload before a cancellation or failure permits directory cleanup
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
-    return results
-
-
 async def _cleanup_video_request(batch: Req) -> None:
     try:
         await asyncio.to_thread(batch.sampling_params.cleanup_video_request, batch)
@@ -422,7 +380,7 @@ async def _dispatch_job_async(
                     )
             raise
 
-        cloud_urls = await _upload_and_cleanup_videos(save_file_path_list)
+        cloud_urls = await cloud_storage.upload_all_and_cleanup(save_file_path_list)
         if not output_persistent and not all(cloud_urls):
             # The temp output dir is removed in `finally`, so an output that was
             # not uploaded would be unretrievable once the job reports completed.
@@ -458,6 +416,10 @@ async def _dispatch_job_async(
         update_fields.update(final_media_fields)
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
+        if await VIDEO_STORE.get(job_id) is None:
+            # DELETE removed the job and stopped its generation
+            logger.info("Video job %s was deleted: %s", job_id, e)
+            return
         logger.exception("Video job %s failed", job_id)
         await VIDEO_STORE.update_fields(
             job_id,
@@ -554,7 +516,7 @@ async def create_video(
                 video_input_path = None
                 image_sources = merge_image_input_list(input_reference, reference_url)
                 if video_reference is not None:
-                    video_input_path = await _save_first_input_image(
+                    video_input_path = await save_first_input_image(
                         video_reference,
                         request_id,
                         uploads_dir,
@@ -565,7 +527,7 @@ async def create_video(
                 elif input_reference is not None and _is_probably_video_source(
                     input_reference
                 ):
-                    video_input_path = await _save_first_input_image(
+                    video_input_path = await save_first_input_image(
                         input_reference,
                         request_id,
                         uploads_dir,
@@ -579,7 +541,7 @@ async def create_video(
                 input_path = None
                 if image_sources:
                     try:
-                        input_path = await _save_first_input_image(
+                        input_path = await save_first_input_image(
                             image_sources,
                             request_id,
                             uploads_dir,
@@ -593,13 +555,13 @@ async def create_video(
 
                 def form_value(name: str, value: Any) -> Any:
                     selected = value if value is not None else extra_from_form.get(name)
-                    return _parse_form_extra_value(selected)
+                    return parse_form_extra_value(selected)
 
                 def form_text_value(name: str, value: Any) -> Any:
                     """Resolve a text field without JSON-decoding it.
 
                     Some models take a serialized JSON object as the prompt text, which
-                    ``_parse_form_extra_value`` would turn back into a dict and fail
+                    ``parse_form_extra_value`` would turn back into a dict and fail
                     request validation.
                     """
                     return value if value is not None else extra_from_form.get(name)
@@ -714,7 +676,7 @@ async def create_video(
                         payload.get("reference_url")
                     ):
                         try:
-                            input_path = await _save_first_input_image(
+                            input_path = await save_first_input_image(
                                 payload.get("reference_url"),
                                 request_id,
                                 uploads_dir,
@@ -760,6 +722,7 @@ async def create_video(
                 external_trace_header=trace_headers,
             )
             batch.report_progress = True
+            batch.cancellable = True
             resources.push_async_callback(_cleanup_video_request, batch)
             # Add diffusers_kwargs if provided.
             if req.diffusers_kwargs:
@@ -839,34 +802,29 @@ async def retrieve_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
-# TODO: support aborting a job.
 @router.delete("/{video_id}", response_model=VideoResponse)
 async def delete_video(video_id: str = Path(...)):
-    job = await VIDEO_STORE.pop(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if not job:
+        raise HTTPException(status_code=404, detail="Video not found")
+    # A queued job does not start; a running job stops after its current
+    # denoising step. Publish also when the job task is done: a job that hit
+    # the scheduler RPC timeout is marked failed but still runs on the GPU.
+    if job["status"] != "completed":
+        try:
+            publish_cancel(video_id)
+        except CancelDeliveryError as e:
+            raise HTTPException(
+                status_code=503,
+                detail="Cancellation unavailable; retry DELETE with the same video ID",
+                headers={"Retry-After": "1"},
+            ) from e
+    job = await VIDEO_STORE.pop(video_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Video not found")
     # Mark as deleted in response semantics
     job["status"] = "deleted"
     return VideoResponse(**job)
-
-
-def _parse_video_variant_index(variant: str | None) -> int | None:
-    try:
-        return 0 if variant is None else int(variant)
-    except (TypeError, ValueError):
-        return None
-
-
-def _select_video_variant_url(job: dict, variant: str | None) -> str | None:
-    urls = job.get("urls")
-    if urls:
-        variant_index = _parse_video_variant_index(variant)
-        if variant_index is not None and 0 <= variant_index < len(urls):
-            return urls[variant_index]
-        return None
-    if _parse_video_variant_index(variant) != 0:
-        return None
-    return job.get("url")
 
 
 _ARTIFACT_MEDIA_TYPES = {
@@ -884,18 +842,6 @@ def _select_lidar_artifact_path(job: dict, variant: str | None) -> str | None:
     return files.get(variant) if isinstance(files, dict) else None
 
 
-def _select_video_variant_path(job: dict, variant: str | None) -> str | None:
-    file_paths = job.get("file_paths")
-    if file_paths:
-        variant_index = _parse_video_variant_index(variant)
-        if variant_index is not None and 0 <= variant_index < len(file_paths):
-            return file_paths[variant_index]
-        return None
-    if _parse_video_variant_index(variant) != 0:
-        return None
-    return job.get("file_path")
-
-
 @router.get("/{video_id}/content")
 async def download_video_content(
     video_id: str = Path(...), variant: Optional[str] = Query(None)
@@ -904,15 +850,15 @@ async def download_video_content(
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    cloud_url = _select_video_variant_url(job, variant)
+    cloud_url = select_output_variant(job, variant, "urls", "url")
     if cloud_url:
         raise HTTPException(
             status_code=400,
             detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {cloud_url}",
         )
 
-    file_path = _select_lidar_artifact_path(job, variant) or _select_video_variant_path(
-        job, variant
+    file_path = _select_lidar_artifact_path(job, variant) or select_output_variant(
+        job, variant, "file_paths", "file_path"
     )
     if job.get("status") not in {"completed", "failed"}:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")

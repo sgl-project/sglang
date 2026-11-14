@@ -5,17 +5,17 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
-from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
-from sglang.srt.utils import (
+from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_media_url_security,
     load_audio,
     load_image,
     load_video,
-    logger,
     smart_to_rgb,
 )
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
+from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.utils import logger
 
 
 def _tokenizer_of(processor):
@@ -56,6 +56,8 @@ class MultimodalProcessorMixin:
         configure_media_url_security(
             processor_config.allowed_media_domains,
             processor_config.media_url_max_file_size_mb,
+            processor_config.media_url_timeout,
+            processor_config.allow_local_media_files,
         )
 
         self.image_processor_backend = processor_config.image_processor_backend

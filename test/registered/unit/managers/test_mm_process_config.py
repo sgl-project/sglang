@@ -522,7 +522,8 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
 
 class TestCudaIpcTransportRollback(CustomTestCase):
     def test_partial_wrap_failure_restores_items_and_cancels_proxy(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.multimodal.transport.cuda_ipc import (
             CudaIpcTensorTransportProxy,
         )
@@ -574,7 +575,8 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
         return processor
 
     def test_enabled_path_sets_hash_and_pad_value(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
 
         item = MultimodalDataItem(
             modality=Modality.IMAGE, feature=torch.arange(8, dtype=torch.float32)
@@ -587,7 +589,8 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
         self.assertTrue(item.feature.is_cpu)
 
     def test_disabled_path_leaves_item_unmodified(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
 
         item = MultimodalDataItem(
             modality=Modality.IMAGE, feature=torch.arange(8, dtype=torch.float32)

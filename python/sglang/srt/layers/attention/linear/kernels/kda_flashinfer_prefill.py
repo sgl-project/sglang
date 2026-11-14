@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.kda_input_pack import contiguous_kda_inputs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -71,6 +72,9 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     """Execute KDA prefill; FlashInfer validates the tensor contract."""
 
     uses_state_checkpoints = True
+    # FlashInfer memoizes cu_seqlens host contents on tensor identity, but casts an
+    # int32 one to a new int64 tensor per call; one int64 tensor per forward hits it.
+    wants_int64_query_start_loc = True
     supports_track_state_snapshot = True
     supports_safe_gate = True
 
@@ -102,6 +106,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         lower_bound: float,
+        query_start_loc_i64: Optional[torch.Tensor] = None,
         return_intermediate_states: bool = False,
         state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
         num_state_checkpoints: int = 0,
@@ -118,12 +123,15 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             if needs_checkpoint
             else None
         )
+        q, k, v, g, beta = contiguous_kda_inputs(
+            q, k, v, g[:, : q.shape[1]], beta[:, : q.shape[1]]
+        )
         result = self._recurrent_kda(
-            q=q.contiguous(),
-            k=k.contiguous(),
-            v=v.contiguous(),
-            g=g[:, : q.shape[1]].contiguous(),
-            beta=beta[:, : q.shape[1]].contiguous(),
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
             A_log=A_log.reshape(-1).float().contiguous(),
             # FlashInfer's grouped-CTA recurrent kernel (extends with a cached prefix)
             # indexes dt_bias as a flat [H*K] tensor and asserts a unit leading stride.
@@ -133,7 +141,9 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             lower_bound=lower_bound,
-            cu_seqlens=query_start_loc,
+            cu_seqlens=(
+                query_start_loc if query_start_loc_i64 is None else query_start_loc_i64
+            ),
             ssm_state_indices=cache_indices.to(torch.int32),
             beta_is_logit=True,
             state_checkpoints=checkpoints,

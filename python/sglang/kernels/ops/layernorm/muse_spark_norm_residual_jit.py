@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -184,7 +185,7 @@ def fused_norm_residual(
 
     auto_cluster = cluster_size is None
     if auto_cluster:
-        supports_clusters = torch.cuda.get_device_capability(branch.device)[0] >= 10
+        supports_clusters = current_arch().is_sm_at_least(10)
         cluster_size = (
             _cluster_size_for_shape(hidden_size, m)
             if supports_clusters and not pre_norm_bf16

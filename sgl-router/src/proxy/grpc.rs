@@ -10,14 +10,15 @@ use super::{breaker_outcome, stream_breaker_outcome, BreakerOutcome, Proxy};
 use crate::config::SamplingField;
 use crate::server::error::{router_grpc_status, ApiError};
 use crate::server::header_utils::should_forward_request_header;
+use crate::server::metrics::MediaCounts;
 use crate::workers::Worker;
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use serde_json::Value;
-use sglang_api_types::runtime::v1 as proto;
-use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
+use sglang_runtime_v1_types as proto;
+use sglang_runtime_v1_types::sglang_service_client::SglangServiceClient;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -170,6 +171,12 @@ pub struct RoutingView<'a> {
     pub sampling_params: Option<&'a proto::SamplingParams>,
     pub stream: bool,
     pub rid: Option<&'a str>,
+    /// Media items the request carries, for the access log.
+    pub media: MediaCounts,
+}
+
+fn media_count(items: &[String]) -> u32 {
+    u32::try_from(items.len()).unwrap_or(u32::MAX)
 }
 
 /// What the router adds to a typed request, as it adds it to an HTTP body.
@@ -288,6 +295,11 @@ impl TypedRpc for proto::GenerateRequest {
             sampling_params: self.sampling_params.as_ref(),
             stream: self.stream.unwrap_or(false),
             rid: self.rid.as_deref(),
+            media: MediaCounts {
+                images: media_count(&self.image_data),
+                videos: media_count(&self.video_data),
+                audios: media_count(&self.audio_data),
+            },
         }
     }
 
@@ -320,6 +332,7 @@ impl TypedRpc for proto::TextGenerateRequest {
             sampling_params: self.sampling_params.as_ref(),
             stream: self.stream.unwrap_or(false),
             rid: self.rid.as_deref(),
+            media: MediaCounts::default(),
         }
     }
 
@@ -416,6 +429,7 @@ macro_rules! embedding_rpc {
                     sampling_params: None,
                     stream: false,
                     rid: self.rid.as_deref(),
+                    media: MediaCounts::default(),
                 }
             }
 
@@ -673,6 +687,21 @@ impl Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generate_view_counts_media_fields() {
+        let request = proto::GenerateRequest {
+            image_data: vec!["a".into(), "b".into()],
+            audio_data: vec!["c".into()],
+            ..Default::default()
+        };
+        let want = MediaCounts {
+            images: 2,
+            videos: 0,
+            audios: 1,
+        };
+        assert_eq!(request.view().media, want);
+    }
 
     #[test]
     fn sampling_values_read_as_the_decimal_sent() {

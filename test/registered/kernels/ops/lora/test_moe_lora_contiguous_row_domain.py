@@ -1,3 +1,7 @@
+"""Contiguous row domain on a CUDA device: the dispatch metadata contract and
+CuTeDSL-vs-Triton parity in eager mode and under a CUDA graph. The pure-math
+bounds live in test/registered/unit/lora/test_moe_lora_contiguous_bounds.py."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -5,25 +9,29 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.kernels.ops.lora.moe.activation import ActivationFn
+from sglang.kernels.ops.lora.moe.dispatch_contiguous import contiguous_m_pad_ceiling
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProviderContract
 from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     ContiguousRowDomainProvider,
-    contiguous_m_pad_ceiling,
 )
-from sglang.srt.lora.moe.plan import (
-    ActivationFn,
-    SelectedPlan,
-    _build_plan,
-    _load_plans,
-    _tile_table,
-)
+from sglang.srt.lora.moe.plan import SelectedPlan, _build_plan, _load_plans, _tile_table
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.srt.lora.utils import Phase
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.moe_lora import (
+    cutedsl_ready,
+    make_token_lora_mapping,
+    standalone_output_allocation,
+)
 
-register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# Also exercise the Blackwell implementation in per-PR CI.
+# The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
+# its four GPUs are allocation granularity, not multi-GPU coverage.
+register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _GB300 = "sm100"
 _H200 = "sm90"
@@ -72,59 +80,6 @@ class _DomainStub(ContiguousRowDomainProvider):
     )
 
 
-class TestAlignedSegmentMath:
-    def test_ceiling_bounds_every_aligned_prefix_total(self) -> None:
-        import random
-
-        rng = random.Random(0xA11C)
-        for _ in range(64):
-            alignment = rng.choice((8, 64, 128))
-            num_experts = rng.randint(1, 32)
-            num_pairs = rng.randint(0, 4096)
-            counts = [0] * num_experts
-            for _ in range(num_pairs):
-                counts[rng.randrange(num_experts)] += 1
-            total = _host_aligned_prefix(counts, alignment)[-1]
-            ceiling = contiguous_m_pad_ceiling(num_pairs, num_experts, alignment)
-            assert total <= ceiling, (counts, alignment, total, ceiling)
-
-
-class TestCuteDslContiguousScheduleGeometry:
-    def test_capacity_bounds_every_actual_schedule_total(self) -> None:
-        import random
-
-        from sglang.kernels.ops.lora.moe.cutedsl.schedule_builder import (
-            dual_stage_schedule_capacities_contiguous,
-        )
-
-        rng = random.Random(0xC0DE)
-        for _ in range(64):
-            num_experts = rng.randint(1, 64)
-            num_pairs = rng.randint(0, 4096)
-            token_width = rng.choice((8, 64, 128))
-            counts = [0] * num_experts
-            for _ in range(num_pairs):
-                counts[rng.randrange(num_experts)] += 1
-            m_pad_ceiling = contiguous_m_pad_ceiling(num_pairs, num_experts, 128)
-            n_gemm1, n_gemm2 = 512, 256
-            capacity1, capacity2 = dual_stage_schedule_capacities_contiguous(
-                num_experts=num_experts,
-                m_pad_ceiling=m_pad_ceiling,
-                max_expert_rows=max(num_pairs, 1),
-                m_alignment=128,
-                token_width=token_width,
-                n_gemm1=n_gemm1,
-                n_gemm2=n_gemm2,
-                output_width=128,
-            )
-            # The builder writes cdiv(count, w) * out_clusters entries for
-            # each expert. The capacity must bound that total for any split of
-            # the counts.
-            clusters = sum(-(-count // token_width) for count in counts)
-            assert clusters * -(-n_gemm1 // 128) <= capacity1, (counts, token_width)
-            assert clusters * -(-n_gemm2 // 128) <= capacity2, (counts, token_width)
-
-
 _TOP_K = 2
 _HIDDEN = 128
 _INTERMEDIATE = 128
@@ -138,19 +93,8 @@ triton_cuda_only = pytest.mark.skipif(
 )
 
 
-def _cutedsl_ready() -> bool:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
-        return False
-    try:
-        import cuda.bindings.driver  # noqa: F401
-        import cutlass  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
 cutedsl_cuda_only = pytest.mark.skipif(
-    not _cutedsl_ready(),
+    not cutedsl_ready(),
     reason="the vendor oracle runs the CuTeDSL providers against Triton",
 )
 
@@ -308,31 +252,6 @@ def _make_gpu_tensors(
     return {name: tensor.to(device) for name, tensor in tensors.items()}
 
 
-def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
-    if traffic == "active":
-        return torch.zeros(num_tokens, dtype=torch.int32)
-    if traffic == "mixed":
-        pattern = torch.tensor([0, -1, -1, 0, -1, -1], dtype=torch.int32)
-        return pattern.repeat((num_tokens + pattern.numel() - 1) // pattern.numel())[
-            :num_tokens
-        ].contiguous()
-    if traffic == "base_only":
-        return torch.full((num_tokens,), -1, dtype=torch.int32)
-    raise AssertionError(f"unknown traffic pattern {traffic}")
-
-
-def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
-    """Allocate the output with the eager shape and no tensor-parallel group."""
-    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
-
-
-def _bind_test_menu(runner, plan, launch_config):
-    """Bind one plan to both phases to isolate execution from plan selection."""
-    tiles = SimpleNamespace(config_for=lambda num_tokens: launch_config)
-    selected = SelectedPlan(name="test", base_gemm_rows="test", plan=plan, tiles=tiles)
-    runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
-
-
 def _build_runner(choice, vendor: str, gpu, num_experts):
     from sglang.srt.lora.moe.runner import MoeLoraRunner
 
@@ -351,7 +270,13 @@ def _build_runner(choice, vendor: str, gpu, num_experts):
         activation=ActivationFn.SILU,
     )
     runner.validate_plan(choice.plan, base_gemm_rows="test")
-    _bind_test_menu(runner, choice.plan, _shipped_launch(choice))
+    # Resolve once and bind both phases, isolating execution from selection.
+    launch_config = _shipped_launch(choice)
+    tiles = SimpleNamespace(config_for=lambda num_tokens: launch_config)
+    selected = SelectedPlan(
+        name="test", base_gemm_rows="test", plan=choice.plan, tiles=tiles
+    )
+    runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
     return runner
 
 
@@ -415,9 +340,7 @@ def test_cutedsl_matches_triton_in_eager_and_cuda_graph(
     from sglang.srt.lora.moe.runner import MoeLoraRunner
 
     device = torch.device("cuda")
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
+    monkeypatch.setattr(MoeLoraRunner, "_allocate_output", standalone_output_allocation)
     num_tokens, num_experts = 64, 16
     choice = _menu(architecture, layout)[fragment]
     gpu = _make_gpu_tensors(num_tokens, num_experts, device, shared=layout)
@@ -429,7 +352,7 @@ def test_cutedsl_matches_triton_in_eager_and_cuda_graph(
     for traffic in ("active", "mixed", "base_only"):
         triton.workspace.routes.clear()
         cutedsl.workspace.routes.clear()
-        token_lora_mapping = _token_lora_mapping(traffic, num_tokens).to(device)
+        token_lora_mapping = make_token_lora_mapping(traffic, num_tokens).to(device)
         reference = _run_once(triton, gpu, token_lora_mapping).hidden_states
         actual = _run_once(cutedsl, gpu, token_lora_mapping).hidden_states
         outputs[traffic] = actual
@@ -445,7 +368,7 @@ def test_cutedsl_matches_triton_in_eager_and_cuda_graph(
     # The vendor under test must apply the LoRA math.
     assert (outputs["active"] - outputs["base_only"]).abs().max().item() > 0.02
 
-    token_lora_mapping = _token_lora_mapping("active", num_tokens).to(device)
+    token_lora_mapping = make_token_lora_mapping("active", num_tokens).to(device)
 
     # The workspace keys scratch by stream: warm up on the capture stream.
     stream = torch.cuda.Stream()

@@ -15,6 +15,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 MAX_TOKENS = 8
@@ -26,11 +27,6 @@ _VEC = 4  # FP32 elements per 16-byte load
 
 def _experts_per_cta(tokens: int) -> int:
     return 1 if tokens == 1 else 2
-
-
-@cache
-def _is_sm100_family(device_index: int) -> bool:
-    return torch.cuda.get_device_capability(device_index)[0] == 10
 
 
 def router_gemv_cute_eligible(x: torch.Tensor, w: torch.Tensor) -> bool:
@@ -57,7 +53,7 @@ def router_gemv_cute_eligible(x: torch.Tensor, w: torch.Tensor) -> bool:
         and w.data_ptr() % 16 == 0
         and w.shape[1] % (_THREADS * _VEC) == 0
         and w.shape[0] % 2 == 0
-        and _is_sm100_family(x.device.index)
+        and current_arch().is_sm(10)
     )
 
 

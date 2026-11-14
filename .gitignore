@@ -188,6 +188,7 @@ work_dirs/
 
 !logo.png
 !docs/images/*.png
+!rust/sglang-processor/tests/fixtures/mm_parity/images/*.png
 
 # Prerequisites
 *.d

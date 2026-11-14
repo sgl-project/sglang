@@ -28,11 +28,17 @@ def _split_time_from_batch(x, batch):
 
 
 class TemporalIsolatedGroupNorm(nn.GroupNorm):
-    def forward(self, input):
+    def forward(self, input, *, silu_pad=False):
         if input.dim() == 5:
-            batch = input.shape[0]
+            batch, channels, depth, height, width = input.shape
             input = _merge_time_to_batch(input)
             output = super().forward(input)
+            if silu_pad:
+                from sglang.kernels.ops.diffusion import fused_silu_temporal_pad
+
+                return fused_silu_temporal_pad(
+                    output.view(batch, depth, channels, height, width)
+                )
             return _split_time_from_batch(output, batch)
         return super().forward(input)
 

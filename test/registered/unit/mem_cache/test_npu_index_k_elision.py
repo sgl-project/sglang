@@ -39,6 +39,7 @@ INDEXER_LAYERS = (0, 3, 6)
 
 def _kvc():
     return types.SimpleNamespace(
+        modelslim_cache_layout=None,
         model_config=types.SimpleNamespace(
             hf_config=types.SimpleNamespace(
                 architectures=["GlmMoeDsaForCausalLM"],
@@ -56,6 +57,7 @@ def _kvc():
         server_args=types.SimpleNamespace(enable_hisparse=False),
         mambaish_config=None,
         is_draft_worker=False,
+        use_combined_kv_buffer=False,
         kv_cache_dtype=torch.bfloat16,
         device="cpu",
     )

@@ -58,6 +58,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        # TODO: torch.xpu.get_device_capability
+        if _is_xpu:
+            return 20
         # lovelace and up
         return 89
 
@@ -242,6 +245,18 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(x, tuple) and self.weight_block_size is not None:
+            # Pre-quantized per-token-group activation (fp8 [M, K], fp32 scales
+            # [M, K / block_k]) from the fused all-reduce epilogue
+            # (layers/communication/gemma4_ar_fusion.py).
+            return self.w8a8_block_fp8_linear(
+                input=x[0],
+                weight=layer.weight,
+                block_size=self.weight_block_size,
+                weight_scale=layer.weight_scale,
+                input_scale=x[1],
+                bias=bias,
+            )
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).

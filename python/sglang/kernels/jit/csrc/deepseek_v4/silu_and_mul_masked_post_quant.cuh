@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tile.cuh>
@@ -49,8 +50,8 @@ SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {
   }
   const auto [g0, g1] = cast<fp32x2_t>(gate);
   const auto [u0, u1] = cast<fp32x2_t>(up);
-  const auto silu0 = g0 / (1.0f + __expf(-g0));
-  const auto silu1 = g1 / (1.0f + __expf(-g1));
+  const auto silu0 = activation::silu(g0);
+  const auto silu1 = activation::silu(g1);
   const float val0 = silu0 * u0;
   const float val1 = silu1 * u1;
   if constexpr (kPrecise) {  // I don't know if we should enable this?
@@ -289,7 +290,7 @@ struct SiluAndMulMaskedPostQuantKernel {
     auto D = SymbolicSize{"hidden_dim x 2"};
     auto N = SymbolicSize{"hidden_dim"};
     auto G = SymbolicSize{"num_groups"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({E, T, D})  // input
         .with_dtype<bf16_t>()
@@ -382,7 +383,7 @@ struct SiluAndMulClampKernel {
     auto M = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"gate_up_dim"};  // 2 * out_dim
     auto H = SymbolicSize{"out_dim"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, D})  // input  (gate || up)
         .with_dtype<DType>()
@@ -531,7 +532,7 @@ struct SiluAndMulContigPostQuantKernel {
     auto D = SymbolicSize{"hidden_dim x 2"};
     auto N = SymbolicSize{"hidden_dim"};
     auto G = SymbolicSize{"num_groups"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, D})  // input (gate/up, natural or gran=8 interleaved on last dim)
         .with_dtype<bf16_t>()

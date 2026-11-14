@@ -254,7 +254,7 @@ struct PagedMqaLogitsKernel {
     auto pages_ = SymbolicSize{"table_pages"};
     auto cols_ = SymbolicSize{"logits_cols"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     // Rebinding one symbolic dtype across q and kv is the "kv must have the
     // same fp8 dtype as q" check; the options stay open because e4m3fn has no
     // DLDataTypeTrait on ROCm.

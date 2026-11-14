@@ -19,6 +19,10 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
+    gather_pool_states,
+    scatter_pool_states,
+)
 from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
@@ -458,7 +462,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
             # will no longer be needed here.
-            state_batch = ssm_states[cache_indices]
+            state_indices, live_rows, state_batch = gather_pool_states(
+                ssm_states, cache_indices
+            )
             output_fi, new_state = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
@@ -472,7 +478,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output=None,
                 use_qk_l2norm=True,
             )
-            ssm_states[cache_indices] = new_state
+            scatter_pool_states(ssm_states, state_indices, live_rows, new_state)
+            output_fi = torch.where(live_rows, output_fi, 0)
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
@@ -532,27 +539,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
-        if self.use_state_pool:
-            # Negative indices (e.g. -1) are padding markers for slots not yet
-            # assigned to a real sequence; clamp them to 0 (the reserved dummy
-            # slot) so the FlashInfer kernel never reads out-of-bounds state.
-            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
-            initial_state_fi = (
-                ssm_states[ssm_cache_indices].to(torch.float32)
-                if self._prefill_needs_fp32_state
-                else ssm_states[ssm_cache_indices].contiguous()
-            )
-            cu_seqlens = query_start_loc.to(torch.int64)  # kernel requires int64
-        else:
-            # SM90: preserve original negative-index handling (remap to last slot).
-            ssm_cache_indices = torch.where(
-                cache_indices >= 0,
-                cache_indices,
-                ssm_states.shape[0] - 1,
-            ).to(torch.int64)
-            # State must be float32; kernel requires int64 cu_seqlens.
-            initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
-            cu_seqlens = query_start_loc.to(torch.int64)
+        ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
+            ssm_states, cache_indices
+        )
+        if not self.use_state_pool or self._prefill_needs_fp32_state:
+            initial_state_fi = initial_state_fi.to(torch.float32)
+        cu_seqlens = query_start_loc.to(torch.int64)
 
         # Keep final state and checkpoints in the same kernel state dtype.
         output_state_fi = torch.empty_like(initial_state_fi)
@@ -582,11 +574,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
 
         # Write back state to pool
-        ssm_states.index_copy_(
-            0,
-            ssm_cache_indices,
-            output_state_fi.to(ssm_states.dtype),
-        )
+        scatter_pool_states(ssm_states, ssm_cache_indices, live_rows, output_state_fi)
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)

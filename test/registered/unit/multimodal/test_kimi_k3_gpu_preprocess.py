@@ -7,7 +7,9 @@ import pytest
 import torch
 from PIL import Image
 
-from sglang.srt.multimodal.processors.kimi_k3 import _fill_transparent_bg
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    fill_transparent_bg as _fill_transparent_bg,
+)
 from sglang.srt.multimodal.processors.kimi_k25 import _resize_bicubic_if_needed
 from sglang.test.ci.ci_register import register_cpu_ci
 

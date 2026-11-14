@@ -10,9 +10,10 @@ and numerical contract. In particular, Cake top-k-then-top-p sampling is not a
 drop-in replacement for joint top-k/top-p filtering. Prepared plans must remain
 valid when input contents and buffers change across calls and CUDA Graph replay.
 
-The sampler's softmax fast path accepts FP32 contiguous logits on SM103,
-small batches and large vocabularies. The sampler retains its existing filtering
-and random-number generation, and deterministic inference retains torch.softmax.
+The sampler's softmax fast path accepts FP32 contiguous logits on SM100 and
+SM103, small batches and large vocabularies. The sampler retains its existing
+filtering and random-number generation, and deterministic inference retains
+torch.softmax.
 Other operators require their own numerical and real-model performance evidence
 before being added here.
 

@@ -533,7 +533,6 @@ import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
     get_adapter_class,
-    registered_model_types,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
@@ -604,8 +603,6 @@ def test_worker_transformer_options_drop_comfy_objects() -> None:
 
 
 def test_minimax_h3_is_registered() -> None:
-    types = registered_model_types()
-    assert "minimax_h3" in types
     assert get_adapter_class("minimax_h3") is MiniMaxH3Adapter
     assert get_adapter_class("minimax_h3").pipeline_class_name == "MiniMaxH3Pipeline"
 
@@ -1135,10 +1132,6 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
     get_comfyui_checkpoint_spec,
 )
@@ -1146,16 +1139,6 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3Attention,
     _reorder_grouped_qkv_to_qkv,
 )
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def _concat_qkv_rows() -> torch.Tensor:
@@ -1187,8 +1170,8 @@ def test_comfyui_h3_spec_disables_grouped_qkv_reorder() -> None:
     assert MiniMaxH3DiTArchConfig().qkv_checkpoint_grouped is True
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_concat_qkv_attention_skips_grouped_weight_loader() -> None:
-    _ensure_single_process_parallel_runtime()
     concat_arch = MiniMaxH3DiTArchConfig(
         hidden_size=32,
         num_attention_heads=2,
@@ -1215,10 +1198,10 @@ def test_concat_qkv_attention_skips_grouped_weight_loader() -> None:
 @pytest.mark.parametrize("layout", [None, "native", "interleaved"])
 @pytest.mark.parametrize("grouped", [True, False])
 @pytest.mark.parametrize("diffusers", [True, False])
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_explicit_checkpoint_qkv_layout_overrides_inferred_layout(
     layout, grouped, diffusers
 ):
-    _ensure_single_process_parallel_runtime()
     arch = MiniMaxH3DiTArchConfig(
         hidden_size=32,
         num_attention_heads=2,
@@ -1246,10 +1229,10 @@ def test_explicit_checkpoint_qkv_layout_overrides_inferred_layout(
 
 
 @pytest.mark.parametrize("backend,out_features", [("comfy_kitchen", 12), ("jit", 16)])
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_integrated_h3_int8_loader_preserves_quantized_weights(
     tmp_path, monkeypatch, backend, out_features
 ):
-    _ensure_single_process_parallel_runtime()
     import json
     from types import SimpleNamespace
 

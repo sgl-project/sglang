@@ -34,7 +34,7 @@ from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 # the report -- if the assert below fires, add the new backend name here in
 # the right display slot. Order isn't alphabetical: CUDA/AMD/NPU/CPU lead
 # (highest test volume historically), then accelerators that have been
-# wired into the registry more recently (XPU, MUSA, MLX, PPU).
+# wired into the registry more recently (XPU, MUSA, MLX, MPS, PPU, MLU).
 BACKEND_DISPLAY_ORDER = (
     "CUDA",
     "AMD",
@@ -45,6 +45,7 @@ BACKEND_DISPLAY_ORDER = (
     "MLX",
     "MPS",
     "PPU",
+    "MLU",
 )
 assert set(BACKEND_DISPLAY_ORDER) == {b.name for b in HWBackend}, (
     "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
@@ -265,7 +266,7 @@ def get_accel_count(test: CIRegistry) -> Optional[int]:
     """Number of GPUs/NPUs a test's suite runs on, or None if unencoded.
 
     Returns None for suites whose name has no size token -- `stress`,
-    `nightly-amd-vlm`, the CPU suites, and the synthesized `mm-gen-*`
+    `nightly-amd`, the CPU suites, and the synthesized `mm-gen-*`
     suites (multimodal_gen spreads one suite across 1-gpu and 2-gpu
     runners, so there is no single answer to report).
     """

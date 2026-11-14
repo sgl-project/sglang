@@ -1,6 +1,8 @@
 """Execute test files in isolated fork children of a preloaded interpreter."""
 
 import argparse
+import ctypes
+import importlib
 import json
 import os
 import runpy
@@ -10,13 +12,37 @@ import time
 import traceback
 
 
-def _preload_common_modules() -> None:
+def _has_cuda_driver() -> bool:
+    try:
+        ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return False
+    return True
+
+
+def _preload_common_modules(extra_modules: list[str]) -> None:
     """Load the expensive common stack without creating a CUDA context."""
+    if _has_cuda_driver():
+        # A child forked after the parent called cuInit or loaded a CUDA kernel
+        # library (flashinfer, sgl_kernel) crashes on its first driver call, so
+        # the parent checks CUDA through NVML and leaves extra modules to children.
+        os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+        if extra_modules:
+            print(
+                f"fork test worker: CUDA driver found, not preloading {extra_modules}",
+                file=sys.stderr,
+                flush=True,
+            )
+            extra_modules = []
+
     import numpy  # noqa: F401
     import pytest  # noqa: F401
     import scipy  # noqa: F401
     import torch
     import triton  # noqa: F401
+
+    for name in extra_modules:
+        importlib.import_module(name)
 
     if torch.cuda.is_initialized():
         raise RuntimeError("fork test worker initialized CUDA before forking")
@@ -77,8 +103,9 @@ def main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--result-fd", type=int, required=True)
+    parser.add_argument("--preload", nargs="*", default=[])
     args = parser.parse_args()
-    _preload_common_modules()
+    _preload_common_modules(args.preload)
 
     with os.fdopen(args.result_fd, "w", buffering=1) as result_stream:
         for line in sys.stdin:

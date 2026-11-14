@@ -12,7 +12,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
-from sglang.srt.sampling.custom_logit_processor import DisallowedTokensLogitsProcessor
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    DisallowedTokensLogitsProcessor,
+)
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
@@ -673,13 +676,24 @@ class TestMergeBatch(CustomTestCase):
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
     def test_returns_copy_without_orchestrator(self):
-        """Test that copy_for_forward returns a copy with orchestrator set to None."""
-        orch = MagicMock(is_required=False)
-        info = _make_info(batch_size=1, penalizer_orchestrator=orch)
-        copied = info.copy_for_forward()
-        self.assertIsNone(copied.penalizer_orchestrator)
-        # Original should still have orchestrator
-        self.assertIsNotNone(info.penalizer_orchestrator)
+        """Both copy implementations preserve every field except the forward-only
+        penalizer removal, including fields declared with init=False."""
+        for fast_path in (False, True):
+            orch = MagicMock(is_required=False)
+            info = _make_info(batch_size=1, penalizer_orchestrator=orch)
+            with (
+                self.subTest(fast_path=fast_path),
+                patch(
+                    "sglang.srt.sampling.sampling_batch_info._fast_copy_enabled",
+                    return_value=fast_path,
+                ),
+            ):
+                copied = info.copy_for_forward()
+            self.assertIsNone(copied.penalizer_orchestrator)
+            self.assertIs(info.penalizer_orchestrator, orch)
+            for name, value in info.__dict__.items():
+                if name != "penalizer_orchestrator":
+                    self.assertIs(copied.__dict__[name], value, name)
 
 
 # from_schedule_batch
@@ -826,6 +840,64 @@ class TestFromScheduleBatch(CustomTestCase):
 
                 self.assertEqual(info.max_top_k, expected)
 
+    def _top_k_flags(self, info):
+        return (
+            info.is_all_greedy,
+            info.is_any_greedy,
+            info.need_top_k_sampling,
+            info.npu_top_k_top_p_eligible,
+            info.max_top_k,
+        )
+
+    def test_refresh_top_k_flags_after_filter_matches_a_fresh_batch(self):
+        """A finished greedy row (top_k=1) must not keep the running batch on the
+        top-k path: refresh_top_k_flags gives the kept rows the flags a batch
+        built from them would have."""
+        cases = (
+            # (top_ks, kept row, need_top_k_sampling, max_top_k after refresh)
+            ((1, TOP_K_ALL), 1, False, None),
+            ((TOP_K_ALL, 20), 1, True, 20),
+            ((1, 20, 50), 2, True, 50),
+        )
+        for top_ks, kept, need_top_k, max_top_k in cases:
+            with self.subTest(top_ks=top_ks, kept=kept):
+                reqs = [self._make_req(top_k=top_k) for top_k in top_ks]
+                batch = MagicMock()
+                batch.reqs = reqs
+                batch.device = DEVICE
+                info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+                before = self._top_k_flags(info)
+
+                info.filter_batch([kept], torch.tensor([kept]))
+                # SamplingBatchInfo.filter_batch alone keeps the old, safe flags.
+                self.assertEqual(self._top_k_flags(info), before)
+
+                info.refresh_top_k_flags([top_ks[kept]])
+                self.assertEqual(info.need_top_k_sampling, need_top_k)
+                self.assertEqual(info.max_top_k, max_top_k)
+                self.assertFalse(info.is_any_greedy)
+                fresh_batch = MagicMock()
+                fresh_batch.reqs = [reqs[kept]]
+                fresh_batch.device = DEVICE
+                fresh = SamplingBatchInfo.from_schedule_batch(fresh_batch, VOCAB_SIZE)
+                self.assertEqual(self._top_k_flags(info), self._top_k_flags(fresh))
+
+    def test_refresh_top_k_flags_reads_only_the_given_top_ks(self):
+        """The flags come from the requests' top_k, not from the top_ks tensor, so
+        a reassigned tensor cannot leave them stale."""
+        batch = MagicMock()
+        batch.reqs = [self._make_req(top_k=TOP_K_ALL), self._make_req(top_k=1)]
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        info.top_ks = torch.tensor([5, 5], dtype=torch.int32)
+
+        info.refresh_top_k_flags([TOP_K_ALL, 1])
+
+        self.assertTrue(info.is_any_greedy)
+        self.assertFalse(info.is_all_greedy)
+        self.assertTrue(info.need_top_k_sampling)
+        self.assertIsNone(info.max_top_k)
+
     def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""
 
@@ -857,6 +929,39 @@ class TestFromScheduleBatch(CustomTestCase):
         entry = left.custom_logit_processor[hash(processor_str)]
         self.assertEqual(entry.rows, [2])
         self.assertEqual(entry.indices.tolist(), [2])
+
+    def test_builtin_page_guard_reaches_logits_with_external_processors_disabled(self):
+        from array import array
+
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        req = self._make_req()
+        req.origin_input_ids = array("q", [7, 20])
+        req.output_ids = array("q", [7, 10, 11, 12, 13])
+        req.uocr_doc = None
+        req.page_guard_state = None
+        req.custom_logit_processor = UOCR_PAGE_GUARD_PROCESSOR
+        req.sampling_params.custom_params = dict(
+            __req__=req,
+            page_token_id=7,
+            eos_token_id=1,
+            max_page_tokens=3,
+        )
+        batch = MagicMock(reqs=[req], device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertTrue(info.has_custom_logit_processor)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        apply_custom_logit_processor(logits, info)
+        self.assertEqual(torch.isfinite(logits[0]).nonzero().flatten().tolist(), [1])
+        self.assertFalse(self._exec_ns.features.enable_custom_logit_processor)
+
+    def test_external_processor_still_requires_the_enable_flag(self):
+        req = self._make_req()
+        req.custom_logit_processor = DisallowedTokensLogitsProcessor.to_str()
+        batch = MagicMock(reqs=[req], device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertFalse(info.has_custom_logit_processor)
+        self.assertIsNone(info.custom_logit_processor)
 
     def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""

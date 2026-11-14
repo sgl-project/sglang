@@ -78,11 +78,10 @@ class TestWorldSizeGate(CustomTestCase):
 class TestGroupEligibility(CustomTestCase):
     """Which groups get this backend, which is the rule that broke other models.
 
-    ``"tp" in unique_name`` also matched attention_tp / moe_tp /
-    pdmux_prefill_tp. Those groups carry no pynccl or custom all-reduce
-    communicator, so a reduction dispatched to them hits an assertion instead
-    of falling back, and Qwen3-8B TP4/DP2 and Qwen3-30B-A3B TP4/EP2 fail to
-    start with the flag on.
+    ``"tp" in unique_name`` also matched attention_tp / moe_tp. Those groups
+    carry no pynccl or custom all-reduce communicator, so a reduction
+    dispatched to them hits an assertion instead of falling back, and Qwen3-8B
+    TP4/DP2 and Qwen3-30B-A3B TP4/EP2 fail to start with the flag on.
     """
 
     def test_only_the_tensor_parallel_group_is_eligible(self):
@@ -92,7 +91,7 @@ class TestGroupEligibility(CustomTestCase):
                     group_name="tp", world_size=4, deterministic=False
                 )
             )
-            for name in ("attention_tp", "moe_tp", "pdmux_prefill_tp", "world", "pp"):
+            for name in ("attention_tp", "moe_tp", "world", "pp"):
                 with self.subTest(group=name):
                     self.assertFalse(
                         pcie_ipc_ar.eligible_group(

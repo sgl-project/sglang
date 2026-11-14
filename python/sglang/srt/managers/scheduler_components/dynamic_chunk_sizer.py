@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import broadcast_pyobj
-from sglang.srt.utils.common import get_device_module
+from sglang.srt.utils.device import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

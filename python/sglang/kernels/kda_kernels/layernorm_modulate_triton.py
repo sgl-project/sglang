@@ -47,7 +47,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.arch import current_arch
 from sglang.kernels.numerics import (
     cuda_rsqrtf,
     div_rn_f32,
@@ -392,10 +392,9 @@ def _is_bf16_cuda(t: torch.Tensor) -> bool:
 
 
 def _qk_head_launch_config() -> tuple[int, int]:
-    arch = get_jit_cuda_arch()
-    if arch.major == 10 and arch.minor == 3:
+    if current_arch().is_sm(10, 3):
         return 32, 1
-    if arch.major * 10 + arch.minor >= 120:
+    if current_arch().is_sm_at_least(12):
         return 8, 4
     return 64, 2
 

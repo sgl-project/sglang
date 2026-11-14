@@ -124,6 +124,8 @@ def fused_kda_conv_gating_verify_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    ring_indices=None,
+    SEPARATE_RING_INDEX: tl.constexpr = False,
 ):
     # PDL: overlap prologue with the tail of the producer qkv-projection GEMM;
     # every global load (conv_state_indices, mixed_qkv, weights) happens after
@@ -338,8 +340,11 @@ def fused_kda_conv_gating_verify_kernel(
         # t < MAX_CACHE_LEN guard drops absorb-overflow steps instead of
         # smashing the next slot's ring.
         if CACHE_RING:
-            if h0_idx >= 0 and t < MAX_CACHE_LEN:
+            if SEPARATE_RING_INDEX:
+                ring_slot = tl.load(ring_indices + i_n).to(tl.int64)
+            else:
                 ring_slot = h0_idx.to(tl.int64)
+            if ring_slot >= 0 and t < MAX_CACHE_LEN:
                 tl.store(
                     replayssm_rawv
                     + ring_slot * stride_rawv_slot
@@ -455,6 +460,7 @@ def fused_kda_conv_gating_verify(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    ring_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
     matching the unfused ``target_verify`` output layout."""
@@ -622,6 +628,8 @@ def fused_kda_conv_gating_verify(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        ring_indices=ring_indices if ring_indices is not None else cache_indices,
+        SEPARATE_RING_INDEX=ring_indices is not None,
         # num_warps=1 matches the reference kernels' reduction order exactly;
         # higher values must be re-validated for bit-exactness before use.
         num_warps=num_warps,

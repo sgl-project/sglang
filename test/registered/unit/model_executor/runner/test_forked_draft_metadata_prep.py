@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-def test_kv_store_location_joins_before_the_deferred_commit_hook(monkeypatch):
+def test_kv_store_location_joins_before_the_deferred_draft_kv_hook(monkeypatch):
     """The first draft KV store reads its location through get_swa_out_cache_loc,
     which must join the forked prep before reading the metadata it builds."""
     from sglang.srt.layers.attention import deepseek_v4_backend as dsv4
@@ -25,12 +25,12 @@ def test_kv_store_location_joins_before_the_deferred_commit_hook(monkeypatch):
     class _Stop(Exception):
         pass
 
-    def deferred_commit_join():
+    def deferred_draft_kv_join():
         order.append("commit")
         raise _Stop
 
     backend = dsv4.DeepseekV4AttnBackend.__new__(dsv4.DeepseekV4AttnBackend)
-    backend.pre_kv_store_hook = deferred_commit_join
+    backend.pre_kv_store_hook = deferred_draft_kv_join
     with pytest.raises(_Stop):
         backend.get_swa_out_cache_loc(SimpleNamespace())
     assert order == ["prep", "commit"]

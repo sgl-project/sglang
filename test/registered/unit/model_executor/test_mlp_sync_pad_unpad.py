@@ -20,7 +20,8 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -47,7 +48,9 @@ def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:
 
 def _logits_output(num_rows: int) -> SimpleNamespace:
     return SimpleNamespace(
-        next_token_logits=torch.randn(num_rows, 16), hidden_states=None
+        next_token_logits=torch.randn(num_rows, 16),
+        hidden_states=None,
+        mm_input_embeds=None,
     )
 
 
@@ -290,6 +293,41 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # row count must match the real request count.
         self.assertEqual((fb.seq_lens - 1).shape[0], fb.batch_size)
 
+    def test_extend_post_forward_drops_bucket_rows_of_full_hidden_states(self):
+        """A chunked prefill padded to a DP-wide prefill-graph bucket returns only
+        its real token rows: an EAGLE draft re-pads them to its own, smaller width."""
+        real, bucket, prefix = 29, 48, 640
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(real),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([prefix + real]),
+            out_cache_loc=torch.arange(real),
+            seq_lens_sum=prefix + real,
+            positions=torch.arange(prefix, prefix + real),
+            seq_lens_cpu=torch.tensor([prefix + real]),
+            lora_ids=[None],
+        )
+        fb._original_batch_size = fb.batch_size
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=bucket, bs=1)
+
+        hidden = torch.randn(bucket, 8)
+        mm_input_embeds = torch.randn(bucket, 8)
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.randn(1, 16),
+            hidden_states=hidden,
+            last_hidden_states=None,
+            mm_input_embeds=mm_input_embeds,
+        )
+        fb.post_forward_mlp_sync_batch(logits_output)
+
+        torch.testing.assert_close(logits_output.hidden_states, hidden[:real])
+        torch.testing.assert_close(
+            logits_output.mm_input_embeds, mm_input_embeds[:real]
+        )
+        self.assertEqual(logits_output.next_token_logits.shape[0], 1)
+
     def test_draft_extend_dummy_request_pads_cpu_and_gpu_lens(self):
         spec_info = MagicMock()
         spec_info.num_tokens_per_req = 4
@@ -321,6 +359,39 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [4])
         self.assertEqual(fb.extend_prefix_lens_cpu, [0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
+
+    def test_padding_leaves_lists_held_by_pre_planned_metadata_intact(self):
+        """Padding must not grow host lists that metadata planned before it holds."""
+        spec_info = MagicMock()
+        spec_info.num_tokens_per_req = 2
+        spec_info.is_draft_input.return_value = False
+        planned_seq_lens = [2, 2]
+        planned_prefix_lens = [5, 6]
+        planned_logprob_start_lens = [0, 0]
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=2,
+            input_ids=torch.arange(4),
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([7, 8]),
+            seq_lens_sum=15,
+            out_cache_loc=torch.arange(4),
+            positions=torch.arange(4),
+            seq_lens_cpu=torch.tensor([7, 8]),
+            extend_seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+            extend_prefix_lens=torch.tensor([5, 6]),
+            extend_seq_lens_cpu=planned_seq_lens,
+            extend_prefix_lens_cpu=planned_prefix_lens,
+            extend_logprob_start_lens_cpu=planned_logprob_start_lens,
+            spec_info=spec_info,
+        )
+
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=6, bs=3)
+
+        self.assertEqual(fb.extend_seq_lens_cpu, [2, 2, 2])
+        self.assertEqual(planned_seq_lens, [2, 2])
+        self.assertEqual(planned_prefix_lens, [5, 6])
+        self.assertEqual(planned_logprob_start_lens, [0, 0])
 
 
 class TestDraftScopeMlpSync(CustomTestCase):

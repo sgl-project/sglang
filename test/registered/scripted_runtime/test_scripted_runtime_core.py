@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.http_server import ScriptedHttpServer

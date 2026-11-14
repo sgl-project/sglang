@@ -22,8 +22,9 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cpu
+from sglang.srt.utils import is_cpu
 
 
 def pad_navit_for_unaligned_cpu_tp(

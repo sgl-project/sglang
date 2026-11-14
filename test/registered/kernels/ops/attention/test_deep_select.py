@@ -26,7 +26,7 @@ register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-
 register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
-    not is_deep_select_supported(), reason="requires CUDA SM90, SM100, or SM103"
+    not is_deep_select_supported(), reason="requires CUDA SM90, SM100, SM103, or SM107"
 )
 
 DEFAULT_IDX_FILL = 2147483647
@@ -203,6 +203,43 @@ def test_page_transform_matches_reference(k, rows, width, with_end):
     logical = inverse[(wide // page_size).clamp(min=0)] * page_size + wide % page_size
     logical = torch.where(valid, logical, torch.full_like(logical, -1))
     _check_topk(input, k, logical, end=end, idx_fill=-1)
+
+
+def test_page_transform_denser_tier():
+    """Just past 2 * SMs rows, where `TopkNormal` moves to its 3-CTA config."""
+    rows = 2 * torch.cuda.get_device_properties(0).multi_processor_count + 1
+    k, width, page_size = 512, 33000, 64
+    input = _make_input(rows, width, torch.bfloat16)
+    table, inverse = _random_page_table(rows, width, page_size)
+
+    slots = topk_page_transform(input, k, page_table=table, page_size=page_size)
+
+    assert slots.dtype == torch.int32 and slots.shape == (rows, k)
+    valid = slots != -1
+    wide = slots.long()
+    logical = inverse[(wide // page_size).clamp(min=0)] * page_size + wide % page_size
+    logical = torch.where(valid, logical, torch.full_like(logical, -1))
+    _check_topk(input, k, logical, idx_fill=-1)
+
+
+def test_denser_tier_with_end_and_offset():
+    """The same 3-CTA config without a page table: ragged ends and per-row offsets."""
+    rows = 2 * torch.cuda.get_device_properties(0).multi_processor_count + 1
+    k, width = 512, 33000
+    input = _make_input(rows, width, torch.bfloat16)
+    g = torch.Generator(device="cuda").manual_seed(2)
+    end = torch.randint(
+        k, width + 1, (rows,), dtype=torch.int32, device="cuda", generator=g
+    )
+    offset = torch.randint(
+        0, 1 << 20, (rows,), dtype=torch.int32, device="cuda", generator=g
+    )
+
+    _, indices = topk(
+        input, k, end=end, output_idx_offset=offset, idx_oob_fill_value=-1
+    )
+
+    _check_topk(input, k, indices, end=end, idx_fill=-1, offset=offset)
 
 
 if __name__ == "__main__":

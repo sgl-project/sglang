@@ -6,9 +6,9 @@ import triton.language as tl
 from sgl_kernel import moe_sum_reduce as moe_sum_reduce_cuda
 from triton.testing import do_bench
 
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 
 @triton.jit
