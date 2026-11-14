@@ -322,6 +322,10 @@ class Envs:
     # [32-row V tile, request, layer x 4 value heads], software-pipelined over the heads), bit
     # for bit the stock commit's math, for the shapes it supports. Opt-in.
     SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT = EnvRuntimeBool(False)
+    # Spec verify commit: the conv-window rollback (every conv type) and the PLE side states
+    # (any dtype), working and track rows, as one multi-pair launch each instead of one
+    # scatter (plus its index casts) per pair and row set; the same bytes. Opt-in.
+    SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER = EnvRuntimeBool(False)
     # EAGLE verify target-only tree sampling (fp32, vocab >= 65536, <= 64 rows) as
     # multi-CTA kernels that keep the stock reduction orders (bitwise).
     SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(

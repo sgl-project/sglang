@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -439,6 +440,198 @@ class TestGdnTiledCommitDispatch(CustomTestCase):
                         ),
                         (32, 1, 1, 4),
                     )
+
+
+def _rollback_rows(*, track: bool, src: bool = False):
+    # As served: int32 working slots, int64 track slots and steps.
+    return dict(
+        slots=torch.tensor([3, 7, -1], dtype=torch.int32),
+        steps=torch.tensor([2, 0, 1]),
+        track=torch.tensor([10, -1, 12]) if track else None,
+        track_steps=torch.tensor([1, -1, 0]) if track else None,
+        src=torch.tensor([2, 0, 1]) if src else None,
+    )
+
+
+def _row_sets(rows):
+    sets = [(rows["slots"], rows["steps"])]
+    if rows["track"] is not None:
+        sets.append((rows["track"], rows["track_steps"]))
+    return sets
+
+
+class TestCommitMultiScatterDispatch(CustomTestCase):
+    """SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER: off, the stock scatter per pair and row
+    set on the rows as given; on, one multi-pair launch for the conv windows and one
+    for the PLE side states, or, with PP source rows or pairs the multi-pair launch
+    does not take, the per-pair scatters on int32 rows cast once."""
+
+    def _conv(self, *, multi, track, src=False, dtype=torch.bfloat16):
+        from sglang.kernels.ops.attention.linear import (
+            gdn_replayssm_spec_decode as replay,
+        )
+        from sglang.kernels.ops.mamba import mamba_state_scatter_triton as scatter
+
+        rows = _rollback_rows(track=track, src=src)
+        state = SimpleNamespace(
+            conv=[torch.zeros(2, 16, 6, 3, dtype=dtype)],
+            intermediate_conv_window=[torch.zeros(2, 4, 3, 6, 3, dtype=dtype)],
+            temporal=None,
+            replayssm_d=torch.zeros(2, 4, 1, 16, 8),
+            replayssm_k=None,
+            replayssm_g=None,
+            replayssm_rawv=None,
+            replayssm_rawk=None,
+        )
+        with (
+            patch.object(replay, "_COMMIT_MULTI_SCATTER", multi),
+            patch.object(replay, "commit_gdn_replayssm_spec"),
+            patch.object(replay, "commit_gdn_replayssm_circular"),
+            patch.object(scatter, "fused_conv_window_scatter_with_mask") as per_pair,
+            patch.object(scatter, "fused_conv_window_scatter_multi") as fused,
+        ):
+            replay.commit_gdn_replayssm_after_verify(
+                spec_state=state,
+                write_pos=None,
+                cache_base=None,
+                is_flush=None,
+                state_batch_indices=rows["slots"],
+                replay_indices=None,
+                accept_lens=None,
+                last_correct_step_indices=rows["steps"],
+                fold_every_commit=True,
+                mamba_track_indices=rows["track"],
+                mamba_steps_to_track=rows["track_steps"],
+                src_indices_raw=rows["src"],
+            )
+        return rows, state, per_pair, fused
+
+    def _ple(self, *, multi, track, src=False, eligible=True):
+        from sglang.srt.layers.attention import hybrid_linear_attn_backend as hla
+        from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
+
+        rows = _rollback_rows(track=track, src=src)
+        short_conv = SimpleNamespace(
+            conv_state=torch.zeros(1, 16, 8, 9, dtype=torch.bfloat16),
+            intermediate_conv_state=torch.zeros(1, 4, 3, 8, 9, dtype=torch.bfloat16),
+        )
+        ngram = SimpleNamespace(
+            context=torch.zeros(16, 2, dtype=torch.int64),
+            intermediate_context=torch.zeros(4, 3, 2, dtype=torch.int64),
+        )
+        router = SimpleNamespace(
+            part_view={SHORT_CONV_PART: short_conv, NGRAM_PART: ngram}.get
+        )
+        with (
+            patch.object(hla, "_COMMIT_MULTI_SCATTER", multi),
+            # CPU tensors: the multi-pair launch itself takes CUDA pairs only.
+            patch.object(hla, "_state_multi_eligible", return_value=eligible),
+            patch.object(
+                hla.HybridLinearAttnBackend, "_scatter_speculative_state_with_mask"
+            ) as per_pair,
+            patch.object(hla, "fused_state_scatter_multi") as fused,
+        ):
+            hla.commit_ple_states_after_verify(
+                router,
+                rows["slots"],
+                rows["steps"],
+                rows["track"],
+                rows["track_steps"],
+                rows["src"],
+            )
+        return rows, (short_conv, ngram), per_pair, fused
+
+    def _assert_stock_rows(self, per_pair, rows, *, pairs):
+        """One call per pair and row set (working, then track), on the rows as given."""
+        sets = _row_sets(rows)
+        calls = per_pair.call_args_list
+        self.assertEqual(len(calls), pairs * len(sets))
+        for i, (slots, steps) in enumerate(sets):
+            for call in calls[i :: len(sets)]:
+                self.assertIs(call.args[2], slots)
+                self.assertIs(call.args[3], steps)
+                self.assertIsNone(call.args[4])
+
+    def _assert_int32_rows(self, per_pair, rows, *, pairs, src):
+        """One call per pair and row set, on that set's int32 rows built once, all
+        sharing one int32 source-row tensor."""
+        sets = _row_sets(rows)
+        calls = per_pair.call_args_list
+        self.assertEqual(len(calls), pairs * len(sets))
+        want_src = (rows["src"] if src else torch.arange(3)).to(torch.int32)
+        self.assertTrue(torch.equal(calls[0].args[4], want_src))
+        for i, (slots, steps) in enumerate(sets):
+            set_calls = calls[i :: len(sets)]
+            for call in set_calls:
+                self.assertIs(call.args[4], calls[0].args[4])
+                for got, first, want in zip(
+                    call.args[2:4], set_calls[0].args[2:4], (slots, steps)
+                ):
+                    self.assertIs(got, first)
+                    self.assertEqual(got.dtype, torch.int32)
+                    self.assertTrue(torch.equal(got, want.to(torch.int32)))
+
+    def test_conv_windows_take_one_launch(self):
+        for track in (False, True):
+            with self.subTest(track=track):
+                rows, _, per_pair, fused = self._conv(multi=False, track=track)
+                self.assertEqual(fused.call_count, 0)
+                self._assert_stock_rows(per_pair, rows, pairs=1)
+
+                rows, state, per_pair, fused = self._conv(multi=True, track=track)
+                self.assertEqual((per_pair.call_count, fused.call_count), (0, 1))
+                (pairs, *index_sets), _ = fused.call_args
+                self.assertEqual(len(pairs), 1)
+                self.assertIs(pairs[0][0], state.conv[0])
+                self.assertIs(pairs[0][1], state.intermediate_conv_window[0])
+                for got, name in zip(
+                    index_sets, ("slots", "steps", "track", "track_steps")
+                ):
+                    self.assertIs(got, rows[name])
+
+    def test_conv_windows_fall_back_to_int32_rows(self):
+        # PP source rows, or FP32 conv windows (the multi-pair conv launch is BF16).
+        for src, dtype in ((True, torch.bfloat16), (False, torch.float32)):
+            with self.subTest(src=src, dtype=dtype):
+                rows, _, per_pair, fused = self._conv(
+                    multi=True, track=True, src=src, dtype=dtype
+                )
+                self.assertEqual(fused.call_count, 0)
+                self._assert_int32_rows(per_pair, rows, pairs=1, src=src)
+
+    def test_ple_side_states_take_one_launch(self):
+        for track in (False, True):
+            with self.subTest(track=track):
+                rows, _, per_pair, fused = self._ple(multi=False, track=track)
+                self.assertEqual(fused.call_count, 0)
+                self._assert_stock_rows(per_pair, rows, pairs=2)
+
+                rows, (short_conv, ngram), per_pair, fused = self._ple(
+                    multi=True, track=track
+                )
+                self.assertEqual((per_pair.call_count, fused.call_count), (0, 1))
+                (pairs, *index_sets), _ = fused.call_args
+                self.assertEqual(len(pairs), 2)
+                self.assertIs(pairs[0][0], short_conv.conv_state)
+                self.assertIs(pairs[0][1], short_conv.intermediate_conv_state)
+                self.assertEqual(pairs[1][0].shape, (1, 16, 2))
+                self.assertEqual(pairs[1][0].data_ptr(), ngram.context.data_ptr())
+                self.assertEqual(
+                    pairs[1][1].data_ptr(), ngram.intermediate_context.data_ptr()
+                )
+                for got, name in zip(
+                    index_sets, ("slots", "steps", "track", "track_steps")
+                ):
+                    self.assertIs(got, rows[name])
+
+    def test_ple_side_states_fall_back_to_int32_rows(self):
+        for src, eligible in ((True, True), (False, False)):
+            with self.subTest(src=src, eligible=eligible):
+                rows, _, per_pair, fused = self._ple(
+                    multi=True, track=True, src=src, eligible=eligible
+                )
+                self.assertEqual(fused.call_count, 0)
+                self._assert_int32_rows(per_pair, rows, pairs=2, src=src)
 
 
 if __name__ == "__main__":

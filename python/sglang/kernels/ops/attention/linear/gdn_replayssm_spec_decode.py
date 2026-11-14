@@ -61,6 +61,8 @@ _TILED_COMMIT_WARPS = 1
 # Warps of the tiled commit while tiled_commit_warps is active; None keeps _TILED_COMMIT_WARPS. Each element's fold
 # order does not depend on the warp count.
 _TILED_COMMIT_WARPS_OVERRIDE = None
+# SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER: the conv-window rollback as one launch for every conv type and row set.
+_COMMIT_MULTI_SCATTER = envs.SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER.get()
 
 
 @contextlib.contextmanager
@@ -1798,7 +1800,10 @@ def commit_gdn_replayssm_after_verify(
     read: the next verify overwrites them.
     """
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        _conv_multi_eligible,
+        fused_conv_window_scatter_multi,
         fused_conv_window_scatter_with_mask,
+        int32_scatter_rows,
     )
 
     commit_gdn_replayssm_spec(
@@ -1833,6 +1838,33 @@ def commit_gdn_replayssm_after_verify(
         null_block_id=null_block_id,
     )
     # Roll back the active conv state and snapshot its interval-crossing window.
+    if _COMMIT_MULTI_SCATTER:
+        pairs = [
+            (conv_states, window)
+            for conv_states, window in zip(
+                spec_state.conv, spec_state.intermediate_conv_window
+            )
+            if conv_states.numel() > 0
+        ]
+        if src_indices_raw is None and _conv_multi_eligible(pairs):
+            fused_conv_window_scatter_multi(
+                pairs,
+                state_batch_indices,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+            return
+        # The per-pair launches below, on rows cast once.
+        state_batch_indices, last_correct_step_indices, src_indices_raw = (
+            int32_scatter_rows(
+                state_batch_indices, last_correct_step_indices, src_indices_raw
+            )
+        )
+        if mamba_track_indices is not None:
+            mamba_track_indices, mamba_steps_to_track, _ = int32_scatter_rows(
+                mamba_track_indices, mamba_steps_to_track, src_indices_raw
+            )
     for conv_states, intermediate_conv_window in zip(
         spec_state.conv, spec_state.intermediate_conv_window
     ):
