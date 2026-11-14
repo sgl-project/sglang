@@ -45,6 +45,12 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_FLOAT8_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2fnuz,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +246,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     ):
         super().__init__()
         self.quant_config = quant_config
+        self.prefix = prefix
         self.output_dtype = output_dtype
 
         self.enable_tp = enable_tp
@@ -396,6 +403,18 @@ class VocabParallelEmbedding(torch.nn.Module):
             if output_dim is not None:
                 shape[output_dim] = shape[output_dim] // self.tp_size
             param.materialize(tuple(shape), dtype=loaded_weight.dtype)
+        elif (
+            loaded_weight.dtype in _FLOAT8_DTYPES and param.dtype not in _FLOAT8_DTYPES
+        ):
+            # A float8 weight needs its scale, which an unquantized table has no
+            # parameter for: the copy would keep the raw float8 codes as values.
+            raise ValueError(
+                f"{self.prefix or type(self).__name__}: the checkpoint stores a "
+                f"{loaded_weight.dtype} weight, but the layer was built unquantized "
+                f"({param.dtype}). The quantization config leaves it out (for "
+                "example in modules_to_not_convert or ignore) while the checkpoint "
+                "quantizes it."
+            )
 
         # If parameter does not have output dim, then it should
         # be copied onto all gpus (e.g. g_idx for act_order gptq).
