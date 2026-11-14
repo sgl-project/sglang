@@ -44,9 +44,8 @@ KIMI_K3_W4A8_32P_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "ASCEND_USE_FIA": "1",
     "SGLANG_NPU_USE_FIAS_V2_BSND": "1",
-    "HCCL_BUFFSIZE": "2000",
+    "HCCL_BUFFSIZE": "200",
     "DEEPEP_HCCL_BUFFSIZE": "1800",
-    "TRITON_CACHE_DIR": "/root/.cache/sglang/triton",
 }
 
 KIMI_K3_W4A8_32P_OTHER_ARGS = [
