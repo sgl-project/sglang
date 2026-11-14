@@ -421,14 +421,15 @@ class TestPagedForward(CustomTestCase):
         ids = torch.full_like(d.topk_output.topk_ids, 2**31 - 1)  # not computed yet
         out = torch.empty_like(d.hidden_states)
         resident = dict(method.policy.resident)
+        callbacks = []
         capture = SimpleNamespace(
-            _end_current_segment=lambda: None,
-            cuda_graph=SimpleNamespace(_break_fns=[]),
-            _begin_new_segment=lambda: None,
+            end_current_segment=lambda: None,
+            begin_next_segment=lambda: None,
+            register_eager_call=callbacks.append,
+            retain_for_replay=lambda value: value,
         )
         device = SimpleNamespace(current_stream=lambda: SimpleNamespace(stream_id=0))
-        token = breakable_cuda_graph._current_capture_var.set(capture)
-        try:
+        with breakable_cuda_graph.use_breakable_capture_recorder(capture):
             with patch.object(
                 breakable_cuda_graph, "get_device_module", return_value=device
             ):
@@ -440,13 +441,11 @@ class TestPagedForward(CustomTestCase):
                     None,
                     out,
                 )
-        finally:
-            breakable_cuda_graph._current_capture_var.reset(token)
         self.assertEqual(method.base_method.rows, 0)
         self.assertEqual(dict(method.policy.resident), resident)
 
         ids.copy_(d.topk_output.topk_ids)
-        (replay,) = capture.cuda_graph._break_fns
+        (replay,) = callbacks
         replay()
         torch.testing.assert_close(out, _reference(full, d))
 

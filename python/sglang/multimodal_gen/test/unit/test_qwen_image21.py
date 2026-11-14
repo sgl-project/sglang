@@ -918,19 +918,17 @@ def test_prefix_pad_replay_writes_the_captured_output():
     q, kv = torch.zeros(1, 3, 2, 4), torch.zeros(1, 6, 2, 4)
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
-        cuda_graph=graph,
-        _end_current_segment=lambda: None,
-        _begin_new_segment=lambda: None,
+        end_current_segment=lambda: None,
+        begin_next_segment=lambda: None,
+        register_eager_call=graph._break_fns.append,
+        retain_for_replay=lambda value: value,
     )
     with patch(
         "sglang.multimodal_gen.runtime.models.dits.qwen_image21.get_forward_context",
         return_value=SimpleNamespace(attn_metadata=None),
     ):
-        token = bcg._current_capture_var.set(capture)
-        try:
+        with bcg.use_breakable_capture_recorder(capture):
             out = QwenImage21Attention.attend_target(attention, q, kv, kv, prefix_pad)
-        finally:
-            bcg._current_capture_var.reset(token)
         prefix_pad.rows.fill_(1)
         with replay_token_scope():
             assert graph._break_fns[0]() is None

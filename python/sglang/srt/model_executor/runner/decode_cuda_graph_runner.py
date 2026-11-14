@@ -97,8 +97,8 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
-    BreakableCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.capture_profile import (
     CaptureProfileOptions,
@@ -1426,7 +1426,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:
-            assert isinstance(self.backend, BreakableCudaGraphBackend), (
+            assert isinstance(self.backend, BaseBreakableGraphBackend), (
                 "Breakable CUDA graph is required for --debug-cuda-graph"
             )
 

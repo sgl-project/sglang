@@ -100,9 +100,6 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     freeze_gc,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
-    BreakableCudaGraphBackend,
-)
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
@@ -121,12 +118,6 @@ def _full_graph_backend_types() -> tuple[type, ...]:
 
 def _is_full_graph_backend(backend: Any) -> bool:
     return isinstance(backend, _full_graph_backend_types())
-
-
-def _is_full_or_bcg_backend(backend: Any) -> bool:
-    return isinstance(
-        backend, (BreakableCudaGraphBackend, *_full_graph_backend_types())
-    )
 
 
 def _has_chunked_local_attn(model_runner: Any) -> bool:
@@ -336,6 +327,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
+    _is_breakable_backend = False
     dllm_attention = None
 
     @property
@@ -383,6 +375,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        self._is_breakable_backend = self.prefill_backend_name == Backend.BREAKABLE
         qwen_bcg = self.prefill_backend_name == Backend.BREAKABLE and is_qwen4_exp(
             model_runner.model_config.hf_config
         )
@@ -579,7 +572,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
-        self._capture_lora = self.enable_lora and _is_full_or_bcg_backend(self.backend)
+        self._capture_lora = self.enable_lora and (
+            self._is_full_backend or self._is_breakable_backend
+        )
         if self._capture_lora:
             model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
                 max_num_tokens=self.max_num_tokens,
@@ -640,7 +635,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     else "auto from chunked_prefill_size"
                 ),
             )
-        if _is_full_or_bcg_backend(self.backend):
+        if self._is_full_backend or self._is_breakable_backend:
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -648,9 +643,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 }
 
         server_args = model_runner.server_args
-        self.enable_cp_bcg_capture = isinstance(
-            self.backend, BreakableCudaGraphBackend
-        ) and supports_prefill_cp_bcg(server_args)
+        self.enable_cp_bcg_capture = (
+            self._is_breakable_backend and supports_prefill_cp_bcg(server_args)
+        )
         if self.enable_cp_bcg_capture:
             if self.max_context_size is not None:
                 # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
@@ -681,7 +676,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # (e.g. EAGLE3 stacks 3 target layers), so capture the pre-reduction
         # width when the draft model exposes it.
         if (
-            isinstance(self.backend, BreakableCudaGraphBackend)
+            self._is_breakable_backend
             and model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_eagle()
         ):
@@ -697,7 +692,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # object the backend then refreshes in place at replay. We honor
         # the contract only when the backend is Breakable; FullCG and
         # TC_PIECEWISE use the eager init_forward_metadata path.
-        if isinstance(self.backend, BreakableCudaGraphBackend):
+        if self._is_breakable_backend:
             self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False
@@ -713,7 +708,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
         # graph bs-invariant so req_slots is not bound by an (req_slots, vocab) buffer.
-        if _is_full_or_bcg_backend(self.backend):
+        if self._is_full_backend or self._is_breakable_backend:
             try:
                 self.layer_model = _resolve_transformer_layer_model(
                     self.model_runner.model
@@ -1918,7 +1913,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4's hook (which restores forward_metadata to a stale
         # _current_capture_raw left over from decode CG capture) doesn't
         # corrupt warmup iter 2's metadata read.
-        if isinstance(self.backend, BreakableCudaGraphBackend):
+        if self._is_breakable_backend:
             post_warmup_hook = None
             req_pool = self.model_runner.req_to_token_pool
             mamba_pool = self.model_runner.token_to_kv_pool.layer_router.part_view(
@@ -2106,9 +2101,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_seqlens_cpu=forward_batch.mamba_track_seqlens_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
-                forward_batch.return_logprob
-                if isinstance(self.backend, BreakableCudaGraphBackend)
-                else False
+                forward_batch.return_logprob if self._is_breakable_backend else False
             ),
             is_prefill_only=forward_batch.is_prefill_only,
             extend_seq_lens=forward_batch.extend_seq_lens,
@@ -2179,7 +2172,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         if (
-            isinstance(self.backend, BreakableCudaGraphBackend)
+            self._is_breakable_backend
             and self.has_mha_companion_layers
             and not is_cuda()
         ):

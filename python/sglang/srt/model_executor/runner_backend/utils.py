@@ -22,9 +22,12 @@ live in :mod:`.cuda_graph_config`.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
@@ -44,6 +47,26 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_breakable_backend_cls(
+    phase: Literal["decode", "prefill"],
+) -> type[BaseBreakableGraphBackend]:
+    backend_cls = None
+    if current_platform.is_out_of_tree():
+        backend_cls = current_platform.get_breakable_graph_backend_cls(phase)
+
+    if backend_cls is None:
+        return BreakableCudaGraphBackend
+    if not isinstance(backend_cls, type) or not issubclass(
+        backend_cls, BaseBreakableGraphBackend
+    ):
+        raise TypeError(
+            f"{type(current_platform).__name__}.get_breakable_graph_backend_cls"
+            f"({phase!r}) must return a BaseBreakableGraphBackend subclass or None, "
+            f"got {backend_cls!r}"
+        )
+    return backend_cls
 
 
 def _needs_hicache_event_capture(model_runner: ModelRunner) -> bool:
@@ -108,7 +131,8 @@ def resolve_decode_backend(
         )
 
     if backend_name == Backend.BREAKABLE:
-        return BreakableCudaGraphBackend(
+        breakable_backend_cls = _resolve_breakable_backend_cls(Phase.DECODE)
+        return breakable_backend_cls(
             cuda_graph_runner,
             enable_memory_saver=enable_memory_saver,
             debug_eager=get_exec().graph.debug_cuda_graph,
@@ -153,7 +177,8 @@ def resolve_prefill_backend(
         )
 
     if backend_name == Backend.BREAKABLE:
-        return BreakableCudaGraphBackend(
+        breakable_backend_cls = _resolve_breakable_backend_cls(Phase.PREFILL)
+        return breakable_backend_cls(
             cuda_graph_runner,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             debug_eager=get_exec().graph.debug_cuda_graph,

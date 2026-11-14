@@ -27,15 +27,52 @@ def recording_capture():
     events = []
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
-        cuda_graph=graph,
-        _end_current_segment=lambda: events.append("end"),
-        _begin_new_segment=lambda: events.append("begin"),
+        end_current_segment=lambda: events.append("end"),
+        begin_next_segment=lambda: events.append("begin"),
+        register_eager_call=graph._break_fns.append,
+        retain_for_replay=bcg._weak_ref_if_tensor,
     )
-    token = bcg._current_capture_var.set(capture)
-    try:
+    with bcg.use_breakable_capture_recorder(capture):
         yield graph, events
-    finally:
-        bcg._current_capture_var.reset(token)
+
+
+def test_decorator_uses_only_the_device_neutral_recorder_contract():
+    calls = []
+    callbacks = []
+    recorder = SimpleNamespace(
+        end_current_segment=lambda: calls.append("end"),
+        begin_next_segment=lambda: calls.append("begin"),
+        register_eager_call=callbacks.append,
+        retain_for_replay=lambda value: value,
+    )
+
+    @bcg.eager_on_graph
+    def eager_call(value, output):
+        output.copy_(value + 1)
+
+    output = torch.zeros(1)
+    with bcg.use_breakable_capture_recorder(recorder):
+        eager_call(torch.ones(1), output)
+
+    assert calls == ["end", "begin"]
+    assert output.item() == 0
+    callbacks[0]()
+    assert output.item() == 2
+
+
+def test_capture_recorder_scope_restores_outer_after_exception():
+    outer = SimpleNamespace()
+    inner = SimpleNamespace()
+
+    with bcg.use_breakable_capture_recorder(outer):
+        assert bcg.get_breakable_capture_recorder() is outer
+        with pytest.raises(RuntimeError, match="capture failure"):
+            with bcg.use_breakable_capture_recorder(inner):
+                assert bcg.get_breakable_capture_recorder() is inner
+                raise RuntimeError("capture failure")
+        assert bcg.get_breakable_capture_recorder() is outer
+
+    assert bcg.get_breakable_capture_recorder() is None
 
 
 def test_method_replay_reads_current_batch_and_preserves_output_address(monkeypatch):
