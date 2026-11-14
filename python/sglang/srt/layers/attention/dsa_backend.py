@@ -953,6 +953,11 @@ class DeepseekSparseAttnBackend(
         else:
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        self.flashmla_sparse_head_padding = self._flashmla_sparse_head_padding(
+            device_sm_major=self.device_sm_major,
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+            num_heads=self.num_q_heads,
+        )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.sparse_prefill_small_heads = _small_heads_prefill_enabled(
             self.device_sm_major,
@@ -3236,6 +3241,15 @@ class DeepseekSparseAttnBackend(
         )
         return o  # type: ignore
 
+    @staticmethod
+    def _flashmla_sparse_head_padding(
+        device_sm_major: int, head_dim: int, num_heads: int
+    ) -> int:
+        # TODO: Validate head64 at d_qk=512 before widening this guard.
+        if device_sm_major == 10 and head_dim == 576 and num_heads <= 64:
+            return 64
+        return 128 if device_sm_major >= 10 else 64
+
     def _forward_flashmla_sparse(
         self,
         q_all: torch.Tensor,
@@ -3247,9 +3261,6 @@ class DeepseekSparseAttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         allow_small_heads: bool = False,
     ) -> torch.Tensor:
-        # FlashMLA sparse kernels are instantiated at 64 heads (Hopper and
-        # Blackwell) and 128 heads (Blackwell); with TP the local head count may
-        # be smaller (e.g., 64 // 4 = 16) and is padded up.
         num_tokens, num_heads, head_dim = q_all.shape
         use_small_heads = (
             allow_small_heads
@@ -3263,10 +3274,7 @@ class DeepseekSparseAttnBackend(
             and page_table_1.shape[-1] % 64 == 0
         )
 
-        # Compact calls use Q64; native calls retain their existing padding.
-        required_padding = (
-            64 if use_small_heads else (128 if self.device_sm_major >= 10 else 64)
-        )
+        required_padding = 64 if use_small_heads else self.flashmla_sparse_head_padding
 
         need_padding = num_heads % required_padding != 0
 
