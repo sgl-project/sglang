@@ -4521,6 +4521,18 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None, running_batch
 
+        # SGLANG_1093_DECODE_PREFER_V2
+        # Prefill-first scheduling: any prefill batch (including chunked_req
+        # continuation) fully preempts decode. Under speculative + !mixed_chunk,
+        # defer ALL prefills while decode is running so multi-turn ITL/TPOT
+        # stays stable for small numPrompts samples.
+        if (
+            not self.spec_algorithm.is_none()
+            and not self.is_mixed_chunk
+            and not running_batch.is_empty()
+        ):
+            return None, running_batch
+
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
