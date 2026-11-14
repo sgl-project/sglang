@@ -172,7 +172,15 @@ class GPUEnv(BaseEnv):
         """
         from torch.utils.cpp_extension import CUDA_HOME
 
+        from sglang.kernels.jit.utils.compile.toolchain import cuda_home
+
         cuda_info = {"CUDA_HOME": CUDA_HOME}
+        # JIT kernels resolve nvcc through cuda_home(). A wheel-only install
+        # has no CUDA_HOME for torch but still has an nvcc on PATH or set in
+        # the environment, so report both.
+        jit_home = cuda_home()
+        if jit_home != CUDA_HOME:
+            cuda_info["JIT_CUDA_HOME"] = jit_home
 
         if CUDA_HOME and os.path.isdir(CUDA_HOME):
             cuda_info.update(self._get_nvcc_info())
