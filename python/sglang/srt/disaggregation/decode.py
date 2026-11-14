@@ -4045,7 +4045,80 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
 
+class DecodeLaneBalancer:
+    """Holds a DP rank's new decode starts above ceil(fleet mean + margin) of the
+    last gathered per-rank running counts, since every rank's step runs the graph
+    of the busiest rank. A rank holding more than MAX_HELD requests, or one held
+    MAX_WAIT_S, starts them past the cap, so total admission is not capped."""
+
+    MAX_HELD = 16
+    MAX_WAIT_S = 1.0
+    LOG_INTERVAL_S = 60.0
+
+    def __init__(self, margin: int) -> None:
+        self.margin = margin
+        self.held = 0
+        self.released_count = 0
+        self.released_wait = 0
+        self.cap_min: Optional[int] = None
+        self.cap_max: Optional[int] = None
+        self.last_log = time.monotonic()
+
+    def free_lanes(
+        self,
+        rows: Optional[List[int]],
+        used: int,
+        free: int,
+        waiting: List[Req],
+        now: float,
+    ) -> int:
+        if not rows or len(rows) < 2 or free <= 0:
+            return free
+        n = len(rows)
+        cap = -(-sum(rows) // n) + self.margin
+        self.cap_min = cap if self.cap_min is None else min(self.cap_min, cap)
+        self.cap_max = cap if self.cap_max is None else max(self.cap_max, cap)
+        base = max(0, min(free, cap - used))
+        if base >= free or len(waiting) <= base:
+            return free
+        by_count = len(waiting) - base - self.MAX_HELD
+        by_wait = (
+            sum(
+                now - req.time_stats.wait_queue_entry_time >= self.MAX_WAIT_S
+                for req in waiting
+            )
+            - base
+        )
+        released = max(0, min(max(by_count, by_wait), free - base))
+        if released:
+            if by_count >= by_wait:
+                self.released_count += released
+            else:
+                self.released_wait += released
+        self.held += min(len(waiting), free) - base - released
+        return base + released
+
+    def maybe_log(self, rows: Optional[List[int]]) -> None:
+        now = time.monotonic()
+        if now - self.last_log < self.LOG_INTERVAL_S:
+            return
+        self.last_log = now
+        if self.cap_min is None:
+            return
+        mean = sum(rows) / len(rows) if rows else 0.0
+        logger.info(
+            f"Decode lane balance: margin={self.margin} cap=[{self.cap_min},"
+            f"{self.cap_max}] rows max/mean={max(rows, default=0)}/{mean:.2f} "
+            f"held_req_steps={self.held} released_count={self.released_count} "
+            f"released_wait={self.released_wait}"
+        )
+        self.held = self.released_count = self.released_wait = 0
+        self.cap_min = self.cap_max = None
+
+
 class SchedulerDisaggregationDecodeMixin:
+    decode_lane_balancer: Optional[DecodeLaneBalancer] = None
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -4392,6 +4465,25 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
+
+        balancer = self.decode_lane_balancer
+        if balancer is not None:
+            rows = self.dp_attn_adapter.rank_rows.rows
+            startable = [
+                req
+                for req in self.waiting_queue
+                if not host_restore
+                or req.kv.restore_done_event is None
+                or id(req) in restores_ready
+            ]
+            num_not_used_batch = balancer.free_lanes(
+                rows,
+                curr_batch_size,
+                num_not_used_batch,
+                startable,
+                time.perf_counter(),
+            )
+            balancer.maybe_log(rows)
 
         # pop req from waiting queue
         can_run_list: List[Req] = []

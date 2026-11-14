@@ -95,6 +95,7 @@ from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation import role_switch
 from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
+    DecodeLaneBalancer,
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
@@ -1711,6 +1712,15 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
                 draft_kv_ring=draft_kv_ring,
             )
+            margin = get_disagg().disaggregation_decode_lane_balance_margin
+            parallel = get_parallel()
+            # A per-rank wait clock could make attention-TP/CP peers admit differently.
+            if (
+                margin > 0
+                and parallel.attn_dp_enabled
+                and parallel.attn_tp_size * parallel.attn_cp_size == 1
+            ):
+                self.decode_lane_balancer = DecodeLaneBalancer(margin)
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
