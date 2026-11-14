@@ -138,7 +138,7 @@ def test_first_call_compiles_every_tile_config_once(monkeypatch):
     assert variants() == [6, 3, 3]
 
 
-def _gated_residual(s, **kwargs):
+def _gated_residual(s):
     from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 
     cfg = HyperConnectionConfig(
@@ -153,7 +153,7 @@ def _gated_residual(s, **kwargs):
     default = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
-        m = GatedResidual(cfg, **kwargs).cuda()
+        m = GatedResidual(cfg).cuda()
     finally:
         torch.set_default_dtype(default)
     with torch.no_grad():
@@ -188,9 +188,6 @@ def test_gated_residual_seam_matches_stock(monkeypatch):
     # R' differs from stock only where the two gates' fp32 sums round differently.
     assert (r1 == stock[1]).float().mean().item() > 0.99
     assert _rel_l2(mixed1, stock[2]) < 1e-2
-    # MTP draft layers are built with seam=False and keep the stock path.
-    off = _gated_residual(_stage(gen), seam=False)
-    assert off.mix(r)[1][1] is not hcm.SEAM_NORMED
 
 
 if __name__ == "__main__":
