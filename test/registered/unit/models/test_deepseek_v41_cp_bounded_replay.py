@@ -57,6 +57,86 @@ def make_tail(*, cp=True, graph=False):
 
 
 class TestCpBoundedReplayOutput(CustomTestCase):
+    def test_real_model_keeps_dspark_cp_tail_compact(self):
+        # The actual model producer must satisfy the compact gather contract.
+        for num_tokens in (64, 200, 16384):
+            for capture in (False, True):
+                with self.subTest(num_tokens=num_tokens, capture=capture):
+                    local_tokens = num_tokens // 4
+                    tail_tokens = min(num_tokens, 128) // 4
+                    local_indices = torch.arange(
+                        local_tokens - tail_tokens, local_tokens
+                    )
+                    markers = torch.arange(
+                        1, tail_tokens * 2 + 1, dtype=torch.float32
+                    ).view(tail_tokens, 2)
+                    tail = LateLayerTail(
+                        token_indices=local_indices,
+                        positions=local_indices * 4,
+                        extend_seq_lens=torch.tensor([tail_tokens * 4]),
+                        extend_seq_lens_cpu=[tail_tokens * 4],
+                        swa_out_cache_loc=torch.arange(tail_tokens * 4),
+                        cp_metadata=object(),
+                    )
+                    body = deepseek_v4.DeepseekV4Model.__new__(
+                        deepseek_v4.DeepseekV4Model
+                    )
+                    torch.nn.Module.__init__(body)
+                    body.pp_group = SimpleNamespace(
+                        is_first_rank=False, is_last_rank=True
+                    )
+                    body.hc_mult, body.hidden_size = 1, 2
+                    body.dspark_layers_to_capture = [0] if capture else None
+                    body.hc_pre_from_prev_sublayer = True
+                    body._can_run_tbo = mock.Mock(return_value=False)
+                    body.norm = torch.nn.Identity()
+
+                    def layers(*args):
+                        packer = args[-1]
+                        if packer is not None:
+                            packer.slot(markers).copy_(markers + 5000)
+                        return markers[:, None, :], None, tail
+
+                    body._forward_layers_hc_pre_from_prev = layers
+                    batch = SimpleNamespace()
+                    ids = torch.arange(local_tokens)
+                    with (
+                        mock.patch.object(deepseek_v4, "_is_cuda", True),
+                        mock.patch.object(deepseek_v4, "_is_npu", False),
+                        mock.patch.object(
+                            deepseek_v4,
+                            "get_parallel",
+                            return_value=SimpleNamespace(attn_dp_size=1),
+                        ),
+                        mock.patch.object(deepseek_v4, "get_attn_backend"),
+                        mock.patch.object(
+                            deepseek_v4, "is_cp_active", return_value=True
+                        ),
+                        mock.patch(
+                            "sglang.kernels.ops.layernorm.mhc.mhc_combine",
+                            side_effect=lambda pre, *args: pre,
+                        ),
+                    ):
+                        output = body._forward_impl(
+                            ids,
+                            ids,
+                            batch,
+                            None,
+                            pp_proxy_tensors={
+                                "hidden_states": torch.zeros(local_tokens, 1, 2)
+                            },
+                        )
+                    if capture:
+                        (hidden, pre), aux = output
+                        torch.testing.assert_close(aux, markers + 5000)
+                        expected = markers
+                    else:
+                        hidden, pre = output
+                        expected = markers.new_zeros((local_tokens, 2))
+                        expected[local_indices] = markers
+                    torch.testing.assert_close(hidden, expected)
+                    torch.testing.assert_close(pre, expected)
+
     def test_compact_global_rows_reach_logits_and_dspark(self):
         model, batch, tail = make_model(), make_batch(), make_tail()
         original_metadata = batch.attn_cp_metadata

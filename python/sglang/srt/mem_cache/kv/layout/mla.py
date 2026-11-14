@@ -211,6 +211,25 @@ class MLAView(MLAKVView):
             f"sub-pool {spec.name!r} store dtype {spec.store_dtype} does not "
             f"match kv cache dtype {kv_cache_dtype}"
         )
+        self._init_view(
+            arena=arena,
+            spec=spec,
+            kv_cache_dtype=kv_cache_dtype,
+            store_dtype=spec.store_dtype,
+            page_size=page_size,
+            model_layer_ids=model_layer_ids,
+        )
+
+    def _init_view(
+        self,
+        *,
+        arena: "KVArena",
+        spec,
+        kv_cache_dtype: torch.dtype,
+        store_dtype: torch.dtype,
+        page_size: int,
+        model_layer_ids: Optional[Tuple[int, ...]],
+    ) -> None:
         self._has_draft_parts = spec.draft_region is not None
         # An MLA latent is replicated, but a fused MHA draft carries rank-local heads.
         self.storage_rank_replicated = spec.draft_region is None or isinstance(
@@ -225,7 +244,7 @@ class MLAView(MLAKVView):
         self.size = self.num_pages * page_size - page_size
         self.page_size = page_size
         self.dtype = kv_cache_dtype
-        self.store_dtype = spec.store_dtype
+        self.store_dtype = store_dtype
         self.device = arena.device
         self.kv_lora_rank = spec.kv_lora_rank
         self.qk_rope_head_dim = spec.qk_rope_head_dim
@@ -501,6 +520,130 @@ class MLAView(MLAKVView):
                     self.kv_buffer[0].device, non_blocking=True
                 )
         current_platform.synchronize()
+
+
+class LayerMajorMLAView(MLAView):
+    """Per layer, a paged ``(pages, page_size, 1, row_bytes)`` view of a
+    composite sub-pool's ``fp8_ds_mla`` latent rows, pages a unit apart;
+    written quantized and read only by the dequantizing kernels. Pages also
+    hold the unit's other parts, so transfers move whole units."""
+
+    def __init__(
+        self,
+        *,
+        arena: "KVArena",
+        spec,
+        geometry,
+        page_size: int,
+        model_layer_ids: Tuple[int, ...],
+    ):
+        from sglang.srt.mem_cache.kv.decl import FP8_DS_MLA, KV_PART
+
+        assert spec.page_size == page_size
+        row_format = geometry.row_format
+        if row_format is None or row_format.name != FP8_DS_MLA:
+            raise ValueError(
+                "layer-major latent rows are stored only in the "
+                f"{FP8_DS_MLA!r} row format; got "
+                f"{'plain rows' if row_format is None else repr(row_format.name)}"
+            )
+        self._has_draft_parts = False
+        self.storage_rank_replicated = True
+        self._arena = arena
+        self._sub_pool_name = spec.name
+        self.kv_buffer = spec.part_views(arena, KV_PART)
+        self.num_pages = arena.extent_entries(spec.name) // page_size
+        self.page_bytes = spec.page_bytes()
+        self.size = self.num_pages * page_size - page_size
+        self.page_size = page_size
+        self.dtype = geometry.kv_cache_dtype
+        self.store_dtype = torch.uint8
+        self.device = arena.device
+        self.kv_lora_rank = geometry.kv_lora_rank
+        self.qk_rope_head_dim = geometry.qk_rope_head_dim
+        # The stored row, in store dtype elements.
+        self.kv_cache_dim = geometry.row_bytes() // self.store_dtype.itemsize
+        self.layer_num = len(self.kv_buffer)
+        self.start_layer = 0
+        self.end_layer = self.layer_num - 1
+        self.model_layer_ids = tuple(model_layer_ids)
+        self.layer_transfer_counter = None
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.dsa_kv_cache_store_fp8 = True
+        self.kv_scale_ue8m0 = row_format.scale_ue8m0
+        self.quant_block_size = 128
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError(
+            "block-quantized latent rows have no value slice; read them "
+            "through the kernels that dequantize them"
+        )
+
+    def get_mla_kv_buffer(self, *args, **kwargs):
+        raise NotImplementedError(
+            "layer-major latent rows are read by page; gather them through the "
+            "paged kernels"
+        )
+
+    def set_kv_buffer(self, *args, **kwargs) -> None:
+        raise NotImplementedError(
+            "layer-major latent rows are written through set_mla_kv_buffer"
+        )
+
+    def set_mla_kv_buffer(
+        self,
+        layer,
+        loc_info,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ) -> None:
+        from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
+            quantize_k_cache_separate,
+        )
+
+        loc, _, _ = unwrap_write_loc(loc_info)
+        self._check_write_loc(loc_info, loc, "set_mla_kv_buffer (layer-major MLA)")
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        nope, rope = quantize_k_cache_separate(
+            cache_k_nope, cache_k_rope, scale_ue8m0=self.kv_scale_ue8m0
+        )
+        set_mla_kv_buffer_triton(self.kv_buffer[layer_id], loc, nope, rope)
+
+    # -- whole units --
+
+    def host_layout(self):
+        from sglang.srt.mem_cache.kv.layout.page import page_envelope_host_layout
+
+        return page_envelope_host_layout(
+            self._arena,
+            self._sub_pool_name,
+            self.size
+            if self.host_capacity_tokens is None
+            else self.host_capacity_tokens,
+            self.page_size,
+        )
+
+    def get_device_pool_infos(self):
+        raise NotImplementedError(
+            "a composite unit is moved whole: use its page envelope"
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        raise NotImplementedError(
+            "retraction backs a unified pool up by whole units in its arena"
+        )
+
+    def load_cpu_copy(self, *args, **kwargs):
+        raise NotImplementedError(
+            "retraction backs a unified pool up by whole units in its arena"
+        )
 
 
 class DraftMLAView(MLAView):

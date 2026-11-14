@@ -1178,9 +1178,11 @@ levels:
   every op, and VAE decode fuses the ViT decoder's per-head QK RMSNorm and
   RoPE into one launch, runs its attention on cuDNN SDPA and, on CUDA, decodes
   several spatial tiles per decoder forward (rounding-level differences only).
-- `"high"`: the audited accelerated path. Quality is guaranteed (the audited
-  Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
-  `exact`), but output is no longer bit-identical to the reference.
+- `"high"`: the audited accelerated path. Cache-DiT reuses the DiT stack's
+  output on a fixed step schedule: the first 15 of the 50 steps always run,
+  then every second step up to step 25, then every eighth. Quality is
+  guaranteed (the audited schedule measures SSIM 0.911 / PSNR 29.09 dB against
+  `lossless`), but output is no longer bit-identical to the reference.
 
 One resident server serves all three levels; a `quality: "high"` request
 mounts its audited Cache-DiT policy at the batch boundary, and a later
@@ -1255,23 +1257,25 @@ latency while keeping output closest to the same-seed exact trajectory.
 
 The measured trade-off is:
 
-| `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />exact | PSNR vs <br />exact | Expected <br />trade-off |
+| `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `exact` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
-| `lossless` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE and uses cuDNN SDPA (rounding-level differences) |
-| `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
+| `exact` | 71.84 s | 0.99× | 0.660 | 17.85 dB | Native reference path; a different sample from `lossless` |
+| `lossless` | 71.17 s | 1.00× | 1.000 | identical | Default; fusion-only tier (rounding-level differences in each operation) |
+| `high` | 35.80 s | 1.99× | 0.911 | 29.09 dB | Stays close to the same-seed `lossless` sample |
 
 These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,
 video flow shift 12, audio flow shift 3, and three fixed prompt/seed pairs on
 4×H200. The prompts cover a quiet detailed scene, fast multi-subject action,
 and a moving close-up portrait. `inference_time_s` is averaged across the three
-prompts; the quiet-scene point is itself the mean of two repeats.
+prompts.
 
-SSIM and PSNR compare decoded, frame-aligned output with the `exact`
+SSIM and PSNR compare decoded, frame-aligned output with the `lossless`
 result for the same prompt and seed. They measure trajectory deviation, not
 absolute perceptual quality: the `high` path can produce a different but
 still plausible realization. It also changes the joint audio-video denoise
-trajectory, while these two metrics cover video only.
+trajectory, while these two metrics cover video only. `exact` and `lossless`
+differ only by rounding inside each operation, but 50 denoising steps grow that
+into a different sample, so `exact` is not a usable reference for `high`.
 
 `quality: "high"` currently accepts only the exact workload and 4×H200
 deployment above; other hardware, task modes, request shapes, step counts, or

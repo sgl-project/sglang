@@ -436,10 +436,6 @@ class Conversation:
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
-    def set_system_message(self, system_message: str):
-        """Set the system message."""
-        self.system_message = system_message
-
     def append_message(self, role: str, message: str):
         """Append a new message."""
         self.messages.append([role, message])
@@ -460,39 +456,6 @@ class Conversation:
     def append_audio(self, audio: str):
         """Append a new audio."""
         self.audio_data.append(audio)
-
-    def update_last_message(self, message: str):
-        """Update the last output.
-
-        The last message is typically set to be None when constructing the prompt,
-        so we need to update it in-place after getting the response from a model.
-        """
-        self.messages[-1][1] = message
-
-    def to_gradio_chatbot(self):
-        """Convert the conversation to gradio chatbot format."""
-        ret = []
-        for i, (role, msg) in enumerate(self.messages[self.offset :]):
-            if i % 2 == 0:
-                ret.append([msg, None])
-            else:
-                ret[-1][-1] = msg
-        return ret
-
-    def to_openai_api_messages(self):
-        """Convert the conversation to OpenAI chat completion format."""
-        if self.system_message == "":
-            ret = []
-        else:
-            ret = [{"role": "system", "content": self.system_message}]
-
-        for i, (_, msg) in enumerate(self.messages[self.offset :]):
-            if i % 2 == 0:
-                ret.append({"role": "user", "content": msg})
-            else:
-                if msg is not None:
-                    ret.append({"role": "assistant", "content": msg})
-        return ret
 
     def copy(self):
         return Conversation(

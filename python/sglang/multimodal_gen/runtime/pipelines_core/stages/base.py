@@ -177,6 +177,9 @@ class PipelineStage(StageDedupMixin, ABC):
         """
         pass
 
+    def drop_breakable_cuda_graphs(self, reason: str) -> None:
+        """Disable captured graphs whose weights changed; stages without graphs do nothing."""
+
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
     ) -> Iterator[Req]:

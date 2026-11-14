@@ -792,6 +792,12 @@ fn media_item(item: &MmItem) -> Value {
             if let Some(detail) = &hints.detail {
                 item.insert("detail".into(), detail.as_str().into());
             }
+            if let Some(max_frames) = hints.max_frames {
+                item.insert("max_frames".into(), max_frames.into());
+            }
+            if let Some(max_tokens_per_frame) = hints.max_tokens_per_frame {
+                item.insert("max_tokens_per_frame".into(), max_tokens_per_frame.into());
+            }
             Value::Object(item)
         }
     }

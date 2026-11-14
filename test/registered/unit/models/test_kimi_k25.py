@@ -580,17 +580,6 @@ def test_kimi_lazy_vmm_feature_uses_proxy_consumer_count():
     proxy.reconstruct_on_target_device.assert_called_once_with(0, consumer_count=2)
 
 
-def test_kimi_lazy_vmm_cache_hit_uses_proxy_consumer_count():
-    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
-    proxy.consumer_count = 2
-    proxy.acknowledge_consumption = Mock()
-    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
-
-    item.acknowledge_deferred_cuda_ipc_feature(consumer_count=8)
-
-    proxy.acknowledge_consumption.assert_called_once_with(2)
-
-
 class _Tokenizer:
     def encode(self, text, allowed_special=None):
         tokens = {

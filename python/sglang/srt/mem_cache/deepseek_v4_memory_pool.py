@@ -2131,7 +2131,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
-        bs = req_pool_indices.numel()
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue

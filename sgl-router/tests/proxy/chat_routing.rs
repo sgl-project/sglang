@@ -8,9 +8,9 @@ use sgl_router::config::{
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
-use sgl_router::server::app::build_router;
+use sgl_router::server::app::{build_router, build_router_with_body_limit};
 use sgl_router::server::app_context::AppContext;
-use sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES;
+use sgl_router::server::routes::chat::max_chat_body_bytes;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 
@@ -775,8 +775,8 @@ async fn oversized_request_body_returns_413() {
     let app = build_router(ctx);
 
     // One byte over the configured cap, so the test tracks the cap
-    // (`MAX_CHAT_BODY_BYTES`) instead of a hardcoded size.
-    let big = vec![b'x'; MAX_CHAT_BODY_BYTES + 1];
+    // (`max_chat_body_bytes()`) instead of a hardcoded size.
+    let big = vec![b'x'; max_chat_body_bytes() + 1];
     let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -796,6 +796,62 @@ async fn oversized_request_body_returns_413() {
         captured.last_body.is_none(),
         "router must not forward oversized body to upstream; got body of {} bytes",
         captured.last_body.as_ref().map(|b| b.len()).unwrap_or(0),
+    );
+}
+
+#[tokio::test]
+async fn configured_body_cap_applies_to_every_inference_route() {
+    // A cap set at startup (SGLANG_ROUTER_MAX_BODY_BYTES) replaces the default
+    // on every inference route: one byte over it is 413 and never reaches the
+    // worker, and a chat exactly at it is forwarded.
+    const CAP: usize = 4096;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let app = build_router_with_body_limit(build_ctx_with_worker(&worker.url), CAP);
+
+    for path in [
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/generate",
+        "/v1/embeddings",
+        "/v1/classify",
+        "/v1/rerank",
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b' '; CAP + 1]))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
+
+    let empty = serde_json::json!({
+        "model": "tiny",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": ""}],
+    });
+    let pad = CAP - serde_json::to_vec(&empty).unwrap().len();
+    let mut at_cap = empty;
+    at_cap["messages"][0]["content"] = "x".repeat(pad).into();
+    let body = serde_json::to_vec(&at_cap).unwrap();
+    assert_eq!(body.len(), CAP);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        worker.captured_json().await["messages"][0]["content"]
+            .as_str()
+            .map(str::len),
+        Some(pad)
     );
 }
 
@@ -981,23 +1037,8 @@ async fn no_healthy_workers_returns_503() {
     );
 }
 
-#[tokio::test]
-async fn unknown_model_without_workers_returns_404() {
-    let ctx = build_ctx_with_worker("http://127.0.0.1:1");
-    ctx.registry.remove(&WorkerId("w1".into()));
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"model":"unknown","messages":[]}"#))
-        .unwrap();
-    let response = build_router(ctx).oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(response.headers()["x-router-error-code"], "model_not_found");
-}
-
-/// A `--model-alias` is served as `--model-id`; a name that is neither stays
-/// `model_not_found`. The case: a gateway forwarding the engine's snapshot path.
+/// A `--model-alias` is served as `--model-id`; any other name is served too
+/// and forwarded as sent. The case: a gateway forwarding the engine's snapshot path.
 #[tokio::test]
 async fn model_alias_routes_as_the_configured_model() {
     const ALIAS: &str = "/weights-repo/snapshots/d89b007b";
@@ -1021,26 +1062,22 @@ async fn model_alias_routes_as_the_configured_model() {
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
-    for (model, forwarded_model, status) in [
-        (ALIAS, "tiny", StatusCode::OK),
+    for (model, forwarded_model) in [
+        (ALIAS, "tiny"),
         // SGLang's `base:adapter` LoRA syntax on an alias.
+        ("/weights-repo/snapshots/d89b007b:my-lora", "tiny:my-lora"),
+        ("s3://bucket/model", "tiny"),
+        ("s3://bucket/model:my-lora", "tiny:my-lora"),
+        ("s3://bucket/model:version", "tiny"),
+        ("s3://bucket/model:version:my-lora", "tiny:my-lora"),
+        ("tiny", "tiny"),
+        ("tiny:my-lora", "tiny:my-lora"),
+        ("dummy", "dummy"),
         (
-            "/weights-repo/snapshots/d89b007b:my-lora",
-            "tiny:my-lora",
-            StatusCode::OK,
+            "/weights-repo/snapshots/other",
+            "/weights-repo/snapshots/other",
         ),
-        ("s3://bucket/model", "tiny", StatusCode::OK),
-        ("s3://bucket/model:my-lora", "tiny:my-lora", StatusCode::OK),
-        ("s3://bucket/model:version", "tiny", StatusCode::OK),
-        (
-            "s3://bucket/model:version:my-lora",
-            "tiny:my-lora",
-            StatusCode::OK,
-        ),
-        ("tiny", "tiny", StatusCode::OK),
-        ("tiny:my-lora", "tiny:my-lora", StatusCode::OK),
-        ("/weights-repo/snapshots/other", "", StatusCode::NOT_FOUND),
-        ("s3://bucket/other:my-lora", "", StatusCode::NOT_FOUND),
+        ("s3://bucket/other:my-lora", "s3://bucket/other:my-lora"),
     ] {
         for (path, mut body) in [
             (
@@ -1059,22 +1096,19 @@ async fn model_alias_routes_as_the_configured_model() {
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap();
             let res = build_router(Arc::clone(&ctx)).oneshot(req).await.unwrap();
-            assert_eq!(res.status(), status, "{path}: model {model}");
-            if status == StatusCode::OK {
-                let sent = worker.captured_json().await;
-                assert_eq!(sent["model"], forwarded_model, "{path}: model {model}");
-                assert_eq!(sent["lora_path"], serde_json::Value::Null);
-            }
+            assert_eq!(res.status(), StatusCode::OK, "{path}: model {model}");
+            let sent = worker.captured_json().await;
+            assert_eq!(sent["model"], forwarded_model, "{path}: model {model}");
+            assert_eq!(sent["lora_path"], serde_json::Value::Null);
         }
     }
 }
 
-/// A worker is registered for a model that is NOT the configured `cfg.model` (so the
-/// policy registry has no entry for it).  The handler returns 404
-/// `model_not_found` rather than 500 — clients can recover by sending a
-/// different model name; an internal_error would mask the misconfiguration.
+/// A worker is registered for a model that is NOT the configured `cfg.model`.
+/// A request naming that model is served as `cfg.model`, which has no
+/// workers, so it is a 503 rather than traffic to the other model's worker.
 #[tokio::test]
-async fn unknown_model_with_no_policy_returns_404_model_not_found() {
+async fn worker_of_another_model_gets_no_traffic() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config_for(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -1106,11 +1140,12 @@ async fn unknown_model_with_no_policy_returns_404_model_not_found() {
         ))
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
-        "model_not_found",
+        "no_healthy_workers",
     );
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
 }
 
 #[tokio::test]

@@ -24,6 +24,9 @@ class Observability(msgspec.Struct):
     """Namespace ``observability``."""
 
     _NS_PATH = "observability"
+    show_time_cost: A[
+        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
+    ] = None
 
     # -------------------------------------------------------------------------
     # Logging, metrics, and tracing
@@ -70,7 +73,6 @@ class Observability(msgspec.Struct):
         Optional[str],
         "Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
     ] = None
-    show_time_cost: A[bool, "Show time cost of custom marks."] = False
     enable_metrics: A[bool, "Enable log prometheus metrics."] = False
     smg_http_sidecar_port: A[
         Optional[int],

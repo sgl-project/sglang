@@ -9,6 +9,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
     make_page_shard_spec,
+    page_shard_row_bytes,
 )
 from sglang.srt.runtime_context import (
     get_context,
@@ -274,6 +275,7 @@ class TestDefaultConfigurator(CustomTestCase):
             max_running_requests=1,
         )
         mr.model_config.context_len = 8193
+        mr.page_shard_scratch_row_bytes = lambda: page_shard_row_bytes(mr)
         with (
             mock_cpu_env(),
             patch(
@@ -1569,14 +1571,22 @@ class TestDflashDraftKvBudget(CustomTestCase):
             draft_kv_ring_pool_rows_from_config,
         )
 
-        for dcp_size, page_size in ((8, 1), (1, 64)):
+        for dcp_size, page_size, publish in (
+            (8, 1, {}),
+            (1, 64, {}),
+            (
+                8,
+                64,
+                dict(disaggregation_mode="decode", disaggregation_decode_extra_slots=6),
+            ),
+        ):
             with (
-                self.subTest(dcp=dcp_size, page=page_size),
+                self.subTest(dcp=dcp_size, page=page_size, **publish),
                 mock_cpu_env(tp_size=8),
                 get_parallel().override(attn_dcp_size=dcp_size),
             ):
                 config = self._ring_target_configurator(
-                    page_size=page_size, max_running_requests=48
+                    page_size=page_size, max_running_requests=48, **publish
                 )
                 with get_spec().override(speculative_dflash_draft_kv_ring=True):
                     charged = config._dflash_draft_kv_ring_bytes()
