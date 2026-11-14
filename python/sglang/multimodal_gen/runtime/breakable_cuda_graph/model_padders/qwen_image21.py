@@ -5,8 +5,8 @@
 
 Only cached steps replay graphs: prefill runs eagerly and stores each layer's
 prefix K/V at its exact length, and a cached step reads nothing else of the
-prompt. The padder left-pads that K/V to the text bucket, stacks it into one
-tensor (one input copy per replay) and drops the prefill-only inputs, so prompts
+prompt. The padder packs that K/V into one left-padded tensor per request
+(one input copy per replay) and drops the prefill-only inputs, so prompts
 of different lengths share one signature. The pad rows never reach attention or
 RoPE: the DiT attends past them at a graph break, so replays stay bit-exact with
 the unpadded eager forward.

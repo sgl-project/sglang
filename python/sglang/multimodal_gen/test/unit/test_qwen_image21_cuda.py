@@ -2,6 +2,7 @@
 """Request-scoped prefix KV and graph replay regression tests; no checkpoint needed."""
 
 import json
+import weakref
 from copy import deepcopy
 
 import pytest
@@ -632,6 +633,9 @@ def test_padded_prefix_replays_one_graph_across_prompt_lengths(
                     torch.testing.assert_close(model(**padded), expected, atol=0, rtol=0)
                     actual = stage._bcg_run(runner, kwargs, model)
                     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            packed = weakref.ref(padded["prefix_kv"])
+            del kwargs, padded
+            assert packed() is None  # captured graphs must not retain request storage
         assert len(replays) == 2 * len(lengths)
         assert len(runner.entries) == 2
     finally:

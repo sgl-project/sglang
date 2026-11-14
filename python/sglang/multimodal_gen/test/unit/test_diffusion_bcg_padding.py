@@ -430,7 +430,6 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             first = self._qwen21_pad(kwargs)
             repeat = self._qwen21_pad(kwargs)
             self.assertIs(first["prefix_kv"], repeat["prefix_kv"])
-            self.assertIs(first["prefix_pad"], repeat["prefix_pad"])
             previous = weakref.ref(first["prefix_kv"])
             del first, repeat
             self.assertIsNotNone(previous())
