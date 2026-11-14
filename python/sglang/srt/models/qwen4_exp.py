@@ -546,7 +546,7 @@ def _use_qwen4_varlen_prefill(
 ) -> bool:
     if (
         not envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
-        or not is_cuda()
+        or not (is_cuda() or is_hip())
         or mode
         not in (
             ForwardMode.EXTEND,

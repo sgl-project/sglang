@@ -13,10 +13,11 @@ from sglang.kernels.ops.mamba.qwen4_short_conv import (
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import qwen4_exp
 from sglang.srt.models.qwen4_exp import _use_qwen4_varlen_prefill
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 requires_cuda = unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 
@@ -323,12 +324,17 @@ class TestQwen4ShortConv(CustomTestCase):
                     ForwardMode.EXTEND, metadata[0], *dispatch_args
                 )
             )
-        with patch.object(qwen4_exp, "is_cuda", return_value=False, create=True):
-            self.assertFalse(
-                _use_qwen4_varlen_prefill(
-                    ForwardMode.EXTEND, metadata[0], *dispatch_args
+        for hip in (False, True):
+            with (
+                patch.object(qwen4_exp, "is_cuda", return_value=False, create=True),
+                patch.object(qwen4_exp, "is_hip", return_value=hip, create=True),
+            ):
+                self.assertEqual(
+                    _use_qwen4_varlen_prefill(
+                        ForwardMode.EXTEND, metadata[0], *dispatch_args
+                    ),
+                    hip,
                 )
-            )
 
 
 if __name__ == "__main__":

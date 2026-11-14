@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -116,7 +121,7 @@ register_kernel(
         op="mamba.fused_qwen4_varlen_conv",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_varlen_conv",
-        capabilities=CUDA_ONLY,
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
 register_kernel(
