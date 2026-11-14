@@ -42,7 +42,6 @@ void tree_speculative_sampling_target_only(
     tvm::ffi::TensorView uniform_samples,
     tvm::ffi::TensorView uniform_samples_for_final_sampling,
     tvm::ffi::TensorView target_probs,
-    tvm::ffi::TensorView draft_probs,
     double threshold_single,
     double threshold_acc) {
   using namespace host;
@@ -66,11 +65,7 @@ void tree_speculative_sampling_target_only(
       .verify(predicts);
   TensorMatcher({batch_size, draft_tokens}).with_dtype<float>().with_device(device).verify(uniform_samples);
   TensorMatcher({batch_size}).with_dtype<float>().with_device(device).verify(uniform_samples_for_final_sampling);
-  TensorMatcher({batch_size, draft_tokens, vocab_size})
-      .with_dtype<float>()
-      .with_device(device)
-      .verify(target_probs)
-      .verify(draft_probs);
+  TensorMatcher({batch_size, draft_tokens, vocab_size}).with_dtype<float>().with_device(device).verify(target_probs);
   CHECK_HOST(draft_tokens.unwrap() > 0 && spec_tokens.unwrap() > 0 && vocab_size.unwrap() > 0);
   CHECK_HOST(std::gcd(int64_t{4}, vocab_size.unwrap()) == VecSize);
   CHECK_HOST(threshold_single >= 0 && threshold_single <= 1);
@@ -78,7 +73,11 @@ void tree_speculative_sampling_target_only(
   if (batch_size.unwrap() == 0) return;
 
   constexpr uint32_t block_threads = 1024;
-  constexpr size_t smem_size = sizeof(SamplingTempStorage<block_threads, SCAN_ALGO, REDUCE_ALGO>);
+  constexpr size_t kMaxDynamicSmemWithoutOptIn = 48 * 1024;
+  // Sampling scratch, then one int32_t slot per draft token for the ids rejected at
+  // the last accepted node (a node has at most draft_tokens - 1 children).
+  const size_t smem_size = sizeof(SamplingTempStorage<block_threads, SCAN_ALGO, REDUCE_ALGO>) +
+                           static_cast<size_t>(draft_tokens.unwrap()) * sizeof(int32_t);
   constexpr auto kernel = speculative_sampling::TreeSpeculativeSamplingTargetOnly<
       block_threads,
       SCAN_ALGO,
@@ -88,7 +87,11 @@ void tree_speculative_sampling_target_only(
       float,
       int32_t,
       int64_t>;
-  runtime::set_max_dynamic_smem_per_device<kernel>(device.unwrap().device_id, smem_size);
+  // The size varies with draft_tokens, so the once-per-device opt-in cache does not fit.
+  // Up to 48 KiB needs no opt-in at all.
+  if (smem_size > kMaxDynamicSmemWithoutOptIn) {
+    runtime::set_max_dynamic_smem(kernel, smem_size);
+  }
   LaunchKernel(static_cast<uint32_t>(batch_size.unwrap()), block_threads, device.unwrap(), smem_size)(
       kernel,
       static_cast<int32_t*>(predicts.data_ptr()),
@@ -101,7 +104,6 @@ void tree_speculative_sampling_target_only(
       static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<float*>(uniform_samples_for_final_sampling.data_ptr()),
       static_cast<float*>(target_probs.data_ptr()),
-      static_cast<float*>(draft_probs.data_ptr()),
       static_cast<uint32_t>(batch_size.unwrap()),
       static_cast<uint32_t>(spec_tokens.unwrap()),
       static_cast<uint32_t>(draft_tokens.unwrap()),
