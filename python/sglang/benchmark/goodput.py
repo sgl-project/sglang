@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import math
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -10,6 +12,27 @@ if TYPE_CHECKING:
     from sglang.benchmark.serving import RequestFuncOutput
 
 GOODPUT_SLO_METRICS = ("ttft", "tpot", "e2el")
+
+
+def parse_goodput_slo(pair: str) -> tuple[str, float]:
+    """Parse the shared serving/suite --goodput KEY:VALUE syntax (milliseconds)."""
+    name, _, value = pair.partition(":")
+    if name not in GOODPUT_SLO_METRICS:
+        raise argparse.ArgumentTypeError(
+            f"expected KEY:VALUE with KEY in {', '.join(GOODPUT_SLO_METRICS)}, "
+            f"got {pair!r}"
+        )
+    try:
+        threshold = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite positive float, got {value!r}"
+        )
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite positive float, got {value!r}"
+        )
+    return name, threshold
 
 
 class GoodputMetrics(msgspec.Struct, frozen=True):
