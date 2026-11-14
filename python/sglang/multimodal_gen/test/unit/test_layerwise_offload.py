@@ -242,6 +242,37 @@ def _server_args(**kwargs):
     return _TestServerArgs(**defaults)
 
 
+def test_shared_store_key_separates_fold_shards(monkeypatch):
+    """Ranks of a folded component hold different bytes for one layer.
+
+    Sharing one store name across them only buys a byte comparison that has to
+    refuse, so the slice belongs in the name. An unfolded component keeps the
+    existing name.
+    """
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    model = _DummyModel()
+
+    def key(store_shard: int) -> str:
+        manager = LayerwiseOffloadManager(
+            model=model,
+            layers_attr_str="blocks",
+            num_layers=1,
+            enabled=True,
+            pin_cpu_memory=False,
+            prefetch_size=1,
+            pin_component_name="text_encoder.model.layers",
+            store_shard=store_shard,
+        )
+        return manager._shared_store_key(0, torch.bfloat16, 1024)
+
+    assert key(0) == "text_encoder.model.layers:0:torch.bfloat16:1024"
+    assert key(1) == "text_encoder.model.layers:0:torch.bfloat16:1024:s1"
+    assert key(1) != key(0)
+
+
 def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
