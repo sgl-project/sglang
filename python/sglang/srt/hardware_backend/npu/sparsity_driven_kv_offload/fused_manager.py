@@ -189,9 +189,8 @@ class FusedSparseKVCacheManager:
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.dev_ptr_list: list[int] = []
 
-        # Radix prefixes and accepted-token relocation are expressed in native
-        # physical token IDs. Keep host payloads in that same address space;
-        # request slots own only the bounded HBM residency maps.
+        # Radix prefixes use native physical token IDs. Keep host payloads in that
+        # same address space; request slots own only bounded HBM residency maps.
         host_kv_shape = self.budget.host_kv_spec.shape
         device_id = torch.npu.current_device()
 
@@ -325,26 +324,6 @@ class FusedSparseKVCacheManager:
         rows = request_ids.long().clamp(0, self.actual_request_rows - 1)
         columns = positions.long().clamp(0, self.logical_max_context_len - 1)
         return self.req_to_token_pool.req_to_token[rows, columns].long()
-
-    def move_host_kv(self, target, source):
-        """Mirror accepted-token compaction before native physical IDs recycle."""
-        if source.numel() == 0:
-            return
-        if self.host_pool.rank == 0:
-            rows = torch.arange(source.numel(), device=self.device, dtype=torch.long)
-            valid = torch.ones_like(source, dtype=torch.bool)
-            for k, v in zip(self.host_k_buffer, self.host_v_buffer):
-                scratch = [
-                    torch.empty(
-                        (source.numel(), 1, width),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for width in (self.kv_lora_rank, self.qk_rope_head_dim)
-                ]
-                self.host_pool.copy_rows((k, v), scratch, source, rows, valid)
-                self.host_pool.copy_rows(scratch, (k, v), rows, target, valid)
-        self.host_pool.publish()
 
     def reset_requests(self, req_ids: List[int]) -> None:
         if not req_ids:

@@ -71,7 +71,7 @@ class TestPDSplitKVPool(CustomTestCase):
         )
         self.assertEqual(pool.get_contiguous_buf_infos()[0], expected)
 
-    def test_shm_split_roundtrip_and_move(self):
+    def test_shm_split_copy_rows_and_attention_pointers(self):
         # Run the real manager/pool methods with only the NPU allocation and
         # row-copy boundaries emulated. The fake device pointer is deliberately
         # different from the CPU address so accidental address substitution fails.
@@ -89,11 +89,6 @@ class TestPDSplitKVPool(CustomTestCase):
             n
             for n in tree.body
             if isinstance(n, ast.ClassDef) and n.name == "FusedSparseKVCacheManager"
-        )
-        move = next(
-            n
-            for n in manager.body
-            if isinstance(n, ast.FunctionDef) and n.name == "move_host_kv"
         )
         attention = next(
             n
@@ -140,7 +135,7 @@ class TestPDSplitKVPool(CustomTestCase):
                     name="Manager",
                     bases=[],
                     keywords=[],
-                    body=[move, attention],
+                    body=[attention],
                     decorator_list=[],
                 ),
             ],
@@ -159,10 +154,8 @@ class TestPDSplitKVPool(CustomTestCase):
             [x[0].shape for x in host.buffers], [(2, 128, 1, 512), (2, 128, 1, 64)]
         )
         m = ns["Manager"]()
-        m.host_pool, m.host_k_buffer, m.host_v_buffer = host, *host.buffers
-        m.device, m.store_dtype = "cpu", torch.bfloat16
         m.kv_lora_rank, m.qk_rope_head_dim = 512, 64
-        m.head_num, m.head_dim, m.start_layer = 1, 576, 0
+        m.head_num, m.start_layer = 1, 0
         m.dev_ptr_list, m.rope_dev_ptr_list = host.dev_ptrs
         m.fused_attn_out = torch.zeros(1, 1, 512)
         m.device_kv_buffer = [torch.zeros(128, 1, 512)]
@@ -226,21 +219,6 @@ class TestPDSplitKVPool(CustomTestCase):
         )
         for component in host.buffers:
             self.assertTrue(torch.all(component[0][1, 3] == 17))
-        for component in host.buffers:
-            for layer, buf in enumerate(component):
-                rows = buf.flatten(0, 1)
-                rows[:, 0, :] = torch.arange(256, dtype=torch.bfloat16)[:, None] + layer
-        before = [
-            [buf.flatten(0, 1).clone() for buf in component]
-            for component in host.buffers
-        ]
-        src, dst = torch.tensor([5, 6, 7]), torch.tensor([6, 7, 5])
-        m.move_host_kv(dst, src)
-        for component, original in zip(host.buffers, before, strict=True):
-            for buf, old in zip(component, original, strict=True):
-                torch.testing.assert_close(
-                    buf.flatten(0, 1)[dst], old[src], rtol=0, atol=0
-                )
 
 
 if __name__ == "__main__":

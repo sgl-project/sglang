@@ -912,24 +912,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(self.index_k_scale_buffer)
         return kv_size_bytes
 
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        """Mirror accepted-token moves for the NPU sparse host-KV pool."""
-        manager = getattr(self, "sparse_kv_manager", None)
-        if manager is None:
-            return super().move_kv_cache(tgt_loc, src_loc)
-
-        size_limit = self.size + self.page_size
-        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
-        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
-        if tgt_loc.numel() == 0:
-            return
-        target = tgt_loc.view(-1).long()
-        source = src_loc.view(-1).long()
-        manager.move_host_kv(target, source)
-        for kv_cache in getattr(self, "kv_buffer", ()):
-            if kv_cache.shape[0] != 0:
-                kv_cache[target] = kv_cache[source]
-
     def _raise_if_native_kv_cache_disabled(self):
         if (
             getattr(self, "k_buffer", None) is None
