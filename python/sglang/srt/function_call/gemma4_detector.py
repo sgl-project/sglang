@@ -88,6 +88,13 @@ def _parse_gemma4_array(arr_str: str) -> list:
             sub_start = i + 1
             i += 1
             while i < n and depth > 0:
+                if arr_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
+                    # Skip over string contents; brackets inside strings
+                    # do not open or close arrays.
+                    i += len(STRING_DELIM)
+                    next_delim = arr_str.find(STRING_DELIM, i)
+                    i = next_delim + len(STRING_DELIM) if next_delim != -1 else n
+                    continue
                 if arr_str[i] == "[":
                     depth += 1
                 elif arr_str[i] == "]":
@@ -100,6 +107,12 @@ def _parse_gemma4_array(arr_str: str) -> list:
             val_start = i
             while i < n and arr_str[i] not in (",", "]"):
                 i += 1
+            if i == val_start:
+                # The cursor sits on a delimiter the scan above cannot
+                # consume (e.g. a stray "]"); skip it so the parser always
+                # makes progress instead of looping forever.
+                i += 1
+                continue
             items.append(_parse_gemma4_value(arr_str[val_start:i]))
 
     return items
