@@ -311,7 +311,7 @@ def build_load_config(
         quantize_and_serve=get_model().quantize_and_serve,
     )
 
-    return LoadConfig(
+    config = LoadConfig(
         load_format=load_format or get_model().load_format,
         download_dir=get_model().download_dir,
         model_loader_extra_config=get_model().model_loader_extra_config,
@@ -331,6 +331,14 @@ def build_load_config(
         weight_cache_socket=weight_cache_socket,
         load_group=load_group,
     )
+    if (
+        config.load_format != LoadFormat.FASTSAFETENSORS
+        and get_model().load_format == LoadFormat.FASTSAFETENSORS
+    ):
+        # GDS belongs to the target fast loader, not a different draft loader.
+        config.model_loader_extra_config = dict(config.model_loader_extra_config or {})
+        config.model_loader_extra_config.pop("enable_gds", None)
+    return config
 
 
 def maybe_enable_ipc_weight_cache(
