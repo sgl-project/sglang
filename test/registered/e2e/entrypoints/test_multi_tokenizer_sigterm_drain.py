@@ -32,7 +32,12 @@ class TestMultiTokenizerSigtermDrain(CustomTestCase):
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--tokenizer-worker-num", str(TOKENIZER_WORKER_NUM)],
+            other_args=[
+                "--tokenizer-worker-num",
+                str(TOKENIZER_WORKER_NUM),
+                "--enable-http-worker-reuseport",
+                "--incremental-streaming-output",
+            ],
         )
 
     @classmethod
@@ -57,15 +62,15 @@ class TestMultiTokenizerSigtermDrain(CustomTestCase):
 
     def _read_stream(self, index: int, chunks_seen: list, results: list) -> None:
         try:
-            last = None
+            last_payload = None
             for line in self._generate(MAX_NEW_TOKENS, stream=True).iter_lines():
                 if not line.startswith(b"data:"):
                     continue
                 payload = line[len(b"data:") :].strip()
                 if payload == b"[DONE]":
-                    results[index] = last
+                    results[index] = json.loads(last_payload)
                     return
-                last = json.loads(payload)
+                last_payload = payload
                 chunks_seen[index] += 1
             results[index] = "stream closed before [DONE]"
         except Exception as e:
@@ -97,7 +102,7 @@ class TestMultiTokenizerSigtermDrain(CustomTestCase):
         for result in results:
             self.assertIsInstance(result, dict, result)
             self.assertEqual(result["meta_info"]["completion_tokens"], MAX_NEW_TOKENS)
-        self.assertIsNotNone(self.process.wait(timeout=120))
+        self.assertEqual(self.process.wait(timeout=120), 0)
 
 
 if __name__ == "__main__":

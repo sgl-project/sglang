@@ -314,6 +314,7 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
+        _set_uvicorn_worker_stop_hook(_global_state.tokenizer_manager)
         worker_id = os.getpid()
         warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
         thread_label = f"MultiTokenizer-{worker_id}"
@@ -2758,6 +2759,15 @@ def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
     else:
         supervisor = _SigquitForwardingMultiprocess(config, sockets=sockets)
     supervisor.run()
+
+
+def _set_uvicorn_worker_stop_hook(tokenizer_manager: TokenizerManager) -> None:
+    handler = signal.getsignal(signal.SIGTERM)
+    if inspect.ismethod(handler) and isinstance(handler.__self__, uvicorn.Server):
+        server = handler.__self__
+        tokenizer_manager.set_server_stop_hook(
+            lambda: setattr(server, "should_exit", True)
+        )
 
 
 def _shutdown_schedulers_after_http_workers(
