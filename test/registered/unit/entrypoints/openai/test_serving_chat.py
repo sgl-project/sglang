@@ -22,6 +22,7 @@ from unittest.mock import Mock, patch
 
 from fastapi import HTTPException, Request
 from tokenizers import Tokenizer as BackendTokenizer
+from tokenizers import decoders
 from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers
 from transformers import PreTrainedTokenizerFast
@@ -4598,6 +4599,93 @@ class ServingChatTestCase(CustomTestCase):
         ):
             chunks.append(chunk)
         return chunks
+
+    def test_logprob_bytes_use_metaspace_decoder_not_vocab_sample(self):
+        """ASCII vocabulary samples must not turn Unicode pieces into raw BPE bytes."""
+        for decoder in (
+            decoders.Metaspace(),
+            decoders.Sequence([decoders.Metaspace()]),
+        ):
+            with (
+                self.subTest(decoder=decoder),
+                patch(
+                    "sglang.srt.entrypoints.openai.utils._BYTE_LEVEL_TOKENIZERS", set()
+                ),
+            ):
+                backend = BackendTokenizer(
+                    tokenizer_models.BPE(
+                        vocab={"a": 0, "b": 1, "c": 2, "d": 3, "é": 4, "f": 5, "g": 6},
+                        merges=[],
+                    )
+                )
+                backend.decoder = decoder
+                self.tm.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+                triple = (-0.1, 4, self.tm.tokenizer.decode([4]))
+                content = self.chat._build_token_logprobs_from_raw([triple], [[triple]])
+                self.assertEqual(content[0].token, "é")
+                self.assertEqual(content[0].bytes, [195, 169])
+                self.assertEqual(content[0].top_logprobs[0].bytes, [195, 169])
+
+    def test_logprob_bytes_use_bytelevel_decoder_for_utf8_fragments(self):
+        """ByteLevel pieces must retain their raw bytes when decoder metadata is used."""
+        for decoder in (
+            decoders.ByteLevel(),
+            decoders.Sequence([decoders.ByteLevel()]),
+        ):
+            with (
+                self.subTest(decoder=decoder),
+                patch(
+                    "sglang.srt.entrypoints.openai.utils._BYTE_LEVEL_TOKENIZERS", set()
+                ),
+            ):
+                backend = BackendTokenizer(
+                    tokenizer_models.BPE(
+                        vocab={"a": 0, "b": 1, "c": 2, "d": 3, "Ã": 4, "©": 5, "z": 6},
+                        merges=[],
+                    )
+                )
+                backend.decoder = decoder
+                self.tm.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+                triples = [
+                    (-0.1, token_id, self.tm.tokenizer.decode([token_id]))
+                    for token_id in (4, 5)
+                ]
+                content = self.chat._build_token_logprobs_from_raw(
+                    triples, [[triple] for triple in triples]
+                )
+                self.assertEqual([item.bytes for item in content], [[195], [169]])
+                self.assertEqual(
+                    [item.top_logprobs[0].bytes for item in content], [[195], [169]]
+                )
+                self.assertEqual(
+                    b"".join(bytes(item.bytes) for item in content).decode("utf-8"), "é"
+                )
+
+    def test_logprob_bytes_support_custom_python_decoders(self):
+        class CustomByteLevelDecoder:
+            def decode_chain(self, tokens):
+                return [decoders.ByteLevel().decode(tokens)]
+
+        backend = BackendTokenizer(
+            tokenizer_models.BPE(vocab={"Ã": 0, "©": 1}, merges=[])
+        )
+        self.tm.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+        self.tm.tokenizer.backend_tokenizer.decoder = decoders.Decoder.custom(
+            CustomByteLevelDecoder()
+        )
+        self.assertEqual(self.tm.tokenizer.decode([0, 1]), "é")
+        triples = [
+            (-0.1, token_id, self.tm.tokenizer.decode([token_id]))
+            for token_id in (0, 1)
+        ]
+        with patch("sglang.srt.entrypoints.openai.utils._BYTE_LEVEL_TOKENIZERS", set()):
+            content = self.chat._build_token_logprobs_from_raw(
+                triples, [[triple] for triple in triples]
+            )
+        self.assertEqual([item.bytes for item in content], [[195], [169]])
+        self.assertEqual(
+            [item.top_logprobs[0].bytes for item in content], [[195], [169]]
+        )
 
     def test_streaming_top_logprobs_follow_each_token_in_chunk(self):
         """Each token of a multi-token streaming chunk keeps its own alternatives."""
