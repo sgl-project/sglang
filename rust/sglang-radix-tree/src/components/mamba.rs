@@ -13,7 +13,7 @@ use crate::components::{ComponentType, FULL, Family, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
-use crate::unified_lru_list::GdsPriority;
+use crate::unified_lru_list::CostPriority;
 use crate::unified_tree_core::{
     CacheActions, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
@@ -28,8 +28,8 @@ pub struct MambaComponent {
     mamba_max_states_per_path: Option<usize>,
     /// Host checkpoints count as a device-prefix match.
     mamba_host_only_checkpoint: bool,
-    /// GDS prefill cost coefficients (d, e); None keeps the LRU walk.
-    gds_cost: Option<(f64, f64)>,
+    /// state_cost prefill cost coefficients (d, e); None keeps the LRU walk.
+    state_cost: Option<(f64, f64)>,
 }
 
 impl MambaComponent {
@@ -51,20 +51,20 @@ impl MambaComponent {
             mamba_checkpoint_grid: least_common_multiple(mamba_cache_chunk_size, params.page_size),
             mamba_max_states_per_path: params.mamba_max_states_per_path,
             mamba_host_only_checkpoint: params.mamba_host_only_checkpoint,
-            gds_cost: params.gds_cost,
+            state_cost: params.state_cost,
         }
     }
 
     /// Stamp a state at the watermark: cached, resumed, or released by its
     /// last request.
-    fn gds_mark_used_<K: ChildKeyType>(
+    fn cost_mark_used_<K: ChildKeyType>(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
     ) {
-        if self.gds_cost.is_some() {
-            let watermark = tree_core.mamba_gds_watermark;
-            tree_core.arena.node_mut(node_id).gds_stamp = watermark;
+        if self.state_cost.is_some() {
+            let watermark = tree_core.mamba_cost_watermark;
+            tree_core.arena.node_mut(node_id).cost_stamp = watermark;
         }
     }
 
@@ -72,15 +72,15 @@ impl MambaComponent {
     /// own, which may predate a shallower state, and those of the nearest
     /// states below it. Their seeds fall to their stamps, a lower bound, so the
     /// walk recomputes them before trusting the order.
-    fn gds_forget_gains_<K: ChildKeyType>(
+    fn cost_forget_gains_<K: ChildKeyType>(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
     ) {
-        if self.gds_cost.is_none() {
+        if self.state_cost.is_none() {
             return;
         }
-        tree_core.arena.node_mut(node_id).gds_gain = 0.0;
+        tree_core.arena.node_mut(node_id).cost_gain = 0.0;
         let mut stack: Vec<NodeIdx_> = tree_core
             .arena
             .node(node_id)
@@ -90,7 +90,7 @@ impl MambaComponent {
             .collect();
         while let Some(x) = stack.pop() {
             if tree_core.arena.has_device_value(x, MAMBA) {
-                tree_core.arena.node_mut(x).gds_gain = 0.0;
+                tree_core.arena.node_mut(x).cost_gain = 0.0;
             } else {
                 stack.extend(tree_core.arena.node(x).children.values().copied());
             }
@@ -98,23 +98,23 @@ impl MambaComponent {
     }
 
     /// A state's priority from its last known gain.
-    fn gds_priority_<K: ChildKeyType>(
+    fn cost_priority_<K: ChildKeyType>(
         &self,
         tree_core: &UnifiedTreeCore<K>,
         node_id: NodeIdx_,
     ) -> f64 {
         let node = tree_core.arena.node(node_id);
-        let stamp = if node.gds_stamp.is_nan() {
-            tree_core.mamba_gds_watermark
+        let stamp = if node.cost_stamp.is_nan() {
+            tree_core.mamba_cost_watermark
         } else {
-            node.gds_stamp
+            node.cost_stamp
         };
-        stamp + node.gds_gain
+        stamp + node.cost_gain
     }
 
     /// Recompute the prefill to rebuild a state from the nearest shallower
     /// device state, or from token 0 without one, and return its priority.
-    fn gds_refresh_priority_<K: ChildKeyType>(
+    fn cost_refresh_priority_<K: ChildKeyType>(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
@@ -133,29 +133,29 @@ impl MambaComponent {
         let fallback = gap.map_or(0, |gap| depth - gap);
         let span = (depth - fallback) as f64;
         let quadratic = (depth * depth - fallback * fallback) as f64;
-        tree_core.arena.node_mut(node_id).gds_gain = d * span + e * quadratic / 2e5;
-        self.gds_priority_(tree_core, node_id)
+        tree_core.arena.node_mut(node_id).cost_gain = d * span + e * quadratic / 2e5;
+        self.cost_priority_(tree_core, node_id)
     }
 
     /// Seed the walk with the last known gains; a popped entry is rechecked,
     /// since evicting a shallower state during the walk raises its gain.
-    fn gds_begin_walk_<K: ChildKeyType>(&self, tree_core: &mut UnifiedTreeCore<K>) {
-        tree_core.mamba_gds_heap.clear();
+    fn cost_begin_walk_<K: ChildKeyType>(&self, tree_core: &mut UnifiedTreeCore<K>) {
+        tree_core.mamba_cost_heap.clear();
         let mut cursor = tree_core
             .device_lru_list(MAMBA)
             .get_lru_no_lock(&tree_core.arena);
         while let Some(x) = cursor {
-            let priority = self.gds_priority_(tree_core, x);
+            let priority = self.cost_priority_(tree_core, x);
             tree_core
-                .mamba_gds_heap
-                .push(Reverse((GdsPriority(priority), x)));
+                .mamba_cost_heap
+                .push(Reverse((CostPriority(priority), x)));
             cursor = tree_core
                 .device_lru_list(MAMBA)
                 .get_prev_no_lock(x, &tree_core.arena);
         }
     }
 
-    fn gds_is_candidate_<K: ChildKeyType>(
+    fn cost_is_candidate_<K: ChildKeyType>(
         &self,
         tree_core: &UnifiedTreeCore<K>,
         node_id: NodeIdx_,
@@ -165,30 +165,30 @@ impl MambaComponent {
             && tree_core.arena.node(node_id).device_lock_ref(MAMBA) == 0
     }
 
-    fn gds_pop_<K: ChildKeyType>(
+    fn cost_pop_<K: ChildKeyType>(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         cost: (f64, f64),
     ) -> Option<NodeIdx_> {
-        while let Some(Reverse((GdsPriority(priority), x))) = tree_core.mamba_gds_heap.pop() {
-            if !self.gds_is_candidate_(tree_core, x) {
+        while let Some(Reverse((CostPriority(priority), x))) = tree_core.mamba_cost_heap.pop() {
+            if !self.cost_is_candidate_(tree_core, x) {
                 continue;
             }
-            let current = self.gds_refresh_priority_(tree_core, x, cost);
+            let current = self.cost_refresh_priority_(tree_core, x, cost);
             if current > priority {
                 tree_core
-                    .mamba_gds_heap
-                    .push(Reverse((GdsPriority(current), x)));
+                    .mamba_cost_heap
+                    .push(Reverse((CostPriority(current), x)));
                 continue;
             }
-            tree_core.mamba_gds_watermark = tree_core.mamba_gds_watermark.max(current);
+            tree_core.mamba_cost_watermark = tree_core.mamba_cost_watermark.max(current);
             return Some(x);
         }
         None
     }
 
     /// One eviction step in priority order, with the LRU walk's contract.
-    fn gds_next_node_<K: ChildKeyType>(
+    fn cost_next_node_<K: ChildKeyType>(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         cost: (f64, f64),
@@ -205,10 +205,10 @@ impl MambaComponent {
             .component_state_mut(MAMBA)
             .evict_device_cursor
             .take()
-            .filter(|&x| self.gds_is_candidate_(tree_core, x));
+            .filter(|&x| self.cost_is_candidate_(tree_core, x));
         let x = match reselect {
             Some(x) => x,
-            None => self.gds_pop_(tree_core, cost)?,
+            None => self.cost_pop_(tree_core, cost)?,
         };
         if tree_core.evictable_device_leaves.contains(x) {
             return Some(x);
@@ -362,7 +362,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             LRURefreshPhase::MatchEnd => {
                 if tree_core.arena.has_device_value(node_id, MAMBA) {
                     tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
-                    self.gds_mark_used_(tree_core, node_id);
+                    self.cost_mark_used_(tree_core, node_id);
                 }
             }
             LRURefreshPhase::InsertEnd => {}
@@ -453,7 +453,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             tree_core.device_lru_list_mut(MAMBA).insert_mru(node_id);
             let tokens = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
             tree_core.inc_evictable_size(MAMBA, tokens);
-            self.gds_mark_used_(tree_core, node_id);
+            self.cost_mark_used_(tree_core, node_id);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
@@ -461,15 +461,15 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
-            self.gds_mark_used_(tree_core, node_id);
-            self.gds_forget_gains_(tree_core, node_id);
+            self.cost_mark_used_(tree_core, node_id);
+            self.cost_forget_gains_(tree_core, node_id);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
         tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
         let tick = tree_core.arena.get_and_bump_access_counter();
         tree_core.arena.node_mut(node_id).last_access_counter = tick;
-        self.gds_mark_used_(tree_core, node_id);
+        self.cost_mark_used_(tree_core, node_id);
         result.mamba_exist = true;
     }
 
@@ -627,8 +627,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// Begin the device-eviction walk from this component's LRU cursor.
     fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K>, request_cnt: usize) {
         tree_core.set_evict_device_start(MAMBA, request_cnt);
-        if self.gds_cost.is_some() {
-            self.gds_begin_walk_(tree_core);
+        if self.state_cost.is_some() {
+            self.cost_begin_walk_(tree_core);
             tree_core.component_state_mut(MAMBA).evict_device_cursor = None;
             return;
         }
@@ -662,8 +662,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 .is_none(),
             "finish the pending internal Mamba eviction before advancing"
         );
-        if let Some(cost) = self.gds_cost {
-            return self.gds_next_node_(
+        if let Some(cost) = self.state_cost {
+            return self.cost_next_node_(
                 tree_core,
                 cost,
                 tracker,
@@ -800,7 +800,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tree_core.arena.dec_device_lock_ref(node_id, MAMBA);
         if device_lock_ref == 1 {
             if tree_core.arena.has_device_value(node_id, MAMBA) {
-                self.gds_mark_used_(tree_core, node_id);
+                self.cost_mark_used_(tree_core, node_id);
             }
             tree_core.update_evictable_leaf_sets_(node_id);
         }
@@ -955,8 +955,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     // The materialization primitive owns the ledger/LRU moves,
                     // including crediting protected when restored under lock.
                     tree_core.set_component_device_value_(node_id, MAMBA, device_indices.copy());
-                    self.gds_mark_used_(tree_core, node_id);
-                    self.gds_forget_gains_(tree_core, node_id);
+                    self.cost_mark_used_(tree_core, node_id);
+                    self.cost_forget_gains_(tree_core, node_id);
                 }
             }
             // The python elif chain has no BACKUP_STORAGE arm.

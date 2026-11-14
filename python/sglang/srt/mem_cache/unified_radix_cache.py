@@ -275,12 +275,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 "--enable-session-radix-cache"
             )
         if (
-            params.eviction_policy.lower() == "gds"
+            params.eviction_policy.lower() == "state_cost"
             and TREE_STATE in families
             and params.enable_session_radix_cache
         ):
             raise ValueError(
-                "--radix-eviction-policy gds does not support "
+                "--radix-eviction-policy state_cost does not support "
                 "--enable-session-radix-cache on a model with recurrent states"
             )
         # Whether a slot keeps a prefix's recurrent state checkpoints.

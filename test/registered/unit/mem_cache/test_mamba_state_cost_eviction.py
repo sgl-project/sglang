@@ -1,4 +1,4 @@
-"""Unit tests for --radix-eviction-policy gds on the unified radix cache."""
+"""Unit tests for --radix-eviction-policy state_cost on the unified radix cache."""
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -17,7 +17,7 @@ from sglang.test.test_utils import CustomTestCase
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestMambaGDSEviction(UnifiedRadixCacheFixtures, CustomTestCase):
+class TestMambaStateCostEviction(UnifiedRadixCacheFixtures, CustomTestCase):
     cfg = CacheConfig(
         page_size=1,
         components=(ComponentType.FULL, ComponentType.MAMBA),
@@ -27,7 +27,7 @@ class TestMambaGDSEviction(UnifiedRadixCacheFixtures, CustomTestCase):
         kv_size=4096,
         max_num_reqs=32,
         max_context_len=4096,
-        eviction_policy="gds",
+        eviction_policy="state_cost",
     )
     tree_core_backend = "python"
 
@@ -165,7 +165,7 @@ class TestMambaGDSEviction(UnifiedRadixCacheFixtures, CustomTestCase):
         self.assertTrue(self._resumes_at_end(lone))
 
 
-class TestMambaGDSEvictionRustCore(TestMambaGDSEviction):
+class TestMambaStateCostEvictionRustCore(TestMambaStateCostEviction):
     """The default core on Linux; a platform without it falls back to Python."""
 
     tree_core_backend = "rust"

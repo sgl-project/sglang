@@ -389,11 +389,11 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "ever TEL-safe and T-LRU is exactly LRU."
             )
 
-    if cfg.radix_eviction_policy == "gds":
-        from sglang.srt.mem_cache.evict_policy import GDSStrategy
+    if cfg.radix_eviction_policy == "state_cost":
+        from sglang.srt.mem_cache.evict_policy import StateCostStrategy
 
         # Building the strategy checks its cost coefficients.
-        GDSStrategy(**(cfg.radix_eviction_policy_config or {}))
+        StateCostStrategy(**(cfg.radix_eviction_policy_config or {}))
 
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
