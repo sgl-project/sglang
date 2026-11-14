@@ -135,6 +135,8 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
             return torch.zeros(q.shape[0], q.shape[1], d_v, dtype=torch.bfloat16)
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_shards_index_k = False
+        backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.dsa_triton_union = union
 
         # `get_is_capture_mode` is patched although the method no longer reads
@@ -223,9 +225,11 @@ class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
 
     def _method(self, prefill_impl, *, store_fp8=True, mode=None):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_shards_index_k = False
+        backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.dsa_kv_cache_store_fp8 = store_fp8
         backend.dsa_prefill_impl = prefill_impl
         return backend.get_topk_transform_method(
@@ -233,14 +237,14 @@ class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
         )
 
     def test_extend_uses_ragged_for_bf16_kv_backends(self):
-        from sglang.srt.layers.attention.dsa_backend import TopkTransformMethod
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 
         for impl in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla"):
             with self.subTest(impl=impl):
                 self.assertEqual(self._method(impl), TopkTransformMethod.RAGGED, impl)
 
     def test_other_backends_keep_paged(self):
-        from sglang.srt.layers.attention.dsa_backend import TopkTransformMethod
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 
         self.assertEqual(
             self._method("flashinfer_sparse_mla"), TopkTransformMethod.PAGED

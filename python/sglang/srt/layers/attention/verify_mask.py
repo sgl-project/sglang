@@ -5,7 +5,8 @@ from typing import Optional
 import msgspec
 import torch
 
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, default_tree_mask_mode
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 
 
 def tree_mask_numel(

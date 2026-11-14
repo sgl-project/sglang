@@ -1,0 +1,48 @@
+name: Bot Bump sgl-amd-mono Version
+#
+# Pins sgl-amd-mono (python/pyproject_other.toml) at the head of its main daily and opens a PR.
+on:
+  schedule:
+    - cron: '0 8 * * *'  # daily 08:00 UTC
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'sgl-amd-mono branch or full commit SHA to pin (default: main)'
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-sgl-amd-mono-version:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Branch off main even when a manual run is dispatched from another branch.
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run sgl-amd-mono version bump script
+        id: bump
+        env:
+          REF: ${{ github.event.inputs.ref || 'main' }}
+        run: |
+          python scripts/release/bump_sgl_amd_mono_version.py "$REF"
+
+      - name: Commit and create PR
+        if: steps.bump.outputs.needs_bump == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+        run: |
+          bash scripts/release/commit_and_pr_sgl_amd_mono.sh "${{ steps.bump.outputs.old_commit }}" "${{ steps.bump.outputs.new_commit }}"

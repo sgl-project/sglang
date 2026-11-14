@@ -6,7 +6,7 @@ import torch
 import triton
 from sgl_kernel import topk_softmax
 
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
 # Optional vLLM import
 try:
@@ -34,7 +34,7 @@ except ImportError:
     musa_topk_softmax = None
     MUSA_AVAILABLE = False
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 
 def vllm_topk_softmax(gating_output, topk):

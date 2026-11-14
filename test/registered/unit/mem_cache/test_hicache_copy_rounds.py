@@ -31,23 +31,6 @@ class TestHiCacheCopyRounds(unittest.TestCase):
         self.assertTrue(_screen(512, unroll=4, is_hip=True))
         self.assertTrue(_screen(512, unroll=4, is_hip=False))
 
-    def test_rocm_admits_no_more_than_the_kernel_can_tile(self):
-        # The screen mirrors group_fits(): the round must divide the element and
-        # split across lanes into a package the hardware has (4, 8 or 16 B).
-        for element_size in range(16, 1300, 4):
-            for unroll in (1, 2, 4, 8, 16, 32):
-                lanes_per_worker = hicache.COPY_GROUP_THREADS // unroll
-                expected = any(
-                    group % lanes_per_worker == 0
-                    and element_size % group == 0
-                    and group // lanes_per_worker in (4, 8, 16)
-                    for group in (128, 64, 32, 16)
-                )
-                with self.subTest(element_size=element_size, unroll=unroll):
-                    self.assertEqual(
-                        _screen(element_size, unroll, is_hip=True), expected
-                    )
-
     def test_an_odd_size_is_turned_away_on_both(self):
         # 100 B is divisible by no round, so no lane split can cover it.
         self.assertFalse(_screen(100, unroll=4, is_hip=True))

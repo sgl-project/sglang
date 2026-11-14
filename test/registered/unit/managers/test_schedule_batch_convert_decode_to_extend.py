@@ -16,15 +16,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import (  # noqa: E402
-    ForwardMode,
-    Req,
-    ScheduleBatch,
-)
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
 from sglang.srt.model_executor.encoder_swa_replay import (  # noqa: E402
     _reset_windows_and_collect_hits,
     folded_replay_rows,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 

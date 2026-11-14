@@ -29,7 +29,7 @@ register_npu_ci(
     est_time=400,
     suite="base-b-test-4-npu-a3",
 )
-register_npu_ci(est_time=2400, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=2700, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestDPAttentionDP2TP2(
@@ -45,9 +45,7 @@ class TestDPAttentionDP2TP2(
     def setUpClass(cls):
         cls.model = QWEN3_32B_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
-            True
-        )
+        cls._env_override = envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(True)
         cls._env_override.__enter__()
         cls.process = popen_launch_server(
             cls.model,
@@ -81,6 +79,9 @@ class TestDPAttentionMixedChunk(
     # with (4-shot chat, temperature 1.0).
     gsm8k_accuracy_thres = 0.83
     gsm8k_backend = "evalscope"
+    # One full-dataset evalscope pass takes ~32 min, so cap at one re-run
+    # (2 passes ~= 55 min) to stay inside the per-file CI timeout.
+    gsm8k_max_attempts = 2
 
     @classmethod
     def setUpClass(cls):

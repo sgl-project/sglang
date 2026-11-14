@@ -293,6 +293,10 @@ class BlockStored(KVCacheEvent):
     # Public adapter name for router lookup. Published hashes are opaque IDs
     # scoped to the internal cache namespace, including the adapter load.
     lora_name: Optional[str] = None
+    # Dynamo format only. Per block (aligned with block_hashes): [start, length,
+    # label] runs of multimodal tokens whose item carried a caller routing
+    # label. Labels are routing metadata only and never affect hashes or reuse.
+    mm_routing_spans: Optional[list[list[tuple[int, int, str]]]] = None
 
 
 class BlockRemoved(KVCacheEvent):
@@ -507,7 +511,10 @@ class ZmqEventPublisher(EventPublisher):
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
         self._running = False
-        self._event_queue.put_nowait(None)
+        try:
+            self._event_queue.put_nowait(None)
+        except queue.Full:
+            pass
 
         start = time.time()
         pending_items = True
@@ -667,7 +674,7 @@ class ZmqEventPublisher(EventPublisher):
         if not endpoint or data_parallel_rank == 0:
             return endpoint
 
-        if "inproc" in endpoint:
+        if "inproc" in endpoint or endpoint.startswith("ipc://"):
             return f"{endpoint}_dp{data_parallel_rank}"
         if "tcp" in endpoint:
             if endpoint and ":" in endpoint:
@@ -678,7 +685,7 @@ class ZmqEventPublisher(EventPublisher):
                 new_port = base_port + data_parallel_rank
                 return f"{base_addr}:{new_port}"
             return endpoint
-        raise ValueError("Invalid endpoint: must contain 'inproc' or 'tcp'")
+        raise ValueError("Invalid endpoint: must contain 'inproc', 'ipc' or 'tcp'")
 
 
 class KVEventsConfig(BaseModel):
@@ -723,7 +730,8 @@ class KVEventsConfig(BaseModel):
     format: Literal["default", "dynamo"] = "default"
     """The event format. "default" is the SGLang format. "dynamo" is the format
     the Dynamo KV router reads: block hashes also depend on extra_key and
-    cache_salt (see ``namespaced_block_hash``), and BlockStored has lora_name.
+    cache_salt (see ``namespaced_block_hash``), and BlockStored has lora_name
+    and, for requests with mm_routing_labels, mm_routing_spans.
     """
 
     @classmethod

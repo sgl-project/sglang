@@ -354,7 +354,6 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
-        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
         "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
       ],
       flags: [
@@ -392,7 +391,6 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
-        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
         "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
         // Non-monokernel point. The monokernel refuses this layout.
         "SGLANG_HIP_DSV41_INDEX_K_PAGE8=1",
@@ -586,7 +584,6 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
-        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -623,7 +620,6 @@ export const config = {
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
-        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
       ],
       flags: [
         "--trust-remote-code",

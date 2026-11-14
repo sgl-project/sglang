@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative import dflash_worker_v2
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -54,6 +54,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         worker._full_embed_gpu = None
         worker._noise_embed_scale = 1.0
         worker.use_compact_draft_cache = False
+        worker.draft_kv_ring = None
         worker.selector = None
         worker.lilicorr = None
 

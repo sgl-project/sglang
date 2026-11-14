@@ -5,15 +5,18 @@ import sys as _sys
 
 from sglang.srt.debug_utils.rocprofiler_register import torch_built_with_hip as _is_hip
 
-# sglang.srt.environ must run before the rest of this file's imports
-# (hf_transformers_patches, lang.api, ...), which pull in torch and
-# FlashInfer: those claim these cache dirs early, and the first value set is
-# the one that sticks. Safe here -- environ has no heavy dependency (no torch).
+# sglang.srt.environ must run before anything imports torch or FlashInfer:
+# those claim these cache dirs early, and the first value set is the one that
+# sticks. Safe here -- environ has no heavy dependency (no torch).
 from sglang.srt.environ import (
     redirect_third_party_caches as _redirect_third_party_caches,
 )
 
 _redirect_third_party_caches()
+
+from sglang._logging_once import install_logging_once as _install_logging_once
+
+_install_logging_once()
 
 if _is_hip():
     from sglang.srt.debug_utils.rocprofiler_register import (
@@ -27,10 +30,7 @@ if _sys.platform == "darwin" and _platform.machine() == "arm64":
 
     _install_platform_stubs()
 
-from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
-
-_apply_hf_patches()
-
+from sglang._lazy_import import LazyImport
 from sglang.lang.api import (
     Runtime,
     assistant,
@@ -61,11 +61,9 @@ from sglang.lang.choices import (
     unconditional_likelihood_normalized,
 )
 from sglang.lang.global_config import global_config
-
-# Lazy backend clients
-from sglang.utils import LazyImport
 from sglang.version import __version__
 
+# Lazy backend clients
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
 Crusoe = LazyImport("sglang.lang.backend.crusoe", "Crusoe")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")

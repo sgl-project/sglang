@@ -472,6 +472,23 @@ class TestRoutedExpertsStartLen(CustomTestCase):
         )
         self._assert_aborted(too_big, "is higher than the number of input tokens")
 
+    def test_negative_start_len_survives_intake_abort(self):
+        """A request rejected by an intake check that runs before the
+        routed-experts check (here an out-of-range logprob_start_len) keeps its
+        negative start; it must be aborted on its own and leave the server
+        serving."""
+        aborted = self._send(
+            self._build_payload(
+                routed_experts_start_len=-5,
+                return_logprob=True,
+                logprob_start_len=1_000_000,
+            )
+        )
+        self._assert_aborted(aborted, "is higher than the number of input tokens")
+
+        resp = self._send(self._build_payload())
+        self.assertEqual(resp.status_code, 200, resp.text)
+
     def test_start_len_with_cache_hit(self):
         """`start_len` must allow the radix prefix to extend past it. The
         first request seeds the cache; the second sends the same prompt

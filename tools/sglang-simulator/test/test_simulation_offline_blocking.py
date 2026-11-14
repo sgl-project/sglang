@@ -31,7 +31,7 @@ def _relative_error(actual, expected):
 def _run_mode(mode, tmp_path):
     case_dir = tmp_path / mode
     case_dir.mkdir()
-    runner = SGLangServingRunner(SIM_CONFIGS["aic_sol"], case_dir, mode=mode)
+    runner = SGLangServingRunner(SIM_CONFIGS["aisimulate_sol"], case_dir, mode=mode)
     try:
         metrics = runner.benchmark(
             case_dir / "benchmark.json", request_rate=REQUEST_RATE, seed=SEED

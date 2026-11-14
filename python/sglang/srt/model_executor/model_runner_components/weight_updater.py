@@ -84,6 +84,16 @@ def _unsupported_derived_weight_cache_error(
     return None
 
 
+def _direct_weight_update_error(model: torch.nn.Module) -> Optional[str]:
+    """Direct updates skip the model's ``load_weights`` and ``post_load_weights``,
+    so buffers those hooks rebuild in place would keep serving the old weights."""
+    for module in model.modules():
+        reason = getattr(module, "_direct_weight_update_error", None)
+        if reason is not None:
+            return reason
+    return None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WeightUpdater:
     tp_rank: int
@@ -170,6 +180,18 @@ class WeightUpdater:
                 f"corrupt the daemon's master copy and every co-attached engine. "
                 f"Restart with --weight-cache-mode off to use this operation."
             )
+
+    def load_rejection(self: WeightUpdater, op: str) -> Optional[str]:
+        """Why ``op`` may not write this runner's weights, or None.
+
+        Startup-determined and rank-uniform: the CUDA IPC weight cache, and
+        derived-weight caches that in-place writes would leave stale.
+        """
+        try:
+            self._assert_weight_cache_inactive(op)
+        except RuntimeError as e:
+            return str(e)
+        return _unsupported_derived_weight_cache_error(self.get_model())
 
     def update_weights_from_disk(
         self: WeightUpdater,
@@ -346,6 +368,8 @@ class WeightUpdater:
         load_format: Optional[str] = None,
     ):
         error = _unsupported_derived_weight_cache_error(self.get_model())
+        if error is None and load_format == "direct":
+            error = _direct_weight_update_error(self.get_model())
         if error is not None:
             return False, error
 

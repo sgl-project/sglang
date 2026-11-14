@@ -147,7 +147,7 @@ done
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -341,7 +341,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -540,7 +540,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
@@ -732,7 +732,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -927,7 +927,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
@@ -1038,7 +1038,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `IMAGE` dataset with 1024x1024 resolution.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name image \
     --backend sglang-oai-chat \
     --host 127.0.0.1 \
@@ -1147,7 +1147,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `IMAGE` dataset with 1920x1080 resolution.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name image \
     --backend sglang-oai-chat \
     --host 127.0.0.1 \
@@ -1262,7 +1262,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -1373,7 +1373,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
