@@ -53,10 +53,9 @@ class InklingOutputParser:
         parse_tool_calls: bool,
         stream_reasoning: bool = True,
         continues_text_block: bool = False,
-        spec: str = "inkling",
     ):
-        self._tml = load_tml_renderers(spec)
-        self._byte_ids = native_byte_ids(spec)
+        self._tml = load_tml_renderers()
+        self._byte_ids = native_byte_ids()
         self._separate_reasoning = separate_reasoning
         self._hold_reasoning = separate_reasoning and not stream_reasoning
         self._parse_tool_calls = parse_tool_calls
@@ -200,10 +199,6 @@ class InklingOutputParser:
         )
 
     def _feed_token(self, token_id: int, delta: _DeltaBuilder) -> None:
-        if token_id in self._tml.unused_special_ids:
-            raise ValueError(
-                f"Generated token {token_id} is a reserved token of this checkpoint"
-            )
         is_special = self._tml.tokenizer.is_special_token(token_id)
         if self._in_unframed_text and is_special:
             # Inside a real text block TML reads most specials as text; the
@@ -369,8 +364,8 @@ class InklingOutputParser:
 
 
 @functools.cache
-def native_byte_ids(spec: str = "inkling") -> tuple[int, ...]:
-    tokenizer = load_tml_renderers(spec).tokenizer
+def native_byte_ids() -> tuple[int, ...]:
+    tokenizer = load_tml_renderers().tokenizer
     byte_ids: dict[int, int] = {}
     token_id = 0
     while len(byte_ids) < 256:

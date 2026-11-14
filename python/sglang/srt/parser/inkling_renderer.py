@@ -15,7 +15,6 @@ from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_IMAGE,
     CONTENT_TEXT,
     IMAGE_TOKEN_ID,
-    INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
 
@@ -36,60 +35,20 @@ _THINKING_PART_TYPES = frozenset({"thinking", "reasoning"})
 _IMAGE_LOCATION_PREFIX = "sglang-inkling-image://"
 _AUDIO_LOCATION_PREFIX = "sglang-inkling-audio://"
 
-# Inkling2 checkpoints keep these native audio IDs as unused reserved tokens.
-_UNUSED_SPECIALS = {
-    "inkling": (),
-    "inkling2": ("content_audio_input", "audio", "audio_end"),
-}
-
 
 @functools.cache
-def load_tml_renderers(spec: str = "inkling") -> SimpleNamespace:
+def load_tml_renderers() -> SimpleNamespace:
     try:
         from tml_renderers import chat, tokenizers, v0
     except ImportError as exc:
         raise ImportError(TML_RENDERERS_INSTALL_HINT) from exc
-    native_tokenizers = {
-        "inkling": tokenizers.O200kBaseChatTokenizer,
-        "inkling2": tokenizers.H200kBaseChatTokenizer,
-    }
-    tokenizer = native_tokenizers[spec]()
+    tokenizer = tokenizers.O200kBaseChatTokenizer()
     return SimpleNamespace(
         chat=chat,
         v0=v0,
         tokenizer=tokenizer,
         renderer=v0.Renderer(tokenizer),
-        unused_special_ids=frozenset(
-            tokenizer.encode_special(name) for name in _UNUSED_SPECIALS[spec]
-        ),
     )
-
-
-_TOKENIZER_PROBE = "Hello, 世界! def f(x): return x**2\n\t  naïve 👩‍🚀 12345678901"
-
-
-def check_served_tokenizer(tokenizer: Any, *, spec: str) -> None:
-    # Prompts and outputs use tml-renderers' tokenizer, while the scheduler matches
-    # stop strings and detokenizes with the served one; they must agree.
-    tml = load_tml_renderers(spec)
-    # encode() is the lookup both the HF and the tiktoken tokenizer wrappers share.
-    mismatched = []
-    for token in INKLING_SPECIAL_TOKEN_IDS:
-        token_id = tml.tokenizer.encode_special(token[2:-2])
-        if token_id not in tml.unused_special_ids and tokenizer.encode(
-            token, add_special_tokens=False
-        ) != [token_id]:
-            mismatched.append(token)
-    if tokenizer.encode(_TOKENIZER_PROBE, add_special_tokens=False) != list(
-        tml.tokenizer.encode_ordinary(_TOKENIZER_PROBE)
-    ):
-        mismatched.append("ordinary text")
-    if mismatched:
-        raise ValueError(
-            "The served tokenizer disagrees with tml-renderers' "
-            f"{type(tml.tokenizer).__name__} on {', '.join(mismatched)}; "
-            "Inkling prompts and outputs would be misencoded."
-        )
 
 
 def render_inkling_messages(
@@ -99,11 +58,10 @@ def render_inkling_messages(
     tool_choice: str | Mapping[str, Any] | None = "auto",
     parallel_tool_calls: bool = True,
     reasoning_effort: float | None = None,
-    spec: str = "inkling",
 ) -> list[int]:
     """Media parts emit one placeholder each; Inkling samples its own assistant header.
     The tool-choice instruction joins the first system message."""
-    tml = load_tml_renderers(spec)
+    tml = load_tml_renderers()
     media_marker = f"sglang-inkling-media-{uuid.uuid4().hex}:"
     oss_messages, media_kinds = _to_oss_messages(messages, media_marker)
     tools = _tools_for_choice(tools=tools, tool_choice=tool_choice)
@@ -133,9 +91,9 @@ def render_inkling_messages(
     return _spans_to_input_ids(spans, tml)
 
 
-def render_inkling_assistant_prefix(prefix: str, *, spec: str = "inkling") -> list[int]:
+def render_inkling_assistant_prefix(prefix: str) -> list[int]:
     """TMLv0 has no prefill; continuation opens a model text block without a terminator."""
-    tokenizer = load_tml_renderers(spec).tokenizer
+    tokenizer = load_tml_renderers().tokenizer
     return [
         tokenizer.encode_special(_special_name(MESSAGE_MODEL)),
         tokenizer.encode_special(_special_name(CONTENT_TEXT)),
@@ -342,7 +300,6 @@ def _spans_to_input_ids(spans: Sequence[Any], tml: SimpleNamespace) -> list[int]
                 input_ids,
                 location=span.location,
                 tokenizer=tml.tokenizer,
-                unused_special_ids=tml.unused_special_ids,
             )
         else:
             raise ValueError(
@@ -356,23 +313,18 @@ def _append_media_placeholder(
     *,
     location: str,
     tokenizer: Any,
-    unused_special_ids: frozenset[int],
 ) -> None:
     if location.startswith(_IMAGE_LOCATION_PREFIX):
         input_ids.append(IMAGE_TOKEN_ID)
         return
-    audio_input, audio_end = (
-        tokenizer.encode_special(_special_name(token))
-        for token in (CONTENT_AUDIO_INPUT, AUDIO_END)
-    )
-    if {audio_input, audio_end} & unused_special_ids:
-        raise ValueError("This Inkling checkpoint does not accept audio input")
     # tml-renderers DMel-encodes audio at render time, so audio rides in an image
     # slot and gets the MM processor's audio framing here.
     if input_ids[-1] != tokenizer.encode_special(_special_name(CONTENT_IMAGE)):
         raise ValueError("Inkling audio placeholder is not framed as a content block")
-    input_ids[-1] = audio_input
-    input_ids.extend([AUDIO_TOKEN_ID, audio_end])
+    input_ids[-1] = tokenizer.encode_special(_special_name(CONTENT_AUDIO_INPUT))
+    input_ids.extend(
+        [AUDIO_TOKEN_ID, tokenizer.encode_special(_special_name(AUDIO_END))]
+    )
 
 
 def _special_name(token: str) -> str:
