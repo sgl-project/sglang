@@ -560,6 +560,7 @@ class KimiK3MoE(nn.Module):
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
+        self._latent_mxfp4 = None
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -764,6 +765,18 @@ class KimiK3MoE(nn.Module):
                 quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
+            # MXFP4 copies are made from the BF16 latent weights only.
+            if (
+                _is_hip
+                and latent_quant_config is None
+                and get_moe_a2a_backend().is_none()
+                and envs.SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4.get()
+            ):
+                from sglang.srt.models.kimi_k3_rocm_mxfp4 import (
+                    build_latent_mxfp4_projections,
+                )
+
+                self._latent_mxfp4 = build_latent_mxfp4_projections()
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -857,6 +870,11 @@ class KimiK3MoE(nn.Module):
                 "writes do not refresh. Restart with SGLANG_K3_SHARDED_MOE=0 "
                 "to allow online updates."
             )
+
+    def _use_latent_mxfp4(self, *, num_tokens: int) -> bool:
+        return self._latent_mxfp4 is not None and self._latent_mxfp4.can_run(
+            num_tokens=num_tokens
+        )
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1362,9 +1380,15 @@ class KimiK3MoE(nn.Module):
 
         # Front: gate + TopK (+ latent down-proj when merged). Strategy table:
         # kernels/ops/moe/moe_front.py.
-        routed_input = self._ep_front(hidden_states)
-        if routed_input is None and not fine_grained_overlap:
-            routed_input = self._ep_front_overlap(hidden_states)
+        # Both front helpers include the BF16 down-projection, bypassing MXFP4.
+        # Leave routed_input unset for separate routing and MXFP4 compression below.
+        routed_input = None
+        # One decision per forward keeps the down and up projections paired.
+        use_mxfp4 = self._use_latent_mxfp4(num_tokens=hidden_states.shape[0])
+        if not use_mxfp4:
+            routed_input = self._ep_front(hidden_states)
+            if routed_input is None and not fine_grained_overlap:
+                routed_input = self._ep_front_overlap(hidden_states)
         topk_output = None
         if routed_input is not None:
             topk_output, routed_input = routed_input
@@ -1399,7 +1423,10 @@ class KimiK3MoE(nn.Module):
                 # materialize its shape-only result without launching GEMM.
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
             else:
-                routed_input, _ = self.routed_expert_down_proj(hidden_states)
+                if use_mxfp4:
+                    routed_input = self._latent_mxfp4.down(x=hidden_states)
+                else:
+                    routed_input, _ = self.routed_expert_down_proj(hidden_states)
         expert_output = run_experts(routed_input, topk_output)
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
@@ -1409,7 +1436,10 @@ class KimiK3MoE(nn.Module):
         else:
             latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
-            out, _ = self.routed_expert_up_proj(latent)
+            if use_mxfp4:
+                out = self._latent_mxfp4.up(x=latent)
+            else:
+                out, _ = self.routed_expert_up_proj(latent)
         wait_and_finalize_shared_experts()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
@@ -1525,19 +1555,26 @@ class KimiK3MoE(nn.Module):
         return norm.weight, norm.variance_epsilon
 
     def _fused_front(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, *, latent_mxfp4: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Read hidden_states once through the merged [H, gate_up + E + latent]
         weight: the shared experts' gate_up, the router logits and the routed
-        input."""
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        input. With latent_mxfp4 the routed input comes from the MXFP4 latent
+        down projection instead, and the caller owns the matching MXFP4 up."""
+        if latent_mxfp4:
+            head_sizes = self._front_sizes[:-1]
+            head = _k3_bf16_gemm(hidden_states, self._front_w[: sum(head_sizes)])
+            gate_up, router_logits = torch.split(head, head_sizes, dim=-1)
+            routed_input = self._latent_mxfp4.down(x=hidden_states)
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
         if hidden_states.shape[0] > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -1598,11 +1635,15 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        sharded = self._sharded_front_covers(num_tokens)
+        use_mxfp4 = self._use_latent_mxfp4(num_tokens=num_tokens)
+        # The sharded front all-gathers the BF16 routed input; MXFP4 makes its own.
+        sharded = not use_mxfp4 and self._sharded_front_covers(num_tokens)
         if sharded:
             gate_up, front_block = self._sharded_front_gemm(hidden_states)
         else:
-            gate_up, router_logits, routed_input = self._fused_front(hidden_states)
+            gate_up, router_logits, routed_input = self._fused_front(
+                hidden_states, latent_mxfp4=use_mxfp4
+            )
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
@@ -1682,6 +1723,7 @@ class KimiK3MoE(nn.Module):
             # fused-norm AR (its GEMV chains on it via PDL)
             if (
                 fused_norm
+                and not use_mxfp4
                 and self._gemm_ag_up_eligible
                 and k3_ar_fusion.gemm_ag_up_fits(num_tokens)
             ):
@@ -1710,7 +1752,10 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         if not fused_norm:
             latent = self._latent_norm(latent)
-        out, _ = self.routed_expert_up_proj(latent)
+        if use_mxfp4:
+            out = self._latent_mxfp4.up(x=latent)
+        else:
+            out, _ = self.routed_expert_up_proj(latent)
 
         # prefetch_bc: b and c complete before the norm / up_proj chain
         # starts; only `a`'s producer can still be in flight at PDL entry.
@@ -3922,6 +3967,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
+                if layer.mlp._latent_mxfp4 is not None:
+                    layer.mlp._latent_mxfp4.prepare(
+                        down_weight=layer.mlp.routed_expert_down_proj.weight,
+                        up_weight=layer.mlp.routed_expert_up_proj.weight,
+                    )
                 if layer.mlp._use_mega_moe and get_parallel().attn_cp_size > 1:
                     # Under prefill CP the shared EP workspace must count
                     # against the KV budget, not first appear during warmup or
