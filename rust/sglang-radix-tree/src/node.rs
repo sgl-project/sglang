@@ -185,6 +185,8 @@ pub struct Node<K: ChildKeyType> {
     pub hash_value: Option<Vec<String>>,
     /// Whether this node is available through the direct external-cache linker.
     pub external_cache_stored: bool,
+    /// This existing state is a request/prompt endpoint for sparse L3 writes.
+    pub mamba_storage_boundary: bool,
     /// Chain-wide logical-page owner rotation, retained across node splits.
     pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
@@ -426,6 +428,7 @@ impl<K: ChildKeyType> Node<K> {
             full_host_uuid: None,
             hash_value: Some(Vec::new()),
             external_cache_stored: false,
+            mamba_storage_boundary: false,
             rotation_base: None,
             write_through_pending_id: None,
             write_back_queued: false,
@@ -454,6 +457,7 @@ impl<K: ChildKeyType> Node<K> {
             full_host_uuid: None,
             hash_value: None,
             external_cache_stored: false,
+            mamba_storage_boundary: false,
             rotation_base: None,
             write_through_pending_id: None,
             write_back_queued: false,

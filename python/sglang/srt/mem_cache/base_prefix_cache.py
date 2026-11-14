@@ -101,6 +101,8 @@ class InsertParams:
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
+    # Preserve an existing legal prompt/request checkpoint when thinning L3.
+    mamba_storage_prompt_boundary: bool = False
     # Prepare held the running request's state back from the tree; the request
     # keeps its tracked checkpoint for a later insert.
     mamba_checkpoint_deferred: bool = False

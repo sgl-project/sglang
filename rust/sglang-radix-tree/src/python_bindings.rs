@@ -1732,11 +1732,14 @@ macro_rules! tree_core_methods {
                 py: Python<'_>,
                 node_id: NodeId,
                 pass_prefix_keys: bool,
+                mamba_l3_snapshot_interval: usize,
             ) -> PyResult<Option<StorageBackupSpecBinding>> {
                 let spec = py
                     .detach(|| {
                         self.core()
-                            .build_storage_backup_spec(node_id, pass_prefix_keys)
+                            .build_storage_backup_spec_with_mamba_l3_interval(
+                                node_id, pass_prefix_keys, mamba_l3_snapshot_interval,
+                            )
                     })
                     .map_err(node_access_error)?;
                 let Some(spec) = spec else {
@@ -1809,6 +1812,13 @@ macro_rules! tree_core_methods {
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 py.detach(|| self.core().node_backuped(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn promote_mamba_storage_boundary(
+                &mut self, py: Python<'_>, node_id: NodeId, mamba_l3_snapshot_interval: usize,
+            ) -> PyResult<bool> {
+                py.detach(|| self.core().promote_mamba_storage_boundary(node_id, mamba_l3_snapshot_interval))
                     .map_err(node_access_error)
             }
 
@@ -3186,15 +3196,17 @@ macro_rules! tree_core_binding {
             }
 
             /// Gather a node's device->storage backup spec; None if the node is not backuped.
+            #[pyo3(signature = (node_id, pass_prefix_keys, mamba_l3_snapshot_interval = 0))]
             fn build_storage_backup_spec(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
                 pass_prefix_keys: bool,
+                mamba_l3_snapshot_interval: usize,
             ) -> PyResult<Option<StorageBackupSpecBinding>> {
                 catch_native_panic(|| {
                     self.inner
-                        .build_storage_backup_spec(py, node_id, pass_prefix_keys)
+                        .build_storage_backup_spec(py, node_id, pass_prefix_keys, mamba_l3_snapshot_interval)
                 })
             }
 
@@ -3240,6 +3252,12 @@ macro_rules! tree_core_binding {
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 catch_native_panic(|| self.inner.node_backuped(py, node_id))
+            }
+
+            fn promote_mamba_storage_boundary(
+                &mut self, py: Python<'_>, node_id: NodeId, mamba_l3_snapshot_interval: usize,
+            ) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.promote_mamba_storage_boundary(py, node_id, mamba_l3_snapshot_interval))
             }
 
             /// Whether the node is a (default or named) root.

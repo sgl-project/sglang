@@ -1142,10 +1142,22 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 torch.cat(full_values)
             ).to(torch.int64)
 
+    def promote_mamba_storage_boundary(
+        self, node_id: NodeId, mamba_l3_snapshot_interval: int
+    ) -> bool:
+        return self._binding.promote_mamba_storage_boundary(
+            node_id, mamba_l3_snapshot_interval
+        )
+
     def build_storage_backup_spec(
-        self, node_id: NodeId, pass_prefix_keys: bool
+        self,
+        node_id: NodeId,
+        pass_prefix_keys: bool,
+        mamba_l3_snapshot_interval: int = 0,
     ) -> Optional[StorageBackupSpec]:
-        spec = self._binding.build_storage_backup_spec(node_id, pass_prefix_keys)
+        spec = self._binding.build_storage_backup_spec(
+            node_id, pass_prefix_keys, mamba_l3_snapshot_interval
+        )
         if spec is None:
             return None
         # Token ids cross the boundary as raw int64 bytes, not per-token ints.
