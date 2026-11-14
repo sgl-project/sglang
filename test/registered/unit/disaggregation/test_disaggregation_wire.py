@@ -2063,6 +2063,36 @@ class TestStagingWatermark(unittest.TestCase):
         self.assertEqual(allocator.get_watermark(), (1, 0))
         self.assertEqual(allocator.assign(70)[1:], (0, 1))
 
+    @patch("sglang.srt.disaggregation.common.staging_buffer.StagingBuffer")
+    def test_out_of_order_frees_advance_watermark_to_oldest_live_allocation(
+        self, staging_buffer
+    ):
+        staging_buffer.return_value.data_ptr = 0
+        allocator = StagingAllocator(100, "cpu", 0)
+        a0, off0, rnd0 = allocator.assign(30)
+        a1, off1, rnd1 = allocator.assign(40)
+        a2, off2, rnd2 = allocator.assign(50)  # wraps to round 1, offset 0
+        a3, off3, rnd3 = allocator.assign(25)  # round 1, offset 50
+
+        self.assertEqual((off0, rnd0), (0, 0))
+        self.assertEqual((off1, rnd1), (30, 0))
+        self.assertEqual((off2, rnd2), (0, 1))
+        self.assertEqual((off3, rnd3), (50, 1))
+
+        # Freeing middle allocations out-of-order keeps watermark pinned at a0.
+        allocator.free(a1)
+        self.assertEqual(allocator.get_watermark(), (0, 0))
+        allocator.free(a2)
+        self.assertEqual(allocator.get_watermark(), (0, 0))
+
+        # Once a0 is freed, watermark jumps past already-freed a1 and a2 to a3.
+        allocator.free(a0)
+        self.assertEqual(allocator.get_watermark(), (1, 50))
+
+        # Freeing the last live allocation resets the ring to the next round at offset 0.
+        allocator.free(a3)
+        self.assertEqual(allocator.get_watermark(), (2, 0))
+
     def test_new_watermark_subscriber_receives_current_allocator_state(self):
         sock = Mock()
         bootstrap_info = {"host": "prefill", "port": 7200}
