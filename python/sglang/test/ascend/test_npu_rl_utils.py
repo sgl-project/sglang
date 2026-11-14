@@ -500,10 +500,6 @@ def checkpoint_files(model_path: str) -> List[str]:
     return files
 
 
-def checkpoint_weight_bytes(model_path: str) -> int:
-    return sum(os.path.getsize(path) for path in checkpoint_files(model_path))
-
-
 _SAFETENSORS_DTYPE = {
     "BF16": "bfloat16",
     "F16": "float16",
