@@ -58,6 +58,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _deepgemm_block_fp8_supported,
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_fp8_mxfp8_can_serve_k,
     block_fp8_scale_to_e8m0_128,
     block_fp8_scale_to_mxfp8_e8m0,
     can_auto_enable_marlin_fp8,
@@ -195,6 +196,7 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 _DENSE_MXSCALE_LOGGED: set = set()
+_BLOCK_FP8_MXFP8_K_SKIPPED: set = set()
 
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
@@ -1018,6 +1020,18 @@ class Fp8LinearMethod(LinearMethodBase):
             return
         n, k = layer.weight.shape
         if k % 32 != 0:
+            return
+        if not block_fp8_mxfp8_can_serve_k(self.mxfp8_dense_backend, k):
+            # b12x cannot take this K, so the view would dispatch to CUTLASS, which
+            # is slower than the block kernel this layer already has.
+            if (n, k) not in _BLOCK_FP8_MXFP8_K_SKIPPED:
+                _BLOCK_FP8_MXFP8_K_SKIPPED.add((n, k))
+                logger.warning(
+                    "Block-fp8 layer N=%d K=%d stays on the Triton block kernel: "
+                    "the selected MXFP8 kernel needs K %% 128 == 0",
+                    n,
+                    k,
+                )
             return
         try:
             scale_u8 = block_fp8_scale_to_mxfp8_e8m0(

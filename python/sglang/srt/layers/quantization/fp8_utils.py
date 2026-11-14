@@ -974,6 +974,23 @@ def can_serve_block_fp8_as_mxfp8(
     return not resolve_block_fp8_mxfp8_backend().is_unsupported()
 
 
+def _flashinfer_b12x_supported() -> bool:
+    return _raw_flashinfer_mm_mxfp8.is_backend_supported("b12x", get_device_sm())
+
+
+def block_fp8_mxfp8_can_serve_k(backend: Mxfp8DenseGemmBackend, k: int) -> bool:
+    """Whether the MXFP8 kernel selected for `backend` consumes a K-wide operand.
+
+    On SM12x the block-fp8-as-MXFP8 route is b12x, which needs one full BK128 tile.
+    A K that is a multiple of 32 but not of 128 is still a valid MXFP8 operand, so
+    the view is built, and the dispatch then quietly uses CUTLASS for it -- which at
+    the decode shapes this view targets is slower than the Triton block kernel the
+    layer would otherwise have kept. Every other backend serves any K%32 == 0."""
+    if backend.is_flashinfer_cutlass() and _flashinfer_b12x_supported():
+        return k % 128 == 0
+    return True
+
+
 def _b12x_or_cutlass_mxfp8_linear(input, weight, *args, **kwargs):
     # SM12x: b12x has small-M tiles and beats CUTLASS at every M, but needs
     # K % 128 == 0.
@@ -985,10 +1002,7 @@ def _b12x_or_cutlass_mxfp8_linear(input, weight, *args, **kwargs):
 
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
-    if (
-        backend.is_flashinfer_cutlass()
-        and _raw_flashinfer_mm_mxfp8.is_backend_supported("b12x", get_device_sm())
-    ):
+    if backend.is_flashinfer_cutlass() and _flashinfer_b12x_supported():
         return _b12x_or_cutlass_mxfp8_linear
     if backend.is_flashinfer_cutlass():
         return partial(
