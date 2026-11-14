@@ -633,6 +633,28 @@ def _speculative_context_eligible_kernel(
 
 
 @triton.jit
+def _record_watermark_contexts_kernel(
+    watermarked_context_hashes,
+    num_watermarked_contexts,
+    req_pool_indices,
+    context_hashes,
+    selected,
+    max_contexts_per_req: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if tl.load(selected + row):
+        pool_index = tl.load(req_pool_indices + row).to(tl.int64)
+        count = tl.load(num_watermarked_contexts + pool_index)
+        if count < max_contexts_per_req:
+            context_hash = tl.load(context_hashes + row).to(tl.int32)
+            tl.store(
+                watermarked_context_hashes + pool_index * max_contexts_per_req + count,
+                context_hash,
+            )
+            tl.store(num_watermarked_contexts + pool_index, count + 1)
+
+
+@triton.jit
 def _record_speculative_contexts_kernel(
     watermarked_context_hashes,
     num_watermarked_contexts,
@@ -937,6 +959,27 @@ def prepare_speculative_watermark_contexts_triton(
         max_contexts_per_req=watermarked_context_hashes.shape[1],
         HISTORY_BLOCK_SIZE=_HISTORY_BLOCK_SIZE,
         num_warps=8,
+    )
+
+
+def record_watermark_contexts_triton(
+    watermarked_context_hashes: torch.Tensor,
+    num_watermarked_contexts: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    context_hashes: torch.Tensor,
+    selected: torch.Tensor,
+) -> None:
+    batch_size = req_pool_indices.shape[0]
+    if batch_size == 0:
+        return
+    _record_watermark_contexts_kernel[(batch_size,)](
+        watermarked_context_hashes,
+        num_watermarked_contexts,
+        req_pool_indices,
+        context_hashes,
+        selected,
+        max_contexts_per_req=watermarked_context_hashes.shape[1],
+        num_warps=1,
     )
 
 
