@@ -282,6 +282,10 @@ REASONING_MODE_RULES = (
 # ---------------------------------------------------------------------------
 
 
+def _is_solar_open2(ctx):
+    return ctx.has_text("<|think:start|>")
+
+
 def _is_apertus2509(ctx):
     return ctx.has_vocab("<|inner_prefix|>")
 
@@ -541,6 +545,7 @@ def _is_iquest_q1(ctx):
 # ---------------------------------------------------------------------------
 
 REASONING_PARSER_RULES = (
+    DetectionRule(name="solar_open2", value="solar_open2", predicate=_is_solar_open2),
     DetectionRule(name="iquest_q1", value="iquest_q1", predicate=_is_iquest_q1),
     DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
@@ -588,6 +593,7 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
+    DetectionRule(name="solar_open2", value="solar_open2", predicate=_is_solar_open2),
     DetectionRule(name="iquest_q1", value="iquest_q1", predicate=_is_iquest_q1),
     DetectionRule(name="gigachat35", value="gigachat35", predicate=_is_gigachat35),
     DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
@@ -866,6 +872,8 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
     if "KimiK3" in arch or model_type == "kimi_k3":
         reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif model_type == "solar_open2" or arch == "SolarOpen2ForCausalLM":
+        reasoning_parser, tool_call_parser = "solar_open2", "solar_open2"
     elif arch == "IQuestQ1ForCausalLM":
         reasoning_parser, tool_call_parser = "iquest_q1", "iquest_q1"
     elif arch in (

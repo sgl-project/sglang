@@ -612,8 +612,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 )
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
             else:
+                backend_class = KDAAttnBackend
+                if spec_result := get_linear_attn_config(runner.model_config.hf_config):
+                    backend_class = import_backend_class(
+                        spec_result[0].backend_class_name
+                    )
                 linear_attn_backend = _create_linear_attention_backend(
-                    runner, KDAAttnBackend
+                    runner, backend_class
                 )
         elif glm5_next_config(runner.model_config) is not None:
             linear_attn_backend = _create_linear_attention_backend(

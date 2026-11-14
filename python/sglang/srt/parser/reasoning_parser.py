@@ -2339,6 +2339,56 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
 
 
+class SolarOpen2Detector(BaseReasoningFormatDetector):
+    """Solar's prompt prefills <|think:start|>; only the end tag is generated."""
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: Optional[bool] = None,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<|think:start|>",
+            "<|think:end|>",
+            force_reasoning=True if force_reasoning is None else force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        if self.think_end_token in text:
+            reasoning, content = text.split(self.think_end_token, 1)
+        elif self._in_reasoning:
+            reasoning, content = text, ""
+        else:
+            return StreamingParseResult(normal_text=text)
+
+        return StreamingParseResult(normal_text=content, reasoning_text=reasoning)
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        if not self._in_reasoning:
+            return StreamingParseResult(normal_text=new_text)
+        self._buffer += new_text
+        if self.think_end_token in self._buffer:
+            reasoning, content = self._buffer.split(self.think_end_token, 1)
+            self._buffer = ""
+            self._in_reasoning = False
+            return StreamingParseResult(normal_text=content, reasoning_text=reasoning)
+        if not self.stream_reasoning:
+            return StreamingParseResult()
+        holdback = self._ends_with_partial_token(self._buffer, self.think_end_token)
+        end = len(self._buffer) - holdback
+        reasoning, self._buffer = self._buffer[:end], self._buffer[end:]
+        return StreamingParseResult(reasoning_text=reasoning)
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -2375,6 +2425,7 @@ class ReasoningParser:
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
+        "solar_open2": SolarOpen2Detector,
         "ernie55": Ernie5_5ReasoningDetector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
