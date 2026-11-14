@@ -195,6 +195,59 @@ class TestMistralDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "Let me check. ")
         self.assertEqual(len(result.calls), 0)
 
+    def test_streaming_preserves_brackets_in_ordinary_text(self):
+        """Streaming without a tool call must preserve code and Markdown text."""
+        text = "Use items[0] and the [guide](https://example.com)."
+        for width in (1, 7, len(text)):
+            with self.subTest(width=width):
+                detector = MistralDetector()
+                output = []
+                calls = []
+                for start in range(0, len(text), width):
+                    result = detector.parse_streaming_increment(
+                        text[start : start + width], self.tools
+                    )
+                    output.append(result.normal_text)
+                    calls.extend(result.calls)
+                self.assertEqual("".join(output), text)
+                self.assertEqual(calls, [])
+
+    def test_streaming_preserves_brackets_after_tool_call(self):
+        """Only a tool array's closing bracket is markup, not later text."""
+        reply = " Result: items[0] and [value]."
+        cases = {
+            "compact": [
+                '[TOOL_CALLS]search[ARGS]{"query":"items[0]"}',
+                reply,
+            ],
+            "array_close_separate": [
+                '[TOOL_CALLS] [{"name":"search","arguments":',
+                '{"query":"items[0]"}}',
+                "]",
+                reply,
+            ],
+            "array_close_with_text": [
+                '[TOOL_CALLS] [{"name":"search","arguments":',
+                '{"query":"items[0]"}}',
+                "]" + reply,
+            ],
+        }
+        for name, chunks in cases.items():
+            with self.subTest(format=name):
+                detector = MistralDetector()
+                output = []
+                calls = []
+                for chunk in chunks:
+                    result = detector.parse_streaming_increment(chunk, self.tools)
+                    output.append(result.normal_text)
+                    calls.extend(result.calls)
+                self.assertEqual("".join(output), reply)
+                self.assertEqual([call.name for call in calls if call.name], ["search"])
+                self.assertEqual(
+                    json.loads("".join(call.parameters for call in calls)),
+                    {"query": "items[0]"},
+                )
+
     def test_streaming_text_then_tool_call(self):
         detector = MistralDetector()
         chunks = [
