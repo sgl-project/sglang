@@ -415,7 +415,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
 
         tmp_input_ids = input_ids[i][: bench_args.cut_len]
         req = Req(
-            rid=i,
+            rid=str(i),
             origin_input_text=prompts[i],
             origin_input_ids=array("q", tmp_input_ids),
             sampling_params=sampling_params,
@@ -459,7 +459,7 @@ def prepare_synthetic_inputs_for_latency_test(
     reqs = []
     for i in range(len(input_ids)):
         req = Req(
-            rid=i,
+            rid=str(i),
             origin_input_text="",
             origin_input_ids=array("q", input_ids[i]),
             sampling_params=sampling_params,
