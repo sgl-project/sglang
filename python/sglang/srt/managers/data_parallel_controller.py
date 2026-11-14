@@ -37,6 +37,7 @@ from sglang.srt.elastic_ep.topology import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.decode_session_placement import DecodeSessionPlacement
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -108,6 +109,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    DECODE_SESSION_TOKENS = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -119,11 +121,21 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self, num_dp_ranks: int):
+    def __init__(self, num_dp_ranks: int, track_dispatches: bool = False):
         self.num_dp_ranks = num_dp_ranks
         self.total_requests = [0] * num_dp_ranks
         self.total_tokens = [0] * num_dp_ranks
+        self.capacity = [0] * num_dp_ranks
         self.last_timestamp = [0.0] * num_dp_ranks
+        self.track_dispatches = track_dispatches
+        self.sent_sequences = [0] * num_dp_ranks
+        self.sent_tokens = [0] * num_dp_ranks
+
+    def note_dispatched(self, rank: int, input_tokens: int):
+        """Track receipt separately from the existing optimistic load update."""
+        self.sent_sequences[rank] += 1
+        self.sent_tokens[rank] += input_tokens
+        return self.sent_sequences[rank], self.sent_tokens[rank]
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -135,6 +147,18 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            if self.track_dispatches and load.dp_dispatch_ack_seq is not None:
+                # A fresh snapshot can still predate requests in the input IPC
+                # queue. Keep their prompt estimates until the worker confirms
+                # that processing them is reflected in its load report.
+                rank = load.dp_rank
+                self.total_requests[rank] += max(
+                    0, self.sent_sequences[rank] - load.dp_dispatch_ack_seq
+                )
+                self.total_tokens[rank] += max(
+                    0, self.sent_tokens[rank] - load.dp_dispatch_ack_cum_tokens
+                )
+            self.capacity[load.dp_rank] = load.max_total_num_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -190,11 +214,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.DECODE_SESSION_TOKENS: self.decode_session_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.DECODE_SESSION_TOKENS,
         )
 
         parallel = get_parallel()
@@ -220,7 +246,20 @@ class DataParallelController:
             self.max_dp_size - self.launch_dp_size
         )
 
-        self.dp_budget = DPBudget(get_parallel().num_dp_ranks)
+        self.dp_budget = DPBudget(
+            get_parallel().num_dp_ranks,
+            track_dispatches=(
+                self.load_balance_method == LoadBalanceMethod.DECODE_SESSION_TOKENS
+            ),
+        )
+        self.decode_sessions = (
+            DecodeSessionPlacement(
+                get_parallel().num_dp_ranks,
+                reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
+            )
+            if self.load_balance_method == LoadBalanceMethod.DECODE_SESSION_TOKENS
+            else None
+        )
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -861,7 +900,7 @@ class DataParallelController:
             ):
                 raise ValueError(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
-            sock_send(self.workers[rank], req)
+            self._send_selected_worker(rank, req)
             return True
         return False
 
@@ -906,6 +945,42 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def decode_session_tokens_scheduler(self, req: Req):
+        already_sent = self.maybe_external_dp_rank_routing(req)
+        input_tokens = len(
+            req.input_ids if req.input_ids is not None else req.input_embeds
+        )
+        params = getattr(req, "sampling_params", None)
+        output_tokens = (params.max_new_tokens or 0) if params is not None else 0
+        session_id = getattr(req, "session_id", None)
+        key = (session_id, getattr(req, "cache_salt", None)) if session_id else None
+        rank = self.decode_sessions.select(
+            key,
+            input_tokens,
+            output_tokens,
+            self._active_workers,
+            self.dp_budget.total_tokens,
+            self.dp_budget.total_requests,
+            self.dp_budget.capacity,
+            forced_rank=req.routed_dp_rank,
+        )
+        # Match native snapshots: used KV plus queued prompt tokens. The
+        # placement policy prices decode reserves separately; charging the
+        # whole output allowance here would create false capacity spills
+        # until a newer snapshot replaces this dispatch estimate.
+        self.dp_budget.total_tokens[rank] += input_tokens
+        self.dp_budget.total_requests[rank] += 1
+        if not already_sent:
+            self._send_selected_worker(rank, req)
+
+    def _send_selected_worker(self, rank: int, req: Req):
+        if self.dp_budget.track_dispatches and not is_health_check_generate_req(req):
+            inputs = req.input_ids if req.input_ids is not None else req.input_embeds
+            req.dp_dispatch_seq, req.dp_dispatch_cum_tokens = (
+                self.dp_budget.note_dispatched(rank, len(inputs))
+            )
+        sock_send(self.workers[rank], req)
 
     def event_loop(self):
         while True:

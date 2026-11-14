@@ -1756,6 +1756,21 @@ class TestLoraForwardDomains(unittest.TestCase):
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
+    def test_decode_session_tokens_requires_decode(self):
+        for role in ("null", "prefill"):
+            with (
+                self.subTest(role=role),
+                self.assertRaisesRegex(ValueError, "requires"),
+            ):
+                self._load_balance_args(
+                    disaggregation_mode=role,
+                    load_balance_method="decode_session_tokens",
+                )
+        args = self._load_balance_args(
+            disaggregation_mode="decode", load_balance_method="decode_session_tokens"
+        )
+        self.assertEqual(args.load_balance_method, "decode_session_tokens")
+
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)
         handle_pd_disaggregation(server_args)

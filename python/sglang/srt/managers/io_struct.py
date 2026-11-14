@@ -1313,6 +1313,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
 
+    # Appended defaults preserve existing positional Rust request messages.
+    dp_dispatch_seq: int = 0
+    dp_dispatch_cum_tokens: int = 0
+
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
         self.positional_embed_overrides = wrap_object_fields_as_pickle(
@@ -1704,6 +1708,10 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     time_stats: Optional[PickleWrapper] = None
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+
+    # Appended defaults preserve existing positional Rust request messages.
+    dp_dispatch_seq: int = 0
+    dp_dispatch_cum_tokens: int = 0
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

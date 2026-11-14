@@ -221,7 +221,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
     sock_send,
 )
-from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
+from sglang.srt.managers.load_snapshot import (
+    DispatchLoadAck,
+    create_load_snapshot_writer,
+)
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
@@ -949,6 +952,8 @@ class Scheduler(
         writer.publish_counter = 0
         try:
             load = self.load_inquirer.get_loads()
+            load.dp_dispatch_ack_seq = self.dispatch_load_ack.sequence
+            load.dp_dispatch_ack_cum_tokens = self.dispatch_load_ack.cumulative_tokens
             writer.write(load)
             return load
         except Exception as e:
@@ -2359,10 +2364,12 @@ class Scheduler(
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
+                self.observe_dp_dispatch_accounted(recv_req)
                 continue
 
             if vmm_errors is not None and any(vmm_errors):
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
+                self.observe_dp_dispatch_accounted(recv_req)
                 continue
 
             output = self._request_dispatcher(recv_req)
@@ -2377,6 +2384,7 @@ class Scheduler(
                     self._pp_pass_release_verdict(output, recv_req)
                 else:
                     self.send_control_output(output, recv_req)
+            self.observe_dp_dispatch_accounted(recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -2846,7 +2854,20 @@ class Scheduler(
             publish_interval=get_observability().load_snapshot_publish_interval,
         )
 
+    def observe_dp_dispatch_accounted(self, recv_req):
+        requests = (
+            recv_req
+            if isinstance(
+                recv_req,
+                (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+            )
+            else (recv_req,)
+        )
+        for request in requests:
+            self.dispatch_load_ack.observe(request)
+
     def init_load_inquirer(self) -> None:
+        self.dispatch_load_ack = DispatchLoadAck()
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
