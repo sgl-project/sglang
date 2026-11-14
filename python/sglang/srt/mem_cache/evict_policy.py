@@ -84,7 +84,10 @@ class TLRUStrategy(EvictionStrategy):
 
 class StateCostStrategy(EvictionStrategy):
     """State-only, cost-based eviction of recurrent-state checkpoints, inspired by
-    FlashState (https://flashstate.ai, https://github.com/FutureMLS-Lab/FlashStates).
+    FlashStates:
+      paper: https://www.alphaxiv.org/abs/2611.flashstate
+      code: https://github.com/FutureMLS-Lab/FlashStates
+      project page: https://flashstates.ai
 
     A checkpoint's priority is its stamp, the eviction watermark at its last use,
     plus the prefill it costs to rebuild from the nearest shallower checkpoint.
@@ -92,9 +95,12 @@ class StateCostStrategy(EvictionStrategy):
     get_priority matches LRUStrategy.
     """
 
-    # Defaults are the GLM-5.3-Flash prefill-time fit published by FlashState
-    # (https://github.com/FutureMLS-Lab/FlashStates), in seconds; only the ratio
-    # d/e affects the order, and other models may want their own.
+    # Defaults are the GLM-5.3-Flash prefill-time fit published by FlashStates, in
+    # seconds; only the ratio d/e affects the order, and other models may want
+    # their own.
+    #   paper: https://www.alphaxiv.org/abs/2611.flashstate
+    #   code: https://github.com/FutureMLS-Lab/FlashStates
+    #   project page: https://flashstates.ai
     def __init__(self, d: float = 1.862e-5, e: float = 3.33e-6):
         if not (math.isfinite(d) and math.isfinite(e)) or min(d, e) < 0 or d == e == 0:
             raise ValueError(

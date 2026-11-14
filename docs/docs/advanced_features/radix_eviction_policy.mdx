@@ -68,14 +68,14 @@ Raising it makes promotion harder, so the protected set stays small and closer t
 
 #### `state_cost` parameters
 
-`state_cost` is a state-only, cost-based eviction order for recurrent-state checkpoints, inspired by [FlashState](https://flashstate.ai) ([code](https://github.com/FutureMLS-Lab/FlashStates)). Full KV stays in recency order. A checkpoint's priority is the eviction watermark at its last use plus the prefill it saves: the cost of rebuilding it from the nearest shallower checkpoint, or from the start of the prompt when there is none. The lowest priority goes first, and the watermark rises to each victim's priority, so a checkpoint nobody resumes ages out.
+`state_cost` is a state-only, cost-based eviction order for recurrent-state checkpoints, inspired by FlashStates ([paper](https://www.alphaxiv.org/abs/2611.flashstate), [code](https://github.com/FutureMLS-Lab/FlashStates), [project page](https://flashstates.ai)). Full KV stays in recency order. A checkpoint's priority is the eviction watermark at its last use plus the prefill it saves: the cost of rebuilding it from the nearest shallower checkpoint, or from the start of the prompt when there is none. The lowest priority goes first, and the watermark rises to each victim's priority, so a checkpoint nobody resumes ages out.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `d` | `1.862e-5` | Prefill seconds per token, the linear term of the cost from token `a` to `b`: `d * (b - a) + e * (b^2 - a^2) / 2e5`. |
 | `e` | `3.33e-6` | Prefill seconds per token per 100,000 tokens of context, the context-length term. |
 
-Only the ratio of `d` to `e` affects the order. The defaults are the GLM-5.3-Flash prefill-time fit published by [FlashState](https://github.com/FutureMLS-Lab/FlashStates); fit your own for other models.
+Only the ratio of `d` to `e` affects the order. The defaults are the GLM-5.3-Flash prefill-time fit published by FlashStates ([paper](https://www.alphaxiv.org/abs/2611.flashstate), [code](https://github.com/FutureMLS-Lab/FlashStates), [project page](https://flashstates.ai)); fit your own for other models.
 
 #### `tlru` parameters
 
