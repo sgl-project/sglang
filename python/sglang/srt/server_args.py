@@ -806,11 +806,16 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
         arg == "--radix-eviction-policy" or arg.startswith("--radix-eviction-policy=")
         for arg in argv
     )
+    linear_attn_backend_explicitly_set = any(
+        arg == "--linear-attn-backend" or arg.startswith("--linear-attn-backend=")
+        for arg in argv
+    )
 
     raw_args = parser.parse_args(argv)
     raw_args._radix_eviction_policy_explicitly_set = (
         radix_eviction_policy_explicitly_set
     )
+    raw_args._linear_attn_backend_explicitly_set = linear_attn_backend_explicitly_set
 
     # Set up basic logging before ServerArgs.__post_init__ so that
     # logger.info / logger.warning calls there are properly formatted.
