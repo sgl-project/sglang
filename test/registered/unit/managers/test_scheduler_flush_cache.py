@@ -37,7 +37,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=None))
 
         self.assertFalse(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(True)
 
     def test_immediate_flush_when_idle(self):
         """Positive timeout but already idle → flush immediately."""
@@ -47,7 +47,27 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=5.0))
 
         self.assertTrue(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(True)
+
+    def test_allocator_release_choice_survives_deferred_flush(self) -> None:
+        for empty_cache in (True, False):
+            for deferred in (True, False):
+                with self.subTest(empty_cache=empty_cache, deferred=deferred):
+                    scheduler = self._new_scheduler()
+                    req = FlushCacheReqInput(
+                        timeout_s=30.0 if deferred else 0.0,
+                        empty_cache=empty_cache,
+                    )
+                    output = scheduler.flush_wrapper.handle(req)
+                    if deferred:
+                        self.assertIsNone(output)
+                        scheduler.flush_cache.assert_not_called()
+                        scheduler.is_fully_idle.return_value = True
+                        scheduler.flush_wrapper.check_pending()
+                        output, answered = scheduler.send_output.call_args.args
+                        self.assertIs(answered, req)
+                    self.assertTrue(output.success)
+                    scheduler.flush_cache.assert_called_once_with(empty_cache)
 
     def test_defers_when_busy(self):
         """Positive timeout + busy → defers, returns None."""
@@ -88,7 +108,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         scheduler.flush_wrapper.check_pending()
 
         self.assertIsNone(scheduler.flush_wrapper._pending)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(True)
         out, answered = scheduler.send_output.call_args.args
         self.assertTrue(out.success)
         self.assertIs(answered, req)
