@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import msgspec.msgpack
+from fastapi import HTTPException
 
 from sglang.srt.entrypoints import v1_loads
 from sglang.srt.entrypoints.v1_loads import get_loads
@@ -234,6 +235,55 @@ class TestGetLoads(CustomTestCase):
             writer.close()
             if os.path.exists(path):
                 os.unlink(path)
+
+
+class TestUnknownIncludeSection(CustomTestCase):
+    """An unknown `include` section is a client error, not a server error.
+
+    ``LoadSnapshot.to_dict`` is the only place that rejects a section name, and
+    ``get_loads`` never reads ``include``, so both response shapes are built
+    after the handler's first ``try``. Left there, the ``ValueError`` escapes
+    the route and Starlette answers 500; the Rust frontend of this same
+    endpoint already answers 400 for ``include=core,bogus``.
+    """
+
+    @staticmethod
+    def _manager():
+        return _FakeHttpTokenizerManager([LoadSnapshot(dp_rank=0, num_running_reqs=1)])
+
+    def test_json_format_rejects_an_unknown_section(self):
+        manager = self._manager()
+        self.addCleanup(manager.restore)
+
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(get_loads(include="core,bogus", tokenizer_manager=manager))
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("bogus", caught.exception.detail)
+
+    def test_prometheus_format_rejects_an_unknown_section(self):
+        manager = self._manager()
+        self.addCleanup(manager.restore)
+
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(
+                get_loads(
+                    include="core,bogus",
+                    format="prometheus",
+                    tokenizer_manager=manager,
+                )
+            )
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("bogus", caught.exception.detail)
+
+    def test_a_valid_section_still_answers(self):
+        manager = self._manager()
+        self.addCleanup(manager.restore)
+
+        response = asyncio.run(get_loads(include="core", tokenizer_manager=manager))
+
+        self.assertEqual(len(response["loads"]), 1)
 
 
 if __name__ == "__main__":
