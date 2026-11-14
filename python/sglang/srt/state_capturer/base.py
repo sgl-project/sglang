@@ -26,6 +26,29 @@ def get_tensor_size_bytes(t: torch.Tensor) -> int:
     return t.numel() * t.element_size()
 
 
+def device_cache_rows(
+    *,
+    chunked_prefill_size: Optional[int],
+    max_prefill_tokens: int,
+    max_req_len: int,
+    max_running_requests: int,
+    num_dp_ranks: int,
+) -> int:
+    """Rows the device cache must hold for one forward, across all DP ranks.
+
+    ``BaseDeviceCache.capture`` has no bounds check, so an under-sized buffer
+    crashes the step. Chunking caps a forward at ``chunked_prefill_size``;
+    without it the input budget is soft (``PrefillAdder`` admits a first request
+    past it) and the real ceiling is ``max_req_len``, the longest request the
+    engine accepts.
+    """
+    if chunked_prefill_size and chunked_prefill_size > 0:
+        prefill_rows = chunked_prefill_size
+    else:
+        prefill_rows = max(max_prefill_tokens, max_req_len)
+    return max(prefill_rows, max_running_requests) * num_dp_ranks
+
+
 class BaseDeviceCache:
     def __init__(
         self,

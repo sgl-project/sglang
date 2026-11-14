@@ -12,7 +12,7 @@ from sglang.srt.runtime_context import (
     get_resources,
     get_schedule,
 )
-from sglang.srt.state_capturer.base import BaseTopkCapturer
+from sglang.srt.state_capturer.base import BaseTopkCapturer, device_cache_rows
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         num_tokens: int,
         num_indexer_layers: int,
         index_topk: int,
+        max_req_len: int,
         max_running_requests: int,
         device: str,
     ):
@@ -34,7 +35,14 @@ class IndexerTopkCapturer(BaseTopkCapturer):
 
         # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
         # to its own device_cache, so the buffer only needs to fit one rank's batch.
-        max_batch_size = max(get_schedule().chunked_prefill_size, max_running_requests)
+        schedule = get_schedule()
+        max_batch_size = device_cache_rows(
+            chunked_prefill_size=schedule.chunked_prefill_size,
+            max_prefill_tokens=schedule.max_prefill_tokens,
+            max_req_len=max_req_len,
+            max_running_requests=max_running_requests,
+            num_dp_ranks=1,
+        )
 
         super().__init__(
             num_tokens=num_tokens,
@@ -92,6 +100,7 @@ def create_indexer_capturer(
     *,
     model_config: ModelConfig,
     num_tokens: int,
+    max_req_len: int,
     max_running_requests: int,
     device: str,
 ) -> Optional[IndexerTopkCapturer]:
@@ -114,6 +123,7 @@ def create_indexer_capturer(
         num_indexer_layers=num_indexer_layers,
         index_topk=index_topk,
         num_tokens=num_tokens,
+        max_req_len=max_req_len,
         max_running_requests=max_running_requests,
         device=device,
     )
@@ -124,6 +134,7 @@ def _create_indexer_capturer_raw(
     num_indexer_layers: int,
     index_topk: int,
     num_tokens: int,
+    max_req_len: int,
     max_running_requests: int,
     device: str,
 ) -> Optional[IndexerTopkCapturer]:
@@ -141,6 +152,7 @@ def _create_indexer_capturer_raw(
         num_tokens=num_tokens,
         num_indexer_layers=num_indexer_layers,
         index_topk=index_topk,
+        max_req_len=max_req_len,
         max_running_requests=max_running_requests,
         device=device,
     )
