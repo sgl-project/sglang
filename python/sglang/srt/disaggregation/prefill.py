@@ -1463,6 +1463,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            self._release_mm_inputs(req)
 
         return done_reqs
 
@@ -1531,6 +1532,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.release_prefill_sender(req, abort_sender=False)
         self.request_retirer.release(req, checkpoint=False)
         self.output_streamer.stream_output([req], req.return_logprob)
+        self._release_mm_inputs(req)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
 
