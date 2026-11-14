@@ -30,6 +30,7 @@ from sglang.srt.function_call.utils import (
     convert_string_union_value,
     get_schema_properties,
     infer_type_from_json_schema,
+    json_safe_value,
     safe_literal_eval,
 )
 
@@ -157,14 +158,14 @@ class GraniteToolCallDetector(BaseFormatDetector):
                 keep_int = "." not in raw and "e" not in raw.lower()
                 number = float(raw)
                 if keep_int and number.is_integer():
-                    return int(number)
-                return number
+                    number = int(number)
             except Exception:
                 logger.warning(
                     f"Parsed value '{raw}' of parameter '{name}' is not a float in tool "
                     f"'{func_name}', degenerating to string."
                 )
                 return raw
+            return json_safe_value(number, raw, name, func_name)
 
         if kind in _BOOL_TYPES:
             lowered = raw.lower()
@@ -176,14 +177,14 @@ class GraniteToolCallDetector(BaseFormatDetector):
 
         if kind in _CONTAINER_TYPES or kind.startswith(_CONTAINER_PREFIXES):
             try:
-                return json.loads(raw)
+                return json_safe_value(json.loads(raw), raw, name, func_name)
             except Exception:
                 logger.warning(
                     f"Parsed value '{raw}' of parameter '{name}' cannot be parsed with json.loads in tool "
                     f"'{func_name}', will try other methods to parse it."
                 )
         try:
-            return safe_literal_eval(raw)
+            return json_safe_value(safe_literal_eval(raw), raw, name, func_name)
         except Exception:
             logger.warning(
                 f"Parsed value '{raw}' of parameter '{name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
