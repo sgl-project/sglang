@@ -202,6 +202,32 @@ _MERGED_K_GATE_MAX_M = 16
 # Kimi-K3.1 prefill extends with at least this many rows split the indexer
 # (logits and top-k) across the attention-TP ranks and all-gather the top-k
 _INDEXER_TP_SPLIT_MIN_ROWS = 1024
+# MI355X, 140k keys: unsplit 512 rows cost ~0.6 ms/layer in logits + top-k vs
+# ~0.16 ms for a 64-row slice; re-measure if the top-k all-gather gets slower.
+_INDEXER_TP_SPLIT_MIN_ROWS_HIP = 64
+
+
+def _indexer_tp_split_min_rows() -> int:
+    rows = envs.SGLANG_OPT_DSA_INDEXER_TP_SPLIT_MIN_ROWS.get()
+    if rows is not None:
+        return rows
+    return _INDEXER_TP_SPLIT_MIN_ROWS_HIP if _is_hip else _INDEXER_TP_SPLIT_MIN_ROWS
+
+
+def _resolve_hip_prefill_mqa_logits():
+    if envs.SGLANG_USE_FLYDSL_DSA_PREFILL_LOGITS.get():
+        try:
+            from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+
+            return flydsl_fp8_mqa_logits
+        except ImportError:
+            logger.warning(
+                "FlyDSL fp8_mqa_logits unavailable; DSA prefill indexer uses Triton",
+                exc_info=True,
+            )
+    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+    return fp8_mqa_logits
 
 
 if _is_cuda or _is_hip:
@@ -495,7 +521,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.num_init_tokens = self.num_local_tokens = 0
         self.tp_split_min_rows: Optional[int] = None
         if config is not None and is_kimi_k31(config):
-            self.tp_split_min_rows = _INDEXER_TP_SPLIT_MIN_ROWS
+            self.tp_split_min_rows = _indexer_tp_split_min_rows()
+        self._hip_prefill_mqa_logits = (
+            _resolve_hip_prefill_mqa_logits() if _is_hip else None
+        )
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
@@ -1949,14 +1978,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         ke,
                     )
                 elif _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
                     kv, scale = kv_fp8
                     # Match the CUDA deep_gemm path (clean_logits=False): the topk
                     # transform masks invalid positions via ks/ke/lengths, so the
                     # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
                     # redundant and grows quadratically with context length.
-                    logits = fp8_mqa_logits(
+                    logits = self._hip_prefill_mqa_logits(
                         q_fp8[:q_offset],
                         kv,
                         scale,
@@ -2009,10 +2036,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if tp_split is not None:
             if not need_chunk:
                 max_rows = row_hi - row_lo
-            # Per-row outputs, so the local rows go to a buffer gathered below.
-            dst = torch.empty(
-                (row_hi - row_lo, self.index_topk), device=device, dtype=torch.int32
+            # Per-row outputs: each rank writes its rows into its own slot of an
+            # equal-stride buffer, so the gather below is an in-place
+            # all_gather_into_tensor (aiter custom all-gather on ROCm) instead of
+            # PyNCCL all_gatherv.
+            group, _, _, sizes = tp_split
+            slot = max(sizes)
+            gather_buf = torch.empty(
+                (group.world_size * slot, self.index_topk),
+                device=device,
+                dtype=torch.int32,
             )
+            mine = group.rank_in_group * slot
+            dst = gather_buf[mine : mine + row_hi - row_lo]
             dst_base = row_lo
 
         start = row_lo
@@ -2031,11 +2067,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         dsa_indexer_hip.fp4_logits_plans(metadata),
                     )
                 elif _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
                     kv, scale = kv_fp8
                     # clean_logits=False: topk transform handles masking (see above)
-                    logits_chunk = fp8_mqa_logits(
+                    logits_chunk = self._hip_prefill_mqa_logits(
                         q_fp8[start:end],
                         kv,
                         scale,
@@ -2096,9 +2130,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if topk_dst is not topk_result:
                 topk_result[:q_offset] = topk_dst[:q_offset]
         if tp_split is not None:
-            # Rank order == row order, so the gather rebuilds rows [0, q_offset).
-            group, _, _, sizes = tp_split
-            group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
+            # int32 rows travel as float32 bits (the custom all-gather is typed).
+            group.all_gather_into_tensor(
+                gather_buf.view(torch.float32),
+                gather_buf[mine : mine + slot].view(torch.float32),
+            )
+            # Rank order == row order: drop each slot's padding to rebuild
+            # rows [0, q_offset).
+            torch.cat(
+                [gather_buf[r * slot : r * slot + n] for r, n in enumerate(sizes)],
+                out=topk_result[:q_offset],
+            )
         return topk_result
 
     def _prefill_lite_topk(
@@ -2180,13 +2222,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         group = get_parallel().attn_tp_group
         tp = group.world_size
         min_rows = max(tp, self.tp_split_min_rows)
-        if (
-            tp <= 1
-            or q_offset < min_rows
-            # the top-k gather is all_gatherv, which runs on PyNCCL only
-            or group.pynccl_comm is None
-            or not group.pynccl_comm.available
-        ):
+        if tp <= 1 or q_offset < min_rows:
             return None
         bounds = self._indexer_tp_split_bounds(
             seq_lens_cpu=forward_batch.seq_lens_cpu,
