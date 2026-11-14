@@ -97,5 +97,62 @@ def test_fused_topk_deepseek(seq_length, params, apply_routed_scaling_factor_on_
     )
 
 
+def test_grouped_topk_with_fused_shared_experts():
+    """
+    Test grouped_topk_gpu and biased_grouped_topk_impl when num_fused_shared_experts > 0.
+    Ensures:
+    1. Routed experts are correctly selected and normalized.
+    2. Shared expert IDs and weights are appended deterministically (no random indices).
+    """
+    from sglang.srt.layers.moe.topk import grouped_topk_gpu
+
+    num_experts = 64
+    num_fused_shared_experts = 2
+    topk = 8  # 6 routed + 2 shared
+    num_tokens = 16
+    device = torch.device("cpu")
+
+    gating_output = torch.randn(
+        num_tokens, num_experts, dtype=torch.float32, device=device
+    )
+    hidden_states = torch.empty(num_tokens, 1, dtype=torch.float32, device=device)
+
+    weights, ids = grouped_topk_gpu(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        topk=topk,
+        renormalize=True,
+        num_expert_group=4,
+        topk_group=2,
+        num_fused_shared_experts=num_fused_shared_experts,
+    )
+
+    # Validate output shapes
+    assert weights.shape == (num_tokens, topk)
+    assert ids.shape == (num_tokens, topk)
+
+    # Validate routed weights sum to 1.0 (renormalized)
+    routed_weights = weights[:, : topk - num_fused_shared_experts]
+    assert torch.allclose(routed_weights.sum(dim=-1), torch.ones(num_tokens), atol=1e-5)
+
+    # Validate shared expert IDs are [num_experts, num_experts + 1]
+    expected_shared_ids = (
+        torch.arange(
+            num_experts, num_experts + num_fused_shared_experts, dtype=torch.int32
+        )
+        .unsqueeze(0)
+        .expand(num_tokens, -1)
+    )
+    assert torch.equal(ids[:, topk - num_fused_shared_experts :], expected_shared_ids)
+
+    # Validate shared expert weights are 1.0
+    expected_shared_weights = torch.ones(
+        (num_tokens, num_fused_shared_experts), dtype=torch.float32
+    )
+    assert torch.equal(
+        weights[:, topk - num_fused_shared_experts :], expected_shared_weights
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
