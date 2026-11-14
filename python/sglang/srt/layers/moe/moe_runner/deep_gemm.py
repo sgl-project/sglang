@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
-from sglang.srt.layers.offloader import get_offloader
+from sglang.srt.layers.offloader import forbid_copy_engine_usage
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -1449,7 +1449,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
     m_indices = buffer_init(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
-    if get_offloader().forbid_copy_engine_usage:
+    if forbid_copy_engine_usage():
         num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
             num_recv_tokens_per_expert
         )
