@@ -159,6 +159,11 @@ def run_eval(args):
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
         )
+    elif args.eval_name in ("aime24", "aime25", "aime26"):
+        from sglang.test.simple_eval_aime import AIMEEval
+
+        year = int(args.eval_name.replace("aime", ""))
+        eval_obj = AIMEEval(year, args.num_examples, args.num_threads)
     elif args.eval_name == "gsm8k":
         from sglang.test.simple_eval_mixed_prefix_gsm8k import GSM8KEval
 
