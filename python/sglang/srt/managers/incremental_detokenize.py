@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 PROMPT_TAIL_LEN = 5
 
+# A character spans at most 4 byte tokens, so a tail this long that still decodes
+# to nothing or to a trailing U+FFFD never completes.
+MAX_UNCOMMITTED_IDS = 16
+
 DETOKENIZER_MAX_STATES = envs.SGLANG_DETOKENIZER_MAX_STATES.get()
 
 
@@ -220,8 +224,11 @@ class DetokenizeState(msgspec.Struct):
             # in a prior "�" recovery step; we skip it from this step's
             # emission so we don't double-send.
             pending = self.sent_offset - self.decoded_text_len
-            if new_text and not new_text.endswith("�"):
-                # Clean text: commit to decoded_text and advance offsets.
+            if (new_text and not new_text.endswith("�")) or (
+                len(self.decode_ids) - self.read_offset > MAX_UNCOMMITTED_IDS
+            ):
+                # Clean text, or a tail that never completes: commit to
+                # decoded_text and advance offsets so the decode window stays bounded.
                 self.append_decoded_text(new_text)
                 self.surr_offset = self.read_offset
                 self.read_offset = len(self.decode_ids)

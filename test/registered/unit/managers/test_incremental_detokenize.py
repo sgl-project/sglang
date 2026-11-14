@@ -11,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.incremental_detokenize import (
+    MAX_UNCOMMITTED_IDS,
     DetokenizeHeader,
     DetokenizeStateTable,
 )
@@ -38,6 +39,21 @@ class _Tokenizer:
             for t in ids
             if not (skip_special_tokens and t >= SPECIAL)
         )
+
+    def batch_decode(self, ids_list, **kwargs):
+        return [self.decode(ids, **kwargs) for ids in ids_list]
+
+
+class _ByteTokenizer:
+    is_fast = True
+
+    def __init__(self):
+        self.longest = 0
+
+    def decode(self, ids, skip_special_tokens, spaces_between_special_tokens):
+        self.longest = max(self.longest, len(ids))
+        kept = [t for t in ids if not (skip_special_tokens and t >= 256)]
+        return bytes(kept).decode("utf-8", errors="replace")
 
     def batch_decode(self, ids_list, **kwargs):
         return [self.decode(ids, **kwargs) for ids in ids_list]
@@ -318,6 +334,46 @@ class TestDetokenizeState(CustomTestCase):
                 self.assertEqual(out.output_strs, ["7."])
                 out = detok.handle_batch_token_id_out(beam)
             self.assertEqual(out.output_strs, ["8."])
+
+    def test_a_split_character_is_held_until_it_completes(self):
+        detok = _detokenizer()
+        detok.tokenizer = _ByteTokenizer()
+        sent = {}
+        rows = [[0xE4], [0xB8], [0xAD], [0x21]]
+
+        texts = [
+            detok.handle_batch_token_id_out(
+                _output(sent, [("r", ids, _header([0x20]) if i == 0 else None, False)])
+            ).output_strs[0]
+            for i, ids in enumerate(rows)
+        ]
+
+        self.assertEqual("".join(texts), "\u4e2d!")
+
+    def test_a_tail_that_never_completes_keeps_the_decode_window_bounded(self):
+        for tail_id, skip, expected in [(0xE4, False, "\ufffd"), (300, True, "")]:
+            with self.subTest(tail_id=tail_id):
+                detok = _detokenizer()
+                detok.tokenizer = _ByteTokenizer()
+                sent = {}
+                texts = []
+                for i in range(200):
+                    header = (
+                        _header([0x20], skip_special_tokens=skip) if i == 0 else None
+                    )
+                    out = detok.handle_batch_token_id_out(
+                        _output(sent, [("r", [tail_id, tail_id], header, False)])
+                    )
+                    texts += out.output_strs
+                out = detok.handle_batch_token_id_out(
+                    _output(sent, [("r", [0x21], None, True)])
+                )
+                texts += out.output_strs
+
+                self.assertLessEqual(
+                    detok.tokenizer.longest, 2 * MAX_UNCOMMITTED_IDS + 6
+                )
+                self.assertEqual("".join(texts), expected * 400 + "!")
 
 
 if __name__ == "__main__":
