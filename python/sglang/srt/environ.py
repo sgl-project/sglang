@@ -704,6 +704,7 @@ class Envs:
     SGLANG_ENABLE_WAITING_PREFIX_REFRESH = EnvBool(True)
     # PD prefill: bootstrap-queued requests each refresh also touches; 0 skips them.
     SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX = EnvInt(512)
+    SGLANG_WAITING_QUEUE_PREFIX_MATCH_MAX = EnvInt(128)
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)

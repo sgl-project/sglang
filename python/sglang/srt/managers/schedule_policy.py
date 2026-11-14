@@ -130,7 +130,7 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
     PREFILL_TILE_BUDGET_MODE = "compact"
 
 # Arbitrary; bounds per-round prefix work on the waiting queue.
-WAITING_QUEUE_PREFIX_MATCH_MAX = 128
+WAITING_QUEUE_PREFIX_MATCH_MAX = envs.SGLANG_WAITING_QUEUE_PREFIX_MATCH_MAX.get()
 # Bound the walk cost using scheduling passes, which agree across TP ranks.
 WAITING_PREFIX_REFRESH_INTERVAL = 32
 
