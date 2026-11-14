@@ -35,7 +35,7 @@ class PythonicDetector(BaseFormatDetector):
     def __init__(self):
         super().__init__()
         self.tool_call_regex = re.compile(
-            r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
+            r"\[([a-zA-Z_]\w*\(([a-zA-Z_]\w*=.*,\s*)*([a-zA-Z_]\w*=.*\s)?\),\s*)*([a-zA-Z_]\w*\(([a-zA-Z_]\w*=.*,\s*)*([a-zA-Z_]\w*=.*\s*)?\)\s*)+\]",
             re.DOTALL,
         )
 
