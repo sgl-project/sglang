@@ -259,7 +259,7 @@ fn has_python_only_space(value: &Value) -> bool {
 
 /// Whether `value` holds a negative zero: serde_json reads JSON `-0` as `-0.0`,
 /// where the engine's orjson reads the integer `0`.
-fn has_negative_zero(value: &Value) -> bool {
+pub(super) fn has_negative_zero(value: &Value) -> bool {
     match value {
         Value::Number(number) => number
             .as_f64()

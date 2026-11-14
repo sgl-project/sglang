@@ -154,7 +154,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_COMPILE`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable torch.compile</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set from <code>--enable-torch-compile</code> at launch; setting it directly has no effect on SRT servers.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
@@ -179,7 +179,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_SKIP_P2P_CHECK`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip P2P (peer-to-peer) access check</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the P2P (peer-to-peer) access check for custom all-reduce and trust the driver's report</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
     </tr>
     <tr>
@@ -194,8 +194,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable RoPE fusion in Fused Multi-Layer Attention</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Apply RoPE inside the ROCm fused MLA decode kernel (<code>SGLANG_ROCM_FUSED_DECODE_MLA</code>) instead of before it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DISABLE_OVERLAP_AFTER_PREFILL`</td>
@@ -261,6 +261,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip-softmax threshold scale factor for TRT-LLM decode attention in flashinfer. <code>None</code> means standard attention. See https://arxiv.org/abs/2512.12087</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_SGL_FA3_KERNEL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the sgl-fa3 wheel implementation for FlashAttention v3 instead of the kernels-hub build</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
 </tbody>
 </table>
@@ -343,8 +348,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"1024"`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer_nvlink_one_sided</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (the larger of <code>--chunked-prefill-size</code> and <code>4096</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE</code></td>
@@ -354,6 +359,11 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-rank FlashInfer MegaMOE symmetric-workspace token capacity. A value of <code>0</code> derives the capacity from the runtime token limits.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-rank token capacity of an extra, smaller FlashInfer MegaMOE workspace for decode-only forwards of ModelOpt NVFP4 MoE layers, including <code>nvfp4_online</code>; other MegaMOE quantizations ignore it with a startup warning. Either <code>0</code> (off) or <code>0 &lt; capacity &lt; main capacity</code>, where the main capacity is <code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code> or its derived value. Startup rejects a negative value, or one not below a positive <code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code>; when that variable is <code>0</code> or unset, the main capacity is derived and the check runs when the first MegaMOE layer is built. A forward uses it only when no DP rank extends and every EP rank's batch fits; otherwise it uses the main workspace. Unused (logged once) when MegaMoE startup autotuning runs, since the tuned capacity profiles already serve small batches; it takes effect with <code>--disable-flashinfer-autotune</code> or <code>--flashinfer-autotune-skip-ops flashinfer_megamoe</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
@@ -901,8 +911,8 @@ SGLang supports various environment variables that can be used to configure its 
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_BLOCK_NONZERO_RANK_CHILDREN`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control blocking of non-zero rank children processes</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On nodes with node rank 1 or higher, block the launch until the schedulers exit. Set to <code>false</code> when using <code>Engine</code> as a Python API.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_IS_FIRST_RANK_ON_NODE`</td>
@@ -961,7 +971,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, register the prefix gather scratch of single-node shard groups as an NCCL symmetric window so NCCL 2.31.2+ runs the all-gather on copy engines (zero SMs). Older NCCL versions keep the SM-kernel all-gather. On single-node deployments this also makes the server set <code>NCCL_CUMEM_ENABLE=1</code> for every NCCL communicator unless it is already set, except under <code>--enable-memory-saver</code> or <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code>; see <code>--enable-kv-cache-sharding</code> for the full conditions. Set to <code>false</code> to keep the SM-kernel all-gather and the default <code>NCCL_CUMEM_ENABLE=0</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, allocate the prefix gather scratch of single-node shard groups with PyTorch symmetric memory and run the all-gather on copy engines (zero SMs) through its CUDA multicast mapping, in chunks that a foreground NVLink transfer pause can stop. GPUs without multicast, <code>--enable-memory-saver</code>, and <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code> keep the NCCL all-gather. Set to <code>false</code> to keep the NCCL all-gather.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
   </tbody>
@@ -1213,11 +1223,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>120</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISABLE_OUTLINES_DISK_CACHE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disable Outlines disk cache</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use SGLang's custom Triton kernel cache implementation for lower overheads (automatically enabled on CUDA)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -1234,8 +1239,13 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUGEPAGE_SIZE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use huge pages for host KV cache allocations (HiCache / disaggregation offload). Valid values: <code>2MB</code> (2 MiB pages via <code>MAP_HUGE_2MB</code>) or <code>1GB</code> (1 GiB pages via <code>MAP_HUGE_1GB</code>). Requires huge pages to be pre-allocated on the host OS (<code>/proc/sys/vm/nr_hugepages</code> or <code>/sys/kernel/mm/hugepages</code>). If the allocation fails, the allocator logs a warning and falls back to regular page-size mmap automatically.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Huge page size for mmap-backed host KV cache allocations (HiCache / disaggregation offload). Valid values: <code>2MB</code> (2 MiB pages via <code>MAP_HUGE_2MB</code>) or <code>1GB</code> (1 GiB pages via <code>MAP_HUGE_1GB</code>). Requires huge pages to be pre-allocated on the host OS (<code>/proc/sys/vm/nr_hugepages</code> or <code>/sys/kernel/mm/hugepages</code>). The host-memory preflight credits the available hugetlb pool only when the selected allocator and device dispatch to mmap. With <code>1GB</code> pages, reserve one extra page per host buffer because each mapping is rounded up to a whole page. Fallback behavior is controlled by <code>SGLANG_HUGEPAGE_MODE</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses OS default page size)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUGEPAGE_MODE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Huge page allocation policy for mmap-backed host allocations. <code>off</code> uses normal pages, <code>prefer</code> tries huge pages and falls back to normal pages, and <code>required</code> uses only huge pages and fails immediately if they are unavailable. Allocators and devices that do not dispatch to mmap ignore this policy. When unset, the mode is <code>off</code> if no huge page size is configured and <code>prefer</code> otherwise.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (backward-compatible inference)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS</code></td>
@@ -1456,7 +1466,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_WAR_BARRIER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force-enable the write-after-read barrier for the overlap scheduler even when CUDA is not detected (e.g. AMD/ROCm). On CUDA the barrier is always enabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force-enable the write-after-read barrier for the overlap and pipeline-parallel schedulers even when CUDA is not detected (e.g. AMD/ROCm). On CUDA, and with <code>--enable-unified-memory</code> on any device, the barrier is always enabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
@@ -1552,11 +1562,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force querying the prefill DP rank for routing.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Extra slots in <code>req_to_token_pool</code> for decode workers (effective when <code>max_num_reqs</code> greater than 32), letting more KV transfers overlap decode.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
   </tbody>
 </table>
@@ -1747,7 +1752,7 @@ SGLang supports various environment variables that can be used to configure its 
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_DETERMINISTIC_INFERENCE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable deterministic inference (fixed reduction/accumulation order).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Deterministic inference (fixed reduction/accumulation order). Set from <code>--enable-deterministic-inference</code> at launch; setting it directly has no effect on SRT servers.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
@@ -1898,6 +1903,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Which fused KDA decode kernel Kimi-K3 uses on ROCm: <code>gfx950</code> runs SGLang's HIP kernel (gfx950 only, FP32 recurrent state), <code>aiter</code> runs the FlyDSL fused boundary (FP32 state; also BF16 once AITER ships ROCm/aiter#6026, unless <code>SGLANG_USE_HIP_K3_FLYDSL_SOURCE=sglang</code>). Any other value keeps the unfused KDA decode. Both backends fall back to the unfused path for inputs they do not cover. Deprecated alias: <code>SGLANG_ROCM_K3_KDA_FUSED_BACKEND</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>gfx950</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_HIP_K3_FLYDSL_SOURCE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Which FlyDSL module backs <code>SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=aiter</code>: <code>sglang</code> or <code>aiter</code> pin one; <code>auto</code> prefers SGLang's vendored copy (FP32 state only), and binds AITER's (ROCm/aiter#6026) when the vendored copy is missing or the pool's state dtype is one only AITER's takes, such as BF16. Other values raise an error. Deprecated alias: <code>SGLANG_K3_FLYDSL_SOURCE</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx942, run dense block-FP8 linears with the AITER CK blockscale GEMM instead of the AITER Triton one for faster decode. Accuracy differences depend on the evaluation setting: Qwen3-32B-FP8 is 1 point lower on 8-shot GSM8K with 512 output tokens, but only 0.26 points lower with 5 shots and 2048 output tokens, with MMLU unchanged (see <a href="https://github.com/sgl-project/sglang/issues/43526">#43526</a>). Set to <code>false</code> to use Triton.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
@@ -1951,16 +1966,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count above which <code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code> stops applying and the split projection runs instead. The merged shape is only faster while the projection is bandwidth bound.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_KDA_FUSED_BACKEND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 fused KDA decode on ROCm: <code>gfx950</code> runs the in-tree gfx950 kernel, <code>aiter</code> runs AITER's FlyDSL kernel. Any other value keeps the unfused decode.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>gfx950</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_K3_FLYDSL_SOURCE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Where the Kimi-K3 FlyDSL operators come from: <code>auto</code> tries the in-tree copy and then AITER, <code>sglang</code> or <code>aiter</code> force one.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code></td>
@@ -2113,6 +2118,11 @@ MPS and does not read them.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MM_RS_THREADS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Thread count of the Rust multimodal preprocessing pool (decode, resize, patchify, hash). The deprecated <code>SGL_MM_RS_THREADS</code> is still read.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>min(8, CPU cores)</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MM_SKIP_COMPUTE_HASH</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip computing multimodal-item hashes.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -2129,7 +2139,7 @@ MPS and does not read them.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_CUDA_IPC_TRANSPORT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use CUDA IPC transport for multimodal-item tensors.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Deprecated: use <code>--mm-feature-transport</code>. When that flag is not passed, <code>1</code> selects <code>cuda_ipc</code> and <code>0</code> selects <code>cpu</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>

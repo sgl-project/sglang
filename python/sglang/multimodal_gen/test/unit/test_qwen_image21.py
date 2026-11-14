@@ -512,6 +512,11 @@ class _RecordingAttention(torch.nn.Module):
         return torch.zeros_like(x), [None] * len(caches)
 
 
+class _IdentityFeedForward(torch.nn.Module):
+    def forward(self, x, use_packed_bf16=False):
+        return x
+
+
 def _block_recording_caches(layer_id, dim=4):
     # The real block forward with its attention swapped for a recorder.
     block = QwenImage21TransformerBlock.__new__(QwenImage21TransformerBlock)
@@ -520,7 +525,7 @@ def _block_recording_caches(layer_id, dim=4):
     block.img_norm1 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.img_norm2 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.attn = _RecordingAttention()
-    block.img_mlp = torch.nn.Identity()
+    block.img_mlp = _IdentityFeedForward()
     return block
 
 

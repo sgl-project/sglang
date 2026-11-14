@@ -558,17 +558,8 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
 template <typename Trait, uint32_t kOccupancy>
 __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
     attn_res_fused_pull_rs_kernel(const __grid_constant__ AttnResTMAParams params) {
-  // The window base lives in shared memory, not in the barrier object: this
-  // kernel's body is register-budgeted (see kConsumerRegs / setmaxnreg), so
-  // keeping the object live across Trait::forward would spill.
-  __shared__ uint32_t exit_base;
-  {
-    const auto barrier =
-        device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size, /*num_arrives=*/2);
-    device::PDLWaitPrimary<true>();
-    barrier.arrive_relaxed(/*n=*/0);
-    if (threadIdx.x == 0) exit_base = barrier.window() + params.world_size;
-  }
+  device::PDLWaitPrimary<true>();
+  device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size).arrive_relaxed();
   __syncthreads();
 
   // Cooperative NVLS materialization: all TMA producer + consumer threads
@@ -603,7 +594,7 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
   Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
 
   __syncthreads();
-  device::distributed::McBarrier::arrive_at<true>(params.sem_local, params.sem_mc, params.world_size, exit_base);
+  device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size).arrive_rel_acq();
 }
 
 // Local attention-residual aggregation + direct AG epilogue. The consumer
@@ -613,20 +604,14 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
 template <typename Trait, uint32_t kOccupancy>
 __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
     attn_res_fused_direct_ag_kernel(const __grid_constant__ AttnResTMAParams params) {
-  __shared__ uint32_t exit_base;  // see the note in the pull-RS kernel above
-  {
-    const auto barrier =
-        device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size, /*num_arrives=*/2);
-    barrier.arrive_relaxed(/*n=*/0);
-    if (threadIdx.x == 0) exit_base = barrier.window() + params.world_size;
-  }
+  device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size).arrive_relaxed();
   __syncthreads();
 
   extern __shared__ char smem_raw[];
   Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
 
   __syncthreads();
-  device::distributed::McBarrier::arrive_at<true>(params.sem_local, params.sem_mc, params.world_size, exit_base);
+  device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size).arrive_rel_acq();
 }
 using host::distributed::CommunicatorRef;
 

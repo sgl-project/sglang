@@ -150,7 +150,6 @@ class Kandinsky6TI2VAPipelineConfig(PipelineConfig):
     flow_shift: float | None = 5.0
 
     # audio frames = ceil(pixel_frames / fps * sample_rate / downsample_factor)
-    sample_fps: float = 24.0
     audio_sample_rate: int = 44100
     audio_downsample_factor: int = 1024
 

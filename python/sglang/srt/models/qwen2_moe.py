@@ -403,6 +403,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     dict(parallel_group="replicated")
                     if (
                         get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_ascend_ops()
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_deepep_v2()
                         or get_moe_a2a_backend().is_flashinfer()
@@ -844,6 +845,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
@@ -934,7 +936,6 @@ class Qwen2MoeAttention(nn.Module):
         max_position_embeddings: int = 8192,
         qkv_bias: int = True,
         quant_config: Optional[QuantizationConfig] = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -989,7 +990,6 @@ class Qwen2MoeAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -1032,9 +1032,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         qkv_bias = getattr(config, "qkv_bias", True)
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -1044,7 +1041,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             qkv_bias=qkv_bias,
             prefix=add_prefix("self_attn", prefix),
         )

@@ -1,0 +1,45 @@
+name: Seed sgl-router Cache
+
+# A cache entry only reaches every PR when it was written from the default branch's
+# ref, and pr-test.yml has no push trigger - so a merge that moves the key leaves
+# every job that launches sgl-router compiling it until the next scheduled run.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # What the key hashes.
+      - 'sgl-router/**'
+      - 'rust/**'
+      - '.github/workflows/_pr-test-sgl-router-build.yml'
+      - 'scripts/ci/utils/build_sgl_router.sh'
+      # Not hashed into the key, but they set its arch part: by the runner each job
+      # here builds on, and by the runner consumers restore on there.
+      - '.github/workflows/seed-sgl-router-cache.yml'
+      - '.github/actions/download-sgl-router/action.yml'
+  workflow_dispatch:
+
+# Only the newest merge needs to seed; earlier ones are already stale.
+concurrency:
+  group: seed-sgl-router-cache
+  cancel-in-progress: true
+
+# Declaring permissions at all drops everything not listed. issues: read for
+# check-maintenance.
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  seed:
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04
+    secrets: inherit
+
+  seed-aarch64:
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04-arm
+      artifact_name: sgl-router-aarch64
+    secrets: inherit

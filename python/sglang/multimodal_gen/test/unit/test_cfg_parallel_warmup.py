@@ -135,6 +135,32 @@ def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
 class TestWarmupReqCfgParallel(unittest.TestCase):
     """Warmup request construction and req-based warmup guards."""
 
+    def test_bcg_warmup_preserves_configured_prompt_and_references(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        server_args.enable_breakable_cuda_graph = True
+        defaults = _apply_warmup_sampling_overrides(
+            SimpleNamespace(
+                warmup_sampling_params={
+                    "prompt": "Use the palette of <Picture 2> in <Picture 1>.",
+                    "image_path": ["first.png", "second.png"],
+                }
+            ),
+            SamplingParams(),
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=defaults,
+        ):
+            requests = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["2048x2048"],
+                server_based_warmup=True,
+            )
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].prompt, defaults.prompt)
+        self.assertEqual(requests[0].image_path, defaults.image_path)
+        self.assertTrue(requests[0].is_warmup)
+
     def test_sampling_workload_override_accepts_json(self):
         defaults = SamplingParams(
             width=1024,

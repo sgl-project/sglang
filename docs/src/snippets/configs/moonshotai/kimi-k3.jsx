@@ -353,6 +353,14 @@ export const config = {
               ? ["--enable-linear-replayssm-spec"]
               : []),
           ],
+          hints: (s) => config.isNpuHw(s)
+            ? [
+                "Optional Ascend DSPARK attention kernels: set SGLANG_NPU_USE_FLASH_MLA=1 for target-model MLA verification, and ASCEND_USE_PAGED_MTP=1 for draft-model MHA attention.",
+                "Both switches default to false and preserve the operators used for ordinary non-speculative decode. They apply to eager execution and graph replay.",
+                "These paths require sgl-kernel-npu with the attention.flash_mla and attention.paged_mtp_attention modules for your NPU.",
+                "To avoid CPU sequence-length mirror and host attention-parameter updates, enable both kernels and set SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0. Its default is 1; selecting the kernels alone keeps the CPU mirrors enabled.",
+              ]
+            : [],
         },
         {
           id: "dflash",

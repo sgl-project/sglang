@@ -153,6 +153,68 @@ def concat_and_cast_mha_k_triton(
 
 
 @triton.jit
+def concat_and_cast_q_fp8_heads_kernel(
+    out_ptr,  # [num_tokens, >= H, NOPE+ROPE] fp8 (only [:, :H, :] written)
+    q_nope_ptr,  # [num_tokens, H, NOPE] bf16
+    q_rope_ptr,  # [num_tokens, H, ROPE] bf16
+    out_s0,
+    out_s1,
+    nope_s0,
+    nope_s1,
+    rope_s0,
+    rope_s1,
+    H,
+    BLOCK_H: tl.constexpr,
+    NOPE: tl.constexpr,
+    ROPE: tl.constexpr,
+):
+    # (token, head block) per program, so any head count (Kimi-K3.1: 12 / 96) works.
+    t = tl.program_id(0).to(tl.int64)
+    hr = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    hm = hr[:, None] < H
+    dst = out_ptr + t * out_s0 + hr[:, None] * out_s1
+    no = tl.arange(0, NOPE)
+    x = tl.load(q_nope_ptr + t * nope_s0 + hr[:, None] * nope_s1 + no[None, :], mask=hm)
+    tl.store(dst + no[None, :], x, mask=hm)
+    if ROPE > 0:
+        ro = tl.arange(0, ROPE)
+        r = tl.load(
+            q_rope_ptr + t * rope_s0 + hr[:, None] * rope_s1 + ro[None, :], mask=hm
+        )
+        tl.store(dst + NOPE + ro[None, :], r, mask=hm)
+
+
+def concat_and_cast_q_fp8_heads(out, q_nope, q_rope):
+    """Fused bf16->fp8 concat-cast of q_nope [T, H, NOPE] / q_rope [T, H, ROPE] into
+    ``out[:, :H, :]``; heads past H (padding) are left untouched. Same values as
+    ``torch.cat([q_nope, q_rope], -1).to(fp8)`` in one pass; NOPE / ROPE must be powers
+    of two (ROPE may be 0)."""
+    num_tokens, num_heads, nope_dim = q_nope.shape
+    rope_dim = q_rope.shape[-1]
+    assert out.dtype == torch.float8_e4m3fn and out.shape[1] >= num_heads
+    assert out.shape[2] == nope_dim + rope_dim
+    if num_tokens == 0:
+        return out
+    block_h = 8
+    concat_and_cast_q_fp8_heads_kernel[(num_tokens, triton.cdiv(num_heads, block_h))](
+        out,
+        q_nope,
+        q_rope,
+        out.stride(0),
+        out.stride(1),
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_rope.stride(0),
+        q_rope.stride(1),
+        num_heads,
+        BLOCK_H=block_h,
+        NOPE=nope_dim,
+        ROPE=rope_dim,
+    )
+    return out
+
+
+@triton.jit
 def concat_and_cast_q_fp8_pad_kernel(
     qpad_ptr,  # [num_tokens, pad_heads, NOPE+ROPE] fp8 (dst; only [:, :H, :] written)
     q_nope_ptr,  # [num_tokens, H, NOPE] bf16

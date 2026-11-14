@@ -54,6 +54,12 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
             raise ValueError(
                 "MiniCPM sparse attention does not support PD disaggregation"
             )
+        if uses_sparse_backend and cfg.enable_unified_memory:
+            raise ValueError(
+                "MiniCPM sparse attention does not support "
+                "--enable-unified-memory: its compressed cache is attached to "
+                "a request pool the unified pool does not use"
+            )
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = (
                 "minicpm_flashinfer"

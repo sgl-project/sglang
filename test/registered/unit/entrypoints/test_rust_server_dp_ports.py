@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import disagg_service
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer, shm_path_for
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
     get_context,
@@ -38,7 +39,7 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
             is_multimodal=False,
             is_image_understandable_model=False,
             is_audio_understandable_model=False,
-            hf_config=SimpleNamespace(model_type=None),
+            hf_config=SimpleNamespace(model_type=None, architectures=None),
             get_default_sampling_params=lambda: {},
         ),
         get_init_info=MagicMock(
@@ -50,6 +51,7 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
             )
         ),
         page_size=16,
+        tree_cache=None,
         rust_server_tokenizer_path=lambda: "tokenizer",
         tokenizer=None,
         max_total_num_tokens=1024,
@@ -115,6 +117,11 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         # launched path.
         ({"tokenizer_path": "/public"}, "tokenizer_path", "tokenizer"),
         ({"tokenizer_path": "/public"}, "public_tokenizer_path", "/public"),
+        # `--warmups` holds health until Python ran them (`rust_server.warmups`).
+        ({"warmups": "voice_chat"}, "custom_warmups_pending", True),
+        # Blank names run nothing, so nothing would release a hold.
+        ({"warmups": ""}, "custom_warmups_pending", False),
+        ({"warmups": " ,"}, "custom_warmups_pending", False),
     ],
     ids=[
         "native-grpc",
@@ -133,6 +140,9 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         "mm-limits-keep-order",
         "loaded-tokenizer",
         "public-tokenizer",
+        "custom-warmups",
+        "custom-warmups-empty",
+        "custom-warmups-blank",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
@@ -681,7 +691,7 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
         _hosts_rust_server=lambda: hosts,
         _holds_rust_drain_end=lambda: False,
         get_rust_server_class=lambda: server_class,
-        _engine_paused=False,
+        pause_state=PauseState(),
     )
     with (
         envs.SGLANG_RUST_SERVER.override(True),
