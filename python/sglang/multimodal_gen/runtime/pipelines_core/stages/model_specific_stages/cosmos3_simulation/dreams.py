@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     CosmosDreamsTransformer,
     HistoryKV,
     KVPair,
+    PrefixKVHistory,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -593,6 +594,26 @@ def append_kv_history(
                 "Cosmos-Dreams K/V must be matching tensors whose token length is a positive "
                 f"multiple of tokens_per_frame={tokens_per_frame}, got {tuple(key.shape)}."
             )
+    if isinstance(history, PrefixKVHistory):
+        if (
+            window_frames is not None
+            and history.history_len == 0
+            and any(
+                key.shape[1] > (sink_frames + window_frames) * tokens_per_frame
+                for key, _ in current_kv
+            )
+        ):
+            raise ValueError(
+                "The initial Cosmos-Dreams K/V block exceeds the history window."
+            )
+        history.append(
+            current_kv,
+            sink_tokens=sink_frames * tokens_per_frame,
+            tail_tokens=None
+            if window_frames is None
+            else window_frames * tokens_per_frame,
+        )
+        return history
     if history is None:
         if window_frames is not None and any(
             key.shape[1] > (sink_frames + window_frames) * tokens_per_frame
@@ -1317,6 +1338,8 @@ class _RolloutContext(msgspec.Struct):
     device: torch.device
     dtype: torch.dtype
     row_domain_ids: torch.Tensor | None = None
+    # Latent frames in the whole request; bounds the K/V buffer's initial capacity.
+    target_frame: int | None = None
 
     def chunk_domain_ids(
         self, frame_start: int, frame_end: int, action_count: int
@@ -1419,6 +1442,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         )
         geometry: CosmosDreamsGeometry = batch.extra[EXTRA_GEOMETRY]
         row_domain_ids = batch.extra.get(EXTRA_ACTION_DOMAIN_IDS)
+        target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
         context = _RolloutContext(
             text_kv=text_kv,
             fps=float(batch.fps),
@@ -1434,9 +1458,9 @@ class CosmosDreamsRolloutStage(PipelineStage):
             device=device,
             dtype=torch.bfloat16,
             row_domain_ids=None if row_domain_ids is None else row_domain_ids.to("cpu"),
+            target_frame=target_frame,
         )
         rows: torch.Tensor | None = batch.extra[EXTRA_ACTION_ROWS]
-        target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
         seed = batch.seed
         if not isinstance(seed, int):
             raise ValueError(
@@ -1626,6 +1650,18 @@ class CosmosDreamsRolloutStage(PipelineStage):
         read_history: HistoryKV | None = None,
     ) -> list[KVPair]:
         """Refresh one clean frame (timestep 0, no time embedding) and commit its K/V."""
+        if history is None:
+            # One rollout-owned [text | history | chunk] buffer replaces the
+            # per-step concats and the per-commit history re-allocation.
+            window = self.profile.window_frames
+            capacity = 0
+            if window is not None:
+                frames = self.profile.sink_frames + window + self.manifest.chunk_size
+                if context.target_frame is not None:
+                    # Never reserve more than the request can commit.
+                    frames = min(frames, context.target_frame)
+                capacity = frames * context.tokens_per_frame
+            history = PrefixKVHistory(context.text_kv, capacity_tokens=capacity)
         return commit_clean_kv(
             self.transformer,
             latent,
