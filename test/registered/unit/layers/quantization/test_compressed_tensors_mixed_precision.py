@@ -1,10 +1,11 @@
-"""CPU regression tests for multi-group ("mixed-precision") compressed-tensors configs.
+"""CPU regression tests for compressed-tensors target and ignore matching.
 
-Such a checkpoint used to load completely unquantized. ``ignore`` was matched by
-substring, so a parent module entry swallowed its quantized children, and the
-activation-quantization gate read the top-level format -- which compressed-tensors
-sets to ``mixed-precision`` when groups disagree -- dropping ``input_activations``
-for every group. Both are config-parsing paths, so these tests run on CPU.
+A multi-group ("mixed-precision") checkpoint used to load completely unquantized.
+``ignore`` was matched by substring, so a parent module entry swallowed its
+quantized children, and the activation-quantization gate read the top-level format
+-- which compressed-tensors sets to ``mixed-precision`` when groups disagree --
+dropping ``input_activations`` for every group. Both are config-parsing paths, so
+these tests run on CPU.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -16,6 +17,8 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.quantization.compressed_tensors import compressed_tensors
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -24,13 +27,24 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
+    find_matched_target,
     should_ignore_layer,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.test.test_utils import CustomTestCase
 
 EXPERTS_LAYER = "model.language_model.layers.0.mlp.experts"
 GATE_PROJ = f"{EXPERTS_LAYER}.0.gate_proj"
 MLP_LAYER = "model.language_model.layers.0.mlp.gate_proj"
+IN_PROJ_QKVZ = "model.language_model.layers.0.linear_attn.in_proj_qkvz"
+
+# Qwen3.5's packed_modules_mapping, which Qwen4-Exp reuses.
+PACKED_MODULES_MAPPING = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
+}
 
 # A vision tower whose ignore list is spelled against the CompressedLinear
 # wrapper. The names below are the prefixes the matcher actually receives:
@@ -135,6 +149,26 @@ def _mixed_precision_config(*groups, ignore=()):
         "config_groups": {f"group_{i}": g for i, g in enumerate(groups)},
         "ignore": list(ignore),
     }
+
+
+def _single_group_config(group):
+    """Nothing in `ignore`, as llm-compressor writes experts-only checkpoints."""
+    config = CompressedTensorsConfig.from_config(
+        {
+            "quant_method": "compressed-tensors",
+            "format": group["format"],
+            "config_groups": {"group_0": group},
+            "ignore": [],
+        }
+    )
+    config.update_packed_modules_mapping(PACKED_MODULES_MAPPING)
+
+    return config
+
+
+def _linear():
+    # __new__ is enough: get_quant_method only isinstance-checks the layer.
+    return LinearBase.__new__(LinearBase)
 
 
 class TestIgnoreListPrefixMatching(CustomTestCase):
@@ -402,6 +436,81 @@ class TestMixedPrecisionFormat(CustomTestCase):
         self.assertEqual(scheme.pack_factor, 32 // 4)
         self.assertEqual(scheme.strategy, "group")
         self.assertEqual(scheme.group_size, 128)
+
+
+class TestUntargetedLayers(CustomTestCase):
+    """A layer that no group targets and `ignore` does not list is stored unquantized;
+    scheme lookup must not raise "Unable to find matching target" for it."""
+
+    def test_untargeted_linear_loads_unquantized(self):
+        config = _single_group_config(NVFP4_GROUP)
+        method = config.get_quant_method(_linear(), IN_PROJ_QKVZ)
+
+        self.assertIsInstance(method, UnquantizedLinearMethod)
+
+    def test_untargeted_experts_load_unquantized(self):
+        config = _single_group_config(FP8_GROUP)
+        scheme = config.get_moe_scheme(torch.nn.Module(), layer_name=EXPERTS_LAYER)
+
+        self.assertIsNone(scheme)
+
+    def test_first_untargeted_layer_is_named_once(self):
+        config = _single_group_config(NVFP4_GROUP)
+        with self.assertLogs(compressed_tensors.logger, level="WARNING") as captured:
+            config.get_quant_method(_linear(), IN_PROJ_QKVZ)
+            config.get_quant_method(_linear(), MLP_LAYER)
+
+        named = [line for line in captured.output if "matches no" in line]
+        self.assertEqual(len(named), 1)
+        self.assertIn(IN_PROJ_QKVZ, named[0])
+
+    def test_untargeted_layers_are_counted_after_build(self):
+        config = _single_group_config(NVFP4_GROUP)
+        config.get_quant_method(_linear(), IN_PROJ_QKVZ)
+        config.get_quant_method(_linear(), IN_PROJ_QKVZ)
+        config.get_quant_method(_linear(), MLP_LAYER)
+
+        with self.assertLogs(compressed_tensors.logger, level="WARNING") as captured:
+            config.warn_untargeted_layers()
+
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("built unquantized: 2.", captured.output[0])
+
+    def test_untargeted_experts_count_as_one_layer(self):
+        config = _single_group_config(FP8_GROUP)
+        with self.assertLogs(compressed_tensors.logger, level="WARNING") as captured:
+            config.get_moe_scheme(torch.nn.Module(), layer_name=EXPERTS_LAYER)
+            config.warn_untargeted_layers()
+
+        self.assertIn(f"{EXPERTS_LAYER} matches no", captured.output[0])
+        self.assertIn("built unquantized: 1.", captured.output[-1])
+
+    def test_fully_targeted_model_logs_no_summary(self):
+        config = _single_group_config(NVFP4_GROUP)
+        config.get_moe_scheme(torch.nn.Module(), layer_name=EXPERTS_LAYER)
+
+        with self.assertNoLogs(compressed_tensors.logger, level="WARNING"):
+            config.warn_untargeted_layers()
+
+    def test_fused_layer_matches_when_every_shard_matches(self):
+        matched = find_matched_target(
+            layer_name=IN_PROJ_QKVZ,
+            module=torch.nn.Module(),
+            targets=["re:.*in_proj_qkv$", "re:.*in_proj_z$"],
+            fused_mapping=PACKED_MODULES_MAPPING,
+        )
+
+        self.assertEqual(matched, "re:.*in_proj_qkv$")
+
+    def test_partly_targeted_fused_layer_raises(self):
+        # Its shards would need different methods inside one fused layer.
+        with self.assertRaisesRegex(ValueError, "different quantization schemes"):
+            find_matched_target(
+                layer_name=IN_PROJ_QKVZ,
+                module=torch.nn.Module(),
+                targets=["re:.*in_proj_qkv$"],
+                fused_mapping=PACKED_MODULES_MAPPING,
+            )
 
 
 if __name__ == "__main__":

@@ -348,6 +348,14 @@ def _initialize_model(
         model = model_class(**kwargs)
         check_stage_producers(model)
     model.shared_experts_config = shared_experts
+
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    if isinstance(quant_config, CompressedTensorsConfig):
+        quant_config.warn_untargeted_layers()
+
     return model
 
 
