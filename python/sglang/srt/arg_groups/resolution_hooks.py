@@ -20,6 +20,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_media_url_security",
         "handle_watermark_config",
         "handle_hicache_ratio_default",
+        "validate_hicache_mamba_size",
         "handle_offload_compatibility",
         "validate_prefill_decode_interval",
         "default_unset_prefill_decode_interval",

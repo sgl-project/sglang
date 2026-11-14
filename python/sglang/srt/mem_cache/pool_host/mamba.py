@@ -197,9 +197,10 @@ class MambaPoolHost(HostKVCache):
 
         if self.size <= device_capacity:
             logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
-                "L2 cache effectiveness is reduced."
-                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                "HiCache host Mamba pool (%d state slots) is smaller than the device "
+                "pool (%d state slots); L2 cache effectiveness is reduced. Consider "
+                "increasing --hicache-mamba-size-gb when it is set, else --hicache-ratio "
+                "(or --hicache-size), for a higher L2 cache hit rate.",
                 self.size,
                 device_capacity,
             )

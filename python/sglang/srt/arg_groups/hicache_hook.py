@@ -12,6 +12,31 @@ from sglang.srt.arg_groups.overrides import declare_resolution
 logger = logging.getLogger(__name__)
 
 
+def validate_hicache_mamba_size(server_args: Any):
+    """--hicache-mamba-size-gb: a share of --hicache-size for the host Mamba pool."""
+    cfg = resolving_view(server_args)
+    size = cfg.hicache_mamba_size_gb
+    if size is None:
+        return
+    if not cfg.enable_hierarchical_cache:
+        raise ValueError("--hicache-mamba-size-gb needs --enable-hierarchical-cache.")
+    if cfg.hicache_size <= 0:
+        raise ValueError(
+            "--hicache-mamba-size-gb needs an explicit --hicache-size to take its "
+            "share from; it does not apply to --hicache-ratio sizing."
+        )
+    if not 0 < size < cfg.hicache_size:
+        raise ValueError(
+            "--hicache-mamba-size-gb must be in (0, --hicache-size); "
+            "the host KV pools get the rest of --hicache-size."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--hicache-mamba-size-gb is not supported with --enable-unified-memory, "
+            "whose host pools split --hicache-size by sub-pool size."
+        )
+
+
 def handle_hicache(server_args: Any):
     """Normalize hicache-related knobs into a valid runtime configuration.
 

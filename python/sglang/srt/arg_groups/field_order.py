@@ -573,5 +573,6 @@ POSITIONAL_FIELD_ORDER = (
     "hybrid_cache_checkpoints_level",
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
+    "hicache_mamba_size_gb",
 )
 # fmt: on

@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
+    _split_hicache_size_with_mamba,
     _SwaStrategy,
     build_full_draft_pools,
     build_host_pool_group,
@@ -1625,6 +1626,126 @@ class TestHostPoolPreflight(CustomTestCase):
                 transfer_layer_id_max=2,
                 transfer_page_size=64,
             )
+
+
+class TestHicacheMambaSizeGb(CustomTestCase):
+    @staticmethod
+    def _pool(nbytes):
+        return SimpleNamespace(
+            host_capacity_bytes=None, get_kv_size_bytes=lambda: nbytes
+        )
+
+    def test_pinned_mamba_share_ignores_device_kv_growth(self):
+        mamba = self._pool(6 << 30)
+        for kv_bytes in (8 << 30, 12 << 30):
+            kv_gb, mamba_gb = _split_hicache_size_with_mamba(
+                hicache_size=192,
+                hicache_mamba_size_gb=70,
+                kv_pools=(self._pool(kv_bytes),),
+                mamba_pool=mamba,
+            )
+            self.assertEqual((kv_gb, mamba_gb), (122, 70))
+
+    def test_unset_keeps_proportional_split(self):
+        kv_gb, mamba_gb = _split_hicache_size_with_mamba(
+            hicache_size=192,
+            hicache_mamba_size_gb=None,
+            kv_pools=(self._pool(10 << 30),),
+            mamba_pool=self._pool(6 << 30),
+        )
+        self.assertEqual((kv_gb, mamba_gb), (120.0, 72.0))
+
+    def test_mamba_swa_stack_gives_the_pin_to_mamba_and_the_rest_by_kv_bytes(self):
+        """The full and SWA host pools split the remainder by device bytes, in
+        that order; the Mamba host pool gets exactly the pin."""
+        params = SimpleNamespace(
+            page_size=1,
+            token_to_kv_pool_allocator=SimpleNamespace(swa_attn_allocator=None),
+        )
+        memory = SimpleNamespace(hicache_size=192, hicache_mamba_size_gb=70)
+        with (
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            patch.object(hybrid_pool_assembler, "_mamba_info"),
+            patch.object(
+                hybrid_pool_assembler, "_mamba_layer_mapping", return_value={2: 0}
+            ),
+            patch.object(hybrid_pool_assembler, "_mtp_full_device_pools"),
+            patch.object(hybrid_pool_assembler, "_mtp_swa_device_pools"),
+            patch.object(hybrid_pool_assembler, "build_hybrid_swa_group") as swa_group,
+            patch.object(hybrid_pool_assembler, "_mamba_entry") as mamba_entry,
+            patch.object(hybrid_pool_assembler, "_build_cache_controller"),
+        ):
+            hybrid_pool_assembler.build_hybrid_mamba_swa_stack(
+                params=params,
+                full_kv_pool=self._pool(8 << 30),
+                swa_kv_pool=self._pool(4 << 30),
+                mamba_pool=self._pool(6 << 30),
+                full_layer_mapping={0: 0},
+                swa_layer_mapping={1: 0},
+                start_layer=0,
+                load_cache_event=None,
+                storage_backend=None,
+            )
+        kv_sizes = swa_group.call_args.kwargs
+        self.assertAlmostEqual(kv_sizes["kv_host_size"], 122 * 2 / 3)
+        self.assertAlmostEqual(kv_sizes["swa_host_size"], 122 / 3)
+        self.assertEqual(mamba_entry.call_args.kwargs["host_size"], 70)
+
+    def test_pin_below_one_mamba_slot_is_rejected(self):
+        """Host sizing pads by one slot, so a pin smaller than one state slot
+        would otherwise build a one-slot Mamba host pool without complaint."""
+        params = SimpleNamespace(
+            mtp_draft_mamba_pools=(),
+            token_to_kv_pool_allocator=SimpleNamespace(state_slots=MagicMock()),
+        )
+        for pin_gb, rejected in ((0.4, True), (0.5, False)):
+            with (
+                self.subTest(pin_gb=pin_gb),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "get_memory",
+                    return_value=SimpleNamespace(hicache_mamba_size_gb=pin_gb),
+                ),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "build_mamba_host_pool",
+                    return_value=SimpleNamespace(size_per_token=int(0.5e9)),
+                ),
+                patch.object(hybrid_pool_assembler, "_state_host_layout"),
+                patch.object(hybrid_pool_assembler, "build_pool_entry"),
+            ):
+                build = partial(
+                    hybrid_pool_assembler._mamba_entry,
+                    params=params,
+                    mamba_pool=None,
+                    info=SimpleNamespace(layer_ids=(0,)),
+                    layer_mapping={0: 0},
+                    transfer_layer_id_max=1,
+                    host_size=pin_gb,
+                    host_evict_fn=None,
+                    device_evict_fn=None,
+                )
+                if rejected:
+                    with self.assertRaisesRegex(ValueError, "one Mamba state slot"):
+                        build()
+                else:
+                    build()
+
+    def test_pin_warns_only_without_a_mamba_host_pool(self):
+        memory = SimpleNamespace(hicache_mamba_size_gb=70)
+        logger = hybrid_pool_assembler.logger
+        with patch.object(hybrid_pool_assembler, "get_memory", return_value=memory):
+            with self.assertLogs(logger, "WARNING") as logs:
+                hybrid_pool_assembler._warn_unused_mamba_host_size(
+                    SimpleNamespace(entry_map={PoolName.KV: object()})
+                )
+            self.assertIn("--hicache-mamba-size-gb has no effect", logs.output[0])
+            with self.assertNoLogs(logger, "WARNING"):
+                hybrid_pool_assembler._warn_unused_mamba_host_size(
+                    SimpleNamespace(
+                        entry_map={PoolName.KV: object(), PoolName.MAMBA: object()}
+                    )
+                )
 
 
 class TestDeclaredPoolVerification(CustomTestCase):

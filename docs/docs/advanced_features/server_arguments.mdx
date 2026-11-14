@@ -2211,6 +2211,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-mamba-size-gb`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Gigabytes of --hicache-size for the host Mamba state pool of a hybrid model, which also holds the state of any MTP draft Mamba layers and must fit one state slot; the host KV pools split the rest, and any indexer or draft host pools come out of that KV share. Needs --enable-hierarchical-cache and an explicit --hicache-size, and is rejected with --enable-unified-memory for every model. Unset splits --hicache-size across all host pools by their device pool sizes. A model without a Mamba host pool ignores it with a warning.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-write-policy`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The write policy of hierarchical cache.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`write_through`</td>

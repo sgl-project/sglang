@@ -480,9 +480,10 @@ class HostKVCache(abc.ABC):
     def _allocate_host_buffer(self) -> None:
         if self.size <= self.device_capacity_tokens:
             logger.warning(
-                "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
-                "L2 cache effectiveness is reduced."
-                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                "HiCache %s host pool (%d tokens) is smaller than the device pool "
+                "(%d tokens); L2 cache effectiveness is reduced. Consider increasing "
+                "--hicache-ratio (or --hicache-size, or lowering --hicache-mamba-size-gb "
+                "when it is set) for a higher L2 cache hit rate.",
                 self.pool_label,
                 self.size,
                 self.device_capacity_tokens,
