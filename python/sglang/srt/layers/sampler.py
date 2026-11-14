@@ -100,7 +100,7 @@ def _trace_e2e_sampler(stage: str, **fields) -> None:
 
 
 class _SamplingMaskCapture(NamedTuple):
-    """Compact post-filter weights and their original batch-row mapping."""
+    """Compact post-filter probabilities (zero off the support) and their batch rows."""
 
     weights: torch.Tensor
     token_ids: Optional[torch.Tensor]
@@ -571,9 +571,7 @@ class Sampler(nn.Module):
             selected_weight = selected_from_weights
 
         support = weights > 0
-        support_mass = torch.where(support, weights, torch.zeros_like(weights)).sum(
-            dim=-1, dtype=torch.float32
-        )
+        support_mass = weights.sum(dim=-1, dtype=torch.float32)
         selected_weight = selected_weight.float()
         selected_logprobs = torch.log(selected_weight / support_mass)
         invalid = ~(
