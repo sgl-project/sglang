@@ -207,6 +207,7 @@ def build_replay_fb_view(
         batch_size=bs,
         forward_mode=capture_forward_mode,
         actual_forward_mode=forward_batch.forward_mode,
+        dllm_is_causal=forward_batch.dllm_is_causal,
         input_ids=buffers.input_ids[:num_tokens],
         positions=buffers.positions[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],

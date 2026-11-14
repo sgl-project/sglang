@@ -76,6 +76,7 @@ from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Omni_Reasoning_V3_Config,
 )
 from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
+from sglang.srt.configs.nemotron_labs_diffusion import NemotronLabsDiffusionConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -167,6 +168,7 @@ __all__ = [
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
     "MiniCPMV4_7Config",
+    "NemotronLabsDiffusionConfig",
     "NemotronHConfig",
     "NemotronHPuzzleConfig",
     "NemotronH_Nano_VL_V2_Config",
