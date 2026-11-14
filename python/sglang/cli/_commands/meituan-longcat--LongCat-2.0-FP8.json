@@ -1,0 +1,3 @@
+[
+  {"hw":"b300","mode":"balanced","verified":"verified","gpus":8,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/Meituan/LongCat-2.0#hw=b300&variant=default&quant=fp8&strategy=balanced&nodes=single","command":"sglang serve \\\n  --trust-remote-code \\\n  --model-path meituan-longcat/LongCat-2.0-FP8 \\\n  --tp 8 \\\n  --ep 8 \\\n  --max-running-requests 64 \\\n  --mem-fraction-static 0.92 \\\n  --chunked-prefill-size 2048 \\\n  --dsa-prefill-backend fa3 \\\n  --kv-cache-dtype bfloat16 \\\n  --model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":12}' \\\n  --host 0.0.0.0 \\\n  --port 30000"}
+]

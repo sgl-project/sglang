@@ -1,0 +1,3 @@
+[
+  {"hw":"h200","mode":"balanced","verified":"verified","gpus":8,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/MiniMax/MiniMax-M3#hw=h200&variant=default&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --trust-remote-code \\\n  --model-path MiniMaxAI/MiniMax-M3 \\\n  --reasoning-parser auto \\\n  --tool-call-parser auto \\\n  --tp 8 \\\n  --mem-fraction-static 0.75 \\\n  --host 0.0.0.0 \\\n  --port 30000"}
+]

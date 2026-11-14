@@ -1,0 +1,4 @@
+[
+  {"hw":"b300","mode":"low-latency","verified":"verified","gpus":8,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/Tencent/Hy4-Preview#hw=b300&variant=default&quant=bf16&strategy=low-latency&nodes=single","command":"sglang serve \\\n  --model-path tencent/Hy4-preview \\\n  --tp 8 \\\n  --reasoning-parser auto \\\n  --tool-call-parser auto \\\n  --speculative-algorithm NEXTN \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --host 0.0.0.0 \\\n  --port 30000"},
+  {"hw":"b300","mode":"high-throughput","verified":"verified","gpus":8,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/Tencent/Hy4-Preview#hw=b300&variant=default&quant=bf16&strategy=high-throughput&nodes=single","command":"sglang serve \\\n  --model-path tencent/Hy4-preview \\\n  --tp 8 \\\n  --reasoning-parser auto \\\n  --tool-call-parser auto \\\n  --host 0.0.0.0 \\\n  --port 30000"}
+]
