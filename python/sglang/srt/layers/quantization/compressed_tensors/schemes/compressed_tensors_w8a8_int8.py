@@ -8,6 +8,7 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
+from sglang.kernels.ops.gemm.int8_kernel import int8_scaled_mm_via_int_mm
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
@@ -23,7 +24,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import is_cuda
 
-__all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
+__all__ = [
+    "CompressedTensorsW8A8Int8",
+    "NPUCompressedTensorsW8A8Int8",
+    "XPUCompressedTensorsW8A8Int8",
+]
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -200,3 +205,44 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
 
     def apply_weights(self, layer, x, bias):
         return self.kernel.apply(layer, x, bias)
+
+
+class XPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
+    """W8A8 int8 linear on XPU: per-channel int8 weights and dynamic symmetric per-token
+    int8 activations.
+
+    sgl-kernel-xpu has no ``int8_scaled_mm``, so the GEMM runs through
+    ``int8_scaled_mm_via_int_mm``: ``torch._int_mm`` plus one fused Triton epilogue for
+    the scales, bias and output cast. ``layer.weight`` is the [K, N] transposed view that
+    ``process_weights_after_loading`` already produces.
+    """
+
+    def __init__(
+        self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
+    ):
+        super().__init__(strategy, is_static_input_scheme, input_symmetric)
+        if strategy != QuantizationStrategy.CHANNEL:
+            # Per-tensor weights would go through requantize_with_max_scale, which
+            # requantizes the int8 weights through FP8 (scaled_fp8_quant).
+            raise NotImplementedError(
+                "XPU W8A8 int8 supports only per-channel weight scales, "
+                f"got strategy={strategy!r}."
+            )
+        if is_static_input_scheme or not input_symmetric:
+            raise NotImplementedError(
+                "XPU W8A8 int8 supports only dynamic symmetric per-token activations."
+            )
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        # TODO: torch.xpu.get_device_capability
+        return 20
+
+    def apply_weights(
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        x_q, x_scale = per_token_quant_int8(x.reshape(-1, x.shape[-1]).contiguous())
+        out = int8_scaled_mm_via_int_mm(
+            x_q, layer.weight, x_scale, layer.weight_scale, x.dtype, bias
+        )
+        return out.reshape(*x.shape[:-1], out.shape[-1])
