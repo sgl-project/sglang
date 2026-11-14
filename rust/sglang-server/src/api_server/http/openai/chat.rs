@@ -362,6 +362,12 @@ async fn chat_completions(
             reasoning_options,
             tool_parser: parser,
             tools,
+            // `tool_constraint` gives these choices a JSON schema when it builds no tag.
+            uses_tool_call_json_schema: !uses_tool_call_structural_tag
+                && matches!(
+                    tool_choice,
+                    DynamoToolChoice::Required | DynamoToolChoice::Named(_)
+                ),
         },
     };
     if stream {
@@ -623,6 +629,7 @@ pub(super) enum OutputParsing {
         reasoning_options: ReasoningOptions,
         tool_parser: Option<String>,
         tools: Option<Vec<ToolDefinition>>,
+        uses_tool_call_json_schema: bool,
     },
     /// recipe over the output token ids, in place of both parsers.
     DeepSeek(DeepSeekOutputOptions),
@@ -695,6 +702,7 @@ pub(super) async fn unary_chat(
                 reasoning_options,
                 tool_parser,
                 tools,
+                uses_tool_call_json_schema,
             } => {
                 // Split reasoning markers out of the content first (Python splits
                 // before tool-call parsing too), then parse tool calls on the clean
@@ -710,11 +718,14 @@ pub(super) async fn unary_chat(
                     tool_parser.as_deref(),
                     tools.as_deref(),
                     parallel_tool_calls,
+                    *uses_tool_call_json_schema,
                 )
                 .await;
                 let finish_reason = match tool_calls {
-                    Some(_) => Some(OpenAIFinishReason::ToolCalls),
-                    None => finish_reason,
+                    Some(_) if !uses_tool_call_json_schema || stopped(&output) => {
+                        Some(OpenAIFinishReason::ToolCalls)
+                    }
+                    _ => finish_reason,
                 };
                 (reasoning_text, content, tool_calls, finish_reason)
             }
@@ -778,6 +789,7 @@ pub(super) fn chat_event_stream(
             reasoning_options,
             tool_parser,
             tools,
+            ..
         } => (
             reasoning_parser,
             reasoning_options,
@@ -1423,6 +1435,45 @@ mod tests {
         assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
     }
 
+    #[tokio::test]
+    async fn named_tool_call_at_token_limit_keeps_parameters_and_length() {
+        let args = ServerArgs {
+            served_model_name: "model".into(),
+            tool_call_parser: Some("pythonic".into()),
+            ..Default::default()
+        };
+        let formatter =
+            sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap();
+        let state = answering_app_state_with_item(Arc::new(args), formatter, None, |rid| {
+            ResponseItem::Done(ChunkEvent {
+                rid: rid.into(),
+                text: r#"[{"name":"search","parameters":{"q": "[other()]"},"arguments":null}]"#
+                    .into(),
+                finish_reason: Some(super::FinishKind::Length { length: Some(24) }.into()),
+                completion_tokens: 24,
+                ..Default::default()
+            })
+        });
+        let body = serde_json::json!({
+            "model": "model", "messages": [{"role": "user", "content": "Search"}],
+            "tools": [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}],
+            "tool_choice": {"type": "function", "function": {"name": "search"}}, "max_tokens": 24
+        });
+        let response = post_json(
+            super::routes().with_state(state),
+            "/v1/chat/completions",
+            body,
+        )
+        .await;
+        let value = body_json(response).await;
+        let choice = &value["choices"][0];
+        let function = &choice["message"]["tool_calls"][0]["function"];
+        assert_eq!(function["name"], "search", "{value}");
+        assert_eq!(function["arguments"], r#"{"q": "[other()]"}"#);
+        assert!(choice["message"]["content"].is_null());
+        assert_eq!(choice["finish_reason"], "length");
+    }
+
     /// The first choice's message for `body`, against a core answering `text`.
     /// Parsing by `reasoning_parser` alone, without tools.
     fn text_parsing(reasoning_parser: Option<&str>) -> OutputParsing {
@@ -1431,6 +1482,7 @@ mod tests {
             reasoning_options: ReasoningOptions::default(),
             tool_parser: None,
             tools: None,
+            uses_tool_call_json_schema: false,
         }
     }
 
