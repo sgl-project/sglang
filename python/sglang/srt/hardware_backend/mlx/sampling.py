@@ -188,7 +188,8 @@ def compute_logprobs(
     """
     if scaled is None:
         scaled = scale_by_temperature(last_logits, params)
-    logp = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+    shifted = scaled - mx.max(scaled, axis=-1, keepdims=True)
+    logp = shifted - mx.logsumexp(shifted, axis=-1, keepdims=True)
 
     chosen = mx.take_along_axis(logp, tokens[:, None], axis=-1).squeeze(-1)
 
