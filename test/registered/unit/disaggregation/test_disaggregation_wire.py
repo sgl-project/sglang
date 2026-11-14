@@ -46,9 +46,12 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_with_staging,
+    pp_sync_polls,
     setup_state_kv_args,
     should_send_replicated_state,
 )
+from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
@@ -1292,6 +1295,74 @@ class TestPollCollectives(CustomTestCase):
             result = poll_and_all_reduce([poller], object())
         self.assertEqual(result, [KVPoll.Failed])
         all_reduce.assert_not_called()
+
+
+class _FakePPSendWork:
+    def __init__(self):
+        self.waited = False
+
+    def wait(self):
+        self.waited = True
+
+
+class _FakePPGroup:
+    def __init__(self, recv_data=None):
+        self.recv_data = recv_data
+        self.recv_calls = []
+        self.send_calls = []
+        self.sent_works = []
+
+    def recv_object(self, *, src, tag):
+        self.recv_calls.append((src, tag))
+        return self.recv_data
+
+    def send_object(self, data, *, dst, async_send, tag):
+        self.send_calls.append((data, dst, async_send, tag))
+        work = _FakePPSendWork()
+        self.sent_works.append(work)
+        return [work]
+
+
+class TestPPSyncPolls(CustomTestCase):
+    def test_forwards_waited_only_behind_the_window(self):
+        """PP0's forwards of its poll states stay un-waited for the window's depth;
+        waiting on the previous call's forwards at every call tied each rank's
+        bootstrap round to the next rank's (the lock-step of #45351)."""
+        pp_group = _FakePPGroup()
+        window = PPSyncSendWindow(rounds=3)
+        rounds = [[KVPoll.Bootstrapping], [KVPoll.WaitingForInput], [KVPoll.Success]]
+        for polls in rounds:
+            self.assertEqual(pp_sync_polls(polls, pp_group, 0, 2, window), polls)
+        self.assertEqual([w.waited for w in pp_group.sent_works], [False] * 3)
+
+        pp_sync_polls([KVPoll.Success], pp_group, 0, 2, window)
+        self.assertEqual(
+            [w.waited for w in pp_group.sent_works], [True, False, False, False]
+        )
+        self.assertEqual(
+            pp_group.send_calls[0],
+            ([KVPoll.Bootstrapping], 1, True, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC),
+        )
+
+    def test_later_ranks_relay_pp0_polls_down_the_pipeline(self):
+        """A middle rank adopts the polls received from the previous rank and
+        forwards them on the same tag; the last rank only receives."""
+        pp0_polls = [KVPoll.Success, KVPoll.Failed]
+        middle = _FakePPGroup(recv_data=pp0_polls)
+        self.assertEqual(
+            pp_sync_polls([], middle, 1, 3, PPSyncSendWindow(rounds=3)), pp0_polls
+        )
+        self.assertEqual(middle.recv_calls, [(0, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)])
+        self.assertEqual(
+            middle.send_calls, [(pp0_polls, 2, True, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)]
+        )
+
+        last = _FakePPGroup(recv_data=pp0_polls)
+        self.assertEqual(
+            pp_sync_polls([], last, 2, 3, PPSyncSendWindow(rounds=3)), pp0_polls
+        )
+        self.assertEqual(last.recv_calls, [(1, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)])
+        self.assertEqual(last.send_calls, [])
 
 
 class TestDsaIndexKTokenBytes(unittest.TestCase):

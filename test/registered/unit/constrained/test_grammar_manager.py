@@ -828,6 +828,7 @@ class _FakePPGroup:
         self.recv_data = recv_data
         self.recv_calls = []
         self.send_calls = []
+        self.sent_works = []
 
     def recv_object(self, *, src, tag):
         self.recv_calls.append((src, tag))
@@ -835,7 +836,9 @@ class _FakePPGroup:
 
     def send_object(self, data, *, dst, async_send, tag):
         self.send_calls.append((data, dst, async_send, tag))
-        return [_FakePPSendWork()]
+        work = _FakePPSendWork()
+        self.sent_works.append(work)
+        return [work]
 
 
 class TestGrammarManagerPPSync(unittest.TestCase):
@@ -845,13 +848,20 @@ class TestGrammarManagerPPSync(unittest.TestCase):
 
     """Test PP synchronization of grammar ready/failed indexes."""
 
-    def _make_mgr_for_pp(self, pp_rank, pp_size, pp_group):
+    def _make_mgr_for_pp(self, pp_rank, pp_size, pp_group, pp_async_batch_depth=0):
         scheduler = _make_scheduler()
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
         # Override ranks after the server-args override rebuilds the config bags.
-        enter_scope(self, get_parallel().override(pp_size=pp_size, pp_rank=pp_rank))
+        enter_scope(
+            self,
+            get_parallel().override(
+                pp_size=pp_size,
+                pp_rank=pp_rank,
+                pp_async_batch_depth=pp_async_batch_depth,
+            ),
+        )
         scheduler.pp_group = pp_group
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
@@ -895,15 +905,22 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         self.assertEqual(pp_group.recv_calls, [(1, P2PTag.GRAMMAR_PP_SYNC)])
         self.assertEqual(pp_group.send_calls, [])
 
-    def test_pp_sync_drains_previous_async_send_work(self):
+    def test_pp_sync_waits_sends_only_behind_the_pipeline_depth(self):
+        """The forwards of a sync stay un-waited for pp_size + pp_async_batch_depth
+        syncs; waiting at every sync tied each rank's round to the next rank's
+        (the lock-step of #45351)."""
         pp_group = _FakePPGroup()
-        mgr = self._make_mgr_for_pp(pp_rank=0, pp_size=2, pp_group=pp_group)
-        work = _FakePPSendWork()
-        mgr.grammar_pp_sync_work_list = [work]
+        mgr = self._make_mgr_for_pp(
+            pp_rank=0, pp_size=2, pp_group=pp_group, pp_async_batch_depth=1
+        )
+        for _ in range(3):
+            mgr._pp_sync_ready_failed({1}, set())
+        self.assertEqual([w.waited for w in pp_group.sent_works], [False] * 3)
 
         mgr._pp_sync_ready_failed({1}, set())
-
-        self.assertTrue(work.waited)
+        self.assertEqual(
+            [w.waited for w in pp_group.sent_works], [True, False, False, False]
+        )
 
 
 class TestStrictReasoningPaths(unittest.TestCase):

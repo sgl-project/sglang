@@ -13,6 +13,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -62,7 +63,11 @@ class GrammarManager:
         self.pp_rank = get_parallel().pp_rank
         self.pp_size = get_parallel().pp_size
         self.pp_group = scheduler.pp_group
-        self.grammar_pp_sync_work_list = []
+        # The PP loop runs pp_size + pp_async_batch_depth rounds deep; the
+        # forwards must stay un-waited that long or they lock the ranks together.
+        self.pp_sync_send_window = PPSyncSendWindow(
+            self.pp_size + get_parallel().pp_async_batch_depth
+        )
 
         self.SGLANG_GRAMMAR_POLL_INTERVAL = envs.SGLANG_GRAMMAR_POLL_INTERVAL.get()
         self.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = (
@@ -79,11 +84,6 @@ class GrammarManager:
     def has_waiting_grammars(self) -> bool:
         return len(self.grammar_queue) > 0
 
-    def _drain_pp_sync_work(self):
-        for p2p_work in self.grammar_pp_sync_work_list:
-            p2p_work.work.wait()
-        self.grammar_pp_sync_work_list.clear()
-
     def _pp_sync_ready_failed(
         self,
         ready_req_idxs: set[int],
@@ -93,12 +93,14 @@ class GrammarManager:
         Synchronize ready/failed grammar request indexes across the PP pipeline.
 
         PP0 provides the data. Each later PP rank receives it from the previous
-        rank and asynchronously forwards it to the next rank.
+        rank and asynchronously forwards it to the next rank. The forwards stay
+        un-waited for the window's depth so this rank's rounds are not tied to
+        the next rank's.
         """
         if self.pp_size <= 1 or self.pp_group is None:
             return ready_req_idxs, failed_req_idxs
 
-        self._drain_pp_sync_work()
+        self.pp_sync_send_window.begin_round()
         data = (ready_req_idxs, failed_req_idxs)
         if self.pp_rank > 0:
             data = self.pp_group.recv_object(
@@ -106,7 +108,7 @@ class GrammarManager:
                 tag=P2PTag.GRAMMAR_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
-            self.grammar_pp_sync_work_list.extend(
+            self.pp_sync_send_window.add(
                 self.pp_group.send_object(
                     data,
                     dst=self.pp_rank + 1,
