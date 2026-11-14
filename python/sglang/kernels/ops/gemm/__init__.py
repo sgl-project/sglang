@@ -496,6 +496,16 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _fn in ("hc_fused_mix", "hc_apply_inject"):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_fn}",
+            backend=KernelBackend.FLYDSL,
+            target=f"sglang.kernels.ops.gemm.hc_fused_flydsl:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _fn
 register_kernel(
     KernelSpec(
         op="gemm.w8a8_block_fp8_matmul_triton",

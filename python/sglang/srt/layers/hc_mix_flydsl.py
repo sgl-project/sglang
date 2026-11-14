@@ -22,6 +22,18 @@ def _aiter_hc_mix_available():
         return False
 
 
+@lru_cache(maxsize=1)
+def flydsl_hc_fused_available():
+    # The modules hc_fused_flydsl imports at load; check only after the device guard.
+    try:
+        return (
+            find_spec("flydsl") is not None
+            and find_spec("aiter.ops.flydsl.kernels.mxfp4_gemm_common") is not None
+        )
+    except ModuleNotFoundError:
+        return False
+
+
 def flydsl_hc_mix_weights_supported(down, up, hc):
     """Device and weight-shape half of the check.
 
