@@ -46,15 +46,44 @@ use crate::{
     },
 };
 
+/// Owns acquired limiter capacity until it is transferred to a response body or dropped.
+///
+/// Keeping this guard alive while the downstream handler runs prevents capacity leaks when
+/// the request future is cancelled before a response body has been constructed.
+struct TokenLease {
+    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
+    token_bucket: Option<Arc<TokenBucket>>,
+    /// Number of tokens to return.
+    tokens: f64,
+}
+
+impl TokenLease {
+    fn new(token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+        Self {
+            token_bucket: Some(token_bucket),
+            tokens,
+        }
+    }
+}
+
+impl Drop for TokenLease {
+    fn drop(&mut self) {
+        if let Some(bucket) = self.token_bucket.take() {
+            debug!(
+                "TokenLease: ownership ended, returning {} tokens to bucket",
+                self.tokens
+            );
+            bucket.return_tokens_sync(self.tokens);
+        }
+    }
+}
+
 /// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
 /// This ensures that for streaming responses, the token is only returned after the entire
 /// stream has been sent to the client.
 pub struct TokenGuardBody {
     inner: Body,
-    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
-    token_bucket: Option<Arc<TokenBucket>>,
-    /// Number of tokens to return.
-    tokens: f64,
+    _lease: TokenLease,
 }
 
 impl TokenGuardBody {
@@ -62,21 +91,14 @@ impl TokenGuardBody {
     pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
         Self {
             inner,
-            token_bucket: Some(token_bucket),
-            tokens,
+            _lease: TokenLease::new(token_bucket, tokens),
         }
     }
-}
 
-impl Drop for TokenGuardBody {
-    fn drop(&mut self) {
-        if let Some(bucket) = self.token_bucket.take() {
-            debug!(
-                "TokenGuardBody: stream ended, returning {} tokens to bucket",
-                self.tokens
-            );
-            // Use lock-free sync return - no runtime needed, guaranteed token return
-            bucket.return_tokens_sync(self.tokens);
+    fn from_lease(inner: Body, lease: TokenLease) -> Self {
+        Self {
+            inner,
+            _lease: lease,
         }
     }
 }
@@ -383,7 +405,7 @@ pub struct QueuedRequest {
     /// Time when the request was queued
     queued_at: Instant,
     /// Channel to send the permit back when acquired
-    permit_tx: oneshot::Sender<Result<(), StatusCode>>,
+    permit_tx: oneshot::Sender<Result<TokenLease, StatusCode>>,
 }
 
 /// Queue metrics for monitoring
@@ -415,6 +437,21 @@ impl QueueProcessor {
         }
     }
 
+    fn grant_permit(
+        token_bucket: Arc<TokenBucket>,
+        permit_tx: oneshot::Sender<Result<TokenLease, StatusCode>>,
+    ) {
+        // The lease travels through the channel. If the receiver is already gone, or is
+        // cancelled after this send but before reading the value, dropping the lease returns
+        // the token automatically.
+        if permit_tx
+            .send(Ok(TokenLease::new(token_bucket, 1.0)))
+            .is_err()
+        {
+            debug!("Queued request was cancelled after token acquisition; returning token");
+        }
+    }
+
     pub async fn run(mut self) {
         debug!("Starting concurrency queue processor");
 
@@ -434,7 +471,7 @@ impl QueueProcessor {
             if self.token_bucket.try_acquire(1.0).await.is_ok() {
                 // Got token immediately
                 debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
+                Self::grant_permit(self.token_bucket.clone(), queued.permit_tx);
             } else {
                 // Need to wait for token
                 let token_bucket = self.token_bucket.clone();
@@ -447,7 +484,7 @@ impl QueueProcessor {
                         .is_ok()
                     {
                         debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
+                        Self::grant_permit(token_bucket, queued.permit_tx);
                     } else {
                         warn!("Queue: request timed out waiting for token");
                         let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
@@ -532,6 +569,7 @@ pub async fn concurrency_limit_middleware(
 
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
+        let token_lease = TokenLease::new(token_bucket, 1.0);
         debug!("Acquired token immediately");
         Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
         let response = next.run(request).await;
@@ -540,7 +578,7 @@ pub async fn concurrency_limit_middleware(
         // This ensures that for streaming responses, the token is only returned
         // after the entire stream has been sent to the client.
         let (parts, body) = response.into_parts();
-        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        let guarded_body = TokenGuardBody::from_lease(body, token_lease);
         Response::from_parts(parts, Body::new(guarded_body))
     } else {
         // No tokens available, try to queue if enabled
@@ -565,7 +603,7 @@ pub async fn concurrency_limit_middleware(
 
                     // Wait for token from queue processor
                     match permit_rx.await {
-                        Ok(Ok(())) => {
+                        Ok(Ok(token_lease)) => {
                             debug!("Acquired token from queue");
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
                             // Dequeue for embeddings
@@ -577,7 +615,7 @@ pub async fn concurrency_limit_middleware(
 
                             // Wrap the response body with TokenGuardBody to return token when stream ends
                             let (parts, body) = response.into_parts();
-                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            let guarded_body = TokenGuardBody::from_lease(body, token_lease);
                             Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {
@@ -982,6 +1020,75 @@ pub async fn wasm_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queue_processor_returns_token_when_queued_request_is_cancelled() {
+        let token_bucket = Arc::new(TokenBucket::new(1, 0));
+        let (queue_tx, queue_rx) = mpsc::channel(1);
+        let (permit_tx, permit_rx) = oneshot::channel();
+
+        drop(permit_rx);
+        queue_tx
+            .send(QueuedRequest {
+                queued_at: Instant::now(),
+                permit_tx,
+            })
+            .await
+            .expect("queue processor receiver should be open");
+        drop(queue_tx);
+
+        QueueProcessor::new(token_bucket.clone(), queue_rx, Duration::from_secs(1))
+            .run()
+            .await;
+
+        assert!(
+            token_bucket.try_acquire(1.0).await.is_ok(),
+            "a cancelled queued request must not consume limiter capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_token_is_returned_when_receiver_drops_after_grant() {
+        let token_bucket = Arc::new(TokenBucket::new(1, 0));
+        let (queue_tx, queue_rx) = mpsc::channel(1);
+        let (permit_tx, permit_rx) = oneshot::channel();
+
+        queue_tx
+            .send(QueuedRequest {
+                queued_at: Instant::now(),
+                permit_tx,
+            })
+            .await
+            .expect("queue processor receiver should be open");
+        drop(queue_tx);
+
+        QueueProcessor::new(token_bucket.clone(), queue_rx, Duration::from_secs(1))
+            .run()
+            .await;
+        drop(permit_rx);
+
+        assert!(
+            token_bucket.try_acquire(1.0).await.is_ok(),
+            "an unread granted lease must return limiter capacity when its receiver drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_lease_returns_capacity_if_request_is_cancelled_before_response() {
+        let token_bucket = Arc::new(TokenBucket::new(1, 0));
+        token_bucket
+            .try_acquire(1.0)
+            .await
+            .expect("initial limiter capacity should be available");
+
+        let lease = TokenLease::new(token_bucket.clone(), 1.0);
+        drop(lease);
+
+        assert!(
+            token_bucket.try_acquire(1.0).await.is_ok(),
+            "dropping the in-flight request lease must return limiter capacity"
+        );
+    }
 
     #[test]
     fn test_normalize_path_no_ids() {
