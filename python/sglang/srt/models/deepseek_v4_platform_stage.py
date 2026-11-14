@@ -8,6 +8,7 @@ from __future__ import annotations
 from functools import cached_property
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
+import msgspec
 import torch
 
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -46,6 +47,24 @@ if TYPE_CHECKING:
     from sglang.srt.models import deepseek_v2
 
 _is_gfx95_supported = is_gfx95_supported()
+
+
+class DSparkTboCapture(msgspec.Struct):
+    """One TBO micro-batch's DSpark aux hidden states: a share per captured layer,
+    in layer order; DeepseekV4Model._forward_layers_tbo merges both micro-batches'."""
+
+    layer_ids: frozenset[int]
+    shares: list[torch.Tensor] = []
+
+
+def capture_dspark_tbo_share(
+    batch: ForwardBatch, layer_id: int, hidden_states: torch.Tensor
+) -> None:
+    # _forward_layers_tbo sets the capture on every child before its operations
+    # run, None when DSpark does not capture.
+    capture = batch._dspark_tbo_capture
+    if capture is not None and layer_id in capture.layer_ids:
+        capture.shares.append(hidden_states.mean(dim=1))
 
 
 def _prepare_ffn_input(layer, hidden_states, residual, post, comb, forward_batch):
@@ -440,6 +459,7 @@ class NonCudaDecoderMixin:
             state.pop("ffn_post"),
             state.pop("ffn_comb"),
         )
+        capture_dspark_tbo_share(state.forward_batch, self.layer_id, hidden_states)
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
