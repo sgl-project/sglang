@@ -85,8 +85,28 @@ Measured on GB300, B300 and H200 at DP 2-8 with host tables:
 
 Every choice returns the same rows. `all_reduce` keeps the collectives used before `auto` (an
 all-reduce for prefill, a reduce-scatter for decode), and an explicit `reduce_scatter` or
-`all_to_all` applies to prefill and decode alike. Without DP attention the lookup is always an
-all-reduce.
+`all_to_all` applies to prefill and decode alike under DP attention. Without DP attention,
+the lookup uses an all-reduce unless the explicit prefill CP configuration below applies.
+
+## Prefill context parallelism
+
+For CUDA eager prefill with one host-table shard per rank, `all_to_all` can also return
+only the rows owned by each context-parallel rank:
+
+```bash
+sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 8 \
+  --enable-prefill-cp --cp-strategy interleave \
+  --engram-config '{"placement": "cpu", "replication": "none", "lookup": "all_to_all"}'
+```
+
+The CP and TP groups must have the same members in the same order.
+The number of hash columns must be divisible by the TP size.
+The path reuses the DP column lookup, exchange, and
+result reordering. It applies to uniform batches with at least 64 token rows per rank
+and no CP padding. Smaller batches, padded tails, empty batches, speculative steps,
+and CUDA graph execution retain the existing lookup. Shared tables, peer reads, and
+staged lookups keep their existing paths. `auto` behavior is unchanged; CP all-to-all
+requires the explicit setting above.
 
 ## Requirements and limits
 
@@ -96,8 +116,9 @@ all-reduce.
 - **`replication` `per_node`**: one shared memory file per TP group, which the other ranks open
   through `/proc`. The TP group must sit on one node (`--nnodes 1`) and the ranks must share a PID
   namespace. This mapping usually gets no huge pages unless shmem transparent huge pages are on.
-- **`lookup` `reduce_scatter` or `all_to_all`**: DP attention on CUDA; `all_to_all` also needs the
-  hash columns to divide over `--tp-size`.
+- **`lookup` `reduce_scatter` or `all_to_all`**: DP attention on CUDA, or the prefill CP
+  configuration above for `all_to_all`. `all_to_all` also needs the hash columns to
+  divide over `--tp-size`.
 - **`lookup` `peer_read`**: CUDA with peer access between the GPUs (POSIX handles within a node,
   fabric handles across an NVLink domain); `auto` takes it only over NVLink. Each GPU holds
   `1 / tp_size` of the table. With TP1 there is no peer, and the setting has no effect.
