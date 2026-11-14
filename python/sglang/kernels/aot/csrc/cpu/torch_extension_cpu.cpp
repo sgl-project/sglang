@@ -537,6 +537,8 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data, int6
 // shared memory reduce_scatter_tensor
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle = -1);
 
+// Diffusion GPT-J-style rotary embedding.
+at::Tensor diffusion_apply_rotary_embedding_cpu(const at::Tensor& input, const at::Tensor& cos, const at::Tensor& sin);
 // rope
 void rotary_embedding_cpu(
     at::Tensor& positions,
@@ -996,6 +998,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shm_alltoall", torch::kCPU, &shm_alltoall);
 
   // rope
+  m.def("diffusion_apply_rotary_embedding_cpu(Tensor input, Tensor cos, Tensor sin) -> Tensor");
+  m.impl("diffusion_apply_rotary_embedding_cpu", torch::kCPU, &diffusion_apply_rotary_embedding_cpu);
   m.def(
       "rotary_embedding_cpu(Tensor positions, Tensor(a!) query, Tensor(b!) key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> ()");
