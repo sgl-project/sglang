@@ -27,6 +27,13 @@ _TILES_ENV = "DG_MEGA_MOE_TILES"
 _BF16_PREFILL_TILES = "2,240,40,128,2"
 
 
+def _home(layer, tensor):
+    # MegaMoE dispatches by logical id; with the EPLB ring it owns the home slots.
+    if layer.eplb_ring is None:
+        return tensor
+    return tensor[: layer.num_local_experts]
+
+
 def _dimensions(layer):
     if hasattr(layer, "global_num_experts"):
         return (
@@ -48,8 +55,8 @@ def _check_canonical_weights(layer, mma_type):
     packed = 2 if mma_type == "nvfp4xnvfp4" else 1
     (mn1, k1), (mn2, k2) = _gemm_shapes(hidden, intermediate)
     if (
-        tuple(layer.gate_up_proj.shape) != (local, mn1, k1 // packed)
-        or tuple(layer.down_proj.shape) != (local, mn2, k2 // packed)
+        tuple(_home(layer, layer.gate_up_proj).shape) != (local, mn1, k1 // packed)
+        or tuple(_home(layer, layer.down_proj).shape) != (local, mn2, k2 // packed)
         or local <= 0
         or experts % local
     ):
@@ -94,13 +101,14 @@ def bind_megamoe_shared_weights(layer, mma_type) -> None:
         if isinstance(l1, tuple):
             l1, l2 = l1[0], l2[0]
     else:
-        l1, l2 = layer.gate_up_proj.detach(), layer.down_proj.detach()
+        l1 = _home(layer, layer.gate_up_proj.detach())
+        l2 = _home(layer, layer.down_proj.detach())
         if packed == 2:
             l1, l2 = l1.view(torch.int8), l2.view(torch.int8)
         l1 = l1.view(local, mn1, k1 // packed)
         l2 = l2.view(local, mn2, k2 // packed)
     if not all(
-        _same_weight_storage(view, parameter)
+        _same_weight_storage(view, _home(layer, parameter))
         for view, parameter in ((l1, layer.gate_up_proj), (l2, layer.down_proj))
     ):
         raise RuntimeError("Muse MegaMoE must alias the final TRT-LLM weights.")
@@ -110,11 +118,15 @@ def bind_megamoe_shared_weights(layer, mma_type) -> None:
         # tensor maps carry TRT's axis order, so nothing is copied or permuted,
         # and a padded one fails the view.
         sf1 = (
-            layer.gate_up_proj_weight_scale.detach()
+            _home(layer, layer.gate_up_proj_weight_scale.detach())
             .reshape(local, -1)
             .view(torch.int32)
         )
-        sf2 = layer.down_proj_weight_scale.detach().reshape(local, -1).view(torch.int32)
+        sf2 = (
+            _home(layer, layer.down_proj_weight_scale.detach())
+            .reshape(local, -1)
+            .view(torch.int32)
+        )
         l1 = (l1, sf1.view(local, mn1, k1 // 64))
         l2 = (l2, sf2.view(local, mn2, k2 // 64))
         extra = [
@@ -164,7 +176,7 @@ def build_nvfp4_megamoe_weights(layer) -> None:
     ):
         raise ValueError("Muse MegaMoE expects packed NVFP4 and E4M3 block scales.")
     local = layer.num_local_experts
-    s13 = layer.gate_up_proj_weight_scale_2.detach().float()
+    s13 = _home(layer, layer.gate_up_proj_weight_scale_2.detach()).float()
     if s13.ndim == 1:
         s13 = s13[:, None].expand(-1, 2)
     if s13.shape != (local, 2):
@@ -172,10 +184,10 @@ def build_nvfp4_megamoe_weights(layer) -> None:
             "Muse MegaMoE requires one gate/up alpha pair per local expert."
         )
     s13 = s13.clone().contiguous()
-    s2 = layer.down_proj_weight_scale_2.detach().float().flatten().clone()
+    s2 = _home(layer, layer.down_proj_weight_scale_2.detach()).float().flatten().clone()
     # Read the original calibration, not w2_input_scale_quant: ModelOpt may
     # neutralize the latter when per-token activation quantization is enabled.
-    in2_inv = layer.down_proj_input_scale.detach().float().flatten()
+    in2_inv = _home(layer, layer.down_proj_input_scale.detach()).float().flatten()
     global_experts, _, _ = _dimensions(layer)
     if in2_inv.numel() == global_experts and global_experts != local:
         offset = layer.local_expert_offset

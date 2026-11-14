@@ -987,10 +987,18 @@ class ExecMoe(msgspec.Struct):
         int, "Allocate this number of redundant experts in expert parallel."
     ] = 0
     ep_dispatch_algorithm: A[
-        Optional[Literal["static", "dynamic", "fake", "lp"]],
-        "The algorithm to choose ranks for redundant experts in expert parallel.",
+        Optional[Literal["static", "dynamic", "fake", "lp", "ring"]],
+        "The algorithm to choose ranks for redundant experts in expert parallel. "
+        "`ring` (with --init-expert-location ring; Muse Spark on NVIDIA GPUs only) "
+        "picks the home or buddy copy of each expert per batch of up to 256 tokens, "
+        "identically on every rank; larger batches use the home copies.",
     ] = None
-    init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
+    init_expert_location: A[
+        str,
+        "Initial location of EP experts: `trivial`, `ring`, or a JSON/.json/.pt "
+        "mapping. `ring` gives each EP rank its home experts plus those of the next "
+        "rank; it needs --ep-num-redundant-experts equal to the routed expert count.",
+    ] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
     eplb_rebalance_num_iterations: A[

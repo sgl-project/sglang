@@ -790,13 +790,19 @@ def handle_eplb_and_dispatch(server_args: Any):
     if (cfg.enable_eplb or (cfg.init_expert_location != "trivial")) and (
         cfg.ep_dispatch_algorithm is None
     ):
+        if cfg.init_expert_location == "ring":
+            default_dispatch = "ring"
+        elif needs_rank_invariant_dispatch:
+            default_dispatch = "dynamic"
+        else:
+            default_dispatch = "static"
         declare_resolution(
             server_args,
             "_handle_eplb_and_dispatch",
-            ep_dispatch_algorithm=(
-                "dynamic" if needs_rank_invariant_dispatch else "static"
-            ),
+            ep_dispatch_algorithm=default_dispatch,
         )
+
+    _validate_ring_dispatch(server_args)
 
     # `dynamic` / `fake` switch to the row-index pick; `static` reads a
     # per-rank table and `lp` samples inside its kernel.
@@ -813,6 +819,95 @@ def handle_eplb_and_dispatch(server_args: Any):
 
     if cfg.enable_eplb and cfg.ep_join_mode != "scale":
         assert resolved_view(server_args).ep_size > 1
+
+
+def _validate_ring_dispatch(server_args: Any) -> None:
+    from sglang.srt.eplb.expert_location import (
+        RING_DISPATCH_ARCHITECTURES,
+        RING_LOAD_FORMATS,
+    )
+
+    cfg = resolving_view(server_args)
+    ring = "ring" in (cfg.ep_dispatch_algorithm, cfg.init_expert_location)
+    if not ring and not (
+        cfg.ep_num_redundant_experts != 0
+        or cfg.ep_dispatch_algorithm is not None
+        or cfg.init_expert_location != "trivial"
+        or cfg.enable_eplb
+        or cfg.expert_distribution_recorder_mode is not None
+        or cfg.expert_balancedness_report_mode != "off"
+    ):
+        return
+    # Placeholder paths build no model; instance connectors have no HF config.
+    if (
+        cfg.model_path.lower() in ("none", "dummy")
+        or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
+    ):
+        return
+    hf_config = model_config_of(server_args).hf_config
+    arch = (hf_config.architectures or [None])[0]
+    if arch not in RING_DISPATCH_ARCHITECTURES:
+        if ring:
+            raise ValueError(
+                "--ep-dispatch-algorithm ring / --init-expert-location ring support "
+                f"only {sorted(RING_DISPATCH_ARCHITECTURES)}, got {arch}."
+            )
+        return
+    num_experts = hf_config.get_text_config().num_local_experts
+    if (
+        cfg.ep_dispatch_algorithm != "ring"
+        or cfg.init_expert_location != "ring"
+        or cfg.ep_num_redundant_experts != num_experts
+    ):
+        raise ValueError(
+            f"{arch} supports expert placement only as --ep-num-redundant-experts "
+            f"{num_experts} --init-expert-location ring --ep-dispatch-algorithm ring "
+            f"(got {cfg.ep_num_redundant_experts}, {cfg.init_expert_location}, "
+            f"{cfg.ep_dispatch_algorithm})."
+        )
+    if not get_platform().is_cuda:
+        raise ValueError("--ep-dispatch-algorithm ring is implemented for CUDA only.")
+    unsupported = [
+        flag
+        for flag, enabled in (
+            ("--enable-eplb", cfg.enable_eplb),
+            (
+                "--expert-distribution-recorder-mode",
+                cfg.expert_distribution_recorder_mode is not None,
+            ),
+            (
+                "--expert-balancedness-report-mode",
+                cfg.expert_balancedness_report_mode != "off",
+            ),
+            ("--elastic-ep-backend", cfg.elastic_ep_backend is not None),
+            ("--enable-elastic-expert-backup", cfg.enable_elastic_expert_backup),
+            ("--elastic-ep-join-mode", cfg.ep_join_mode is not None),
+            ("--weight-cache-mode", cfg.weight_cache_mode != "off"),
+            (
+                f"--load-format {cfg.load_format}",
+                cfg.load_format not in RING_LOAD_FORMATS,
+            ),
+            (
+                f"--model-impl {cfg.model_impl}",
+                str(cfg.model_impl).lower() not in ("auto", "sglang"),
+            ),
+            ("attention DP", attn_dp_enabled_of(cfg)),
+            (
+                f"--moe-a2a-backend {resolved_view(server_args).moe_a2a_backend}",
+                resolved_view(server_args).moe_a2a_backend
+                not in ("none", "flashinfer_nvlink_one_sided"),
+            ),
+            (
+                f"EP{cfg.ep_size} with TP{cfg.tp_size} (needs EP == TP > 1)",
+                cfg.ep_size < 2 or cfg.ep_size != cfg.tp_size,
+            ),
+        )
+        if enabled
+    ]
+    if unsupported:
+        raise ValueError(
+            f"--ep-dispatch-algorithm ring does not support {', '.join(unsupported)}."
+        )
 
 
 def handle_expert_distribution_metrics(server_args: Any):

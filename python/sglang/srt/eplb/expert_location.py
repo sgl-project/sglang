@@ -148,6 +148,28 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
+    def init_ring(model_config: ModelConfig, moe_ep_rank: int):
+        common = ExpertLocationMetadata._init_common(model_config)
+        if common is None:
+            return None
+        num_layers = common["model_config_for_expert_location"].num_layers
+        num_logical = common["model_config_for_expert_location"].num_logical_experts
+        if common["num_physical_experts"] != 2 * num_logical:
+            raise ValueError(
+                "--init-expert-location ring needs --ep-num-redundant-experts "
+                f"{num_logical} (one buddy copy per routed expert)."
+            )
+        return ExpertLocationMetadata.init_by_mapping(
+            model_config,
+            physical_to_logical_map=compute_ring_physical_to_logical_map(
+                num_layers=num_layers,
+                num_logical_experts=num_logical,
+                ep_size=common["ep_size"],
+            ),
+            moe_ep_rank=moe_ep_rank,
+        )
+
+    @staticmethod
     def init_by_mapping(
         model_config: ModelConfig,
         physical_to_logical_map,
@@ -536,6 +558,48 @@ def set_global_expert_location_metadata(value, allow_overwrite=False):
     resources.expert_location_metadata = value
 
 
+# Models whose router implements the ring pick; they accept no other placement or dispatch.
+RING_DISPATCH_ARCHITECTURES = frozenset({"MuseSparkForConditionalGeneration"})
+# Loaders that fill the buddy slots through load_weights (dummy: functional checks only).
+RING_LOAD_FORMATS = frozenset({"auto", "pt", "safetensors", "dummy"})
+
+
+def compute_ring_physical_to_logical_map(
+    num_layers: int, num_logical_experts: int, ep_size: int
+) -> torch.Tensor:
+    if ep_size < 2 or num_logical_experts % ep_size:
+        raise ValueError(
+            f"Ring placement needs an EP size > 1 dividing {num_logical_experts} "
+            f"experts, got {ep_size}."
+        )
+    home = num_logical_experts // ep_size
+    row = []
+    for rank in range(ep_size):
+        buddy = (rank + 1) % ep_size
+        row += range(rank * home, (rank + 1) * home)
+        row += range(buddy * home, (buddy + 1) * home)
+    # CPU explicitly: model construction runs under a CUDA default-device context.
+    return torch.tensor(row, dtype=torch.int64, device="cpu").repeat(num_layers, 1)
+
+
+def is_ring_placement(
+    metadata: Optional[ExpertLocationMetadata],
+    *,
+    num_layers: int,
+    num_logical_experts: int,
+    ep_size: int,
+) -> bool:
+    if metadata is None or metadata.ep_size != ep_size:
+        return False
+    actual = metadata.physical_to_logical_map_cpu
+    expected = compute_ring_physical_to_logical_map(
+        num_layers=num_layers,
+        num_logical_experts=num_logical_experts,
+        ep_size=ep_size,
+    )
+    return actual.shape == expected.shape and torch.equal(actual.long(), expected)
+
+
 def append_trivial_expert_slots(
     physical_to_logical_map: torch.Tensor,
     count: int,
@@ -853,6 +917,8 @@ def compute_initial_expert_location_metadata(
     data = get_exec().moe.init_expert_location
     if data == "trivial":
         return ExpertLocationMetadata.init_trivial(model_config, moe_ep_rank)
+    if data == "ring":
+        return ExpertLocationMetadata.init_ring(model_config, moe_ep_rank)
 
     # TODO unify with the utils function
     if data.endswith(".pt"):

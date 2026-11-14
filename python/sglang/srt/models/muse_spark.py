@@ -69,6 +69,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.muse_spark import muse_eplb_ring
 from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import MuseSpark1xBf16Experts
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
 from sglang.srt.layers.muse_spark.muse_spark_layers import (
@@ -94,7 +95,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import is_cpu, is_hip, use_intel_amx_backend
 from sglang.srt.utils.device import get_device_capability, is_cuda
@@ -575,6 +576,22 @@ class MuseSpark1xMoE(nn.Module):
         )
         self.nvfp4_checkpoint = nvfp4_checkpoint
         self.use_megamoe = getattr(parallel, "enable_megamoe_for_layernorm_sp", False)
+        self.eplb_ring = muse_eplb_ring.resolve_layout(
+            num_layers=config.num_hidden_layers,
+            num_experts=self.num_experts,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+        )
+        if self.eplb_ring is not None:
+            # Online updates would not refresh the buddy copies.
+            self._derived_weight_cache_error = (
+                "Online weight updates do not support --ep-dispatch-algorithm ring."
+            )
+            self.register_buffer(
+                "_eplb_ring_scratch",
+                torch.zeros(2 * self.num_experts, dtype=torch.int32),
+                persistent=False,
+            )
         if int4_checkpoint:
             from sglang.srt.layers.muse_spark.muse_spark_int4_moe import (
                 MuseSpark1xInt4Experts,
@@ -600,6 +617,7 @@ class MuseSpark1xMoE(nn.Module):
                 intermediate_size=self.intermediate_size,
                 top_k=self.top_k,
                 quant_config=quant_config,
+                eplb_ring=self.eplb_ring,
             )
         else:
             self.experts = MuseSpark1xBf16Experts(
@@ -609,6 +627,7 @@ class MuseSpark1xMoE(nn.Module):
                 expert_hidden_size=self.expert_hidden_size,
                 intermediate_size=self.intermediate_size,
                 top_k=self.top_k,
+                eplb_ring=self.eplb_ring,
             )
         self.experts.post_expert_norm = post_expert_norm
         self.experts.use_megamoe = self.use_megamoe
@@ -843,9 +862,19 @@ class MuseSpark1xMoE(nn.Module):
                 if use_split2
                 else self.gate(router_input)
             )
-            topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
-                None, router_logits, self.top_k, True, want_packed=True
-            )
+            if self.eplb_ring is not None and not sp_active:
+                # Physical packed ids; topk_ids stay logical for the capturer.
+                topk_scores, topk_ids, packed_topk_ids = muse_eplb_ring.route_and_pick(
+                    self._routing_op(),
+                    router_logits,
+                    self.top_k,
+                    self.eplb_ring,
+                    self._eplb_ring_scratch,
+                )
+            else:
+                topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
+                    None, router_logits, self.top_k, True, want_packed=True
+                )
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
@@ -1289,6 +1318,37 @@ class MuseSparkTextForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.nvfp4_checkpoint = quant_name == "modelopt_fp4"
         self.int4_checkpoint = int4_checkpoint
+        self.eplb_ring = muse_eplb_ring.resolve_layout(
+            num_layers=config.num_hidden_layers,
+            num_experts=config.num_local_experts,
+            ep_size=get_parallel().moe_ep_size,
+            ep_rank=get_parallel().moe_ep_rank,
+        )
+        if self.eplb_ring is not None and not self.nvfp4_checkpoint:
+            raise ValueError(
+                "--ep-dispatch-algorithm ring needs the ModelOpt NVFP4 checkpoint."
+            )
+        if self.eplb_ring is not None:
+            layers_prefix = add_prefix("language_model", add_prefix("model", prefix))
+            moe_layers = [
+                i
+                for i in range(config.num_hidden_layers)
+                if MuseSpark1xDecoderLayer._is_moe_layer(config, i)
+            ]
+            num_nvfp4 = sum(
+                _uses_nvfp4_experts(
+                    quant_config, add_prefix(f"layers.{i}", layers_prefix)
+                )
+                for i in moe_layers
+            )
+            muse_eplb_ring.log_expected_replica_bytes(
+                self.eplb_ring,
+                num_nvfp4_layers=num_nvfp4,
+                num_bf16_layers=len(moe_layers) - num_nvfp4,
+                hidden_size=config.moe_hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                group_size=quant_config.group_size,
+            )
         self.model = MuseSparkModel(config, quant_config, add_prefix("model", prefix))
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -1303,6 +1363,7 @@ class MuseSparkTextForCausalLM(nn.Module):
             config, logit_scale=config.output_multiplier
         )
         self.capture_aux_hidden_states = False
+        self._eplb_ring_checked = False
 
     def forward(
         self,
@@ -1370,6 +1431,19 @@ class MuseSparkTextForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.language_model.layers_to_capture = list(layer_ids)
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        # Muse builds expert placement metadata only for ring dispatch.
+        if get_exec().moe.ep_dispatch_algorithm != "ring":
+            return None
+        from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+        text_config = config.get_text_config()
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_local_experts,
+        )
+
     def get_input_embeddings(self):
         return self.model.language_model.embed_tokens
 
@@ -1384,6 +1458,12 @@ class MuseSparkTextForCausalLM(nn.Module):
     def _copy_expert_stack(
         self, param: torch.Tensor, loaded_weight: torch.Tensor, name: str
     ) -> None:
+        if (
+            self.eplb_ring is not None
+            and loaded_weight.shape[0] == self.config.num_local_experts
+        ):
+            muse_eplb_ring.copy_ring_slots(param, loaded_weight, self.eplb_ring)
+            return
         if param.shape == loaded_weight.shape:
             param.data.copy_(loaded_weight)
             return
@@ -1652,6 +1732,15 @@ class MuseSparkTextForCausalLM(nn.Module):
                 and not self.int4_checkpoint
             ):
                 module.experts.prepare_trtllm_weights(module.experts.post_expert_norm)
+        if self.eplb_ring is not None and not self._eplb_ring_checked:
+            moes = [
+                layer.mlp
+                for layer in self.model.language_model.layers
+                if layer.is_moe_layer
+            ]
+            muse_eplb_ring.log_replica_bytes(moes)
+            muse_eplb_ring.startup_self_check(moes[0], get_parallel().tp_group)
+            self._eplb_ring_checked = True
 
 
 # Preserve the CUDA implementation and its FlashInfer/JIT optimizations.
