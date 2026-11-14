@@ -82,11 +82,13 @@ mkdir -p sgl-kernel-npu
     cd sgl-kernel-npu
     wget "${GITHUB_PROXY_URL}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py312-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip"
     unzip ./*.zip
+
+    ${UV_PIP_INSTALL} --no-deps ./sgl_kernel_npu*.whl
     ${UV_PIP_INSTALL} \
-        ./sgl_kernel_npu*.whl \
         ./deep_ep*.whl \
         ./attentions*.whl \
         ./torch_memory_saver*.whl
+
     cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')"
     ln -sf deep_ep/deep_ep_cpp*.so
 )
