@@ -30,7 +30,8 @@ pub(super) async fn respond(
                 .and_then(generate_result)
                 .ok()
                 .and_then(Result::err)
-                .map(Responder::rejected)
+                .zip(responder.as_ref())
+                .map(|(error, responder)| responder.rejected(error))
         } else {
             unary_reply(responder.take().expect("OpenAI responder"), &bytes)
         };
@@ -105,7 +106,7 @@ fn unary_reply(responder: Responder, bytes: &[u8]) -> Option<Reply> {
     if items.iter().any(|item| {
         item.get("error").is_none() && item.get("text").and_then(Value::as_str).is_none()
     }) {
-        return Some(Responder::malformed_output("text"));
+        return Some(responder.malformed_output("text"));
     }
     let output = items
         .into_iter()

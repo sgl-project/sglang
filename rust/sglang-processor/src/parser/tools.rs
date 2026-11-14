@@ -261,7 +261,11 @@ where
                     });
                     choice.delta.tool_calls = Some(calls.collect());
                 }
-                if choice.finish_reason == Some(FinishReason::Stop) && called.contains(&choice.index) {
+                // A call the stream left open does not finish as `tool_calls`.
+                if choice.finish_reason == Some(FinishReason::Stop)
+                    && called.contains(&choice.index)
+                    && !detector.has_incomplete_call()
+                {
                     choice.finish_reason = Some(FinishReason::ToolCalls);
                 }
             }

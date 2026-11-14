@@ -206,7 +206,7 @@ fn check_case(
             let reply = match case["request"]["stream"] == true || status != 200 {
                 true => generate_result(engine["body"].clone())
                     .err()
-                    .map(Responder::rejected),
+                    .map(|error| responder.rejected(error)),
                 false => {
                     let output = match engine["body"].clone() {
                         Value::Array(items) => items,
@@ -316,15 +316,17 @@ fn event_json(event: &str) -> Value {
     serde_json::from_str(data).unwrap_or_else(|_| json!(data))
 }
 
-/// `created` is the wall clock at response time, and tool call ids are random.
+/// `created` is the wall clock at response time, as are the leading 8 hex
+/// digits of a Kimi-K3 response id; tool call ids are random.
 fn without_created(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.into_iter()
-                .map(|(k, v)| match k.as_str() {
-                    "created" => (k, json!(0)),
-                    "id" if v.as_str().is_some_and(|id| id.starts_with("call_")) => {
-                        (k, json!("call_"))
+                .map(|(k, v)| match (k.as_str(), v.as_str()) {
+                    ("created", _) => (k, json!(0)),
+                    ("id", Some(id)) if id.starts_with("call_") => (k, json!("call_")),
+                    ("id", Some(id)) if id.starts_with("chatcmpl-") && id.len() == 33 => {
+                        (k, json!(format!("chatcmpl-00000000{}", &id[17..])))
                     }
                     _ => (k, without_created(v)),
                 })

@@ -217,6 +217,8 @@ def lower(case, settings, model):
         model_path=model.path,
         model_config=SimpleNamespace(
             hf_config=model.hf_config,
+            # `_top_logprobs_error` bounds `top_logprobs` by it.
+            vocab_size=model.text_config.vocab_size,
             is_multimodal=False,
             get_default_sampling_params=lambda: model.sampling_defaults,
         ),
@@ -267,18 +269,31 @@ def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
     return recorded
 
 
+def volatile_id(value, previous):
+    """Whether two ids differ only by chance: `call_` ids are random, and a
+    Kimi-K3 `chatcmpl-` id leads with 8 hex digits of the response time."""
+    value, previous = str(value), str(previous)
+    if value.startswith("call_"):
+        return previous.startswith("call_")
+    return (
+        value.startswith("chatcmpl-")
+        and len(value) == len(previous) == 33
+        and previous.startswith("chatcmpl-")
+        and value[17:] == previous[17:]
+    )
+
+
 def keep_volatile(new, old):
-    """`new`, with the `created` times and `call_` ids of `old`, its previous
-    recording, where they line up, so a rerun changes only what Python changed.
+    """`new`, with the `created` times and `call_` and Kimi-K3 response ids of
+    `old`, its previous recording, where they line up, so a rerun changes only
+    what Python changed.
     """
     if isinstance(new, dict) and isinstance(old, dict):
         kept = {}
         for key, value in new.items():
             previous = old.get(key)
             volatile = key == "created" or (
-                key == "id"
-                and str(value).startswith("call_")
-                and str(previous).startswith("call_")
+                key == "id" and volatile_id(value, previous)
             )
             kept[key] = (
                 previous if volatile and key in old else keep_volatile(value, previous)

@@ -243,6 +243,7 @@ lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<
 responder.unary(items) / responder.stream_data(item) -> OpenAI JSON or SSE events
 // item is Result<GenerateResponse, GenerateStreamError>; unary accepts a Vec of items
 responder.stream_end() // after the transport receives [DONE]
+responder.rejected(error) / responder.malformed_output(field) -> Reply // in the response's shape
 ```
 
 SGLang-only: Python's OpenAI layer (`entrypoints/openai/`) over the engine's
@@ -256,6 +257,14 @@ exactly is `Unsupported`, and the host sends it to the engine's own route.
 `/generate` output of a live engine, or on hand-written (`synthetic`) output.
 Chat splits reasoning with `think/`, and serves only the parser names
 `think/models/` ports.
+
+A `kimi_k3` chat encoding answers chat in Kimi-K3's shape (`openai/kimi_k3_wire.rs`,
+after `kimi_k3_wire.py`): `chatcmpl-` ids, deltas without null fields, a
+`reasoning_content: ""` frame where reasoning ends, tool calls opened with
+empty arguments, each choice's usage on its end frame, both usage details,
+`server_interrupted` for an abort, a stream that fails mid-response ending its
+choices, and errors under an `error` key. Its usage headers are not sent, and
+a stream asking for `internal_content` is `Unsupported`.
 
 ```rust
 chat_model.deepseek_output(reasoning_parser, tool_call_parser)? // Option<&DeepSeekOutput>

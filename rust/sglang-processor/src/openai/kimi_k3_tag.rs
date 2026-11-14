@@ -1,6 +1,6 @@
-//! Kimi-K3's `tool_choice: "auto"` structural tag
-//! (`get_kimik3_auto_tool_call_structural_tag` in
-//! `function_call/kimik3_structural_tag.py`), dumped as xgrammar's
+//! Kimi-K3's `tool_choice: "auto"` and `"none"` structural tags
+//! (`get_kimik3_auto_tool_call_structural_tag` and `get_kimik3_structural_tag`
+//! in `function_call/kimik3_structural_tag.py`), dumped as xgrammar's
 //! `StructuralTag.model_dump(by_alias=True)`.
 
 use serde_json::{Map, Value, json};
@@ -8,9 +8,11 @@ use serde_json::{Map, Value, json};
 use super::Unsupported;
 
 use crate::kimi_k3_format::{
-    CALL_CLOSE, CALL_OPEN, THINK_CLOSE, THINK_OPEN, TOOLS_CLOSE, TOOLS_OPEN,
+    CALL_CLOSE, CALL_OPEN, MESSAGE_CLOSE, RESPONSE_CLOSE, RESPONSE_OPEN, THINK_CLOSE, THINK_OPEN,
+    TOOLS_CLOSE, TOOLS_OPEN,
 };
 
+const OPEN_TOKEN: &str = "<|open|>";
 const CLOSE_TOKEN: &str = "<|close|>";
 
 const JSON_TYPES: [&str; 7] = [
@@ -62,7 +64,7 @@ pub(super) fn auto_tool_call_tag(
         .into_iter()
         .filter(|token| !strip.contains(token))
         .collect();
-    let format = json!({
+    let triggered = json!({
         "type": "triggered_tags",
         "triggers": [TOOLS_OPEN],
         "tags": [tools_tag],
@@ -70,7 +72,37 @@ pub(super) fn auto_tool_call_tag(
         "stop_after_first": !parallel_tool_calls,
         "excludes": excludes,
     });
+    // A grammar that stops after the one call must still admit the message close.
+    let format = match parallel_tool_calls {
+        true => triggered,
+        false => sequence(vec![triggered, optional_message_close()]),
+    };
     Ok(Some(json!({"type": "structural_tag", "format": format})))
+}
+
+/// The `tool_choice: "none"` tag: the K3 prompt still lists the tools, so the
+/// output is held to a non-empty response, with no tools section for raw call
+/// markup to reach the content through.
+pub(super) fn no_tool_call_tag() -> Value {
+    // `_NONEMPTY_RESPONSE`: response text admits no control token, and a model
+    // that wanted a tool could otherwise close an empty response.
+    let text = sequence(vec![
+        json!({"type": "regex", "pattern": r"[^ \t\r\n<]|<[^|<]"}),
+        any_text(&[OPEN_TOKEN, CLOSE_TOKEN]),
+    ]);
+    // `_response`: without thinking the prompt already opens the response channel.
+    let response = json!({"type": "or", "elements": [
+        {"type": "tag", "begin": RESPONSE_OPEN, "content": text, "end": RESPONSE_CLOSE},
+        {"type": "tag", "begin": "", "content": text, "end": RESPONSE_CLOSE},
+    ]});
+    let format = sequence(vec![response, optional_message_close()]);
+    json!({"type": "structural_tag", "format": format})
+}
+
+/// `_OPTIONAL_MESSAGE_CLOSE`: K3 emits the message close before EOS, and EOS is
+/// masked until the grammar completes.
+fn optional_message_close() -> Value {
+    json!({"type": "optional", "content": {"type": "const_string", "value": MESSAGE_CLOSE}})
 }
 
 fn escape_attr(value: &str) -> String {

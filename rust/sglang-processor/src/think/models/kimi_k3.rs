@@ -47,6 +47,12 @@ impl KimiK3Detector {
         }
     }
 
+    /// `in_reasoning`.
+    #[cfg(feature = "openai")]
+    pub(crate) fn in_reasoning(&self) -> bool {
+        self.in_reasoning
+    }
+
     /// `detect_and_parse`.
     pub(crate) fn parse(&mut self, text: &str) -> (String, String) {
         let in_reasoning = self.in_reasoning || text.contains(THINK_OPEN);

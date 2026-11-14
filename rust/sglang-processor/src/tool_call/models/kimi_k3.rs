@@ -5,6 +5,15 @@
 //! argument values go through `json.loads` and `json.dumps` as in Python
 //! (`python_json_reencode`), except lone surrogates. `_ATTR_RE`'s `\w` is the
 //! regex crate's, which differs from Python's only outside ASCII.
+//!
+//! Streaming converts the XTML to JSON as it arrives (`_stream_calls`): a call's
+//! name and `{` once its header is complete, a string value as it streams, a
+//! typed value once its close arrives. A call still open is incomplete, which
+//! keeps a stop from finishing as `tool_calls`. A typed value `json.loads`
+//! fails on with an error other than `JSONDecodeError` (an integer past 4300
+//! digits, nesting past its recursion limit) is kept as text here, where
+//! Python's stream starts its parse over and its one-shot parse drops every
+//! call.
 
 use std::sync::LazyLock;
 
@@ -31,8 +40,20 @@ pub(super) struct KimiK3Detector {
     buffer: String,
     /// `_sent_normal_idx`, a byte offset into `buffer`.
     sent_normal_idx: usize,
-    /// `current_tool_id + 1`: calls already streamed.
-    streamed_calls: usize,
+    /// `_tool_pos`, a byte offset into `buffer`: where streaming resumes in the
+    /// tools channel, once one opened.
+    tool_pos: Option<usize>,
+    /// `current_tool_id + 1`: calls opened so far.
+    opened_calls: usize,
+    /// `_in_call`: the last call opened has not closed, so it is in
+    /// `incomplete_tool_call_indices`.
+    in_call: bool,
+    /// `_argument_type` of the argument whose value is streaming.
+    argument_type: Option<String>,
+    /// `_argument_value`: a typed value, held until its close.
+    argument_value: String,
+    /// `_argument_count` of the open call.
+    argument_count: usize,
 }
 
 impl KimiK3Detector {
@@ -53,24 +74,128 @@ impl KimiK3Detector {
         (before, calls.collect())
     }
 
-    /// `parse_streaming_increment`: the section is not cut at `TOOLS_CLOSE`.
+    /// `parse_streaming_increment`.
     fn parse_streaming_increment(&mut self, text: &str) -> Parsed {
         self.buffer.push_str(text);
         let Some(open_idx) = self.buffer.find(TOOLS_OPEN) else {
             return (self.emit_normal_text(None), Vec::new());
         };
         let normal = self.emit_normal_text(Some(open_idx));
-        let parsed = parse_calls(&self.buffer[open_idx + TOOLS_OPEN.len()..]);
+        self.tool_pos.get_or_insert(open_idx + TOOLS_OPEN.len());
+        (normal, self.stream_calls())
+    }
+
+    /// `_stream_calls`: the calls' JSON from `tool_pos` on, as far as it can be
+    /// written yet.
+    fn stream_calls(&mut self) -> Vec<ToolCallItem> {
         let mut calls = Vec::new();
-        for (name, parameters) in parsed.into_iter().skip(self.streamed_calls) {
-            calls.push(ToolCallItem {
-                tool_index: self.streamed_calls as i64,
-                name,
-                parameters,
-            });
-            self.streamed_calls += 1;
+        let mut pos = self.tool_pos.expect("tools channel open");
+        while pos < self.buffer.len() {
+            let tool_index = self.opened_calls as i64 - 1;
+            // `emit` of an argument fragment of the open call.
+            let mut emit = |fragment: String| {
+                if !fragment.is_empty() {
+                    calls.push(ToolCallItem {
+                        tool_index,
+                        name: String::new(),
+                        parameters: fragment,
+                    });
+                }
+            };
+            let remaining = &self.buffer[pos..];
+            if let Some(kind) = &self.argument_type {
+                let end = remaining.find(ARGUMENT_CLOSE);
+                let count = end.unwrap_or_else(|| {
+                    remaining.len() - partial_suffix_len(remaining, &[ARGUMENT_CLOSE])
+                });
+                let value = &remaining[..count];
+                pos += count;
+                if kind == "string" {
+                    let quoted = python_json(&Value::String(value.to_owned()), false);
+                    emit(quoted[1..quoted.len() - 1].to_owned());
+                } else {
+                    self.argument_value.push_str(value);
+                }
+                if end.is_none() {
+                    break;
+                }
+                if kind == "string" {
+                    emit("\"".to_owned());
+                } else {
+                    let raw = std::mem::take(&mut self.argument_value);
+                    let value = python_json_reencode(&raw)
+                        .unwrap_or_else(|| python_json(&Value::String(raw), false));
+                    emit(value);
+                }
+                pos += ARGUMENT_CLOSE.len();
+                self.argument_type = None;
+                continue;
+            }
+
+            // Whitespace between XTML elements is not part of any argument.
+            let stripped = remaining.trim_start_matches(py_space);
+            pos += remaining.len() - stripped.len();
+            let remaining = stripped;
+            if self.in_call && remaining.starts_with(CALL_CLOSE) {
+                emit("}".to_owned());
+                self.in_call = false;
+                pos += CALL_CLOSE.len();
+                continue;
+            }
+
+            let (opener, stops): (&str, &[&str]) = match self.in_call {
+                true => (ARGUMENT_OPEN, &[CALL_CLOSE, TOOLS_CLOSE]),
+                false => (CALL_OPEN, &[TOOLS_CLOSE]),
+            };
+            let Some((attrs, header_len)) = header(remaining, opener) else {
+                // Skip what cannot start the next element, as the one-shot
+                // parse does; wait on an incomplete header or the tools close.
+                match skippable_len(remaining, opener, stops) {
+                    0 => break,
+                    skip => {
+                        pos += skip;
+                        continue;
+                    }
+                }
+            };
+            if !self.in_call {
+                let name = attr(attrs, "tool").unwrap_or_default();
+                if name.is_empty() {
+                    // Skip the whole call, as the one-shot parse does.
+                    let Some(end) = remaining[header_len..].find(CALL_CLOSE) else {
+                        break;
+                    };
+                    pos += header_len + end + CALL_CLOSE.len();
+                    continue;
+                }
+                self.opened_calls += 1;
+                self.argument_count = 0;
+                self.in_call = true;
+                calls.push(ToolCallItem {
+                    tool_index: self.opened_calls as i64 - 1,
+                    name,
+                    parameters: "{".to_owned(),
+                });
+            } else {
+                let key = attr(attrs, "key").unwrap_or_default();
+                let kind = attr(attrs, "type").unwrap_or_else(|| "string".to_owned());
+                let mut prefix = match self.argument_count {
+                    0 => String::new(),
+                    _ => ", ".to_owned(),
+                };
+                prefix.push_str(&python_json(&Value::String(key), false));
+                prefix.push_str(": ");
+                if kind == "string" {
+                    prefix.push('"');
+                }
+                emit(prefix);
+                self.argument_type = Some(kind);
+                self.argument_count += 1;
+            }
+            pos += header_len;
         }
-        (normal, calls)
+        self.tool_pos = Some(pos);
+        calls
     }
 
     /// `finish`: an open tools channel drops what is left; otherwise the held-back
@@ -125,6 +250,54 @@ impl ToolDetector for KimiK3Detector {
             calls.extend(end_calls);
         }
         (normal, calls)
+    }
+
+    fn has_incomplete_call(&self) -> bool {
+        self.in_call
+    }
+}
+
+/// The header `re.match` finds at the start of `text`: `opener`, whitespace,
+/// then attributes up to the first `<|sep|>`. Returns the attributes and the
+/// header's length.
+fn header<'a>(text: &'a str, opener: &str) -> Option<(&'a str, usize)> {
+    let rest = text.strip_prefix(opener)?;
+    let attrs = rest.trim_start_matches(py_space);
+    if attrs.len() == rest.len() {
+        // `\s+` needs one space.
+        return None;
+    }
+    let sep = attrs.find(SEP)?;
+    let start = text.len() - attrs.len();
+    Some((&attrs[..sep], start + sep + SEP.len()))
+}
+
+/// `_skippable_len`: how much of `text` to skip before the next element can
+/// start, an `opener` header or one of `stops`, as the one-shot `finditer`
+/// skips stray text and a header without whitespace after its tag. 0 when
+/// `text` starts with a stop or may still grow into an element.
+fn skippable_len(text: &str, opener: &str, stops: &[&str]) -> usize {
+    let markers: Vec<&str> = std::iter::once(opener)
+        .chain(stops.iter().copied())
+        .collect();
+    if stops.iter().any(|stop| text.starts_with(stop))
+        || markers.iter().any(|marker| marker.starts_with(text))
+        || text
+            .strip_prefix(opener)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(py_space)
+    {
+        return 0;
+    }
+    let first = text.chars().next().map_or(0, char::len_utf8);
+    match markers
+        .iter()
+        .filter_map(|marker| text[first..].find(marker))
+        .min()
+    {
+        Some(start) => first + start,
+        // Keep a marker the next chunk may complete.
+        None => text.len() - partial_suffix_len(text, &markers),
     }
 }
 
