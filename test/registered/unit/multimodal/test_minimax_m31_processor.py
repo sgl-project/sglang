@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentVideoURL,
 )
 from sglang.srt.models.minimax_vl_common import _stack_pixel_values
+from sglang.srt.multimodal.cache import MultimodalPreprocessCache
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -127,6 +128,8 @@ class _ProcessorCase(CustomTestCase):
         processor.IM_START_TOKEN_ID = 12
         processor.IM_END_TOKEN_ID = 13
         processor.mm_tokens = None
+        # The image artifact cache is opt-in; these tests cover the uncached path.
+        processor.mm_preprocess_cache = MultimodalPreprocessCache(0)
         processor.image_config = {}
         processor.video_config = {}
         processor.video_fps = 1.0
