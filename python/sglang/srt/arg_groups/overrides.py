@@ -616,6 +616,77 @@ def _check_dsa_backend_constraints(
         raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
 
 
+def _check_dsa_kpool_backend_support(
+    hf_config: Any,
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    device_capability: tuple[int, int],
+    disaggregation_mode: str,
+) -> None:
+    """Reject DSA backends that cannot serve an index_kpool > 1 model.
+
+    Without this check the server loads the weights and then fails in CUDA
+    graph capture with NotImplementedError from _check_kpool_tail_backend.
+    """
+    from sglang.srt.configs.model_config import get_dsa_index_kpool
+    from sglang.srt.layers.attention.dsa.kpool_backend import (
+        kpool_tail_backends,
+        resolve_kpool_tail_backend,
+    )
+
+    index_kpool = get_dsa_index_kpool(hf_config)
+    if index_kpool <= 1:
+        return
+    sm = f"SM{device_capability[0]}{device_capability[1]}"
+    if device_capability < (9, 0):
+        raise ValueError(
+            f"{hf_config.architectures[0]} sets index_kpool={index_kpool}, but the "
+            f"CUDA pooled indexer requires SM90 or newer. This device is {sm}."
+        )
+    # A PD node serves only its own role, and calculate_mla_kv_cache_dim reads only
+    # that role. A literal trtllm there keeps FP8 rows raw. FlashInfer autotune on a
+    # prefill node also runs a decode dummy, so an unsupported decode backend still
+    # fails after load in _check_kpool_tail_backend.
+    roles = {"prefill": prefill_backend, "decode": decode_backend}
+    if disaggregation_mode in roles:
+        roles = {disaggregation_mode: roles[disaggregation_mode]}
+    bf16_kv = kv_cache_dtype == "bfloat16"
+    supported = []
+    unsupported = []
+    for phase, backend in roles.items():
+        backends = kpool_tail_backends(
+            phase, bf16_kv=bf16_kv, device_capability=device_capability
+        )
+        other_phase = "decode" if phase == "prefill" else "prefill"
+        sparse_target = resolve_kpool_tail_backend(
+            "flashmla_sparse",
+            device_capability,
+            packed_fp8=not bf16_kv and roles.get(other_phase) != "trtllm",
+        )
+        if sparse_target in backends:
+            backends += ("flashmla_sparse",)
+            if phase == "prefill":
+                backends += ("flashmla_auto",)
+        if backend not in backends:
+            unsupported.append(f"{phase}={backend}")
+            supported.append(f"Supported {phase} backends: {', '.join(backends)}.")
+    if not unsupported:
+        return
+    if not bf16_kv:
+        supported.append(
+            "For FP8 KV with tilelang, set both DSA backends to tilelang and use --dcp-size 1."
+        )
+    raise ValueError(
+        f"{hf_config.architectures[0]} sets index_kpool={index_kpool}, and the "
+        f"{', '.join(unsupported)} DSA backend does not support index_kpool > 1 "
+        f"(kv_cache_dtype={kv_cache_dtype}, prefill={prefill_backend}, "
+        f"decode={decode_backend}, {sm}). "
+        f"{' '.join(supported)}"
+    )
+
+
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
     prefill_backend: Optional[str],
@@ -662,7 +733,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     import torch
 
-    major, _ = torch.cuda.get_device_capability()
+    device_capability = torch.cuda.get_device_capability()
+    major = device_capability[0]
     if kimi_k31:
         return _kimi_k31_dsa_backends(view)
 
@@ -767,6 +839,15 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
     )
+    if get_platform().is_cuda:
+        _check_dsa_kpool_backend_support(
+            hf_config,
+            kv_cache_dtype,
+            prefill,
+            decode,
+            device_capability=device_capability,
+            disaggregation_mode=getattr(view, "disaggregation_mode", "null"),
+        )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
