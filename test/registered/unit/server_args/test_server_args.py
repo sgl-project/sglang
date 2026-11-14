@@ -5922,5 +5922,90 @@ class TestPagedExpertsNumResident(unittest.TestCase):
                 _paged_experts_num_resident(bad)
 
 
+def _handle_xpu_deepep(**server_arg_values):
+    """Run handle_a2a_moe for --moe-a2a-backend deepep as if on XPU; returns the view."""
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    server_args = ServerArgs(
+        model_path="dummy",
+        moe_a2a_backend="deepep",
+        **{"deepep_mode": "normal", "chunked_prefill_size": 1024, **server_arg_values},
+    )
+    server_args.cuda_graph_config = CudaGraphConfig()
+    with (
+        patch(
+            "sglang.srt.arg_groups.moe_hook.get_platform",
+            return_value=SimpleNamespace(is_xpu=True),
+        ),
+        patch(
+            "sglang.srt.hardware_backend.xpu.deepsymm.import_deepsymm_moe_ep",
+            return_value=SimpleNamespace(),
+        ),
+    ):
+        handle_a2a_moe(server_args)
+    return resolving_view(server_args)
+
+
+class TestXpuDeepEPOverlap(CustomTestCase):
+    """TBO/SBO are refused on XPU: deep_symm.moe_ep cannot overlap them with compute."""
+
+    def test_two_batch_and_single_batch_overlap_are_refused(self):
+        for flag in ("enable_two_batch_overlap", "enable_single_batch_overlap"):
+            with self.subTest(flag=flag):
+                with self.assertRaisesRegex(ValueError, "does not overlap"):
+                    _handle_xpu_deepep(**{flag: True})
+
+
+class TestXpuDeepEPLowLatencyCapacity(CustomTestCase):
+    """XPU low-latency dispatch must stay within its per-rank token capacity.
+
+    deep_symm.moe_ep does not bound-check it, so an overflow on some ranks at
+    runtime would leave the others waiting; the launch must refuse it instead.
+    """
+
+    def setUp(self):
+        self.enterContext(
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128)
+        )
+
+    def test_auto_mode_does_not_bound_prefill_by_the_low_latency_capacity(self):
+        _handle_xpu_deepep(deepep_mode="auto", tp_size=4, chunked_prefill_size=8192)
+
+    def test_low_latency_prefill_above_capacity_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "--chunked-prefill-size"):
+            _handle_xpu_deepep(
+                deepep_mode="low_latency", tp_size=4, chunked_prefill_size=1024
+            )
+
+    def test_low_latency_prefill_bound_counts_tokens_per_dp_rank(self):
+        # With DP attention chunked_prefill_size is per DP rank, and here each DP
+        # rank is one TP rank, so all 512 tokens go to one rank.
+        with self.assertRaisesRegex(ValueError, "--chunked-prefill-size"):
+            _handle_xpu_deepep(
+                deepep_mode="low_latency",
+                tp_size=4,
+                attn_dp_size=4,
+                chunked_prefill_size=512,
+            )
+
+    def test_decode_requests_are_capped_to_the_capacity_when_unset(self):
+        for deepep_mode in ("auto", "low_latency"):
+            with self.subTest(deepep_mode=deepep_mode):
+                view = _handle_xpu_deepep(
+                    deepep_mode=deepep_mode, tp_size=4, chunked_prefill_size=512
+                )
+                self.assertEqual(view.max_running_requests, 128 * 4)
+
+    def test_decode_requests_above_capacity_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "--max-running-requests"):
+            _handle_xpu_deepep(deepep_mode="auto", tp_size=4, max_running_requests=1024)
+
+    def test_normal_mode_has_no_low_latency_bound(self):
+        view = _handle_xpu_deepep(
+            deepep_mode="normal", tp_size=4, chunked_prefill_size=8192
+        )
+        self.assertIsNone(view.max_running_requests)
+
+
 if __name__ == "__main__":
     unittest.main()
