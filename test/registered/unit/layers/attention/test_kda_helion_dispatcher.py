@@ -223,6 +223,73 @@ class TestHelionKDADispatcher(unittest.TestCase):
                     resolution_result(args, "linear_attn_verify_backend"), expected
                 )
 
+    def test_npu_non_arch35_gdn_mamba_ssm_dtype(self):
+        from sglang.srt.configs.qwen3_5 import Qwen3_5Config
+
+        config = SimpleNamespace(hf_config=Qwen3_5Config())
+
+        # Unset on Ascend 910B (non-arch35): auto-defaults to bfloat16
+        args = ServerArgs(model_path="dummy")
+        with (
+            patch(
+                "sglang.srt.arg_groups.attention_hook.model_config_of",
+                return_value=config,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                return_value=False,
+            ),
+            override_platform(is_npu=True, is_sm100=False, is_cuda=False),
+        ):
+            handle_linear_attn_backend(args)
+        self.assertEqual(resolution_result(args, "mamba_ssm_dtype"), "bfloat16")
+
+        # Explicit float32 on Ascend 910B (non-arch35): raises ValueError
+        bad_args = ServerArgs(model_path="dummy", mamba_ssm_dtype="float32")
+        with (
+            patch(
+                "sglang.srt.arg_groups.attention_hook.model_config_of",
+                return_value=config,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                return_value=False,
+            ),
+            override_platform(is_npu=True, is_sm100=False, is_cuda=False),
+        ):
+            with self.assertRaisesRegex(ValueError, "bfloat16"):
+                handle_linear_attn_backend(bad_args)
+
+        # Explicit bfloat16 on Ascend 910B (non-arch35): succeeds
+        ok_args = ServerArgs(model_path="dummy", mamba_ssm_dtype="bfloat16")
+        with (
+            patch(
+                "sglang.srt.arg_groups.attention_hook.model_config_of",
+                return_value=config,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                return_value=False,
+            ),
+            override_platform(is_npu=True, is_sm100=False, is_cuda=False),
+        ):
+            handle_linear_attn_backend(ok_args)
+
+        # Explicit float32 on Ascend 950 (arch35): succeeds
+        arch35_args = ServerArgs(model_path="dummy", mamba_ssm_dtype="float32")
+        with (
+            patch(
+                "sglang.srt.arg_groups.attention_hook.model_config_of",
+                return_value=config,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                return_value=True,
+            ),
+            override_platform(is_npu=True, is_sm100=False, is_cuda=False),
+        ):
+            handle_linear_attn_backend(arch35_args)
+
 
 if __name__ == "__main__":
     unittest.main()
