@@ -16,10 +16,20 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
+)
+from sglang.srt.layers.attention.qsa.dense_prefill import (
+    assert_prefill_selection_exhaustive,
+    dense_causal_prefill_reference,
+    exhaustive_prefill_budget,
+    gather_packed_sequence_kv,
+    is_prefill_selection_exhaustive,
+    total_visible_tokens,
+    visible_prefix_counts,
 )
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
 from sglang.srt.layers.attention.qsa.kernel import (
@@ -54,7 +64,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
-from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
+from sglang.srt.utils import get_bool_env_var, is_hip, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +86,40 @@ def _resolve_trtllm_sparse_decode():
     except ImportError:
         return None
     return trtllm_batch_decode_with_kv_cache
+
+
+@lru_cache(maxsize=1)
+def _resolve_dense_prefill_varlen_func():
+    """FA varlen for the dense prefill fast path, ``None`` when unavailable.
+
+    Deliberately narrower than ``_resolve_flash_attn_varlen_func``: that one
+    also hands back the QSA sparse-decode kernels for SM121 and ROCm, which
+    have only ever run at decode row counts over gathered selections, never
+    over dense full-length K/V in prefill. Those platforms keep the sparse
+    prefill path until someone validates them.
+    """
+
+    from sglang.srt.utils import is_sm121
+
+    if is_hip() or is_sm121():
+        return None
+    try:
+        from flash_attn import flash_attn_varlen_func
+
+        return flash_attn_varlen_func
+    except ImportError:
+        pass
+    try:
+        from flash_attn.cute.interface import flash_attn_varlen_func as cute_varlen_func
+    except ImportError:
+        return None
+
+    def flash_attn_varlen_func(*args, **kwargs):
+        output = cute_varlen_func(*args, **kwargs)
+        # The cute interface returns (out, lse); lse is None here.
+        return output[0] if isinstance(output, tuple) else output
+
+    return flash_attn_varlen_func
 
 
 @lru_cache(maxsize=1)
@@ -242,6 +286,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             if self.qsa_profile is not None
             else int(getattr(config, "indexer_compress_ratio", 4))
         )
+        # Requests no longer than this have a provably exhaustive block
+        # selection, so prefill can run dense causal attention instead.
+        self._dense_prefill_budget = (
+            0
+            if get_bool_env_var("SGLANG_QSA_DISABLE_DENSE_PREFILL")
+            else exhaustive_prefill_budget(self.qsa_profile)
+        )
+        self._assert_dense_prefill = get_bool_env_var("SGLANG_QSA_ASSERT_DENSE_PREFILL")
         req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
@@ -1458,6 +1510,149 @@ class QwenSparseAttnBackend(AttentionBackend):
             new_kv=(k, v, loc, width),
         )
 
+    def _try_dense_causal_prefill(self, *, q, k, v, layer, forward_batch, topk_indices):
+        """Dense causal attention when the indexer's block selection provably
+        covers every query's causal prefix, ``None`` to leave the batch to the
+        sparse path. Eligibility is decided from host metadata only."""
+
+        if not self._dense_prefill_budget:
+            return None
+        if q.is_cuda and q.dtype not in (torch.bfloat16, torch.float16):
+            return None
+        if is_batch_invariant_mode_enabled():
+            # The QSA kernels have batch-invariant variants; FA varlen does
+            # not, so deterministic mode keeps the sparse path.
+            return None
+        extend_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        sequence_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if extend_lens_cpu is None or sequence_lens_cpu is None:
+            return None
+        extend_lens = [int(x) for x in extend_lens_cpu]
+        sequence_lens = [int(x) for x in sequence_lens_cpu]
+        if not is_prefill_selection_exhaustive(
+            sequence_lens=sequence_lens,
+            extend_lens=extend_lens,
+            query_rows=q.shape[0],
+            budget=self._dense_prefill_budget,
+        ):
+            return None
+        if self._assert_dense_prefill:
+            assert_prefill_selection_exhaustive(
+                token_indices=topk_indices,
+                visible_counts=visible_prefix_counts(
+                    sequence_lens=sequence_lens,
+                    extend_lens=extend_lens,
+                    device=topk_indices.device,
+                ),
+            )
+        packed = self._dense_prefill_keys(
+            q=q,
+            k=k,
+            v=v,
+            layer=layer,
+            forward_batch=forward_batch,
+            extend_lens=extend_lens,
+            sequence_lens=sequence_lens,
+        )
+        if packed is None:
+            return None
+        keys, values, cu_seqlens_k = packed
+        cu_seqlens_q = F.pad(
+            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
+            (1, 0),
+        ).contiguous()
+        if q.is_cuda:
+            varlen_func = _resolve_dense_prefill_varlen_func()
+            if varlen_func is None:
+                return None
+            # Sound and sync-free: a row's entries cannot exceed its causal
+            # prefix, so the batch total is reached only when the selection
+            # covered every row. This holds the top-k contract the dense path
+            # relies on without reading anything back to the host.
+            torch._assert_async(
+                (topk_indices >= 0).sum()
+                == total_visible_tokens(
+                    sequence_lens=sequence_lens, extend_lens=extend_lens
+                )
+            )
+            return varlen_func(
+                q=q.contiguous(),
+                k=keys,
+                v=values,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max(extend_lens, default=1),
+                max_seqlen_k=max(sequence_lens, default=1),
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
+        return dense_causal_prefill_reference(
+            q=q,
+            k=keys,
+            v=values,
+            extend_lens=extend_lens,
+            sequence_lens=sequence_lens,
+            scale=layer.scaling,
+        )
+
+    def _dense_prefill_keys(
+        self, *, q, k, v, layer, forward_batch, extend_lens, sequence_lens
+    ):
+        """Every request's whole sequence packed back to back, with its varlen
+        cumulative lengths; ``None`` when the batch cannot be packed."""
+
+        pool = self.token_to_kv_pool
+        key_cache = pool.layer_router.read(layer.layer_id).key()
+        value_cache = pool.layer_router.read(layer.layer_id).value()
+        if key_cache.ndim != 3 or value_cache.shape != key_cache.shape:
+            # Paged and FIA pools expose rank-4 caches that need a layout
+            # adapter before a physical-slot gather is meaningful.
+            return None
+        kv_heads = key_cache.shape[1]
+        if sequence_lens == extend_lens:
+            # Single-chunk prefill: this layer's own K/V already is the sequence.
+            if k is None or v is None:
+                return None
+            rows = sum(extend_lens)
+            cu_seqlens_k = F.pad(
+                forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
+                (1, 0),
+            ).contiguous()
+            return (
+                k[:rows].reshape(rows, kv_heads, -1).contiguous(),
+                v[:rows].reshape(rows, kv_heads, -1).contiguous(),
+                cu_seqlens_k,
+            )
+
+        # Continuation chunks and prefix-cache hits: the committed cache holds
+        # the prefix, and this chunk's K/V was stored before attention ran.
+        cu_seqlens_k = F.pad(
+            torch.tensor(sequence_lens, dtype=torch.int32, device=q.device).cumsum(0),
+            (1, 0),
+        ).contiguous()
+        if q.is_cuda:
+            keys, values = pack_qsa_prefill_kv(
+                k=key_cache,
+                v=value_cache,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_indices=forward_batch.req_pool_indices,
+                cu_k=cu_seqlens_k,
+                total_k=sum(sequence_lens),
+                max_k=max(sequence_lens, default=1),
+                output_dtype=q.dtype,
+            )
+            return keys, values, cu_seqlens_k
+        metadata = self._resolve_metadata(forward_batch)
+        if metadata.token_slot_table.shape[1] < max(sequence_lens, default=0):
+            return None
+        keys, values = gather_packed_sequence_kv(
+            key_cache=key_cache,
+            value_cache=value_cache,
+            token_slot_table=metadata.token_slot_table,
+            sequence_lens=sequence_lens,
+        )
+        return keys, values, cu_seqlens_k
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1502,6 +1697,16 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q, layer, forward_batch, topk_indices
             )
             return self._pad_extend_output(output, num_output_rows)
+        dense_output = self._try_dense_causal_prefill(
+            q=q,
+            k=k,
+            v=v,
+            layer=layer,
+            forward_batch=forward_batch,
+            topk_indices=topk_indices,
+        )
+        if dense_output is not None:
+            return self._pad_extend_output(dense_output, num_output_rows)
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
