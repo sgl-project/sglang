@@ -16,11 +16,13 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_S2V_14B_Config
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     MAX_FRAME_INTERPOLATION_EXP,
     SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.wan import Wan2_2_S2V_14B_SamplingParam
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.configs.task_type import ModelTaskType as Task
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, utils, video_api
@@ -72,6 +74,13 @@ def test_legacy_enums_and_capabilities():
         assert config.get_supported_task_types() == (task,)
         assert config.resolve_task_type() == task
         assert config.resolve_task_type(task.name.lower()) == task
+
+
+def test_video_output_tasks_declare_video_gen():
+    """A task producing VIDEO must pass is_video_gen(), or visual adjustment is
+    skipped for it and served output keeps an extensionless file name."""
+    for task in Task:
+        assert task.is_video_gen() is (task.data_type() is DataType.VIDEO)
 
 
 @pytest.mark.parametrize("declared", [(), (Task.T2I,), (Task.T2V, Task.T2V)])
@@ -344,6 +353,84 @@ def test_video_transports_keep_selected_task(http_client, multipart):
     assert admitted[-1].task_type == Task.F2V
     assert admitted[-1].data_type == DataType.VIDEO
     assert config.task_type == Task.T2V
+
+
+@pytest.mark.parametrize(
+    "http_client",
+    [(Wan2_2_S2V_14B_Config, Wan2_2_S2V_14B_SamplingParam)],
+    indirect=True,
+)
+@pytest.mark.parametrize("multipart", [False, True])
+def test_wan_s2v_video_request_admits_audio_and_names_mp4(http_client, multipart):
+    """An S2V model declares no audio field, so the endpoint drops audio_path and
+    rejects every request; S2V outside is_video_gen() also loses the extension."""
+    client, admitted, _ = http_client
+    payload = {"prompt": "a woman sings", "size": "1024x704"}
+    if multipart:
+        # The form field is typed UploadFile, so the reference travels as bytes.
+        response = client.post(
+            "/v1/videos",
+            data={**payload, "audio_path": "/tmp/talk.wav"},
+            files={"input_reference": ("ref.png", png_bytes(), "image/png")},
+        )
+    else:
+        response = client.post(
+            "/v1/videos",
+            json={
+                **payload,
+                "input_reference": "/tmp/ref.png",
+                "audio_path": "/tmp/talk.wav",
+            },
+        )
+    assert response.status_code == 200, response.text
+    params = admitted[-1].sampling_params
+    assert params.task_type == Task.S2V
+    assert params.image_path is not None
+    assert params.audio_path == "/tmp/talk.wav"
+    assert params.output_file_name.endswith(".mp4")
+
+
+@pytest.mark.parametrize(
+    "http_client",
+    [(Wan2_2_S2V_14B_Config, Wan2_2_S2V_14B_SamplingParam)],
+    indirect=True,
+)
+@pytest.mark.parametrize("multipart", [False, True])
+def test_wan_s2v_rejects_cache_flags_it_would_ignore(
+    http_client, multipart, monkeypatch
+):
+    """The S2V DiT has no TeaCache/Spectrum hooks, so an accepted flag ran every step
+    uncached while the caller believed it was on; it must be refused at admission."""
+    client, admitted, _ = http_client
+    # The fixture's from_pretrained returns the base class; the registry resolves the
+    # S2V model to its own, whose __post_init__ holds the check.
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_pretrained",
+        classmethod(lambda cls, *a, **kw: Wan2_2_S2V_14B_SamplingParam()),
+    )
+    payload = {
+        "prompt": "a woman sings",
+        "size": "1024x704",
+        "audio_path": "/tmp/talk.wav",
+        "enable_teacache": "true" if multipart else True,
+    }
+    if multipart:
+        response = client.post(
+            "/v1/videos",
+            data=payload,
+            files={"input_reference": ("ref.png", png_bytes(), "image/png")},
+        )
+    else:
+        response = client.post(
+            "/v1/videos", json={**payload, "input_reference": "/tmp/ref.png"}
+        )
+    assert response.status_code == 400, response.text
+    assert "enable_teacache" in response.json()["detail"]
+    assert admitted == []
+    # Spectrum is not an HTTP field; it reaches the same check from the CLI/Python API.
+    with pytest.raises(ValueError, match="enable_spectrum"):
+        Wan2_2_S2V_14B_SamplingParam(enable_spectrum=True)
 
 
 def test_http_rejects_invalid_tasks_before_model_execution(http_client):
