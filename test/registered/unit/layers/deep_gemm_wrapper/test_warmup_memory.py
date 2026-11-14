@@ -11,11 +11,15 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.hardware_backend.sail.deep_gemm.kernel_types import (
+    SailDeepGemmKernelType,
+)
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
     DeepGemmKernelType,
     _BaseWarmupExecutor,
 )
+from sglang.srt.utils import is_sail
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -90,12 +94,24 @@ def _scale_workspace_on_meta(executor, architecture):
 
 class TestWarmupMemory(CustomTestCase):
     def test_budget_covers_executor_buffers(self):
+        kernel_types = list(DeepGemmKernelType) + list(SailDeepGemmKernelType)
         for architecture in ("hopper", "blackwell", "musa"):
             for max_m, n, k, num_groups in (
                 (9, 131, 259, 3),  # Ceil division and grouped packing fallback.
                 (16384, 4096, 7168, 32),  # V3 DP8/EP8 startup OOM shape.
             ):
-                for kernel_type in DeepGemmKernelType:
+                for kernel_type in kernel_types:
+                    if (
+                        kernel_type not in compile_utils._WARMUP_EXECUTORS
+                        and not is_sail()
+                    ):
+                        # The SAIL-only executors live under hardware_backend/sail and
+                        # are only priced on a host that builds them.
+                        continue
+                    if "F4F4" in kernel_type.name:
+                        # mxfp4 scales are preprocessed in setup_tensors, so no
+                        # DeepGEMM scale layout conversion is left to model.
+                        continue
                     if (
                         kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
                         and architecture == "musa"

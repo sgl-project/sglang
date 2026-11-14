@@ -1948,11 +1948,41 @@ def _zero_topk_weights_padded_region(
     topk_weights[_padded_row_mask(topk_weights, num_token_non_padded), :] = 0.0
 
 
+def _sail_topk_ids_need_int64_masking(topk_ids: torch.Tensor) -> bool:
+    """Whether SAIL's DeepEP-family dispatch left int32 ids to widen and mask.
+
+    Only call this on SAIL: it imports the platform package.
+    """
+    from sglang.srt.hardware_backend.sail.moe.topk_ids import need_int64_masking
+
+    return need_int64_masking(topk_ids)
+
+
+def _mask_topk_ids_padded_region_to_int64(
+    topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return masked int64 IDs; int32 inputs on SAIL use the fused kernel."""
+    if num_token_non_padded is not None and _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.topk_ids import (
+            mask_padded_region_to_int64,
+        )
+
+        masked = mask_padded_region_to_int64(topk_ids, num_token_non_padded)
+        if masked is not None:
+            return masked
+    topk_ids = topk_ids.to(torch.int64)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_ids
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids, expert_location_dispatch_info, num_token_non_padded, cast_to_int64=False
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    if cast_to_int64:
+        return _mask_topk_ids_padded_region_to_int64(topk_ids, num_token_non_padded)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
 
@@ -2632,6 +2662,7 @@ def _post_process_topk_ids(
             # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
+            cast_to_int64 = _is_sail and _sail_topk_ids_need_int64_masking(topk_ids)
             fused_topk_ids = None
             recorder = get_global_expert_distribution_recorder()
             load_buffer = recorder.get_current_pass_count_buffer()
@@ -2644,8 +2675,26 @@ def _post_process_topk_ids(
                 )
             if fused_topk_ids is not None:
                 topk_ids = fused_topk_ids
-                _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+                if cast_to_int64:
+                    topk_ids = _mask_topk_ids_padded_region_to_int64(
+                        topk_ids, num_token_non_padded
+                    )
+                else:
+                    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
                 recorder_was_fused = True
+            elif cast_to_int64:
+                # Same padded-row rule as the shared branch below; SAIL also
+                # widens the ids to int64.
+                topk_ids = _biased_grouped_topk_postprocess(
+                    topk_ids,
+                    expert_location_dispatch_info,
+                    (
+                        None
+                        if padded_rows_masked and expert_location_dispatch_info is None
+                        else num_token_non_padded
+                    ),
+                    cast_to_int64=True,
+                )
             else:
                 # A remap table indexed by -1 aliases its last entry, so only the
                 # identity-remap branch may drop the padded-row mask.

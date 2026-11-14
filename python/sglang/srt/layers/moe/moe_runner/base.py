@@ -209,6 +209,16 @@ class PermuteMethodPool:
     _post_permute_methods: dict[
         Tuple[MoeRunnerBackend, CombineInputFormat], Callable
     ] = {}
+    # Platform-scoped overrides, keyed by the extra platform key a runner passes
+    # on lookup. A platform registers under the same (dispatch, runner) pair as
+    # the shared implementation and wins the lookup, so the shared entry keeps
+    # serving every other platform.
+    _platform_pre_permute_methods: dict[
+        Tuple[DispatchOutputFormat, MoeRunnerBackend, str], Callable
+    ] = {}
+    _platform_post_permute_methods: dict[
+        Tuple[MoeRunnerBackend, CombineInputFormat, str], Callable
+    ] = {}
 
     @classmethod
     def register_pre_permute(
@@ -216,6 +226,7 @@ class PermuteMethodPool:
         dispatch_output_name: str,
         runner_backend_name: str,
         permute_func: Callable,
+        platform: Optional[str] = None,
     ):
         """
         Register a customized pre-permute function for the given DispatchOutputFormat and MoeRunnerBackend.
@@ -223,14 +234,23 @@ class PermuteMethodPool:
         :param dispatch_output_name: The DispatchOutputFormat name.
         :param runner_backend_name: The MoeRunnerBackend name.
         :param permute_func: The permute function to register.
+        :param platform: Optional platform key. Registers an override that only
+            that platform picks up, leaving the shared entry untouched.
         """
         # TODO: check if registration is valid
-        key = (dispatch_output_name, runner_backend_name)
-        if key in cls._pre_permute_methods:
+        if platform is None:
+            registry = cls._pre_permute_methods
+            key = (dispatch_output_name, runner_backend_name)
+        else:
+            registry = cls._platform_pre_permute_methods
+            key = (dispatch_output_name, runner_backend_name, platform)
+        if key in registry:
+            scope = "" if platform is None else f" on platform {platform!r}"
             raise ValueError(
-                f"Pre-permute method for {dispatch_output_name} to {runner_backend_name} is already registered."
+                f"Pre-permute method for {dispatch_output_name} to {runner_backend_name}"
+                f"{scope} is already registered."
             )
-        cls._pre_permute_methods[key] = permute_func
+        registry[key] = permute_func
 
     @classmethod
     def register_post_permute(
@@ -238,6 +258,7 @@ class PermuteMethodPool:
         runner_backend_name: str,
         combine_input_name: str,
         permute_func: Callable,
+        platform: Optional[str] = None,
     ):
         """
         Register a customized post-permute function for the given MoeRunnerBackend and CombineInputFormat.
@@ -245,30 +266,49 @@ class PermuteMethodPool:
         :param runner_backend_name: The MoeRunnerBackend name.
         :param combine_input_name: The CombineInputFormat name.
         :param permute_func: The permute function to register.
+        :param platform: Optional platform key. Registers an override that only
+            that platform picks up, leaving the shared entry untouched.
         """
         # TODO: check if registration is valid
-        key = (runner_backend_name, combine_input_name)
-        if key in cls._post_permute_methods:
+        if platform is None:
+            registry = cls._post_permute_methods
+            key = (runner_backend_name, combine_input_name)
+        else:
+            registry = cls._platform_post_permute_methods
+            key = (runner_backend_name, combine_input_name, platform)
+        if key in registry:
+            scope = "" if platform is None else f" on platform {platform!r}"
             raise ValueError(
-                f"Post-permute method for {runner_backend_name} to {combine_input_name} is already registered."
+                f"Post-permute method for {runner_backend_name} to {combine_input_name}"
+                f"{scope} is already registered."
             )
-        cls._post_permute_methods[key] = permute_func
+        registry[key] = permute_func
 
     @classmethod
     def get_pre_permute(
         cls,
         dispatch_output_format: DispatchOutputFormat,
         runner_input_format: MoeRunnerBackend,
+        platform: Optional[str] = None,
     ) -> Callable:
         """
         Retrieve the pre-permute function for the given DispatchOutputFormat and MoeRunnerBackend.
 
         :param dispatch_output_format: The DispatchOutputFormat type.
         :param runner_input_format: The MoeRunnerBackend type.
+        :param platform: Optional platform key; its override takes precedence
+            over the shared entry.
         :return: The registered permute function or None if not found.
         """
-        key = (dispatch_output_format, runner_input_format)
-        pre_permute_func = cls._pre_permute_methods.get(key)
+        pre_permute_func = None
+        if platform is not None:
+            pre_permute_func = cls._platform_pre_permute_methods.get(
+                (dispatch_output_format, runner_input_format, platform)
+            )
+        if pre_permute_func is None:
+            pre_permute_func = cls._pre_permute_methods.get(
+                (dispatch_output_format, runner_input_format)
+            )
         assert pre_permute_func is not None, (
             f"Pre-permute function for {dispatch_output_format} to {runner_input_format} is not registered"
         )
@@ -279,16 +319,26 @@ class PermuteMethodPool:
         cls,
         runner_output_format: MoeRunnerBackend,
         combine_input_format: CombineInputFormat,
+        platform: Optional[str] = None,
     ) -> Callable:
         """
         Retrieve the post-permute function for the given MoeRunnerBackend and CombineInputFormat.
 
         :param runner_output_format: The MoeRunnerBackend type.
         :param combine_input_format: The CombineInputFormat type.
+        :param platform: Optional platform key; its override takes precedence
+            over the shared entry.
         :return: The registered permute function or None if not found.
         """
-        key = (runner_output_format, combine_input_format)
-        post_permute_func = cls._post_permute_methods.get(key)
+        post_permute_func = None
+        if platform is not None:
+            post_permute_func = cls._platform_post_permute_methods.get(
+                (runner_output_format, combine_input_format, platform)
+            )
+        if post_permute_func is None:
+            post_permute_func = cls._post_permute_methods.get(
+                (runner_output_format, combine_input_format)
+            )
         assert post_permute_func is not None, (
             f"Post-permute function for {runner_output_format} to {combine_input_format} is not registered"
         )
@@ -319,12 +369,14 @@ def register_fused_func(
 def register_pre_permute(
     dispatch_output_name: str,
     runner_backend_name: str,
+    platform: Optional[str] = None,
 ) -> Callable:
     """
     Decorator to register a pre-permute function for the given DispatchOutputFormat and MoeRunnerBackend.
 
     :param dispatch_output_name: The DispatchOutputFormat name.
     :param runner_backend_name: The MoeRunnerBackend name.
+    :param platform: Optional platform key for a platform-specific override.
     :return: The decorator function.
     """
 
@@ -334,7 +386,7 @@ def register_pre_permute(
         ],
     ) -> Callable:
         PermuteMethodPool.register_pre_permute(
-            dispatch_output_name, runner_backend_name, permute_func
+            dispatch_output_name, runner_backend_name, permute_func, platform
         )
         return permute_func
 
@@ -344,12 +396,14 @@ def register_pre_permute(
 def register_post_permute(
     runner_backend_name: str,
     combine_input_name: str,
+    platform: Optional[str] = None,
 ) -> Callable:
     """
     Decorator to register a post-permute function for the given MoeRunnerBackend and CombineInputFormat.
 
     :param runner_backend_name: The MoeRunnerBackend name.
     :param combine_input_name: The CombineInputFormat name.
+    :param platform: Optional platform key for a platform-specific override.
     :return: The decorator function.
     """
 
@@ -359,7 +413,7 @@ def register_post_permute(
         ],
     ) -> Callable:
         PermuteMethodPool.register_post_permute(
-            runner_backend_name, combine_input_name, permute_func
+            runner_backend_name, combine_input_name, permute_func, platform
         )
         return permute_func
 

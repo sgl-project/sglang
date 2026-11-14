@@ -198,12 +198,61 @@ def handle_xpu_backends(server_args: Any):
             )
 
 
+def _disable_sail_unsupported_mhc_paths() -> None:
+    """Pin the MHC pre-norm engines SAIL does not implement off.
+
+    The DeepGEMM TF32 pre-norm GEMM and the FlashInfer MHC pre-norm are
+    NVIDIA kernels; SAIL serves the pre-norm from its own MHC ops. The model
+    reads both switches directly, so they are forced here instead of being
+    re-checked at every dispatch site. Only an explicit opt-in is worth a
+    warning -- the DeepGEMM one defaults to on, and that default is not a
+    choice anybody made.
+    """
+    for name, var in (
+        ("SGLANG_OPT_DEEPGEMM_HC_PRENORM", envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM),
+        ("SGLANG_OPT_USE_FLASHINFER_MHC", envs.SGLANG_OPT_USE_FLASHINFER_MHC),
+    ):
+        if var.get():
+            if var.is_set():
+                logger.warning("%s is not supported on SAIL; disabling it.", name)
+            var.set(False)
+
+
 def handle_sail_backends(server_args: Any):
     if not get_platform().is_sail:
         return
     from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.platforms import current_platform
+
+    _disable_sail_unsupported_mhc_paths()
+    # Install the SAIL-only MoE registrations before any model is built. The
+    # hook lives on the plugin object, not on the `get_platform()` facts view.
+    current_platform.register_platform_backends()
+
+    if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
+    if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
 
     cfg = resolving_view(server_args)
+    if cfg.moe_a2a_backend == "megamoe":
+        raise ValueError(
+            "SAIL does not support MegaMoE; please use --moe-a2a-backend none."
+        )
+    valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
+    mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
+    # The flags are not published yet, so hand the guard the values being
+    # resolved. Its hardware half stays with the quant method: probing the device
+    # or the DeepGEMM build here would fail before the model is even built.
+    from sglang.srt.hardware_backend.sail.quantization.mxfp4 import validate_w4a16_modes
+
+    validate_w4a16_modes(
+        valu_enabled,
+        mma_enabled,
+        runner_backend=cfg.moe_runner_backend,
+        a2a_backend=cfg.moe_a2a_backend,
+        check_hardware=False,
+    )
     # A captured prefill graph pins MLA to the absorbed path, which hands the
     # backend a non-None q_v; the SAIL FA3 interface rejects that argument, so
     # MLA prefill must stay eager on SAIL. DSA models keep their own policy.

@@ -40,3 +40,10 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
         piecewise_graph=True,
         supports_pynccl=True,
     )
+
+    def register_platform_backends(self) -> None:
+        # The SAIL DeepGEMM MoE engines register their fused ops against the
+        # shared MoE runner through decorators, so importing the module is the
+        # registration. Done here rather than in each quantization method that
+        # can select the runner, which keeps the shared paths SAIL-free.
+        import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401

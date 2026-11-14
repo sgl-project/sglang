@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.utils import (
     register_moe_runner_backend_name,
     resolve_moe_runner_backend,
 )
+from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -93,6 +94,9 @@ class MoeRunner:
             )
 
         self.fused_func = None
+        # Platform whose permute overrides apply on lookup; None uses the shared
+        # entries in PermuteMethodPool.
+        self.permute_platform: Optional[str] = None
 
         if custom_factory := _CUSTOM_RUNNER_CORE_FACTORIES.get(runner_backend.value):
             self.runner_core = custom_factory(config)
@@ -103,7 +107,25 @@ class MoeRunner:
 
             self.runner_core = AscendRunnerCore(config)
         elif runner_backend.is_deep_gemm():
-            self.runner_core = DeepGemmRunnerCore(config)
+            if is_sail():
+                # SAIL's EP kernels live in a subclass so that the shared
+                # DeepGEMM runner stays free of them; the TP counterparts are
+                # registered as fused funcs by hardware_backend/sail/moe/
+                # deepgemm_moe.py instead.
+                from sglang.srt.hardware_backend.sail.moe.deepgemm_ep import (
+                    SailDeepGemmEpRunnerCore,
+                )
+
+                # Importing the permute module registers SAIL's pre-permute
+                # overrides for the DeepEP dispatch formats.
+                from sglang.srt.hardware_backend.sail.moe.permute import (
+                    PERMUTE_PLATFORM as SAIL_PERMUTE_PLATFORM,
+                )
+
+                self.runner_core = SailDeepGemmEpRunnerCore(config)
+                self.permute_platform = SAIL_PERMUTE_PLATFORM
+            else:
+                self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_humming():
             from sglang.srt.layers.moe.moe_runner.humming import HummingRunnerCore
 
@@ -236,7 +258,7 @@ class MoeRunner:
         dispatch_format = dispatch_output.format.value
         runner_format = self.runner_core.runner_backend.value
         self.pre_permute_func = PermuteMethodPool.get_pre_permute(
-            dispatch_format, runner_format
+            dispatch_format, runner_format, self.permute_platform
         )
 
         running_state = {}
@@ -257,7 +279,7 @@ class MoeRunner:
         runner_format = self.runner_core.runner_backend.value
         combine_format = dispatch_output.format.value
         self.post_permute_func = PermuteMethodPool.get_post_permute(
-            runner_format, combine_format
+            runner_format, combine_format, self.permute_platform
         )
         combine_input = self.post_permute_func(
             runner_output, quant_info, self.config, running_state

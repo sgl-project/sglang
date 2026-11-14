@@ -235,6 +235,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
+    is_sail,
     is_sm90_supported,
     use_intel_amx_backend,
 )
@@ -282,6 +283,7 @@ logger = logging.getLogger(__name__)
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
 _moe_quant_once_logged = False
+_is_sail = is_sail()
 
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
@@ -398,6 +400,16 @@ class DeepseekV2MLP(nn.Module):
                 x = (x, None, y)
 
             gate_up, _ = self.gate_up_proj(x)
+
+        if _is_sail and self.allow_fused_down:
+            # Imported here so that no other platform loads the SAIL package.
+            from sglang.srt.hardware_backend.sail.quantization.fp8_fused_down import (
+                can_fuse_fp8_down_proj,
+                fused_fp8_down_proj,
+            )
+
+            if can_fuse_fp8_down_proj(self.down_proj, gate_up):
+                return fused_fp8_down_proj(self.down_proj, gate_up, self.swiglu_limit)
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).

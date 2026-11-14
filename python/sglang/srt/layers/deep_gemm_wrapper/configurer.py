@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
@@ -6,12 +7,14 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_musa,
+    is_sail,
 )
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
+_is_sail = is_sail()
 
 
 def _sm120_deep_gemm_apis_available() -> bool:
@@ -29,19 +32,42 @@ def _sm120_deep_gemm_apis_available() -> bool:
     )
 
 
+def _deep_gemm_build() -> Optional[str]:
+    """The DeepGEMM build this platform loads, or None when it loads none."""
+    if _is_sail:
+        return "sail"
+    if _is_cuda:
+        return "cuda"
+    if _is_musa:
+        return "musa"
+    return None
+
+
+# The minimum SM a build serves is a property of the DeepGEMM library, not of
+# the device: the SAIL build reaches SM80, MUSA numbers from SM31, and the CUDA
+# build needs SM90.
+_DEEPGEMM_MIN_SM = {"cuda": 90, "musa": 31, "sail": 80}
+
+
 def _compute_enable_deep_gemm():
-    if not (_is_cuda or _is_musa):
+    build = _deep_gemm_build()
+    if build is None:
         return False
     if not envs.SGLANG_ENABLE_JIT_DEEPGEMM.get():
         return False
 
     sm_version = get_device_sm()
-    if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
+    if sm_version < _DEEPGEMM_MIN_SM[build]:
         return False
     # SM120/SM121 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
     # probe every API used by the SM120 DSV4 paths since installed builds may
-    # expose fp8_einsum but still predate the SM120 kernels.
-    if sm_version in (120, 121) and not _sm120_deep_gemm_apis_available():
+    # expose fp8_einsum but still predate the SM120 kernels. The SAIL build does
+    # not track upstream DeepGEMM, so it is exempt.
+    if (
+        build != "sail"
+        and sm_version in (120, 121)
+        and not _sm120_deep_gemm_apis_available()
+    ):
         return False
 
     try:
@@ -54,11 +80,21 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
-DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
-    get_platform().is_sm100 or get_device_sm() in (120, 121)
+# _deep_gemm_build() is the single place mapping a platform to a build, so the
+# feature flags below ask the build rather than the platform boolean.
+_DEEPGEMM_BUILD = _deep_gemm_build()
+
+DEEPGEMM_BLACKWELL = (
+    ENABLE_JIT_DEEPGEMM and _DEEPGEMM_BUILD != "sail" and get_platform().is_sm100
 )
-DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
+DEEPGEMM_SCALE_UE8M0 = (
+    ENABLE_JIT_DEEPGEMM
+    and _DEEPGEMM_BUILD != "sail"
+    and (get_platform().is_sm100 or get_device_sm() in (120, 121))
+)
+DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (
+    DEEPGEMM_SCALE_UE8M0 or _is_musa or _DEEPGEMM_BUILD == "sail"
+)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:
