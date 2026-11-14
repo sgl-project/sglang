@@ -122,7 +122,8 @@ async def set_lora(
         strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
             If a list, must match the length of lora_nickname. Values < 1.0 reduce the effect,
             values > 1.0 amplify the effect.
-        merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
+        merge_mode: Optional LoRA merge mode: "auto", "merge", "dynamic", or
+            "disabled" (dynamic LoRA without base-weight snapshots).
         lora_alpha: Training alpha override for adapters that omit it from metadata.
     """
     req = SetLoraReq(

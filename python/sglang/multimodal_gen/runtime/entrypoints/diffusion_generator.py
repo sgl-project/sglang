@@ -698,7 +698,8 @@ class DiffGenerator:
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
-            merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
+            merge_mode: Optional LoRA merge mode: "auto", "merge", "dynamic", or
+                "disabled" (dynamic LoRA without base-weight snapshots).
             lora_alpha: Training alpha override for adapters that omit it from metadata.
         """
         req = SetLoraReq(
