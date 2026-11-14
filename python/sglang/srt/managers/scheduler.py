@@ -2392,6 +2392,26 @@ class Scheduler(
     def send_abort_output(self, abort_req: AbortReq, req: Req) -> None:
         """Report a request the scheduler ends outside the output stream
         (aborted while queued, preempted, retracted or rejected)."""
+        if (
+            self.rust_server is None
+            and req.detokenize_output_held
+            and not req.finished_output
+            and req.output_ids
+        ):
+            # Send the held IDs and the abort together. A separate AbortReq
+            # can reach the tokenizer before the detokenizer's text does.
+            reason = abort_req.finished_reason or {}
+            req.finish_outside_step(
+                FINISH_ABORT(
+                    message=reason.get("message")
+                    or abort_req.abort_message
+                    or "Abort in waiting queue",
+                    status_code=reason.get("status_code"),
+                    err_type=reason.get("err_type"),
+                )
+            )
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return
         record_send(req, "abort")
         if self.rust_server is not None:
             # The zmq tokenizer socket is not consumed in Rust mode.

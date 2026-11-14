@@ -674,6 +674,10 @@ class Req(ReqDllmMixin):
         self.send_token_offset: int = 0
         # Whether the DetokenizeHeader went out, so the detokenizer holds its state.
         self.detokenize_header_sent = False
+        # Worker whose streaming quota this request holds until finish or release.
+        self.detokenize_worker_slot: Optional[int] = None
+        # A first streaming row was withheld because no slot was available.
+        self.detokenize_output_held = False
         # TODO (Byron): send_output_token_logprobs_offset and send_token_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
@@ -1495,7 +1499,7 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
-    def reset_for_retract(self):
+    def reset_for_retract(self, *, keep_output_ids: bool = False):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
@@ -1528,8 +1532,9 @@ class Req(ReqDllmMixin):
         # output_ids will have no use, but will lead to wrong size cache indexes.
         # Therefore, we discard the generated output_ids and restart prefill and generation
         # to ensure shape consistency in KV cache.
-        if self.input_embeds is not None:
+        if self.input_embeds is not None and not keep_output_ids:
             self.output_ids = array("q")
+            self.detokenize_output_held = False
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
@@ -1803,6 +1808,7 @@ def release_req(
     tree_cache: BasePrefixCache,
     request_retirer: RequestRetirer,
     offload_kv: bool = True,
+    will_abort: bool = False,
 ) -> bool:
     """Returns whether the request can be resumed."""
     resumable = request_retirer.retract(req, offload_kv=offload_kv)
@@ -1810,7 +1816,10 @@ def release_req(
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    req.reset_for_retract()
+    # An aborted held stream still needs these IDs for its final output.
+    req.reset_for_retract(
+        keep_output_ids=req.detokenize_output_held and (will_abort or not resumable)
+    )
     return resumable
 
 
@@ -3032,7 +3041,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 free_beam_member_rows(
                     last_req, self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
-            self.release_req(last_idx, 0, request_retirer, offload_kv=False)
+            self.release_req(
+                last_idx, 0, request_retirer, offload_kv=False, will_abort=True
+            )
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -3093,6 +3104,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         remaing_req_count: int,
         request_retirer: RequestRetirer,
         offload_kv: bool = True,
+        *,
+        will_abort: bool = False,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
@@ -3100,6 +3113,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             request_retirer=request_retirer,
             offload_kv=offload_kv,
+            will_abort=will_abort,
         )
 
     def prepare_encoder_info_decode(self):

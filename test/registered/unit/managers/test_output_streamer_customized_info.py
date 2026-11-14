@@ -81,6 +81,7 @@ class _FakeReq(FakeReq):
     ):
         self.rid = rid
         self.http_worker_ipc = None
+        self.detokenize_worker_slot = None
         self._finished = finished
         self.finished_reason = (
             SimpleNamespace(to_json=lambda: {"type": "stop"}) if finished else None
@@ -163,7 +164,9 @@ def _enter_streamer_scope(test):
     """Patch what `SchedulerOutputStreamer` reads per call, for `test`."""
     serving_patch = patch(
         "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
-        return_value=SimpleNamespace(stream_interval=1, weight_version="default"),
+        return_value=SimpleNamespace(
+            stream_interval=1, weight_version="default", detokenizer_worker_num=1
+        ),
     )
     observability_patch = patch(
         "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
@@ -1178,7 +1181,62 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         req.output_ids.append(7)
         streamer.stream_output([req], False)
         streamer.release_detokenize_state(req)
-        self.assertEqual(outputs[-1], DetokenizeReleaseReq(rid="r"))
+        self.assertEqual(
+            outputs[-1], DetokenizeReleaseReq(rid="r", http_worker_ipc="worker-a")
+        )
+
+    def test_full_detokenizer_defers_output_without_consuming_tokens(self):
+        outputs = []
+        with patch(
+            "sglang.srt.managers.scheduler_components.output_streamer.DETOKENIZER_MAX_STATES",
+            1,
+        ):
+            streamer = _streamer(outputs)
+            active = self._req("active")
+            active.output_ids.append(7)
+            streamer.stream_output([active], False)
+
+            held = self._req("held")
+            held.output_ids.append(8)
+            streamer.stream_output([held], False)
+
+            self.assertEqual(len(outputs), 1)
+            self.assertEqual(held.send_token_offset, 0)
+            self.assertTrue(held.detokenize_output_held)
+
+            streamer.release_detokenize_state(active)
+            held.output_ids.append(9)
+            streamer.stream_output([held], False)
+
+        payload = outputs[-1]
+        self.assertEqual(list(row_output_ids(payload, 0)), [8, 9])
+        self.assertEqual(payload.rids, ["held"])
+        self.assertEqual(payload.detokenize_headers[0].http_worker_ipc, "worker-a")
+        self.assertFalse(held.detokenize_output_held)
+
+    def test_detokenizer_capacity_remainder_is_assigned_to_lowest_rank(self):
+        parallel = SimpleNamespace(
+            num_dp_ranks=3,
+            dp_rank=0,
+            attn_dp_rank=0,
+            max_ep_size=None,
+            tp_size=1,
+        )
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.output_streamer.DETOKENIZER_MAX_STATES",
+                1,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.output_streamer.get_parallel",
+                side_effect=lambda: parallel,
+            ),
+        ):
+            for rank, expected in ((0, 1), (1, 0), (2, 0)):
+                parallel.dp_rank = rank
+                parallel.attn_dp_rank = rank
+                streamer = _streamer([])
+                self.assertEqual(streamer._detokenize_stream_capacity, expected)
 
     def test_finished_rows_carry_their_route(self):
         outputs = []
@@ -1192,8 +1250,8 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
                 done.finished_reason = FINISH_LENGTH(length=2)
             streamer.stream_output([running, done], False)
 
-        self.assertIsNone(outputs[0].http_worker_ipcs)
-        self.assertEqual(outputs[1].http_worker_ipcs, [None, "worker-b"])
+        self.assertEqual(outputs[0].http_worker_ipcs, ["worker-a", "worker-b"])
+        self.assertEqual(outputs[1].http_worker_ipcs, ["worker-a", "worker-b"])
 
     def test_skip_tokenizer_init_rows_carry_ipc_and_no_header(self):
         outputs = []

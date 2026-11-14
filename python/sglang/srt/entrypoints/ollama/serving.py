@@ -144,7 +144,11 @@ class OllamaServing:
                 is_done = chunk.get("meta_info", {}).get("finish_reason") is not None
 
                 # Calculate delta (new text since last chunk)
-                delta = text[len(previous_text) :]
+                delta = (
+                    text
+                    if self.tokenizer_manager.incremental_streaming_output
+                    else text[len(previous_text) :]
+                )
                 previous_text = text
 
                 if is_done:
@@ -152,7 +156,7 @@ class OllamaServing:
                     response = OllamaChatStreamResponse(
                         model=model_name,
                         created_at=self._get_timestamp(),
-                        message=OllamaMessage(role="assistant", content=""),
+                        message=OllamaMessage(role="assistant", content=delta),
                         done=True,
                         done_reason="stop",
                     )
@@ -261,14 +265,18 @@ class OllamaServing:
                 is_done = chunk.get("meta_info", {}).get("finish_reason") is not None
 
                 # Calculate delta (new text since last chunk)
-                delta = text[len(previous_text) :]
+                delta = (
+                    text
+                    if self.tokenizer_manager.incremental_streaming_output
+                    else text[len(previous_text) :]
+                )
                 previous_text = text
 
                 if is_done:
                     response = OllamaGenerateStreamResponse(
                         model=model_name,
                         created_at=self._get_timestamp(),
-                        response="",
+                        response=delta,
                         done=True,
                         done_reason="stop",
                     )

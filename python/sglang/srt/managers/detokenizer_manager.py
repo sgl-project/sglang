@@ -17,6 +17,7 @@ import logging
 import signal
 import traceback
 from collections import defaultdict
+from os.path import commonprefix
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
@@ -272,22 +273,37 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     ) -> List[Optional[DetokenizeState]]:
         vocab_size = self.vocab_size
         headers = recv_obj.detokenize_headers
+        worker_ipcs = recv_obj.http_worker_ipcs
         beam_outputs = recv_obj.beam_search_output
+        table = self.detokenize_state_table
         states = []
         for i, rid in enumerate(recv_obj.rids):
             header = None if headers is None else headers[i]
+            finished = recv_obj.finished_reasons[i] is not None
             if header is not None:
-                s = self.detokenize_state_table.start(
-                    rid=rid, header=header, vocab_size=vocab_size
+                if finished:
+                    # A complete output in one row needs no resident state.
+                    table.release(rid, header.http_worker_ipc)
+                    s = DetokenizeState.from_header(
+                        header=header, vocab_size=vocab_size
+                    )
+                else:
+                    s = table.start(rid=rid, header=header, vocab_size=vocab_size)
+                    if s is None:
+                        logger.warning(
+                            "Could not start detokenization for rid=%r. "
+                            "SGLANG_DETOKENIZER_MAX_STATES is exhausted.",
+                            rid,
+                        )
+            else:
+                worker_ipc = None if worker_ipcs is None else worker_ipcs[i]
+                s = (
+                    table.release(rid, worker_ipc)
+                    if finished
+                    else table.get(rid, worker_ipc)
                 )
-            elif (s := self.detokenize_state_table.get(rid)) is None:
-                logger.warning(
-                    f"Dropped the text of an output for {rid=}, which has no detokenize "
-                    "state: it was evicted, or already released when the request "
-                    "ended outside the output stream. The detokenizer keeps at most "
-                    f"SGLANG_DETOKENIZER_MAX_STATES={DETOKENIZER_MAX_STATES} states. "
-                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
-                )
+                if s is None:
+                    logger.warning("No detokenization state for output of rid=%r.", rid)
             if s is not None:
                 s.append_row(
                     rid=rid,
@@ -349,14 +365,76 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 output_strs.append("")
                 continue
             finished_reason = recv_obj.finished_reasons[i]
-            if finished_reason is not None:
-                self.detokenize_state_table.release(recv_obj.rids[i])
+            matched = finished_reason.get("matched") if finished_reason else None
+            stop_suffix = None
+            if isinstance(matched, str) and matched:
+                # The scheduler matches before skipping special tokens and stops
+                # at the first token prefix that contains the match. Skipping a
+                # token may create an earlier apparent match in the visible text.
+                output_start = len(s.header.prompt_tail_ids)
+                # Look near the end first. Allow up to four byte tokens per
+                # character, plus context for the start of the match.
+                tail_start = max(output_start, len(s.decode_ids) - 4 * len(matched) - 1)
+                starts = (
+                    (tail_start, output_start)
+                    if tail_start > output_start
+                    else (output_start,)
+                )
+                raw_match_found = False
+                for start in starts:
+                    ids = s.decode_ids[start:]
+                    if not ids:
+                        break
+                    raw_text = self.tokenizer.decode(ids)
+                    pos = raw_text.find(matched)
+                    raw_match_found = raw_match_found or pos != -1
+                    # A regex can report its pattern instead of a literal
+                    # match. Only trim a literal that reaches the final token.
+                    if pos != -1 and pos + len(matched) != len(raw_text):
+                        raw_prefix = self.tokenizer.decode(ids[:-1])
+                        unchanged = len(commonprefix((raw_text, raw_prefix)))
+                        pos = raw_text.find(
+                            matched, max(0, unchanged - len(matched) + 1)
+                        )
+                    if pos != -1:
+                        end = pos + len(matched) if s.header.no_stop_trim else pos
+                        stop_suffix = raw_text[end:]
+                        # A skipped final token supplies no visible suffix. If
+                        # the match belongs to that token, suppress the fallback
+                        # trim; otherwise trim the visible stop text normally.
+                        if s.header.skip_special_tokens:
+                            space = s.header.spaces_between_special_tokens
+                            if self.disable_tokenizer_batch_decode:
+                                last_text = self.tokenizer.decode(
+                                    ids[-1:],
+                                    skip_special_tokens=True,
+                                    spaces_between_special_tokens=space,
+                                )
+                            else:
+                                last_text = self._grouped_batch_decode(
+                                    [ids[-1:]], [True], [space]
+                                )[0]
+                            if not last_text:
+                                raw_prefix = self.tokenizer.decode(ids[:-1])
+                                if pos >= len(raw_prefix):
+                                    stop_suffix = ""
+                            elif not stop_suffix:
+                                stop_suffix = None
+                        elif not stop_suffix:
+                            stop_suffix = None
+                        break
+                if raw_match_found and stop_suffix is None:
+                    # A literal occurrence that does not reach the terminal
+                    # token may be an earlier piece of text for a regex stop.
+                    # Do not let the fallback trim remove that earlier text.
+                    stop_suffix = ""
             output_strs.append(
                 s.step(
                     read_text=read_texts[i],
                     surr_text=surr_texts[i],
                     finished_reason=finished_reason,
                     trim_matched_stop=self.trim_matched_stop,
+                    stop_suffix=stop_suffix,
                 )
             )
 
@@ -390,10 +468,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
         own_ipcs = recv_obj.http_worker_ipcs
         if own_ipcs is not None:
-            # A row's own route wins: the stored header may be missing (evicted)
-            # or another request's (one rid in flight on two workers).
+            # A finished row still needs to reach its worker without a state.
             for i, ipc in enumerate(own_ipcs):
-                if ipc is not None:
+                if ipc is not None and (
+                    headers[i] is not None or recv_obj.finished_reasons[i] is not None
+                ):
                     ipcs[i] = ipc
         return ipcs
 
@@ -466,7 +545,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
 
     def handle_detokenize_release_req(self, recv_req: DetokenizeReleaseReq):
-        self.detokenize_state_table.release(recv_req.rid)
+        self.detokenize_state_table.release(recv_req.rid, recv_req.http_worker_ipc)
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager", recv_req.gc_threshold)
