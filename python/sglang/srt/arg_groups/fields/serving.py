@@ -118,6 +118,12 @@ class Serving(msgspec.Struct):
         Optional[str],
         "Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
     ] = None
+    checkpoint_prepare_on_startup: A[
+        bool,
+        "After warmup and before serving, prepare for an external process "
+        "checkpoint as /checkpoint/prepare does. The server serves only after "
+        "/checkpoint/restore. Requires --enable-memory-saver.",
+    ] = False
     enable_http2: A[
         bool,
         "Serve HTTP/2 alongside HTTP/1.1 on the same port: clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. The Python frontend switches from Uvicorn to Granian and requires 'pip install sglang[http2]'; the Rust frontend (SGLANG_RUST_SERVER=1) serves it natively.",

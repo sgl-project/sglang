@@ -22,6 +22,8 @@ ADMIN_PATHS = [
     "/stop_profile",
     "/set_trace_level",
     "/freeze_gc",
+    "/checkpoint/prepare",
+    "/checkpoint/restore",
 ]
 
 ROUTE_AUTH_LEVELS = {
