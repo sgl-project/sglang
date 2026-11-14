@@ -66,7 +66,10 @@ extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-lin
 default_target = "gfx942"
 amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
 
-if torch.cuda.is_available():
+# An explicit AMDGPU_TARGET wins over the GPU of the build machine.
+if "AMDGPU_TARGET" in os.environ:
+    print(f"Using AMDGPU_TARGET={amdgpu_target}")
+elif torch.cuda.is_available():
     try:
         amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
     except Exception as e:
@@ -97,7 +100,8 @@ hipcc_flags = [
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    "-std=c++17",
+    # Same default as CMakeLists.txt; recent torch headers need C++20.
+    f"-std=c++{os.environ.get('SGL_KERNEL_CXX_STANDARD', '20')}",
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
