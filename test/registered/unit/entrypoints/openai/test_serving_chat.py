@@ -2758,6 +2758,128 @@ class ServingChatTestCase(CustomTestCase):
             },
         )
 
+    def _auto_tools_with_json_answer_sampling_params(
+        self, parser_name, strict, enable_thinking=False
+    ):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = parser_name
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Read note.txt, report the word."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                        "strict": strict,
+                    },
+                }
+            ],
+            tool_choice="auto",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"word": {"type": "string"}},
+                        "required": ["word"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            chat_template_kwargs={"enable_thinking": enable_thinking},
+        )
+        processed = self.chat._process_messages(request, is_multimodal=False)
+        return request.to_sampling_params(
+            stop=processed.stop,
+            model_generation_config={},
+            tool_call_constraint=processed.tool_call_constraint,
+            renderer_handles_response_format=self.chat._renders_response_format(),
+            tool_call_constraint_covers_answer=(
+                processed.tool_call_constraint_covers_answer
+            ),
+        )
+
+    def test_glm47_auto_tools_with_json_answer_keeps_tools_callable(self):
+        """tool_choice="auto" plus a JSON response_format must leave tools
+        callable and hold only the final answer to the schema; the format
+        alone made every tool call ungrammatical (#47167)."""
+        for enable_thinking in (False, True):
+            params = self._auto_tools_with_json_answer_sampling_params(
+                "glm47", strict=False, enable_thinking=enable_thinking
+            )
+
+            self.assertNotIn("json_schema", params)
+            self.assertTrue(params["ebnf_full_assistant"])
+            grammar = Grammar.from_ebnf(params["ebnf"])
+            prefix = "Plan.</think>" if enable_thinking else ""
+            for output, allowed in (
+                (
+                    "<tool_call>read_file<arg_key>path</arg_key>"
+                    "<arg_value>note.txt</arg_value></tool_call>",
+                    True,
+                ),
+                ('{"word": "banana"}', True),
+                ("The word is banana.", False),
+                ('{"other": "banana"}', False),
+                # A prose answer must not be able to end in a forced call.
+                (
+                    "The word is banana.<tool_call>read_file<arg_key>path"
+                    "</arg_key><arg_value>note.txt</arg_value></tool_call>",
+                    False,
+                ),
+            ):
+                with self.subTest(enable_thinking=enable_thinking, output=output):
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, prefix + output), allowed
+                    )
+
+    def test_kimi_k3_auto_tools_with_json_answer_keeps_tools_callable(self):
+        """The Kimi-K3 tag admits a tools section or a schema-shaped response
+        instead of being dropped or refused under a JSON format (#47167)."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat._encoding_adapter = self.chat._build_chat_encoding_adapter()
+        params = self._auto_tools_with_json_answer_sampling_params(
+            "kimi_k3", strict=True
+        )
+
+        self.assertNotIn("json_schema", params)
+        grammar = Grammar.from_structural_tag(params["structural_tag"])
+        call = (
+            TOOLS_OPEN + '<|open|>call tool="read_file" index="1"<|sep|>'
+            '<|open|>argument key="path" type="string"<|sep|>note.txt'
+            "<|close|>argument<|sep|><|close|>call<|sep|>" + TOOLS_CLOSE
+        )
+        for output, allowed in (
+            (call, True),
+            ('{"word": "banana"}<|close|>response<|sep|>', True),
+            ("The word is banana.<|close|>response<|sep|>", False),
+        ):
+            with self.subTest(output=output):
+                self.assertEqual(_is_grammar_accept_string(grammar, output), allowed)
+
+    def test_auto_tools_with_json_answer_keeps_format_without_combined_grammar(
+        self,
+    ):
+        """A parser that cannot express calls and the answer together keeps
+        the client's JSON format rather than losing it."""
+        params = self._auto_tools_with_json_answer_sampling_params(
+            "hermes", strict=False
+        )
+
+        self.assertEqual(
+            json.loads(params["json_schema"])["properties"],
+            {"word": {"type": "string"}},
+        )
+
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"

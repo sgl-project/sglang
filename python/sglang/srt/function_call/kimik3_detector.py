@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from xgrammar import StructuralTag
 
@@ -23,6 +23,7 @@ from sglang.srt.function_call.kimik3_format import (
     strip_response_wrappers,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
+    get_kimik3_answer_structural_tag,
     get_kimik3_auto_tool_call_structural_tag,
     get_kimik3_structural_tag,
 )
@@ -106,6 +107,22 @@ class KimiK3Detector(BaseFormatDetector):
             tools or [],
             thinking_mode=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
+        )
+
+    def get_answer_structural_tag(
+        self,
+        tools: List[Tool],
+        answer_json_schema: Dict[str, Any],
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+        strict_arguments: bool = False,
+    ) -> Optional[StructuralTag]:
+        return get_kimik3_answer_structural_tag(
+            tools,
+            answer_json_schema,
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+            strict_arguments=strict_arguments,
         )
 
     def get_structural_tag(

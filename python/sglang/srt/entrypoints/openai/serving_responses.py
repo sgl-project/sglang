@@ -516,6 +516,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                             if processed_messages
                             else None
                         ),
+                        tool_call_constraint_covers_answer=(
+                            processed_messages is not None
+                            and processed_messages.tool_call_constraint_covers_answer
+                        ),
                     )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
@@ -773,6 +777,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             chat_request,
             is_multimodal,
             output_constrained=request.has_json_schema_constraint(),
+            answer_json_schema=request._json_schema_from_text_format(request.text),
         )
         # ``_process_messages`` merges server defaults into the temporary Chat
         # request before rendering. Response parsing happens later from the

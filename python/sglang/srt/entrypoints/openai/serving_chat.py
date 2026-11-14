@@ -83,6 +83,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
+    convert_json_schema_to_str,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
@@ -1265,9 +1266,9 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
-            renderer_handles_response_format=(
-                self._encoding_adapter is not None
-                and self._encoding_adapter.renders_response_format
+            renderer_handles_response_format=self._renders_response_format(),
+            tool_call_constraint_covers_answer=(
+                processed_messages.tool_call_constraint_covers_answer
             ),
         )
         set_request_reasoning_end_token_ids(
@@ -1725,12 +1726,59 @@ class OpenAIServingChat(OpenAIServingBase):
             and issubclass(tool_detector, ResponseTemplateToolDetector)
         )
 
+    def _renders_response_format(self) -> bool:
+        return (
+            self._encoding_adapter is not None
+            and self._encoding_adapter.renders_response_format
+        )
+
+    def _answer_json_schema(self, request: ChatCompletionRequest) -> Optional[str]:
+        """The JSON schema response_format holds the answer to, if any."""
+        response_format = request.response_format
+        if response_format is None or request.regex or request.ebnf:
+            return None
+        if response_format.type == "json_object":
+            return '{"type": "object"}'
+        if response_format.type != "json_schema":
+            return None
+        # Mirrors to_sampling_params: the renderer states a non-strict schema
+        # in the prompt instead of constraining the output.
+        if (
+            response_format.json_schema.strict is False
+            and self._renders_response_format()
+        ):
+            return None
+        return convert_json_schema_to_str(response_format.json_schema.schema_)
+
+    def _answer_tool_call_constraint(
+        self,
+        request: ChatCompletionRequest,
+        parser: FunctionCallParser,
+        answer_json_schema: Optional[str],
+        thinking_mode: bool,
+    ) -> Optional[ToolCallConstraint]:
+        """The constraint admitting tool calls or the JSON answer, or None
+        when there is no JSON answer or the parser cannot express both."""
+        if (
+            answer_json_schema is None
+            or request.tool_choice != "auto"
+            # Response templates frame a JSON answer with their own grammar.
+            or isinstance(parser.detector, ResponseTemplateToolDetector)
+        ):
+            return None
+        return parser.get_answer_structure_constraint(
+            answer_json_schema,
+            parallel_tool_calls=request.parallel_tool_calls,
+            thinking_mode=thinking_mode,
+        )
+
     def _process_messages(
         self,
         request: ChatCompletionRequest,
         is_multimodal: bool,
         *,
         output_constrained: bool = False,
+        answer_json_schema: Optional[str] = None,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         if self.is_minimax_m3:
@@ -1765,7 +1813,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # tags must describe only the post-reasoning tool-call suffix.
         xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
         tool_call_constraint = None
+        tool_call_constraint_covers_answer = False
         template_tool_parser = None
+        if answer_json_schema is None:
+            answer_json_schema = self._answer_json_schema(request)
 
         effective_tools = self._effective_tools(request)
         # A grammar reaching its terminal state ends generation regardless of
@@ -1782,13 +1833,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 "enable_thinking"
             )
             parser = FunctionCallParser(effective_tools, self.tool_call_parser)
-            tool_call_constraint = parser.get_structure_constraint(
-                request.tool_choice,
-                parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=(
-                    True if enable_thinking is None else bool(enable_thinking)
-                ),
+            glm_thinking = True if enable_thinking is None else bool(enable_thinking)
+            tool_call_constraint = self._answer_tool_call_constraint(
+                request, parser, answer_json_schema, thinking_mode=glm_thinking
             )
+            tool_call_constraint_covers_answer = tool_call_constraint is not None
+            if tool_call_constraint is None:
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                    thinking_mode=glm_thinking,
+                )
 
         # Apply chat template and its stop strings
         tools = None
@@ -1815,11 +1870,19 @@ class OpenAIServingChat(OpenAIServingBase):
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
-                tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice,
-                    parallel_tool_calls=request.parallel_tool_calls,
+                tool_call_constraint = self._answer_tool_call_constraint(
+                    request,
+                    parser,
+                    answer_json_schema,
                     thinking_mode=xgrammar_reasoning,
                 )
+                tool_call_constraint_covers_answer = tool_call_constraint is not None
+                if tool_call_constraint is None:
+                    tool_call_constraint = parser.get_structure_constraint(
+                        request.tool_choice,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        thinking_mode=xgrammar_reasoning,
+                    )
                 if (
                     tool_call_constraint is not None
                     and tool_call_constraint[0] == "structural_tag"
@@ -1865,6 +1928,21 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_choice="none",
                     thinking_mode=xgrammar_reasoning,
                 ),
+            )
+
+        if (
+            tool_call_constraint is None
+            and answer_json_schema is not None
+            and request.tool_choice == "auto"
+            and effective_tools
+            and self.tool_call_parser
+            and template_tool_parser is None
+        ):
+            logger.warning(
+                "The %s tool-call parser cannot combine tool calls with a JSON "
+                "response format; the format covers the whole output, so the "
+                "model cannot call tools.",
+                self.tool_call_parser,
             )
 
         if tool_call_constraint is None and self._takes_turn_grammar(
@@ -1920,6 +1998,7 @@ class OpenAIServingChat(OpenAIServingBase):
             configure_response_template_request(request)
             result.uses_response_template = True
         result.tool_call_constraint = tool_call_constraint
+        result.tool_call_constraint_covers_answer = tool_call_constraint_covers_answer
         result.require_reasoning = thinking_mode
         if template_tool_parser is not None and result.uses_response_template:
             self._record_template_tool_call_grammar(

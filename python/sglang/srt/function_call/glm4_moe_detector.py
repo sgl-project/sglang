@@ -8,6 +8,8 @@ from enum import Enum
 from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
+from xgrammar import Grammar
+
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -1071,6 +1073,7 @@ def generate_glm_grammar(
     root_name: str = "root",
     required: bool = False,
     parallel_tool_calls: bool = True,
+    allow_text_before_tool_calls: bool = True,
 ) -> str:
     ebnf_lines = [
         f'{root_name} ::= assistant_turn ( "{special_tokens.assistant_token}" assistant_turn )*'
@@ -1078,16 +1081,14 @@ def generate_glm_grammar(
         else f"{root_name} ::= assistant_turn",
         "assistant_turn ::= thinking_block text_block tool_call_blocks",
     ]
-
-    thinking_exclusions = [
-        special_tokens.begin_of_tool_call,
-        special_tokens.end_of_tool_call,
-        special_tokens.begin_of_key,
-        special_tokens.end_of_key,
-        special_tokens.begin_of_value,
-        special_tokens.end_of_value,
-        special_tokens.end_of_thinking,
-    ]
+    ebnf_lines.extend(
+        _glm_thinking_rules(
+            enable_thinking=enable_thinking,
+            special_tokens=special_tokens,
+            chat_template_version=chat_template_version,
+            accommodate_chat_template=accommodate_chat_template,
+        )
+    )
 
     if chat_template_version == "glm45":
         extra_seperator = '"\\n"'
@@ -1097,6 +1098,93 @@ def generate_glm_grammar(
         raise NotImplementedError(
             f"Unsupported chat_template_version: {chat_template_version}"
         )
+
+    ebnf_lines.extend(
+        _glm_any_string_exclude(
+            "text_without_special_tokens", special_tokens.all_special_tokens()
+        )
+    )
+
+    ebnf_lines.append(
+        f"text_block ::= ( {extra_seperator} text_without_special_tokens )?"
+        if allow_text_before_tool_calls
+        else "text_block ::= [ \\t\\r\\n]*"
+    )
+
+    if functions:
+        ebnf_lines.extend(
+            _glm_build_tool_call_rules(
+                non_terminal_name="tool_call_blocks",
+                functions=functions,
+                special_tokens=special_tokens,
+                chat_template_version=chat_template_version,
+                required=required,
+                parallel_tool_calls=parallel_tool_calls,
+            )
+        )
+    else:
+        ebnf_lines.append('tool_call_blocks ::= ""')
+
+    return _glm_join_rules(ebnf_lines)
+
+
+def generate_glm_answer_grammar(
+    enable_thinking: bool,
+    functions: list[Any],
+    special_tokens: GlmSpecialTokenConfig,
+    answer_json_schema: str,
+    parallel_tool_calls: bool = True,
+) -> str:
+    """A glm47 assistant turn that either calls at least one tool or answers
+    with JSON matching `answer_json_schema` after the thinking block."""
+    # Text before the calls would let the model write a free-form answer and
+    # then be forced into a call to end the turn.
+    tool_turn = generate_glm_grammar(
+        enable_thinking=enable_thinking,
+        functions=functions,
+        special_tokens=special_tokens,
+        chat_template_version="glm47",
+        accommodate_chat_template=True,
+        allow_multiple_assistant_turns=False,
+        required=True,
+        parallel_tool_calls=parallel_tool_calls,
+        allow_text_before_tool_calls=False,
+    )
+    answer_prefix = _glm_join_rules(
+        [
+            "root ::= thinking_block [ \\t\\r\\n]*",
+            *_glm_thinking_rules(
+                enable_thinking=enable_thinking,
+                special_tokens=special_tokens,
+                chat_template_version="glm47",
+                accommodate_chat_template=True,
+            ),
+        ]
+    )
+    # union/concat rename clashing rules, e.g. both sides define basic_number.
+    answer_turn = Grammar.concat(
+        Grammar.from_ebnf(answer_prefix),
+        Grammar.from_json_schema(answer_json_schema),
+    )
+    return str(Grammar.union(Grammar.from_ebnf(tool_turn), answer_turn))
+
+
+def _glm_thinking_rules(
+    enable_thinking: bool,
+    special_tokens: GlmSpecialTokenConfig,
+    chat_template_version: Literal["glm45", "glm47"],
+    accommodate_chat_template: bool,
+) -> list[str]:
+    ebnf_lines: list[str] = []
+    thinking_exclusions = [
+        special_tokens.begin_of_tool_call,
+        special_tokens.end_of_tool_call,
+        special_tokens.begin_of_key,
+        special_tokens.end_of_key,
+        special_tokens.begin_of_value,
+        special_tokens.end_of_value,
+        special_tokens.end_of_thinking,
+    ]
 
     if chat_template_version == "glm45":
         if enable_thinking:
@@ -1138,31 +1226,10 @@ def generate_glm_grammar(
         raise NotImplementedError(
             f"Unsupported chat_template_version: {chat_template_version}"
         )
+    return ebnf_lines
 
-    ebnf_lines.extend(
-        _glm_any_string_exclude(
-            "text_without_special_tokens", special_tokens.all_special_tokens()
-        )
-    )
 
-    ebnf_lines.append(
-        f"text_block ::= ( {extra_seperator} text_without_special_tokens )?"
-    )
-
-    if functions:
-        ebnf_lines.extend(
-            _glm_build_tool_call_rules(
-                non_terminal_name="tool_call_blocks",
-                functions=functions,
-                special_tokens=special_tokens,
-                chat_template_version=chat_template_version,
-                required=required,
-                parallel_tool_calls=parallel_tool_calls,
-            )
-        )
-    else:
-        ebnf_lines.append('tool_call_blocks ::= ""')
-
+def _glm_join_rules(ebnf_lines: list[str]) -> str:
     non_terminals = {}
     deduped_lines = []
     for line in ebnf_lines:

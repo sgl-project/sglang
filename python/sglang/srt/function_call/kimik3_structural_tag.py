@@ -677,6 +677,43 @@ def get_kimik3_auto_tool_call_structural_tag(
     return StructuralTag(format=_with_reasoning(suffix, thinking_mode))
 
 
+def get_kimik3_answer_structural_tag(
+    tools: List[Tool],
+    answer_json_schema: Dict[str, Any],
+    thinking_mode: bool = False,
+    parallel_tool_calls: bool = True,
+    strict_arguments: bool = False,
+) -> Optional[StructuralTag]:
+    """Automatic tool choice whose final answer, when no tool is called, is
+    JSON matching `answer_json_schema`."""
+    if not tools:
+        return None
+
+    call_tags = [
+        _tool_call_tag(
+            tool, None if strict_arguments else _auto_tool_arguments_format(tool)
+        )
+        for tool in tools
+    ]
+    tools_tag = _tool_calls_tag(call_tags, parallel_tool_calls)
+    answer = _response(JSONSchemaFormat(json_schema=answer_json_schema))
+    suffix = OrFormat(
+        elements=[
+            SequenceFormat(
+                elements=[
+                    # Prose before the calls would let the model answer freely
+                    # and then be forced into a call to end the turn.
+                    OptionalFormat(content=_response(RegexFormat(pattern=r"\s*"))),
+                    tools_tag,
+                    _OPTIONAL_MESSAGE_CLOSE,
+                ]
+            ),
+            SequenceFormat(elements=[answer, _OPTIONAL_MESSAGE_CLOSE]),
+        ]
+    )
+    return StructuralTag(format=_with_reasoning(suffix, thinking_mode))
+
+
 def _select_tools(
     tools: List[Tool],
     tool_choice: Union[ToolChoice, Literal["auto", "required"]],

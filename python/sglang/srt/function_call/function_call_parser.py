@@ -1,4 +1,5 @@
 import inspect
+import json
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
@@ -29,6 +30,7 @@ from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
 from sglang.srt.function_call.glm4_moe_detector import (
     Glm4MoeDetector,
     GlmSpecialTokenConfig,
+    generate_glm_answer_grammar,
     generate_glm_grammar,
 )
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
@@ -346,9 +348,8 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
-        should_constrain_auto = tool_choice == "auto" and (
-            any(tool.function.strict for tool in self.tools)
-            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        should_constrain_auto = (
+            tool_choice == "auto" and self._constrains_auto_arguments()
         )
         structural_tag_tools = self.structural_tag_tools()
         if isinstance(self.detector, ResponseTemplateToolDetector):
@@ -438,3 +439,48 @@ class FunctionCallParser:
         except Exception as e:
             logger.error(f"Error getting structure constraint: {e}")
             return None
+
+    def get_answer_structure_constraint(
+        self,
+        answer_json_schema: str,
+        parallel_tool_calls: bool = True,
+        thinking_mode: bool = False,
+    ) -> Optional[ToolCallConstraint]:
+        """
+        Returns a constraint for tool_choice="auto" that admits tool calls or a
+        final answer matching answer_json_schema, or None if the format cannot
+        express both.
+        """
+        if not self.tools:
+            return None
+        if (
+            isinstance(self.detector, Glm47MoeDetector)
+            and self.detector.parses_required_natively()
+        ):
+            return (
+                "full_assistant_ebnf",
+                generate_glm_answer_grammar(
+                    enable_thinking=thinking_mode,
+                    functions=[tool.function for tool in self.tools],
+                    special_tokens=GlmSpecialTokenConfig(),
+                    answer_json_schema=answer_json_schema,
+                    parallel_tool_calls=parallel_tool_calls,
+                ),
+            )
+        strict_arguments = self._constrains_auto_arguments()
+        structural_tag = self.detector.get_answer_structural_tag(
+            tools=self.structural_tag_tools() if strict_arguments else self.tools,
+            answer_json_schema=json.loads(answer_json_schema),
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+            strict_arguments=strict_arguments,
+        )
+        if structural_tag is None:
+            return None
+        return ("structural_tag", structural_tag)
+
+    def _constrains_auto_arguments(self) -> bool:
+        return (
+            any(tool.function.strict for tool in self.tools)
+            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        )
