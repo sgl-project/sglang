@@ -260,20 +260,69 @@ class SanaCombinedTimestepSizeEmbeddings(nn.Module):
         )
 
     def forward(self, timestep, hidden_dtype=None):
-        timesteps_proj = self.time_proj(timestep)
-        if hidden_dtype is not None:
-            timesteps_proj = timesteps_proj.to(dtype=hidden_dtype)
-        if timesteps_proj.device.type == "mps":
-            embedder = self.timestep_embedder
-            timesteps_emb = _mps_safe_linear(embedder.linear_1, timesteps_proj)
-            if embedder.act is not None:
-                timesteps_emb = embedder.act(timesteps_emb)
-            timesteps_emb = _mps_safe_linear(embedder.linear_2, timesteps_emb)
-            if embedder.post_act is not None:
-                timesteps_emb = embedder.post_act(timesteps_emb)
-        else:
-            timesteps_emb = self.timestep_embedder(timesteps_proj)
-        return timesteps_emb
+        return _embed_timestep(
+            self.time_proj, self.timestep_embedder, timestep, hidden_dtype
+        )
+
+
+def _embed_timestep(
+    proj: Timesteps,
+    embedder: TimestepEmbedding,
+    timestep: torch.Tensor,
+    hidden_dtype: torch.dtype | None,
+) -> torch.Tensor:
+    timesteps_proj = proj(timestep)
+    if hidden_dtype is not None:
+        timesteps_proj = timesteps_proj.to(dtype=hidden_dtype)
+    if timesteps_proj.device.type != "mps":
+        return embedder(timesteps_proj)
+    timesteps_emb = _mps_safe_linear(embedder.linear_1, timesteps_proj)
+    if embedder.act is not None:
+        timesteps_emb = embedder.act(timesteps_emb)
+    timesteps_emb = _mps_safe_linear(embedder.linear_2, timesteps_emb)
+    if embedder.post_act is not None:
+        timesteps_emb = embedder.post_act(timesteps_emb)
+    return timesteps_emb
+
+
+class SanaCombinedTimestepGuidanceEmbeddings(nn.Module):
+    """Timestep plus embedded-guidance conditioning of guidance-distilled SANA
+    checkpoints (SANA-Sprint); the module layout matches Diffusers' weights."""
+
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.time_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        self.timestep_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+        self.guidance_condition_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        self.guidance_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=True)
+
+    def forward(self, timestep, guidance, hidden_dtype=None):
+        conditioning = _embed_timestep(
+            self.time_proj, self.timestep_embedder, timestep, hidden_dtype
+        ) + _embed_timestep(
+            self.guidance_condition_proj, self.guidance_embedder, guidance, hidden_dtype
+        )
+        out = _mps_safe_linear(self.linear, self.silu(conditioning))
+        return out, conditioning
+
+
+def _make_qk_norms(qk_norm: str | None, dim: int) -> tuple[nn.Module, nn.Module]:
+    if qk_norm is None:
+        return nn.Identity(), nn.Identity()
+    if qk_norm != "rms_norm_across_heads":
+        raise ValueError(f"Unsupported SANA qk_norm: {qk_norm!r}")
+    # eps matches the Diffusers Attention default (1e-5).
+    return RMSNorm(dim, eps=1e-5), RMSNorm(dim, eps=1e-5)
 
 
 class SanaAdaLayerNormSingle(nn.Module):
@@ -328,7 +377,7 @@ class GLUMBConv(nn.Module):
 class SanaLinearAttention(nn.Module):
     """Linear attention with O(N*D^2) complexity instead of O(N^2*D)."""
 
-    def __init__(self, query_dim, num_heads, head_dim, bias=False):
+    def __init__(self, query_dim, num_heads, head_dim, bias=False, qk_norm=None):
         super().__init__()
         inner_dim = num_heads * head_dim
         self.num_heads = num_heads
@@ -339,6 +388,7 @@ class SanaLinearAttention(nn.Module):
         self.to_qkv = MergedColumnParallelLinear(
             query_dim, [inner_dim, inner_dim, inner_dim], bias=bias, gather_output=True
         )
+        self.norm_q, self.norm_k = _make_qk_norms(qk_norm, inner_dim)
         self.to_out = nn.ModuleList(
             [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
         )
@@ -350,6 +400,8 @@ class SanaLinearAttention(nn.Module):
         query, key, value = qkv.split(
             [self.inner_dim, self.inner_dim, self.inner_dim], dim=-1
         )
+        query = self.norm_q(query)
+        key = self.norm_k(key)
 
         query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
@@ -370,7 +422,15 @@ class SanaLinearAttention(nn.Module):
 
 
 class SanaCrossAttention(nn.Module):
-    def __init__(self, query_dim, cross_attention_dim, num_heads, head_dim, bias=False):
+    def __init__(
+        self,
+        query_dim,
+        cross_attention_dim,
+        num_heads,
+        head_dim,
+        bias=False,
+        qk_norm=None,
+    ):
         super().__init__()
         inner_dim = num_heads * head_dim
         self.num_heads = num_heads
@@ -382,6 +442,7 @@ class SanaCrossAttention(nn.Module):
         self.to_kv = MergedColumnParallelLinear(
             cross_attention_dim, [inner_dim, inner_dim], bias=bias, gather_output=True
         )
+        self.norm_q, self.norm_k = _make_qk_norms(qk_norm, inner_dim)
         self.to_out = nn.ModuleList(
             [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
         )
@@ -392,9 +453,10 @@ class SanaCrossAttention(nn.Module):
         B, S, _ = hidden_states.shape
         T = encoder_hidden_states.shape[1]
 
-        query = _mps_safe_linear(self.to_q, hidden_states)
+        query = self.norm_q(_mps_safe_linear(self.to_q, hidden_states))
         kv, _ = self.to_kv(encoder_hidden_states)
         key, value = kv.split([self.inner_dim, self.inner_dim], dim=-1)
+        key = self.norm_k(key)
 
         query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
@@ -425,6 +487,7 @@ class SanaTransformerBlock(nn.Module):
         mlp_ratio,
         norm_eps,
         attention_bias=False,
+        qk_norm=None,
     ):
         super().__init__()
 
@@ -436,6 +499,7 @@ class SanaTransformerBlock(nn.Module):
             num_heads=num_attention_heads,
             head_dim=attention_head_dim,
             bias=attention_bias,
+            qk_norm=qk_norm,
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
@@ -445,6 +509,7 @@ class SanaTransformerBlock(nn.Module):
             num_heads=num_cross_attention_heads,
             head_dim=cross_attention_head_dim,
             bias=True,
+            qk_norm=qk_norm,
         )
 
         self.ff = GLUMBConv(in_channels=dim, out_channels=dim, expand_ratio=mlp_ratio)
@@ -516,7 +581,12 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 ),
             }
         )
-        self.time_embed = SanaAdaLayerNormSingle(self.inner_dim)
+        self.guidance_embeds = arch.guidance_embeds
+        self.time_embed = (
+            SanaCombinedTimestepGuidanceEmbeddings(self.inner_dim)
+            if self.guidance_embeds
+            else SanaAdaLayerNormSingle(self.inner_dim)
+        )
         self.caption_projection = PixArtAlphaTextProjection(
             in_features=arch.caption_channels,
             hidden_size=self.inner_dim,
@@ -536,6 +606,7 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     mlp_ratio=arch.mlp_ratio,
                     norm_eps=arch.norm_eps,
                     attention_bias=False,
+                    qk_norm=arch.qk_norm,
                 )
                 for _ in range(arch.num_layers)
             ]
@@ -578,9 +649,18 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # copying the transposed patch view independently.
         hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
 
-        timestep_emb, embedded_timestep = self.time_embed(
-            timestep, hidden_dtype=hidden_states.dtype
-        )
+        if self.guidance_embeds:
+            if guidance is None:
+                raise ValueError(
+                    "This SANA checkpoint has guidance embeddings; pass `guidance`"
+                )
+            timestep_emb, embedded_timestep = self.time_embed(
+                timestep, guidance, hidden_dtype=hidden_states.dtype
+            )
+        else:
+            timestep_emb, embedded_timestep = self.time_embed(
+                timestep, hidden_dtype=hidden_states.dtype
+            )
 
         if isinstance(encoder_attention_mask, (list, tuple)):
             encoder_attention_mask = encoder_attention_mask[0]

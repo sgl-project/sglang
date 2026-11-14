@@ -65,6 +65,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_sprint import (
+    SanaSprintPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
@@ -106,6 +109,7 @@ __all__ = [
     "Flux2FinetunedPipelineConfig",
     "PipelineConfig",
     "SanaPipelineConfig",
+    "SanaSprintPipelineConfig",
     "SanaVideoPipelineConfig",
     "SenseNovaU1PipelineConfig",
     "MOVAPipelineConfig",
