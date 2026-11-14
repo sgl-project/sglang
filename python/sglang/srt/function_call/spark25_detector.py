@@ -66,6 +66,9 @@ def _convert_value(value: str, param_type: str) -> Any:
         if normalized_type in {"integer", "int"}:
             return int(value)
         if normalized_type in {"number", "float"}:
+            # Avoid rounding integer literals through an intermediate float.
+            if value.strip().lstrip("+-").isdecimal():
+                return int(value)
             number = float(value)
             return int(number) if number.is_integer() else number
         if normalized_type in {"boolean", "bool"}:
