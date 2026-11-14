@@ -2219,15 +2219,18 @@ class DeepseekV4AttnBackend(
             forward_batch.global_num_token_non_padded,
             forward_batch.num_token_non_padded,
         )
-        if tail.real_rows_count is not None:
-            forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
+        real_rows = tail.real_rows_count
+        if real_rows is None and tail.cp_metadata is None:
+            real_rows = sum(tail.extend_seq_lens_cpu)
+        if real_rows is not None:
+            forward_batch.global_num_token_non_padded_cpu = real_rows
             non_padded = forward_batch.global_num_token_non_padded
             if non_padded is not None:
                 if self._bcg_tail_num_token_non_padded is None:
                     self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
                 bound = torch.clamp(
                     non_padded,
-                    max=tail.real_rows_count,
+                    max=real_rows,
                     out=self._bcg_tail_num_token_non_padded,
                 )
                 forward_batch.global_num_token_non_padded = bound
