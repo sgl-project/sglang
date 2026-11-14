@@ -268,6 +268,13 @@ def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     )
 
 
+def mamba_path_state_cap_of(cfg: Any) -> int:
+    """The per-path Mamba state cap the tree enforces."""
+    if cfg.mamba_max_states_per_path is not None:
+        return cfg.mamba_max_states_per_path
+    return 1 if cfg.hybrid_cache_checkpoints_level < 3 else -1
+
+
 def collect_model_override_declarations(
     architecture: str, server_args: Any, hf_config: Any
 ) -> List[Tuple[str, Dict[str, Any]]]:
