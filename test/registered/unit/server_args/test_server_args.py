@@ -257,6 +257,15 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                     ("quark_mxfp4", "triton", 0.72, False),
                 )
 
+    def test_window_free_slots_keep_the_global_default(self):
+        """Forcing the window-free switch off collapses the prefix cache (#50416)."""
+        from sglang.srt.environ import envs
+
+        self.resolve()
+        flag = envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS
+        self.assertFalse(flag.is_set())
+        self.assertTrue(flag.get())
+
     def test_megamoe_conditions_and_opt_out(self):
         self.assertTrue(self.resolve().enable_megamoe_for_layernorm_sp)
         self.assertTrue(

@@ -19,12 +19,16 @@ MUSE_SPARK_ARCHITECTURES = ("MuseSparkForConditionalGeneration",)
 MUSE_SPARK_CHAT_TEMPLATE_FILE = "chat_template.jinja"
 
 # Graph-pool and KV-sizing switches the reference launcher (sglang_meta) sets.
+# The launcher also pins SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=0, but
+# that override is deliberately not mirrored here: keeping window KV for every
+# cached prompt fills the SWA pool after a few long conversations, and prefix
+# matches need live SWA at the branch point, so the switch belongs to the
+# global default (True since #34653). See #50416.
 MUSE_SPARK_ENV_DEFAULTS = (
     (envs.SGLANG_ENABLE_CUDA_GRAPH_DEDUP, True),
     (envs.SGLANG_ENABLE_GRAPH_POOL_BORROW, True),
     (envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE, True),
     (envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING, True),
-    (envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS, False),
 )
 
 
