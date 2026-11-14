@@ -534,6 +534,53 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(allocation_bytes(full_tokens), available)
         self.assertGreater(allocation_bytes(full_tokens + page_size), available)
 
+    def test_nvfp4_prices_each_sub_pool_with_the_fp4_method(self):
+        """An FP4 hybrid SWA pool is priced by the KV quant method (packed data,
+        block scales, and its once-per-pool workspace), not one byte per element."""
+        import torch
+
+        full_layers, swa_layers = 2, 3
+        mr = _make_model_runner(
+            self,
+            num_kv_heads=4,
+            head_dim=64,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(full_layers)),
+            swa_attention_layer_ids=list(range(full_layers, full_layers + swa_layers)),
+            swa_num_kv_heads=2,
+            swa_head_dim=128,
+            swa_v_head_dim=128,
+            page_size=16,
+        )
+        mr.kv_cache_dtype = torch.float4_e2m1fn_x2
+        mr.kv_cache_dtype_str = "nvfp4"
+
+        def cell_size(head_num, head_dim, num_layers, kv_size):
+            return 3 * head_num * head_dim * num_layers + 1000 * head_num
+
+        method = MagicMock()
+        method.compute_cell_size.side_effect = cell_size
+        with (
+            mock_cpu_env(kv_size=1),
+            patch(
+                "sglang.srt.layers.quantization.fp4_kv_cache_quant_method."
+                "get_kv_cache_quant_method",
+                return_value=method,
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(10_000_000, page_size=16)
+
+        used = config.full_max_total_num_tokens * cell_size(
+            4, 64, full_layers, 1
+        ) + config.swa_max_total_num_tokens * cell_size(2, 128, swa_layers, 1)
+        self.assertLessEqual(used, 10_000_000)
+        self.assertGreater(used, 10_000_000 * 0.99)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,

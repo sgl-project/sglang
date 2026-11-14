@@ -2577,6 +2577,19 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8"
             else mha_pool_class
         )
+        # FP4 recipes own packed data and block scales; both sub-pools share one
+        # method, whose per-layer global scales are indexed by global layer id.
+        # Only FP4 is wired here: other quant methods keep the existing pools.
+        quant_method = self._build_fp4_quant_method(
+            num_layers=self.layer_info.num_effective_layers
+        )
+        if quant_method is not None:
+            if self.is_hybrid_swa_compress:
+                raise NotImplementedError(
+                    "FP4 KV cache does not support SWA layers with their own "
+                    "head geometry yet."
+                )
+            kwargs["quant_method"] = quant_method
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         # The draft SWA ring must cover the target allocator's full token capacity.
@@ -2590,7 +2603,7 @@ class KVCacheConfigurator:
             size_swa=size_swa,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            post_capture_active=self.post_capture_kv_active,
+            post_capture_active=self.post_capture_kv_active and quant_method is None,
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),

@@ -840,6 +840,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * kv_size
             )
 
+        # Per-token bytes that each pool owns once, not once per layer (the FP4
+        # prefill dequant workspace).
+        self._full_fixed_per_token = 0
+        self._swa_fixed_per_token = 0
         if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
@@ -850,6 +854,39 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 model_config.get_swa_num_kv_heads(tp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
+        elif (
+            is_float4_e2m1fn_x2(kv_cache_dtype)
+            and model_config.attention_arch != AttentionArch.MLA
+        ):
+            # Price packed FP4 data, block scales and any workspace the recipe
+            # actually allocates, the same way the plain MHA sizer does.
+            from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+                get_kv_cache_quant_method,
+                resolve_kv_cache_quant,
+            )
+
+            quant_method = get_kv_cache_quant_method(
+                resolve_kv_cache_quant(kvc.kv_cache_dtype_str),
+                num_layers=1,
+                device=kvc.device,
+                page_size=kvc.page_size,
+            )
+            quant_method.configure_attention_backends_from_server_args(kvc.server_args)
+
+            def fp4_costs(head_num: int, head_dim: int) -> tuple[int, int]:
+                fixed = quant_method.compute_cell_size(head_num, head_dim, 0, kv_size)
+                per_layer = (
+                    quant_method.compute_cell_size(head_num, head_dim, 1, kv_size)
+                    - fixed
+                )
+                return per_layer, fixed
+
+            self._full_per_token, self._full_fixed_per_token = fp4_costs(
+                model_config.get_num_kv_heads(tp_size), model_config.head_dim
+            )
+            self._swa_per_token, self._swa_fixed_per_token = fp4_costs(
+                model_config.get_swa_num_kv_heads(tp_size), model_config.swa_head_dim
+            )
 
         # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
         self._draft_full_layers_num = 0
@@ -911,8 +948,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         there, else the target's rows plus the private draft's full rows."""
         if self._fused_full_entry is not None:
             return self._fused_full_entry
-        return self._full_per_token * (
-            self._full_layers_num + self._draft_full_layers_num
+        return (
+            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+            + self._full_fixed_per_token
         )
 
     def _swa_cell_bytes(self) -> int:
@@ -921,6 +959,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return (
             self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
             + self._draft_swa_cell_size
+            + self._swa_fixed_per_token
         )
 
     def _recompute_cell_size(self) -> None:
@@ -929,6 +968,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self._full_layers_num == 0:
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
+                + self._swa_fixed_per_token
                 + self._full_per_token * self._draft_full_layers_num
                 + self._swa_per_token * self._draft_swa_layers_num
                 + self._swa_per_token * self._draft_swa_full_layers_num
