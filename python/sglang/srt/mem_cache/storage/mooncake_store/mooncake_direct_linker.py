@@ -287,7 +287,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys)
         if not page_keys:
             return []
-        result = self.storage.batch_exists_v2(page_keys, expanded)
+        if self.load_mode == "prefetch":
+            result = self.storage.batch_exists_v2(page_keys, expanded, probe_only=True)
+        else:
+            result = self.storage.batch_exists_v2(page_keys, expanded)
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
         if restorable:
