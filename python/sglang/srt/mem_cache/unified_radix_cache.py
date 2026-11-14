@@ -4259,14 +4259,17 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _fence_write_back_on_streams(self) -> None:
-        """Submit queued write-backs and order the current and forward streams
-        (and through the latter the load stream) behind them instead of blocking
-        the host on the copies."""
+        """Submit queued write-backs and order the forward stream (and through it
+        the load stream) behind them instead of blocking the host on the copies."""
         cc = self.cache_controller
         cc.start_writing()
-        current_stream = device_module.current_stream()
+        # Without overlap the forward and state copies run on the current stream.
+        current_stream = (
+            None if cc.forward_on_fence_stream else device_module.current_stream()
+        )
         for ack in cc.ack_write_queue:
-            current_stream.wait_event(ack.finish_event)
+            if current_stream is not None:
+                current_stream.wait_event(ack.finish_event)
             cc.write_fence_stream.wait_event(ack.finish_event)
             for ack_id in ack.node_ids:
                 if ack_id in self.ongoing_write_through:
