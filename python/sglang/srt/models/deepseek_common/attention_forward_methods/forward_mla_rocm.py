@@ -23,6 +23,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
+    cp_lse_ag_out,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
@@ -59,6 +60,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    _finish_absorb_output,
     _select_local_dcp_heads_for_autotune,
 )
 from sglang.srt.models.deepseek_common.utils import (
@@ -1119,6 +1121,22 @@ class DeepseekMLARocmForwardMixin:
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
+                if (
+                    dcp_comm_backend == "ag_delay_reduce"
+                    and forward_batch.forward_mode.is_decode()
+                ):
+                    attn_output = cp_lse_ag_out(
+                        attn_output,
+                        lse,
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                    )
+                    attn_bmm_output = self.project_mla_values(
+                        attn_output, zero_allocator, dcp_group_heads=True
+                    )
+                    return _finish_absorb_output(
+                        self, attn_bmm_output, None, topk_indices
+                    )
                 if self._dcp_project_before_merge():
                     # Project-before-merge: the LSE merge is linear in the
                     # partial output, so V-project every group head first and

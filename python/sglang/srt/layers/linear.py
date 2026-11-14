@@ -1622,6 +1622,9 @@ class RowParallelLinear(LinearBase):
         self.use_presharded_weights = use_presharded_weights
         # Flag set by CpDecodeAttnTpContext to enable all_reduce during decode.
         self.use_decode_attn_tp: bool = False
+        # Set by layers.dcp.projection for --dcp-comm-backend ag_delay_reduce.
+        self.dcp_replica: Optional[torch.nn.Module] = None
+        self.dcp_replica_input_size: int = 0
 
         self.quant_method.create_weights(
             layer=self,
@@ -1770,6 +1773,23 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (tp_rank > 0 or self.skip_bias_add) else self.bias
+        # ag_delay_reduce feeds decode the whole DCP group's heads and prefill this
+        # rank's shard, so the input width selects the weight.
+        projection = self
+        if self.dcp_replica is not None:
+            width = (
+                input_parallel[0]
+                if isinstance(input_parallel, tuple)
+                else input_parallel
+            ).shape[-1]
+            if width == self.dcp_replica_input_size:
+                projection = self.dcp_replica
+            elif width != self.input_size_per_partition:
+                raise ValueError(
+                    f"attention output width {width} matches neither this "
+                    f"rank's o_proj shard ({self.input_size_per_partition}) nor "
+                    f"its DCP replica ({self.dcp_replica_input_size})"
+                )
 
         # Megatron SP "g-bar": reduce-scatter along the token dim instead of
         # all-reduce, leaving the output sharded for the next SP LayerNorm region.
@@ -1797,7 +1817,7 @@ class RowParallelLinear(LinearBase):
         with symm_ctx:
             if output_tensor is None:
                 output_parallel = self.quant_method.apply(
-                    self, input_parallel, bias=bias_
+                    projection, input_parallel, bias=bias_
                 )
             else:
                 apply_into = getattr(self.quant_method, "apply_into", None)
@@ -1807,7 +1827,7 @@ class RowParallelLinear(LinearBase):
                         "caller-owned linear output"
                     )
                 output_parallel = apply_into(
-                    self, input_parallel, output_tensor, bias=bias_
+                    projection, input_parallel, output_tensor, bias=bias_
                 )
 
         # skip_all_reduce: explicit call-site override. Also honor the

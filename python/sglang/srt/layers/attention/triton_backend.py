@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
+    cp_lse_ag_out,
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
@@ -2599,6 +2600,9 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
+            if get_parallel().dcp_comm_backend == "ag_delay_reduce":
+                o = cp_lse_ag_out(o_for_decode, local_lse, group, is_lse_base_on_e=True)
+                return o.flatten(1, 2).to(q.dtype)
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 

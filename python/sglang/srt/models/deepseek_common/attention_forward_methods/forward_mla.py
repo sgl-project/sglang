@@ -26,6 +26,7 @@ from sglang.srt.layers.cp.interleave import (
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
+    cp_lse_ag_out,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
     dcp_push_combine_fits,
@@ -168,6 +169,9 @@ class DeepseekMLAForwardMixin:
     # Apply W_UV to the DCP decode partials before the reduce (DSA layers only)
     dcp_v_preproject = False
     _dcp_v_weights: Optional[torch.Tensor] = None
+    # DCP-group V weights for ag_delay_reduce, set by layers.dcp.projection at startup.
+    _dcp_w_vc: Optional[torch.Tensor] = None
+    _dcp_w_scale_v: Optional[torch.Tensor] = None
 
     def _prepare_dcp_v_weights(self, group):
         weights = group.all_gather(self.w_vc.contiguous(), dim=0)
@@ -918,6 +922,7 @@ class DeepseekMLAForwardMixin:
             )
 
         dcp_v_projected = False
+        dcp_group_heads = False
         # correct attn_output with respect to lse from other ranks
         if self.is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
@@ -937,7 +942,20 @@ class DeepseekMLAForwardMixin:
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
-                if dcp_comm_backend in ("a2a", "fi_a2a"):
+                if (
+                    dcp_comm_backend == "ag_delay_reduce"
+                    and forward_batch.forward_mode.is_decode()
+                ):
+                    # Keep every group head: the o_proj all-reduce then sums
+                    # context partitions along with head partitions.
+                    attn_output = cp_lse_ag_out(
+                        attn_output,
+                        lse,
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                    )
+                    dcp_group_heads = True
+                elif dcp_comm_backend in ("a2a", "fi_a2a"):
                     # A head's linear V projection commutes with its LSE-weighted
                     # reduction. Exchange the narrower projected partials.
                     if (
@@ -1009,7 +1027,12 @@ class DeepseekMLAForwardMixin:
             return _finish_absorb_output(
                 self, attn_output.flatten(1, 2), attention_output_gate, topk_indices
             )
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        output_heads = (
+            self.num_local_heads * self.dcp_size
+            if dcp_group_heads
+            else self.num_local_heads
+        )
+        attn_output = attn_output.view(-1, output_heads, self.kv_lora_rank)
 
         _kvb_v = None
         kv_b_lora = kv_b_lora_correction(self)
@@ -1025,7 +1048,9 @@ class DeepseekMLAForwardMixin:
 
             _kvb_v = mla_correction.prepare_v_correction(self, attn_output)
 
-        attn_bmm_output = self.project_mla_values(attn_output, zero_allocator)
+        attn_bmm_output = self.project_mla_values(
+            attn_output, zero_allocator, dcp_group_heads=dcp_group_heads
+        )
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_v_apply,
@@ -1050,11 +1075,16 @@ class DeepseekMLAForwardMixin:
         self: DeepseekV2AttentionMLA,
         attn_output: torch.Tensor,
         zero_allocator: BumpAllocator,
+        dcp_group_heads: bool = False,
     ) -> torch.Tensor:
         """Expand latent values before LoRA correction and output gating.
 
-        MLA_ROCM uses its own projection and bypasses this hook.
+        ``dcp_group_heads`` selects the DCP-replicated V weights, for the
+        ag_delay_reduce merge that keeps every head of the group. MLA_ROCM normally
+        uses its own projection; its ag_delay_reduce path uses this hook.
         """
+        w_vc = self._dcp_w_vc if dcp_group_heads else self.w_vc
+        num_heads = attn_output.shape[1]
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
 
@@ -1079,11 +1109,11 @@ class DeepseekMLAForwardMixin:
                 attn_output.transpose(0, 1)
             )
             attn_bmm_output = attn_output.new_empty(
-                (self.num_local_heads, aligned_m, self.v_head_dim)
+                (num_heads, aligned_m, self.v_head_dim)
             )
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                 (attn_output_val, attn_output_scale),
-                (self.w_vc, self.w_scale_v),
+                (w_vc, self._dcp_w_scale_v if dcp_group_heads else self.w_scale_v),
                 attn_bmm_output,
                 masked_m,
                 expected_m,
@@ -1091,11 +1121,11 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
-        elif self.w_vc.dtype == torch.float8_e4m3fn and not _is_sail:
+        elif w_vc.dtype == torch.float8_e4m3fn and not _is_sail:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),
-                    self.w_vc.to(torch.bfloat16) * self.w_scale,
+                    w_vc.to(torch.bfloat16) * self.w_scale,
                 )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
             else:
@@ -1111,7 +1141,7 @@ class DeepseekMLAForwardMixin:
                 )
                 attn_bmm_output = bmm_fp8(
                     attn_output_val,
-                    self.w_vc,
+                    w_vc,
                     attn_output_scale,
                     self.w_scale,
                     torch.bfloat16,
@@ -1119,21 +1149,21 @@ class DeepseekMLAForwardMixin:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         elif _is_musa:
             attn_bmm_output = torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc
+                attn_output.to(torch.bfloat16).transpose(0, 1), w_vc
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
             attn_bmm_output = torch.empty(
-                (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+                (attn_output.shape[0], num_heads * self.v_head_dim),
                 dtype=attn_output.dtype,
                 device=attn_output.device,
             )
             torch.bmm(
                 attn_output.transpose(0, 1),
-                self.w_vc,
-                out=attn_bmm_output.view(
-                    -1, self.num_local_heads, self.v_head_dim
-                ).transpose(0, 1),
+                w_vc,
+                out=attn_bmm_output.view(-1, num_heads, self.v_head_dim).transpose(
+                    0, 1
+                ),
             )
         return attn_bmm_output
 

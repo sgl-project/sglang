@@ -15,7 +15,7 @@ On Kimi K3, DCP applies only to MLA layers. Request-indexed KDA state is unchang
 | Setting | Behavior |
 | --- | --- |
 | `--dcp-size N` | Enables DCP and widens virtual capacity and page size by `N`. Alias: `--decode-context-parallel-size`. |
-| `--dcp-comm-backend` | Selects the decode partial-output merge (MLA on CUDA/ROCm, MHA on Intel XPU): `ag_rs`, `a2a`, or `fi_a2a`. Unset resolves to `fi_a2a` where the DCP group shares an MNNVL domain on Blackwell, otherwise `a2a` on CUDA/ROCm/XPU. |
+| `--dcp-comm-backend` | Selects the decode partial-output merge: `ag_rs`, `ag_delay_reduce`, `a2a`, or `fi_a2a`. `ag_delay_reduce` all-gathers only LSE and delays the attention reduction into the output projection's TP all-reduce (MLA and Triton GQA on CUDA/ROCm). Unset resolves to `fi_a2a` where the DCP group shares an MNNVL domain on Blackwell, otherwise `a2a` on CUDA/ROCm/XPU. |
 | `--dcp-replicate-q-proj` | Removes the query all-gather for supported MLA weights. Use `--no-dcp-replicate-q-proj` to disable a model-specific default. |
 | `--attn-dp-size N` | Composes only when DCP groups nest inside attention TP. |
 
@@ -130,6 +130,7 @@ Normally each layer all-gathers its absorbed and rotary query components. `--dcp
 | Backend | DCP collectives per MLA layer | Notes |
 | --- | --- | --- |
 | `ag_rs` | Query AG + LSE AG + FP32 output RS | Fallback for platforms without the a2a path; opt in with `--dcp-comm-backend ag_rs` |
+| `ag_delay_reduce` | Query AG (unless Q is replicated) + LSE AG | Defers output summation to the existing attention-TP all-reduce after output projection; replicates V/O weights within DCP |
 | `a2a`, gathered Q | Query AG + packed NCCL A2A | Two collectives |
 | `a2a`, replicated Q | One packed NCCL A2A | Canonical low-latency path |
 | `fi_a2a`, replicated Q | One FlashInfer MNNVL A2A | Requires Blackwell and a DCP group inside one MNNVL domain (GB200/GB300 fabric, or a single node) |
@@ -137,6 +138,16 @@ Normally each layer all-gathers its absorbed and rotary query components. `--dcp
 When `--dcp-comm-backend` is unset, every DCP launch resolves it the same way: `fi_a2a` where the DCP group shares one MNNVL domain on Blackwell, otherwise `a2a` on CUDA/ROCm/XPU, and `ag_rs` only on platforms without the a2a path. Query replication stays model-resolved: Kimi K3 enables it by default on the a2a family, and its decode backend is `cutedsl_mla`.
 
 DCP adds a context-independent decode collective while cutting context-dependent KV storage and reads by about `c`. Extend is outside that decode cost model: it may gather cached prefix shards, restore token order, and append new tokens, and that work grows with prefix length.
+
+### Delayed reduce (`ag_delay_reduce`)
+
+Use `--dcp-comm-backend ag_delay_reduce` to retain all DCP-group heads after local attention. Each rank gathers LSE and scales its partial output by `exp(lse_r - global_lse)`, using the attention backend's log base. It then applies the output projection locally. MLA also applies the V up-projection to all group heads. The existing attention-TP all-reduce sums both the context partitions and the head partitions.
+
+This follows linearity: for a group's output weight `W`, `sum_r(alpha_r * o_r) @ W = sum_r((alpha_r * o_r) @ W)`. Moving the sum after projection removes the separate attention-output exchange. Floating-point reduction order and activation quantization can change the numerical result slightly.
+
+The output weights are gathered once before KV-cache sizing and graph capture. Decode performs more projection work and uses more weight memory; prefill retains its original TP weight shard and attention merge. Gated GQA layers additionally gather the head-local output gate. Query-projection replication is optional for MLA with this backend.
+
+Unquantized output projections are supported on CUDA/ROCm. Block-FP8 output projections require a non-preshuffled E4M3FN weight layout with 128x128 blocks; other quantization layouts are rejected. GQA requires the Triton decode backend. Model-specific MLA output-gate hooks, LoRA, speculative decoding, and online weight updates are not supported in this mode. Restart with an updated checkpoint to refresh replicated weights. Measure your workload before selecting this backend: the saved collective competes with the additional projection compute and weight reads, so gains depend on batch size and model dimensions.
 
 ## Compositions
 

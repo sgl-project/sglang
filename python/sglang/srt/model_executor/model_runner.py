@@ -91,6 +91,11 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
+from sglang.srt.layers.dcp.projection import (
+    gather_block_fp8_linear,
+    is_block_fp8_linear,
+    prepare_dcp_output_projections,
+)
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_gathered_buffer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
@@ -765,6 +770,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
+        self.maybe_init_dcp_output_projections()
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
@@ -863,6 +869,31 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if get_parallel().tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+
+    def maybe_init_dcp_output_projections(self):
+        """Replicate DCP-group output weights for the LSE-only decode merge."""
+        parallel = get_parallel()
+        if (
+            self.is_draft_worker
+            or not parallel.dcp_enabled
+            or parallel.dcp_comm_backend != "ag_delay_reduce"
+        ):
+            return
+        prepared = prepare_dcp_output_projections(
+            model=self.model,
+            group=parallel.dcp_group,
+            is_mla=self.use_mla_backend,
+            decode_attention_backend=resolve_attention_backend_strs(
+                model_runner=self
+            ).decode,
+            num_kv_heads=self.model_config.get_num_kv_heads(
+                parallel.attn_tp_size, parallel.attn_dcp_size
+            ),
+        )
+        logger.info(
+            "dcp_comm_backend=ag_delay_reduce: replicated output weights for %d attention layers",
+            prepared,
+        )
 
     def maybe_init_lora_manager(self):
         if self.spec_algorithm.is_uno():
@@ -1214,8 +1245,8 @@ class ModelRunner:
                 rows = local.shape[0]
                 r = dcp_group.rank_in_group
                 qp.weight.data = m.q_b_proj_qrep_weight[r * rows : (r + 1) * rows]
-            elif _is_block_fp8(qp):
-                m.q_b_proj_qrep = _gather_block_fp8_linear(qp, dcp_group)
+            elif is_block_fp8_linear(qp):
+                m.q_b_proj_qrep = gather_block_fp8_linear(qp, dcp_group)
             else:
                 logger.warning("dcp_replicate_q_proj: skipping unsupported q-proj")
                 continue
@@ -2698,55 +2729,3 @@ class ModelRunner:
                 load_format=load_format,
             )
         self.load_config = load_config
-
-
-def _is_block_fp8(layer: torch.nn.Module) -> bool:
-    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
-    method = layer.quant_method
-    return (
-        isinstance(method, Fp8LinearMethod)
-        and not method.use_mxfp8
-        and not method.use_marlin
-        and method.weight_block_size == [128, 128]
-        and layer.weight.dtype == torch.float8_e4m3fn
-        # An aiter-preshuffled weight is no longer row-major, so it cannot be
-        # gathered along the output dim.
-        and not getattr(layer, "aiter_bpreshuffled", False)
-    )
-
-
-def _gather_block_fp8_linear(layer: torch.nn.Module, group) -> torch.nn.Module:
-    """Gather a column-sharded block-FP8 linear and re-run its post-load step."""
-    from sglang.srt.layers.quantization.fp8_utils import (
-        inverse_transform_scale_ue8m0,
-        transform_scale_ue8m0,
-    )
-
-    scale = layer.weight_scale_inv.data
-    packed_ue8m0 = scale.dtype == torch.int32  # DeepGEMM layout
-    if packed_ue8m0:
-        scale = inverse_transform_scale_ue8m0(scale, mn=layer.weight.shape[0])
-    replica = torch.nn.Module()
-    replica.weight = torch.nn.Parameter(
-        group.all_gather(layer.weight.data, dim=0), requires_grad=False
-    )
-    scale = group.all_gather(scale, dim=0)
-    if packed_ue8m0:
-        # The shards' weights are already requantized against these UE8M0
-        # scales. Re-pack instead of letting the post-load step requantize
-        # again: that pass is not idempotent (a block whose amax sits at a
-        # power-of-two boundary halves its scale), so the replica would not
-        # match the shards bit for bit.
-        scale = transform_scale_ue8m0(scale, mn=replica.weight.shape[0])
-    replica.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
-    replica.weight_scale_inv.format_ue8m0 = packed_ue8m0
-    # The attributes Fp8LinearMethod's post-load step reads off a LinearBase,
-    # copied so the replica picks the same kernel (UE8M0 requant, MXFP8 view).
-    replica.orig_dtype = getattr(layer, "orig_dtype", None)
-    replica.deepgemm_mxfp8_input = getattr(layer, "deepgemm_mxfp8_input", False)
-    replica.keep_plain_weight_layout = getattr(layer, "keep_plain_weight_layout", False)
-    replica.prefix = f"{getattr(layer, 'prefix', 'q_b_proj')}.dcp_replica"
-    replica.quant_method = layer.quant_method
-    layer.quant_method.process_weights_after_loading(replica)
-    return replica
