@@ -1,4 +1,4 @@
-"""Reject PD sampling-mask requests before entering transfer queues."""
+"""Reject PD requests the metadata buffers cannot carry before entering transfer queues."""
 
 import unittest
 from array import array
@@ -14,10 +14,57 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def _handle_pd_request(mode, req):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.enable_session_radix_cache = False
+    scheduler.model_config = SimpleNamespace(
+        hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=120
+    )
+    scheduler.disaggregation_mode = mode
+    scheduler.disagg_metadata_buffers = SimpleNamespace(enable_sampling_mask=False)
+    scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+    scheduler.tokenizer = None
+    scheduler.dllm_config = None
+    scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+    scheduler._record_kv_event_lora_name = MagicMock()
+    scheduler.spec_algorithm = SimpleNamespace(
+        is_dflash_family=lambda: False,
+        is_uno=lambda: False,
+    )
+    scheduler._add_request_to_queue = MagicMock()
+    scheduler.output_streamer = MagicMock()
+    scheduler.tree_cache = MagicMock()
+    scheduler.beam_coordinator = MagicMock()
+    scheduler.hisparse_coordinator = None
+    scheduler.uocr_runtime = None
+    scheduler.send_abort_output = MagicMock()
+    scheduler.init_request_retirer()
+    recv_req = MagicMock(
+        session_params=None,
+        session_id=None,
+        input_embeds=None,
+        bootstrap_port=1,
+        bootstrap_room=9,
+    )
+    req.exit_via = req.send_via = req.kv.retraction_backup = None
+    req.kv.holds_kv = req.kv.holds_mamba = False
+    with (
+        patch(
+            "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+            return_value=1,
+        ),
+        patch("sglang.srt.managers.scheduler.Req", return_value=req) as make_req,
+        patch("sglang.srt.managers.scheduler.prepare_abort") as abort,
+    ):
+        scheduler.handle_generate_request(recv_req)
+    return abort, scheduler._add_request_to_queue, make_req
 
 
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
@@ -25,59 +72,44 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
         """Neither PD role may queue mask requests without metadata buffers."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
-                scheduler = Scheduler.__new__(Scheduler)
-                scheduler.enable_session_radix_cache = False
-                scheduler.model_config = SimpleNamespace(
-                    hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=120
+                abort, add_to_queue, make_req = _handle_pd_request(
+                    mode, MagicMock(return_sampling_mask=True, return_logprob=False)
                 )
-                scheduler.disaggregation_mode = mode
-                scheduler.disagg_metadata_buffers = SimpleNamespace(
-                    enable_sampling_mask=False
-                )
-                scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
-                scheduler.tokenizer = None
-                scheduler.dllm_config = None
-                scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
-                scheduler._record_kv_event_lora_name = MagicMock()
-                scheduler.spec_algorithm = SimpleNamespace(
-                    is_dflash_family=lambda: False,
-                    is_uno=lambda: False,
-                )
-                scheduler._add_request_to_queue = MagicMock()
-                scheduler.output_streamer = MagicMock()
-                scheduler.tree_cache = MagicMock()
-                scheduler.beam_coordinator = MagicMock()
-                scheduler.hisparse_coordinator = None
-                scheduler.uocr_runtime = None
-                scheduler.send_abort_output = MagicMock()
-                scheduler.init_request_retirer()
-                recv_req = MagicMock(
-                    session_params=None,
-                    session_id=None,
-                    input_embeds=None,
-                    bootstrap_port=1,
-                    bootstrap_room=9,
-                )
-                req = MagicMock(return_sampling_mask=True, return_logprob=False)
-                req.exit_via = req.send_via = req.kv.retraction_backup = None
-                req.kv.holds_kv = req.kv.holds_mamba = False
-                with (
-                    patch(
-                        "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
-                        return_value=1,
-                    ),
-                    patch(
-                        "sglang.srt.managers.scheduler.Req", return_value=req
-                    ) as make_req,
-                    patch("sglang.srt.managers.scheduler.prepare_abort") as abort,
-                ):
-                    scheduler.handle_generate_request(recv_req)
                 self.assertEqual(make_req.call_args.kwargs["vocab_size"], 120)
                 abort.assert_called_once()
                 self.assertEqual(
                     abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
                 )
-                scheduler._add_request_to_queue.assert_not_called()
+                add_to_queue.assert_not_called()
+
+    def test_pd_top_logprobs_beyond_capacity_return_bad_request_before_admission(
+        self,
+    ):
+        capacity = 8
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            for top_logprobs_num in (capacity, capacity + 1):
+                with (
+                    self.subTest(mode=mode, top_logprobs_num=top_logprobs_num),
+                    get_context().override_server_args(
+                        disaggregation_max_top_logprobs_num=capacity
+                    ),
+                ):
+                    req = MagicMock(return_sampling_mask=True, return_logprob=True)
+                    req.logprob.top_logprobs_num = top_logprobs_num
+                    abort, add_to_queue, _ = _handle_pd_request(mode, req)
+                    abort.assert_called_once()
+                    self.assertIn(
+                        (
+                            "top_logprobs_num"
+                            if top_logprobs_num > capacity
+                            else "return_sampling_mask"
+                        ),
+                        abort.call_args.args[1],
+                    )
+                    self.assertEqual(
+                        abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
+                    )
+                    add_to_queue.assert_not_called()
 
     def test_rejected_streaming_turn_leaves_session_idle(self):
         """A turn rejected after `create_req` must not wedge its streaming session."""

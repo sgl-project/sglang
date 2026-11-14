@@ -68,8 +68,13 @@ with DCP.
 
 DCP keys separate TP/DCP/PP/CP sizes and logical page sizes. With TP=4/DCP=2,
 ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
-Use matching model settings. KV format and host layout are not yet in the keys;
-use different `extra_backend_tag` values when these differ.
+Use matching model settings. HiCache includes the server's resolved logical KV
+dtype and any `storage_format_tag` in the model prefix, for both DCP and non-DCP
+keys. FP8 E4M3 and E5M2 use different keys even when both are backed by `uint8`.
+This works with the default Mooncake master
+and leaves configured tenants unchanged. Existing keys become cold and are
+repopulated; there is no fallback to untyped objects. Other format differences
+still require different `extra_backend_tag` values.
 
 ### GPU staging capacity
 

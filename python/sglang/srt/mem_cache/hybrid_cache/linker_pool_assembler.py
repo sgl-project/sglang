@@ -480,18 +480,32 @@ def _mha_device_pool_entry(
     indices_from_pool: PoolName | None = None,
     draft_pools: Sequence[Any] = (),
 ) -> DevicePoolEntry:
-    # TODO(alphabetc1): support mxfp8.
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMXFP8
+
+    parts = [pool.k_buffer, pool.v_buffer]
+    if isinstance(pool, MHATokenToKVPoolMXFP8):
+        # Only whole aligned pages move, and a page's scales are contiguous in
+        # both layouts, so they ride as rows aligned with the payload slots.
+        slots = pool.k_buffer[0].shape[0]
+        parts += [
+            [scale.view(torch.uint8).reshape(slots, -1) for scale in scales]
+            for scales in (pool.k_scale_buffer, pool.v_scale_buffer)
+        ]
+    elif pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
+        raise ValueError(
+            "The direct external linker does not support FP4 scaled KV caches yet."
+        )
     if any(
         p.k_scale_buffer is not None or p.native_k_scale_buffer is not None
-        for p in (pool, *draft_pools)
+        for p in draft_pools
     ):
         raise ValueError(
-            "The direct external linker does not support scaled KV caches yet."
+            "The direct external linker does not support scaled draft KV caches yet."
         )
     if any(p.page_size != page_size for p in draft_pools):
         raise ValueError("Draft KV page size must match the tree page size.")
     num_layers = len(pool.k_buffer)
-    buffers = [*pool.k_buffer, *pool.v_buffer]
+    buffers = [buffer for part in parts for buffer in part]
     draft_buffer_indices = []
     for draft in draft_pools:
         for k, v in zip(draft.k_buffer, draft.v_buffer, strict=True):
@@ -504,7 +518,7 @@ def _mha_device_pool_entry(
         components=[buffers],
         layer_mapping=_with_draft_buffers(
             {
-                layer: (index, num_layers + index)
+                layer: tuple(part * num_layers + index for part in range(len(parts)))
                 for layer, index in layer_mapping.items()
             },
             draft_buffer_indices,

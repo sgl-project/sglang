@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Retag a freshly-built sgl-fa3 wheel for the sgl-whl index.
 #
-# scikit-build-core tags the wheel `cp311-abi3-linux_x86_64`. `linux_x86_64` is
+# scikit-build-core tags the wheel `cp310-abi3-linux_x86_64`. `linux_x86_64` is
 # not installable from an index -- pip and PyPI both reject it -- so the
 # platform becomes manylinux2014_<arch>, and the version gains the +cuXXX local
 # segment the index keys on. The abi3 tag is left alone.
 #
-# Input:  <WHEEL_DIR>/sgl_fa3-<VERSION>-cp311-abi3-linux_<ARCH>.whl
-# Output: <WHEEL_DIR>/sgl_fa3-<VERSION>+<CU_TAG>-cp311-abi3-manylinux2014_<ARCH>.whl
+# Input:  <WHEEL_DIR>/sgl_fa3-<VERSION>-cp310-abi3-linux_<ARCH>.whl
+# Output: <WHEEL_DIR>/sgl_fa3-<VERSION>+<CU_TAG>-cp310-abi3-manylinux2014_<ARCH>.whl
 #
 # Usage: rename_sgl_fa3_whl.sh <WHEEL_DIR> <CU_TAG> <ARCH>
 # (sgl_fa3/scripts/build.sh in sgl-project/sgl-flash-attn runs it inside the

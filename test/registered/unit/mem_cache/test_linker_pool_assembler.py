@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _mha_device_pool_entry,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -131,6 +132,48 @@ class TestDevicePoolEntry(CustomTestCase):
             with self.subTest(indices=indices.tolist()):
                 with self.assertRaisesRegex(ValueError, error):
                     pool.prepare_locations(indices)
+
+    def test_mxfp8_pages_carry_their_scale_blocks(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MHATokenToKVPoolMXFP8,
+        )
+
+        pool = MHATokenToKVPoolMXFP8.__new__(MHATokenToKVPoolMXFP8)
+        pool.k_buffer = [
+            torch.zeros((8, 1, 3), dtype=torch.float8_e4m3fn) for _ in range(2)
+        ]
+        pool.v_buffer = [
+            torch.zeros((8, 1, 5), dtype=torch.float8_e4m3fn) for _ in range(2)
+        ]
+        pool.k_scale_buffer = [
+            torch.zeros((2, 1, 4, 1, 2), dtype=torch.float8_e8m0fnu) for _ in range(2)
+        ]
+        pool.v_scale_buffer = [
+            torch.zeros((2, 1, 4, 1, 3), dtype=torch.float8_e8m0fnu) for _ in range(2)
+        ]
+        entry = _mha_device_pool_entry(PoolName.KV, pool, {0: 0, 2: 1}, 4)
+
+        self.assertEqual(entry.layer_mapping, {0: (0, 2, 4, 6), 2: (1, 3, 5, 7)})
+        pointers, sizes = entry.get_page_buffer_meta(torch.arange(4, 8))
+        self.assertEqual(
+            pointers,
+            [
+                buffer[index].data_ptr()
+                for buffer, index in zip(
+                    [*pool.k_buffer, *pool.v_buffer, *pool.k_scale_buffer]
+                    + pool.v_scale_buffer,
+                    [4] * 4 + [1] * 4,
+                )
+            ],
+        )
+        self.assertEqual(sizes, [12, 12, 20, 20, 8, 8, 12, 12])
+
+        fp4 = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        fp4.k_buffer, fp4.v_buffer = pool.k_buffer, pool.v_buffer
+        fp4.k_scale_buffer, fp4.native_k_scale_buffer = pool.k_scale_buffer, None
+        with self.assertRaisesRegex(ValueError, "FP4 scaled KV"):
+            _mha_device_pool_entry(PoolName.KV, fp4, {0: 0}, 4)
 
 
 class TestDevicePoolGroup(CustomTestCase):

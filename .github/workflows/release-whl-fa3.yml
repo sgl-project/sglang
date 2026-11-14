@@ -42,7 +42,7 @@ jobs:
   build:
     if: github.repository == 'sgl-project/sglang'
     # One wheel: x86_64 only (FA3 targets sm_80/sm_86/sm_90a), and abi3
-    # (cp311-abi3) so 3.11 only drives the build.
+    # (cp310-abi3), built with the oldest CPython it supports.
     runs-on: x64-kernel-build-node
     steps:
       - name: Clean workspace (remove root-owned files from prior runs)
@@ -60,10 +60,10 @@ jobs:
           ref: ${{ inputs.branch || 'sgl-kernel' }}
           path: sgl-flash-attn
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Set wheel version
         run: |
@@ -71,7 +71,7 @@ jobs:
           cat sgl-flash-attn/sgl_fa3/python/sgl_fa3/_version.py
 
       - name: Build wheel
-        run: bash sgl-flash-attn/sgl_fa3/scripts/build.sh 3.11 13.0 "${{ github.workspace }}"
+        run: bash sgl-flash-attn/sgl_fa3/scripts/build.sh 3.10 13.0 "${{ github.workspace }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

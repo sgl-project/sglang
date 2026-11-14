@@ -21,7 +21,7 @@ import logging
 import re
 from array import array
 from functools import lru_cache
-from typing import Iterable, List, Optional, Set, Tuple, TypedDict
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -52,11 +52,6 @@ from sglang.srt.utils import flatten_nested_list, is_xpu
 logger = logging.getLogger(__name__)
 
 cached_get_processor = lru_cache(get_processor)
-
-
-class Gemma3ImagePixelInputs(TypedDict):
-    pixel_values: torch.Tensor
-    """Shape: `(batch_size * num_images, num_channels, height, width)`"""
 
 
 class Gemma3MultiModalProjector(nn.Module):

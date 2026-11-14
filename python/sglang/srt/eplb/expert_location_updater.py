@@ -31,9 +31,7 @@ from sglang.srt.utils import get_bool_env_var, is_npu
 
 _is_npu = is_npu()
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.eplb import (
-        update_expert_weights_with_staging,
-    )
+    from sglang.srt.hardware_backend.npu.eplb import migrate_expert_weights
 
 
 logger = logging.getLogger(__name__)
@@ -153,7 +151,7 @@ def _update_expert_weights_raw(
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
     if _is_npu:
-        return update_expert_weights_with_staging(
+        return migrate_expert_weights(
             weights_by_layer=routed_experts_weights_of_layer,
             old_metadata=old_expert_location_metadata,
             new_metadata=new_expert_location_metadata,
@@ -243,6 +241,7 @@ def update_expert_weights_single_layer(
     missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
     log_metrics: bool = False,
+    group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -419,6 +418,7 @@ def update_expert_weights_single_layer(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
                         peer=src_rank,
+                        group=group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -467,6 +467,7 @@ def update_expert_weights_single_layer(
                         op=torch.distributed.isend,
                         tensor=_get_tensor(send_weights, i, src_expert_location),
                         peer=dst_rank,
+                        group=group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)

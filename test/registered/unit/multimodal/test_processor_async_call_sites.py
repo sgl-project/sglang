@@ -149,6 +149,9 @@ _NO_WORKER_POOL_ROUTE = {
     # in _preprocess_media_async and _run_preprocess_and_build_artifact_batch.
     "muse_spark_omni.py",
     "nano_nemotron_vl.py",
+    # Inkling2 renders token-first prompts and assembles them in io_executor
+    # (process_mm_data_async in multimodal/inkling2/processor.py).
+    "processor.py",
     "voxtral.py",
     "whisper.py",
 }

@@ -441,9 +441,3 @@ class GatedResidual(HyperConnectionBase):
             self.hidden_size,
         ).to(self.params_dtype)
         return updated_residuals
-
-
-HYPERCONNECTION_CLASS_DICT = {
-    "hyperconnection_average": HyperConnectionBase,
-    "gated_residual_simple": GatedResidual,
-}

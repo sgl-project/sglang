@@ -8,6 +8,7 @@ register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import copy
 import re
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -540,6 +541,111 @@ class TestSamplingParamsNormalize(CustomTestCase):
             f"stop_regex is {MAX_STOP_REGEX_LEN + 1} bytes, over the "
             f"{MAX_STOP_REGEX_LEN}-byte limit",
         )
+
+    def test_stop_regex_rejects_compounding_backtracking(self):
+        """A short stop pattern must not monopolize the scheduler on a no-match tail."""
+        patterns = [
+            r"(a+)+b",
+            r"(?:a+?)+b",
+            r"(?:.|.)*Z",
+            r"(a|aa)+b",
+            r"(?:a*){10}b",
+            r"(?:.?){30}Z",
+            r"a*a*b",
+            r"(a*)a*b",
+            r"a+(?:bc|d+)",
+            r"(?:a{1,3}){4}b",
+        ]
+        if sys.version_info >= (3, 11):
+            patterns.extend((r"(?>(a+)+b)", r"(?:a+)+\w++"))
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                sp = SamplingParams(stop_regex=pattern)
+                with self.assertRaisesRegex(ValueError, "stop_regex"):
+                    sp.normalize(self._mock_tokenizer())
+                self.assertFalse(sp.is_normalized)
+
+    def test_stop_regex_bounds_repeat_products(self):
+        """Nested counts and empty-body repeats share the Rust admission budget."""
+        for pattern in (r"a{511}", r"(?:a{7}){73}", r"a{0,511}"):
+            with self.subTest(admitted=pattern):
+                sp = SamplingParams(stop_regex=pattern)
+                sp.normalize(self._mock_tokenizer())
+                self.assertTrue(sp.is_normalized)
+
+        for pattern in (
+            r"a{512}",
+            r"(?:a{16}){32}",
+            r"(?:){1048575}x",
+            r"a{4294967295}",
+        ):
+            with self.subTest(rejected=pattern):
+                with self.assertRaisesRegex(ValueError, "stop_regex"):
+                    SamplingParams(stop_regex=pattern).normalize(self._mock_tokenizer())
+
+    def test_stop_regex_rejects_unanalyzed_constructs(self):
+        """Look-around and backreferences must not bypass the repetition checks."""
+        for pattern in (
+            r"(?=(a+)+b)",
+            r"(?!(a+)+b)",
+            r"(?<=a)b",
+            r"(a+)\1",
+            r"(a)?(?(1)b|c)",
+        ):
+            with self.subTest(pattern=pattern):
+                with self.assertRaisesRegex(ValueError, "stop_regex"):
+                    SamplingParams(stop_regex=pattern).normalize(self._mock_tokenizer())
+
+    def test_stop_regex_limits_nesting(self):
+        """Nested groups are bounded before recursive decode-path compilation."""
+        SamplingParams(stop_regex="(" * 64 + "a" + ")" * 64).normalize(
+            self._mock_tokenizer()
+        )
+        with self.assertRaisesRegex(ValueError, "stop_regex"):
+            SamplingParams(stop_regex="(" * 65 + "a" + ")" * 65).normalize(
+                self._mock_tokenizer()
+            )
+
+    def test_stop_regex_admission_preserves_safe_patterns_and_windows(self):
+        """Cost checks must keep ordinary stops and their existing scan bounds."""
+        cases = [
+            (r"[.!?]\s*$", MAX_LEN + 1),
+            (r"and|or", 3),
+            (r"\d+", MAX_LEN),
+            (r"colou?r", 6),
+            (r"(?i)[a-z]+", MAX_LEN),
+            (r"(?:a|b)+", MAX_LEN),
+            (r"[a-f0-9]{40}", 40),
+            (r"\d{4}-\d{2}", 7),
+            (r"(foo|bar)\d{2}", 5),
+            (r"(?P<end>END)", 3),
+            (r"\(a\+\)\+b", 6),
+            ("(?x)END # (a+)+b", 3),
+            ("停止", 2),
+            ("", 0),
+        ]
+        if sys.version_info >= (3, 11):
+            cases.extend(((r"(?>END)", MAX_LEN), (r"a++b", MAX_LEN + 1)))
+        for pattern, bound in cases:
+            with self.subTest(pattern=pattern):
+                sp = SamplingParams(stop_regex=pattern)
+                sp.normalize(self._mock_tokenizer())
+                self.assertEqual(sp.stop_regex_strs, [pattern])
+                self.assertEqual(sp.stop_regex_max_len, bound)
+
+    def test_stop_regex_checks_every_pattern_in_a_list(self):
+        with self.assertRaisesRegex(ValueError, "stop_regex"):
+            SamplingParams(stop_regex=["END", r"(a+)+b"]).normalize(
+                self._mock_tokenizer()
+            )
+
+    def test_stop_regex_guards_do_not_change_grammar_regex_or_literal_stops(self):
+        """Structured-output regex and literal stop strings have different engines."""
+        pattern = r"(a+)+b"
+        sp = SamplingParams(regex=pattern, stop=pattern)
+        sp.normalize(self._mock_tokenizer())
+        self.assertEqual(sp.regex, pattern)
+        self.assertEqual(sp.stop_strs, [pattern])
 
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):

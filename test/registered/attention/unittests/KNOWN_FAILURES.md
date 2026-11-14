@@ -69,7 +69,7 @@ so that "skipped: ..." results have a quick lookup.
 | `flashmla` decode/verify | SM 9.0 (Hopper) only | `mla/test_flashmla.py:_DECODE_REQUIRES_SM90A` | `Dense decode MLA is only supported on SM90a architecture` |
 | `trtllm_mla` | SM 12.0a / 12.1a | `mla/test_trtllm_mla.py::_supported` | FlashInfer XQA MLA dispatch reject |
 | `trtllm_mha` prefill | SM ≥ 10.0 | `dense/test_trtllm_mha.py` decode-only matrix | FlashInfer TRT-LLM Gen FMHA reject (`Unsupported architecture`) |
-| `dsa` `fa3` impl | SM 9.x only | `dsa_impl_capability("fa3")` | `flash_attn at sgl-kernel is only supported on sm90 and above` |
+| `dsa` `fa3` impl | SM 9.x only | `dsa_impl_capability("fa3")` | `sgl-fa3 is only supported on sm8x and sm90` |
 | `dsa` `trtllm` impl | exactly SM 10.0 | `dsa_impl_capability("trtllm")` | `Missing TRTLLM-GEN kernel` (compiled for SM10.0) |
 | `fa3` (non-MLA) | SM 80 or SM 90 | `_is_fa3_supported` in `flash_attention_v3.py` | `attention_registry.py:177-180` reject |
 
