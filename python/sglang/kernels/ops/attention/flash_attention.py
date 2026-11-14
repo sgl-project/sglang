@@ -50,6 +50,7 @@ def flash_attn_with_kvcache(
     out=None,
     max_seqlen_k: Optional[int] = None,
     mask_mod=None,
+    rel_bias_scale_after_add=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -217,6 +218,7 @@ def flash_attn_with_kvcache(
             sfk=sfk,
             sfv=sfv,
             rel_bias=rel_bias,
+            rel_bias_scale_after_add=rel_bias_scale_after_add,
             rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
             out=out,
@@ -261,6 +263,7 @@ def flash_attn_varlen_func(
     ver=3,
     out=None,
     mask_mod=None,
+    rel_bias_scale_after_add=False,
 ):
     if mask_mod is not None and ver != 4:
         raise NotImplementedError("mask_mod requires FlashAttention 4")
@@ -327,6 +330,7 @@ def flash_attn_varlen_func(
             sfk=sfk,
             sfv=sfv,
             rel_bias=rel_bias,
+            rel_bias_scale_after_add=rel_bias_scale_after_add,
             rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
             out=out,
