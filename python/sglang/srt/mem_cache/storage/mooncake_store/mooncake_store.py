@@ -466,6 +466,36 @@ class MooncakeBaseStore:
         finally:
             self.clear_request_context()
 
+    @staticmethod
+    def _valid_object_buffers(ptrs, sizes):
+        ptrs = ptrs if isinstance(ptrs, Sequence) else (ptrs,)
+        sizes = sizes if isinstance(sizes, Sequence) else (sizes,)
+        return (
+            bool(ptrs)
+            and len(ptrs) == len(sizes)
+            and all(type(value) is int and value > 0 for value in (*ptrs, *sizes))
+        )
+
+    @staticmethod
+    def _checked_io_results(results, buffer_sizes, *, is_set):
+        if len(results) != len(buffer_sizes):
+            return [-1] * len(buffer_sizes)
+        checked = []
+        for result, size in zip(results, buffer_sizes):
+            expected_bytes = sum(size) if isinstance(size, Sequence) else size
+            valid = (
+                isinstance(result, int)
+                and not isinstance(result, bool)
+                and expected_bytes > 0
+                and (result == 0 if is_set else result == expected_bytes)
+            )
+            checked.append(result if valid else -1)
+        return checked
+
+    def _batch_exist(self, key_strs: List[str]) -> List[int]:
+        results = self.store.batch_is_exist(key_strs)
+        return results if len(results) == len(key_strs) else [-1] * len(key_strs)
+
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     @staticmethod
@@ -1374,6 +1404,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         results: dict = {}
         for name, key_multiplier, start, end in prepared:
+            if len(io_results) != len(all_key_strs):
+                results[name] = [False] * ((end - start) // key_multiplier)
+                continue
             results[name] = self._batch_postprocess(
                 io_results[start:end],
                 is_set_operate=is_set,
@@ -1548,6 +1581,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 2
                 if self.should_split_heads:
                     key_multiplier *= self.split_factor
+
+        if len(results) % key_multiplier:
+            return [False] * (len(results) // key_multiplier)
 
         result_groups = [
             results[i : i + key_multiplier]
@@ -1726,7 +1762,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         success_count = 0
         for i in range(len(keys)):
-            if exist_result[i] == 0:
+            # A short existence reply is normalized to -1 (unknown), which is
+            # not a stored state. Only an explicit 1 counts as success.
+            if exist_result[i] != 1:
                 break
             success_count += 1
         # TODO: return the number of consecutive successful operations from the start.
@@ -1826,6 +1864,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         group_ids: Optional[List[str]] = None,
         session_ids: Optional[List[str]] = None,
     ) -> List[int]:
+        if not len(key_strs) == len(buffer_ptrs) == len(buffer_sizes):
+            raise ValueError("Mooncake key, pointer and size counts differ")
+        if not all(map(self._valid_object_buffers, buffer_ptrs, buffer_sizes)):
+            return [-1] * len(key_strs)
         config = None
         if self._can_use_group_semantics() and group_ids is not None:
             if len(group_ids) != len(key_strs):
@@ -1841,27 +1883,31 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
+            results = self.store.batch_put_from_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         elif config is not None:
-            return self.store.batch_put_from(
+            results = self.store.batch_put_from(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+            results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        return self._checked_io_results(results, buffer_sizes, is_set=True)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
+        if not len(key_strs) == len(buffer_ptrs) == len(buffer_sizes):
+            raise ValueError("Mooncake key, pointer and size counts differ")
+        if not all(map(self._valid_object_buffers, buffer_ptrs, buffer_sizes)):
+            return [-1] * len(key_strs)
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
-
-    def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self.store.batch_is_exist(key_strs)
+        else:
+            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        return self._checked_io_results(results, buffer_sizes, is_set=False)
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
