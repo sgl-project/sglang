@@ -81,7 +81,7 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.layers.moe import aiter_presort, route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
@@ -1485,8 +1485,10 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            # The radix-4 route+sort launch zeroes the published latent for
+            # fused_moe, so route inside the block too.
             with zero_copy_context.set_moe_output(latent):
+                topk_output = self.topk(hidden_states, router_logits)
                 expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1763,16 +1765,21 @@ class KimiK3MoE(nn.Module):
         group, and only this rank's CP rows of the output are returned."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if cp_shard_rows:
-            return self._forward_cp_shard_rows(hidden_states)
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
-        else:
-            out = self._forward_unfused(
-                hidden_states,
-                prefix_sum=prefix_sum,
-                valid_token_count=valid_token_count,
-            )
+        try:
+            if cp_shard_rows:
+                return self._forward_cp_shard_rows(hidden_states)
+            if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+                out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            else:
+                out = self._forward_unfused(
+                    hidden_states,
+                    prefix_sum=prefix_sum,
+                    valid_token_count=valid_token_count,
+                )
+        finally:
+            # Every self.topk call may register a radix-4 presort; one that no
+            # fused_moe consumed must not outlive this layer (AITER's contract).
+            aiter_presort.clear_registration()
         return out.view(num_tokens, hidden_size)
 
 
