@@ -424,9 +424,18 @@ class HunyuanDetector(BaseFormatDetector):
                     tool_name not in self._tool_indices
                     and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
                 ):
+                    # Skip the whole call, as detect_and_parse does.
+                    tc_end = self._buffer.find(self.tool_call_end_token, boundary_pos)
+                    if tc_end == -1:
+                        self._buffer = self._buffer[tc_start:]
+                        break
                     logger.warning(
                         "Model attempted to call undefined function: %s", tool_name
                     )
+                    self._buffer = self._buffer[
+                        tc_end + len(self.tool_call_end_token) :
+                    ]
+                    continue
 
                 self._streaming_tool_name = tool_name
                 self.current_tool_id += 1
