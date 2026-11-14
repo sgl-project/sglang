@@ -138,6 +138,22 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         raise ValueError(
             "--engram-config: replication 'per_node' needs the TP group on one node."
         )
+    if config.replication == EngramReplication.GROUP_SHARDS:
+        if (
+            not envs.SGLANG_DSV41_ENGRAM_GROUP_STORE.get()
+            or envs.SGLANG_DSV41_ENGRAM_GROUP_SIZE.get() < cfg.tp_size
+        ):
+            raise ValueError(
+                "--engram-config: replication 'group_shards' needs "
+                "SGLANG_DSV41_ENGRAM_GROUP_STORE, a directory every server of the "
+                "group sees, and SGLANG_DSV41_ENGRAM_GROUP_SIZE, the group's GPU "
+                "count (at least --tp-size)."
+            )
+        if cfg.pp_size > 1:
+            raise ValueError(
+                "--engram-config: replication 'group_shards' does not support "
+                "pipeline parallelism."
+            )
     declare_resolution(server_args, "_resolve_engram_config", engram_config=config)
     logger.info("DeepSeek-V4.1 Engram tables: %s", config)
 

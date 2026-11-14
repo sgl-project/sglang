@@ -2077,6 +2077,10 @@ class Envs:
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
     # Deprecated for --engram-config "lookup".
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
+    # --engram-config replication 'group_shards': a directory every server of
+    # the group sees, empty for each deployment, and the group's GPU count.
+    SGLANG_DSV41_ENGRAM_GROUP_STORE = EnvStr("")
+    SGLANG_DSV41_ENGRAM_GROUP_SIZE = EnvInt(0)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
