@@ -455,6 +455,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--weight-cache-max-bytes`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Admission limit in bytes for a newly started weight cache daemon. The daemon rejects checkpoint estimates above the limit before loading and checks measured GPU reservation and the static memory upper bound (total device memory times `--mem-fraction-static`) before exporting weights. This is not a GPU peak-memory limit and does not constrain an already-running daemon when connecting as a client. The engine separately checks actual free memory and KV cache needs. The cap cannot be combined with weight offloading. The checkpoint estimate covers the whole checkpoint and can be conservative for tensor parallelism. If file selection is uncertain, the estimate is deferred and the measured cap is enforced after loading. When unset, the daemon applies no weight cache limit.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-running-requests`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of running requests.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

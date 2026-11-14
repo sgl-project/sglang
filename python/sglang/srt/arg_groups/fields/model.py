@@ -406,3 +406,16 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    weight_cache_max_bytes: A[
+        Optional[int],
+        Arg(
+            help="Admission limit in bytes for a newly started weight cache daemon. "
+            "The daemon rejects checkpoint estimates above the limit before loading "
+            "and checks measured GPU reservation and the static memory upper bound "
+            "before exporting weights. This is not a GPU peak-memory limit and "
+            "does not constrain an already-running daemon when connecting as a "
+            "client. The engine separately checks free memory and KV cache needs. "
+            "The cap cannot be combined with weight offloading. Unset keeps the "
+            "previous behavior.",
+        ),
+    ] = None
