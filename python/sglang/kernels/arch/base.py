@@ -47,6 +47,16 @@ class DeviceArch:
         return self.props.shared_memory_per_block_optin
 
     @cached_property
+    def smem_bytes(self) -> int:
+        """Shared memory a kernel can use per block: the opt-in limit, except on SM107,
+        where the device query does not report the capacity and CuTe DSL's is used."""
+        if self.is_sm(10, 7):
+            import cutlass
+
+            return cutlass.memory.get_smem_capacity_in_bytes("sm_107")
+        return self.smem_per_block_optin
+
+    @cached_property
     def smem_per_sm(self) -> int:
         return self.props.shared_memory_per_multiprocessor
 
