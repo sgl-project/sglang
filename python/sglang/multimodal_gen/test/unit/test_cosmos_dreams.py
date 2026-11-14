@@ -41,6 +41,7 @@ from sglang.multimodal_gen.registry import (
 )
 from sglang.multimodal_gen.runtime.models.dits import cosmos_dreams
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
+    CosmosDreamsKVCache,
     build_cosmos_dreams_position_ids,
     interleave_action_vision_tokens,
     null_action_token_slices,
@@ -51,9 +52,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3DecodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
+    EXTRA_TARGET_LATENT_FRAMES,
     CausalDecodeQueue,
+    CosmosDreamsPrepareStage,
     CosmosDreamsRolloutStage,
-    _history_view,
     _RolloutContext,
     actions_for_frames,
     append_kv_history,
@@ -79,6 +81,7 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
 from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps
+from sglang.test.test_utils import CustomTestCase
 
 # ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Bimanual
 # (checkpoint causal_8b_sf_dmd_max_4step_cam_chunk4_480p_961f@iter_000002000).
@@ -657,8 +660,8 @@ class TestCosmosDreamsPositionIds(unittest.TestCase):
             _, _, v = cosmos_dreams._joint_attention(
                 attention,
                 hidden,
-                prefix_k=torch.zeros(1, 0, 1, 2),
-                prefix_v=torch.zeros(1, 0, 1, 2),
+                text_kv=(torch.zeros(1, 0, 1, 2), torch.zeros(1, 0, 1, 2)),
+                history_kv=None,
                 cos_sin_cache=None,
                 rope_positions=None,
                 null_token_slices=slices,
@@ -689,27 +692,6 @@ class TestCosmosDreamsSdeSeeding(unittest.TestCase):
 
 
 class TestCosmosDreamsKVHistory(unittest.TestCase):
-    def test_empty_retrieval_stays_empty_during_clean_commit(self):
-        kv = (torch.ones(1, 2, 1, 1), torch.ones(1, 2, 1, 1))
-        archive = [kv]
-        selected = _history_view(archive, [], tokens_per_frame=1)
-
-        def transformer(latent, timestep, *, history_kv, **kwargs):
-            self.assertEqual(history_kv[0][0].shape[1], 0)
-            return SimpleNamespace(current_kv=[(kv[0][:, :1], kv[1][:, :1])])
-
-        result = commit_clean_kv(
-            transformer,
-            torch.zeros(1, 1, 1, 1, 1),
-            history=archive,
-            read_history=selected,
-            dtype=torch.float32,
-            tokens_per_frame=1,
-            sink_frames=0,
-            window_frames=4,
-        )
-        self.assertEqual(result[0][0].shape[1], 3)
-
     @staticmethod
     def _frame_kv(frame: int, layers: int = 2, tokens_per_frame: int = 2):
         value = torch.full((1, tokens_per_frame, 1, 1), float(frame))
@@ -753,6 +735,572 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
                 sink_frames=0,
                 window_frames=3,
             )
+
+
+class TestCosmosDreamsKVBuffer(CustomTestCase):
+    @staticmethod
+    def _stage(cache, current):
+        views = []
+        for layer, (key, value) in enumerate(current):
+            all_k, all_v = cache.attention_buffer(layer, key.shape[1])
+            all_k[:, -key.shape[1] :].copy_(key)
+            all_v[:, -value.shape[1] :].copy_(value)
+            views.append((all_k, all_v))
+        return views
+
+    def test_noise_is_not_committed_and_compaction_preserves_joint_attention(self):
+        """Persistent suffix writes must preserve sink/recent history through
+        eviction. Denoise chunks may span two frames, but clean commits contain
+        one frame. Shared scratch must not leak another layer's K/V.
+        """
+        generator = torch.Generator().manual_seed(42)
+        for sinks, window in [(0, 1), (1, 3), (8, 55)]:
+            with self.subTest(sinks=sinks, window=window):
+
+                def pairs(count):
+                    return [
+                        tuple(
+                            torch.randn(1, count, 2, 4, generator=generator)
+                            for _ in range(2)
+                        )
+                        for _ in range(2)
+                    ]
+
+                text = pairs(7)
+                cache = CosmosDreamsKVCache(
+                    text,
+                    tokens_per_frame=2,
+                    sink_frames=sinks,
+                    window_frames=window,
+                    max_current_frames=2,
+                )
+                history = None
+                for _ in range(sinks + window + 3):
+                    for _ in range(4):
+                        self._stage(cache, pairs(4))
+                        if history is not None:
+                            for actual, expected in zip(cache, history):
+                                for a, b in zip(actual, expected):
+                                    torch.testing.assert_close(a, b, rtol=0, atol=0)
+                    current = pairs(2)
+                    actual_kv = self._stage(cache, current)
+                    for layer, actual in enumerate(actual_kv):
+                        expected = tuple(
+                            torch.cat(
+                                [text[layer][kind]]
+                                + ([] if history is None else [history[layer][kind]])
+                                + [current[layer][kind]],
+                                dim=1,
+                            )
+                            for kind in range(2)
+                        )
+                        q = torch.randn(1, 2, 4, 4, generator=generator)
+
+                        def attend(kv):
+                            return torch.nn.functional.scaled_dot_product_attention(
+                                q.transpose(1, 2),
+                                kv[0].transpose(1, 2),
+                                kv[1].transpose(1, 2),
+                                enable_gqa=True,
+                            )
+
+                        torch.testing.assert_close(
+                            attend(actual), attend(expected), rtol=0, atol=0
+                        )
+                    history = append_kv_history(
+                        history,
+                        current,
+                        tokens_per_frame=2,
+                        sink_frames=sinks,
+                        window_frames=window,
+                    )
+                    updated = append_kv_history(
+                        cache,
+                        current,
+                        tokens_per_frame=2,
+                        sink_frames=sinks,
+                        window_frames=window,
+                    )
+                    self.assertIs(updated, cache)
+                    for actual, expected in zip(cache, history):
+                        for a, b in zip(actual, expected):
+                            torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    def test_full_history_retains_every_frame_without_compaction(self):
+        """Full history must grow in-place through its request capacity without
+        evicting frames or allocating sliding-compaction resources.
+        """
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device):
+                text = [(torch.ones(1, 3, 2, 4, device=device),) * 2] * 2
+                cache = CosmosDreamsKVCache(
+                    text,
+                    tokens_per_frame=2,
+                    sink_frames=0,
+                    window_frames=9,
+                    max_current_frames=2,
+                    max_history_frames=8,
+                )
+                pointers = [buffer.data_ptr() for buffer in cache._buffers]
+                self.assertEqual(cache._scratch.numel(), 0)
+                self.assertIsNone(cache._stream)
+                self.assertEqual(cache._ready, [])
+                history = None
+                with cache:
+                    for frame in range(8):
+                        current = [
+                            tuple(
+                                torch.full(
+                                    (1, 2, 2, 4),
+                                    float(frame + layer * 10 + kind),
+                                    device=device,
+                                )
+                                for kind in range(2)
+                            )
+                            for layer in range(2)
+                        ]
+                        self._stage(cache, current)
+                        cache.commit(2)
+                        history = append_kv_history(
+                            history,
+                            current,
+                            tokens_per_frame=2,
+                            sink_frames=0,
+                            window_frames=None,
+                        )
+                        for actual, expected in zip(cache, history):
+                            for a, b in zip(actual, expected):
+                                torch.testing.assert_close(a, b, rtol=0, atol=0)
+                    self.assertEqual(cache.history_tokens, 16)
+                    self.assertEqual(
+                        [buffer.data_ptr() for buffer in cache._buffers], pointers
+                    )
+                    self._stage(cache, current)
+                    with self.assertRaisesRegex(
+                        ValueError, "history capacity exceeded"
+                    ):
+                        cache.commit(2)
+                    self.assertEqual(cache.history_tokens, 16)
+
+    def test_full_history_rejects_requests_beyond_configured_limit(self):
+        stage = object.__new__(CosmosDreamsRolloutStage)
+        stage.profile = SimpleNamespace(history_mode="full", window_frames=2)
+        batch = SimpleNamespace(extra={EXTRA_TARGET_LATENT_FRAMES: 3}, num_frames=9)
+        with self.assertRaisesRegex(ValueError, "history_max_frames"):
+            stage._rollout(batch)
+
+    def test_frustum_requires_an_image_and_complete_archive(self):
+        """The selected working set assumes the archive retains every past
+        frame; sliding and image-free requests must fail before entering it.
+        """
+        stage = object.__new__(CosmosDreamsPrepareStage)
+        batch = SimpleNamespace(
+            sampling_params=SimpleNamespace(frustum_geometry={}), num_frames=9
+        )
+        for profile, has_image, message in (
+            (None, True, "history_mode='full'"),
+            (SimpleNamespace(history_mode="sliding"), True, "history_mode='full'"),
+            (SimpleNamespace(history_mode="full"), False, "conditioning image"),
+            (
+                SimpleNamespace(history_mode="full", window_frames=1, sink_frames=0),
+                True,
+                "whole rollout",
+            ),
+        ):
+            with self.subTest(profile=profile, has_image=has_image):
+                stage.profile = profile
+                with self.assertRaisesRegex(ValueError, message):
+                    stage._frustum_selector(
+                        batch, rows=None, target_frame=3, has_image=has_image
+                    )
+        batch.sampling_params.frustum_geometry = None
+        self.assertIsNone(
+            stage._frustum_selector(batch, rows=None, target_frame=3, has_image=False)
+        )
+
+    def test_clean_forward_commits_resident_suffix_instead_of_noise(self):
+        cache = CosmosDreamsKVCache(
+            [(torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1))],
+            tokens_per_frame=1,
+            sink_frames=0,
+            window_frames=2,
+            max_current_frames=2,
+        )
+        self._stage(
+            cache, [(torch.full((1, 1, 1, 1), -1.0), torch.full((1, 1, 1, 1), -2.0))]
+        )
+        clean = [(torch.ones(1, 1, 1, 1), torch.full((1, 1, 1, 1), 2.0))]
+
+        def transformer(latent, timestep, *, history_kv, **kwargs):
+            views = self._stage(history_kv, clean)
+            return SimpleNamespace(
+                current_kv=[(k[:, -1:], v[:, -1:]) for k, v in views]
+            )
+
+        result = commit_clean_kv(
+            transformer,
+            torch.zeros(1, 1, 1, 1, 1),
+            history=cache,
+            dtype=torch.float32,
+            tokens_per_frame=1,
+            sink_frames=0,
+            window_frames=2,
+        )
+        self.assertIs(result, cache)
+        for actual, expected in zip(cache[0], clean[0]):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "one clean frame"):
+            append_kv_history(
+                cache,
+                [(torch.zeros(1, 2, 1, 1),) * 2],
+                tokens_per_frame=1,
+                sink_frames=0,
+                window_frames=2,
+            )
+
+    def test_requests_do_not_share_mutable_history_or_change_text(self):
+        text = [(torch.ones(1, 3, 1, 2), torch.full((1, 3, 1, 2), 2.0))]
+        options = dict(
+            tokens_per_frame=1, sink_frames=1, window_frames=2, max_current_frames=2
+        )
+        first = CosmosDreamsKVCache(text, **options)
+        clean = [(torch.full((1, 1, 1, 2), 3.0), torch.full((1, 1, 1, 2), 4.0))]
+        self._stage(first, clean)
+        first.commit(1)
+        second = CosmosDreamsKVCache(text, **options)
+        self.assertEqual(second[0][0].shape[1], 0)
+        self._stage(
+            second, [(torch.zeros_like(clean[0][0]), torch.zeros_like(clean[0][1]))]
+        )
+        for actual, expected in zip(first[0], clean[0]):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            text[0][0], torch.ones_like(text[0][0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            text[0][1], torch.full_like(text[0][1], 2.0), rtol=0, atol=0
+        )
+
+    def test_frustum_reuses_selected_history_and_archives_only_clean_frames(self):
+        """Selected history stays fixed through denoising, then each clean
+        refresh sees the preceding clean frames. A frame absent from earlier
+        working sets must still be retrievable from the complete archive.
+        """
+        generator = torch.Generator().manual_seed(42)
+
+        def pairs(count):
+            return [
+                tuple(
+                    torch.randn(1, count, 2, 4, generator=generator) for _ in range(2)
+                )
+                for _ in range(3)
+            ]
+
+        text = pairs(3)
+        archive = CosmosDreamsKVCache(
+            text,
+            tokens_per_frame=2,
+            sink_frames=0,
+            window_frames=11,
+            max_current_frames=2,
+            max_history_frames=10,
+        )
+        working = CosmosDreamsKVCache(
+            text,
+            tokens_per_frame=2,
+            sink_frames=0,
+            window_frames=6,
+            max_current_frames=2,
+            max_history_frames=5,
+        )
+        buffers = [t.data_ptr() for t in archive._buffers + working._buffers]
+        reference = None
+
+        def assert_history(actual, expected):
+            for actual_pair, expected_pair in zip(actual, expected, strict=True):
+                for a, b in zip(actual_pair, expected_pair, strict=True):
+                    torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+        def refresh(current, selected):
+            nonlocal reference
+
+            def transformer(latent, timestep, *, history_kv, **kwargs):
+                assert_history(history_kv, selected)
+                views = self._stage(history_kv, current)
+                return SimpleNamespace(
+                    current_kv=[(k[:, -2:], v[:, -2:]) for k, v in views]
+                )
+
+            result = commit_clean_kv(
+                transformer,
+                torch.zeros(1, 1, 1, 1, 1),
+                history=working,
+                archive=archive,
+                dtype=torch.float32,
+                tokens_per_frame=2,
+                sink_frames=0,
+                window_frames=None,
+            )
+            self.assertIs(result, working)
+            reference = append_kv_history(
+                reference,
+                current,
+                tokens_per_frame=2,
+                sink_frames=0,
+                window_frames=None,
+            )
+            assert_history(archive, reference)
+            return [
+                tuple(torch.cat([old, new], dim=1) for old, new in zip(a, b))
+                for a, b in zip(selected, current)
+            ]
+
+        refresh(pairs(2), [tuple(t[:, :0] for t in pair) for pair in text])
+        for ids, chunk_frames in [
+            ([], 2),
+            ([0, 2], 2),
+            ([1, 3, 4], 2),
+            ([], 1),
+            ([0, 2, 7], 2),
+        ]:
+            with self.subTest(ids=ids, chunk_frames=chunk_frames):
+                positions = torch.tensor(
+                    [frame * 2 + token for frame in ids for token in range(2)],
+                    dtype=torch.long,
+                )
+                selected = [
+                    tuple(t.index_select(1, positions) for t in pair)
+                    for pair in reference
+                ]
+                working.load_selected(archive, ids, tokens_per_frame=2)
+                for _ in range(4):
+                    noise = pairs(chunk_frames * 2)
+                    actual = self._stage(working, noise)
+                    expected = [
+                        tuple(
+                            torch.cat([t, h, c], dim=1)
+                            for t, h, c in zip(text_pair, history_pair, current_pair)
+                        )
+                        for text_pair, history_pair, current_pair in zip(
+                            text, selected, noise
+                        )
+                    ]
+                    assert_history(actual, expected)
+                    assert_history(archive, reference)
+                for _ in range(chunk_frames):
+                    selected = refresh(pairs(2), selected)
+        self.assertEqual(
+            buffers, [t.data_ptr() for t in archive._buffers + working._buffers]
+        )
+        for ids in ([2, 0], [0, 0], [-1], [10]):
+            with self.subTest(invalid_ids=ids), self.assertRaises(ValueError):
+                working.load_selected(archive, ids, tokens_per_frame=2)
+        with self.assertRaisesRegex(ValueError, "selected history exceeds"):
+            working.load_selected(archive, list(range(6)), tokens_per_frame=2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA copy stream")
+    def test_frustum_copy_orders_archive_writes_reads_and_working_set_reuse(self):
+        """Delay both producer and copies so missing ready/reuse dependencies
+        corrupt snapshots. Keep all comparisons off the host until completion.
+        """
+
+        def pairs(frame, device):
+            return [
+                tuple(
+                    torch.full(
+                        (1, 2, 2, 8), frame + layer * 100 + kind * 10, device=device
+                    )
+                    for kind in range(2)
+                )
+                for layer in range(3)
+            ]
+
+        text = pairs(0.0, "cuda")
+        archive = CosmosDreamsKVCache(
+            text,
+            tokens_per_frame=2,
+            sink_frames=0,
+            window_frames=12,
+            max_current_frames=2,
+            max_history_frames=11,
+        )
+        working = CosmosDreamsKVCache(
+            text,
+            tokens_per_frame=2,
+            sink_frames=0,
+            window_frames=6,
+            max_current_frames=2,
+            max_history_frames=5,
+        )
+        original_copy = torch.Tensor.copy_
+        selections = ([0, 2, 5], [1, 3], [], [0, 4, 5])
+
+        def delayed_copy(dest, source, *args, **kwargs):
+            if (
+                dest.is_cuda
+                and torch.cuda.current_stream(dest.device) == working._stream
+            ):
+                torch.cuda._sleep(5_000_000)
+            return original_copy(dest, source, *args, **kwargs)
+
+        snapshots = []
+        with archive, working, mock.patch.object(torch.Tensor, "copy_", delayed_copy):
+            for frame in range(1, 7):
+                torch.cuda._sleep(1_000_000)
+                self._stage(archive, pairs(float(frame), "cuda"))
+                archive.commit(2)
+            for ids in selections:
+                working.load_selected(archive, ids, tokens_per_frame=2)
+                for _ in range(4):
+                    views = self._stage(working, pairs(-100.0, "cuda"))
+                    # Observe the actual attention inputs, without adding a
+                    # second ready wait through cache.__getitem__.
+                    snapshots.append(
+                        ([tuple(t.clone() for t in pair) for pair in views], ids)
+                    )
+                # The next copy must not overtake these preceding readers.
+                torch.cuda._sleep(20_000_000)
+                snapshots.append(
+                    ([tuple(t.clone() for t in pair) for pair in views], ids)
+                )
+        for actual, ids in snapshots:
+            expected = [
+                tuple(
+                    torch.cat(
+                        [pairs(0.0, "cpu")[layer][kind]]
+                        + [pairs(float(frame + 1), "cpu")[layer][kind] for frame in ids]
+                        + [pairs(-100.0, "cpu")[layer][kind]],
+                        dim=1,
+                    )
+                    for kind in range(2)
+                )
+                for layer in range(3)
+            ]
+            for actual_pair, expected_pair in zip(actual, expected):
+                for a, b in zip(actual_pair, expected_pair):
+                    torch.testing.assert_close(a.cpu(), b, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA compaction stream")
+    def test_compaction_waits_for_clean_and_precedes_current_suffix_writes(self):
+        """A delayed clean producer and delayed compaction copies must preserve
+        history when the next denoise immediately overwrites the current suffix.
+        Snapshots stay on the GPU until all iterations, so host checks cannot
+        accidentally serialize the stream dependency being tested.
+        """
+
+        def pairs(value, count, device):
+            return [
+                tuple(
+                    torch.full(
+                        (1, count, 2, 8), value + layer * 10 + kind, device=device
+                    )
+                    for kind in range(2)
+                )
+                for layer in range(3)
+            ]
+
+        for sinks in (0, 1):
+            with self.subTest(sinks=sinks):
+                cache = CosmosDreamsKVCache(
+                    pairs(0.0, 3, "cuda"),
+                    tokens_per_frame=2,
+                    sink_frames=sinks,
+                    window_frames=2,
+                    max_current_frames=2,
+                )
+                original_copy = torch.Tensor.copy_
+
+                def delayed_copy(dest, source, *args, **kwargs):
+                    if (
+                        dest.is_cuda
+                        and torch.cuda.current_stream(dest.device) == cache._stream
+                    ):
+                        torch.cuda._sleep(1_000_000)
+                    return original_copy(dest, source, *args, **kwargs)
+
+                def commit_frame(frame, reference):
+                    torch.cuda._sleep(1_000_000)
+                    self._stage(cache, pairs(float(frame), 2, "cuda"))
+                    cache.commit(2)
+                    return append_kv_history(
+                        reference,
+                        pairs(float(frame), 2, "cpu"),
+                        tokens_per_frame=2,
+                        sink_frames=sinks,
+                        window_frames=2,
+                    )
+
+                reference, snapshots = None, []
+                with (
+                    cache,
+                    mock.patch.object(torch.Tensor, "copy_", delayed_copy),
+                ):
+                    # Fill the sink and recent window without eviction.
+                    for frame in range(1, sinks + 3):
+                        reference = commit_frame(frame, reference)
+                    # First eviction; the next clean forward must consume ready
+                    # before it overwrites the resident suffix and records again.
+                    reference = commit_frame(sinks + 3, reference)
+                    reference = commit_frame(sinks + 4, reference)
+                    # Reuse the events across another eviction, followed each
+                    # time by four denoise writes. Checks stay on the GPU.
+                    for frame in (sinks + 5, sinks + 6):
+                        reference = commit_frame(frame, reference)
+                        for _ in range(4):
+                            self._stage(cache, pairs(-100.0, 4, "cuda"))
+                        snapshots.append(
+                            (
+                                [tuple(t.clone() for t in cache[i]) for i in range(3)],
+                                reference,
+                            )
+                        )
+                torch.cuda.synchronize()
+                for actual, expected in snapshots:
+                    for actual_pair, expected_pair in zip(actual, expected):
+                        for a, b in zip(actual_pair, expected_pair):
+                            torch.testing.assert_close(a.cpu(), b, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA side stream")
+    def test_exception_drains_side_stream_before_request_buffers_are_released(self):
+        text = [(torch.zeros(1, 1, 1, 1, device="cuda"),) * 2]
+        clean = [(torch.ones(1, 1, 1, 1, device="cuda"),) * 2]
+        for gather in (False, True):
+            with self.subTest(gather=gather):
+                archive = CosmosDreamsKVCache(
+                    text,
+                    tokens_per_frame=1,
+                    sink_frames=0,
+                    window_frames=2 if gather else 1,
+                    max_history_frames=1,
+                    max_current_frames=1,
+                )
+                self._stage(archive, clean)
+                archive.commit(1)
+                cache = (
+                    CosmosDreamsKVCache(
+                        text,
+                        tokens_per_frame=1,
+                        sink_frames=0,
+                        window_frames=2,
+                        max_history_frames=1,
+                        max_current_frames=1,
+                    )
+                    if gather
+                    else archive
+                )
+                with self.assertRaisesRegex(RuntimeError, "request failed"):
+                    with cache:
+                        if gather:
+                            cache.load_selected(archive, [0], tokens_per_frame=1)
+                        else:
+                            self._stage(cache, clean)
+                            cache.commit(1)
+                        with torch.cuda.stream(cache._stream):
+                            torch.cuda._sleep(50_000_000)
+                        raise RuntimeError("request failed")
+                self.assertTrue(cache._stream.query())
+                self.assertFalse(any(cache._pending))
 
 
 UNIFIED_FIELDS = [
