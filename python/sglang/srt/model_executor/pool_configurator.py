@@ -700,7 +700,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
-                indexer_size_per_token = index_head_dim
+                indexer_size_per_token = ceil_div(
+                    index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
+                )
                 element_size = torch._utils._element_size(dtype)
         memory_config = get_memory()
         indexer_ratio = 1

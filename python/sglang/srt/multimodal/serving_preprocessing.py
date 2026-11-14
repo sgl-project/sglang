@@ -71,7 +71,18 @@ def fast_image_processor_device(
     if _is_xpu:
         return "xpu"
     if _is_npu:
-        return None if processor.__class__.__name__ == "Glm4vProcessor" else "npu"
+        if processor.__class__.__name__ == "Glm4vProcessor":
+            return None
+        if processor.__class__.__name__ == "Glm5NextProcessor":
+            # GLM5-Next patchify materializes up to 10-dim tensors, above the
+            # Ascend 8-dim limit; only run its fast processor on NPU once the
+            # patchify replacement is in place.
+            from sglang.srt.hardware_backend.npu.modules.glm5_next_processor import (
+                npu_apply_glm5_next_preprocess_patch,
+            )
+
+            return "npu" if npu_apply_glm5_next_preprocess_patch(processor) else None
+        return "npu"
     platform = platforms.current_platform
     if not platform.is_cuda_alike():
         return None
@@ -95,7 +106,13 @@ def apply_npu_image_preprocess_patches(processor) -> None:
             and processor.video_processor is not None
         ):
             npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
-    elif processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
+    elif processor.__class__.__name__ not in {
+        "Glm4vProcessor",
+        "Glm46VProcessor",
+        # GLM5-Next is patched in fast_image_processor_device, where the patch
+        # result decides the device.
+        "Glm5NextProcessor",
+    }:
         # For qwen-vl, the processor hits a reshape issue from the Ascend
         # dims restriction.
         from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (

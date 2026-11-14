@@ -182,6 +182,16 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 page_size = 64 * index_kpool
                 overrides["page_size"] = page_size
                 logger.warning(f"Setting page size to {page_size} for DeepSeek DSA.")
+        elif get_platform().is_npu:
+            index_kpool = get_dsa_index_kpool(hf_config)
+            if index_kpool > 1:
+                if cfg.dcp_size > 1:
+                    raise ValueError("NPU DSA KPool does not support --dcp-size > 1.")
+                overrides["page_size"] = 128 * index_kpool
+                logger.warning(
+                    "Setting logical page size to %d for NPU DSA KPool.",
+                    overrides["page_size"],
+                )
         elif get_platform().is_xpu:
             overrides["page_size"] = 128
             logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")

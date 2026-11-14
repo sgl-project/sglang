@@ -20,7 +20,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.device import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported, is_npu
 
 _is_hip = is_hip()
 if _is_hip:
@@ -2049,6 +2049,10 @@ def _mhc_post_dispatch(
         if result is not None:
             return result
 
+    if is_npu():
+        from sgl_kernel_npu.operators.hyper_conn import mhc_post as npu_mhc_post
+
+        return npu_mhc_post(residual, comb_res_mix, x, post_layer_mix.squeeze(-1))
     if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
@@ -2085,20 +2089,35 @@ def hc_pre(
 
     fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
     residual_3d = x.view(s, hc_mult, hidden_size)
-    post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
-        residual=residual_3d,
-        fn=fn,
-        hc_scale=hc_scale,
-        hc_base=hc_base,
-        rms_eps=rms_eps,
-        hc_pre_eps=hc_eps,
-        hc_sinkhorn_eps=hc_eps,
-        hc_post_mult_value=post_mult_value,
-        sinkhorn_repeat=sinkhorn_iters,
-        norm_weight=out_norm_weight,
-        norm_eps=out_norm_eps,
-        n_splits_pre=n_splits_pre,
-    )
+    if is_npu():
+        from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn
+
+        y, post, comb = mhc_pre_sinkhorn(
+            residual_3d,
+            fn,
+            hc_scale,
+            hc_base,
+            hc_mult=hc_mult,
+            num_iters=sinkhorn_iters,
+            norm_eps=rms_eps,
+            hc_eps=hc_eps,
+        )
+        post_mix, comb_mix, layer_input, norm_fused = post, comb, y, False
+    else:
+        post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
+            residual=residual_3d,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_eps,
+            hc_sinkhorn_eps=hc_eps,
+            hc_post_mult_value=post_mult_value,
+            sinkhorn_repeat=sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
+            n_splits_pre=n_splits_pre,
+        )
     return (
         layer_input,
         comb_mix.reshape(s, hc_mult * hc_mult),
@@ -2135,7 +2154,7 @@ def npu_hc_pre(
     hc_eps: float,
     forward_batch=None,
 ) -> tuple:
-    """NPU-accelerated hc_pre via the custom_ops kernel.
+    """NPU-accelerated hc_pre via sgl-kernel-npu's public mHC API.
 
     Returns (y, post, comb, norm_fused).  norm_fused is always False
     because npu_hc_pre does not fold input_layernorm — the caller must
@@ -2161,17 +2180,19 @@ def npu_hc_pre(
         return y, post, comb, False
 
     # Note the return order: (y, post, comb) — y is the (T, hidden)
-    # mixed activation, post / comb are the hc_post inputs. The
-    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
-    # cast back to the input dtype before the downstream
-    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
-    y, post, comb = torch.ops.custom.npu_hc_pre(
+    # mixed activation, and post / comb are the hc_post inputs.
+    # Preserve the vendor output dtype in the kernel API. This caller casts y
+    # to the input dtype for downstream aclnnRmsNorm, which has no
+    # x=fp32 / gamma=bf16 overload.
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn
+
+    y, post, comb = mhc_pre_sinkhorn(
         x,
         hc_fn,
         hc_scale,
         hc_base,
         hc_mult=hc_mult,
-        hc_sinkhorn_iters=hc_sinkhorn_iters,
+        num_iters=hc_sinkhorn_iters,
         norm_eps=rms_norm_eps,
         hc_eps=hc_eps,
     )
