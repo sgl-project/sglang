@@ -146,7 +146,10 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": {},
                     }
-                else:
+
+                # The closing fence and the end tokens can arrive in the same
+                # increment as the name, so continue into argument handling.
+                if self.current_tool_name_sent:
                     argument_diff = (
                         func_args_raw[len(self._last_arguments) :]
                         if func_args_raw.startswith(self._last_arguments)
