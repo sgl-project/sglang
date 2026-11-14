@@ -15,8 +15,8 @@ limitations under the License.
 
 // Pybind entry for the InfLLM-V2 FlashAttention backend (vendored from
 // 3rdparty/infllmv2_cuda_impl). This builds as a standalone extension module
-// `infllm_ops` so its `flash::` symbols stay isolated from sgl-kernel's own
-// flash attention (`flash_ops` / `common_ops`).
+// `infllm_ops` so its `flash::` symbols stay isolated from sgl-kernel's other
+// extension modules (`common_ops`).
 
 #include <ATen/ATen.h>
 #include <c10/util/Optional.h>

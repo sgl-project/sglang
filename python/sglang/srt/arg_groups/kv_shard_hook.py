@@ -26,6 +26,23 @@ from sglang.srt.utils.device import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
+# GQA prefill attention backends that implement the logical-page KV-shard
+# contract of layers/attention/kv_shard_hooks.py.
+_KV_SHARD_PREFILL_BACKENDS = {"fa3"}
+# Transfer backends whose prefill senders send only their own pages
+# (filter_kv_indices_for_shard_rank) and pair destinations by position.
+_KV_SHARD_TRANSFER_BACKENDS = {"mooncake", "nixl"}
+
+
+def register_kv_shard_prefill_backend(name: str) -> None:
+    """Admit an out-of-tree prefill attention backend for KV sharding."""
+    _KV_SHARD_PREFILL_BACKENDS.add(name)
+
+
+def register_kv_shard_transfer_backend(name: str) -> None:
+    """Admit an out-of-tree disaggregation transfer backend for KV sharding."""
+    _KV_SHARD_TRANSFER_BACKENDS.add(name)
+
 
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
@@ -65,7 +82,7 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
         return
     if is_deepseek_dsa(model_config_of(server_args).hf_config):
         raise ValueError("DSA KV sharding requires the dsa attention backend.")
-    if prefill_backend == "fa3":
+    if prefill_backend in _KV_SHARD_PREFILL_BACKENDS:
         return
     if prefill_backend != "trtllm_mla":
         raise ValueError(
@@ -238,7 +255,7 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     validate_kv_shard_attention_backend(server_args, cfg)
-    if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+    if cfg.disaggregation_transfer_backend not in _KV_SHARD_TRANSFER_BACKENDS:
         raise ValueError(
             "--enable-kv-cache-sharding currently only supports the mooncake "
             "and nixl transfer backends: both route sends through "

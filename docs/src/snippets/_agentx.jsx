@@ -259,6 +259,7 @@ export const AgentX = ({ data: input }) => {
     DECODE_HEAD_IP: "first node of this decode worker",
     IB_DEVICES: "the node's RDMA NICs",
     EFA_DEVICES: "EFA device filter (AWS EFA fabrics only)",
+    DRAFT_MODEL_DIR: "local snapshot directory of the draft checkpoint (see the setup note)",
   };
   const placeholderText = (name) =>
     PLACEHOLDERS[name] ||

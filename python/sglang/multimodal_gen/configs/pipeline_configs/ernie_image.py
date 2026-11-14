@@ -36,13 +36,6 @@ def ernie_image_postprocess_text(outputs, _text_inputs, hidden_layer_index=-2):
     return pad_text_embeddings_with_mask(split_hidden_states)
 
 
-def _patchify_latents(latents: torch.Tensor) -> torch.Tensor:
-    b, c, h, w = latents.shape
-    latents = latents.view(b, c, h // 2, 2, w // 2, 2)
-    latents = latents.permute(0, 1, 3, 5, 2, 4).reshape(b, c * 4, h // 2, w // 2)
-    return latents
-
-
 def _unpatchify_latents(latents: torch.Tensor) -> torch.Tensor:
     b, c, h, w = latents.shape
     latents = latents.reshape(b, c // 4, 2, 2, h, w)

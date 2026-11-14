@@ -101,6 +101,9 @@ class InsertParams:
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
+    # Prepare held the running request's state back from the tree; the request
+    # keeps its tracked checkpoint for a later insert.
+    mamba_checkpoint_deferred: bool = False
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None

@@ -1324,6 +1324,36 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             source.host_pool.free(indices)
 
     @requires_hicache
+    @requires_swa
+    def test_buffer_only_kv_short_prefetch_heals_swa_window_beliefs(self):
+        """A rank whose KV read falls short skips the SWA read; its discard must
+        still drop the window beliefs that a peer which read the window drops."""
+        storage_dir = self._make_storage_dir()
+        seq = self._buffer_swa_seq()
+        prod, prod_alloc, prod_rtp = self._build_buffer_hicache_fixture(storage_dir)
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        leaf = match_prefix(prod, seq).last_device_node
+        self._buffer_backup_and_wait(prod, leaf)
+        page_hashes = self._all_page_hashes(prod, leaf)
+
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+        swa_beliefs = cons.storage_existence_cache.pool(PoolName.SWA)
+        swa_beliefs.add(page_hashes)
+        req_id = CacheRequestHandle("kv-short", 0)
+        with mock.patch.object(cons.cache_controller, "page_get_func", return_value=0):
+            cons.prefetch_from_storage(
+                req_id, cons.root_node_handle(), array("q", seq), None, None
+            )
+            self._pump_hicache_until(
+                cons,
+                lambda: cons.check_prefetch_progress(req_id),
+                "short prefetch did not finish",
+            )
+        self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
+        self.assertFalse(swa_beliefs.contains(page_hashes[-1]))
+        cons.sanity_check()
+
+    @requires_hicache
     def test_buffer_only_read_path_roundtrip(self):
         """Read path end to end: prefetch -> staged -> load-back that evicts before
         alloc and publishes pre-ack -> ack frees the bounce."""
@@ -1949,6 +1979,130 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                 self._assert_masked_full_is_reused(
                     storage_dir, seq, live_tail=self.cfg.page_size
                 )
+
+    @requires_hicache
+    @requires(lambda cfg: cfg.has_swa, "a window repair requires an SWA component")
+    @requires(
+        lambda cfg: -(-cfg.sliding_window_size // cfg.page_size) >= 2,
+        "a one-page window never reaches past the node holding the splice base",
+    )
+    def test_buffer_only_window_repair_keeps_its_resident_rows_locked(self):
+        """The admission lock must cover every window row a staged repair keeps,
+        even when the FULL match ends inside a longer node: the reclaim the
+        admission runs before the load may not strip those rows."""
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+        page_size = self.cfg.page_size
+        sw_pages = -(-self.cfg.sliding_window_size // page_size)
+        storage_dir = self._make_storage_dir()
+        # The span ends one page past `head`. Its window keeps the head's
+        # resident SWA tail and repairs the page behind the head.
+        head = self._make_seq(1, sw_pages)
+        span = head + self._make_seq(5000, 1)
+        full = span + self._make_seq(9000, sw_pages)
+        self._produce_buffer_l3(storage_dir, span)
+
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
+        head_value = self._alloc(cons_alloc, len(head))[: len(head)]
+        cons.insert(
+            InsertParams(
+                key=RadixKey(array("q", head)),
+                value=head_value,
+                component_evicted_seqlens={ComponentType.SWA: page_size},
+            )
+        )
+        cons_alloc.free_swa(head_value[:page_size])
+        resident = head_value[page_size:]
+        resident_swa = cons_alloc.full_to_swa_index_mapping[resident].clone()
+        self.assertTrue(bool((resident_swa > 0).all()), "head tail not resident")
+
+        req_id = CacheRequestHandle("window-repair-lock", 0)
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", span), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
+            "prefetch did not stage",
+        )
+        cons.pop_prefetch_loaded_tokens(req_id)
+        staged = cons.buffer_pipeline.staged_prefetches[req_id]
+        self.assertEqual(
+            (staged.matched_len, staged.num_tokens), (len(head), page_size)
+        )
+
+        # While the request waits, another one inserts a longer path through the
+        # span end, so the span's FULL becomes resident inside one node longer
+        # than a window, with no SWA of its own.
+        tail_value = self._alloc(cons_alloc, len(full) - len(head))
+        tail_value = tail_value[: len(full) - len(head)]
+        cons.insert(
+            InsertParams(
+                key=RadixKey(array("q", full)),
+                value=torch.cat([head_value, tail_value]),
+                prev_prefix_len=len(head),
+                component_evicted_seqlens={ComponentType.SWA: len(full)},
+            )
+        )
+        cons_alloc.free_swa(tail_value)
+        # The request's joint match runs over its whole input, which follows the
+        # node past the span end, so it splits nothing there.
+        self.assertEqual(match_prefix(cons, full).device_prefix_len, 0)
+        full_len, _, pinned_len = cons.tree_core.match_full_device_prefix(
+            RadixKey(array("q", span))
+        )
+        self.assertEqual((full_len, pinned_len), (len(span), len(full)))
+
+        req = self._make_req(cons_rtp)
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.extra_key = None
+        req.cache_salt = None
+        req.prefix_len = 0
+        req.last_node = cons.root_node_handle()
+        self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
+        plan = req.staged_prefetch_plan
+        window = plan.windows[ComponentType.SWA]
+        self.assertEqual(plan.full_tokens, 0)
+        self.assertEqual(window.missing_ranges, ((len(head), len(span)),))
+        anchor_end = len(cons.path_device_indices(req.last_node))
+
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.tree_cache = cons
+        with adder._lock_node(req.last_node):
+            # The unified budget's prepare_load_back reclaims SWA first here.
+            cons.evict(
+                EvictParams(
+                    window_num_tokens={
+                        cons.window_sub_pool_of_slot(ComponentType.SWA): len(resident)
+                    }
+                )
+            )
+            loaded = cons.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=None,
+                    host_hit_length=req.host_hit_length,
+                    req=req,
+                )
+            )
+        self.assertEqual(anchor_end, len(span), "anchor does not end at the splice")
+        self.assertIsNotNone(loaded)
+        self.assertTrue(
+            torch.equal(cons_alloc.full_to_swa_index_mapping[resident], resident_swa),
+            "a kept window row was reclaimed before the load published",
+        )
+        cons.ready_to_load_host_cache()
+        self._pump_hicache_until(
+            cons,
+            lambda: not cons.buffer_pipeline.ongoing_buffer_load_back,
+            "window repair did not commit",
+        )
+        self.assertEqual(match_prefix(cons, span).device_prefix_len, len(span))
+        cons.sanity_check()
 
     @requires_hicache
     @requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
