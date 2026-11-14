@@ -30,7 +30,11 @@ import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import GenerateReqInput, ShutdownReq
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    ShutdownReq,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import DRAIN_STATE_NO_LISTENER
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
@@ -918,6 +922,14 @@ class RustServer:
             )
             self.server.push_error(obj.rid, f"invalid request: {e}")
             raise
+        # Rust text generations reuse the internal rid as the retirement
+        # instance identity; HTTP mints its own unique token instead. Omit a
+        # long filler tail on the Rust hot-path wire (field defaults to None).
+        if (
+            isinstance(obj, TokenizedGenerateReqInput)
+            and obj.request_instance_id is None
+        ):
+            obj.request_instance_id = obj.rid
         return obj
 
     def _attach_buffers(self, obj, buffers: dict) -> None:

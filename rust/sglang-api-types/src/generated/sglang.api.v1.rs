@@ -871,14 +871,41 @@ pub struct AbortRequest {
     /// this call, including HTTP chat/completions.
     #[prost(bool, tag = "2")]
     pub abort_all: bool,
+    /// Absent: legacy accepted-only Abort (cancellation requested, no retirement
+    /// wait). Present: opt into exact-request scheduler retirement with a bounded
+    /// wait of this many milliseconds, including 0 for a single poll. Cap is
+    /// 30000. abort_all and ambiguous duplicate public RIDs are rejected.
+    /// Requires a nonempty cancellation_id. Supported only for single-rank text
+    /// serving when SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS=1; MM, PD, and
+    /// distributed modes return UNIMPLEMENTED. A wait timeout returns
+    /// success=true with retirement_confirmed=false; retry the same
+    /// cancellation_id within the bounded five-minute retention window.
+    #[prost(uint32, optional, tag = "3")]
+    pub wait_for_retirement_ms: ::core::option::Option<u32>,
+    /// Required only with wait_for_retirement_ms; max 128 UTF-8 bytes; scoped to
+    /// one engine lifetime. Retries bind to the originally captured internal
+    /// request instance and MUST NOT recapture by public RID. After retention
+    /// expiry the server does not claim idempotency or old-target safety.
+    #[prost(string, tag = "4")]
+    pub cancellation_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AbortResponse {
     /// True if at least one active generation matched and cancellation was
     /// requested. Not an acknowledgement that the scheduler has stopped yet.
-    /// False for an unknown/already-finished ID; repeated aborts are harmless.
+    /// False for an unknown/already-finished ID on the legacy path; repeated
+    /// legacy aborts are harmless. Opt-in wait mode returns FailedPrecondition
+    /// or Unavailable for unknown/lost receipts instead of inventing success.
     #[prost(bool, tag = "1")]
     pub success: bool,
+    /// True only after the captured internal generation has retired from
+    /// scheduler ownership (or was proven never admitted). Unknown targets,
+    /// stream terminals, channel closure, and load counters cannot confirm it.
+    /// This is not device-wide idleness, native/MM completion, or PD drain.
+    /// Defaults to false. Old servers ignore wait_for_retirement_ms, so clients
+    /// MUST require an explicit true and MUST NOT infer completion from success.
+    #[prost(bool, tag = "2")]
+    pub retirement_confirmed: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckRequest {}

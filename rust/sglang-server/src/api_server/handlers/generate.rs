@@ -669,6 +669,20 @@ struct Entry {
     cancelled: oneshot::Sender<(Cancellation, bool)>,
 }
 
+/// One live generation captured by public ID for an opt-in retirement wait.
+/// Keeps the original internal rid; retries must not
+/// recapture by public ID.
+#[derive(Clone)]
+pub(super) struct CapturedGeneration {
+    pub(super) rid: Rid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CaptureError {
+    NotFound,
+    Ambiguous,
+}
+
 impl Generations {
     fn register(&self, rid: Rid, abort_tx: flume::Sender<AbortSource>) -> Generation {
         let admission = RequestAdmission::pending();
@@ -697,6 +711,33 @@ impl Generations {
         }
     }
 
+    /// Snapshot exactly one live generation for `public_rid` without removing
+    /// it. Opt-in retirement refuses ambiguous duplicates.
+    pub(super) fn capture_one(&self, public_rid: &str) -> Result<CapturedGeneration, CaptureError> {
+        let entries = self.0.lock().unwrap();
+        let Some(group) = entries.get(public_rid) else {
+            return Err(CaptureError::NotFound);
+        };
+        if group.len() != 1 {
+            return Err(CaptureError::Ambiguous);
+        }
+        let (rid, _) = group.iter().next().expect("len checked");
+        Ok(CapturedGeneration { rid: rid.clone() })
+    }
+
+    /// Cancel a still-pending admission for `rid` without aborting accepted
+    /// work. `true` means Intake never claimed it.
+    pub(super) fn fence_pending(&self, rid: &Rid) -> bool {
+        let entries = self.0.lock().unwrap();
+        let Some(group) = entries.get(rid.client_facing()) else {
+            return false;
+        };
+        let Some(entry) = group.get(rid) else {
+            return false;
+        };
+        entry.admission.cancel_if_pending()
+    }
+
     fn abort(
         &self,
         rid: Option<&str>,
@@ -708,6 +749,28 @@ impl Generations {
         Self::notify(self.detach(rid), rid.is_none(), ending, abort_tx)
     }
 
+    /// End one previously captured internal generation after a positive
+    /// retirement proof. Removes only that internal entry (public-ID reuse is
+    /// untouched), notifies the call with [`Cancellation::Error`] first, then
+    /// sends [`AbortSource::Local`] for detok/local cleanup only — never a
+    /// scheduler Guard/Request abort that could hit a newer request.
+    pub(super) fn notify_retired(&self, rid: &Rid, abort_tx: &flume::Sender<AbortSource>) -> bool {
+        let selected = self.detach_exact(rid);
+        let mut matched = false;
+        for entries in selected {
+            for (rid, entry) in entries {
+                matched = true;
+                // Mark cancelled whether pending was already fenced or accepted.
+                let _ = entry.admission.cancel_requires_abort();
+                // Notify the call before Local deregistration so the response
+                // sink is not torn down into a truncated 500.
+                let _ = entry.cancelled.send((Cancellation::Error, false));
+                let _ = abort_tx.send(AbortSource::Local(rid));
+            }
+        }
+        matched
+    }
+
     /// The entries an abort of `rid`, or of all, selects, taken out of the
     /// index.
     fn detach(&self, rid: Option<&str>) -> Vec<HashMap<Rid, Entry>> {
@@ -716,6 +779,22 @@ impl Generations {
             Some(rid) => entries.remove(rid).into_iter().collect(),
             None => std::mem::take(&mut *entries).into_values().collect(),
         }
+    }
+
+    fn detach_exact(&self, rid: &Rid) -> Vec<HashMap<Rid, Entry>> {
+        let mut entries = self.0.lock().unwrap();
+        let Some(group) = entries.get_mut(rid.client_facing()) else {
+            return Vec::new();
+        };
+        let Some(entry) = group.remove(rid) else {
+            return Vec::new();
+        };
+        if group.is_empty() {
+            entries.remove(rid.client_facing());
+        }
+        let mut selected = HashMap::new();
+        selected.insert(rid.clone(), entry);
+        vec![selected]
     }
 
     /// End the `selected` entries' generations as `ending` says;

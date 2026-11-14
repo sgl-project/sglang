@@ -366,3 +366,37 @@ fn custom_params_raw_json_passthrough() {
     let p: SamplingParams = serde_json::from_str(r#"{"custom_params": {"k": 3}}"#).unwrap();
     assert_eq!(p.custom_params.as_deref(), Some(r#"{"k":3}"#));
 }
+
+/// Legacy AbortResponse success bytes cannot confirm retirement; optional
+/// wait_for_retirement_ms keeps absent distinct from an explicit zero poll;
+/// cancellation_id round-trips on the explicit-zero request.
+#[test]
+fn abort_retirement_fields_preserve_wire_compatibility() {
+    use prost::Message;
+
+    let legacy = AbortResponse::decode([8u8, 1].as_slice()).unwrap();
+    assert!(legacy.success);
+    assert!(!legacy.retirement_confirmed);
+
+    let absent = AbortRequest {
+        rid: "r".into(),
+        abort_all: false,
+        wait_for_retirement_ms: None,
+        cancellation_id: String::new(),
+    };
+    let zero = AbortRequest {
+        rid: "r".into(),
+        abort_all: false,
+        wait_for_retirement_ms: Some(0),
+        cancellation_id: "opid".into(),
+    };
+    let absent_bytes = absent.encode_to_vec();
+    let zero_bytes = zero.encode_to_vec();
+    assert_ne!(absent_bytes, zero_bytes);
+    let absent_decoded = AbortRequest::decode(absent_bytes.as_slice()).unwrap();
+    assert_eq!(absent_decoded.wait_for_retirement_ms, None);
+    assert!(absent_decoded.cancellation_id.is_empty());
+    let zero_decoded = AbortRequest::decode(zero_bytes.as_slice()).unwrap();
+    assert_eq!(zero_decoded.wait_for_retirement_ms, Some(0));
+    assert_eq!(zero_decoded.cancellation_id, "opid");
+}

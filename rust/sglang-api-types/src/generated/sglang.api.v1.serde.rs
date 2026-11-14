@@ -4216,6 +4216,14 @@ impl ::serde::Serialize for AbortRequest {
         let mut map = serializer.serialize_map(None)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "rid", &self.rid)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "abort_all", &self.abort_all)?;
+        if let Some(v) = &self.wait_for_retirement_ms {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "wait_for_retirement_ms", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "cancellation_id",
+            &self.cancellation_id,
+        )?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -4234,6 +4242,8 @@ impl<'de> ::serde::Deserialize<'de> for AbortRequest {
             ) -> Result<Self::Value, A::Error> {
                 let mut f_rid = None;
                 let mut f_abort_all = None;
+                let mut f_wait_for_retirement_ms = None;
+                let mut f_cancellation_id = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -4248,6 +4258,21 @@ impl<'de> ::serde::Deserialize<'de> for AbortRequest {
                             }
                             f_abort_all = Some(map.next_value::<bool>()?);
                         }
+                        "wait_for_retirement_ms" => {
+                            if f_wait_for_retirement_ms.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "wait_for_retirement_ms",
+                                ));
+                            }
+                            f_wait_for_retirement_ms = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "cancellation_id" => {
+                            if f_cancellation_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("cancellation_id"));
+                            }
+                            f_cancellation_id =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -4256,6 +4281,8 @@ impl<'de> ::serde::Deserialize<'de> for AbortRequest {
                 Ok(AbortRequest {
                     rid: f_rid.unwrap_or_default(),
                     abort_all: f_abort_all.unwrap_or_default(),
+                    wait_for_retirement_ms: f_wait_for_retirement_ms.flatten(),
+                    cancellation_id: f_cancellation_id.unwrap_or_default(),
                 })
             }
         }
@@ -4267,6 +4294,11 @@ impl ::serde::Serialize for AbortResponse {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "retirement_confirmed",
+            &self.retirement_confirmed,
+        )?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -4284,6 +4316,7 @@ impl<'de> ::serde::Deserialize<'de> for AbortResponse {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut f_success = None;
+                let mut f_retirement_confirmed = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "success" => {
@@ -4292,6 +4325,14 @@ impl<'de> ::serde::Deserialize<'de> for AbortResponse {
                             }
                             f_success = Some(map.next_value::<bool>()?);
                         }
+                        "retirement_confirmed" => {
+                            if f_retirement_confirmed.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "retirement_confirmed",
+                                ));
+                            }
+                            f_retirement_confirmed = Some(map.next_value::<bool>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -4299,6 +4340,7 @@ impl<'de> ::serde::Deserialize<'de> for AbortResponse {
                 }
                 Ok(AbortResponse {
                     success: f_success.unwrap_or_default(),
+                    retirement_confirmed: f_retirement_confirmed.unwrap_or_default(),
                 })
             }
         }

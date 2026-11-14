@@ -9,6 +9,7 @@ mod handle;
 mod health;
 mod hicache;
 mod info;
+mod retirement;
 #[cfg(test)]
 mod test_utils;
 mod tokenize;

@@ -1363,6 +1363,61 @@ class TestRustServerExtension(CustomTestCase):
         self.assertEqual(masks["mm"], set(server_cores))
         self.assertEqual(masks["scheduler"], full_mask)
 
+    def test_admit_fills_rust_generation_request_instance_id_from_rid(self):
+        """Decoded Rust generations reuse the internal rid as request_instance_id;
+        an already-set HTTP instance id is left unchanged."""
+        import msgspec
+
+        from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        rid = "internal-rid#abc123def"
+        bridge = RustServer(Mock(), http_port=0)
+        bridge._multimodal_enabled = False
+
+        rust_wire = TokenizedGenerateReqInput(
+            rid=rid,
+            input_text=None,
+            input_ids=None,
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=1),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            request_instance_id=None,
+        )
+        admitted = bridge._admit(
+            msgspec.msgpack.encode(rust_wire),
+            {"input_ids": array("q", [1, 2, 3]).tobytes()},
+        )
+        self.assertEqual(admitted.rid, rid)
+        self.assertEqual(admitted.request_instance_id, rid)
+
+        http_wire = TokenizedGenerateReqInput(
+            rid=rid,
+            input_text=None,
+            input_ids=None,
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=1),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            request_instance_id="http-minted-uuid",
+        )
+        admitted_http = bridge._admit(
+            msgspec.msgpack.encode(http_wire),
+            {"input_ids": array("q", [1]).tobytes()},
+        )
+        self.assertEqual(admitted_http.request_instance_id, "http-minted-uuid")
+
 
 if __name__ == "__main__":
     unittest.main()

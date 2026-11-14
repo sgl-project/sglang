@@ -663,6 +663,8 @@ class AbortRequest(msgspec.Struct, kw_only=True, frozen=True):
 
     rid: str = ""
     abort_all: bool = False
+    wait_for_retirement_ms: Optional[int] = None
+    cancellation_id: str = ""
 
     @classmethod
     def from_json_value(cls, value: Any) -> "AbortRequest":
@@ -678,6 +680,7 @@ class AbortResponse(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.AbortResponse: JSON object (unknown keys ignored)."""
 
     success: bool = False
+    retirement_confirmed: bool = False
 
     @classmethod
     def from_json_value(cls, value: Any) -> "AbortResponse":
@@ -2329,6 +2332,10 @@ def decode_AbortRequest(value: Any) -> AbortRequest:
             kw["rid"] = _expect_str(x, expected="a string")
         elif key == "abort_all":
             kw["abort_all"] = _expect_bool(x, expected="a boolean")
+        elif key == "wait_for_retirement_ms":
+            kw["wait_for_retirement_ms"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "cancellation_id":
+            kw["cancellation_id"] = _expect_str(x, expected="a string")
     return AbortRequest(**kw)
 
 
@@ -2336,6 +2343,9 @@ def encode_AbortRequest(v: AbortRequest) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["rid"] = v.rid
     d["abort_all"] = v.abort_all
+    if v.wait_for_retirement_ms is not None:
+        d["wait_for_retirement_ms"] = v.wait_for_retirement_ms
+    d["cancellation_id"] = v.cancellation_id
     return d
 
 
@@ -2345,12 +2355,15 @@ def decode_AbortResponse(value: Any) -> AbortResponse:
     for key, x in m.items():
         if key == "success":
             kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "retirement_confirmed":
+            kw["retirement_confirmed"] = _expect_bool(x, expected="a boolean")
     return AbortResponse(**kw)
 
 
 def encode_AbortResponse(v: AbortResponse) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["success"] = v.success
+    d["retirement_confirmed"] = v.retirement_confirmed
     return d
 
 
