@@ -1395,7 +1395,12 @@ impl ChatResponder {
             for (index, finish_type, matched_stop) in std::mem::take(&mut self.finish_reasons) {
                 let mut chunk =
                     self.chunk_json(index, json!({"reasoning_content": null}), None, None);
-                let tool_calls = self.has_tool_calls.contains(&index);
+                // A call the stream left open does not finish as `tool_calls`.
+                let tool_calls = self.has_tool_calls.contains(&index)
+                    && !self
+                        .tool_detectors
+                        .get(&index)
+                        .is_some_and(|detector| detector.has_incomplete_call());
                 chunk["choices"][0]["finish_reason"] = if finish_type == "stop" && tool_calls {
                     "tool_calls".into()
                 } else {

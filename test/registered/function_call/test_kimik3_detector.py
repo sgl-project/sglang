@@ -8,6 +8,8 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
+    ARGUMENT_CLOSE,
+    CALL_CLOSE,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -305,6 +307,52 @@ def test_nameless_call_is_skipped_like_non_streaming():
     assert [c.name for c in calls if c.name] == [c.name for c in expected]
     actual = "".join(c.parameters for c in calls)
     assert json.loads(actual) == json.loads(expected[0].parameters)
+
+
+@pytest.mark.parametrize("size", [1, 5, 4096])
+@pytest.mark.parametrize(
+    "call_junk, argument_junk",
+    [
+        # Headers without whitespace after their tag.
+        (
+            f"<|open|>call<|sep|>x{CALL_CLOSE}",
+            f"<|open|>argument<|sep|>x{ARGUMENT_CLOSE}",
+        ),
+        ("oops ", "oops "),
+        (ARGUMENT_CLOSE, ARGUMENT_CLOSE),
+    ],
+)
+def test_malformed_xtml_is_skipped_like_non_streaming(call_junk, argument_junk, size):
+    argument = (
+        f'<|open|>argument key="code" type="string"<|sep|>print(1){ARGUMENT_CLOSE}'
+    )
+    call = (
+        '<|open|>call tool="python" index="1"<|sep|>'
+        f"{argument_junk}{argument}{argument_junk}{CALL_CLOSE}"
+    )
+    text = TOOLS_OPEN + call_junk + call + call_junk + call + TOOLS_CLOSE
+    detector = KimiK3Detector()
+    _, calls = _stream(detector, _chunks(text, size), [_make_tool("python")])
+    expected = detector.detect_and_parse(text, []).calls
+    assert [c.name for c in calls if c.name] == [c.name for c in expected]
+    assert len(expected) == 2
+    for i, parsed in enumerate(expected):
+        actual = "".join(c.parameters for c in calls if c.tool_index == i)
+        assert json.loads(actual) == json.loads(parsed.parameters)
+        assert json.loads(actual) == {"code": "print(1)"}
+    assert detector.incomplete_tool_call_indices == set()
+
+
+def test_skipping_stops_at_tools_close():
+    text = (
+        TOOLS_OPEN
+        + "oops"
+        + TOOLS_CLOSE
+        + _call_block("python", 1, {"code": ("string", "print(1)")})
+    )
+    detector = KimiK3Detector()
+    _, calls = _stream(detector, _chunks(text, 3), [_make_tool("python")])
+    assert calls == detector.detect_and_parse(text, []).calls == []
 
 
 if __name__ == "__main__":
