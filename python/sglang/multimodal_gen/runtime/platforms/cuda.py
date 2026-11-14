@@ -592,7 +592,6 @@ class CudaPlatformBase(Platform):
     device_name: str = "cuda"
     device_type: str = "cuda"
     dispatch_key: str = "CUDA"
-    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
