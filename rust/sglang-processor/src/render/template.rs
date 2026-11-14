@@ -76,6 +76,7 @@ impl ChatFormatter {
                 | ChatFormatter::Glm53(_)
                 | ChatFormatter::MiniMaxM3 { .. }
                 | ChatFormatter::Qwen38 { .. }
+                | ChatFormatter::Step3p5 { .. }
         );
         let request = TemplateArgsRequest {
             request,

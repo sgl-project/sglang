@@ -490,6 +490,10 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         default_factory=lambda: (qwen_image_edit_postprocess_text,)
     )
 
+    def supports_sequential_multi_output_inference(self):
+        # The edit stages handle one sample per forward; n > 1 runs the outputs one by one.
+        return True
+
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False
     ):
@@ -752,6 +756,11 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     )
     # promoting the auxiliary components regresses first-request latency
     supports_auto_residency: bool = False
+
+    def supports_sequential_multi_output_inference(self):
+        # The Layered pipeline's first stage does not split an n > 1 request, so the
+        # worker must not expect one result per output.
+        return False
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(

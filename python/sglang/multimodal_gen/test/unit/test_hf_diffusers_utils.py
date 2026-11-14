@@ -145,15 +145,19 @@ def test_external_component_loads_from_its_repository(tmp_path):
         == local
     )
 
-    # A release directory that also holds its own copy is ambiguous.
+    # A release that bundles its own copy loads it without another download.
     (release / "text_encoder").mkdir()
-    with pytest.raises(ValueError, match="also has"):
-        resolve(
+    with patch(
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model",
+    ) as download:
+        path = resolve(
             pipeline,
             SimpleNamespace(component_paths={}),
             "text_encoder",
             "text_encoder",
         )
+    assert path == str(release / "text_encoder")
+    download.assert_not_called()
 
 
 def _write_model_index(root):

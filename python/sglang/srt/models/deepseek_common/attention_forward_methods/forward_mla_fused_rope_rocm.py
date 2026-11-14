@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -35,6 +35,7 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
         )
+        self.rocm_fused_mla_rope_fusion = envs.SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION.get()
 
     def forward_absorb_fused_mla_rope_prepare(
         self: DeepseekV2AttentionMLA,
@@ -43,9 +44,7 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        enable_rope_fusion = (
-            os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
-        )
+        enable_rope_fusion = self.rocm_fused_mla_rope_fusion
         # NOTE: hidden_states can be a tuple for some quantization paths.
         # For shape/device/dtype, use the first tensor; still pass the original
         # hidden_states through linear ops which may accept tuple inputs.

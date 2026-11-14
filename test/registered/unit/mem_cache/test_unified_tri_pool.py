@@ -59,6 +59,7 @@ from sglang.test.unified_allocator_fixtures import (
     FakeUnifiedSWAKVPool,
     arena_of,
     build_test_unified_pools,
+    largest_take,
     open_float_side,
     setup_allocator_context,
     stand_in_views,
@@ -157,7 +158,7 @@ class TestUnifiedTriPool(_PoolTestCase):
 
     def test_pd_preallocation_binds_only_swa_tail_pages(self):
         _, allocator, _, _ = self._build(page_size=4)
-        before = allocator.available_size()
+        before = largest_take(allocator)
         prefix = torch.tensor([0], dtype=torch.int64)
         seq = torch.tensor([12], dtype=torch.int64)
         # With an empty prefix, ordinary allocation supplies the same virtual
@@ -183,7 +184,7 @@ class TestUnifiedTriPool(_PoolTestCase):
         allocator.free(virtual)
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
-        self.assertEqual(allocator.available_size(), before)
+        self.assertEqual(largest_take(allocator), before)
 
     def test_pd_short_tail_fits_beyond_joint_capacity(self):
         for lazy in (True,):
@@ -191,7 +192,7 @@ class TestUnifiedTriPool(_PoolTestCase):
                 with self.subTest(lazy=lazy, tail_len=tail_len):
                     _, allocator, _, _ = self._build(page_size=4, lazy_compaction=lazy)
                     full = allocator.full_attn_allocator
-                    length = allocator.available_size() + 4
+                    length = largest_take(allocator) + 4
                     self.assertFalse(
                         allocator.admits(
                             KVDemand(length, demand_windows(allocator, length, length))
@@ -264,13 +265,13 @@ class TestUnifiedTriPool(_PoolTestCase):
 
     def test_available_shrinks_as_state_slots_grow(self):
         _, allocator, _, _ = self._build()
-        before = allocator.available_size()
+        before = largest_take(allocator)
         slots = allocator.mamba_allocator.alloc(4)
         self.assertIsNotNone(slots)
-        after = allocator.available_size()
+        after = largest_take(allocator)
         self.assertLess(after, before)
         allocator.mamba_allocator.free(slots)
-        self.assertEqual(allocator.available_size(), before)
+        self.assertEqual(largest_take(allocator), before)
 
     # -- steady-state SWA churn: tombstones -> holes -> in-place reuse --
 
@@ -356,7 +357,8 @@ class TestUnifiedTriPool(_PoolTestCase):
             allocator.mamba_allocator,
             device=_DEV,
             take=allocator.alloc_state_slots,
-            capacity=allocator.state_slots_available,
+            fits=allocator.state_slots_fit,
+            estimate=allocator.estimated_state_slots_available,
         )
         v = slot_alloc.alloc(3)
         self.assertIsNotNone(v)
@@ -369,8 +371,9 @@ class TestUnifiedTriPool(_PoolTestCase):
         )
         slot_alloc.free(v)
         self.assertEqual(slot_alloc.available_size(), pool.num_entries("mamba") - 1)
-        # Group prefetch draw-down + surplus return.
+        # A group takes nothing ahead; each slot is taken when drawn.
         slot_alloc.alloc_group_begin(4)
+        self.assertEqual(slot_alloc.available_size(), pool.num_entries("mamba") - 1)
         s1 = slot_alloc.alloc(1)
         self.assertIsNotNone(s1)
         slot_alloc.alloc_group_end()
@@ -412,7 +415,8 @@ class TestUnifiedTriPool(_PoolTestCase):
                     allocator.mamba_allocator,
                     device=_DEV,
                     take=allocator.alloc_state_slots,
-                    capacity=allocator.state_slots_available,
+                    fits=allocator.state_slots_fit,
+                    estimate=allocator.estimated_state_slots_available,
                 )
 
                 full_leaves = []
@@ -422,13 +426,13 @@ class TestUnifiedTriPool(_PoolTestCase):
                         break
                     full_leaves.append(indices)
                 self.assertTrue(full_leaves)
-                residual_mamba = mamba_slots.schedulable_available_size()
+                residual_mamba = largest_take(allocator, allocator.sub_pool_roles()[2])
                 if residual_mamba:
                     self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
                 while mamba_slots.alloc(1) is not None:
                     pass
                 self.assertGreater(mamba_slots.available_size(), 0)
-                self.assertEqual(mamba_slots.schedulable_available_size(), 0)
+                self.assertFalse(mamba_slots.slots_fit(1))
 
                 cache = object.__new__(UnifiedRadixCache)
                 cache.disable = False
@@ -497,7 +501,7 @@ class TestUnifiedTriPool(_PoolTestCase):
                 self.assertEqual(
                     allocator.swa_attn_allocator._live_pages(), swa_live_before
                 )
-                self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 1)
+                self.assertTrue(mamba_slots.slots_fit(1))
                 self.assertIsNotNone(mamba_slots.alloc(1))
                 self.assertEqual(allocator.verify_byte_accounting(), [])
 
@@ -550,14 +554,14 @@ class TestTriPagedFreeGroup(_PoolTestCase):
         pool, allocator = self._build_paged()
         v = allocator.alloc(8)
         self.assertIsNotNone(v)
-        before = allocator.available_size()
+        before = largest_take(allocator)
 
         allocator.free_group_begin()
         allocator.free_segment(v, start_pos=0)
         allocator.free_group_end()  # -> _release_page_reps -> float.free(_pages=)
 
         self.assertEqual(allocator.verify_byte_accounting(), [])
-        self.assertGreaterEqual(allocator.available_size(), before)
+        self.assertGreaterEqual(largest_take(allocator), before)
         # Capacity fully recovered: the float parked, both ends rewound.
         self.assertTrue(allocator.swa_attn_allocator._is_frontier_transparent())
 
@@ -1277,7 +1281,7 @@ class TestTriPoolHardening(_PoolTestCase):
         self.assertIsNotNone(grab)
         # The read credits sliding the float, so exactly what it reports must
         # be taken, and no layout that leaves the float in place holds it.
-        need = allocator.available_size()
+        need = largest_take(allocator)
         page = allocator.page_size
         demands = {
             n: d
@@ -1311,7 +1315,7 @@ class TestTriPoolHardening(_PoolTestCase):
         reqs = []
         while True:
             v = allocator.alloc(4)
-            if v is None or allocator.available_size() < 4:
+            if v is None or largest_take(allocator) < 4:
                 if v is not None:
                     reqs.append(v)
                 break
@@ -1357,7 +1361,7 @@ class TestTriPoolHardening(_PoolTestCase):
         # tree_cache=None: the default helper no-ops; the bounded loop must
         # return promptly (no infinite re-check) and the gate reports honestly.
         _, allocator, _, _ = self._build()
-        big = allocator.available_size() + 64
+        big = largest_take(allocator) + 64
         self.assertFalse(
             check_decode_capacity(allocator=allocator, num_tokens=big, tree_cache=None)
         )
@@ -1436,15 +1440,15 @@ class TestJointCapacityIsHonoured(_PoolTestCase):
                                 lazy=lazy,
                                 specs=specs,
                             )
-                            n = alloc.available_size()
+                            n = largest_take(alloc)
                             if n <= 0:
                                 continue
-                            # The whole point: the number the scheduler reads
-                            # must be allocatable, with no backstop assert.
+                            # The whole point: whatever the planner admits is
+                            # allocatable, with no backstop assert.
                             out = alloc.alloc(n)
                             self.assertIsNotNone(
                                 out,
-                                f"alloc(available_size()={n}) returned None",
+                                f"alloc(largest_take={n}) returned None",
                             )
                             self.assertEqual(out.numel(), n)
                             # Both sides bound for every allocated virtual id.
@@ -1590,13 +1594,15 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         # page_size 1 leaves no slack between the per-side and joint views;
         # the double-count only has room to show on a paged grid.
         _, allocator, _, _ = self._build(page_size=4)
-        full_demand = allocator.full_available_size()
-        swa_demand = allocator.swa_available_size()
+        owner, (window,), _ = allocator.sub_pool_roles()
+        full_demand = largest_take(allocator, owner)
+        swa_demand = largest_take(allocator, window)
         self.assertGreater(min(full_demand, swa_demand), 0)
-        # Each side alone reports room for its own half ...
-        self.assertLessEqual(full_demand, allocator.full_available_size())
-        self.assertLessEqual(swa_demand, allocator.swa_available_size())
-        # ... yet the two draw on the same bytes, so the grid refuses the pair.
+        # Each side alone has room for its own half ...
+        self.assertTrue(allocator.units_fit({owner: full_demand // 4}))
+        self.assertTrue(allocator.units_fit({window: swa_demand // 4}))
+        # ... yet the two draw on the same bytes, so the grid refuses the pair,
+        # with budgets holding nothing back (counted from zero).
         self.assertFalse(
             allocator.ensure_capacity(token_demand(allocator, full_demand, swa_demand))
         )
@@ -1604,46 +1610,41 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
             allocator.prealloc_fits(
                 token_demand(allocator, full_demand, swa_demand),
                 evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
-                full_budget_tokens=full_demand,
-                window_budget_tokens={allocator.target_window_pool(): swa_demand},
+                full_budget_tokens=0,
+                window_budget_tokens={allocator.target_window_pool(): 0},
             )
         )
 
     def test_the_scheduler_budget_still_binds(self):
-        # Decode builds each side's budget as that side's availability minus
-        # the tokens it holds back for running requests; what a budget holds
-        # back is charged beside the request on both sides at once.
+        # Over a shared memory decode budgets count from zero: minus the tokens held
+        # back for running requests, charged beside the request on both sides at once.
         _, allocator, _, _ = self._build()
         page_size = allocator.page_size
+        owner, (window,), _ = allocator.sub_pool_roles()
+        evictable = evictable_by_sub_pool(self._empty_tree(), allocator)
+        request = token_demand(allocator, page_size, page_size)
+
+        def fits(full_held, window_held):
+            return allocator.prealloc_fits(
+                request,
+                evictable=evictable,
+                full_budget_tokens=-full_held,
+                window_budget_tokens={allocator.target_window_pool(): -window_held},
+            )
+
         held = 2 * page_size
-        full_budget = allocator.full_available_size() - held
-        swa_budget = allocator.swa_available_size() - held
-        self.assertTrue(
-            allocator.prealloc_fits(
-                token_demand(allocator, page_size, page_size),
-                evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
-                full_budget_tokens=full_budget,
-                window_budget_tokens={allocator.target_window_pool(): swa_budget},
-            )
+        self.assertTrue(fits(held, held))
+        self.assertEqual(
+            fits(held, held),
+            allocator.admits(
+                token_demand(allocator, page_size + held, page_size + held),
+                evictable=evictable,
+            ),
         )
-        # The request may not exceed its side's budget.
+        # Holding back each side's whole room alone at once leaves no shared
+        # bytes for the request.
         self.assertFalse(
-            allocator.prealloc_fits(
-                token_demand(allocator, page_size, page_size),
-                evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
-                full_budget_tokens=page_size - 1,
-                window_budget_tokens={allocator.target_window_pool(): swa_budget},
-            )
-        )
-        # Holding back nearly all of each side's own availability at once
-        # leaves no shared bytes for the request.
-        self.assertFalse(
-            allocator.prealloc_fits(
-                token_demand(allocator, page_size, page_size),
-                evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
-                full_budget_tokens=page_size,
-                window_budget_tokens={allocator.target_window_pool(): page_size},
-            )
+            fits(largest_take(allocator, owner), largest_take(allocator, window))
         )
 
 

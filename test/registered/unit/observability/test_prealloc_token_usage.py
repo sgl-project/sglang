@@ -17,7 +17,11 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     WindowPoolStats,
 )
-from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     SchedulerStats,
@@ -47,6 +51,22 @@ def _queue(reqs):
     )
     queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=PAGE)
     return queue
+
+
+def _waiting_req(input_len, output_len):
+    return FakeReq(origin_input_ids=[0] * input_len, output_ids=[0] * output_len)
+
+
+class TestNumTokensPendingPrealloc(CustomTestCase):
+    def test_counts_prealloc_and_retracted_reqs(self):
+        queue = object.__new__(DecodePreallocQueue)
+        queue.queue = decode_queue(
+            ListKind.PD_PREALLOC, [SimpleNamespace(req=_waiting_req(100, 0))]
+        )
+        queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
+        move([_waiting_req(50, 11)], queue.retracted_queue)
+        # The last output id of a retracted req is the pending decode input.
+        self.assertEqual(queue.num_tokens_pending_prealloc, 100 + 50 + 10)
 
 
 class TestPreAllocatedTokenCounts(CustomTestCase):
@@ -79,17 +99,20 @@ class TestPreAllocatedTokenCounts(CustomTestCase):
         )
 
 
-def _reporter(*, counts, pool_stats):
+def _reporter(*, counts, pool_stats, pending=0):
     reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
     reporter.stats = SchedulerStats()
     reporter.scheduler = SimpleNamespace(
         disagg_decode_prealloc_queue=SimpleNamespace(
-            queue=[], pre_allocated_token_counts=lambda windows: counts
+            queue=[],
+            num_tokens_pending_prealloc=pending,
+            pre_allocated_token_counts=lambda windows: counts,
         ),
         disagg_decode_transfer_queue=SimpleNamespace(
             queue=[], num_pending_deferred_releases=lambda: 0
         ),
         pool_stats_observer=SimpleNamespace(get_pool_stats=lambda: pool_stats),
+        max_total_num_tokens=1000,
     )
     return reporter
 
@@ -166,6 +189,15 @@ class TestDecodeQueueStats(CustomTestCase):
         self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.1)
         self.assertEqual(reporter.stats.prealloc_window_token_usage, {})
         self.assertEqual(reporter.stats.prealloc_swa_token_usage, 0.0)
+
+    def test_pending_prealloc_share_of_max_total_num_tokens(self):
+        reporter = _reporter(
+            counts=(0, {"window_128": 0}),
+            pool_stats=_swa_pool_stats(1000, 200),
+            pending=1500,
+        )
+        self._update(reporter)
+        self.assertEqual(reporter.stats.pending_prealloc_token_usage, 1.5)
 
     def test_zero_capacity_reports_zero_like_token_usage(self):
         reporter = _reporter(

@@ -9,6 +9,7 @@ import numpy as np
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori import conn as mori_conn
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=5, suite="stage-a-test-1-gpu-small-amd")
 
@@ -183,6 +184,83 @@ class TestMoriDsaStateElision(unittest.TestCase):
         # Decode elided layer 4. Writing to it would use a None descriptor.
         calls = self._send([4, 5], [3, 4, 5], [132, 132], [132, 0, 132])
         self.assertEqual(calls, [call("s5", "d5", "plan")])
+
+
+# GLM-5.2 under PP4: get_pp_indices splits its 78 layers 19/19/20/20;
+# the last stage also holds the MTP draft entry.
+_DECODE_DSA_ENTRIES = 79
+_PP4_STAGES = ((0, 19), (19, 19), (38, 20), (58, 21))
+
+
+class TestMoriPpDsaStatePairing(CustomTestCase):
+    def _manager(self, start_layer, *, hybrid=False):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.pp_size = 4
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = hybrid
+        manager.attn_tp_size = 1
+        manager.kv_args = SimpleNamespace(prefill_start_layer=start_layer)
+        manager._build_contiguous_transfer_plan = Mock(return_value="plan")
+        manager._submit_batch_transfer_plan = Mock(return_value=[])
+        return manager
+
+    def _send_unlabeled_state(
+        self, manager, *, state_type, num_src, num_dst=_DECODE_DSA_ENTRIES
+    ):
+        manager._send_swa_dsa_state(
+            peer_info=SimpleNamespace(decode_tp_size=4),
+            src_state_indices=np.array([3, 4, 9], dtype=np.int32),
+            dst_state_indices=np.array([7, 8, 12], dtype=np.int32),
+            src_state_mem_descs=[f"P{i}" for i in range(num_src)],
+            src_state_item_lens=[64] * num_src,
+            dst_state_mem_descs=[f"D{j}" for j in range(num_dst)],
+            dst_state_item_lens=[64] * num_dst,
+            state_type=state_type,
+            src_layer_ids=[],
+            dst_layer_ids=[],
+        )
+
+    def test_each_stage_writes_decode_entries_at_its_layer_offset(self):
+        """DSA state has no layer ids, so a PP>1 prefill used to fail every state send;
+        each stage must write its entries from its first layer, draft included."""
+        for start_layer, num_src in _PP4_STAGES:
+            with self.subTest(start_layer=start_layer):
+                manager = self._manager(start_layer)
+
+                self._send_unlabeled_state(manager, state_type="dsa", num_src=num_src)
+
+                self.assertEqual(
+                    manager._submit_batch_transfer_plan.call_args_list,
+                    [
+                        call(f"P{i}", f"D{start_layer + i}", "plan")
+                        for i in range(num_src)
+                    ],
+                )
+
+    def test_unpairable_layouts_still_fail_before_any_write(self):
+        """Only plain DSA state pairs by stage offset; SWA, a hybrid linear+DSA pool,
+        and a stage overrunning the decode entries all raise before any write."""
+        for state_type, hybrid, start_layer, num_src, num_dst, error in (
+            ("swa", False, 40, 20, _DECODE_DSA_ENTRIES, "requires layer ids"),
+            ("dsa", False, 70, 19, _DECODE_DSA_ENTRIES, "do not match prefill pp"),
+            # Hybrid, half the layers full attention: decode lists 40 entries,
+            # the stage at layer 20 has 10.
+            ("dsa", True, 20, 10, 40, "requires layer ids"),
+        ):
+            with self.subTest(
+                state_type=state_type, hybrid=hybrid, start_layer=start_layer
+            ):
+                manager = self._manager(start_layer, hybrid=hybrid)
+
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self._send_unlabeled_state(
+                        manager,
+                        state_type=state_type,
+                        num_src=num_src,
+                        num_dst=num_dst,
+                    )
+
+                manager._submit_batch_transfer_plan.assert_not_called()
 
 
 if __name__ == "__main__":

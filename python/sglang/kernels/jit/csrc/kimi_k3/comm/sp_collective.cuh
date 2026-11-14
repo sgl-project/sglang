@@ -11,9 +11,8 @@
 //     its local shard once, then every peer polls the rank slots and copies
 //     them into rank-concatenated row order.
 //
-// Both kernels reuse CustomAllReduceV2's double-buffered push workspace and
-// phase counters.  A bumper block advances counters outside the tuned work
-// grid, so calls remain protocol-compatible with all-reduce and gemm_ag.
+// Both kernels reuse CustomAllReduceV2's double-buffered push workspace and its
+// phase word, so calls remain protocol-compatible with all-reduce and gemm_ag.
 
 #include <sgl_kernel/tensor.h>
 
@@ -29,7 +28,7 @@ namespace sglang {
 
 namespace sp_collective {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 using device::distributed::Semaphore;
 
 struct Params {
@@ -38,13 +37,12 @@ struct Params {
   const uint8_t* residual;
   uint8_t* push_workspaces[device::distributed::kMaxWorldSize];
   uint8_t* push_ws_mc;
-  Counter* counter;
+  EpochCounter* counter;
   Semaphore* sem_local;
   Semaphore* sem_mc;
   uint8_t* input_mc;
   uint8_t* output_mc;
   int64_t stride_bytes;
-  uint32_t num_counters;
   uint32_t rank;
   uint32_t local_vecs;
   uint32_t residual_is_local;
@@ -61,32 +59,15 @@ SGL_DEVICE Vec empty_vec() {
   return vec;
 }
 
-template <uint32_t kWorldSize>
-SGL_DEVICE bool bumper_block(const Params& params) {
-  const auto bx = blockIdx.x;
-  if (bx + 1 != gridDim.x) return false;
-  const auto phase = params.counter[bx].get() & 1;
-  __syncthreads();
-  for (uint32_t i = bx + threadIdx.x; i < params.num_counters; i += blockDim.x) {
-    params.counter[i].set(phase ^ 1);
-  }
-  return true;
-}
-
 template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL>
 __global__ void reduce_scatter_res_kernel(const __grid_constant__ Params params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
 
   device::PDLWaitPrimary<kUsePDL>();
-  if (bumper_block<kWorldSize>(params)) {
-    device::PDLTriggerSecondary<kUsePDL>();
-    return;
-  }
 
-  const uint32_t bx = blockIdx.x;
-  const uint32_t tid = bx * blockDim.x + threadIdx.x;
-  const uint32_t num_threads = (gridDim.x - 1) * blockDim.x;
-  const uint32_t phase = params.counter[bx].get() & 1;
+  const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t num_threads = gridDim.x * blockDim.x;
+  const uint32_t phase = params.counter->load();
   const auto phase_offset = phase * kWorldSize * params.stride_bytes;
   const auto producer_offset = phase_offset + params.rank * params.stride_bytes;
 
@@ -129,7 +110,7 @@ __global__ void reduce_scatter_res_kernel(const __grid_constant__ Params params)
   }
 
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[bx].set(phase ^ 1);
+  if (threadIdx.x == 0) params.counter->commit();
 }
 
 template <uint32_t kWorldSize, bool kUsePDL>
@@ -137,15 +118,10 @@ __global__ void all_gather_kernel(const __grid_constant__ Params params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
 
   device::PDLWaitPrimary<kUsePDL>();
-  if (bumper_block<kWorldSize>(params)) {
-    device::PDLTriggerSecondary<kUsePDL>();
-    return;
-  }
 
-  const uint32_t bx = blockIdx.x;
-  const uint32_t tid = bx * blockDim.x + threadIdx.x;
-  const uint32_t num_threads = (gridDim.x - 1) * blockDim.x;
-  const uint32_t phase = params.counter[bx].get() & 1;
+  const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t num_threads = gridDim.x * blockDim.x;
+  const uint32_t phase = params.counter->load();
   const auto phase_offset = phase * kWorldSize * params.stride_bytes;
   const auto producer_offset = phase_offset + params.rank * params.stride_bytes;
 
@@ -174,7 +150,7 @@ __global__ void all_gather_kernel(const __grid_constant__ Params params) {
   }
 
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[bx].set(phase ^ 1);
+  if (threadIdx.x == 0) params.counter->commit();
 }
 
 // Direct variant: output is multicast-bound symmetric memory.  Each producer
@@ -186,10 +162,9 @@ template <uint32_t kWorldSize, bool kUsePDL>
 __global__ void all_gather_direct_kernel(const __grid_constant__ Params params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
 
-  // Reserve the window before the PDL wait, signal after it.
-  const auto barrier = device::distributed::McBarrier(params.sem_local, params.sem_mc, kWorldSize, /*num_arrives=*/2);
+  const auto barrier = device::distributed::McBarrier(params.sem_local, params.sem_mc, kWorldSize);
   device::PDLWaitPrimary<kUsePDL>();
-  barrier.arrive_relaxed(/*n=*/0);
+  barrier.arrive_relaxed();
   __syncthreads();
 
   const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -203,7 +178,7 @@ __global__ void all_gather_direct_kernel(const __grid_constant__ Params params) 
 
   device::PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  barrier.arrive_rel_acq(/*n=*/1);
+  barrier.arrive_rel_acq();
 }
 
 // NVLS pull variant: o_proj writes its TP-partial result into multicast-bound
@@ -214,10 +189,9 @@ __global__ void reduce_scatter_pull_kernel(const __grid_constant__ Params params
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
   using SumOp = device::ReductionTrait<device::ReductionOp::SUM, bf16x2_t>;
 
-  // Reserve the window before the PDL wait, signal after it.
-  const auto barrier = device::distributed::McBarrier(params.sem_local, params.sem_mc, kWorldSize, /*num_arrives=*/2);
+  const auto barrier = device::distributed::McBarrier(params.sem_local, params.sem_mc, kWorldSize);
   device::PDLWaitPrimary<kUsePDL>();
-  barrier.arrive_relaxed(/*n=*/0);
+  barrier.arrive_relaxed();
   __syncthreads();
 
   const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -241,7 +215,7 @@ __global__ void reduce_scatter_pull_kernel(const __grid_constant__ Params params
 
   device::PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  barrier.arrive_rel_acq(/*n=*/1);
+  barrier.arrive_rel_acq();
 }
 
 }  // namespace sp_collective
@@ -292,7 +266,6 @@ struct SPCollectiveKernel {
         .input_mc = nullptr,
         .output_mc = nullptr,
         .stride_bytes = 0,
-        .num_counters = 0,
         .rank = comm.get_rank(),
         .local_vecs = static_cast<uint32_t>(local_elems.unwrap() * sizeof(bf16_t) / 16),
         .residual_is_local = static_cast<uint32_t>(residual_is_local),
@@ -307,7 +280,6 @@ struct SPCollectiveKernel {
     params.push_ws_mc = push.mc_workspace;
     params.counter = push.counter;
     params.stride_bytes = push.slot_bytes;
-    params.num_counters = push.num_blocks;
   }
 
   static void bind_pull(sp_collective::Params& params, const host::distributed::PullPlaneObj& pull) {
@@ -316,8 +288,8 @@ struct SPCollectiveKernel {
     params.sem_mc = pull.mc_semaphore;
   }
 
-  static void check_push_launch(const host::distributed::PushPlaneObj& push, int64_t num_blocks, int64_t block_size) {
-    CHECK_HOST(num_blocks > 0 && num_blocks < push.num_blocks);
+  static void check_push_launch(int64_t num_blocks, int64_t block_size) {
+    CHECK_HOST(num_blocks > 0);
     // The RS reduction keeps one 16B vector per producer in registers.
     // 1024-thread CTAs exceed the GB300 launch resource limit.
     CHECK_HOST(block_size >= 32 && block_size <= 512 && block_size % 32 == 0);
@@ -337,25 +309,25 @@ struct SPCollectiveKernel {
       int64_t num_blocks,
       int64_t block_size) {
     const auto& push = ref.get()->get_push_obj();
-    check_push_launch(push, num_blocks, block_size);
+    check_push_launch(num_blocks, block_size);
     auto params = make_params(*ref.get(), input, output, residual, residual_is_local);
     bind_push(params, push);
     const auto kernel = residual.has_value() ? sp_collective::reduce_scatter_res_kernel<kWorldSize, true, kUsePDL>
                                              : sp_collective::reduce_scatter_res_kernel<kWorldSize, false, kUsePDL>;
-    host::LaunchKernel(num_blocks + 1, block_size, input.device()).enable_pdl(kUsePDL)(kernel, params);
+    host::LaunchKernel(num_blocks, block_size, input.device()).enable_pdl(kUsePDL)(kernel, params);
   }
 
   static void
   all_gather(CommunicatorRef ref, TensorView input, TensorView output, int64_t num_blocks, int64_t block_size) {
     const auto& push = ref.get()->get_push_obj();
-    check_push_launch(push, num_blocks, block_size);
+    check_push_launch(num_blocks, block_size);
     // Reuse the RS matcher by swapping input/output roles conceptually.
     auto params = make_params(*ref.get(), output, input, std::nullopt, false);
     bind_push(params, push);
     CHECK_HOST(params.push_ws_mc != nullptr) << "all-gather requires a multicast-capable push plane";
     params.input = static_cast<const uint8_t*>(input.data_ptr());
     params.output = static_cast<uint8_t*>(output.data_ptr());
-    host::LaunchKernel(num_blocks + 1, block_size, input.device())
+    host::LaunchKernel(num_blocks, block_size, input.device())
         .enable_pdl(kUsePDL)(sp_collective::all_gather_kernel<kWorldSize, kUsePDL>, params);
   }
 

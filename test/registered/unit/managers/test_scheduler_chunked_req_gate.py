@@ -17,6 +17,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
@@ -98,7 +99,8 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
     s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
-    s.chunked_req = chunked_req
+    if chunked_req is not None:
+        move([chunked_req], s.chunked_reqs)
     s._pending_chunked_abort_req = None
     s.running_reqs = KeyedReqList(ListKind.DECODING)
     s.invariant_checker = MagicMock()

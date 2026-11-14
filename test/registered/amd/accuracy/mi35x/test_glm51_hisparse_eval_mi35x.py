@@ -17,6 +17,7 @@ register_amd_ci(
     est_time=5400,
     suite="nightly-amd-8-gpu-mi35x-glm51-hisparse",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 

@@ -10,6 +10,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.kernels.ops.diffusion import (
+    SANA_VIDEO2_SOFTMAX_ATTENTION,
+    try_sana_video2_softmax_attention,
+)
 from sglang.multimodal_gen.configs.models.dits.sana_video2 import SanaVideo2Config
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_reduce,
@@ -45,6 +49,11 @@ class SanaVideo2RotaryPosEmbed(WanRotaryPosEmbed):
     def _apply(self, fn, recurse=True):
         # Keep complex128 frequencies; forward moves them to the input device.
         return self
+
+    def forward(self, fhw, device, frame_index=None):
+        if self._freqs.device != device:
+            self._freqs = self._freqs.to(device)
+        return super().forward(fhw, device, frame_index)
 
 
 class ChannelRMSNorm(_RMSNorm):
@@ -118,6 +127,7 @@ class GatedSoftmaxAttention(nn.Module):
         self.q_norm = _RMSNorm(dim, eps=1e-5) if qk_norm else nn.Identity()
         self.k_norm = _RMSNorm(dim, eps=1e-5) if qk_norm else nn.Identity()
         self.output_gate = nn.Linear(dim, dim)
+        SANA_VIDEO2_SOFTMAX_ATTENTION.mark(self)
 
     def forward(self, x, rotary_emb=None, shard=None):
         batch, tokens, channels = x.shape
@@ -137,9 +147,11 @@ class GatedSoftmaxAttention(nn.Module):
                 for tensor in (q, k, v)
             )
             k, v = k[:, :, : shard.orig_len], v[:, :, : shard.orig_len]
-        if self.fp32_attention:
-            q, k, v = q.float(), k.float(), v.float()
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        out = try_sana_video2_softmax_attention(self, q, k, v)
+        if out is None:
+            if self.fp32_attention:
+                q, k, v = q.float(), k.float(), v.float()
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         out = out.transpose(1, 2)
         if shard is not None:
             out = sequence_model_parallel_all_to_all_4D(

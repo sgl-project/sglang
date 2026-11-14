@@ -204,7 +204,7 @@ class TestW4A8MoE(unittest.TestCase):
     def test_config_selects_online_experts_and_respects_ignored_layers(self):
         layer = FusedMoE.__new__(FusedMoE)
         torch.nn.Module.__init__(layer)
-        layer.use_triton_kernels = layer.use_flashinfer_trtllm_moe = False
+        layer.use_flashinfer_trtllm_moe = False
         prefix = "model.layers.0.mlp.experts"
         with (
             patch("sglang.srt.layers.quantization.npu_mxfp4.is_npu", return_value=True),

@@ -2,7 +2,7 @@ import logging
 import re
 from array import array
 from functools import lru_cache
-from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -39,18 +39,6 @@ from sglang.srt.utils import flatten_nested_list
 logger = logging.getLogger(__name__)
 
 cached_get_processor = lru_cache(get_processor)
-
-
-class Gemma3nImagePixelInputs(TypedDict):
-    pixel_values: torch.Tensor
-    """Shape: `(batch_size * num_images, num_channels, height, width)`"""
-
-
-class Gemma3nAudioInputs(TypedDict):
-    input_features: torch.Tensor
-    """Shape: `(batch_size * num_audio, seq_length, num_features)`"""
-    input_features_mask: torch.Tensor
-    """Shape: `(batch_size * num_audio, seq_length)`"""
 
 
 class Gemma3nMultimodalEmbedder(nn.Module):

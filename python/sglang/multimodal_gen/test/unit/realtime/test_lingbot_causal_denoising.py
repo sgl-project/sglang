@@ -1039,17 +1039,13 @@ def test_lingbot_causal_attention_without_cache_applies_rope_once(monkeypatch):
         seen["k"] = k.clone()
         return v
 
-    def fake_inplace_rope(q, k, cos_sin_cache, is_neox):
-        q.add_(1.0)
-        k.add_(1.0)
-        return q, k
+    def unexpected_rope(*args, **kwargs):
+        pytest.fail("RoPE must be applied by the parent when kv_cache is None")
+
+    attn.rotary_emb = unexpected_rope
 
     monkeypatch.setattr(
         lingbot_world_module.CausalWanSelfAttention, "forward", fake_parent_forward
-    )
-    monkeypatch.setattr(lingbot_world_module, "_is_cuda", True)
-    monkeypatch.setattr(
-        lingbot_world_module, "apply_flashinfer_rope_qk_inplace", fake_inplace_rope
     )
     monkeypatch.setattr(
         lingbot_world_module,
