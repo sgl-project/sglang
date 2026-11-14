@@ -381,16 +381,22 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
         self.assertTrue(kwargs["save_output"])
 
-    def test_cli_accepts_url_postprocess_model_paths(self):
-        """URL weights stay supported outside HTTP; only network entry points reject them."""
-        url = "https://example.com/weights.pth"
-        params = SamplingParams(
-            **self._parse_cli_kwargs(
-                ["--upscaling-model-path", url, "--frame-interpolation-model-path", url]
-            )
-        )
-        self.assertEqual(params.upscaling_model_path, url)
-        self.assertEqual(params.frame_interpolation_model_path, url)
+    def test_cli_accepts_any_postprocess_model_path(self):
+        """Any weights stay supported outside HTTP; only network entry points restrict them."""
+        for path in ("https://example.com/weights.pth", "org/weights", "/models/w"):
+            with self.subTest(path=path):
+                params = SamplingParams(
+                    **self._parse_cli_kwargs(
+                        [
+                            "--upscaling-model-path",
+                            path,
+                            "--frame-interpolation-model-path",
+                            path,
+                        ]
+                    )
+                )
+                self.assertEqual(params.upscaling_model_path, path)
+                self.assertEqual(params.frame_interpolation_model_path, path)
 
     def test_get_cli_args_accepts_seed_list(self):
         self.assertEqual(self._parse_cli_kwargs(["--seed", "7"])["seed"], 7)

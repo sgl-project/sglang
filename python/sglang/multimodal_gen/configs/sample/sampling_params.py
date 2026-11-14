@@ -95,6 +95,37 @@ def validate_frame_interpolation_exp(exp: int) -> None:
         )
 
 
+# Default post-processing weight repos; a served request may always select them.
+DEFAULT_FRAME_INTERPOLATION_REPO = "elfgum/RIFE-4.22.lite"
+DEFAULT_UPSCALING_REPO = "ai-forever/Real-ESRGAN"
+_DEFAULT_POSTPROCESS_REPOS = {
+    "frame_interpolation_model_path": DEFAULT_FRAME_INTERPOLATION_REPO,
+    "upscaling_model_path": DEFAULT_UPSCALING_REPO,
+}
+
+
+def validate_served_postprocess_model_path(
+    name: str, value: Any, allowed: list[str] | None
+) -> None:
+    """Reject post-processing weights the server operator did not allow.
+
+    The model path of a served request is client-chosen, and the server would
+    download and load whatever it names. Only the default repo and the paths
+    listed in --postprocess-model-paths are accepted.
+    """
+    # falsy selects the default weights, as in the loaders
+    if not value:
+        return
+    if isinstance(value, str) and (
+        value == _DEFAULT_POSTPROCESS_REPOS[name] or value in (allowed or ())
+    ):
+        return
+    raise ValueError(
+        f"{name} {value!r} is not allowed on this server; omit it to use the "
+        "default weights, or list it in --postprocess-model-paths"
+    )
+
+
 @dataclass(frozen=True)
 class SkipSoftmaxParams:
     """Validated request-scoped BLASST/Skip-Softmax controls."""

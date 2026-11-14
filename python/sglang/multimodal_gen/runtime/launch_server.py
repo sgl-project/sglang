@@ -679,6 +679,11 @@ def dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
     apply_plugin_hooks()
 
+    # A server loads only the default post-processing weights unless the
+    # operator lists more. The CLI and Python API do not launch through here.
+    if server_args.postprocess_model_paths is None:
+        server_args.postprocess_model_paths = []
+
     if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
 

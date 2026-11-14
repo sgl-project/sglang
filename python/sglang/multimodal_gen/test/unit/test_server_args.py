@@ -4016,6 +4016,53 @@ class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
                     )
 
 
+class TestPostprocessModelPathsArgs(unittest.TestCase):
+    def test_config_values(self):
+        for paths in (None, [], ["org/rife", "/models/esrgan.pth"]):
+            with self.subTest(paths=paths):
+                args = _from_dict_without_model_resolution(
+                    {"model_path": "/fake", "postprocess_model_paths": paths}
+                )
+                self.assertEqual(args.postprocess_model_paths, paths)
+        for paths in ("org/rife", [1]):
+            with self.subTest(paths=paths):
+                with self.assertRaisesRegex(ValueError, "postprocess_model_paths"):
+                    _from_dict_without_model_resolution(
+                        {"model_path": "/fake", "postprocess_model_paths": paths}
+                    )
+
+    def test_cli_flag(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        base = ["--model-path", "/fake"]
+        unset, _ = parser.parse_known_args(base)
+        listed, _ = parser.parse_known_args(
+            base + ["--postprocess-model-paths", "org/rife", "/models/esrgan.pth"]
+        )
+        self.assertIsNone(unset.postprocess_model_paths)
+        self.assertEqual(
+            listed.postprocess_model_paths, ["org/rife", "/models/esrgan.pth"]
+        )
+
+    def test_server_launch_allows_only_default_weights_unless_listed(self):
+        from sglang.multimodal_gen.runtime import launch_server as launch_module
+
+        for configured, expected in ((None, []), (["org/rife"], ["org/rife"])):
+            with self.subTest(configured=configured):
+                args = _from_dict_without_model_resolution(
+                    {"model_path": "/fake", "postprocess_model_paths": configured}
+                )
+                with (
+                    patch.dict(os.environ),
+                    patch.object(launch_module, "apply_plugin_hooks"),
+                    patch.object(launch_module, "launch_server") as launch,
+                ):
+                    launch_module.dispatch_launch(args)
+                self.assertEqual(
+                    launch.call_args.args[0].postprocess_model_paths, expected
+                )
+
+
 class TestNcclNvlsArgs(unittest.TestCase):
     def test_enable_nccl_nvls_cli_arg(self):
         parser = FlexibleArgumentParser()

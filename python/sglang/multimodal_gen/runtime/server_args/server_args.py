@@ -591,6 +591,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
+    # Post-processing model paths a served request may select besides the
+    # defaults. A server resolves None to an empty list (dispatch_launch); the
+    # CLI and Python API keep None, which is unrestricted.
+    postprocess_model_paths: list[str] | None = None
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -723,6 +727,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 "http_graceful_shutdown_timeout must be None or a non-negative "
                 "integer in seconds"
             )
+        paths = self.postprocess_model_paths
+        if paths is not None and not (
+            isinstance(paths, (list, tuple))
+            and all(isinstance(path, str) for path in paths)
+        ):
+            # a bare string would be matched by substring
+            raise ValueError("postprocess_model_paths must be a list of strings")
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -3200,6 +3211,17 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.input_save_path,
             help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
+        )
+        parser.add_argument(
+            "--postprocess-model-paths",
+            type=str,
+            nargs="+",
+            default=ServerArgs.postprocess_model_paths,
+            help=(
+                "Frame interpolation / upscaling model paths that server requests "
+                "may select besides the default weights. A request naming any "
+                "other path is rejected."
+            ),
         )
 
         # LoRA

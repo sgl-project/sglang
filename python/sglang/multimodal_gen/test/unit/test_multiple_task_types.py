@@ -18,6 +18,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DEFAULT_FRAME_INTERPOLATION_REPO,
+    DEFAULT_UPSCALING_REPO,
     MAX_FRAME_INTERPOLATION_EXP,
     SamplingParams,
 )
@@ -391,16 +393,45 @@ def test_http_rejects_out_of_range_frame_interpolation_exp(http_client, multipar
         ("videos", "frame_interpolation_model_path"),
     ],
 )
-def test_http_rejects_url_postprocess_model_paths(http_client, endpoint, field):
-    """A client-supplied URL must not make the server fetch it (SSRF)."""
+@pytest.mark.parametrize(
+    "value", ["http://169.254.169.254/x.pth", "attacker/weights", "/etc"]
+)
+def test_http_rejects_unlisted_postprocess_model_paths(
+    http_client, endpoint, field, value
+):
+    """A client must not make the server fetch or load weights it names: a URL
+    (SSRF), a Hub repo id (arbitrary download) or a local path."""
     client, admitted, _ = http_client
     response = client.post(
         "/v1/" + endpoint,
-        json={"prompt": "p", "size": "64x64", field: "http://169.254.169.254/x.pth"},
+        json={"prompt": "p", "size": "64x64", field: value},
     )
     assert response.status_code == 400, response.text
     assert field in response.text
     assert admitted == []
+
+
+@pytest.mark.parametrize(
+    "field,value,listed",
+    [
+        ("frame_interpolation_model_path", "", False),
+        ("frame_interpolation_model_path", DEFAULT_FRAME_INTERPOLATION_REPO, False),
+        ("upscaling_model_path", DEFAULT_UPSCALING_REPO, False),
+        ("frame_interpolation_model_path", "org/rife", True),
+        ("upscaling_model_path", "org/esrgan:x4.pth", True),
+    ],
+)
+def test_http_accepts_default_and_listed_postprocess_model_paths(
+    http_client, field, value, listed
+):
+    client, admitted, _ = http_client
+    if listed:
+        utils.get_global_server_args().postprocess_model_paths = [value]
+    response = client.post(
+        "/v1/videos", json={"prompt": "p", "size": "64x64", field: value}
+    )
+    assert response.status_code == 200, response.text
+    assert getattr(admitted[-1], field) == value
 
 
 def test_http_cloud_upload_failure_is_502_and_temp_output_is_removed(

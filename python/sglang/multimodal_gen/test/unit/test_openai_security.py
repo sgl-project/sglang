@@ -4,6 +4,7 @@ import asyncio
 import errno
 import io
 import os
+import pickle
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -37,6 +38,7 @@ from sglang.multimodal_gen.runtime.postprocess import (
     bounded_cache,
     realesrgan_upscaler,
     rife_interpolator,
+    served_model_paths,
 )
 from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
     cache_get,
@@ -737,9 +739,97 @@ def test_rife_uses_bounded_cache(monkeypatch):
 
     monkeypatch.setattr(rife_interpolator, "_MODEL_CACHE", OrderedDict())
     monkeypatch.setattr(rife_interpolator, "_MAX_CACHED_MODELS", 1)
-    monkeypatch.setattr(hf, "maybe_download_model", lambda p: p)
+    monkeypatch.setattr(hf, "maybe_download_model", lambda p, **kw: p)
     monkeypatch.setattr(rife_interpolator, "Model", FakeModel)
     monkeypatch.setattr(rife_interpolator, "current_platform", _CPU)
     for path in ["a", "b"]:
         rife_interpolator.FrameInterpolator(model_path=path)._ensure_model_loaded()
     assert list(rife_interpolator._MODEL_CACHE) == ["b"]
+
+
+class _OpenOnUnpickle:
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __reduce__(self):
+        return (open, (self.marker, "w"))
+
+
+def test_rife_weights_load_without_running_pickled_code(tmp_path):
+    """flownet.pkl can come from a repo or path the operator does not control."""
+    marker = tmp_path / "executed"
+    torch.save(_OpenOnUnpickle(str(marker)), tmp_path / "flownet.pkl")
+    with pytest.raises(pickle.UnpicklingError):
+        rife_interpolator.Model().load_model(str(tmp_path))
+    assert not marker.exists()
+
+
+def test_rife_weights_must_be_a_state_dict(tmp_path):
+    torch.save(torch.zeros(1), tmp_path / "flownet.pkl")
+    with pytest.raises(ValueError, match="state dict"):
+        rife_interpolator.Model().load_model(str(tmp_path))
+
+
+def test_rife_weights_load_from_a_state_dict(tmp_path):
+    source = rife_interpolator.Model()
+    torch.nn.init.constant_(source.flownet.block0.conv0[0][0].weight, 0.25)
+    state = {f"module.{k}": v for k, v in source.flownet.state_dict().items()}
+    torch.save(state, tmp_path / "flownet.pkl")
+    model = rife_interpolator.Model()
+    model.load_model(str(tmp_path))
+    assert torch.all(model.flownet.block0.conv0[0][0].weight == 0.25)
+
+
+def test_rife_fetches_only_the_weight_file(monkeypatch):
+    import sglang.multimodal_gen.runtime.utils.hf_diffusers_utils as hf
+
+    requested = {}
+
+    def download(path, **kwargs):
+        requested.update(kwargs)
+        raise RuntimeError("stop before loading")
+
+    monkeypatch.setattr(hf, "maybe_download_model", download)
+    with pytest.raises(RuntimeError, match="stop before loading"):
+        rife_interpolator.FrameInterpolator(
+            model_path="org/rife"
+        )._ensure_model_loaded()
+    assert requested == {"allow_patterns": ["flownet.pkl"]}
+
+
+def test_served_model_path_check_follows_server_args(monkeypatch):
+    args = SimpleNamespace(postprocess_model_paths=None)
+    monkeypatch.setattr(served_model_paths, "get_global_server_args", lambda: args)
+    check = served_model_paths.check_served_model_path
+    # no list: CLI and Python API accept any path
+    check("upscaling_model_path", "any/repo")
+    args.postprocess_model_paths = ["org/rife"]
+    check("frame_interpolation_model_path", None)
+    check("frame_interpolation_model_path", "org/rife")
+    with pytest.raises(ValueError, match="upscaling_model_path"):
+        check("upscaling_model_path", "any/repo")
+
+
+@pytest.mark.parametrize(
+    "loader,field",
+    [
+        (rife_interpolator.FrameInterpolator, "frame_interpolation_model_path"),
+        (realesrgan_upscaler.ImageUpscaler, "upscaling_model_path"),
+    ],
+)
+def test_server_loaders_do_not_resolve_unlisted_model_paths(monkeypatch, loader, field):
+    """A request that skips the HTTP layer (scheduler socket) still cannot make a
+    worker download or load weights the operator did not list."""
+    import sglang.multimodal_gen.runtime.utils.hf_diffusers_utils as hf
+
+    resolved = []
+    monkeypatch.setattr(
+        served_model_paths,
+        "get_global_server_args",
+        lambda: SimpleNamespace(postprocess_model_paths=[]),
+    )
+    monkeypatch.setattr(hf, "maybe_download_model", lambda p, **kw: resolved.append(p))
+    monkeypatch.setattr(realesrgan_upscaler, "_resolve_model_path", resolved.append)
+    with pytest.raises(ValueError, match=field):
+        loader(model_path="attacker/weights")._ensure_model_loaded()
+    assert resolved == []
