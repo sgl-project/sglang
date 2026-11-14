@@ -45,12 +45,12 @@ def can_fuse_qwen4_gate_value(gate: torch.Tensor, value: torch.Tensor) -> bool:
     """Return whether inputs match Qwen4's fixed BF16 gate/value contract."""
 
     return (
-        gate.is_cuda
+        (gate.is_cuda or gate.is_xpu)
         and gate.dtype == torch.bfloat16
         and gate.dim() == 3
         and gate.shape[1:] == (_QWEN4_HC_COUNT, 1)
         and gate.is_contiguous()
-        and value.is_cuda
+        and (value.is_cuda or value.is_xpu)
         and value.dtype == gate.dtype
         and value.shape == (gate.shape[0], _QWEN4_HIDDEN_SIZE)
         and value.is_contiguous()
@@ -62,6 +62,10 @@ def fused_qwen4_gate_value(gate: torch.Tensor, value: torch.Tensor) -> torch.Ten
 
     if not can_fuse_qwen4_gate_value(gate, value):
         raise ValueError("unsupported input for fused Qwen4 PLE gate/value")
+    if gate.is_xpu:
+        from sgl_kernel import qwen4_gate_value
+
+        return qwen4_gate_value(gate, value)
     output = torch.empty(
         (gate.shape[0], _QWEN4_HC_COUNT, _QWEN4_HIDDEN_SIZE),
         dtype=value.dtype,
@@ -113,7 +117,7 @@ def _qwen4_gate_reduce_kernel(
 
 def can_fuse_qwen4_gate_reduce(key, query, value):
     return (
-        key.is_cuda
+        (key.is_cuda or key.is_xpu)
         and key.dtype == torch.bfloat16
         and key.ndim == 3
         and key.shape[1:] == (_QWEN4_HC_COUNT, _QWEN4_HIDDEN_SIZE)
@@ -132,6 +136,10 @@ def can_fuse_qwen4_gate_reduce(key, query, value):
 def fused_qwen4_gate_reduce(key, query, value):
     if not can_fuse_qwen4_gate_reduce(key, query, value):
         raise ValueError("unsupported input for Qwen4 PLE gate reduction")
+    if key.is_xpu:
+        from sgl_kernel import qwen4_gate_reduce
+
+        return qwen4_gate_reduce(key, query, value)
     output = torch.empty_like(key)
     if key.shape[0]:
         _qwen4_gate_reduce_kernel[(key.shape[0] * _QWEN4_HC_COUNT,)](

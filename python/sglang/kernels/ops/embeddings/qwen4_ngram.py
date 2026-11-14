@@ -61,18 +61,18 @@ def can_fuse_qwen4_ngram_hash(
     """Return whether inputs match the fixed Qwen4 PLE hash contract."""
 
     return (
-        contexts.is_cuda
+        (contexts.is_cuda or contexts.is_xpu)
         and contexts.dtype == torch.long
         and contexts.dim() == 2
         and contexts.shape[1] == _QWEN4_NGRAM_SIZE
         and contexts.is_contiguous()
-        and multipliers.is_cuda
+        and (multipliers.is_cuda or multipliers.is_xpu)
         and multipliers.dtype == torch.long
         and multipliers.numel() == _QWEN4_NGRAM_SIZE
-        and vocab_sizes.is_cuda
+        and (vocab_sizes.is_cuda or vocab_sizes.is_xpu)
         and vocab_sizes.dtype == torch.long
         and vocab_sizes.numel() == _QWEN4_NGRAM_HEADS
-        and offsets.is_cuda
+        and (offsets.is_cuda or offsets.is_xpu)
         and offsets.dtype == torch.long
         and offsets.numel() == _QWEN4_NGRAM_HEADS
     )
@@ -89,6 +89,12 @@ def fused_qwen4_ngram_hash(
 
     if not can_fuse_qwen4_ngram_hash(contexts, multipliers, vocab_sizes, offsets):
         raise ValueError("unsupported input for fused Qwen4 PLE N-gram hash")
+    if contexts.is_xpu:
+        from sgl_kernel import qwen4_ngram_hash
+
+        return qwen4_ngram_hash(
+            contexts, multipliers, vocab_sizes, offsets, eos_token_id
+        )
     output = torch.empty(
         (contexts.shape[0], _QWEN4_NGRAM_HEADS),
         dtype=torch.long,

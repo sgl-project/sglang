@@ -1,4 +1,4 @@
-"""CUDA kernels and tensor transforms for simple QSA."""
+"""QSA kernels and tensor transforms."""
 
 from __future__ import annotations
 
@@ -29,10 +29,14 @@ def qsa_fast_topk(
     row_ends: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    """Select compressed blocks, with a compatibility fallback for top-k 512."""
+    """Select compressed blocks with device kernels when available."""
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
+    if logits.is_xpu and topk in (512, 2048):
+        from sgl_kernel import fast_topk_v2
+
+        return fast_topk_v2(logits, lengths, topk=topk, row_starts=starts)
     if logits.is_cuda:
         if is_batch_invariant_mode_enabled() and not is_hip():
             from flashinfer import TopKTieBreak, top_k_ragged_transform
@@ -222,7 +226,7 @@ def triton_expand_qsa_block_indices(
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """CUDA fast path for fast_topk_v2 output (valid blocks precede -1 padding)."""
+    """Fast path for fast_topk_v2 output (valid blocks precede -1 padding)."""
     rows, block_topk = block_indices.shape
     final_topk = token_topk + compress_ratio - 1
     output = torch.empty(
@@ -325,7 +329,7 @@ def expand_qsa_block_indices(
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
+    """Expand compressed blocks with Triton on CUDA/XPU and Torch elsewhere."""
 
     block_topk = (token_topk + compress_ratio - 1) // compress_ratio
     if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
@@ -336,7 +340,7 @@ def expand_qsa_block_indices(
     rows = block_indices.shape[0]
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
-    if block_indices.is_cuda:
+    if block_indices.is_cuda or block_indices.is_xpu:
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.
         return triton_expand_qsa_block_indices(
@@ -362,7 +366,7 @@ def qsa_sparse_attention(
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Torch reference for sparse GQA over physical token slots."""
+    """Sparse GQA over physical token slots."""
 
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
         raise ValueError("q, k_cache and v_cache must be rank-3 tensors")
@@ -375,6 +379,21 @@ def qsa_sparse_attention(
         raise ValueError("Q/K/V head dimensions must match")
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
+    if (
+        q.is_xpu
+        and q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+        and q.shape[-1] == 256
+        and token_slots.dtype == torch.int32
+    ):
+        import sgl_kernel
+
+        return sgl_kernel.qsa_sparse_attention(
+            q.contiguous(),
+            k_cache.contiguous(),
+            v_cache.contiguous(),
+            token_slots.contiguous(),
+            softmax_scale,
+        )
     return qsa_sparse_attention_reference(
         q, k_cache, v_cache, token_slots, softmax_scale
     )

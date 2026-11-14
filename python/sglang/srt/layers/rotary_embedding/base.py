@@ -93,6 +93,8 @@ class RotaryEmbedding(BaseFusedOp):
 
     # (source cos_sin_cache, cast copy) memo for cos_sin_cache_as().
     _cos_sin_cache_cast: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Set by a consumer that needs an fp32 cache, e.g. the fused QSA prepare kernels.
+    keep_cos_sin_cache_fp32: bool = False
 
     def __init__(
         self,
@@ -208,7 +210,7 @@ class RotaryEmbedding(BaseFusedOp):
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
-        if _is_hip:
+        if _is_hip or (_is_xpu and self.keep_cos_sin_cache_fp32):
             # On HIP, keep fp32 for the fused QSA indexer JIT kernel
             # (qsa_indexer.cuh requires const float* cos_sin_cache).
             if self.cos_sin_cache.device != query.device:
