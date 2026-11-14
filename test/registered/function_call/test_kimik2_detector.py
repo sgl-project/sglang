@@ -282,6 +282,66 @@ class TestKimiK2DetectorStreaming(unittest.TestCase):
         self.assertEqual(detector._buffer, "")
         self.assertEqual(detector.current_tool_id, 1)
 
+    def test_streaming_drains_emitted_arguments(self):
+        """Keep only a possible end-marker suffix while arguments stream."""
+        detector = KimiK2FuncDetector()
+        arguments = '{"city":"' + "x" * 4096 + '"}'
+        prefix = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:0"
+            "<|tool_call_argument_begin|>"
+        )
+        chunks = [prefix]
+        chunks.extend(arguments[i : i + 4] for i in range(0, len(arguments), 4))
+        chunks.extend(
+            [
+                "<|too",
+                "l_call_",
+                "end|>",
+                "<|tool_calls_section_end|>",
+            ]
+        )
+
+        tool_calls = []
+        normal_text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                while len(tool_calls) <= call.tool_index:
+                    tool_calls.append({"name": "", "parameters": ""})
+                if call.name:
+                    tool_calls[call.tool_index]["name"] += call.name
+                tool_calls[call.tool_index]["parameters"] += call.parameters
+            if detector._current_function_id is not None:
+                self.assertLess(
+                    len(detector._buffer),
+                    len(detector.tool_call_end_token),
+                )
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(
+            tool_calls,
+            [{"name": "get_weather", "parameters": arguments}],
+        )
+
+    def test_streaming_unfinished_call_at_stream_end(self):
+        """serving_chat reads streamed_args_for_tool when a stream ends mid-call."""
+        detector = KimiK2FuncDetector()
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:0"
+            '<|tool_call_argument_begin|>{"city": "a',
+            " <",
+        ]
+
+        tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, self.tools)
+        end = detector.finish(self.tools)
+
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "a ')
+        self.assertEqual([call.parameters for call in end.calls], ["<"])
+        self.assertEqual(detector.streamed_args_for_tool, ['{"city": "a <'])
+
 
 class TestKimiK2DetectorSpecialTokenLeakage(unittest.TestCase):
     """Verify special tokens are never leaked into normal_text output."""
@@ -1392,6 +1452,19 @@ class TestKimiK2BareCounterParsing(unittest.TestCase):
         tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, single_tool)
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "search")
+
+    def test_streaming_bare_counter_resolves_before_end_marker(self):
+        detector = KimiK2FuncDetector()
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>0"
+            '<|tool_call_argument_begin|>{"city": ',
+            '"Tokyo"}',
+        ]
+        tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, self.tools)
+        self.assertEqual(
+            tool_calls, [{"name": "get_weather", "parameters": '{"city": "Tokyo"}'}]
+        )
 
 
 if __name__ == "__main__":
