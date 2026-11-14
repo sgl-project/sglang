@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
@@ -529,7 +530,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self._fused_chain_verify_fn = None
         if (
             envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
-            and verify_backend.is_triton()
+            # nv_cutedsl resolves to the Triton verify kernel off CUDA
+            and (
+                verify_backend.is_triton()
+                or (is_hip() and verify_backend.is_nv_cutedsl())
+            )
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
             from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
@@ -1332,12 +1337,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 assert ring_indices is not None, "request-scoped ring without rows"
                 ring_kwargs["ring_indices"] = ring_indices
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-            self.req_to_token_pool.size,
-        )
+        if not pp_spec_stable_rows_enabled():
+            # The row mask below is only read with PP spec; building it
+            # eagerly costs one elementwise launch per layer.
+            intermediate_state_indices = self.verify_intermediate_state_indices
+        else:
+            intermediate_state_indices = select_verify_intermediate_state_indices(
+                self.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                self.req_to_token_pool.size,
+            )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.ragged_verify_layout
@@ -1581,8 +1591,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        if replayssm_on and (
-            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+        hip_ring = replayssm_on and is_hip()
+        if (
+            replayssm_on
+            and not hip_ring
+            and (
+                batch_size != 1
+                or not (get_platform().is_sm90 or get_platform().is_sm100)
+            )
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1629,10 +1645,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (layer.bias is not None and layer.bias.dtype != layer.conv_weights.dtype)
         ):
             return False
+        # ReplaySSM ring (no intermediate-ssm cache): the kernel only reads
+        # ssm_states (h0, upcast to fp32 in-kernel, as the unfused
+        # fused_sigmoid_gating_delta_rule_update does), so a bf16 state pool
+        # (--mamba-ssm-dtype bfloat16) is fine there.
+        ssm_dtype_ok = ssm_states.dtype == torch.float32 or (
+            replayssm_on
+            and hip_ring
+            and ssm_states.dtype in (torch.bfloat16, torch.float16)
+        )
         if (
             layer.A_log.dtype != torch.float32
             or layer.dt_bias.dtype != torch.float32
-            or ssm_states.dtype != torch.float32
+            or not ssm_dtype_ok
         ):
             return False
         if replayssm_on:
@@ -1660,8 +1685,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (not replayssm_on and not intermediate_state_cache.is_contiguous())
         ):
             return False
+        a_width = layer.head_k_dim * layer.num_v_heads
         if (
-            a.numel() != seq_len * layer.num_v_heads * layer.head_k_dim
+            a.numel() != seq_len * a_width
             or b.numel() != seq_len * layer.num_v_heads
             or layer.A_log.numel() != layer.num_v_heads
             or layer.dt_bias.numel() != layer.num_v_heads * layer.head_k_dim

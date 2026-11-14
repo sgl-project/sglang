@@ -1,11 +1,14 @@
 """KDA backend dispatch and ReplaySSM verify -> commit -> verify parity."""
 
+import dataclasses
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import Mock
 
 import torch
 
+from sglang.kernels.ops.attention.linear import fused_kda_conv_recurrent_verify as fkv
 from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
     fused_kda_conv_gating_verify,
 )
@@ -20,10 +23,12 @@ from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 # One bf16 ulp: the fused and unfused kernels reduce K in different orders.
 _OUTPUT_TOL = dict(rtol=2**-7, atol=1e-7)
@@ -33,9 +38,19 @@ _SNAPSHOT_ORACLE_TOL = dict(rtol=0, atol=1e-5)
 
 
 class TestKDAFusedVerifyBackend(CustomTestCase):
-    def _make_case(self, batch_size=1, heads=2, v_heads=4, lower_bound=-5.0):
+    def _make_case(
+        self,
+        batch_size=1,
+        heads=2,
+        v_heads=4,
+        lower_bound=-5.0,
+        steps=4,
+        ssm_dtype=torch.float32,
+        conv_dtype=torch.bfloat16,
+        permute_slots=False,
+    ):
         torch.manual_seed(36821)
-        steps, head_dim, num_layers = 4, 128, 2
+        head_dim, num_layers = 128, 2
         num_slots = batch_size + 3
         dim = (2 * heads + v_heads) * head_dim
 
@@ -54,8 +69,8 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 q_dim=heads * head_dim,
                 k_dim=heads * head_dim,
                 v_dim=v_heads * head_dim,
-                conv_weights=randn(dim, 4),
-                bias=randn(dim),
+                conv_weights=randn(dim, 4, dtype=conv_dtype),
+                bias=randn(dim, dtype=conv_dtype),
                 A_log=randn(v_heads, dtype=torch.float32),
                 dt_bias=randn(v_heads * head_dim, dtype=torch.float32),
                 lower_bound=lower_bound,
@@ -70,7 +85,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 v_heads,
                 head_dim,
                 head_dim,
-                dtype=torch.float32,
+                dtype=ssm_dtype,
             ),
             intermediate_ssm=None,
             intermediate_conv_window=[randn(num_layers, batch_size, steps, 3, dim)],
@@ -86,6 +101,10 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         # Physical slots differ from scratch rows; reverse them to catch callers
         # accidentally committing by request index instead of mamba slot.
         slots = torch.arange(batch_size + 1, 1, -1, device="cuda", dtype=torch.int32)
+        if permute_slots:
+            gen = torch.Generator().manual_seed(batch_size)
+            perm = torch.randperm(num_slots, generator=gen)[:batch_size]
+            slots = perm.to(device="cuda", dtype=torch.int32)
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
             ragged_verify_layout=None,
@@ -175,6 +194,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             for layer, (mixed, a, b) in zip(layers, inputs)
         ]
 
+    @unittest.skipIf(is_hip(), "CUDA sm90/sm100 dispatch; HIP has its own test")
     def test_verify_commit_verify(self):
         # B=1 exercises the enabled path. Platform override makes the dispatch
         # testable on any CUDA CI runner; it does not replace a GPU kernel.
@@ -262,6 +282,117 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                     torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
                 self.assertEqual(fused._fused_chain_verify_fn.call_count, 4)
 
+    @unittest.skipUnless(is_hip(), "HIP low-precision-state ReplaySSM path")
+    def test_hip_k3_verify_commit_verify(self):
+        # Kimi-K3 TP8 shape through the backend with default launch settings:
+        # H=HV=12, K=V=128, bf16/fp16 temporal state, fp32 conv weights,
+        # T=6/8, B=7/8 around the B>=8 tile switch, mixed accepted lengths and
+        # permuted physical slots.
+        for ssm_dtype in (torch.bfloat16, torch.float16):
+            for steps in (6, 8):
+                for batch_size in (7, 8):
+                    with self.subTest(
+                        ssm_dtype=ssm_dtype, steps=steps, batch_size=batch_size
+                    ):
+                        self._check_hip_k3(steps, batch_size, ssm_dtype)
+
+    def _check_hip_k3(self, steps, batch_size, ssm_dtype):
+        layers, initial, slots, batch, rounds = self._make_case(
+            batch_size=batch_size,
+            heads=12,
+            v_heads=12,
+            lower_bound=None,
+            steps=steps,
+            ssm_dtype=ssm_dtype,
+            conv_dtype=torch.float32,
+            permute_slots=True,
+        )
+        fused, fused_hybrid, fused_state = self._make_backend(
+            initial, slots, steps, fused=True
+        )
+        reference, ref_hybrid, ref_state = self._make_backend(
+            initial, slots, steps, fused=False
+        )
+        # fp32 per-step snapshots from the same (upcast) initial state
+        snapshots, _, snapshot_state = self._make_backend(
+            dataclasses.replace(initial, temporal=initial.temporal.float()),
+            slots,
+            steps,
+            fused=False,
+            ring=False,
+        )
+        seen = []
+        real_block_v = fkv._verify_block_v
+
+        def spy_block_v(*args, **kwargs):
+            bv = real_block_v(*args, **kwargs)
+            seen.append((args[0], bv))
+            return bv
+
+        with mock.patch.object(fkv, "_verify_block_v", spy_block_v):
+            out_fused = self._verify(fused, layers, batch, rounds[0])
+        out_ref = self._verify(reference, layers, batch, rounds[0])
+        self._verify(snapshots, layers, batch, rounds[0])
+        self.assertEqual(fused._fused_chain_verify_fn.call_count, len(layers))
+        want_bv = (
+            fkv.KDA_VERIFY_BLOCK_V_HIP if batch_size >= 8 else fkv.KDA_VERIFY_BLOCK_V
+        )
+        self.assertEqual(seen, [(batch_size, want_bv)] * len(layers))
+        for actual, expected in zip(out_fused, out_ref):
+            torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
+        for name in (
+            "replayssm_rawv",
+            "replayssm_rawk",
+            "replayssm_g",
+            "replayssm_beta",
+        ):
+            torch.testing.assert_close(
+                getattr(fused_state, name), getattr(ref_state, name), rtol=0, atol=0
+            )
+        for state in (fused_state, ref_state):
+            torch.testing.assert_close(state.temporal, initial.temporal, rtol=0, atol=0)
+
+        accept = torch.arange(batch_size, device="cuda") % steps + 1
+        for hybrid in (fused_hybrid, ref_hybrid):
+            hybrid.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=(accept - 1).to(slots.dtype),
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                model=None,
+            )
+        torch.testing.assert_close(
+            fused_state.temporal, ref_state.temporal, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            fused_state.conv[0], ref_state.conv[0], rtol=0, atol=0
+        )
+        # Independent snapshot oracle: each slot holds its accepted-prefix state,
+        # untouched slots keep the checkpoint.
+        expected_ssm = initial.temporal.clone()
+        for r in range(batch_size):
+            expected_ssm[:, int(slots[r])] = snapshot_state.intermediate_ssm[
+                :, r, int(accept[r]) - 1
+            ].to(ssm_dtype)
+        torch.testing.assert_close(
+            fused_state.temporal, expected_ssm, rtol=2**-7, atol=1e-5
+        )
+        # independent conv oracle: last 3 inputs of each request's accepted prefix
+        expected_conv = initial.conv[0].clone()
+        for i, (mixed, _, _) in enumerate(rounds[0]):
+            per_req = mixed.view(batch_size, steps, -1)
+            for r in range(batch_size):
+                n = int(accept[r])
+                slot = int(slots[r])
+                history = torch.cat((initial.conv[0][i, slot], per_req[r, :n]), dim=0)
+                expected_conv[i, slot] = history[-3:]
+        torch.testing.assert_close(fused_state.conv[0], expected_conv, rtol=0, atol=0)
+
+        out_fused = self._verify(fused, layers, batch, rounds[1])
+        out_ref = self._verify(reference, layers, batch, rounds[1])
+        for actual, expected in zip(out_fused, out_ref):
+            torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
+        self.assertEqual(fused._fused_chain_verify_fn.call_count, 2 * len(layers))
+
     def test_ring_dispatch_falls_back(self):
         # B=2 and the measured regression sizes on the enabled architectures,
         # plus B=1 on an architecture without ring measurements.
@@ -303,6 +434,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                         getattr(state, name), getattr(ref_state, name), rtol=0, atol=0
                     )
 
+    @unittest.skipIf(is_hip(), "CUDA sm90/sm100 dispatch; HIP has its own test")
     def test_snapshot_dispatch_is_unchanged(self):
         for platform in (
             {"is_sm90": True, "is_sm100": False},

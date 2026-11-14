@@ -419,6 +419,36 @@ def fused_kda_conv_gating_verify_kernel(
     # tile in a later wave would read what i_v == 0 had overwritten.
 
 
+def _verify_block_v(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    num_warps: int,
+    conv_dtype: torch.dtype,
+    cache_ring: bool,
+) -> int:
+    """V tile width of the fused verify kernel for one launch shape."""
+    BV = min(triton.next_power_of_2(V), KDA_VERIFY_BLOCK_V)
+    if (
+        is_hip_runtime()
+        and num_warps == 1
+        and T in (6, 8)
+        and H == HV == 16
+        and K == V == 128
+        and conv_dtype == torch.float32
+        and 3 <= B <= 16
+    ):
+        BV = KDA_VERIFY_BLOCK_V_HIP
+    elif is_hip_runtime() and cache_ring and H == HV == 12 and K == V == 128 and B >= 8:
+        # gfx950 ReplaySSM ring at 12 heads of 128 (Kimi-K3 TP8): from 8
+        # requests up the per-tile duplicated q/k conv work dominates.
+        BV = KDA_VERIFY_BLOCK_V_HIP
+    return BV
+
+
 def fused_kda_conv_gating_verify(
     mixed_qkv: torch.Tensor,
     conv_weight: torch.Tensor,
@@ -492,17 +522,7 @@ def fused_kda_conv_gating_verify(
     # BV=128 (the norm-fusion single-tile probe) measured 2x slower -- folding
     # the gated RMSNorm into this kernel's epilogue is a dead end; it is
     # PDL-chained behind this kernel instead (see fused_norm_gate.py).
-    BV = min(triton.next_power_of_2(V), KDA_VERIFY_BLOCK_V)
-    if (
-        is_hip_runtime()
-        and num_warps == 1
-        and T in (6, 8)
-        and H == HV == 16
-        and K == V == 128
-        and conv_weight.dtype == torch.float32
-        and 3 <= B <= 16
-    ):
-        BV = KDA_VERIFY_BLOCK_V_HIP
+    BV = _verify_block_v(B, T, H, HV, K, V, num_warps, conv_weight.dtype, cache_ring)
     NV = triton.cdiv(V, BV)
 
     a2 = a.reshape(seq_len, HV * K)
