@@ -143,7 +143,11 @@ def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
 # Native MXFP8 linear (dot_scaled) vs dequant-to-bf16 matmul
 # --------------------------------------------------------------------------- #
 @requires_gfx950
-@pytest.mark.parametrize("m,n,k", [(64, 256, 128), (37, 512, 256), (1, 6144, 4096)])
+@pytest.mark.parametrize(
+    "m,n,k",
+    # the last one splits 33 k-tiles, which do not divide evenly across the programs
+    [(64, 256, 128), (37, 512, 256), (1, 6144, 4096), (13, 1280, 4224)],
+)
 @torch.inference_mode()
 def test_mxfp8_native_linear(m, n, k):
     torch.manual_seed(0)
