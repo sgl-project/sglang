@@ -107,6 +107,10 @@ MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
 RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn", "aiter")
+if current_platform.is_xpu():
+    # XPUSageAttention3Backend runs ring steps (which need the LSE) on XPU
+    # flash attention; CUDA's sage_attn_3 has no LSE and stays excluded.
+    RING_CAPABLE_ATTENTION_BACKENDS += ("sage_attn_3",)
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
