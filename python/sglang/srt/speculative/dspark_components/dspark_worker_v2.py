@@ -262,7 +262,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model.logits_mup_width_multiplier = getattr(
             target_model_config.hf_text_config, "logits_mup_width_multiplier", None
         )
-        self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,

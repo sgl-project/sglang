@@ -720,8 +720,6 @@ def resolve_transformer_quant_load_spec(
                 "Per-layer checkpoint quantization and Nunchaku are mutually exclusive"
             )
         quant_config = checkpoint_quant_config
-    elif getattr(model_cls, "handles_checkpoint_quantization", False):
-        quant_config = None
     else:
         quant_config = _resolve_quant_config(
             hf_config=hf_config,

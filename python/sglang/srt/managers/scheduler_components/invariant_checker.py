@@ -81,9 +81,6 @@ class SchedulerInvariantChecker:
     get_pp_mbs: Callable = field(default=lambda: ())
     # Whether the idle pool checks skip this idle iteration.
     get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
-    # The finished requests whose KV the decode offload still copies to host;
-    # they exit once the copy lands.
-    get_offloading_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
     reporter: FailureReporter = field(default_factory=FailureReporter)
     # Requests that have not both exited and sent their final output; an ended
     # one leaves at the next idle check.
@@ -120,6 +117,11 @@ class SchedulerInvariantChecker:
                 phase=CheckPhase.IDLE,
                 when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
                 fn=self._check_ended_requests,
+            ),
+            StateCheck(
+                phase=CheckPhase.IDLE,
+                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
+                fn=self._check_listed_requests_unfinished,
             ),
             StateCheck(
                 phase=CheckPhase.IDLE,
@@ -698,8 +700,8 @@ class SchedulerInvariantChecker:
 
     def _check_ended_requests(self) -> None:
         """At idle, every request the scheduler kept is in a list (held, parked,
-        deferred) or has sent its final output and exited through the retirer;
-        a decode offload's exit waits for its copy."""
+        deferred, offloading) or has sent its final output and exited through
+        the retirer."""
         self.unended = {
             req for req in self.unended if req.send_via is None or req.exit_via is None
         }
@@ -709,10 +711,23 @@ class SchedulerInvariantChecker:
             {req for req in unlisted if req.send_via is None},
             "Requests in no list that never sent their final output",
         )
-        offloading = set(self.get_offloading_reqs())
         self._raise_if_any(
-            {req for req in unlisted - offloading if req.exit_via is None},
+            {req for req in unlisted if req.exit_via is None},
             "Requests in no list that never exited through the retirer",
+        )
+
+    def _check_listed_requests_unfinished(self) -> None:
+        """At idle, no list but DEFERRED holds a finished request; a nonempty
+        PD_RELEASING or PD_OFFLOADING keeps the scheduler from idling."""
+        self._raise_if_any(
+            {
+                req
+                for kind, reqs in self.get_request_lists().items()
+                if kind is not ListKind.DEFERRED
+                for req in reqs
+                if req.finished()
+            },
+            "Requests finished but still in a list at idle",
         )
 
     def _check_batch_consistency(self, batch: ScheduleBatch) -> None:

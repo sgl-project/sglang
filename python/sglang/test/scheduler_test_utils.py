@@ -55,11 +55,18 @@ def leaving_retirer() -> MagicMock:
     """A mock `RequestRetirer` whose exits take the request out of its list."""
     retirer = MagicMock()
 
-    def leave(req, **_):
+    def leave(req, *_, **__):
         if req.owner_list is not None:
             req.owner_list._leave([req])
 
-    for exit_ in ("abort", "retire_unadmitted", "release", "abort_retracted"):
+    for exit_ in (
+        "abort",
+        "retire_unadmitted",
+        "release",
+        "abort_retracted",
+        "abandon",
+        "settle_output",
+    ):
         getattr(retirer, exit_).side_effect = leave
     return retirer
 
@@ -96,5 +103,7 @@ def empty_request_lists(scheduler: Scheduler) -> None:
     scheduler.deferred_responses = DeferredResponses(
         disaggregation_mode=DisaggregationMode.NULL,
         output_streamer=None,
+        request_retirer=None,
         send_abort=None,
     )
+    scheduler.decode_offload_manager = None

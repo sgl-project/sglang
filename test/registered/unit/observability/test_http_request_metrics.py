@@ -9,6 +9,8 @@ from prometheus_client import REGISTRY
 
 import sglang.srt.entrypoints.http_server as http_server
 from sglang.srt.observability import http_request_metrics
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 UNKNOWN_PATH = "/__no_such_route__"
@@ -22,6 +24,8 @@ class TestHttpRequestMetrics(CustomTestCase):
         self.assertIsNone(http_request_metrics._http_request_metrics)
 
         http_request_metrics.init_http_request_metrics()
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
         TestClient(http_server.app).get(UNKNOWN_PATH)
 
         self.assertEqual(

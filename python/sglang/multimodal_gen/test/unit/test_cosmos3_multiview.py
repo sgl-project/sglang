@@ -47,8 +47,6 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
     lidar_patch_grid,
     pack_state,
     patchify_lidar,
-    sequence_shard_padding,
-    shard_sequence,
     spatial_patch_hw,
     unpack_state,
     unpatchify_lidar,
@@ -1505,28 +1503,6 @@ class TestDeploymentConfig(unittest.TestCase):
             args(ulysses_degree=2, sp_degree=2, enable_cfg_parallel=True)
         )
         config.validate_server_args(args(enable_cfg_parallel=True))
-
-    def test_sequence_sharding_helpers(self):
-        self.assertEqual(sequence_shard_padding(10, 1), 0)
-        self.assertEqual(sequence_shard_padding(10, 4), 2)
-        self.assertEqual(sequence_shard_padding(12, 4), 0)
-        tokens = torch.arange(10.0).view(1, 10, 1)
-        # Tokens pad with zeros; each rank gets a contiguous chunk of 3.
-        self.assertEqual(
-            shard_sequence(tokens, 4, 3, dim=1, pad_last=False).flatten().tolist(),
-            [9.0, 0.0, 0.0],
-        )
-        self.assertEqual(
-            shard_sequence(tokens, 4, 0, dim=1, pad_last=False).flatten().tolist(),
-            [0.0, 1.0, 2.0],
-        )
-        # Positions repeat their last entry so the pad has a valid RoPE position.
-        positions = torch.arange(10).view(1, 1, 10).expand(3, 1, 10)
-        last = shard_sequence(positions, 4, 3, dim=2, pad_last=True)
-        self.assertEqual(last.shape, (3, 1, 3))
-        self.assertEqual(last[0, 0].tolist(), [9, 9, 9])
-        # Degree 1 is the identity.
-        self.assertIs(shard_sequence(tokens, 1, 0, dim=1, pad_last=False), tokens)
 
 
 def _views(cameras, *, vision=False):

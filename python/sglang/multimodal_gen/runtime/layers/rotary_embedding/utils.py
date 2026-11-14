@@ -74,8 +74,9 @@ def _apply_rotary_emb(
     """
     Args:
         x: [num_tokens, num_heads, head_size] or [num_tokens, head_size]
-        cos: [num_tokens, head_size // 2]
-        sin: [num_tokens, head_size // 2]
+        cos: [num_tokens, head_size // 2], or [num_tokens, head_size] for
+            Neox style, whose two halves may differ
+        sin: same shape as cos
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
@@ -85,8 +86,15 @@ def _apply_rotary_emb(
         cos = cos.unsqueeze(-2)
         sin = sin.unsqueeze(-2)
         x1, x2 = torch.chunk(x, 2, dim=-1)
-        o1 = (x1.float() * cos - x2.float() * sin).type_as(x)
-        o2 = (x2.float() * cos + x1.float() * sin).type_as(x)
+        if cos.shape[-1] == x.shape[-1]:
+            # Full-width table, halves may differ: x * cos + rotate_half(x) * sin.
+            cos1, cos2 = torch.chunk(cos, 2, dim=-1)
+            sin1, sin2 = torch.chunk(sin, 2, dim=-1)
+        else:
+            cos1 = cos2 = cos
+            sin1 = sin2 = sin
+        o1 = (x1.float() * cos1 - x2.float() * sin1).type_as(x)
+        o2 = (x2.float() * cos2 + x1.float() * sin2).type_as(x)
         return torch.cat((o1, o2), dim=-1)
     else:
         return apply_rotary_embedding(x, cos, sin, interleaved)

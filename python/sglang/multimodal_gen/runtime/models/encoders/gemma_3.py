@@ -473,21 +473,6 @@ class Gemma3DecoderLayer(nn.Module):
         return hidden_states, None
 
 
-class Gemma3TextScaledWordEmbedding(nn.Embedding):
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: int,
-        embed_scale: Optional[float] = 1.0,
-    ):
-        super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.embed_scale = embed_scale
-
-    def forward(self, input_ids: torch.Tensor):
-        return super().forward(input_ids) * self.embed_scale
-
-
 class Gemma3MultiModalProjector(nn.Module):
     """Projector for Gemma3 multimodal."""
 

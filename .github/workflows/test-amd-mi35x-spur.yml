@@ -6,12 +6,9 @@ name: Test AMD MI35x (Spur)
 # pr-test-amd.yml. Cluster settings come from the runner's environment (see the
 # launcher's header).
 #
-# The schedule runs stage-b-test-1-gpu-small-amd-mi35x, whose ARC pool
-# (linux-mi35x-gpu-1) queues for hours, at the same times as pr-test-amd.yml's
-# rocm10 schedule. pr-test-amd.yml keeps its copy while the two are compared.
+# Manual runs only: pr-test-amd.yml's scheduled runs now send their
+# stage-b-test-1-gpu-small-amd-mi35x job to these runners themselves.
 on:
-  schedule:
-    - cron: '0 1,13 * * *'  # rocm10, same times as pr-test-amd.yml
   workflow_dispatch:
     inputs:
       ref:
@@ -41,7 +38,6 @@ env:
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
-  # Per event, so a manual run never cancels a scheduled one in progress.
   group: test-amd-mi35x-spur-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
@@ -84,8 +80,7 @@ jobs:
   stage-b-test-1-gpu-small-amd-mi35x-spur:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event_name == 'schedule' ||
-       inputs.suite == 'stage-b-test-1-gpu-small-amd-mi35x' || inputs.suite == 'all')
+      (inputs.suite == 'stage-b-test-1-gpu-small-amd-mi35x' || inputs.suite == 'all')
     runs-on: linux-sglang-mi35x-spur
     timeout-minutes: 120
     steps:
@@ -95,16 +90,13 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
 
-      # Scheduled runs keep going past a failing file so every file reports,
-      # as pr-test-amd.yml's scheduled runs do.
       - name: Run suite on a cluster node
         timeout-minutes: 110
         run: |
           bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
             --suite stage-b-test-1-gpu-small-amd-mi35x \
             --gpus 1 \
-            --rocm-version "${{ inputs.rocm_version || 'rocm10' }}" \
-            -- ${{ github.event_name == 'schedule' && '--continue-on-error' || '' }}
+            --rocm-version "${{ inputs.rocm_version || 'rocm10' }}"
 
       - name: Cancel cluster jobs on failure/cancel
         if: failure() || cancelled()
