@@ -54,6 +54,7 @@ See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) 
 - `--sp-degree {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
+- `--quantization convrot_int8 --quantization-ignored-layers proj_out`: Data-free INT8 for both A14B experts; at 832x480x81 on 1 GPU it reduces peak VRAM from 87.5 to 60.6 GiB (T2V) and from 88.1 to 61.8 GiB (I2V) and generation is about 1.2x faster; see [ConvRot INT8 Quantization](#4-2-4-convrot-int8-quantization)
 
 ## 4. Model Invocation
 
@@ -251,6 +252,84 @@ sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
 sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000 \
     --lora-path Cseti/wan2.2-14B-Arcane_Jinx-lora-v1
 ```
+
+#### 4.2.4 ConvRot INT8 Quantization
+
+`--quantization convrot_int8` quantizes both A14B experts online at load time
+(data-free W8A8 [ConvRot](/docs/sglang-diffusion/quantization#convrot-int8)) from
+the stock BF16 checkpoint: with `--quantization-ignored-layers proj_out`, 400 of
+the 401 eligible linears per expert go to INT8 (26.17 -> 13.09 GiB each) and the
+output head stays in BF16. No calibration data and no quantized checkpoint are
+needed. The
+published [ModelOpt FP8/NVFP4 transformers](/docs/sglang-diffusion/quantization#validated-modelopt-checkpoints)
+cover only T2V-A14B, so this is the quantized path for I2V-A14B.
+
+```shell Command
+# T2V
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization convrot_int8 \
+  --quantization-ignored-layers proj_out \
+  --prompt "A curious raccoon" \
+  --save-output
+
+# I2V
+sglang generate \
+  --model-path Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+  --quantization convrot_int8 \
+  --quantization-ignored-layers proj_out \
+  --image-path /path/to/first_frame.jpg \
+  --prompt "The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face." \
+  --save-output
+```
+
+Native inference at [SGLang `c5bf3aafbc22`](https://github.com/sgl-project/sglang/commit/c5bf3aafbc229e887eb6a6f01045b8f90a7dee13)
+on 1, 2 and 4 GB200 GPUs at 832x480, 81 frames, 30 steps, CFG 5, seed 42, six
+prompts, all components resident (`--performance-mode manual`, no offload),
+cache-dit and torch.compile off. E2E is the mean of six requests after one
+warm-up; loading is excluded. The 1- and 2-GPU rows are the mean of two
+same-time BF16/ConvRot pairs with the GPUs swapped, because slots on one node
+differ by up to 10 percent; the 4-GPU rows are the mean of two rounds.
+Same-seed outputs are bit-identical across runs on one build. Peak is the
+runtime peak per GPU, not a minimum VRAM requirement.
+
+| Variant | GPUs | Flags | BF16 E2E (s) | ConvRot INT8 E2E (s) | Speedup | Peak per GPU (GiB) |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| T2V | 1 | none | 113.2 | 96.5 | 1.17x | 87.5 -> 60.6 |
+| I2V | 1 | none | 109.0 | 92.9 | 1.17x | 88.1 -> 61.8 |
+| T2V | 2 | `--enable-cfg-parallel` | 57.6 | 49.0 | 1.18x | 73.0 -> 46.6 |
+| I2V | 2 | `--enable-cfg-parallel` | 58.6 | 50.2 | 1.17x | 77.2 -> 50.2 |
+| T2V | 4 | `--enable-cfg-parallel --ulysses-degree 2` | 29.6 | 25.0 | 1.19x | 65.4 -> 38.7 |
+| I2V | 4 | `--enable-cfg-parallel --ulysses-degree 2` | 30.7 | 25.9 | 1.19x | 67.8 -> 41.0 |
+
+The per-GPU saving at every layout is the two experts' INT8 weights. Same-seed
+outputs are approximate, not bit-exact with BF16: over the six prompts PSNR /
+SSIM / LPIPS to BF16 is 21.4 dB / 0.768 / 0.149 (T2V) and 28.1 dB / 0.915 /
+0.048 (I2V) at 1 GPU, with similar values at 2 and 4 GPUs; keeping `proj_out`
+in BF16 adds 2 to 4 dB on the hardest T2V prompts. See the
+[quantization page](/docs/sglang-diffusion/quantization#convrot-int8) for how
+this compares with the spread BF16 shows against itself across parallel
+layouts.
+
+On one H100 NVL 94 GB (CC 9.0; the node caps the board at 310 W) the same
+recipe and workload at 1 GPU measured 1.23x (T2V) and 1.20x (I2V) with the same
+peak memory; BF16 fits resident on the 94 GB part.
+
+Notes:
+
+- Both experts are quantized; `--quantization-ignored-layers` matches module
+  paths in both (`proj_out`, `blocks.0.ffn`, ...).
+- The fused INT8 kernels are JIT-compiled once per machine (about a minute,
+  needs nvcc) for CC 9.0 (H100/H200), 10.0 (B200/GB200) and 12.0 / 12.1
+  (RTX PRO 6000 Blackwell, RTX 50 series, DGX Spark).
+- CC 10.3 (B300/GB300) is refused by the JIT backend on purpose (Blackwell
+  Ultra's INT8 tensor-core rate makes W8A8 a slowdown, see
+  [ConvRot INT8](/docs/sglang-diffusion/quantization#convrot-int8)); there the
+  quantized option for T2V-A14B is the
+  [ModelOpt FP8/NVFP4 transformers](/docs/sglang-diffusion/quantization#validated-modelopt-checkpoints),
+  and I2V-A14B has no validated quantized path today.
+- Loading stages the BF16 weights on the GPU before quantizing them; the load
+  peak stays below the runtime peak.
 
 ## 5. Benchmark
 
