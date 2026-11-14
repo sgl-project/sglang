@@ -489,7 +489,10 @@ mod tests {
             2,
             vec![
                 (0, CoreError::Unavailable),
-                (1, CoreError::Unimplemented("retirement not supported".into())),
+                (
+                    1,
+                    CoreError::Unimplemented("retirement not supported".into()),
+                ),
             ],
         );
         assert_eq!(mixed_unimplemented.kind(), CoreErrorKind::Unimplemented);
