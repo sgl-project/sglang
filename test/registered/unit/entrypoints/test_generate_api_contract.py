@@ -98,6 +98,20 @@ class TestGenerateContract(CustomTestCase):
         self.assertIsNotNone(error)
         self.assertIn("unknown field", error)
 
+    def test_skip_detokenize_is_refused_rather_than_ignored(self):
+        """Only the Rust server skips decoding; this one would return text."""
+        error = generate_contract_error({"text": "hi", "skip_detokenize": True})
+        self.assertIsNotNone(error)
+        self.assertIn("skip_detokenize", error)
+        for value in (False, None):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    generate_contract_error({"text": "hi", "skip_detokenize": value})
+                )
+        self.assertIsNotNone(
+            generate_contract_error({"text": "hi", "skip_detokenize": "yes"})
+        )
+
 
 class TestGenerateRouteGate(CustomTestCase):
     def test_route_checks_the_contract_and_serve_does_not(self):

@@ -22,6 +22,8 @@ pub enum DetokMsg {
         no_stop_trim: bool,
         /// `SamplingParams.skip_special_tokens` for the output text.
         skip_special_tokens: bool,
+        /// Emit token IDs without constructing an output decoder for this request.
+        skip_detokenize: bool,
     },
     /// One decode step's chunks for *this shard*. Batched because `from-scheduler` blocks
     /// per send.

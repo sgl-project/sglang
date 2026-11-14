@@ -756,6 +756,9 @@ fn typed_fields(request: &GenerateRequest) -> Map<String, Value> {
     if let Some(value) = request.return_text_in_logprobs {
         set("return_text_in_logprobs", value.into());
     }
+    if request.skip_detokenize {
+        set("skip_detokenize", true.into());
+    }
     set("stream", request.stream.into());
     set("return_hidden_states", request.return_hidden_states.into());
     set("bootstrap_host", request.bootstrap_host.clone().into());

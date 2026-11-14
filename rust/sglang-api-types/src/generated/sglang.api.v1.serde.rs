@@ -1698,6 +1698,9 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.modalities {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "modalities", v)?;
         }
+        if let Some(v) = &self.skip_detokenize {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "skip_detokenize", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1753,6 +1756,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_routed_experts_start_len = None;
                 let mut f_return_sampling_mask = None;
                 let mut f_modalities = None;
+                let mut f_skip_detokenize = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -2037,6 +2041,12 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_modalities = Some(map.next_value::<Option<OptionalStringList>>()?);
                         }
+                        "skip_detokenize" => {
+                            if f_skip_detokenize.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("skip_detokenize"));
+                            }
+                            f_skip_detokenize = Some(map.next_value::<Option<bool>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2082,6 +2092,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     routed_experts_start_len: f_routed_experts_start_len.unwrap_or_default(),
                     return_sampling_mask: f_return_sampling_mask.flatten(),
                     modalities: f_modalities.flatten(),
+                    skip_detokenize: f_skip_detokenize.flatten(),
                 })
             }
         }
