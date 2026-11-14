@@ -46,8 +46,8 @@ __global__ void moe_permute_prepare_kernel(
     bool is_ep) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
-  int32_t neg_count = 0;
-  if (is_ep) neg_count = lower_bound(sorted_topk_ids, numel, 0);
+  // Padding and nonlocal routes are both inactive, independently of EP.
+  int32_t neg_count = lower_bound(sorted_topk_ids, numel, 0);
 
   for (int e = tid; e <= num_experts; e += stride) {
     int32_t offset;

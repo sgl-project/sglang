@@ -23,7 +23,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs import DbrxConfig
+from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
@@ -38,10 +38,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -53,7 +54,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
@@ -118,6 +119,7 @@ class DbrxExperts(nn.Module):
             self.top_k,
             layer_id=layer_id,
             renormalize=True,
+            output_format=TopKOutputFormat.STANDARD,
         )
         self.moe_runner_config = MoeRunnerConfig(inplace=True)
         self.ws = nn.Parameter(

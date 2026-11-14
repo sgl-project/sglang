@@ -9,7 +9,8 @@
 //   hardware           optional — per-model GPUs the shared HARDWARE_CATALOG lacks:
 //                      {id, label, vram, vendor}[] merged into the catalog at render
 //                      (so a model-specific GPU never needs an engine-catalog edit);
-//                      vendor picks the selector group: blackwell | hopper | amd | npu.
+//                      vendor picks the selector group: blackwell | hopper | amd |
+//                      npu | cpu | tpu (cpu and tpu drop GPU passthrough from docker run).
 //                      `multiNodeDockerFlags: string[]` (either source) adds
 //                      `docker run` flags the platform's fabric needs
 //   groupHardware      optional — set false to show one flat hardware row
@@ -40,6 +41,7 @@
 //                      builder while reusing this engine's overlay composition and
 //                      command rendering. Shape:
 //                      {defaultSelection, resource: {limits, verifiedRecipes,
+//                      recommendedRecipe?(sel),
 //                      autoTopology(sel), validateTopology(sel)},
 //                      resolveDeployment(sel)}. Recipes may use verifiedWhen(sel)
 //                      to qualify the recommendation badge by checkpoint or mode.
@@ -71,7 +73,7 @@
 //                      dockerMounts carry role-specific rendering metadata.
 //   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
 //                      `hw|quant`, `quant`, `hw`, then `default`
-//   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
+//   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?, showWhen?(sel)}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders), or
 //                      `(selection, cell) => template` when the request payload
 //                      depends on a custom match/overlay dimension
@@ -92,7 +94,8 @@
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
 //   dockerHostNetworkWhen optional — `(selection, {flags, env}) => boolean`
-//   dockerMounts       optional — additional `-v` mount specs
+//   dockerMounts       optional — additional `-v` mount specs, as an array or
+//                      `(selection) => array`
 //   dockerRunCommand   optional — command placed after the image and before
 //                      generated server flags; string or `(selection) => string`
 //   runModes           optional — command output tabs to show (`python` and/or
@@ -117,6 +120,9 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
+
+  // ==== COMMAND ENGINE ====
+  // docs/scripts/export_commands.mjs runs this block in Node; keep it free of JSX and React.
 
   // ==== 1. Hardware catalog (shared across cookbooks) ====
   // VRAM is per-GPU on-chip memory, not per-module.
@@ -144,6 +150,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       { id: "h20-3e", label: "H20-3e", vram: "141GB" },
       { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
+    rubin: [],
     // ROCm multi-node runs the RDMA NICs straight through: /dev/infiniband
     // covers rdma_cm plus the per-NIC uverbsN nodes, IPC_LOCK + an unlimited
     // memlock let the transport pin its registered buffers, and the stack /
@@ -819,7 +826,8 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     const modelName = resolveModelName(sel);
     if (cell.pd && cell.commands) return interpolate(cell.commands[mode] || cell.commands.python, envValues, modelName);
     const nnodes = cellNnodes(cell, sel);
-    const multinode = nnodes > 1;
+    // Xeon's "nodes" selector sizes --tp-size, not a real multi-machine launch.
+    const multinode = nnodes > 1 && sel.hw !== "xeon";
     const cellEnv = [...(cell.env || []), ...overlayEnv(sel)];
     const flags = overlayCompose(cell.flags, sel);
     if (multinode) {
@@ -929,6 +937,19 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             "  -v /var/queue_schedule:/var/queue_schedule",
             "  -v ~/.cache/:/root/.cache/",
           ]
+        : vendorOf(sel.hw) === "cpu"
+        ? [
+            // CPU-only platform: no GPU device passthrough. --privileged and a
+            // large /dev/shm are what the CPU TP ranks need for their shared
+            // memory transport.
+            "docker run --privileged",
+            "  --shm-size 32g",
+          ]
+        : vendorOf(sel.hw) === "tpu"
+        ? [
+            "docker run --privileged",
+            "  --shm-size 64g",
+          ]
         : [
             "docker run --gpus all",
             "  --shm-size 32g",
@@ -939,11 +960,16 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
-        ...((multinode || cell.pd) ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
+        // A single-node PD role on the host network moves KV over RDMA too.
+        ...((multinode || cell.pd || (hostNetwork && PD_SERVE_PORTS[sel.pdMode] !== undefined))
+          ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
+        ...[
+          ...(typeof config.dockerMounts === "function" ? config.dockerMounts(sel) : config.dockerMounts || []),
+          ...(cell.pd ? cell.dockerMounts || [] : []),
+        ].map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
@@ -982,6 +1008,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     }
     return cmd;
   };
+  // ==== end COMMAND ENGINE ====
 
   // Accuracy labels: [field-key, display-label, unit]. Declared per model via
   // `config.accuracyLabels` — the engine ships NO default eval set. A config
@@ -1321,9 +1348,21 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       }
     }
     for (const [key, bounds] of Object.entries(commandBuilder.resource?.limits || {})) {
+      if (typeof bounds.disabledWhen === "function" && bounds.disabledWhen(out)) {
+        out[key] = bounds.disabledValue ?? 0;
+        continue;
+      }
       const fallback = Number(commandBuilder.defaultSelection?.[key] ?? bounds.min ?? 1);
       const value = Number.parseInt(out[key], 10);
-      out[key] = Math.min(bounds.max, Math.max(bounds.min, Number.isFinite(value) ? value : fallback));
+      const values = typeof bounds.allowedValues === "function"
+        ? bounds.allowedValues(out)
+        : (bounds.allowedValues || []);
+      const bounded = Math.min(bounds.max, Math.max(bounds.min, Number.isFinite(value) ? value : fallback));
+      out[key] = values.length
+        ? values.reduce((closest, candidate) =>
+            Math.abs(candidate - bounded) < Math.abs(closest - bounded) ? candidate : closest,
+          values[0])
+        : bounded;
     }
     for (const key of ["tp_size", "ulysses_degree", "ring_degree"]) {
       const value = Number.parseInt(out[key], 10);
@@ -1632,7 +1671,12 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     return out;
   };
 
-  const recommendedBuilderRecipe = (hw) => {
+  const recommendedBuilderRecipe = (hw, selection) => {
+    // Model-specific recommendations can preserve the selected capacity and
+    // workload. Hardware switches still use the platform default below.
+    if (selection && typeof commandBuilder.resource?.recommendedRecipe === "function") {
+      return commandBuilder.resource.recommendedRecipe(selection);
+    }
     const recipes = commandBuilder.resource?.verifiedRecipes || [];
     return recipes.find((entry) => entry.hw === hw && entry.default)
       || recipes.find((entry) => entry.hw === hw);
@@ -1645,17 +1689,33 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         if (dim === "hw") {
           const currentRecipe = recommendedBuilderRecipe(prev.hw);
           const nextRecipe = recommendedBuilderRecipe(value);
-          const resourcesFollowPlatformDefault = !!currentRecipe
+          const gpuBounds = commandBuilder.resource?.limits?.gpus_per_node;
+          const fixedGpuCount = typeof gpuBounds?.disabledWhen === "function"
+            && gpuBounds.disabledWhen(next);
+          const previousFixedGpuCount = typeof gpuBounds?.disabledWhen === "function"
+            && gpuBounds.disabledWhen(prev);
+          const resourcesFollowPlatformDefault = fixedGpuCount || previousFixedGpuCount || (!!currentRecipe
             && Number(prev.nodes) === Number(currentRecipe.nodes)
-            && Number(prev.gpus_per_node) === Number(currentRecipe.gpus_per_node);
+            && Number(prev.gpus_per_node) === Number(currentRecipe.gpus_per_node));
           next = {
             ...next,
+            ...Object.fromEntries(resourcesFollowPlatformDefault && nextRecipe
+              ? overlayDimSpecs
+                .filter((spec) => spec.scope === "serve" && nextRecipe[spec.id] !== undefined)
+                .map((spec) => [spec.id, nextRecipe[spec.id]])
+              : []),
             nodes: resourcesFollowPlatformDefault
               ? (nextRecipe?.nodes ?? next.nodes)
               : next.nodes,
-            gpus_per_node: resourcesFollowPlatformDefault
-              ? (nextRecipe?.gpus_per_node ?? next.gpus_per_node)
-              : next.gpus_per_node,
+            gpus_per_node: (() => {
+              const bounds = commandBuilder.resource?.limits?.gpus_per_node;
+              if (typeof bounds?.disabledWhen === "function" && bounds.disabledWhen(next)) {
+                return bounds.disabledValue ?? 0;
+              }
+              return resourcesFollowPlatformDefault
+                ? (nextRecipe?.gpus_per_node ?? next.gpus_per_node)
+                : next.gpus_per_node;
+            })(),
             topology_mode: "auto",
             tp_size: resourcesFollowPlatformDefault
               ? (nextRecipe?.tp_size ?? 1)
@@ -1702,11 +1762,12 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     commit(value);
   };
 
-  const renderBuilderNumberInput = ({ identity, value, min, max, label, onCommit }) => (
+  const renderBuilderNumberInput = ({ identity, value, min, max, label, disabled, onCommit }) => (
     <input
       key={identity}
       type="number"
       inputMode="numeric"
+      disabled={disabled}
       min={min}
       max={max}
       step="1"
@@ -1729,7 +1790,15 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     if (!commandBuilder) return;
     const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
     setSel((prev) => {
-      const value = Math.min(bounds.max, Math.max(bounds.min, Number(prev[key]) + delta));
+      if (typeof bounds.disabledWhen === "function" && bounds.disabledWhen(prev)) return prev;
+      const values = typeof bounds.allowedValues === "function"
+        ? bounds.allowedValues(prev)
+        : (bounds.allowedValues || []);
+      const current = Number(prev[key]);
+      const value = values.length
+        ? values[Math.max(0, Math.min(values.length - 1,
+            values.findIndex((candidate) => candidate === current) + delta))]
+        : Math.min(bounds.max, Math.max(bounds.min, current + delta));
       return normalizeBuilderSelection({ ...prev, [key]: value, topology_mode: "auto" });
     });
   };
@@ -1739,11 +1808,22 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     const value = Number.parseInt(rawValue, 10);
     if (!Number.isFinite(value)) return;
     const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
-    setSel((prev) => normalizeBuilderSelection({
+    setSel((prev) => {
+      if (typeof bounds.disabledWhen === "function" && bounds.disabledWhen(prev)) return prev;
+      const values = typeof bounds.allowedValues === "function"
+        ? bounds.allowedValues(prev)
+        : (bounds.allowedValues || []);
+      const bounded = Math.min(bounds.max, Math.max(bounds.min, value));
+      return normalizeBuilderSelection({
       ...prev,
-      [key]: Math.min(bounds.max, Math.max(bounds.min, value)),
+      [key]: values.length
+        ? values.reduce((closest, candidate) =>
+            Math.abs(candidate - bounded) < Math.abs(closest - bounded) ? candidate : closest,
+          values[0])
+        : bounded,
       topology_mode: "auto",
-    }));
+      });
+    });
   };
 
   const editBuilderTopology = (key, value) => {
@@ -1776,6 +1856,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   const placeholderGroups = (() => {
     const out = { command: [], curl: [] };
     for (const [key, meta] of Object.entries(config.placeholders || {})) {
+      if (typeof meta.showWhen === "function" && !meta.showWhen(sel)) continue;
       (out[meta.target] || (out[meta.target] = [])).push({ key, ...meta });
     }
     return out;
@@ -1882,9 +1963,13 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       || selectedOption(dim)?.label
       || sel[dim.id]
       || "—";
-    const recommendedRecipe = recommendedBuilderRecipe(sel.hw);
+    const hardwareLabel = hwGroups.flatMap((group) => group.items)
+      .find((hardware) => hardware.id === sel.hw)?.label || sel.hw.toUpperCase();
+    const recommendedRecipe = recommendedBuilderRecipe(sel.hw, sel);
     const recommendedIsVerified = !!recommendedRecipe && !recommendedRecipe.unverified
       && (typeof recommendedRecipe.verifiedWhen !== "function" || recommendedRecipe.verifiedWhen(sel));
+    const recommendedLabel = recommendedIsVerified ? "Verified"
+      : recommendedRecipe?.unverified ? "Derived" : "Recommended";
     const recommendedInUse = !!recommendedRecipe
       && Number(sel.nodes) === recommendedRecipe.nodes
       && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
@@ -1893,7 +1978,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         const expected = recommendedRecipe[dim.id] ?? dim.default;
         if (dim.id === "attention") return sel.attention === "platform";
         return expected === undefined || sel[dim.id] === expected
-          || (["placement", "encoder"].includes(dim.id) && sel[dim.id] === "auto");
+          || (dim.id === "placement" && sel[dim.id] === "auto");
       });
 
     const restoreRecommendedRecipe = () => {
@@ -1968,6 +2053,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
 
     const renderStepper = (key, label, detail) => {
       const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
+      const disabled = typeof bounds.disabledWhen === "function" && bounds.disabledWhen(sel);
       return (
         <div className="sgd-builder-stepper-field">
           <div>
@@ -1978,7 +2064,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             <button
               type="button"
               aria-label={`Decrease ${label}`}
-              disabled={Number(sel[key]) <= bounds.min}
+              disabled={disabled || Number(sel[key]) <= bounds.min}
               onClick={() => updateBuilderResource(key, -1)}
             >−</button>
             {renderBuilderNumberInput({
@@ -1987,12 +2073,13 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               min: bounds.min,
               max: bounds.max,
               label,
+              disabled,
               onCommit: (value) => setBuilderResource(key, value),
             })}
             <button
               type="button"
               aria-label={`Increase ${label}`}
-              disabled={Number(sel[key]) >= bounds.max}
+              disabled={disabled || Number(sel[key]) >= bounds.max}
               onClick={() => updateBuilderResource(key, 1)}
             >+</button>
           </div>
@@ -2005,17 +2092,18 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         {recommendedRecipe && (
           <section className="sgd-builder-recipe">
             <div>
-              {/* This is the verified operating point, not sizing advice — a
-                  hardware whose validation ran on 8 GPUs is not "recommending"
-                  8 over a smaller deployment. */}
-              <span>{recommendedIsVerified ? "Verified recipe" : "Derived recipe"} · {sel.hw.toUpperCase()}</span>
+              {/* Derived marks an estimated hardware recipe; an untested
+                  request does not turn a measured server into an estimate. */}
+              <span>{recommendedLabel} recipe · {hardwareLabel}</span>
               <strong>
                 {[
-                  `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
+                  `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPU${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node === 1 ? "" : "s"}`,
                   recommendedRecipe.tp_size > 1 && `TP ${recommendedRecipe.tp_size}`,
                   `Ulysses ${recommendedRecipe.ulysses_degree}`,
                   recommendedRecipe.ring_degree > 1 && `Ring ${recommendedRecipe.ring_degree}`,
-                  { resident: "Resident", fsdp: "FSDP", offload: "Layerwise offload" }[recommendedRecipe.placement],
+                  overlayDimSpecs.find((dim) => dim.id === "placement")?.options
+                    ?.find((option) => option.id === recommendedRecipe.placement)?.label
+                    || { resident: "Resident", fsdp: "FSDP", offload: "Offload" }[recommendedRecipe.placement],
                 ].filter(Boolean).join(" · ")}
               </strong>
             </div>
@@ -2023,7 +2111,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               {renderStatus(recommendedIsVerified ? "verified" : "unverified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedIsVerified ? "Use verified recipe" : "Use derived recipe"}</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>Use {recommendedLabel.toLowerCase()} recipe</button>}
             </div>
           </section>
         )}
@@ -2064,7 +2152,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
           </div>
           {Number(sel.nodes) > 1 && (
             <p className="sgd-builder-resource-summary">
-              {sel.nodes} nodes × {sel.gpus_per_node} {sel.hw.toUpperCase()} = {totalGpus} GPUs
+              {sel.nodes} nodes × {sel.gpus_per_node} {hardwareLabel} = {totalGpus} GPUs
             </p>
           )}
           <button
@@ -2155,7 +2243,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
                   [dim.id]: Math.min(dim.max, Number(prev[dim.id]) + 1),
                 }))}
               >+</button>
-              <span>{dim.unit || "outputs"}</span>
+              <span>{dim.unit ?? "outputs"}</span>
             </div>
           ) : (
             <div className="sgd-builder-context-options">
@@ -2264,7 +2352,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               <strong>{serve ? "Serve" : "Request"}</strong>
               <span>
                 {serve
-                  ? `${sel.hw.toUpperCase()} · ${activeRunMode === "docker" ? "Docker" : "Python"}`
+                  ? `${hardwareLabel} · ${activeRunMode === "docker" ? "Docker" : "Python"}`
                   : "cURL"}
               </span>
             </div>
@@ -2288,7 +2376,11 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             <div className="sgd-builder-node-fields">
               <label>
                 <span>Head address</span>
-                <input value={builderHeadAddress} onChange={(event) => setBuilderHeadAddress(event.target.value)} />
+                <input
+                  value={builderHeadAddress}
+                  disabled={sel.hw === "xeon"}
+                  onChange={(event) => setBuilderHeadAddress(event.target.value)}
+                />
               </label>
               <label>
                 <span>Node rank</span>
@@ -2298,6 +2390,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
                   min: 0,
                   max: Number(sel.nodes) - 1,
                   label: "Node rank",
+                  disabled: sel.hw === "xeon",
                   onCommit: setBuilderNodeRank,
                 })}
               </label>

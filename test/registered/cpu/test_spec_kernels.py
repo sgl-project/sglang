@@ -4,7 +4,8 @@ import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, organize_draft_results
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision
 from sglang.test.test_utils import CustomTestCase

@@ -1,12 +1,11 @@
-"""CPU-only regression tests for Inkling's linearized shared-sink LoRA path:
-in-place refresh of the derived decode operands on an adapter swap, and the
-shared-sink factor layout from checkpoint to one moe-TP shard's operands."""
+"""Inkling legacy/V2 sink operand layouts, in-place adapter refresh, and TP sharding."""
 
 from __future__ import annotations
 
 import importlib
 import sys
 import types
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -39,8 +38,8 @@ _DOWN_B = f"{_PREFIX}.down_proj.lora_B.weight"
 
 
 class _FakeSharedSink(nn.Module):
-    """Stand-in for ``InklingBatchDenseMLP``: only the attributes
-    ``InklingBatchDenseMLPWithLoRA`` reads."""
+    """Stand-in for ``InklingBatchDenseMLP``: only the attributes the LoRA
+    wrappers read."""
 
     def __init__(
         self,
@@ -48,6 +47,7 @@ class _FakeSharedSink(nn.Module):
         num_shared: int = _NUM_SHARED,
         intermediate: int = _SHARD,
         moe_tp_size: int = 1,
+        contiguous_gate_up: bool = False,
     ):
         super().__init__()
         self.n_shared_experts = num_shared
@@ -55,10 +55,11 @@ class _FakeSharedSink(nn.Module):
         self.moe_tp_size = moe_tp_size
         self.moe_tp_rank = 0
         self._linearized_bf16_enabled = True
+        self._w13_gate_up_contiguous = contiguous_gate_up
 
 
-def _load_sink_lora_class():
-    """Import the real Inkling LoRA layer against the fake dense-sink base."""
+def _load_sink_lora_module():
+    """Import the real Inkling LoRA layers against the fake dense-sink base."""
     stub = types.ModuleType("sglang.srt.models.inkling_common.dense_mlp")
     stub.InklingBatchDenseMLP = _FakeSharedSink
     patched = dict(sys.modules)
@@ -68,23 +69,36 @@ def _load_sink_lora_class():
     patched.pop("sglang.srt.models.inkling_common.lora", None)
     with mock.patch.dict(sys.modules, patched, clear=True):
         module = importlib.import_module("sglang.srt.models.inkling_common.lora")
-    return module.InklingBatchDenseMLPWithLoRA
+    return module
 
 
-InklingSharedSinkWithLoRA = _load_sink_lora_class()
+_lora_module = _load_sink_lora_module()
+InklingSharedSinkWithLoRA = _lora_module.InklingBatchDenseMLPWithLoRA
+InklingSharedSinkWithLoRAV2 = _lora_module.InklingBatchDenseMLPWithLoRAV2
+WRAPPERS = [InklingSharedSinkWithLoRA, InklingSharedSinkWithLoRAV2]
+WRAPPER_IDS = ["legacy", "v2"]
 
 
-def _new_sink(*, slots: int = 1, moe_tp_size: int = 1, intermediate: int = _SHARD):
-    layer = InklingSharedSinkWithLoRA(
-        moe_tp_size=moe_tp_size, intermediate=intermediate
+def _new_sink(
+    cls=InklingSharedSinkWithLoRA,
+    *,
+    slots: int = 1,
+    moe_tp_size: int = 1,
+    intermediate: int = _SHARD,
+):
+    layer = cls(
+        moe_tp_size=moe_tp_size,
+        intermediate=intermediate,
+        contiguous_gate_up=cls is InklingSharedSinkWithLoRAV2,
     )
-    # initialize_lora() reads only these two backend fields (and flips
-    # is_moe_lora on the backend it is handed).
+    # initialize_lora() reads only these backend fields (and flips is_moe_lora
+    # on the backend it is handed); V2 needs the dense engine present.
     layer.initialize_lora(
         SimpleNamespace(
             name="triton" if slots > 1 else "torch-test",
             max_loras_per_batch=slots,
             is_moe_lora=False,
+            runner=object(),
         )
     )
     return layer
@@ -188,8 +202,8 @@ def _pool_from_shards(shards, *, max_rank: int, slots: int = 1):
     return buffers
 
 
-def _sink_with_shard(shards, *, max_rank: int):
-    layer = _new_sink(moe_tp_size=_MOE_TP_SIZE)
+def _sink_with_shard(cls, shards, *, max_rank: int):
+    layer = _new_sink(cls, moe_tp_size=_MOE_TP_SIZE)
     layer.set_lora_info(*_pool_from_shards(shards, max_rank=max_rank))
     return layer
 
@@ -205,19 +219,59 @@ def _consumer_delta(layer, x, act):
     )
 
 
-def _reference_delta(shards, x, act):
-    """The same delta straight from the sharded adapter factors; the sink's w13 is
-    gate/up *interleaved*, so gate lands at ``[..., 0::2]`` and up at
-    ``[..., 1::2]`` of each expert's block."""
+def _site_delta(layer, x, act):
+    """The V2 wrapper's two deltas by the dense engine's contract on its bound
+    sites: shrink over ``a``, expand slice s from bridge block
+    s % bridge_slices (s when 0) into its output columns."""
+
+    def run(site, x):
+        a, b = site["a"][0], site["b"][0]
+        rank = b.shape[-1]
+        assert int(site["lora_ranks"][0]) == rank
+        if site.get("a_windowed"):
+            k, r = a.shape[-1], a.shape[0] // site["a_blocks"]
+            bridge = torch.cat(
+                [
+                    x[:, e * k : (e + 1) * k] @ a[e * r : (e + 1) * r].T
+                    for e in range(site["a_blocks"])
+                ],
+                dim=1,
+            )
+        else:
+            bridge = x @ a.T
+        blocks = site.get("bridge_slices", 0)
+        offsets = site["offsets"]
+        starts = site.get("out_offsets", offsets[:-1])
+        out = x.new_zeros(x.shape[0], offsets[-1])
+        for s, (lo, hi) in enumerate(zip(offsets, offsets[1:])):
+            block = s % blocks if blocks else s
+            columns = starts[s] + torch.arange(hi - lo)
+            out[:, columns] += bridge[:, block * rank : (block + 1) * rank] @ b[lo:hi].T
+        return out
+
+    return run(layer._gate_up, x), run(layer._down, act)
+
+
+def _reference_delta(shards, x, act, contiguous: bool = False):
+    """The same delta straight from the sharded adapter factors. With the
+    sink's w13 gate/up *interleaved* (the legacy wrapper) gate lands at
+    ``[..., 0::2]`` and up at ``[..., 1::2]`` of each expert's block; on the
+    dense-engine wrapper's contiguous layout gate is the block's first half and
+    up its second."""
     a_gate_up, b_gate_up, a_down, b_down = shards
     rank = b_gate_up.shape[-1]
     experts, f = b_gate_up.shape[0], b_gate_up.shape[1] // 2
     gate_shrink = x @ a_gate_up[0, :rank].T
     up_shrink = x @ a_gate_up[0, rank:].T
     y = x.new_zeros(x.shape[0], experts, 2 * f)
+    gate_cols, up_cols = (
+        (slice(0, f), slice(f, 2 * f))
+        if contiguous
+        else (slice(0, None, 2), slice(1, None, 2))
+    )
     for expert in range(experts):
-        y[:, expert, 0::2] = gate_shrink @ b_gate_up[expert, :f].T
-        y[:, expert, 1::2] = up_shrink @ b_gate_up[expert, f:].T
+        y[:, expert, gate_cols] = gate_shrink @ b_gate_up[expert, :f].T
+        y[:, expert, up_cols] = up_shrink @ b_gate_up[expert, f:].T
     down_shrink = torch.einsum("tef,ekf->tk", act.view(-1, experts, f), a_down)
     return y.reshape(x.shape[0], -1), down_shrink @ b_down[0].T
 
@@ -243,6 +297,11 @@ def _fake_adapter(*, gate_up_b: float, down_a: float, max_rank: int):
 
 def _derived_signature(layer):
     """Which adapter the derived operands currently hold."""
+    if isinstance(layer, InklingSharedSinkWithLoRAV2):
+        return (
+            layer._gate_up["b"].abs().max().item(),
+            layer._down_cat.abs().max().item(),
+        )
     return (
         layer._w1_delta.abs().max().item(),
         layer._a_cat.abs().max().item(),
@@ -323,15 +382,13 @@ def _record_refreshes(layer, events: list) -> None:
     layer.on_lora_slots_updated = record
 
 
-def test_derived_operands_refresh_in_place_after_slot_copy(monkeypatch):
-    """Guards adapter swaps landing in the pre-allocated derived operands; reds when
-    a swap rebinds instead of copying in place, notifies before the pool copies the
-    new adapter, or skips the refresh on an unload, a reload, or a base-only batch."""
+@pytest.mark.parametrize("cls", WRAPPERS, ids=WRAPPER_IDS)
+def test_derived_operands_refresh_in_place_after_slot_copy(monkeypatch, cls):
+    """Pool copies precede refreshes, including eviction, unload, and reload."""
     max_rank = _ADAPTER_RANK
     buffers = _empty_pool(slots=1, max_rank=max_rank)
-    layer = _new_sink(slots=1)
+    layer = _new_sink(cls, slots=1)
     layer.set_lora_info(*buffers)
-    assert layer.experts_shared_outer_loras is True
 
     events: list = []
     _record_refreshes(layer, events)
@@ -341,7 +398,7 @@ def test_derived_operands_refresh_in_place_after_slot_copy(monkeypatch):
         "uid-a": _fake_adapter(gate_up_b=1.0, down_a=0.5, max_rank=max_rank),
         "uid-b": _fake_adapter(gate_up_b=2.0, down_a=0.25, max_rank=max_rank),
     }
-    pointers = (layer._w1_delta.data_ptr(), layer._a_cat.data_ptr())
+    pointers = tuple(buffer.data_ptr() for buffer in layer.buffers())
 
     # The pool copies the adapter into its slot first; only then is the slot's
     # derived operand rebuilt. Refreshing first would derive it from zeros.
@@ -396,12 +453,13 @@ def test_derived_operands_refresh_in_place_after_slot_copy(monkeypatch):
     assert _derived_signature(layer) == (3.0, 0.75)
 
     # Every refresh wrote through the buffers allocated at set_lora_info() time.
-    assert (layer._w1_delta.data_ptr(), layer._a_cat.data_ptr()) == pointers
+    assert tuple(buffer.data_ptr() for buffer in layer.buffers()) == pointers
 
 
-def test_shared_sink_factor_layout_roundtrip():
+@pytest.mark.parametrize("cls", WRAPPERS, ids=WRAPPER_IDS)
+def test_shared_sink_factor_layout_roundtrip(cls):
     """Guards the shared-sink factor layout from checkpoint to one moe-TP shard's
-    decode operands; reds on a lost ``down_proj`` transpose, gate-major gate/up
+    operands; reds on a lost ``down_proj`` transpose, gate-major gate/up
     LoRA-B, a collapsed gate/up shard, or a rank offset from the wrong rank."""
     rank, hidden = _ADAPTER_RANK, _HIDDEN
     experts, full = _NUM_SHARED, _INTERMEDIATE
@@ -450,7 +508,7 @@ def test_shared_sink_factor_layout_roundtrip():
 
     # -- layer side: this moe-TP rank's shard -----------------------------
     normalized = _normalize(_inkling_config(), dict(flat))
-    layer = _new_sink(moe_tp_size=_MOE_TP_SIZE)
+    layer = _new_sink(cls, moe_tp_size=_MOE_TP_SIZE)
     shards = _shard_factors(layer, normalized)
     start = _MOE_TP_RANK * _SHARD
     # The gate half and the up half are sharded independently and re-paired, so
@@ -492,17 +550,62 @@ def test_shared_sink_factor_layout_roundtrip():
     x = torch.tensor([[0.5, -1.0, 0.25], [1.25, 0.75, -0.5]])
     act = torch.tensor([[0.5, -0.25, 1.0, 0.75], [-1.0, 0.25, 0.5, -0.75]])
     assert x.shape[-1] == hidden and act.shape[-1] == experts * _SHARD
-    expected_gate_up_delta, expected_down_delta = _reference_delta(shards, x, act)
+    expected_gate_up_delta, expected_down_delta = _reference_delta(
+        shards, x, act, contiguous=cls is InklingSharedSinkWithLoRAV2
+    )
 
     # A pool padded past the adapter's rank must produce the same delta as an
     # exactly-sized one: the up half's column offset comes from the padded
     # max_rank, matching where the pool stacks the up half of LoRA-A.
     for max_rank in (rank, rank + 1):
-        sink = _sink_with_shard(shards, max_rank=max_rank)
-        assert sink.experts_shared_outer_loras is True
-        gate_up_delta, down_delta = _consumer_delta(sink, x, act)
+        sink = _sink_with_shard(cls, shards, max_rank=max_rank)
+        if cls is InklingSharedSinkWithLoRA:
+            assert sink.experts_shared_outer_loras is True
+        else:
+            assert sink._down["kind"] == "linear"
+        delta = _consumer_delta if cls is InklingSharedSinkWithLoRA else _site_delta
+        gate_up_delta, down_delta = delta(sink, x, act)
         torch.testing.assert_close(gate_up_delta, expected_gate_up_delta)
         torch.testing.assert_close(down_delta, expected_down_delta)
+
+
+def test_outer_overlap_dispatch(monkeypatch):
+    from sglang.srt.lora.trtllm_lora_temp import inkling_dense
+    from sglang.srt.models.inkling_common import moe
+
+    sink, routed = SimpleNamespace(), SimpleNamespace()
+    calls = []
+    alt_stream, current_stream = mock.Mock(), mock.Mock()
+    layer = SimpleNamespace(
+        shared_experts=sink,
+        experts=routed,
+        alt_stream=alt_stream,
+        gate=lambda x: (None, None, None, None),
+        _clone_fused_sink_input=False,
+        _forward_routed=lambda *args: calls.append("routed"),
+        _forward_shared=lambda *args: calls.append("sink"),
+    )
+    legacy_gate = mock.Mock(return_value=False)
+    monkeypatch.setattr(inkling_dense, "allow_inkling_moe_two_stream", legacy_gate)
+    monkeypatch.setattr(moe, "lora_compatible_layout_enabled", lambda: True)
+    monkeypatch.setattr(
+        moe, "get_lora", lambda: SimpleNamespace(lora_backend="triton_v2")
+    )
+    monkeypatch.setattr(moe, "get_is_capture_mode", lambda: True)
+    monkeypatch.setattr(
+        moe.envs.SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP, "get", lambda: True
+    )
+    monkeypatch.setattr(moe.torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(moe.torch.cuda, "stream", lambda stream: nullcontext())
+    moe.InklingMoE.forward(
+        layer, SimpleNamespace(is_cuda=True, shape=(64, 6144)), reduce=False
+    )
+    # The v2 path never consults the legacy gate, and the sink runs on the side
+    # stream between a fork wait and a join wait.
+    legacy_gate.assert_not_called()
+    assert calls == ["sink", "routed"]
+    alt_stream.wait_stream.assert_called_once_with(current_stream)
+    current_stream.wait_stream.assert_called_once_with(alt_stream)
 
 
 if __name__ == "__main__":

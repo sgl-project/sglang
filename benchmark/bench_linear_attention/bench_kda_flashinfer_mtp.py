@@ -2,7 +2,7 @@
 Benchmark & Correctness: FlashInfer KDA (SM100) vs Triton KDA — decode & MTP verify.
 
 Exercises the two real backend wrappers used by ``KDAKernelDispatcher``:
-  - ``FlashInferKDAKernel`` — wraps ``flashinfer.kda_decode.recurrent_kda``
+  - ``FlashInferKDAKernel`` — wraps ``flashinfer.recurrent_kda``
     (CuTe DSL, SM100/Blackwell only). Provides ``decode`` + ``target_verify``.
   - ``TritonKDAKernel``     — wraps ``fused_sigmoid_gating_delta_rule_update``
     (IS_KDA=True). Reference for both ``decode`` and ``target_verify``.

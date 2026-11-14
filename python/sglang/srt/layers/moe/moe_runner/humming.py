@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 try:
     from humming import dtypes
     from humming.config import GemmType as HummingGemmType
+    from humming.config import InputQuantizationMode
     from humming.layer import HummingMethod
 
     _humming_available = True
@@ -99,13 +100,40 @@ class HummingMoeQuantInfo(MoeQuantInfo):
     layer: torch.nn.Module
 
 
-@register_custom_op()
+def _humming_moe_runner_core_run_fake(
+    moe_runner_id: int,
+    gemm_type: str,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output_dtype: torch.dtype,
+    expert_num_tokens: torch.Tensor | None = None,
+    expected_m: int | None = None,
+    hidden_states_scale: torch.Tensor | None = None,
+    apply_routed_scaling_factor: bool = True,
+) -> torch.Tensor:
+    output_shape = hidden_states.shape
+    if gemm_type == "grouped_masked" and hidden_states.ndim == 2:
+        assert expert_num_tokens is not None
+        num_experts = expert_num_tokens.shape[0]
+        output_shape = (
+            num_experts,
+            hidden_states.shape[0] // num_experts,
+            hidden_states.shape[-1],
+        )
+    # DeepEP can dispatch FP8 inputs, but the GEMMs return the model dtype.
+    # Keep fake execution independent of the runtime runner registry.
+    return hidden_states.new_empty(output_shape, dtype=output_dtype)
+
+
+@register_custom_op(fake_impl=_humming_moe_runner_core_run_fake)
 def humming_moe_runner_core_run(
     moe_runner_id: int,
     gemm_type: str,
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    output_dtype: torch.dtype,
     expert_num_tokens: torch.Tensor | None = None,
     expected_m: int | None = None,
     hidden_states_scale: torch.Tensor | None = None,
@@ -245,59 +273,48 @@ class HummingRunnerCore(MoeRunnerCore):
             output_shape = (hidden_states.size(0), K)
 
         down_input_size = N
-        a_dtype = self.layer.humming_metas["w13"].a_dtype
+        gate_up_dtype = self.layer.humming_metas["w13"].a_dtype
+        down_dtype = self.layer.humming_metas["w2"].a_dtype
         c_dtype = self.layer.humming_metas["w13"].c_dtype
-        num_bits = a_dtype.num_bits
-        torch_dtype_map = {
-            dtypes.float16: torch.float16,
-            dtypes.bfloat16: torch.bfloat16,
-            dtypes.float8e4m3: torch.float8_e4m3fn,
-            dtypes.int8: torch.int8,
-            dtypes.int4: torch.uint8,
-        }
+        output_dtype = dtypes.torch_dtype_map[c_dtype]
+        gate_up_packing = max(8 // gate_up_dtype.num_bits, 1)
+        down_packing = max(8 // down_dtype.num_bits, 1)
 
         buffer_metas = {
             "quanted_gate_up_input": {
-                "shape": (input_shape_m, K),
-                "dtype": torch_dtype_map[a_dtype],
+                "shape": (input_shape_m, K // gate_up_packing),
+                "dtype": dtypes.torch_dtype_map.get(gate_up_dtype, torch.uint8),
             },
             "gate_up_output": {
                 "shape": (real_shape_m, N * 2),
-                "dtype": torch_dtype_map[c_dtype],
+                "dtype": output_dtype,
             },
             "activation_output": {
                 "shape": (real_shape_m, down_input_size),
-                "dtype": torch_dtype_map[c_dtype],
+                "dtype": output_dtype,
             },
             "quanted_down_input": {
-                "shape": (real_shape_m, down_input_size),
-                "dtype": torch_dtype_map[a_dtype],
+                "shape": (real_shape_m, down_input_size // down_packing),
+                "dtype": dtypes.torch_dtype_map.get(down_dtype, torch.uint8),
             },
             "down_output": {
                 "shape": output_shape if is_grouped_masked else (real_shape_m, K),
-                "dtype": torch_dtype_map[c_dtype],
+                "dtype": output_dtype,
             },
             "output": {
                 "shape": output_shape,
-                "dtype": torch_dtype_map[c_dtype],
+                "dtype": output_dtype,
             },
         }
 
-        for key in buffer_metas:
-            meta = buffer_metas[key]
-            if "quanted" in key and a_dtype.num_bits == 4:
-                meta["shape"] = meta["shape"][:-1] + (meta["shape"][-1] // 2,)
-
-        if num_bits == 16:
-            required_buffers = ["gate_up_output", "activation_output", "down_output"]
-        else:
-            required_buffers = [
-                "quanted_gate_up_input",
-                "gate_up_output",
-                "activation_output",
-                "quanted_down_input",
-                "down_output",
-            ]
+        required_buffers = []
+        if gate_up_dtype.num_bits != 16:
+            required_buffers.append("quanted_gate_up_input")
+        required_buffers.append("gate_up_output")
+        required_buffers.append("activation_output")
+        if down_dtype.num_bits != 16:
+            required_buffers.append("quanted_down_input")
+        required_buffers.append("down_output")
 
         # grouped masked moe use down_output as output
         if gemm_type != HummingGemmType.GROUPED_MASKED:
@@ -405,12 +422,58 @@ class HummingRunnerCore(MoeRunnerCore):
         else:
             raise ValueError(f"Unsupported activation: {self.activation}")
 
+    def _prepare_input(
+        self,
+        inputs: torch.Tensor,
+        sublayer_name: str,
+        quanted_input: torch.Tensor | None = None,
+        input_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        meta = self.layer.humming_metas[sublayer_name]
+        hadamard_block_size = self._get_hadamard_block_size(sublayer_name)
+        if input_scale is not None:
+            if hadamard_block_size > 1:
+                raise ValueError("Humming Hadamard inputs require BF16 DeepEP dispatch")
+            # DeepEP already supplies FP8 values with row-major FP32 group scales.
+            meta.check_device(inputs.device)
+            return inputs, input_scale, None
+
+        quant_mode = meta.input_quant_mode
+        token_scales = None
+        if quant_mode.has_tensor_scale:
+            scale_name = (
+                meta.input_scale_2_name
+                if quant_mode.has_secondary_scale
+                else meta.input_scale_name
+            )
+            token_scales = getattr(self.layer, scale_name, None)
+            if token_scales is None:
+                raise ValueError(f"Humming {sublayer_name} requires {scale_name}")
+
+        inputs, group_scales, token_scales = HummingMethod.may_process_input(
+            layer=self.layer,
+            inputs=inputs,
+            outputs=quanted_input,
+            token_scales=token_scales,
+            hadamard_block_size=hadamard_block_size,
+            m_major_scale=False,
+            sublayer_name=sublayer_name,
+        )
+        input_scale = group_scales if quant_mode.has_group_scale else token_scales
+        input_scale_2 = token_scales if quant_mode.has_secondary_scale else None
+        return inputs, input_scale, input_scale_2
+
+    def _get_hadamard_block_size(self, sublayer_name: str) -> int:
+        weight_schemas = getattr(self.layer, "weight_schemas", {})
+        weight_schema = weight_schemas.get(sublayer_name)
+        return getattr(weight_schema, "hadamard_block_size", 0) or 0
+
     def _grouped_masked_act_quant(
         self,
         gate_up: torch.Tensor,
         expert_num_tokens: torch.Tensor,
         buffers: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         num_experts, max_tokens, two_i = gate_up.shape
         intermediate = two_i // 2
         w2_meta = self.layer.humming_metas["w2"]
@@ -418,7 +481,10 @@ class HummingRunnerCore(MoeRunnerCore):
         num_threads = intermediate // 8
         use_fused_masked_act_quant = (
             w2_meta.a_dtype == dtypes.float8e4m3
+            and w2_meta.input_quant_mode == InputQuantizationMode.DynamicGroup
+            and w2_meta.as_dtype == dtypes.float32
             and w2_meta.input_scale_group_size == 128
+            and self._get_hadamard_block_size("w2") <= 1
             and self.activation == "silu"
             and gate_up.dtype == torch.bfloat16
             and intermediate % 256 == 0
@@ -448,14 +514,13 @@ class HummingRunnerCore(MoeRunnerCore):
                 topk=self.config.top_k,
                 swiglu_limit=self.swiglu_limit,
             )
-            return down_input.flatten(0, 1), down_scale.flatten(0, 1)
+            return down_input.flatten(0, 1), down_scale.flatten(0, 1), None
 
         self.apply_activation(
             inputs=buffers["gate_up_output"],
             outputs=buffers["activation_output"],
         )
-        return HummingMethod.may_quant_input(
-            layer=self.layer,
+        return self._prepare_input(
             inputs=buffers["activation_output"],
             quanted_input=buffers.get("quanted_down_input"),
             sublayer_name="w2",
@@ -476,15 +541,14 @@ class HummingRunnerCore(MoeRunnerCore):
                 )
             )
 
-        # To make it compatible with dynamic shapes in torch.compile,
-        # we wrap the main logic inside a torch op.
-        # (the moe_block_size selection in indexed gemm would break dynamic shapes).
+        # Keep kernel selection opaque to torch.compile.
         output = humming_moe_runner_core_run(
             moe_runner_id=id(self),
             gemm_type=runner_input.gemm_type.value,
             hidden_states=runner_input.hidden_states,
             topk_weights=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
+            output_dtype=self.layer.params_dtype,
             expected_m=runner_input.expected_m,
             expert_num_tokens=runner_input.expert_num_tokens,
             hidden_states_scale=runner_input.hidden_states_scale,
@@ -501,38 +565,42 @@ class HummingRunnerCore(MoeRunnerCore):
         configs = self.get_humming_gemm_configs(HummingGemmType.INDEXED)
         valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
 
-        for min_shape_m, max_shape_m, config in configs["w13_tuning_config"]:
-            if valid_shape_m > min_shape_m and valid_shape_m <= max_shape_m:
-                moe_block_size = config["block_shape"][0]
-                break
-        else:
-            raise ValueError(f"cannot found moe_block_size for shape {valid_shape_m}")
+        alignments = {}
+        gemm_kwargs = []
+        for sublayer_name, top_k in (("w13", topk_ids.size(1)), ("w2", 1)):
+            tuning_config = configs[f"{sublayer_name}_tuning_config"]
+            for min_shape_m, max_shape_m, config in tuning_config:
+                if min_shape_m < valid_shape_m <= max_shape_m:
+                    moe_block_size = config["block_shape"][0]
+                    break
+            else:
+                raise ValueError(
+                    f"Cannot find {sublayer_name} MoE block size for shape {valid_shape_m}"
+                )
 
-        sorted_ids, expert_ids, num_tokens_padded = moe_align_block_size(
-            topk_ids=topk_ids,
-            block_size=moe_block_size,
-            num_experts=self.num_experts,
-            ignore_invalid_expert=True,
-        )
+            # Each kernel addresses expert IDs and sorted rows using its own M tile.
+            # Heuristics can choose different tiles for the gate/up and down GEMMs.
+            if moe_block_size not in alignments:
+                alignments[moe_block_size] = moe_align_block_size(
+                    topk_ids=topk_ids,
+                    block_size=moe_block_size,
+                    num_experts=self.num_experts,
+                    ignore_invalid_expert=True,
+                )
+            sorted_ids, expert_ids, num_tokens_padded = alignments[moe_block_size]
+            gemm_kwargs.append(
+                {
+                    "sorted_ids": sorted_ids,
+                    "expert_ids": expert_ids,
+                    "num_tokens_padded": num_tokens_padded,
+                    "compute_config": configs["compute_config_str"],
+                    "valid_shape_m": valid_shape_m,
+                    "top_k": top_k,
+                    "tuning_config": configs[f"{sublayer_name}_tuning_config_str"],
+                }
+            )
 
-        moe_common_kwargs = {
-            "sorted_ids": sorted_ids,
-            "expert_ids": expert_ids,
-            "num_tokens_padded": num_tokens_padded,
-            "compute_config": configs["compute_config_str"],
-            "valid_shape_m": valid_shape_m,
-        }
-
-        top_k = topk_ids.size(1)
-        moe_kwargs1 = {
-            "top_k": top_k,
-            "tuning_config": configs["w13_tuning_config_str"],
-        }
-        moe_kwargs2 = {"top_k": 1, "tuning_config": configs["w2_tuning_config_str"]}
-        moe_kwargs1.update(moe_common_kwargs)
-        moe_kwargs2.update(moe_common_kwargs)
-
-        return moe_kwargs1, moe_kwargs2
+        return gemm_kwargs[0], gemm_kwargs[1]
 
     def _run_indexed_gemm(
         self,
@@ -555,8 +623,7 @@ class HummingRunnerCore(MoeRunnerCore):
 
         moe_kwargs1, moe_kwargs2 = self._prepare_indexed_gemm_kwargs(topk_ids)
 
-        inputs, input_scale = HummingMethod.may_quant_input(
-            layer=self.layer,
+        inputs, input_scale, input_scale_2 = self._prepare_input(
             inputs=hidden_states,
             input_scale=hidden_states_scale,
             quanted_input=buffers.get("quanted_gate_up_input", None),
@@ -567,6 +634,7 @@ class HummingRunnerCore(MoeRunnerCore):
             layer=self.layer,
             inputs=inputs,
             input_scale=input_scale,
+            input_scale_2=input_scale_2,
             outputs=buffers["gate_up_output"],
             sublayer_name="w13",
             **moe_kwargs1,
@@ -577,10 +645,9 @@ class HummingRunnerCore(MoeRunnerCore):
             outputs=buffers["activation_output"],
         )
 
-        inputs, input_scale = HummingMethod.may_quant_input(
-            layer=self.layer,
+        inputs, input_scale, input_scale_2 = self._prepare_input(
             inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input", None),
+            quanted_input=buffers.get("quanted_down_input"),
             sublayer_name="w2",
         )
 
@@ -588,6 +655,7 @@ class HummingRunnerCore(MoeRunnerCore):
             layer=self.layer,
             inputs=inputs,
             input_scale=input_scale,
+            input_scale_2=input_scale_2,
             outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
             sublayer_name="w2",
             **moe_kwargs2,
@@ -650,8 +718,7 @@ class HummingRunnerCore(MoeRunnerCore):
                 outputs=buffers["quanted_gate_up_input"],
             )
 
-        inputs, input_scale = HummingMethod.may_quant_input(
-            layer=self.layer,
+        inputs, input_scale, input_scale_2 = self._prepare_input(
             inputs=hidden_states,
             input_scale=hidden_states_scale,
             quanted_input=buffers.get("quanted_gate_up_input", None),
@@ -662,6 +729,7 @@ class HummingRunnerCore(MoeRunnerCore):
             layer=self.layer,
             inputs=inputs,
             input_scale=input_scale,
+            input_scale_2=input_scale_2,
             outputs=buffers["gate_up_output"],
             valid_shape_m=valid_shape_m,
             expert_layout=expert_first_token_offset,
@@ -675,10 +743,9 @@ class HummingRunnerCore(MoeRunnerCore):
             outputs=buffers["activation_output"],
         )
 
-        inputs, input_scale = HummingMethod.may_quant_input(
-            layer=self.layer,
+        inputs, input_scale, input_scale_2 = self._prepare_input(
             inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input", None),
+            quanted_input=buffers.get("quanted_down_input"),
             sublayer_name="w2",
         )
 
@@ -686,6 +753,7 @@ class HummingRunnerCore(MoeRunnerCore):
             layer=self.layer,
             inputs=inputs,
             input_scale=input_scale,
+            input_scale_2=input_scale_2,
             outputs=buffers["down_output"],
             valid_shape_m=valid_shape_m,
             expert_layout=expert_first_token_offset,
@@ -731,8 +799,7 @@ class HummingRunnerCore(MoeRunnerCore):
             gemm_type=HummingGemmType.GROUPED_MASKED,
         )
 
-        inputs, input_scale = HummingMethod.may_quant_input(
-            layer=self.layer,
+        inputs, input_scale, input_scale_2 = self._prepare_input(
             inputs=hidden_states,
             input_scale=hidden_states_scale,
             quanted_input=buffers.get("quanted_gate_up_input", None),
@@ -743,6 +810,7 @@ class HummingRunnerCore(MoeRunnerCore):
             layer=self.layer,
             inputs=inputs,
             input_scale=input_scale,
+            input_scale_2=input_scale_2,
             outputs=buffers["gate_up_output"],
             valid_shape_m=valid_shape_m,
             expert_layout=expert_num_tokens,
@@ -756,7 +824,7 @@ class HummingRunnerCore(MoeRunnerCore):
             -1,
             buffers["gate_up_output"].shape[-1],
         )
-        down_input, down_scale = self._grouped_masked_act_quant(
+        down_input, down_scale, down_scale_2 = self._grouped_masked_act_quant(
             gate_up, expert_num_tokens, buffers
         )
 
@@ -764,6 +832,7 @@ class HummingRunnerCore(MoeRunnerCore):
             layer=self.layer,
             inputs=down_input,
             input_scale=down_scale,
+            input_scale_2=down_scale_2,
             outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
             valid_shape_m=valid_shape_m,
             expert_layout=expert_num_tokens,
@@ -795,7 +864,18 @@ def fused_experts_none_to_humming(
         gemm_type=get_standard_humming_moe_gemm_type(),
     )
 
-    runner_core = HummingRunnerCore(runner_config)
+    # ``humming_moe_runner_core_run`` resolves the runner through
+    # ``HummingRunnerCore.runner_cores[id(self)]`` and torch.compile bakes that
+    # id into the graph. A per-call core would be dropped right after this call
+    # (the registry is a WeakValueDictionary), so a replayed graph could miss
+    # the entry or resolve an unrelated runner, leaving ``layer`` unset. Keep
+    # one core per layer and bind the layer eagerly.
+    runner_core = getattr(quant_info.layer, "_humming_standard_runner_core", None)
+    if runner_core is None:
+        runner_core = HummingRunnerCore(runner_config)
+        runner_core.layer = quant_info.layer
+        quant_info.layer._humming_standard_runner_core = runner_core
+
     runner_output = runner_core.run(runner_input, quant_info, {})
 
     return StandardCombineInput(hidden_states=runner_output.hidden_states)
@@ -832,8 +912,17 @@ def _validate_deepep_dispatch_input(
             "Humming requires row-major FP32 DeepEP scales with group size 128."
         )
     meta = layer.humming_metas["w13"]
-    if meta.a_dtype != dtypes.float8e4m3 or meta.input_scale_group_size != 128:
-        raise ValueError("Humming w13 must use FP8 group-128 input metadata.")
+    has_fp8_group_input = (
+        meta.a_dtype == dtypes.float8e4m3 and meta.input_scale_group_size == 128
+    )
+    has_fp32_dynamic_scales = (
+        meta.input_quant_mode == InputQuantizationMode.DynamicGroup
+        and meta.as_dtype == dtypes.float32
+    )
+    if not has_fp8_group_input or not has_fp32_dynamic_scales:
+        raise ValueError(
+            "Humming w13 must use dynamic FP8 group-128 FP32 input scales."
+        )
 
 
 @register_pre_permute("deepep_ll", "humming")

@@ -107,18 +107,8 @@ jobs:
 
       - name: Install dependencies
         env:
-          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
-          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
-          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
-          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
         run: |
-          # speed up by using infra cache services
-          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
-          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
-          pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host "${CACHING_URL}"
-
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
 
       - name: Generate outputs
@@ -179,18 +169,8 @@ jobs:
 
       - name: Install dependencies
         env:
-          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
-          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
-          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
-          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
         run: |
-          # speed up by using infra cache services
-          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
-          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
-          pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host "${CACHING_URL}"
-
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
 
       - name: Generate outputs

@@ -125,7 +125,7 @@ class TestZImageTurboAMD(DiffusionServerBase):
             diffusion_server, case.id, generate_fn
         )
 
-        self._validate_and_record(case, perf_record)
+        self._validate_and_record(diffusion_server, case, perf_record)
         self._test_v1_models_endpoint(diffusion_server, case)
 
         prompt = case.sampling_params.prompt or ""

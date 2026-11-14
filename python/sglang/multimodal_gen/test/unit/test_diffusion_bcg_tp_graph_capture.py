@@ -275,6 +275,9 @@ class TestBCGTPGraphCapture(CustomTestCase):
         self.assertEqual(
             events,
             [
+                # The warmup forwards take the BCG branches outside the TP context.
+                "enter:bcg_enable",
+                "exit:bcg_enable",
                 "enter:tp",
                 "enter:bcg_enable",
                 "enter:bcg_capture",

@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 def execute():
     if dist.get_rank() == 0:
-        logger.info(f"[slow_rank_detector] Start benchmarking...")
+        logger.info("[slow_rank_detector] Start benchmarking...")
 
     local_metrics = {
         bench_name: _compute_local_metric(bench_name) for bench_name in _BENCH_NAMES

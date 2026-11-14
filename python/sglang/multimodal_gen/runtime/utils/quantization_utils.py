@@ -113,6 +113,24 @@ def _merge_comfy_quant_marker(
     previous.update(marker)
 
 
+# Model prefixes ComfyUI strips before matching _quantization_metadata layer names.
+_COMFY_MODEL_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "model.")
+
+
+def _checkpoint_prefix(layer: str, names: set[str]) -> str:
+    """The checkpoint name of a _quantization_metadata layer.
+
+    Some converters write layer names relative to the diffusion model
+    (``blocks.0.attn.qkv_proj``) while the tensors keep the full prefix.
+    """
+    if f"{layer}.weight" in names:
+        return layer
+    for model_prefix in _COMFY_MODEL_PREFIXES:
+        if f"{model_prefix}{layer}.weight" in names:
+            return model_prefix + layer
+    return layer
+
+
 def inspect_comfy_quant_markers(
     safetensors_list: list[str],
     param_name_mapper: Callable[[str], str] | None = None,
@@ -122,6 +140,7 @@ def inspect_comfy_quant_markers(
     raw_markers: dict[str, dict[str, Any]] = {}
     marked_dtype_weight_prefixes: set[str] = set()
     global_quant_formats: set[str] = set()
+    metadata_markers: list[tuple[str, str, dict[str, Any]]] = []
 
     for path in safetensors_list:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
@@ -150,8 +169,15 @@ def inspect_comfy_quant_markers(
                         raise ValueError(
                             f"Comfy quantization metadata for {prefix!r} must be an object"
                         )
-                    _merge_comfy_quant_marker(raw_markers, prefix, marker)
-            for key in checkpoint.keys():
+                    metadata_markers.append((path, prefix, marker))
+            keys = list(checkpoint.keys())
+            names = set(keys)
+            for path_, prefix, marker in metadata_markers:
+                if path_ == path:
+                    _merge_comfy_quant_marker(
+                        raw_markers, _checkpoint_prefix(prefix, names), marker
+                    )
+            for key in keys:
                 tensor_slice = checkpoint.get_slice(key)
                 checkpoint_meta[key] = (
                     tensor_slice.get_dtype(),
@@ -657,6 +683,48 @@ def handle_fp8_metadata_format(quant_config_dict):
     return quant_config_dict
 
 
+def _get_serialized_quant_config(
+    file_path: str, quant_config_dict: dict
+) -> Optional[QuantizationConfig]:
+    from sglang.multimodal_gen.runtime.layers.quantization.rowwise_fp8 import (
+        FP8_FORMAT,
+        build_rowwise_fp8_config_from_metadata,
+    )
+
+    declared_formats = set()
+    layers = quant_config_dict.get("layers", {})
+    if isinstance(layers, dict):
+        for layer_config in layers.values():
+            layer_format = (
+                layer_config.get("format")
+                if isinstance(layer_config, dict)
+                else layer_config
+            )
+            if isinstance(layer_format, str):
+                declared_formats.add(layer_format)
+    quant_configs = quant_config_dict.get("quant_configs", {})
+    if isinstance(quant_configs, dict):
+        declared_formats.update(quant_configs)
+
+    # NVFP4 layer formats stay with the Comfy loaders, which own that layout.
+    format_builders = {
+        FP8_FORMAT: lambda: build_rowwise_fp8_config_from_metadata(
+            quant_config_dict, _read_safetensors_tensor_metadata(file_path)
+        ),
+    }
+    supported_formats = declared_formats.intersection(format_builders)
+    if not supported_formats:
+        return None
+    if len(supported_formats) > 1:
+        raise ValueError(
+            "Serialized quantization metadata declares multiple supported quant "
+            f"formats: {sorted(supported_formats)}. Only one is supported."
+        )
+
+    quant_format = supported_formats.pop()
+    return format_builders[quant_format]()
+
+
 def get_quant_config_from_safetensors_metadata(
     file_path: str,
 ) -> Optional[QuantizationConfig]:
@@ -686,6 +754,11 @@ def get_quant_config_from_safetensors_metadata(
 
     if not quant_config_dict:
         return None
+
+    quant_config = _get_serialized_quant_config(file_path, quant_config_dict)
+    if quant_config is not None:
+        logger.debug(f"Get quantization config from safetensors file: {file_path}")
+        return quant_config
 
     # handle diffusers fp8 safetensors metadata format
     if (

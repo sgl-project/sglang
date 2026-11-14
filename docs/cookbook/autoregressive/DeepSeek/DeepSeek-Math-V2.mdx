@@ -419,7 +419,7 @@ Output throughput: 540.162 token/s
 **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \
@@ -477,7 +477,7 @@ Max ITL (ms):                            24.93
 **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \

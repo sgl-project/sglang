@@ -24,12 +24,14 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -39,7 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BumpAllocator, add_prefix
+from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +321,15 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     matches the target's MLA cache.
     """
 
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
+
+    @staticmethod
+    def own_quant_config(hf_config, quant_config):
+        """Like deepseek_nextn: modelopt_fp4 is target-only; the draft is bf16."""
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            return None
+        return quant_config
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -327,14 +338,13 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # Match deepseek_nextn behavior: modelopt_fp4 is target-only and the
-        # bf16 draft must not inherit the FP4 quant method.
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        loader_quant_config = quant_config
+        quant_config = self.own_quant_config(config, quant_config)
+        if loader_quant_config is not None and quant_config is None:
             logger.warning(
                 "Overriding Eagle3DeepseekV2ForCausalLM quant config for "
                 "modelopt_fp4 target; draft weights are bf16."
             )
-            quant_config = None
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 

@@ -138,7 +138,7 @@ void per_token_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output
   auto MOutput = SymbolicSize{"output_num_tokens"};
   auto K = SymbolicSize{"hidden_dim"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   TensorMatcher({M, K}).with_dtype<T>().with_device(device).verify(input);
   TensorMatcher({MOutput, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(output_q);

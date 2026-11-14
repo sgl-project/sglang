@@ -89,6 +89,8 @@ def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
         return x_q, scales
 
 
+# Not fp8_kernel._per_token_group_quant_8bit: that kernel multiplies by 1 / scale and
+# clamps int8 to -127 on ROCm, the non-CUDA platforms this path serves.
 @triton.jit
 def _per_token_group_quant_int8(
     # Pointers to inputs and output

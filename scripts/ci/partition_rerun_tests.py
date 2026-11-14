@@ -91,7 +91,6 @@ def _multimodal_estimates(root):
     try:
         suites = parser.collect_diffusion_suites(
             parser.resolve_case_config_path(root, run_suite),
-            run_suite,
             root / parser.BASELINE_REL_PATH,
         )
     except Exception:
