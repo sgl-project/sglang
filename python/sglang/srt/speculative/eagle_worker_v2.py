@@ -288,13 +288,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     @property
     def draft_probs_vocab_size(self) -> int:
-        """Width of ``draft_probs`` (q) as it travels between draft steps.
-
-        q stays in the draft head's vocabulary until _build_verify_draft_probs
-        scatters it into the target vocabulary, so every buffer that carries it
-        across steps -- the draft CUDA-graph input and the idle stub -- is this
-        wide, not the target's.
-        """
+        """Vocabulary width of draft probabilities before verification."""
         if self.hot_token_id is not None:
             return self.hot_token_id.shape[0]
         return self.draft_runner.model_config.vocab_size
@@ -940,58 +934,32 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 hidden_states = logits_output.hidden_states
 
         # Organize the results
-        if draft_tokens_topk1 is not None:
-            bs = draft_tokens_topk1.shape[0]
-            top_scores_index = self._topk1_score_indices_prealloc[:bs]
-            parent_list = self._topk1_parents_prealloc[:bs]
-            return (
-                parent_list,
-                top_scores_index,
-                draft_tokens_topk1,
-                self._build_verify_draft_probs(draft_probs_list, draft_tokens_topk1),
-            )
-
         if topk1_chain_fits:
-            bs = token_list[0].shape[0]
-            draft_tokens = torch.cat(token_list, dim=1)
+            draft_tokens = draft_tokens_topk1
+            if draft_tokens is None:
+                draft_tokens = torch.cat(token_list, dim=1)
+
+            bs = draft_tokens.shape[0]
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return (
-                parent_list,
-                top_scores_index,
-                draft_tokens,
-                self._build_verify_draft_probs(draft_probs_list, draft_tokens),
+        else:
+            parent_list, top_scores_index, draft_tokens = organize_draft_results(
+                score_list, token_list, parents_list, self.speculative_num_draft_tokens
             )
 
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
-        )
-
-        return (
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            self._build_verify_draft_probs(draft_probs_list, draft_tokens),
-        )
+        draft_probs = self._build_verify_draft_probs(draft_probs_list, draft_tokens)
+        return parent_list, top_scores_index, draft_tokens, draft_probs
 
     def _build_verify_draft_probs(
         self,
         draft_probs_list: Optional[List[torch.Tensor]],
         draft_tokens: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Stack the per-step q into the (bs, num_steps, vocab) verify input.
+        """Stack per-step q and align it with chain slots for verification.
 
-        Row i is the proposal distribution the draft token at chain slot i + 1 was
-        sampled from; the verify kernel reads row ``step - 1`` for slot ``step``,
-        so the list order must not be disturbed.
-
-        The kernel indexes q by target token id, so a reduced draft vocabulary is
-        scattered into the target vocabulary here -- once, at the kernel boundary,
-        rather than on every producer.
-
-        ``draft_probs_list`` is None whenever the proposal distribution was never
-        collected -- rejection sampling off, or an all-greedy batch that verifies
-        by argmax -- and there is nothing to stack in that case.
+        Row i holds the distribution for chain slot i + 1; the verify kernel reads
+        row ``step - 1`` for slot ``step``. None means the proposal distribution
+        was not collected: rejection sampling is off, or the batch is all-greedy.
         """
         if draft_probs_list is None:
             return None
@@ -1001,12 +969,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         draft_probs = scatter_draft_probs_to_target_vocab(
             draft_probs, self.hot_token_id, self.target_vocab_size
         )
-        # Every proposed token was drawn from its own row of q, so q > 0 there. A
-        # misaligned or mis-scattered q shows up as q == 0, which makes the
-        # `coin * q < p` accept test vacuously true: accept length pins to
-        # num_steps while the text degrades. Gated so this never runs in
-        # production. Rows with no mass are CUDA-graph filler -- capture warms up
-        # on the zeroed q buffer and replay zeroes the padded rows -- so skip them.
+        # Every proposed token must have q > 0. Zero-mass rows are graph filler:
+        # capture warms up on zeroed q, and replay zeroes padded rows.
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
             proposed_q = draft_probs.gather(
                 -1, draft_tokens.to(torch.int64).unsqueeze(-1)

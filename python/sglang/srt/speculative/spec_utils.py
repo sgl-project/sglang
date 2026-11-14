@@ -277,27 +277,19 @@ def scatter_draft_probs_to_target_vocab(
     hot_token_id: torch.Tensor,
     target_vocab_size: int,
 ) -> torch.Tensor:
-    """Lift a reduced-vocabulary ``q`` into the target vocabulary.
+    """Map reduced-vocabulary probabilities onto target token ids.
 
-    EAGLE3 draft heads emit ``draft_vocab_size`` logits and ``hot_token_id``
-    maps those columns onto target token ids. This is exact, not an
-    approximation: the draft can only ever propose a hot token, so ``q(x) = 0``
-    on every non-hot ``x`` is the true proposal mass. The accept test therefore
-    never sees ``q = 0`` on a proposed token, and ``relu(p - q)`` keeps the full
-    ``p`` on non-hot tokens.
-
-    fp32 is forced so the eager and CUDA-graph paths hand the kernel the same
-    dtype. No buffer reuse: the returned tensor outlives this call under overlap
-    scheduling, so a cached buffer would alias across iterations.
+    ``hot_token_id`` maps the draft head's columns to target vocabulary columns.
+    Columns outside the hot vocabulary have zero probability. The result is fp32,
+    and the caller owns it independently of later calls.
     """
     out = torch.zeros(
         (*draft_probs.shape[:-1], target_vocab_size),
         dtype=torch.float32,
         device=draft_probs.device,
     )
-    # index_copy_ (not advanced indexing / scatter_): advanced indexing lowers to
-    # a non-deterministic index_put_ on duplicate indices, and scatter_ would
-    # need an index tensor of the full source shape.
+    # hot_token_id must contain unique target IDs.
+    # index_copy_ accepts the 1-D vocabulary map directly.
     out.index_copy_(-1, hot_token_id, draft_probs.to(torch.float32))
     return out
 
