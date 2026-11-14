@@ -77,9 +77,9 @@ class TestStaleEndpointRemoval:
     """When fake-worker replicas drop, the router must stop routing to the
     removed endpoints.
 
-    Because sgl-router has no /workers admin API, we verify removal
-    indirectly: scale to 0, assert the router returns non-200 (or at least
-    that scaling back to 2 restores routing), then restore.
+    This test verifies discovery-driven removal indirectly: scale to 0,
+    assert the router returns non-200 (or at least that scaling back to 2
+    restores routing), then restore.
     """
 
     def test_routing_restores_after_scale_down_and_back_up(self, router_url):

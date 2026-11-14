@@ -9,17 +9,14 @@ use crate::server::error::ApiError;
 use axum::http::Uri;
 use axum::response::{IntoResponse, Response};
 
-/// Responses and conversations API, parser endpoints, the worker and tokenizer
-/// management APIs, WASM modules, mesh HA, and the aggregated load and engine
-/// metrics endpoints.
+/// Responses and conversations API, parser endpoints, tokenizer management,
+/// WASM modules, mesh HA, and the aggregated load and engine metrics endpoints.
 pub(crate) const UNSUPPORTED_PATHS: &[&str] = &[
     "/v1/responses",
     "/v1/responses/{*rest}",
     "/v1/conversations",
     "/v1/conversations/{*rest}",
     "/parse/{*rest}",
-    "/workers",
-    "/workers/{*rest}",
     "/v1/tokenizers",
     "/v1/tokenizers/{*rest}",
     "/wasm",

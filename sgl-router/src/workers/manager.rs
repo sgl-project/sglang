@@ -6,6 +6,9 @@ use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::state::kv_events::KvEventIndex;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
+use crate::workers::control::{
+    worker_urls_equal, WorkerControlAction, WorkerControlCommand, WorkerControlService,
+};
 use crate::workers::introspect::{
     worker_client, DisaggregationRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
 };
@@ -30,6 +33,11 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// Faster cadence for prefills held unroutable by the bootstrap-port grace, so
 /// they get several retries before it expires.
 const BOOTSTRAP_PORT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+struct PendingRegistration {
+    url: String,
+    handle: JoinHandle<()>,
+}
 
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
@@ -145,11 +153,38 @@ pub async fn run_with_config(
     .await
 }
 
+pub async fn run_with_config_and_control(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    control_rx: mpsc::Receiver<WorkerControlCommand>,
+    control: Arc<WorkerControlService>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
+    metrics: Option<Arc<crate::server::metrics::MetricsRegistry>>,
+) {
+    let registry = control.registry();
+    let auth = cfg.as_ref().and_then(|c| c.server.worker_auth.clone());
+    let introspector = WorkerIntrospector::with_client(worker_client(SERVER_INFO_TIMEOUT, auth));
+    run_manager(
+        rx,
+        Some(control_rx),
+        Some(control),
+        metrics,
+        registry,
+        cfg,
+        kv_index,
+        router_inflight_load,
+        Arc::new(introspector),
+        RECONCILE_INTERVAL,
+    )
+    .await
+}
+
 /// Internal entry point used by tests so they can supply a custom
 /// [`WorkerIntrospector`] (e.g. shorter timeout, fake transport).
-/// Production callers use [`run_with_config`]. Reconciles unresolved
-/// workers on [`RECONCILE_INTERVAL`]; tests that need a tighter cadence
-/// call [`run_with_introspector_and_reconcile`] directly.
+/// The production binary uses [`run_with_config_and_control`]. This entry point
+/// reconciles unresolved workers on [`RECONCILE_INTERVAL`]; tests that need a
+/// tighter cadence call [`run_with_introspector_and_reconcile`] directly.
 pub async fn run_with_introspector(
     rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
@@ -185,6 +220,8 @@ pub async fn run_with_introspector(
 ///   Without this await, a `Removed` queued while `Added` is still
 ///   fetching would no-op (registry empty), then the deferred Added
 ///   write would leak the worker indefinitely.
+/// - **Control commands:** share the event loop and the same per-id `pending`
+///   tasks, so replace and remove observe the preceding registration result.
 /// - **Reconcile tick:** every `reconcile_interval`, re-introspects any
 ///   registered worker whose `model_ids` are still empty or that is a
 ///   prefill without a bootstrap port (see [`reconcile_unresolved_workers`]).
@@ -192,7 +229,7 @@ pub async fn run_with_introspector(
 ///   re-registrations stay serialized per id against concurrent `Added` /
 ///   `Removed`.
 pub async fn run_with_introspector_and_reconcile(
-    mut rx: mpsc::Receiver<DiscoveryEvent>,
+    rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
@@ -200,6 +237,36 @@ pub async fn run_with_introspector_and_reconcile(
     introspector: Arc<WorkerIntrospector>,
     reconcile_interval: Duration,
 ) {
+    run_manager(
+        rx,
+        None,
+        None,
+        None,
+        registry,
+        cfg,
+        kv_index,
+        router_inflight_load,
+        introspector,
+        reconcile_interval,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_manager(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    control_rx: Option<mpsc::Receiver<WorkerControlCommand>>,
+    control: Option<Arc<WorkerControlService>>,
+    metrics: Option<Arc<crate::server::metrics::MetricsRegistry>>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
+    introspector: Arc<WorkerIntrospector>,
+    reconcile_interval: Duration,
+) {
+    let mut discovery_rx = Some(rx);
+    let mut control_rx = control_rx;
     // In-flight registrations, keyed by worker id. Subsequent
     // `Removed` / `ModeChanged` events (and reconcile passes) for the
     // same id `await` the handle so they observe the registry write the
@@ -207,7 +274,7 @@ pub async fn run_with_introspector_and_reconcile(
     // its own slot; slots are reaped by the `retain(!is_finished())`
     // sweeps below, or drained by a `Removed` / `Added` / reconcile for
     // the same id.
-    let mut pending: HashMap<WorkerId, JoinHandle<()>> = HashMap::new();
+    let mut pending: HashMap<WorkerId, PendingRegistration> = HashMap::new();
 
     // Periodic reconcile. `interval_at` delays the first tick by one
     // interval (no point scanning an empty registry at t=0); `Skip` means
@@ -221,20 +288,41 @@ pub async fn run_with_introspector_and_reconcile(
     let mut reconcile = ticker(reconcile_interval);
     let mut port_retry = ticker(reconcile_interval.min(BOOTSTRAP_PORT_RETRY_INTERVAL));
 
-    loop {
+    while discovery_rx.is_some() || control_rx.is_some() {
         tokio::select! {
-            maybe_event = rx.recv() => {
+            maybe_event = receive_optional(&mut discovery_rx) => {
                 let Some(event) = maybe_event else {
-                    break;
+                    discovery_rx = None;
+                    continue;
                 };
                 // Opportunistically reap handles whose tasks have already
                 // completed so the map doesn't grow without bound under
                 // steady-state churn. O(map.len()) per event, but the map
                 // only holds in-flight registrations (typically << total
                 // workers).
-                pending.retain(|_, h| !h.is_finished());
+                pending.retain(|_, registration| !registration.handle.is_finished());
                 handle_discovery_event(
                     event,
+                    &control,
+                    &registry,
+                    &cfg,
+                    &kv_index,
+                    &router_inflight_load,
+                    &introspector,
+                    &mut pending,
+                )
+                .await;
+            }
+            maybe_command = receive_optional(&mut control_rx) => {
+                let Some(command) = maybe_command else {
+                    control_rx = None;
+                    continue;
+                };
+                pending.retain(|_, registration| !registration.handle.is_finished());
+                handle_control_command(
+                    command,
+                    control.as_ref().expect("control receiver requires service"),
+                    &metrics,
                     &registry,
                     &cfg,
                     &kv_index,
@@ -245,7 +333,7 @@ pub async fn run_with_introspector_and_reconcile(
                 .await;
             }
             _ = reconcile.tick() => {
-                pending.retain(|_, h| !h.is_finished());
+                pending.retain(|_, registration| !registration.handle.is_finished());
                 reconcile_unresolved_workers(
                     &registry,
                     &cfg,
@@ -256,7 +344,7 @@ pub async fn run_with_introspector_and_reconcile(
                 );
             }
             _ = port_retry.tick() => {
-                pending.retain(|_, h| !h.is_finished());
+                pending.retain(|_, registration| !registration.handle.is_finished());
                 reconcile_unresolved_workers(
                     &registry,
                     &cfg,
@@ -272,8 +360,113 @@ pub async fn run_with_introspector_and_reconcile(
     // Drain any still-running registration tasks so callers `await`ing
     // the manager handle (tests, shutdown paths) see all registry
     // mutations land before the future resolves.
-    for (_, h) in pending.drain() {
-        let _ = h.await;
+    for (_, registration) in pending.drain() {
+        let _ = registration.handle.await;
+    }
+}
+
+async fn receive_optional<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_control_command(
+    command: WorkerControlCommand,
+    control: &Arc<WorkerControlService>,
+    metrics: &Option<Arc<crate::server::metrics::MetricsRegistry>>,
+    registry: &Arc<WorkerRegistry>,
+    cfg: &Option<Arc<Config>>,
+    kv_index: &Option<Arc<KvEventIndex>>,
+    router_inflight_load: &Option<Arc<RouterInflightLoadRegistry>>,
+    introspector: &Arc<WorkerIntrospector>,
+    pending: &mut HashMap<WorkerId, PendingRegistration>,
+) {
+    let worker_id = command.worker_id();
+    let kind = command.action.kind();
+    let submitted_at = command.submitted_at;
+    if let Some(previous) = pending.remove(&worker_id) {
+        let _ = previous.handle.await;
+    }
+    control.mark_processing(&command.operation_id);
+
+    match command.action {
+        WorkerControlAction::Create(spec) | WorkerControlAction::Replace { spec } => {
+            let conflicting: Vec<_> = pending
+                .iter()
+                .filter(|(_, registration)| worker_urls_equal(&registration.url, &spec.url))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in conflicting {
+                if let Some(registration) = pending.remove(&id) {
+                    let _ = registration.handle.await;
+                }
+            }
+            if registry
+                .all()
+                .iter()
+                .any(|worker| worker.id != spec.id && worker_urls_equal(&worker.url, &spec.url))
+            {
+                control.mark_failed(
+                    &command.operation_id,
+                    format!("worker URL {} is already registered", spec.url),
+                );
+                record_control_metric(metrics, kind, false, submitted_at);
+                return;
+            }
+            let registry = Arc::clone(registry);
+            let cfg = cfg.clone();
+            let kv_index = kv_index.clone();
+            let introspector = Arc::clone(introspector);
+            let control = Arc::clone(control);
+            let metrics = metrics.clone();
+            let operation_id = command.operation_id;
+            let pending_url = spec.url.clone();
+            let task = tokio::spawn(async move {
+                match register_one(spec, registry, cfg, kv_index, introspector).await {
+                    Ok(()) => {
+                        control.mark_succeeded(&operation_id);
+                        record_control_metric(&metrics, kind, true, submitted_at);
+                    }
+                    Err(error) => {
+                        control.mark_failed(&operation_id, error.to_string());
+                        record_control_metric(&metrics, kind, false, submitted_at);
+                    }
+                }
+            });
+            pending.insert(
+                worker_id,
+                PendingRegistration {
+                    url: pending_url,
+                    handle: task,
+                },
+            );
+        }
+        WorkerControlAction::Remove { .. } => {
+            remove_worker(
+                &worker_id,
+                registry,
+                kv_index,
+                router_inflight_load,
+                "control",
+            )
+            .await;
+            control.mark_succeeded(&command.operation_id);
+            record_control_metric(metrics, kind, true, submitted_at);
+        }
+    }
+}
+
+fn record_control_metric(
+    metrics: &Option<Arc<crate::server::metrics::MetricsRegistry>>,
+    kind: crate::workers::control::WorkerControlKind,
+    succeeded: bool,
+    submitted_at: std::time::Instant,
+) {
+    if let Some(metrics) = metrics {
+        metrics.record_worker_control(kind, succeeded, submitted_at.elapsed());
     }
 }
 
@@ -283,14 +476,16 @@ pub async fn run_with_introspector_and_reconcile(
 /// `tokio::select!`. See the concurrency-model doc on
 /// [`run_with_introspector_and_reconcile`] for the per-id ordering
 /// contract `pending` enforces.
+#[allow(clippy::too_many_arguments)]
 async fn handle_discovery_event(
     event: DiscoveryEvent,
+    control: &Option<Arc<WorkerControlService>>,
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
     router_inflight_load: &Option<Arc<RouterInflightLoadRegistry>>,
     introspector: &Arc<WorkerIntrospector>,
-    pending: &mut HashMap<WorkerId, JoinHandle<()>>,
+    pending: &mut HashMap<WorkerId, PendingRegistration>,
 ) {
     match event {
         DiscoveryEvent::Added(spec) => {
@@ -301,16 +496,34 @@ async fn handle_discovery_event(
             // pre-state (and so the new spawn doesn't race with the
             // old).
             if let Some(prev) = pending.remove(&id) {
-                let _ = prev.await;
+                let _ = prev.handle.await;
+            }
+            if control
+                .as_ref()
+                .is_some_and(|control| control.has_managed_url(&spec.url))
+            {
+                tracing::warn!(
+                    worker_id = %spec.id,
+                    worker_url = %spec.url,
+                    "discovery ignored an API-managed worker URL",
+                );
+                return;
             }
             let registry_t = registry.clone();
             let cfg_t = cfg.clone();
             let kv_index_t = kv_index.clone();
             let introspector_t = introspector.clone();
+            let pending_url = spec.url.clone();
             let handle = tokio::spawn(async move {
-                register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+                let _ = register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
             });
-            pending.insert(id, handle);
+            pending.insert(
+                id,
+                PendingRegistration {
+                    url: pending_url,
+                    handle,
+                },
+            );
         }
         DiscoveryEvent::Removed { id } => {
             tracing::info!("discovery: -worker {id}");
@@ -319,45 +532,13 @@ async fn handle_discovery_event(
                 // finish its registry write so the Removed observes (and
                 // clears) it — this is what prevents a mid-reconcile
                 // worker from being resurrected after it genuinely left.
-                let _ = prev.await;
+                let _ = prev.handle.await;
             }
-            // Look up the URL before dropping the entry so the
-            // KV-event index can clear its per-(url, dp_rank) state.
-            let worker_url = registry.get(&id).map(|w| w.url.clone());
-            registry.remove(&id);
-            match (kv_index, worker_url) {
-                (Some(idx), Some(url)) => {
-                    idx.remove_worker(&url).await;
-                }
-                (Some(_), None) => {
-                    // Registry didn't know this worker but kv-events
-                    // is enabled — duplicate Removed or out-of-order
-                    // event. KvEventIndex state for this id (if any)
-                    // leaks until process shutdown; log so it's
-                    // detectable.
-                    tracing::warn!(
-                        id = %id,
-                        "discovery: Removed without a known URL; kv-events state (if any) not cleared",
-                    );
-                }
-                (None, _) => {}
-            }
-            // Drop the active-load per-worker counters slot.
-            // Idempotent on the registry side, so we call it
-            // unconditionally — a Removed for an unknown worker
-            // (duplicate event) is a no-op. In-flight guards
-            // pointing at this id are NOT invalidated; their drop
-            // still removes the per-request entry cleanly, but the
-            // per-worker counters slot will not be re-created
-            // (selectors no longer see the worker, so no new
-            // requests can register against it).
-            if let Some(al) = router_inflight_load {
-                al.forget_worker(&id);
-            }
+            remove_worker(&id, registry, kv_index, router_inflight_load, "discovery").await;
         }
         DiscoveryEvent::ServicesChanged { id, services } => {
             if let Some(prev) = pending.remove(&id) {
-                let _ = prev.await;
+                let _ = prev.handle.await;
             }
             if let Some(worker) = registry.get(&id) {
                 worker.set_services(services);
@@ -367,7 +548,7 @@ async fn handle_discovery_event(
             if let Some(prev) = pending.remove(&id) {
                 // Same rationale as Removed: wait for the registry
                 // write so the mode flip lands on the new entry.
-                let _ = prev.await;
+                let _ = prev.handle.await;
             }
             // Mutate mode in place — preserves active_requests counter
             // (in-flight LoadGuards stay valid) and CircuitBreaker state
@@ -426,7 +607,7 @@ fn reconcile_unresolved_workers(
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
     introspector: &Arc<WorkerIntrospector>,
-    pending: &mut HashMap<WorkerId, JoinHandle<()>>,
+    pending: &mut HashMap<WorkerId, PendingRegistration>,
     unresolved: impl Fn(&Worker) -> bool,
 ) {
     for worker in registry.all() {
@@ -467,9 +648,15 @@ fn reconcile_unresolved_workers(
         let kv_index_t = kv_index.clone();
         // The upsert keeps the live load and breaker state of a routable worker.
         let handle = tokio::spawn(async move {
-            register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+            let _ = register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
         });
-        pending.insert(id, handle);
+        pending.insert(
+            id,
+            PendingRegistration {
+                url: worker_url,
+                handle,
+            },
+        );
     }
 }
 
@@ -523,13 +710,21 @@ fn log_protocol_resolution(worker_url: &str, enable_http2: Option<bool>, clearte
 /// step is logged inside the call chain; we still register the worker
 /// with empty `model_ids` so the rest of the proxy plane treats it as
 /// reachable.
+#[derive(Debug, thiserror::Error)]
+enum RegisterWorkerError {
+    #[error("prefill worker is incompatible with --decode-dispatch-limit")]
+    DecodeDispatchIncompatible,
+    #[error(transparent)]
+    Registry(#[from] crate::workers::registry::AddWorkerError),
+}
+
 async fn register_one(
     mut spec: WorkerSpec,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     introspector: Arc<WorkerIntrospector>,
-) {
+) -> Result<(), RegisterWorkerError> {
     let worker_url = spec.url.clone();
     let info = introspector.fetch(&worker_url).await;
     if let Some(name) = info.served_model_name {
@@ -584,7 +779,7 @@ async fn register_one(
                      needs prefill engines with --optimistic-prefill-attempts above 0 or \
                      --disaggregation-decode-allocation-policy prefill_complete",
                 );
-                return;
+                return Err(RegisterWorkerError::DecodeDispatchIncompatible);
             }
             None => tracing::warn!(
                 worker_url = %worker_url,
@@ -622,7 +817,7 @@ async fn register_one(
             error = %e,
             "worker manager: refused to register worker due to mixed PD/plain configuration",
         );
-        return;
+        return Err(e.into());
     }
     // After the insert, so the log describes a worker that is actually taking
     // traffic — a spec refused above never reaches the wire at all.
@@ -639,6 +834,30 @@ async fn register_one(
         // Pass the pre-resolved EventConfig so the KvEventIndex does
         // not issue a second `/server_info` round-trip.
         idx.add_worker(&worker_url, info.event_config).await;
+    }
+    Ok(())
+}
+
+async fn remove_worker(
+    id: &WorkerId,
+    registry: &Arc<WorkerRegistry>,
+    kv_index: &Option<Arc<KvEventIndex>>,
+    router_inflight_load: &Option<Arc<RouterInflightLoadRegistry>>,
+    source: &'static str,
+) {
+    let worker_url = registry.get(id).map(|worker| worker.url.clone());
+    registry.remove(id);
+    match (kv_index, worker_url) {
+        (Some(index), Some(url)) => index.remove_worker(&url).await,
+        (Some(_), None) => tracing::warn!(
+            %source,
+            %id,
+            "worker removal had no known URL; KV-event state could not be cleared",
+        ),
+        (None, _) => {}
+    }
+    if let Some(load) = router_inflight_load {
+        load.forget_worker(id);
     }
 }
 

@@ -28,6 +28,8 @@ enum ErrorClass {
     BadRequest,
     /// 404 — requested model / resource not found.
     NotFound,
+    /// 409 — request conflicts with current resource state.
+    Conflict,
     /// 502 — a selected worker failed to return a usable response (unreachable,
     /// or started a response then dropped the body).
     Upstream,
@@ -46,6 +48,7 @@ impl ErrorClass {
         match self {
             ErrorClass::BadRequest => StatusCode::BAD_REQUEST,
             ErrorClass::NotFound => StatusCode::NOT_FOUND,
+            ErrorClass::Conflict => StatusCode::CONFLICT,
             ErrorClass::Upstream => StatusCode::BAD_GATEWAY,
             ErrorClass::NoTarget => StatusCode::SERVICE_UNAVAILABLE,
             ErrorClass::Timeout => StatusCode::GATEWAY_TIMEOUT,
@@ -76,6 +79,9 @@ pub enum ApiError {
 
     #[error("model not found: {0}")]
     ModelNotFound(String),
+
+    #[error(transparent)]
+    WorkerControl(#[from] crate::workers::control::WorkerControlError),
 
     /// A request refused by the fleet-wide sampling contract
     /// (`--override-sampling-params` under `--sampling-param-conflict
@@ -187,7 +193,7 @@ pub enum ApiError {
     },
 
     /// An sgl-model-gateway endpoint this router does not provide yet
-    /// (`/v1/responses`, `/workers`, ...); `path` is the request path.
+    /// (`/v1/responses`, `/v1/tokenizers`, ...); `path` is the request path.
     #[error("{path} is not supported by sgl-router yet")]
     UnsupportedEndpoint { path: String },
 
@@ -210,6 +216,18 @@ impl ApiError {
             ApiError::BadRequest(_) => ErrorClass::BadRequest,
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
+            ApiError::WorkerControl(error) => match error {
+                crate::workers::control::WorkerControlError::Invalid(_)
+                | crate::workers::control::WorkerControlError::MissingRevision
+                | crate::workers::control::WorkerControlError::InvalidRevision => {
+                    ErrorClass::BadRequest
+                }
+                crate::workers::control::WorkerControlError::NotFound(_) => ErrorClass::NotFound,
+                crate::workers::control::WorkerControlError::Conflict { .. } => {
+                    ErrorClass::Conflict
+                }
+                crate::workers::control::WorkerControlError::Unavailable => ErrorClass::NoTarget,
+            },
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
             ApiError::UpstreamStatus { .. } | ApiError::PrefillFailed { .. } => {
                 ErrorClass::Upstream
@@ -241,6 +259,7 @@ impl ApiError {
             // contract rejections separately from malformed client requests.
             ApiError::SamplingContract { .. } => "sampling_contract_violation",
             ApiError::ModelNotFound(_) => "model_not_found",
+            ApiError::WorkerControl(error) => error.code(),
             ApiError::UpstreamUnreachable { .. } => "upstream_unreachable",
             // Mid-body drop: headers (incl. a status) arrived, then the body
             // didn't. We surface a 502 but echo the worker's status in
@@ -286,6 +305,7 @@ impl ApiError {
             | ApiError::UnsupportedEndpoint { .. }
             | ApiError::UpstreamGrpc(_)
             | ApiError::Internal(_) => None,
+            ApiError::WorkerControl(_) => None,
         }
     }
 
@@ -350,6 +370,7 @@ impl ApiError {
         let code = match self.class() {
             ErrorClass::BadRequest => Code::InvalidArgument,
             ErrorClass::NotFound => Code::NotFound,
+            ErrorClass::Conflict => Code::FailedPrecondition,
             ErrorClass::Upstream | ErrorClass::NoTarget => Code::Unavailable,
             ErrorClass::Timeout => Code::DeadlineExceeded,
             ErrorClass::NotImplemented => Code::Unimplemented,
@@ -435,7 +456,8 @@ impl ApiError {
             ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
             | ApiError::SamplingContract { .. }
-            | ApiError::UnsupportedEndpoint { .. } => self.to_string(),
+            | ApiError::UnsupportedEndpoint { .. }
+            | ApiError::WorkerControl(_) => self.to_string(),
             ApiError::UpstreamGrpc(status) => status.message().to_string(),
         }
     }
