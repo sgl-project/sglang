@@ -98,6 +98,7 @@ on:
         default: false
 
 env:
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ github.event_name != 'pull_request' || inputs.continue_on_error }}
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
@@ -113,6 +114,7 @@ concurrency:
 
 permissions:
   actions: write
+  checks: read
   contents: read
   issues: read
   pull-requests: read
@@ -146,6 +148,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
@@ -184,6 +191,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -219,6 +231,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -248,6 +265,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm

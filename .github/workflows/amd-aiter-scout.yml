@@ -24,6 +24,7 @@ on:
 
 permissions:
   actions: write
+  checks: read
   contents: read
   issues: read
   pull-requests: read

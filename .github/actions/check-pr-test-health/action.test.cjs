@@ -14,7 +14,7 @@ const run = new (Object.getPrototypeOf(async function () {}).constructor)(
 
 async function check({
   snapshot = [], live = [], lint = 'success', event = 'pull_request',
-  failedJobNames = ['model-test'], jobs, independentTestJobPrefix = '',
+  failedJobNames = ['model-test'], jobs, independentTestJobPrefix = '', skipHealthCheck = 'false',
 } = {}) {
   const failures = [];
   let labelReads = 0;
@@ -50,7 +50,8 @@ async function check({
       ? { pull_request: { number: 42, head: { sha: 'head' }, labels: labels(snapshot) } }
       : {},
   }, { info: () => {}, setFailed: message => failures.push(message) },
-     { env: { GITHUB_WORKSPACE: WORKSPACE, INDEPENDENT_TEST_JOB_PREFIX: independentTestJobPrefix } }, require);
+     { env: { GITHUB_WORKSPACE: WORKSPACE, INDEPENDENT_TEST_JOB_PREFIX: independentTestJobPrefix,
+       SKIP_PR_TEST_HEALTH_CHECK: skipHealthCheck } }, require);
   return { failures, labelReads, jobReads };
 }
 
@@ -191,3 +192,110 @@ test('the generic action still blocks real roots behind a coverage summary', asy
   assert.match(result.failures[0], /diffusion-1-gpu-5090/);
   assert.doesNotMatch(result.failures[0], /coverage-check/);
 });
+
+const nondeterministicPrefix = 'stage-b-test-1-gpu-small-amd-nondeterministic (';
+const nondeterministicJobName = `${nondeterministicPrefix}rocm10, linux-mi300-1gpu-sglang)`;
+
+test('AMD nondeterministic test failures do not stop other AMD lanes', async () => {
+  const result = await check({ independentTestJobPrefix: nondeterministicPrefix,
+    failedJobNames: [nondeterministicJobName] });
+  assert.deepEqual(result.failures, []);
+});
+
+test('the AMD exemption does not change other callers', async () => {
+  const result = await check({ failedJobNames: [nondeterministicJobName] });
+  assert.deepEqual(result.failures,
+    [`Fail-fast: skipping — root cause job(s): ${nondeterministicJobName}`]);
+});
+
+test('the AMD exemption does not include similarly named suites', async () => {
+  const name = 'stage-b-test-1-gpu-small-amd-nondeterministic-extra (rocm10)';
+  const result = await check({ independentTestJobPrefix: nondeterministicPrefix,
+    failedJobNames: [name] });
+  assert.deepEqual(result.failures, [`Fail-fast: skipping — root cause job(s): ${name}`]);
+});
+
+test('AMD nondeterministic setup failures still stop other lanes', async () => {
+  const result = await check({ independentTestJobPrefix: nondeterministicPrefix,
+    jobs: [failed(nondeterministicJobName, 'Install dependencies')] });
+  assert.deepEqual(result.failures,
+    [`Fail-fast: skipping — root cause job(s): ${nondeterministicJobName}`]);
+});
+
+test('an AMD nondeterministic failure does not hide a deterministic failure', async () => {
+  const name = 'stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 0)';
+  const result = await check({ independentTestJobPrefix: nondeterministicPrefix,
+    failedJobNames: [nondeterministicJobName, name] });
+  assert.deepEqual(result.failures, [`Fail-fast: skipping — root cause job(s): ${name}`]);
+});
+
+test('the AMD exemption never hides lint failure', async () => {
+  const result = await check({ independentTestJobPrefix: nondeterministicPrefix, lint: 'failure' });
+  assert.deepEqual(result.failures, ['Fail-fast: lint check failed']);
+});
+
+for (const name of ['pr-test-amd-finish', 'pr-test-amd-extra-finish',
+  'call-pr-test-amd-extra / pr-test-amd-extra-finish']) {
+  test(`AMD finish summaries do not block producer retries: ${name}`, async () => {
+    const result = await check({ failedJobNames: [name] });
+    assert.deepEqual(result.failures, []);
+  });
+}
+
+for (const [waitName, producerName] of [
+  ['wait-for-stage-a-amd', 'stage-a-test-1-gpu-small-amd (rocm10)'],
+  ['wait-for-stage-b-amd', 'stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 0)'],
+]) {
+  test(`AMD health-only wait cascades do not block producer retries: ${waitName}`, async () => {
+    const result = await check({ jobs: [
+      failed(waitName, 'Run ./.github/actions/wait-for-jobs'),
+      failed(producerName, 'Check PR test health'),
+    ] });
+    assert.deepEqual(result.failures, []);
+  });
+
+  test(`a real AMD failure remains visible with its wait summary: ${waitName}`, async () => {
+    const result = await check({ jobs: [
+      failed(waitName, 'Run ./.github/actions/wait-for-jobs'),
+      failed(producerName, 'Run test'),
+    ] });
+    assert.deepEqual(result.failures,
+      [`Fail-fast: skipping — root cause job(s): ${waitName}, ${producerName}`]);
+  });
+
+  test(`a standalone AMD wait failure remains a root: ${waitName}`, async () => {
+    const result = await check({ jobs: [failed(waitName, 'Run ./.github/actions/wait-for-jobs')] });
+    assert.deepEqual(result.failures, [`Fail-fast: skipping — root cause job(s): ${waitName}`]);
+  });
+}
+
+for (const event of ['pull_request', 'schedule', 'workflow_dispatch']) {
+  test(`explicit diagnostic mode bypasses lint and sibling checks: ${event}`, async () => {
+    const result = await check({ event, lint: 'failure', skipHealthCheck: 'true' });
+    assert.deepEqual(result, { failures: [], labelReads: 0, jobReads: 0 });
+  });
+}
+
+for (const filename of ['pr-test-amd.yml', 'pr-test-amd-extra.yml']) {
+  test(`every AMD GPU job checks health immediately after checkout: ${filename}`, () => {
+    const workflow = fs.readFileSync(path.join(WORKSPACE, '.github', 'workflows', filename), 'utf8');
+    const jobs = workflow.split(/(?=^  [a-z][a-z0-9-]*:\n)/m);
+    const gpuJobs = jobs.filter(job => /^    runs-on: (?!ubuntu-latest)/m.test(job));
+    assert.ok(gpuJobs.length > 0);
+    for (const job of gpuJobs) {
+      const name = job.split('\n')[0].trim();
+      const steps = job.split(/(?=^      - )/m).filter(step => /^      - /.test(step));
+      const checkoutIndex = steps.findIndex(step => step.includes('uses: actions/checkout@'));
+      assert.ok(checkoutIndex >= 0, name);
+      assert.match(steps[checkoutIndex + 1], /uses: \.\/\.github\/actions\/check-pr-test-health/, name);
+      assert.equal(steps.filter(step => step.includes('uses: ./.github/actions/check-pr-test-health')).length, 1, name);
+      assert.match(steps[checkoutIndex + 1], /independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic \("/, name);
+      assert.doesNotMatch(steps[checkoutIndex + 1], /persist-credentials:/, name);
+    }
+    assert.match(workflow, /^  checks: read$/m);
+    assert.match(workflow, /^  SKIP_PR_TEST_HEALTH_CHECK: .*github.event_name != 'pull_request'.*inputs.continue_on_error/m);
+    if (filename === 'pr-test-amd.yml') {
+      assert.match(workflow, /^  SKIP_PR_TEST_HEALTH_CHECK: .*inputs.run_all_tests/m);
+    }
+  });
+}

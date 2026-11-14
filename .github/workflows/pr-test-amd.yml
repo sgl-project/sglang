@@ -141,11 +141,13 @@ on:
 # validation ("requesting actions: write... but only allowed ...none").
 permissions:
   actions: write
+  checks: read
   contents: read
   issues: read
   pull-requests: read
 
 env:
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ github.event_name != 'pull_request' || inputs.run_all_tests || inputs.continue_on_error }}
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
@@ -316,6 +318,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -378,6 +385,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -423,6 +435,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -464,6 +481,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -504,6 +526,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
@@ -575,6 +602,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -614,6 +646,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
@@ -667,6 +704,11 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
           # The Spur runners keep their work directory on shared storage.
           persist-credentials: ${{ matrix.runner != 'linux-sglang-mi35x-spur' }}
+
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         if: matrix.runner != 'linux-sglang-mi35x-spur'
@@ -742,6 +784,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -784,6 +831,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -825,6 +877,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
@@ -980,6 +1037,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
@@ -1150,6 +1212,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -1211,6 +1278,11 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
@@ -1265,6 +1337,11 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
           # The Spur runners keep their work directory on shared storage.
           persist-credentials: ${{ matrix.runner != 'linux-sglang-mi35x-spur' }}
+
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         if: matrix.runner != 'linux-sglang-mi35x-spur'
@@ -1343,6 +1420,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Check PR test health
+        uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: "stage-b-test-1-gpu-small-amd-nondeterministic ("
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
