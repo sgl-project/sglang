@@ -6,8 +6,9 @@
 //! encoded on an earlier turn. The encoder keeps recent prompts with their ids
 //! and byte offsets. A new prompt reuses the ids of the stored prompt it shares
 //! the longest prefix with, up to the last cut inside that prefix, and encodes
-//! only the text after the cut. A cut is a space whose left neighbour is not a
-//! space; no vocabulary entry spans one except the few `crossing` entries, whose
+//! only the text after the cut. A cut is a space whose left neighbour is neither
+//! a space nor a literal `"▁"` (the two are the same after normalization); no
+//! vocabulary entry spans one except the few `crossing` entries, whose
 //! occurrences are never cut, so both sides encode independently and the joined
 //! ids equal a whole-prompt encode.
 
@@ -18,24 +19,13 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-/// Prefix lengths a prompt is indexed under, doubling from 1 KiB to 1 MiB. A
-/// lookup starts at the longest level the prompt reaches, so prompts sharing a
-/// long system prompt but not their history land in separate buckets once a
-/// level passes the shared part. Doubling keeps a level within 2x of any shared
-/// length; the range is arbitrary.
-const LEVELS: [usize; 11] = [
-    1 << 10,
-    1 << 11,
-    1 << 12,
-    1 << 13,
-    1 << 14,
-    1 << 15,
-    1 << 16,
-    1 << 17,
-    1 << 18,
-    1 << 19,
-    1 << 20,
-];
+/// Prompts are indexed by hashes of their prefix at multiples of this many bytes:
+/// at the powers of two, which prompts sharing a system prompt reach together, and
+/// at the last multiple a prompt reaches, which is usually its session's alone. A
+/// lookup probes every multiple from the top down. Arbitrary granularity.
+const LEVEL_BYTES: usize = 1 << 10;
+/// Prefixes longer than this are not hashed further; arbitrary.
+const MAX_LEVEL_BYTES: usize = 1 << 20;
 /// Most recent prompts kept per bucket; bounds the prefix compares of a lookup.
 const BUCKET_CAP: usize = 8;
 /// Shorter prompts are cheap to encode whole and are never stored.
@@ -47,53 +37,68 @@ const REPLACE_SLACK_BYTES: usize = 256;
 const MAX_CROSSING_PATTERNS: usize = 64;
 const SPACE_MARK: char = '\u{2581}';
 
-/// A vocabulary entry whose `"▁"` follows a non-space, as raw text: a cut at the
-/// space `space_at` bytes into an occurrence of `raw` would split that token.
+/// A vocabulary entry with a `"▁"` after a non-space, split at that `"▁"` into the
+/// raw text before and after it (`"▁"` written as a space): a cut at a space with
+/// `left` just before it and `right` just after it would split that token.
 struct CrossingPattern {
-    raw: Vec<u8>,
-    space_at: usize,
+    left: Vec<u8>,
+    right: Vec<u8>,
 }
 
 /// Where a prompt may be cut so that encoding the two sides apart gives its ids.
 struct Cutter {
     crossing: Vec<CrossingPattern>,
-    /// Bytes a cut needs on each side inside the shared prefix to rule out `crossing`.
-    left_context: usize,
-    right_context: usize,
 }
 
 impl Cutter {
-    fn new(crossing: Vec<CrossingPattern>) -> Self {
-        let left_context = crossing.iter().map(|p| p.space_at).max().unwrap_or(0);
-        let right_context = crossing
-            .iter()
-            .map(|p| p.raw.len() - p.space_at)
-            .max()
-            .unwrap_or(1);
-        Self {
-            crossing,
-            left_context,
-            right_context,
-        }
-    }
-
     /// The last cut before `prefix_len`, or 0 when there is none.
     fn cut_point(&self, text: &[u8], prefix_len: usize) -> usize {
-        let hi = prefix_len.saturating_sub(self.right_context);
-        (self.left_context.max(1)..hi)
+        (1..prefix_len)
             .rev()
-            .find(|&p| text[p] == b' ' && text[p - 1] != b' ' && !self.crosses(text, p))
+            .find(|&p| {
+                text[p] == b' ' && !ends_with_normalized(text, p, b" ") && !self.crosses(text, p)
+            })
             .unwrap_or(0)
     }
 
     fn crosses(&self, text: &[u8], p: usize) -> bool {
         self.crossing.iter().any(|c| {
-            p >= c.space_at
-                && text
-                    .get(p - c.space_at..p - c.space_at + c.raw.len())
-                    .is_some_and(|window| window == c.raw.as_slice())
+            ends_with_normalized(text, p, &c.left) && starts_with_normalized(text, p + 1, &c.right)
         })
     }
+}
+
+/// UTF-8 of `SPACE_MARK`, which a literal `"▁"` in the input encodes to.
+const SPACE_MARK_UTF8: &[u8] = "\u{2581}".as_bytes();
+
+/// Whether `text[..end]` ends with `pattern` after normalization: a space in
+/// `pattern` also matches a literal `"▁"`.
+fn ends_with_normalized(text: &[u8], mut end: usize, pattern: &[u8]) -> bool {
+    for &byte in pattern.iter().rev() {
+        if byte == b' ' && text[..end].ends_with(SPACE_MARK_UTF8) {
+            end -= SPACE_MARK_UTF8.len();
+        } else if end > 0 && text[end - 1] == byte {
+            end -= 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `text[start..]` starts with `pattern` after normalization.
+fn starts_with_normalized(text: &[u8], mut start: usize, pattern: &[u8]) -> bool {
+    for &byte in pattern {
+        let rest = text.get(start..).unwrap_or_default();
+        if byte == b' ' && rest.starts_with(SPACE_MARK_UTF8) {
+            start += SPACE_MARK_UTF8.len();
+        } else if rest.first() == Some(&byte) {
+            start += 1;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 /// Ids with the byte span of each in the encoded text.
@@ -170,7 +175,9 @@ impl IncrementalEncoder {
             .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))?;
         Ok(Self {
             tokenizer,
-            cutter: Cutter::new(admission(&spec)?),
+            cutter: Cutter {
+                crossing: admission(&spec)?,
+            },
             budget_bytes,
             store: Mutex::new(Store::default()),
         })
@@ -181,9 +188,9 @@ impl IncrementalEncoder {
             let encoding = self.tokenizer.encode(text).map_err(|e| e.to_string())?;
             return Ok(encoding.token_ids().to_vec());
         }
-        let keys = level_keys(text);
+        let probes = prefix_keys(text);
         let reuse = self
-            .candidates(&keys)
+            .candidates(&probes)
             .into_iter()
             .map(|(id, entry)| {
                 let shared = common_prefix_len(entry.text.as_bytes(), text.as_bytes());
@@ -222,6 +229,13 @@ impl IncrementalEncoder {
             text: text.to_string(),
             tokens,
         };
+        let top = probes.len() - 1;
+        let keys = probes
+            .into_iter()
+            .enumerate()
+            .filter(|&(i, (level, _))| level.is_power_of_two() || i == top)
+            .map(|(_, key)| key)
+            .collect();
         self.insert(keys, entry, reused);
         Ok(ids)
     }
@@ -244,10 +258,11 @@ impl IncrementalEncoder {
         })
     }
 
-    /// The deepest non-empty bucket's prompts.
-    fn candidates(&self, keys: &[(usize, u64)]) -> Vec<(u64, Arc<Entry>)> {
+    /// The prompts of the deepest non-empty bucket among `probes`.
+    fn candidates(&self, probes: &[(usize, u64)]) -> Vec<(u64, Arc<Entry>)> {
         let store = self.store.lock().unwrap();
-        keys.iter()
+        probes
+            .iter()
             .rev()
             .find_map(|key| store.buckets.get(key))
             .map(|bucket| {
@@ -321,18 +336,19 @@ impl IncrementalEncoder {
     }
 }
 
-/// One key per level the text reaches, from a single hashing pass.
-fn level_keys(text: &str) -> Vec<(usize, u64)> {
-    let bytes = text.as_bytes();
+/// (level, hash of the first `level` bytes) for every multiple of `LEVEL_BYTES` the
+/// text reaches, from a single hashing pass.
+fn prefix_keys(text: &str) -> Vec<(usize, u64)> {
+    let bytes = &text.as_bytes()[..text.len().min(MAX_LEVEL_BYTES)];
     let mut hasher = DefaultHasher::new();
-    let mut hashed = 0;
-    let mut keys = Vec::new();
-    for level in LEVELS.into_iter().take_while(|&level| level <= bytes.len()) {
-        hasher.write(&bytes[hashed..level]);
-        hashed = level;
-        keys.push((level, hasher.clone().finish()));
-    }
-    keys
+    bytes
+        .chunks_exact(LEVEL_BYTES)
+        .enumerate()
+        .map(|(i, chunk)| {
+            hasher.write(chunk);
+            ((i + 1) * LEVEL_BYTES, hasher.clone().finish())
+        })
+        .collect()
 }
 
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
@@ -390,13 +406,15 @@ fn admission(spec: &Value) -> Result<Vec<CrossingPattern>, String> {
         let chars: Vec<char> = token.chars().collect();
         for i in 1..chars.len() {
             if chars[i] == SPACE_MARK && chars[i - 1] != SPACE_MARK {
-                let raw: String = chars
-                    .iter()
-                    .map(|&c| if c == SPACE_MARK { ' ' } else { c })
-                    .collect();
+                let raw = |part: &[char]| -> Vec<u8> {
+                    part.iter()
+                        .map(|&c| if c == SPACE_MARK { ' ' } else { c })
+                        .collect::<String>()
+                        .into_bytes()
+                };
                 crossing.push(CrossingPattern {
-                    raw: raw.into_bytes(),
-                    space_at: chars[..i].iter().map(|c| c.len_utf8()).sum(),
+                    left: raw(&chars[..i]),
+                    right: raw(&chars[i + 1..]),
                 });
             }
         }
@@ -414,26 +432,34 @@ fn admission(spec: &Value) -> Result<Vec<CrossingPattern>, String> {
 mod tests {
     use super::*;
 
-    /// A cut never lands inside a run of spaces, where `"▁▁"` entries merge.
+    /// A cut never lands inside a run of spaces, where `"▁▁"` entries merge; a
+    /// literal `"▁"` before a space starts such a run too.
     #[test]
     fn cut_starts_a_space_run() {
-        let cutter = Cutter::new(Vec::new());
+        let cutter = Cutter {
+            crossing: Vec::new(),
+        };
         let text = b"one two   three";
         assert_eq!(cutter.cut_point(text, text.len()), 7);
         assert_eq!(cutter.cut_point(text, 7), 3);
+        let text = "one two\u{2581} three".as_bytes();
+        assert_eq!(cutter.cut_point(text, text.len()), 3);
     }
 
-    /// A cut never splits a crossing pattern, and keeps the pattern's right
-    /// context inside the shared prefix.
+    /// A cut never splits an occurrence of a crossing pattern.
     #[test]
     fn cut_avoids_crossing_patterns() {
-        let cutter = Cutter::new(vec![CrossingPattern {
-            raw: b"> </".to_vec(),
-            space_at: 1,
-        }]);
-        assert_eq!(cutter.cut_point(b"a b <i> </i>", 12), 3);
-        assert_eq!(cutter.cut_point(b"a b x </i>", 10), 5);
-        assert_eq!(cutter.cut_point(b"a b x </i>", 7), 3);
+        let cutter = Cutter {
+            crossing: vec![CrossingPattern {
+                left: b">".to_vec(),
+                right: b"</ b".to_vec(),
+            }],
+        };
+        assert_eq!(cutter.cut_point(b"a b <i> </ b>", 10), 3);
+        assert_eq!(cutter.cut_point(b"a b x </ b>", 8), 5);
+        // The pattern's inner space also matches a literal "▁".
+        let text = "a b <i> </\u{2581}b>".as_bytes();
+        assert_eq!(cutter.cut_point(text, text.len()), 3);
     }
 
     /// Gemma 4's shape is admitted with its crossing entries; a byte-level
@@ -444,10 +470,16 @@ mod tests {
         let mut crossing: Vec<_> = admission(&spec)
             .unwrap()
             .into_iter()
-            .map(|c| (c.raw, c.space_at))
+            .map(|c| (c.left, c.right))
             .collect();
         crossing.sort();
-        assert_eq!(crossing, [(b"> ".to_vec(), 1), (b"> <".to_vec(), 1)]);
+        assert_eq!(
+            crossing,
+            [
+                (b">".to_vec(), b"".to_vec()),
+                (b">".to_vec(), b"<".to_vec())
+            ]
+        );
         let mut byte_level = spec.clone();
         byte_level["pre_tokenizer"] = serde_json::json!({"type": "ByteLevel"});
         assert!(admission(&byte_level).is_err());
@@ -488,7 +520,18 @@ mod tests {
         let whole = load();
         std::fs::remove_dir_all(&dir).ok();
 
-        let words = ["ab", "ba", "a", "b", ">", "<", "a>", "<b"];
+        let words = [
+            "ab",
+            "ba",
+            "a",
+            "b",
+            ">",
+            "<",
+            "a>",
+            "<b",
+            "\u{2581}",
+            "a\u{2581}",
+        ];
         let mut seed = 7u64;
         let mut phrase = |n: usize| -> String {
             (0..n)
@@ -510,7 +553,7 @@ mod tests {
                 }
                 history.push_str(&phrase(300));
                 let prompt = format!("<bos>{system}{history}<eot>");
-                let had = encoder.candidates(&level_keys(&prompt)).len();
+                let had = encoder.candidates(&prefix_keys(&prompt)).len();
                 let ids = encoder.encode(&prompt).unwrap();
                 assert_eq!(
                     ids,
