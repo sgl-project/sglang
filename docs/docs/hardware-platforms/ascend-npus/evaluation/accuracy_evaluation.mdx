@@ -266,4 +266,41 @@ You can add `--no-check-certificate`
 wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv --no-check-certificate
 ```
 
+### EvalScope Fails with a Read-Only Model Directory
+
+When `--model` points to a local weights directory that is mounted read-only, EvalScope writes its review cache next to the model and aborts before the first request:
+
+```text
+OSError: [Errno 30] Read-only file system: '/home/weights/Qwen2.5-7B-Instruct/gsm8k_main.jsonl.rerun-<hash>'
+```
+
+Pass a logical model name instead of the weights path when the server is already running:
+
+```bash
+evalscope eval \
+  --model Qwen2.5-7B-Instruct \
+  --model-id Qwen2.5-7B-Instruct \
+  --api-url http://localhost:30000/v1 \
+  --api-key EMPTY \
+  --eval-type openai_api \
+  --datasets gsm8k
+```
+
+### GSM8K Dataset Not Found with the Default ModelScope Hub
+
+With the default `--dataset-hub modelscope`, EvalScope may download `AI-ModelScope/gsm8k` and then fail to load it:
+
+```text
+datasets.exceptions.DataFilesNotFoundError: No (supported) data files found in gsm8k
+```
+
+Switch the dataset hub to Hugging Face, and set the mirror endpoint when direct access is restricted:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+evalscope eval ... --dataset-hub huggingface
+```
+
+Both issues were observed with EvalScope 1.14.1 on Ascend A2 (910B3).
+
 For additional assistance, refer to [SGLang GitHub Issues](https://github.com/sgl-project/sglang/issues).
