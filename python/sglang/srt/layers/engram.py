@@ -63,6 +63,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
+    note_dp_gather_in_prefill_graph,
     world_dp_gather_enabled,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -1347,6 +1348,10 @@ class EngramEmbedding(nn.Module):
         )
         if sizes is None:
             return self._dp_global_buffer_lookup(indices, forward_batch)
+        # The exchange below bakes the per-rank counts into a captured prefill
+        # graph, so every DP rank must replay the same bucket. Without the latch
+        # an idle rank would run the step eagerly (other collectives) and hang.
+        note_dp_gather_in_prefill_graph()
         if sum(sizes) == 0:
             return self.new_rows(indices)
         ids = indices.new_empty((sum(sizes), *indices.shape[1:]))
