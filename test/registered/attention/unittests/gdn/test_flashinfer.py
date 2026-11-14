@@ -1,9 +1,13 @@
+import contextlib
+import functools
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
@@ -389,6 +393,133 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         )
         torch.testing.assert_close(
             flashinfer_tracked, triton_tracked, atol=3e-2, rtol=3e-2
+        )
+
+    @staticmethod
+    def _prewarm_case(
+        name, num_k_heads, num_v_heads, prefix_lens, extend_lens, track_seqlens
+    ):
+        return (
+            GDNAttentionCase(
+                name=name,
+                backend="triton",
+                linear_attn_prefill_backend="flashinfer",
+                forward_mode=ForwardMode.EXTEND,
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                page_size=16,
+                prefix_lens=prefix_lens,
+                extend_lens=extend_lens,
+            ),
+            track_seqlens,
+        )
+
+    def _assert_prewarm_leaves_nothing_to_compile(self, cases):
+        """FlashInfer compiles each GDN prefill variant on its first call, which
+        stalls serving for seconds; after the startup prewarm, no prefill of the
+        given batches, with or without tracked checkpoints, compiles."""
+        from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache
+
+        fixtures = [
+            build_gdn_attention_fixture(
+                self,
+                case,
+                head_k_dim=self.HEAD_DIM,
+                head_v_dim=self.HEAD_DIM,
+                max_context_len=320,
+                # Room for each request's slot and its tracked checkpoint's.
+                runner_batch_size=10,
+            )
+            for case, _ in cases
+        ]
+        with contextlib.ExitStack() as stack:
+            # Start from empty compile caches, as a new server process does.
+            stack.enter_context(
+                patch.dict(custom_compile_cache._in_mem_compile_cache, clear=True)
+            )
+            compiled = [lambda: len(custom_compile_cache._in_mem_compile_cache)]
+            if _sm_major == 10:
+                from flashinfer.gdn_kernels.blackwell import gdn_cp_prefill, gdn_prefill
+
+                fresh = functools.cache(gdn_prefill._get_compiled_cache.__wrapped__)
+                stack.enter_context(
+                    patch.object(gdn_prefill, "_get_compiled_cache", fresh)
+                )
+                compiled.append(lambda: fresh.cache_info().currsize)
+                # The context-parallel fixup kernels, one per specialization.
+                fixups = functools.cache(gdn_cp_prefill._get_fixup_kernel.__wrapped__)
+                stack.enter_context(
+                    patch.object(gdn_cp_prefill, "_get_fixup_kernel", fixups)
+                )
+                compiled.append(lambda: fixups.cache_info().currsize)
+            stack.enter_context(
+                get_exec().mamba.override(enable_mamba_extra_buffer=True)
+            )
+
+            linear_backend = fixtures[0].backend.linear_attn_backend
+            linear_backend.prewarm_flashinfer_extend(fixtures[0].actual_module)
+            prewarmed = [count() for count in compiled]
+            self.assertGreater(sum(prewarmed), 0)
+
+            for fixture, (case, track_seqlens) in zip(fixtures, cases):
+                run_gdn_fixture_eager(fixture)
+                self.assertEqual([count() for count in compiled], prewarmed, case.name)
+                batch = fixture.forward_batch
+                batch.mamba_track_mask = torch.ones(
+                    case.batch_size, dtype=torch.bool, device="cuda"
+                )
+                batch.mamba_track_indices = torch.arange(
+                    case.batch_size + 1,
+                    2 * case.batch_size + 1,
+                    dtype=torch.int64,
+                    device="cuda",
+                )
+                batch.mamba_track_seqlens = torch.tensor(
+                    track_seqlens, dtype=torch.int64, device="cuda"
+                )
+                run_gdn_fixture_eager(fixture)
+                metadata = fixture.backend.linear_attn_backend.forward_metadata
+                self.assertGreater(metadata.num_state_checkpoints, 0)
+                self.assertEqual([count() for count in compiled], prewarmed, case.name)
+
+    def test_prewarm_leaves_no_prefill_variant_to_compile_while_serving(self):
+        # Qwen3.5-like heads: FlashInfer runs one sequence on its
+        # context-parallel kernel and three on its native kernel, on SM90 and
+        # on SM100.
+        self._assert_prewarm_leaves_nothing_to_compile(
+            [
+                self._prewarm_case("one_sequence", 16, 32, (0,), (192,), [129]),
+                self._prewarm_case(
+                    "three_sequences",
+                    16,
+                    32,
+                    (0, 64, 128),
+                    (64, 65, 129),
+                    [64, 129, 257],
+                ),
+            ]
+        )
+
+    def test_prewarm_covers_each_context_parallel_sequence_count(self):
+        # The same model's heads per rank under tensor parallelism 4: FlashInfer
+        # keeps up to a few sequences on its context-parallel kernel, whose
+        # final-state fixup specializes on sequences times heads (on SM100 one
+        # sequence and two take different fixups).
+        self._assert_prewarm_leaves_nothing_to_compile(
+            [
+                self._prewarm_case("one_sequence", 4, 8, (0,), (192,), [129]),
+                self._prewarm_case(
+                    "two_sequences", 4, 8, (0, 64), (129, 65), [129, 129]
+                ),
+                self._prewarm_case(
+                    "four_sequences",
+                    4,
+                    8,
+                    (0, 64, 0, 128),
+                    (64, 65, 129, 129),
+                    [64, 129, 129, 257],
+                ),
+            ]
         )
 
 

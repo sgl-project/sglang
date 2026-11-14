@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -81,10 +81,31 @@ _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
 
 
+def _host_track_lens(
+    forward_batch: ForwardBatch, use_host_metadata: bool
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extend lengths, track mask and tracked lengths past the prefix, on the host;
+    read back from the device only when the batch carries no host copy."""
+    if use_host_metadata:
+        return (
+            torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int64),
+            torch.tensor(forward_batch.mamba_prefill_track_mask_cpu, dtype=torch.bool),
+            torch.tensor(forward_batch.mamba_track_seqlens_cpu, dtype=torch.int64)
+            - torch.tensor(forward_batch.extend_prefix_lens_cpu, dtype=torch.int64),
+        )
+    return (
+        forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64),
+        forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool),
+        forward_batch.mamba_track_seqlens.to(device="cpu", dtype=torch.int64)
+        - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64),
+    )
+
+
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
     device: str,
+    use_host_metadata: bool,
 ) -> None:
     """Populate packed FlashInfer checkpoint metadata when tracking requires it."""
     if (
@@ -94,11 +115,9 @@ def maybe_build_flashinfer_checkpoint_plan(
         return
 
     checkpoint_every_n_tokens = mamba_cache_chunk_size()
-    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
-    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
-    relative_track_lens = forward_batch.mamba_track_seqlens.to(
-        device="cpu", dtype=torch.int64
-    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+    extend_seq_lens, track_mask, relative_track_lens = _host_track_lens(
+        forward_batch, use_host_metadata=use_host_metadata
+    )
 
     checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
@@ -166,6 +185,46 @@ def _get_flashinfer_gdn_kernels():
         _flashinfer_gated_delta_rule_decode,
         _flashinfer_gated_delta_rule_mtp_bf16,
     )
+
+
+# Upper bound on the sequence counts the prewarm runs on the context-parallel
+# kernel; FlashInfer sends only batches of few sequences there.
+_MAX_PREWARM_CP_SEQUENCES = 64
+
+
+def _context_parallel_sequence_counts(num_heads: int, device: torch.device) -> list:
+    """The sequence counts for which FlashInfer's automatic policy
+    (``use_cp="auto"``) runs the context-parallel prefill with ``num_heads``
+    local heads on ``device``, always including one."""
+    try:
+        from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import (
+            should_use_cp_host,
+        )
+        from flashinfer.utils import (
+            get_compute_capability,
+            get_device_name,
+            get_device_sm_count,
+        )
+    except ImportError:
+        should_use_cp_host = None
+    if should_use_cp_host is None:
+        # Every automatic threshold keeps the parallel work below the SM count.
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        return list(
+            range(1, max(1, min(num_sms // num_heads, _MAX_PREWARM_CP_SEQUENCES)) + 1)
+        )
+    capability = get_compute_capability(device)
+    num_sms = get_device_sm_count(device)
+    name = get_device_name(device)
+    counts = [
+        num_seqs
+        for num_seqs in range(1, _MAX_PREWARM_CP_SEQUENCES + 1)
+        if capability[0] in (9, 10, 12)
+        and should_use_cp_host(
+            num_seqs * num_heads, num_sms, name, device_capability=capability
+        )
+    ]
+    return counts or [1]
 
 
 def is_flashinfer_gdn_prefill_available() -> bool:
@@ -542,12 +601,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
             ssm_states, cache_indices
         )
-        if not self.use_state_pool or self._prefill_needs_fp32_state:
-            initial_state_fi = initial_state_fi.to(torch.float32)
+        initial_state_fi = initial_state_fi.to(
+            self._prefill_state_dtype(initial_state_fi.dtype)
+        )
         cu_seqlens = query_start_loc.to(torch.int64)
 
         # Keep final state and checkpoints in the same kernel state dtype.
-        output_state_fi = torch.empty_like(initial_state_fi)
         state_checkpoints = (
             initial_state_fi.new_empty(
                 (num_state_checkpoints, *initial_state_fi.shape[1:])
@@ -555,19 +614,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if num_state_checkpoints > 0
             else None
         )
-        output_fi, output_state_fi = self._prefill_fn(
+        output_fi, output_state_fi = self._run_prefill(
             q=q_fi,
             k=k_fi,
             v=v_fi,
-            g=alpha_fi,
+            alpha=alpha_fi,
             beta=beta_fi,
-            scale=None,
             initial_state=initial_state_fi,
-            output_final_state=True,
             cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
             output=output_fi,
-            output_state=output_state_fi,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
@@ -582,6 +637,132 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
         h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
         return core_attn_out, None, h
+
+    def _prefill_state_dtype(self, pool_state_dtype: torch.dtype) -> torch.dtype:
+        if not self.use_state_pool or self._prefill_needs_fp32_state:
+            return torch.float32
+        return pool_state_dtype
+
+    def _run_prefill(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        output: Optional[torch.Tensor],
+        state_checkpoints: Optional[torch.Tensor],
+        checkpoint_cu_starts: Optional[torch.Tensor],
+        checkpoint_every_n_tokens: int,
+        use_cp: str | bool = "auto",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._prefill_fn(
+            q=q,
+            k=k,
+            v=v,
+            g=alpha,
+            beta=beta,
+            scale=None,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output=output,
+            output_state=torch.empty_like(initial_state),
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            use_cp=use_cp,
+        )
+
+    def prewarm_extend(
+        self,
+        *,
+        num_qk_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        io_dtype: torch.dtype,
+        pool_state_dtype: torch.dtype,
+        checkpoint_every_n_tokens: int,
+        device: torch.device,
+    ) -> int:
+        """Run extend()'s prefill once per kernel variant, outside graph capture,
+        so that no serving batch waits on FlashInfer's lazy per-process compile.
+
+        Per batch, FlashInfer runs a context-parallel or a native kernel, each
+        compiled with and without state checkpoints; the checkpoint variants
+        run only when ``checkpoint_every_n_tokens > 0``. The context-parallel
+        kernel also specializes its final-state fixup on the number of states
+        it reduces (sequences times heads), so it runs once per sequence count
+        that FlashInfer's automatic policy sends to it. Returns how many
+        prefills ran.
+        """
+        assert not torch.cuda.is_current_stream_capturing()
+        seq_len = max(checkpoint_every_n_tokens, 64)
+        state_dtype = self._prefill_state_dtype(pool_state_dtype)
+        num_runs = 0
+        cp_counts = _context_parallel_sequence_counts(
+            max(num_qk_heads, num_v_heads), device
+        )
+        # The native kernel's compile key does not depend on the sequence count.
+        for use_cp, num_seqs in [(True, n) for n in cp_counts] + [(False, 1)]:
+            total = num_seqs * seq_len
+            q = torch.zeros(
+                (total, num_qk_heads, head_k_dim), dtype=io_dtype, device=device
+            )
+            v = torch.zeros(
+                (total, num_v_heads, head_v_dim), dtype=io_dtype, device=device
+            )
+            alpha = torch.ones((total, num_v_heads), dtype=torch.float32, device=device)
+            # extend() hands the kernel a gathered, contiguous state per sequence.
+            initial_state = torch.zeros(
+                (num_seqs, num_v_heads, head_v_dim, head_k_dim),
+                dtype=state_dtype,
+                device=device,
+            )
+            cu_seqlens = torch.arange(
+                0, total + 1, seq_len, dtype=torch.int64, device=device
+            )
+            checkpoint_modes = [(0, None, None)]
+            if checkpoint_every_n_tokens > 0:
+                per_seq = seq_len // checkpoint_every_n_tokens
+                checkpoint_modes.append(
+                    (
+                        checkpoint_every_n_tokens,
+                        initial_state.new_empty(
+                            (num_seqs * per_seq, *initial_state.shape[1:])
+                        ),
+                        torch.arange(
+                            0,
+                            num_seqs * per_seq + 1,
+                            per_seq,
+                            dtype=torch.int64,
+                            device=device,
+                        ),
+                    )
+                )
+            for every_n_tokens, state_checkpoints, cu_starts in checkpoint_modes:
+                self._run_prefill(
+                    q=q,
+                    k=torch.zeros_like(q),
+                    v=v,
+                    alpha=alpha,
+                    beta=torch.zeros_like(alpha),
+                    initial_state=initial_state,
+                    cu_seqlens=cu_seqlens,
+                    output=None,
+                    state_checkpoints=state_checkpoints,
+                    checkpoint_cu_starts=cu_starts,
+                    checkpoint_every_n_tokens=every_n_tokens,
+                    use_cp=use_cp,
+                )
+                num_runs += 1
+        torch.cuda.current_stream(device).synchronize()
+        return num_runs
 
     # ---- target_verify (MTP) ----
 

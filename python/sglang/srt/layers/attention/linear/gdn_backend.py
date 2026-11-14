@@ -1,3 +1,4 @@
+import time
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -20,7 +21,11 @@ from sglang.kernels.ops.mamba.gdn_prefill_track import (
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+    MambaAttnBackendBase,
+)
 from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
     GDNPrefillGraphMetadata,
     buckets_keep_chunk_o_block_size,
@@ -675,6 +680,47 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
         )
 
+    def prewarm_flashinfer_extend(self, model: torch.nn.Module) -> None:
+        """Compile every FlashInfer prefill variant serving can reach, for the
+        model's linear-attention head geometry, before the first batch needs it."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        kernel = self.kernel_dispatcher.extend_kernel
+        if not isinstance(kernel, FlashInferGDNKernel):
+            return
+        geometries = {
+            (layer.num_q_heads, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim)
+            for layer in model.modules()
+            if isinstance(layer, RadixLinearAttention)
+        }
+        # Only prefix-cache tracking asks the extend for state checkpoints.
+        checkpoint_every_n_tokens = (
+            mamba_cache_chunk_size()
+            if get_exec().mamba.enable_mamba_extra_buffer
+            else 0
+        )
+        tic = time.perf_counter()
+        num_runs = sum(
+            kernel.prewarm_extend(
+                num_qk_heads=num_qk_heads,
+                num_v_heads=num_v_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                io_dtype=self._model_runner.dtype,
+                pool_state_dtype=self.state_pool.mamba_cache.temporal.dtype,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                device=torch.device(self.device),
+            )
+            for num_qk_heads, num_v_heads, head_k_dim, head_v_dim in geometries
+        )
+        if num_runs:
+            rank0_log(
+                f"Prewarmed FlashInfer GDN prefill with {num_runs} runs in "
+                f"{time.perf_counter() - tic:.1f} s."
+            )
+
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.
         return (
@@ -849,7 +895,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
                 maybe_build_flashinfer_checkpoint_plan(
-                    forward_batch, self.forward_metadata, self.device
+                    forward_batch,
+                    self.forward_metadata,
+                    self.device,
+                    use_host_metadata=self._has_cpu_prefill_track_metadata(
+                        forward_batch
+                    ),
                 )
         self._init_prefill_conv_block_table(forward_batch)
 
@@ -1898,3 +1949,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
+
+
+def prewarm_gdn_prefill_kernels(
+    *, attn_backend: AttentionBackend, model: torch.nn.Module
+) -> None:
+    """Prewarm the GDN extend kernel behind a runner's attention backend."""
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+    if isinstance(attn_backend, TboAttnBackend):
+        attn_backend = attn_backend.primary
+    if isinstance(attn_backend, HybridLinearAttnBackend) and isinstance(
+        attn_backend.linear_attn_backend, GDNAttnBackend
+    ):
+        attn_backend.linear_attn_backend.prewarm_flashinfer_extend(model)
