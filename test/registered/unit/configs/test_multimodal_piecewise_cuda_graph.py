@@ -166,6 +166,45 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         self.assertTrue(resolution_result(args, "is_embedding"))
 
+    def test_encoders_disable_prefix_reuse_and_split_prefill(self):
+        """Encoder embedders, cross-encoders and CLIP never reuse a cached prefix or
+        split a prompt: an encoder's K/V depend on later tokens, and CLIP's text
+        tower does not read the KV pool. Causal classifiers still may."""
+        for architecture, disabled in (
+            ("BertModel", True),
+            ("XLMRobertaModel", True),
+            ("Lfm2BidirectionalModel", True),
+            ("BertForSequenceClassification", True),
+            ("XLMRobertaForSequenceClassification", True),
+            ("CLIPModel", True),
+            ("Qwen3ForSequenceClassification", False),
+        ):
+            with self.subTest(architecture=architecture):
+                args = ServerArgs(model_path="dummy")
+                args.disable_radix_cache = False
+                args.chunked_prefill_size = 2048
+                args._model_config = SimpleNamespace(
+                    embedding_model_spec=resolve_embedding_model_spec(
+                        [architecture],
+                        is_embedding_requested=False,
+                        is_embedding_gemma=False,
+                    ),
+                    joint_head_config=None,
+                    pointer_head=None,
+                    is_multimodal=False,
+                    hf_config=SimpleNamespace(architectures=[architecture]),
+                )
+
+                handle_model_capability_adjustments(args)
+
+                self.assertEqual(
+                    resolution_result(args, "disable_radix_cache"), disabled
+                )
+                self.assertEqual(
+                    resolution_result(args, "chunked_prefill_size"),
+                    -1 if disabled else 2048,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
