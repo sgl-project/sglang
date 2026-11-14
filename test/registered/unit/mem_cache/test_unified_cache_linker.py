@@ -1149,6 +1149,21 @@ class TestUnifiedCacheLinkerPythonBackend(
         self.assertEqual(match.host_hit_length, len(tokens))
         consumer.linker.release_request(req.cache_request_handle)
 
+    def test_offload_disabled_marks_nodes_stored_without_writing(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_pool = build_fixture(cfg)
+        linker = _InMemoryUnifiedCacheLinker()
+        linker.offload_enabled = False
+        cache.init_cache_linker(linker)
+
+        inserted = self._insert(cache, allocator, req_pool, list(range(1, 9)))
+        self.assertEqual(linker.offload_calls, [])
+        self.assertEqual(cache.linker.pending_offloads, [])
+        self.assertTrue(
+            cache.tree_core.is_external_cache_stored(inserted.last_device_node)
+        )
+
     def test_failed_split_offload_retries_and_reset_releases_locks(self):
         cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg

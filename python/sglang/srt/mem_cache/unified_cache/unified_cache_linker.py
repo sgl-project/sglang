@@ -166,6 +166,7 @@ class UnifiedCacheLinker(ABC):
     pools: dict[PoolName, object]
     load_mode = "layer_wise"
     prefetch_policy = "timeout"
+    offload_enabled = True
     # None when the current stream is the only one using the pages.
     forward_stream: Optional[torch.cuda.Stream] = None
 
@@ -745,6 +746,9 @@ class UnifiedCacheLinkerWrapper:
     def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
         """Persist a write-through chain, skipping nodes already in the store."""
         for node_id in node_ids:
+            if not self.cache_linker.offload_enabled:
+                self._mark_stored_by_other_writer(node_id)
+                continue
             transfers = self.cache.tree_core.build_external_linker_offload_transfers(
                 node_id
             )
@@ -782,11 +786,7 @@ class UnifiedCacheLinkerWrapper:
             )
             if drop == len(transfer.keys):
                 if transfer.name == PoolName.KV:
-                    # The caller delegates storage of this prefix to another writer.
-                    # Mark it stored locally to suppress uploads, without a persistence ACK.
-                    self.cache.tree_core.mark_external_cache_stored_path(
-                        node_id, info.parent_id
-                    )
+                    self._mark_stored_by_other_writer(node_id)
                     return None
                 continue
             if drop:
@@ -797,6 +797,11 @@ class UnifiedCacheLinkerWrapper:
                 )
             kept.append(transfer)
         return kept
+
+    def _mark_stored_by_other_writer(self, node_id: NodeId) -> None:
+        # Suppress uploads of a node another writer stores, without a persistence ACK.
+        info = self.cache.tree_core.collect_path_info([node_id])[0][-1]
+        self.cache.tree_core.mark_external_cache_stored_path(node_id, info.parent_id)
 
     def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         cache = self.cache
