@@ -22,6 +22,8 @@ from sglang.test.kits.attention_unittest.attention_methods.mamba2_attention impo
     build_mamba2_attention_fixture,
     make_mamba2_cases,
     run_mamba2_attention_case,
+    run_mamba2_mis_case,
+    run_mamba2_mis_guard_cases,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_mamba2_cuda_graph_decode_case,
@@ -227,6 +229,35 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             "the trailing rows holding the real mamba indices instead "
             "of -1.",
         )
+
+    def test_mamba2_multi_item_scoring_parity(self):
+        mis_cases = (
+            ("single_req_multi_item", 16, [(5, [3, 7, 1])]),
+            ("cross_chunk", 16, [(19, [18, 5, 21])]),
+            (
+                "batched_mixed_empty_query",
+                16,
+                [(0, [1, 6, 19]), (9, [4, 17])],
+            ),
+        )
+        # MIS passes transposed inputs (stride(-1) != 1) with seq_lens_cpu, so
+        # causal_conv1d_fn (causal_conv1d.py:88) always routes to Triton here.
+        for use_triton_causal_conv in (False, True):
+            for case_name, chunk_size, requests in mis_cases:
+                with self.subTest(
+                    case=case_name,
+                    use_triton_causal_conv=use_triton_causal_conv,
+                ):
+                    run_mamba2_mis_case(
+                        testcase=self,
+                        requests=requests,
+                        backend="triton",
+                        mamba_chunk_size=chunk_size,
+                        use_triton_causal_conv=use_triton_causal_conv,
+                    )
+
+    def test_mamba2_multi_item_scoring_guards(self):
+        run_mamba2_mis_guard_cases(testcase=self)
 
     # Hybrid dispatch fan-out tests (MagicMock-based) — same pattern as
     # GDN. `Mamba2AttnBackend` inherits the `MambaAttnBackendBase`
