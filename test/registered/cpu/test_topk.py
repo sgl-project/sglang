@@ -6,6 +6,9 @@ import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.topk import (
+    biased_grouped_topk_cpu,
+)
+from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
 from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
@@ -123,13 +126,17 @@ class TestBiasedGroupedTopK(CustomTestCase):
         torch.testing.assert_close(res, ref)
 
     def test_biased_grouped_topk(self):
+        # M=34 ties two experts' scores under bf16 bias for E_num=160 (GLM-4.5's
+        # routed expert count), sending them to different-but-equally-valid groups;
+        # M=35 sidesteps that coincidental tie.
+        m_by_num_experts = {128: 34, 160: 35, 192: 34, 256: 34, 384: 34}
         for renormalize in [False]:
             for bias_dtype in [torch.float32, torch.bfloat16]:
                 for gating_dtype in [torch.float32, torch.bfloat16]:
                     for routed_scaling_factor in [None, 1.125]:
-                        for E_num in [128, 192, 256, 384]:
+                        for E_num, M in m_by_num_experts.items():
                             self._run_single_test(
-                                34,
+                                M,
                                 E_num,
                                 8,
                                 8,
@@ -138,6 +145,84 @@ class TestBiasedGroupedTopK(CustomTestCase):
                                 gating_dtype,
                                 bias_dtype,
                                 routed_scaling_factor,
+                            )
+
+
+# GLM-4.5 folds its shared expert into the routed set as an always-selected
+# extra slot (id == num_routed_experts); the kernel must match
+# biased_grouped_topk_impl's num_fused_shared_experts semantics exactly.
+class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
+    def _run_single_test(
+        self,
+        M,
+        E,
+        G,
+        topk_group,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    ):
+        torch.manual_seed(7)
+        topk_routed = 8
+        topk = topk_routed + 1
+
+        hidden_states = torch.randn(M, 100, dtype=torch.bfloat16)
+        gating_output = torch.randn(M, E, dtype=torch.float32) * 3
+        correction_bias = torch.randn(E, dtype=torch.float32)
+
+        ref_topk_weights, ref_topk_ids = native_biased_grouped_topk(
+            hidden_states.float(),
+            gating_output.float(),
+            correction_bias.float(),
+            topk,
+            renormalize,
+            G,
+            topk_group,
+            num_fused_shared_experts=1,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+        topk_weights, topk_ids = biased_grouped_topk_cpu(
+            hidden_states,
+            gating_output,
+            correction_bias,
+            topk,
+            renormalize,
+            G,
+            topk_group,
+            num_fused_shared_experts=1,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+
+        self.assertTrue(torch.equal(topk_ids.long(), ref_topk_ids))
+        self.assertTrue((topk_ids[:, -1] == E).all())
+        torch.testing.assert_close(topk_weights, ref_topk_weights, atol=1e-4, rtol=1e-4)
+
+    def test_fused_shared_expert(self):
+        for renormalize in [True, False]:
+            for routed_scaling_factor in [None, 0.0, 1.0, 2.5]:
+                for apply_routed_scaling_factor_on_output in [False, True]:
+                    if (
+                        apply_routed_scaling_factor_on_output
+                        and routed_scaling_factor is None
+                    ):
+                        continue
+                    for E_num in [128, 160, 192, 256, 384]:
+                        with self.subTest(
+                            num_experts=E_num,
+                            renormalize=renormalize,
+                            routed_scaling_factor=routed_scaling_factor,
+                            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                        ):
+                            self._run_single_test(
+                                12,
+                                E_num,
+                                8,
+                                2,
+                                renormalize,
+                                routed_scaling_factor,
+                                apply_routed_scaling_factor_on_output,
                             )
 
 

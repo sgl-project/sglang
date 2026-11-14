@@ -253,7 +253,8 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     int64_t topk_group,
     int64_t num_fused_shared_experts,
     std::optional<double> routed_scaling_factor,
-    std::optional<at::Tensor> num_token_non_padded);
+    std::optional<at::Tensor> num_token_non_padded,
+    double shared_expert_weight);
 
 // attention
 void decode_attention_cpu(
@@ -816,7 +817,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "biased_grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, Tensor correction_bias, int topk, bool "
       "renormalize, int num_expert_group, int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, "
-      "Tensor? num_token_non_padded) -> (Tensor, Tensor)");
+      "Tensor? num_token_non_padded, float shared_expert_weight=1.0) -> (Tensor, Tensor)");
   m.impl("biased_grouped_topk_cpu", torch::kCPU, &biased_grouped_topk_cpu);
 
   // decode
