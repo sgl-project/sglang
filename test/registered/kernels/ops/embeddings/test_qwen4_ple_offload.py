@@ -157,6 +157,28 @@ def test_qwen4_ple_pinned_gather_empty_input():
     assert actual.numel() == 0
 
 
+@pytest.mark.skipif(
+    torch.version.cuda is None, reason="exact-size pinning is CUDA-only"
+)
+def test_qwen4_ple_pinned_table_bypasses_rounding_host_allocator():
+    from sglang.srt.models.qwen4_exp_ple_table import allocate_ple_host_table
+
+    def torch_pinned_bytes():
+        return torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
+
+    # Repeat so a freed table's address range is handed out again.
+    for _ in range(3):
+        before = torch_pinned_bytes()
+        table = allocate_ple_host_table((20, 150), torch.float8_e4m3fn, "pinned")
+        assert table.is_pinned()
+        # torch's pinned allocator would hand back a power-of-two block.
+        assert torch_pinned_bytes() == before
+        rows = torch.randint(0, 255, (20, 150), dtype=torch.uint8)
+        table.view(torch.uint8).copy_(rows)
+        assert torch.equal(table.view(torch.uint8).to(DEVICE).cpu(), rows)
+        del table
+
+
 def test_qwen4_ple_pinned_embedding_rejects_unsupported_weights():
     with pytest.raises(TypeError, match="requires bfloat16"):
         Qwen4ExpPinnedHostEmbedding(_make_source_embedding(dtype=torch.float16))

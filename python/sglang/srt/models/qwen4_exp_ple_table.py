@@ -5,7 +5,9 @@ Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
 rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
-    ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
+    Page-locked host memory of exactly the table's size (``cudaHostAlloc``;
+    ``torch.empty(..., pin_memory=True)`` on non-CUDA builds). On a discrete
+    GPU this frees VRAM.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -244,6 +246,8 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
+        if torch.version.cuda is not None:
+            return _alloc_cuda_host_table(tuple(shape), dtype)
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
     numel = 1
@@ -479,6 +483,24 @@ def _madvise_random(storage: torch.Tensor, nbytes: int) -> None:
     exists for."""
     if not _madvise(storage.data_ptr(), nbytes, _MADV_RANDOM):
         logger.warning("PLE table: madvise(MADV_RANDOM) not applied")
+
+
+def _alloc_cuda_host_table(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Exact size: torch pin_memory would round the 47.7 GiB FP8 table of
+    # Qwen3.8-Flash-Next up to 64 GiB. Same call and flags as torch's pinned
+    # allocator (cudaHostAllocDefault).
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        CudaRTLibrary,
+    )
+    from sglang.srt.mem_cache.pool_host.common import alloc_owned_host_tensor
+
+    cudart = CudaRTLibrary()
+    return alloc_owned_host_tensor(
+        dims=shape,
+        dtype=dtype,
+        alloc=lambda nbytes: cudart.cudaHostAlloc(nbytes).value,
+        free=lambda ptr: cudart.cudaFreeHost(ctypes.c_void_p(ptr)),
+    )
 
 
 def _libc() -> Optional[ctypes.CDLL]:

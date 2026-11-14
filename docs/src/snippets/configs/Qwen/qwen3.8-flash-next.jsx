@@ -1027,7 +1027,7 @@ export const config = {
     // GiB of the 94.2 GiB the process can use. --mem-fraction-static keeps
     // (1 - fraction) x 94.2 GiB of that as runtime slack and the pools take the
     // rest: 6.6 GiB slack + 12.8 GiB of pools at 0.93, 3.8 + 8.3 GiB at 0.96.
-    // The host needs >= 64 GB of free RAM for the locked table and Docker
+    // The host needs >= 52 GB of free RAM for the locked table and Docker
     // needs --ulimit memlock=-1.
     //
     // Both cells are the model card's recipe (modelopt_fp4, flashinfer_cutlass
@@ -1076,7 +1076,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~78k tokens (~4.9k per request at 16 concurrent); lower --max-running-requests for long-context work. See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. The FP8 N-gram table lives in pinned host RAM: keep >= 52 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~78k tokens (~4.9k per request at 16 concurrent); lower --max-running-requests for long-context work. See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1112,7 +1112,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image, the build this cell is verified on. The FP8 N-gram table lives in pinned host RAM: keep >= 52 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1353,7 +1353,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~170k tokens (~10k per request at 16 concurrent). See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The FP8 N-gram table lives in pinned host RAM: keep >= 52 GB of host memory free and run Docker with --ulimit memlock=-1. The KV pool is ~170k tokens (~10k per request at 16 concurrent). See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1381,7 +1381,7 @@ export const config = {
     {
       match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The FP8 N-gram table lives in pinned host RAM: keep >= 64 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
+      warn: "Single RTX PRO 6000 (96 GB). Use the lmsysorg/sglang:dev-qwen38-next-local image: this ModelOpt MIXED_PRECISION export needs the loader from [sgl-project/sglang#38121](https://github.com/sgl-project/sglang/pull/38121), which the qwen38flashnext image does not have. The FP8 N-gram table lives in pinned host RAM: keep >= 52 GB of host memory free and run Docker with --ulimit memlock=-1. At 64 concurrent requests the KV pool is ~98k tokens (~1.5k per request when full); lower --max-running-requests for long-context workloads. See [RTX PRO 6000 notes](#rtx6000-note).",
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
