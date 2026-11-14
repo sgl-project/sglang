@@ -570,12 +570,12 @@ def _byte_sum(t: torch.Tensor) -> int:
 
 
 class TestTrtllmNvfp4HiddenAlignment(CustomTestCase):
-    def test_only_per_token_non_gated_is_padded(self):
+    def test_per_token_non_gated_needs_512_and_the_rest_256(self):
         for per_token, is_gated, expected in [
             (True, False, 512),
-            (True, True, 1),
-            (False, False, 1),
-            (False, True, 1),
+            (True, True, 256),
+            (False, False, 256),
+            (False, True, 256),
         ]:
             self.assertEqual(
                 trtllm_nvfp4_hidden_alignment(
@@ -583,6 +583,24 @@ class TestTrtllmNvfp4HiddenAlignment(CustomTestCase):
                 ),
                 expected,
             )
+
+    def test_static_alignment_pads_only_unaligned_hidden_sizes(self):
+        # Nemotron-3 Nano (2688) pads to 2816; 256-aligned models stay untouched.
+        alignment = trtllm_nvfp4_hidden_alignment(
+            use_per_token_activation=False, is_gated=False
+        )
+        for hidden, expected in [(2688, 2816), (2048, 2048), (4096, 4096)]:
+            weights = _generate_fp4_moe_weights(2, hidden, 1920, is_gated=False)
+            out = _align_fp4_moe_weights(
+                *weights,
+                is_gated=False,
+                intermediate_alignment=128,
+                hidden_alignment=alignment,
+            )
+            self.assertEqual(out[5], expected)
+            if expected == hidden:
+                for original, returned in zip(weights, out[:4]):
+                    self.assertIs(returned, original)
 
 
 class TestAlignFp4MoeWeights(CustomTestCase):
