@@ -512,6 +512,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         (

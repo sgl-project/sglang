@@ -10,7 +10,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import popen_with_error_check, try_cached_model
+from sglang.test.test_utils import try_cached_model
 
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="8-gpu-b300")
 
@@ -58,6 +58,7 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase, GSM8KMixin):
     prefill_tp_size = 4
     decode_tp_size = 4
     decode_base_gpu_id = 4
+    lb_request_timeout_secs = 7200
 
     @classmethod
     def setUpClass(cls):
@@ -91,35 +92,6 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase, GSM8KMixin):
         cls.extra_decode_args = common
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, trust_remote_code=True)
         cls.launch_all()
-
-    @classmethod
-    def launch_lb(cls):
-        cls.process_lb = popen_with_error_check(
-            [
-                "python3",
-                "-m",
-                "sglang_router.launch_router",
-                "--pd-disaggregation",
-                "--prefill",
-                cls.prefill_url,
-                cls.bootstrap_port,
-                "--decode",
-                cls.decode_url,
-                "--host",
-                cls.base_host,
-                "--port",
-                cls.lb_port,
-                "--request-timeout-secs",
-                "7200",
-                "--worker-startup-timeout-secs",
-                "7200",
-                "--retry-max-retries",
-                "1",
-                "--health-check-timeout-secs",
-                "60",
-            ]
-        )
-        cls.wait_server_ready(cls.lb_url + "/readiness", process=cls.process_lb)
 
     def _prompt(self, length):
         suffix = self.tokenizer.encode(
