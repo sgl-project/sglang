@@ -279,7 +279,10 @@ class HashTopK(nn.Module):
 
             lplb_solver = get_global_lplb_solver(self.layer_id)
             if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(routed_ids)
+                if _is_npu:
+                    log2phy_prob = lplb_solver.solve(routed_ids, num_token_non_padded)
+                else:
+                    log2phy_prob = lplb_solver.solve(routed_ids)
 
         routed_cols = topk_ids_logical_to_physical(
             routed_ids, expert_location_dispatch_info, log2phy_prob

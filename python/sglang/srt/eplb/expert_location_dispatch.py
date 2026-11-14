@@ -190,14 +190,21 @@ def _topk_ids_logical_to_physical_probability(
     info: ExpertLocationDispatchInfo,
     log2phy_prob: torch.Tensor,
 ) -> torch.Tensor:
-    """Select physical experts via the JIT-compiled CUDA dispatch kernel.
+    """Select physical experts with the device backend's probability kernel."""
+    # torch_npu's CUDA compatibility layer also sets NPU tensor.is_cuda to True.
+    if topk_ids.device.type == "npu":
+        from sglang.srt.hardware_backend.npu.moe.lplb_kernels import (
+            dispatch_probability,
+        )
 
-    Raises if ``topk_ids`` isn't on CUDA — the LP path requires the fused
-    kernel and there is no torch reference fallback at runtime.
-    """
+        if info.rank_invariant:
+            raise ValueError("NPU LP dispatch requires a MoE all-to-all backend.")
+        return dispatch_probability(
+            topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map
+        )
     if not topk_ids.is_cuda:
         raise RuntimeError(
-            f"LP dispatch requires CUDA tensors; got topk_ids on {topk_ids.device}."
+            f"LP dispatch requires CUDA or NPU tensors; got topk_ids on {topk_ids.device}."
         )
     from sglang.kernels.ops.lplb import cuda_solver
 
