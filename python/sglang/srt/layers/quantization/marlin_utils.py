@@ -12,6 +12,7 @@ import numpy
 import torch
 
 from sglang.srt.layers.quantization.utils import (
+    get_pack_factor,
     get_scalar_types,
     pack_cols,
     unpack_cols,
@@ -347,6 +348,45 @@ def marlin_moe_permute_scales(
     for e in range(num_experts):
         output[e] = marlin_permute_scales(s[e], size_k, size_n, group_size)
     return output
+
+
+def marlin_moe_unpermute_scales(
+    s: torch.Tensor,
+    size_k: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Inverse of ``marlin_moe_permute_scales`` called with the same ``size_k``."""
+    scale_perm, scale_perm_single = get_scale_perms()
+    if group_size < size_k and group_size != -1:
+        perm = scale_perm
+    else:
+        perm = scale_perm_single
+    inverse = torch.argsort(torch.tensor(perm, device=s.device))
+    num_experts = s.shape[0]
+    return s.reshape(num_experts, -1, len(perm))[:, :, inverse].reshape(s.shape)
+
+
+def gptq_marlin_unrepack(
+    marlin_q_w: torch.Tensor, size_k: int, size_n: int, num_bits: int
+) -> torch.Tensor:
+    """Inverse of ``gptq_marlin_repack`` with an empty ``perm`` (no act-order): Marlin
+    ``[size_k // 16, size_n * num_bits // 2]`` to GPTQ ``[size_k // pack_factor, size_n]``.
+    """
+    from sglang.srt.layers.quantization.moe_wna16 import get_weight_perm
+
+    pack_factor = get_pack_factor(num_bits)
+    tile = 16
+    device = marlin_q_w.device
+    shifts = torch.arange(0, 32, num_bits, dtype=torch.int32, device=device)
+    # Each Marlin int32 holds pack_factor consecutive permuted values.
+    q_w = (marlin_q_w.unsqueeze(-1) >> shifts) & ((1 << num_bits) - 1)
+    perm = get_weight_perm(num_bits).to(device)
+    q_w = q_w.reshape(-1, perm.numel())[:, torch.argsort(perm)]
+    q_w = q_w.reshape(size_k // tile, size_n // tile, tile, tile).permute(0, 2, 1, 3)
+    q_w = q_w.reshape(size_k // pack_factor, pack_factor, size_n).to(torch.int64)
+    packed = (q_w << shifts.to(torch.int64).view(1, -1, 1)).sum(dim=1)
+    # The checkpoint stores the low 32 bits as int32.
+    return torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32)
 
 
 def marlin_zero_points(
