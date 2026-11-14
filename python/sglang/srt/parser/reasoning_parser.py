@@ -95,6 +95,7 @@ class BaseReasoningFormatDetector:
         self.reasoning_default = reasoning_default
 
         self._buffer = ""
+        self._scanned_len = 0
         self._streamed_reasoning_tail = ""
         self.stripped_think_start = False
         self.think_start_self_label = ""
@@ -138,14 +139,14 @@ class BaseReasoningFormatDetector:
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret
 
-    def _find_tool_start(self, text: str, preceded_by: str = "") -> int:
+    def _find_tool_start(self, text: str, preceded_by: str = "", start: int = 0) -> int:
         """Index of the first tool_start_token that interrupts reasoning, or -1.
 
         `preceded_by` is the character just before `text`, for a streaming
         buffer whose leading newline was already emitted as reasoning."""
         if not self.tool_start_token:
             return -1
-        idx = text.find(self.tool_start_token)
+        idx = text.find(self.tool_start_token, start)
         while idx != -1:
             prev = text[idx - 1] if idx > 0 else preceded_by
             # Nothing precedes the token at the absolute start of generation;
@@ -220,14 +221,23 @@ class BaseReasoningFormatDetector:
         ret = self._parse_streaming_increment_impl(new_text)
         if self._force_nonempty_content:
             if self._in_reasoning:
-                self._accumulated_reasoning += ret.reasoning_text
+                if ret.reasoning_text:
+                    # Detach the attribute reference first so CPython appends in place.
+                    accumulated = self._accumulated_reasoning
+                    self._accumulated_reasoning = ""
+                    accumulated += ret.reasoning_text
+                    self._accumulated_reasoning = accumulated
             else:
                 self._accumulated_reasoning = ""
         return ret
 
     def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
-        self._buffer += new_text
+        # Detach the attribute reference before `+=` so CPython mutates the buffer in place.
         current_text = self._buffer
+        self._buffer = ""
+        prev_len = len(current_text) if len(current_text) == self._scanned_len else 0
+        self._scanned_len = 0
+        current_text += new_text
 
         think_start_text = self.think_start_token + self.think_start_self_label
 
@@ -235,46 +245,53 @@ class BaseReasoningFormatDetector:
         tokens_to_check = [think_start_text, self.think_end_token]
         if self.tool_start_token:
             tokens_to_check.append(self.tool_start_token)
-        if any(
-            token.startswith(current_text) and token != current_text
-            for token in tokens_to_check
+        max_token_len = max([len(token) for token in tokens_to_check])
+        if len(current_text) < max_token_len and any(
+            [
+                token.startswith(current_text) and token != current_text
+                for token in tokens_to_check
+            ]
         ):
+            self._buffer = current_text
             return StreamingParseResult()
 
+        search_offset = max(0, prev_len - max_token_len + 1)
+
         # Strip `<think>` token if present
-        if not self.stripped_think_start and think_start_text in current_text:
-            current_text = current_text.replace(think_start_text, "", 1)
-            # Write back, or stream_reasoning=False carries the token into finish().
-            self._buffer = current_text
-            self.stripped_think_start = True
-            self._in_reasoning = True
+        if not self.stripped_think_start:
+            start_idx = current_text.find(think_start_text, search_offset)
+            if start_idx != -1:
+                current_text = (
+                    current_text[:start_idx]
+                    + current_text[start_idx + len(think_start_text) :]
+                )
+                self.stripped_think_start = True
+                self._in_reasoning = True
+                search_offset = 0
 
         # Handle end of reasoning block
-        if self._in_reasoning and self.think_end_token in current_text:
-            end_idx = current_text.find(self.think_end_token)
+        if self._in_reasoning:
+            end_idx = current_text.find(self.think_end_token, search_offset)
+            if end_idx != -1:
+                reasoning_text = current_text[:end_idx]
+                self._in_reasoning = False
+                normal_text = current_text[end_idx + len(self.think_end_token) :]
 
-            reasoning_text = current_text[:end_idx]
-
-            self._buffer = ""
-            self._in_reasoning = False
-            normal_text = current_text[end_idx + len(self.think_end_token) :]
-
-            return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text
-            )
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
 
         # Continue with reasoning content
         if self._in_reasoning:
             # Check for tool_start_token interruption. Streaming cannot see a
             # think_end_token that has not arrived yet; see the chunk_dependent test.
             tool_idx = self._find_tool_start(
-                current_text, self._streamed_reasoning_tail
+                current_text, self._streamed_reasoning_tail, search_offset
             )
             if tool_idx != -1:
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = current_text[tool_idx:]
-                self._buffer = ""
                 self._in_reasoning = False
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
@@ -288,8 +305,10 @@ class BaseReasoningFormatDetector:
                     # force_reasoning never saw the opening token; it can still split.
                     holdback_tokens.append(think_start_text)
                 holdback = max(
-                    self._ends_with_partial_token(current_text, token)
-                    for token in holdback_tokens
+                    [
+                        self._ends_with_partial_token(current_text, token)
+                        for token in holdback_tokens
+                    ]
                 )
                 self._buffer = current_text[len(current_text) - holdback :]
                 reasoning_text = current_text[: len(current_text) - holdback]
@@ -297,11 +316,12 @@ class BaseReasoningFormatDetector:
                     self._streamed_reasoning_tail = reasoning_text[-1]
                 return StreamingParseResult(reasoning_text=reasoning_text)
             else:
+                self._scanned_len = len(current_text)
+                self._buffer = current_text
                 return StreamingParseResult()
 
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
-            self._buffer = ""
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
@@ -342,6 +362,7 @@ class BaseReasoningFormatDetector:
         (e.g. max_tokens cut it short), instead of dropping it: the whole block under
         stream_reasoning=False, the held-back token suffix under stream_reasoning=True.
         force_nonempty_content emits it as normal_text, else as reasoning_text."""
+        self._scanned_len = 0
         if not self._in_reasoning:
             # Same as the reasoning-side flush below: a held-back slice that never
             # became a token is content.
