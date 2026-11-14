@@ -294,27 +294,36 @@ class WeightUpdater:
             "Please call `init_weights_update_group` first."
         )
 
+        if not len(names) == len(dtypes) == len(shapes):
+            raise ValueError(
+                "Weight update metadata must have equal lengths: "
+                f"names={len(names)}, dtypes={len(dtypes)}, shapes={len(shapes)}"
+            )
+
         if load_format == "flattened_bucket":
             return self._receive_bucketed_weights_from_distributed(
                 names=names, dtypes=dtypes, shapes=shapes, group_name=group_name
             )
 
         weights = []
-        handles = []
+        # Prepare every buffer before posting any receives. An invalid later
+        # dtype/shape or an allocation failure must not strand an earlier
+        # asynchronous broadcast, and zip must not silently truncate a round.
         for name, dtype, shape in zip(names, dtypes, shapes):
             target_dtype = (
                 dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
             )
             weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-            handles.append(
-                torch.distributed.broadcast(
-                    weight,
-                    src=0,
-                    group=self._model_update_group[group_name],
-                    async_op=True,
-                )
-            )
             weights.append((name, weight))
+        handles = [
+            torch.distributed.broadcast(
+                weight,
+                src=0,
+                group=self._model_update_group[group_name],
+                async_op=True,
+            )
+            for _, weight in weights
+        ]
         for handle in handles:
             handle.wait()
         return weights
