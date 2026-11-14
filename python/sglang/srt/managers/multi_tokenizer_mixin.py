@@ -75,6 +75,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     kill_process_tree,
 )
+from sglang.srt.utils.common import freeze_gc
 from sglang.srt.utils.network import get_zmq_socket
 
 if TYPE_CHECKING:
@@ -505,6 +506,9 @@ class MultiTokenizerRouter:
                     await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
+            if isinstance(recv_obj, FreezeGCReq):
+                freeze_gc("Tokenizer Router", recv_obj.gc_threshold)
+
             await async_sock_send(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
@@ -570,6 +574,9 @@ class MultiDetokenizerRouter:
     def event_loop(self):
         while True:
             recv_obj = sock_recv(self.recv_from_scheduler)
+
+            if isinstance(recv_obj, FreezeGCReq):
+                freeze_gc("Detokenizer Router", recv_obj.gc_threshold)
 
             # Control messages must reach every detokenizer process.
             if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
