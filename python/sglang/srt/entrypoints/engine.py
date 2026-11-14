@@ -1782,7 +1782,7 @@ class Engine(EngineScoreMixin, EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        serialized_named_tensors = self._serialize_tensors_per_rank(
+        serialized_named_tensors = self.serialize_tensors_per_rank(
             named_tensors, load_format
         )
         obj = UpdateWeightsFromTensorReqInput(
@@ -1835,22 +1835,24 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def _serialize_tensors_per_rank(
+    def serialize_tensors_per_rank(
         self,
         tensors,
         load_format: Optional[str],
     ) -> List[bytes]:
-        """One serialized payload per TP rank: each rank deserializes only its
-        own copy, so producer-side CUDA-IPC refcounts drop cleanly after every
-        load. flattened_bucket callers pass pre-serialized per-rank payloads."""
+        """One serialized payload per engine rank (tp_size * pp_size, in world
+        rank order): each rank deserializes only its own copy, so producer-side
+        CUDA-IPC refcounts drop cleanly after every load. flattened_bucket
+        callers pass pre-serialized per-rank payloads."""
         if load_format == "flattened_bucket":
             return normalize_serialized_named_tensor_payloads(
                 cast(List[SerializedTensorPayload], tensors)
             )
         else:
+            parallel = get_parallel()
             return [
                 MultiprocessingSerializer.serialize(tensors)
-                for _ in range(get_parallel().tp_size)
+                for _ in range(parallel.tp_size * parallel.pp_size)
             ]
 
     def load_lora_adapter_from_tensors(
@@ -1860,9 +1862,7 @@ class Engine(EngineScoreMixin, EngineBase):
         config_dict: Dict,
         load_format: Optional[str] = None,
     ):
-        serialized_named_tensors = self._serialize_tensors_per_rank(
-            tensors, load_format
-        )
+        serialized_named_tensors = self.serialize_tensors_per_rank(tensors, load_format)
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,

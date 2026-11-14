@@ -376,7 +376,7 @@ This strategy requires the training process and rollout engine to share access t
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>serialized_named_tensors</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-TP serialized tensor payloads.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>One serialized tensor payload per engine rank (<code>tp_size * pp_size</code> entries, world-rank order: all TP ranks of pipeline stage 0, then stage 1, ...).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Required</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: list[str|bytes]</td>
     </tr>

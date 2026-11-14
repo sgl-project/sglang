@@ -260,7 +260,7 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
                 with (
                     _mock_flashinfer(),
                     get_context().override_server_args(weight_cache_mode="off"),
-                    get_parallel().override(tp_rank=0),
+                    get_parallel().override(tp_size=1, pp_size=1, pp_rank=0, tp_rank=0),
                     patch.object(
                         weight_updater, "get_model_loader", return_value=loader
                     ),
@@ -414,7 +414,7 @@ class TestFlashInferTrtllmBf16MoEReload(CustomTestCase):
                 with (
                     _mock_flashinfer(),
                     get_context().override_server_args(weight_cache_mode="off"),
-                    get_parallel().override(tp_rank=0),
+                    get_parallel().override(tp_size=1, pp_size=1, pp_rank=0, tp_rank=0),
                     patch.object(
                         weight_updater, "monkey_patch_torch_reductions", lambda: None
                     ),
@@ -487,7 +487,7 @@ class TestWeightUpdateSessionFinalization(CustomTestCase):
                 with (
                     _mock_flashinfer(),
                     get_context().override_server_args(weight_cache_mode="off"),
-                    get_parallel().override(tp_rank=0),
+                    get_parallel().override(tp_size=1, pp_size=1, pp_rank=0, tp_rank=0),
                     patch.object(
                         weight_updater, "monkey_patch_torch_reductions", lambda: None
                     ),
@@ -549,7 +549,7 @@ class TestWeightUpdateSessionFinalization(CustomTestCase):
         with (
             _mock_flashinfer(),
             get_context().override_server_args(weight_cache_mode="off"),
-            get_parallel().override(tp_rank=0),
+            get_parallel().override(tp_size=1, pp_size=1, pp_rank=0, tp_rank=0),
             patch.object(weight_updater, "monkey_patch_torch_reductions", lambda: None),
         ):
             method.process_weights_after_loading(layer)

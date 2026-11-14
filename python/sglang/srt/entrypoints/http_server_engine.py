@@ -104,12 +104,13 @@ class HttpServerEngineAdapter(EngineBase):
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
 
+        cfg = resolving_view(self.server_args)
         return self._make_request(
             "update_weights_from_tensor",
             {
                 "serialized_named_tensors": [
                     MultiprocessingSerializer.serialize(named_tensors, output_str=True)
-                    for _ in range(resolving_view(self.server_args).tp_size)
+                    for _ in range(cfg.tp_size * cfg.pp_size)
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,
