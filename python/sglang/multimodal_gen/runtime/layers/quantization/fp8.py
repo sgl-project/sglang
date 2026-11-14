@@ -534,12 +534,53 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def accepts_per_token_fp8_input(self, layer: Module) -> bool:
+        # Keep schemes with a different apply contract on their existing path.
+        return (
+            type(self).apply is Fp8LinearMethod.apply
+            and _is_cuda
+            and self.cutlass_fp8_supported
+            and not self.use_marlin
+            and not self.block_quant
+            and not self.quant_config.is_checkpoint_fp8_serialized
+            and layer.input_scale is None
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(x, tuple):
+            if not self.accepts_per_token_fp8_input(layer):
+                raise ValueError("this FP8 layer does not accept per-token FP8 input")
+            qinput, input_scale = x
+            if (
+                qinput.dtype != torch.float8_e4m3fn
+                or not qinput.is_contiguous()
+                or qinput.ndim != 2
+                or qinput.shape[1] != layer.weight.shape[0]
+                or qinput.device != layer.weight.device
+                or input_scale.device != qinput.device
+                or input_scale.dtype != torch.float32
+                or input_scale.shape not in ((qinput.shape[0],), (qinput.shape[0], 1))
+                or not input_scale.is_contiguous()
+            ):
+                raise ValueError(
+                    "requires E4M3 rows and contiguous FP32 per-token scales on the weight device"
+                )
+            return apply_fp8_linear(
+                input=qinput,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=input_scale.view(-1, 1),
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=True,
+                pre_quant_output_dtype=torch.bfloat16,
+            )
+
         # The activation quantization kernels assert on row-major input, and
         # diffusion backbones routinely pass a permuted view. Normalising at the
         # producer instead would also move the unquantized path's output, by

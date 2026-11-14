@@ -33,8 +33,11 @@ from sglang.kernels.ops.diffusion import (
     can_use_aten_head_rmsnorm,
     can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_packed_swiglu_per_token_fp8,
     can_use_rmsnorm_indexed_scale_shift,
+    can_use_rmsnorm_indexed_scale_shift_fp8,
     fused_inplace_qknorm_rope,
+    fused_packed_swiglu_per_token_fp8,
     fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
     indexed_gate_bf16_,
@@ -44,6 +47,7 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
     rmsnorm_indexed_scale_shift,
+    rmsnorm_indexed_scale_shift_fp8,
     tensors_equal,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
@@ -455,6 +459,25 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
         isinstance(linear, LinearBase)
         and linear.quant_method is not None
         and linear.quant_method.accepts_mxfp8_input(linear)
+    )
+
+
+def _accepts_per_token_fp8_input(linear: nn.Module) -> bool:
+    return (
+        isinstance(linear, LinearBase)
+        and linear.quant_method is not None
+        and linear.quant_method.accepts_per_token_fp8_input(linear)
+    )
+
+
+def _can_fuse_per_token_fp8_modulation(block, linear, x, norm, shift, scale, indices):
+    return (
+        MINIMAX_H3_NORM_MODULATE.is_enabled(block)
+        and norm.weight is not None
+        and _accepts_per_token_fp8_input(linear)
+        and can_use_rmsnorm_indexed_scale_shift_fp8(
+            x, norm.weight, shift, scale, indices
+        )
     )
 
 
@@ -1740,6 +1763,11 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
+        if _accepts_per_token_fp8_input(
+            self.fc2
+        ) and can_use_fused_packed_swiglu_per_token_fp8(hidden):
+            out, _ = self.fc2(fused_packed_swiglu_per_token_fp8(hidden))
+            return out
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
@@ -1962,7 +1990,26 @@ class MiniMaxH3DiTBlock(nn.Module):
         # a block-local buffer.
         residual = x
         h_prequant = None
-        if _accepts_mxfp8_input(self.attn.qkv_proj):
+        if _can_fuse_per_token_fp8_modulation(
+            self,
+            self.attn.qkv_proj,
+            x,
+            self.norm1,
+            shift_msa,
+            scale_msa,
+            combined_indices,
+        ):
+            # Hybrid/VDN branch projections also consume native BF16 rows.
+            h, h_prequant = rmsnorm_indexed_scale_shift_fp8(
+                x,
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                self.norm1.eps,
+                keep_bf16=True,
+            )
+        elif _accepts_mxfp8_input(self.attn.qkv_proj):
             h = self.norm1(x)
             if can_use_mxfp8_swizzled(h):
                 # the bf16 modulated rows stay in h for the VDN branch projections
@@ -2005,7 +2052,25 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
         residual = x
-        if _accepts_mxfp8_input(self.mlp.fc1):
+        if _can_fuse_per_token_fp8_modulation(
+            self,
+            self.mlp.fc1,
+            x,
+            self.norm2,
+            shift_mlp,
+            scale_mlp,
+            combined_indices,
+        ):
+            _, h_prequant = rmsnorm_indexed_scale_shift_fp8(
+                x,
+                self.norm2.weight,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                self.norm2.eps,
+            )
+            h = self.mlp(h_prequant)
+        elif _accepts_mxfp8_input(self.mlp.fc1):
             h = self.norm2(x)
             if can_use_mxfp8_swizzled(h):
                 _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(

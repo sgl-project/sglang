@@ -163,6 +163,19 @@ Several norms look interchangeable and are not. Start here.
 | `indexed_scale_shift_bf16_` / `indexed_scale_shift_fp32_` | Triton | bit-exact vs `x * (1 + scale[idx]) + shift[idx]`, in place | bf16 rows, per-row index into `[n, D]` shift/scale tables; fp32 tables are serialized INT8 MiniMax-H3 |
 | `norm_infer` / `rms_norm_fn` | Triton (+torch/NPU/MPS fallbacks) | close | the generic entry point; use when nothing above fits |
 
+`rmsnorm_indexed_scale_shift_fp8` is the SM90 BF16 width-5376 fused
+norm/modulation + per-token E4M3 entry point. It preserves native BF16 norm
+rounding and returns `(optional_bf16, (fp8_rows, fp32_scales[M,1]))`.
+`keep_bf16=True` retains native rows for additional consumers. Weights must be
+contiguous; modulation tables and integer indices may be strided.
+`fused_packed_swiglu_per_token_fp8` accepts contiguous SM90 BF16 packed rows
+of width 28672 and returns unpadded E4M3 rows with FP32 scales [M]. Both FP8
+entries require at least 4096 rows and match the existing per-token quantizer:
+amax/448 scales (zero for zero rows), approximate-reciprocal multiplication.
+SwiGLU retains precise libdevice SiLU and both BF16 rounds. Both fused entries
+use ordinary Triton, without CUDA JIT or experimental Gluon dependencies. The original norm and
+FLUX3 rowwise SwiGLU entry points keep their original numerical contracts.
+
 ### Norm variants
 
 | Entry point | Backend | Contract | Applies to |
