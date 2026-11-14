@@ -904,16 +904,17 @@ class Glm47MoeDetector(BaseFormatDetector):
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
             arg_type = get_argument_type(func_name, arg_key, tools, known_arguments)
+            if arg_type == "string":
+                # The chat template writes string values raw, so the raw text is
+                # the value, quotes included (as in the streaming path).
+                arguments[arg_key] = arg_value
+                known_arguments[arg_key] = arg_value
+                continue
             parsed_value, is_good_json = parse_arguments(
                 arg_value, arg_type or "string"
             )
 
-            if arg_type == "string":
-                if isinstance(parsed_value, str):
-                    arguments[arg_key] = parsed_value
-                else:
-                    arguments[arg_key] = arg_value
-            elif arg_type is None:
+            if arg_type is None:
                 # A value whose parsed JSON type is inadmissible stays the raw
                 # string when the schema allows a string (e.g. enum ["7", 8]).
                 allowed = _get_argument_types(
