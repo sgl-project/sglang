@@ -200,3 +200,23 @@ class GigaChat3Detector(BaseFormatDetector):
         raise NotImplementedError(
             "GigaChat3Detector does not support structural_tag format."
         )
+
+    def finish(self, tools):
+        normal = ""
+        if self._buffer:
+            leftover = self._buffer
+            m_func = REGEX_FUNCTION_CALL.search(leftover)
+            complete = False
+            if m_func:
+                try:
+                    json.loads(m_func.group(1), strict=False)
+                    complete = True
+                except (json.JSONDecodeError, ValueError):
+                    complete = False
+            if complete:
+                # Fully closed JSON was already parsed; do not re-emit.
+                self._buffer = ""
+            else:
+                normal = leftover
+                self._buffer = ""
+        return StreamingParseResult(normal_text=normal, calls=[])

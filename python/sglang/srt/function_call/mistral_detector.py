@@ -341,3 +341,15 @@ class MistralDetector(BaseFormatDetector):
             end="}]",
             trigger="[TOOL_CALLS]",
         )
+
+    def finish(self, tools):
+        normal = ""
+        if self._buffer:
+            leftover = self._buffer
+            if leftover.rstrip().endswith(self.eot_token):
+                # Fully closed call was already parsed; do not re-emit.
+                self._buffer = ""
+            else:
+                normal = leftover
+                self._buffer = ""
+        return StreamingParseResult(normal_text=normal, calls=[])
