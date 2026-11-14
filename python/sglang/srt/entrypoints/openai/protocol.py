@@ -31,6 +31,7 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Sequence,
     Tuple,
     Type,
     TypeAlias,
@@ -2635,8 +2636,15 @@ class RequestResponseMetadata(BaseModel):
 
 
 @dataclass
+class ChatTemplateCacheEntry:
+    prompt_ids: Sequence[int]
+    decoded_prompt: Optional[str] = None
+
+
+@dataclass
 class MessageProcessingResult:
-    prompt: str
+    # None when the caller can use token IDs without requesting the text.
+    prompt: Optional[str]
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
     audio_data: Optional[Any]
@@ -2655,6 +2663,7 @@ class MessageProcessingResult:
         Callable[[], Optional[ToolCallConstraint]]
     ] = None
     uses_response_template: bool = False
+    chat_template_cache_entry: Optional[ChatTemplateCacheEntry] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
