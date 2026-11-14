@@ -216,6 +216,15 @@ def _check_mm_routing_labels(labels, field_name: str, input_count: int) -> None:
             )
 
 
+def _check_batch_list_length(name: str, values: list, batch_size: int) -> None:
+    """A per-request list must have one entry per request of the batch."""
+    if len(values) != batch_size:
+        raise ValueError(
+            f"The length of {name} ({len(values)}) should be equal to the batch "
+            f"size ({batch_size})."
+        )
+
+
 @dataclass
 class GenerateReqInput:
     # Request ID(s). If omitted, generated during normalization. For batch
@@ -605,6 +614,10 @@ class GenerateReqInput:
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = validate_n(self.sampling_params.get("n", 1))
         else:  # isinstance(self.sampling_params, list):
+            # Check the length before n is read from the first entry.
+            _check_batch_list_length(
+                "sampling_params", self.sampling_params, self.batch_size
+            )
             self.parallel_sample_num = validate_n(self.sampling_params[0].get("n", 1))
             for sampling_params in self.sampling_params:
                 if self.parallel_sample_num != validate_n(sampling_params.get("n", 1)):
@@ -636,6 +649,9 @@ class GenerateReqInput:
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
+        elif isinstance(self.sampling_params, list):
+            # _handle_parallel_sampling checked that it has one entry.
+            self.sampling_params = self.sampling_params[0].copy()
         else:
             self.sampling_params = self.sampling_params.copy()
         if self.rid is None:
@@ -723,6 +739,7 @@ class GenerateReqInput:
             if isinstance(self.lora_path, str):
                 self.lora_path = [self.lora_path] * num
             elif isinstance(self.lora_path, list):
+                _check_batch_list_length("lora_path", self.lora_path, self.batch_size)
                 self.lora_path = self.lora_path * self.parallel_sample_num
             else:
                 raise ValueError("lora_path should be a list or a string.")
@@ -844,6 +861,7 @@ class GenerateReqInput:
         elif not isinstance(self.video_data, list):
             self.video_data = [self.video_data] * num
         elif isinstance(self.video_data, list):
+            _check_batch_list_length("video_data", self.video_data, self.batch_size)
             self.video_data = self.video_data * self.parallel_sample_num
 
     def _normalize_audio_data(self, num):
@@ -855,6 +873,7 @@ class GenerateReqInput:
         elif not isinstance(self.audio_data, list):
             self.audio_data = [self.audio_data] * num
         elif isinstance(self.audio_data, list):
+            _check_batch_list_length("audio_data", self.audio_data, self.batch_size)
             self.audio_data = self.audio_data * self.parallel_sample_num
 
     def _normalize_sampling_params(self, num):
@@ -863,7 +882,7 @@ class GenerateReqInput:
             self.sampling_params = [{} for _ in range(num)]
         elif isinstance(self.sampling_params, dict):
             self.sampling_params = [self.sampling_params.copy() for _ in range(num)]
-        else:  # Already a list
+        else:  # A list, whose length _handle_parallel_sampling checked
             self.sampling_params = [
                 params.copy()
                 for params in self.sampling_params * self.parallel_sample_num
@@ -912,6 +931,7 @@ class GenerateReqInput:
                     raise ValueError(
                         f"Cannot use list {param_name} with parallel_sample_num > 1"
                     )
+                _check_batch_list_length(param_name, param, self.batch_size)
                 return param
 
         # Normalize each logprob parameter
@@ -944,6 +964,10 @@ class GenerateReqInput:
             raise ValueError(
                 "Cannot use list token_ids_logprob with parallel_sample_num > 1"
             )
+        else:
+            _check_batch_list_length(
+                "token_ids_logprob", self.token_ids_logprob, self.batch_size
+            )
 
     def _normalize_return_hidden_states(self, num):
         """Normalize and validate per-request hidden-state return modes."""
@@ -970,6 +994,10 @@ class GenerateReqInput:
         elif self.parallel_sample_num > 1:
             raise ValueError(
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
+            )
+        else:
+            _check_batch_list_length(
+                "custom_logit_processor", self.custom_logit_processor, self.batch_size
             )
 
     def _normalize_extra_key(self, num):
@@ -1031,6 +1059,17 @@ class GenerateReqInput:
 
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
+        for name in (
+            "bootstrap_host",
+            "bootstrap_port",
+            "bootstrap_room",
+            "bootstrap_pair_key",
+            "decode_tp_size",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, list):
+                _check_batch_list_length(name, value, self.batch_size)
+
         # Normalize bootstrap_host
         if self.bootstrap_host is None:
             self.bootstrap_host = [None] * num
@@ -1519,6 +1558,7 @@ class EmbeddingReqInput:
                 self.rid = expand_base_rid(self.rid, self.batch_size)
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
+                _check_batch_list_length("rid", self.rid, self.batch_size)
 
             if self.sampling_params is None:
                 self.sampling_params = [{} for _ in range(self.batch_size)]
@@ -1527,6 +1567,9 @@ class EmbeddingReqInput:
                     self.sampling_params.copy() for _ in range(self.batch_size)
                 ]
             else:
+                _check_batch_list_length(
+                    "sampling_params", self.sampling_params, self.batch_size
+                )
                 self.sampling_params = [
                     params.copy() for params in self.sampling_params
                 ]
