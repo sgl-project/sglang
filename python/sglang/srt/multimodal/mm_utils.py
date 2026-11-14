@@ -48,6 +48,15 @@ def ensure_numpy(x):
     return x.numpy() if isinstance(x, torch.Tensor) else x
 
 
+def split_audio_length(length: int, chunk_size: int) -> list[int]:
+    """Sizes of consecutive nonempty chunks of one packed audio sequence."""
+    full, tail = divmod(length, chunk_size)
+    chunks = [chunk_size] * full
+    if tail:
+        chunks.append(tail)
+    return chunks
+
+
 def has_valid_data(data) -> bool:
     if data is None:
         return False

@@ -51,6 +51,7 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
+from sglang.srt.multimodal.mm_utils import split_audio_length
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cpu, is_npu, logger
 
@@ -263,29 +264,22 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
             mel length after cnn
         """
-        aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
-        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
-
-        chunk_lengths = torch.tensor(
-            [self.n_window * 2] * chunk_num.sum(),
-            dtype=torch.long,
-            device=feature_lens.device,
-        )
-        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
-        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
-        chunk_lengths[chunk_lengths == 0] = self.n_window * 2
-
-        chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
+        mel_lengths = feature_lens.tolist()
+        chunk_lengths = [
+            chunk
+            for length in mel_lengths
+            for chunk in split_audio_length(length, self.n_window * 2)
+        ]
+        chunk_list = input_features.T.split(chunk_lengths, dim=0)
         padded_feature = nn.utils.rnn.pad_sequence(
             chunk_list, batch_first=True
         ).transpose(1, 2)
 
         # Introduce vectorized mask to avoid many small tensors
-        feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
-        max_len_after_cnn = (
-            int(feature_lens_after_cnn.max().item())
-            if feature_lens_after_cnn.numel()
-            else 0
+        cnn_lengths = [_get_feat_extract_output_lengths(n) for n in chunk_lengths]
+        max_len_after_cnn = max(cnn_lengths, default=0)
+        feature_lens_after_cnn = torch.tensor(
+            cnn_lengths, device=input_features.device, dtype=torch.long
         )
 
         idx = torch.arange(max_len_after_cnn, device=padded_feature.device)
@@ -323,14 +317,10 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         window_aftercnn = padded_mask_after_cnn.shape[-1] * (
             self.n_window_infer // (self.n_window * 2)
         )
-        # Use tolist() for efficient batch conversion from tensor to Python
-        for cnn_len in aftercnn_lens.tolist():
-            num_full_chunks = cnn_len // window_aftercnn
-            remainder = cnn_len % window_aftercnn
-            cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
-            if remainder:
-                cu_chunk_lens.append(remainder)
-        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
+        for length in mel_lengths:
+            cnn_len = _get_feat_extract_output_lengths(length)
+            cu_chunk_lens.extend(split_audio_length(cnn_len, window_aftercnn))
+        cu_seqlens = torch.tensor(cu_chunk_lens, device=input_features.device).cumsum(
             -1, dtype=torch.int32
         )
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
