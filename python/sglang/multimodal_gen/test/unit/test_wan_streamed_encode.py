@@ -103,6 +103,39 @@ def _video_request(**overrides) -> SimpleNamespace:
 
 @unittest.skipUnless(condition=torch.cuda.is_available(), reason="needs CUDA")
 class TestStreamedEncode(CustomTestCase):
+    def test_nvenc_stream_muxes_the_frames_actually_written(self):
+        from sglang.multimodal_gen.runtime.entrypoints import utils
+        from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+            NvencVideoEncoder,
+        )
+
+        audio = torch.zeros(800)
+        writer = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp, "audio.mp4"))
+            stream = EncodeWhileDecoding(
+                path,
+                _video_request(num_frames=10),
+                audio=audio,
+                audio_sample_rate=16000,
+                use_nvenc=True,
+            )
+            with (
+                mock.patch.object(
+                    NvencVideoEncoder, "open", return_value=writer
+                ) as open_nvenc,
+                mock.patch.object(utils, "_maybe_mux_audio_into_mp4") as mux_audio,
+            ):
+                stream(torch.zeros((1, 3, 2, 8, 8), device="cuda"))
+                stream(torch.zeros((1, 3, 1, 8, 8), device="cuda"))
+                self.assertEqual(stream.finish(), [path])
+
+        self.assertEqual(writer.write.call_count, 2)
+        self.assertIsNone(open_nvenc.call_args.kwargs["audio"])
+        writer.close.assert_called_once()
+        self.assertEqual(len(mux_audio.call_args.kwargs["frames"]), 3)
+        self.assertIs(mux_audio.call_args.kwargs["audio"], audio)
+
     @torch.no_grad()
     def test_hunyuan_without_callback_matches_one_shot_mp4(self):
         config = HunyuanVAEConfig(
