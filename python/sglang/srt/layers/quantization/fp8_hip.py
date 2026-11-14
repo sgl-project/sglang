@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import bf16_dequant_blockscaled_linear
 from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
+    mxfp8_native_packed_q,
     native_route_supports,
     prepare_mxfp8_native_weight,
     ue8m0_weight_scale,
@@ -148,6 +149,33 @@ def apply_dense(
         weight_scale=layer.weight_scale_inv,
         input_scale=input_scale,
         bias=bias,
+    )
+
+
+def apply_dense_packed_q(
+    method, layer: torch.nn.Module, x
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """apply_dense of a bias-free query projection, its [M, H * 512] output written as
+    the fp8 OPUS kernel's query pair by the native route's GEMM (mxfp8_native_packed_q).
+    None off that route or at sizes its packed tile does not cover; the caller then
+    takes apply_dense's bf16 output."""
+    if not (
+        getattr(method, "block_fp8_as_mxfp8", False)
+        and method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
+        and layer.block_fp8_mxfp8_ready
+        and layer.mxfp8_native_ready
+        and getattr(layer, "bias", None) is None
+    ):
+        return None
+    input_scale = None
+    if isinstance(x, Mxfp8Activation):
+        x, input_scale = x.q, x.scale
+    elif isinstance(x, Fp8GridActivation):
+        x = x.x
+    elif isinstance(x, tuple):
+        x, input_scale = x
+    return mxfp8_native_packed_q(
+        x, layer.weight.view(torch.uint8), layer.weight_scale_mx_e8m0, input_scale
     )
 
 

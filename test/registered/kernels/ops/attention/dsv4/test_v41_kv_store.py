@@ -639,7 +639,8 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
     def test_query_rope_in_the_k_launch(self):
         """With q the K launch must rope every query head's trailing ROPE_DIM bitwise
         like the flat rope kernel, leave the cache bytes and the nope part untouched,
-        and rope rows without a slot."""
+        and rope rows without a slot; a q of the RoPE dims alone ([T, H, ROPE_DIM],
+        the packed OPUS query's) the same way."""
         dev = "cuda"
         num_tokens, heads, pos_dtype, seed = 300, 16, torch.int32, 2
         for layout in (KVLayout.V4, KVLayout.V41):
@@ -698,6 +699,22 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                 )
                 self.assertTrue(torch.equal(got, expected))
                 self.assertTrue(torch.equal(cache_q, cache))
+                got_rope = q[..., -ROPE_DIM:].clone()
+                cache_r = torch.zeros_like(cache)
+                fused_k_norm_rope_flashmla(
+                    kv,
+                    weight,
+                    1e-6,
+                    freqs_cis,
+                    positions,
+                    out_loc,
+                    cache_r,
+                    PAGE_SIZE,
+                    q=got_rope,
+                    layout=layout,
+                )
+                self.assertTrue(torch.equal(got_rope, expected[..., -ROPE_DIM:]))
+                self.assertTrue(torch.equal(cache_r, cache))
 
 
 if __name__ == "__main__":

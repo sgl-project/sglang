@@ -280,10 +280,12 @@ struct FusedKNormRopeFlashMLAParams {
   uint32_t batch_size;
   float eps;
   // kRopeQ (ROCm): (B, num_q_heads, kHeadDim) DType; the trailing kRopeDim of every head
-  // are rotated in place with this token's frequencies by the same launch.
+  // are rotated in place with this token's frequencies by the same launch. A
+  // (B, num_q_heads, kRopeDim) q is those RoPE dims alone (q_rope_offset 0).
   void* __restrict__ q = nullptr;
   int64_t q_stride_batch = 0;
   int64_t q_stride_head = 0;
+  int64_t q_rope_offset = 0;
   uint32_t num_q_heads = 0;
 };
 
@@ -362,12 +364,12 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
 
   // Before the out_loc check: a row without a KV slot still ropes its query heads.
   if constexpr (kRopeQ) {
-    // Query rope, pair j of head h at q[h * stride + kHeadDim - kRopeDim + 2j]: the cross product
+    // Query rope, pair j of head h at q[h * stride + q_rope_offset + 2j]: the cross product
     // is rounded, then one fma with the cosine, so the bf16 result is bitwise the Triton flat
     // rope kernel's on gfx950.
     static_assert(std::is_same_v<DType, bf16_t>, "the in-place query rope reads q as bf16 pairs");
     constexpr uint32_t kPairsPerHead = kRopeDim / 2;
-    const auto q_row = static_cast<DType*>(params.q) + work_id * params.q_stride_batch + (kHeadDim - kRopeDim);
+    const auto q_row = static_cast<DType*>(params.q) + work_id * params.q_stride_batch + params.q_rope_offset;
     const auto n_pairs = params.num_q_heads * kPairsPerHead;
     for (uint32_t p = tx; p < n_pairs; p += kFusedKBlockSize) {
       const auto head = p / kPairsPerHead;
@@ -596,7 +598,8 @@ struct FusedKNormRopeFlashMLAKernel {
     forward_impl<false>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, nullptr);
   }
 
-  /// `forward` with the same tokens' query heads `q` (B, H, kHeadDim) roped in place (ROCm).
+  /// `forward` with the same tokens' query heads `q` (B, H, kHeadDim), or their RoPE dims
+  /// alone (B, H, kRopeDim), roped in place (ROCm).
   static void forward_with_q(
       const tvm::ffi::TensorView kv,
       const tvm::ffi::TensorView kv_weight,
@@ -670,16 +673,20 @@ struct FusedKNormRopeFlashMLAKernel {
     };
     if constexpr (kRopeQ) {
       auto H = SymbolicSize{"num_q_heads"};
-      TensorMatcher({B, H, kHeadDim})  //
+      auto D = SymbolicSize{"q_head_dim"};
+      TensorMatcher({B, H, D})  //
           .with_strides({-1, -1, 1})
           .with_dtype<DType>()
           .with_device(device_)
           .verify(*q);
+      const auto q_dim = static_cast<int64_t>(D.unwrap());
+      RuntimeCheck(q_dim == kHeadDim || q_dim == kRopeDim, "q must be (B, H, head_dim) or (B, H, rope_dim)");
       // The rope pairs are read and written as 4-byte packs.
       RuntimeCheck(q->stride(1) % 2 == 0 && q->stride(0) % 2 == 0, "q strides must be even");
       params.q = q->data_ptr();
       params.q_stride_batch = q->stride(0);
       params.q_stride_head = q->stride(1);
+      params.q_rope_offset = q_dim - kRopeDim;
       params.num_q_heads = static_cast<uint32_t>(H.unwrap());
     }
     if constexpr (kLayout != deepseek_v4::KVLayout::V4 && !kRopeQ) {

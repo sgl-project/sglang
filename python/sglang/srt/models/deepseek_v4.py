@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
+from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import OpusPackedQ
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import (
     can_use_fused_wo_a,
@@ -2518,7 +2519,15 @@ class MQALayer(MqaAttentionBase):
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
-                    self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
+                    self,
+                    q_lora,
+                    q_for_wqb,
+                    positions,
+                    q_out,
+                    unified,
+                    use_cp,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
                 )
             else:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -2584,7 +2593,11 @@ class MQALayer(MqaAttentionBase):
                     forward_batch,
                     attn_backend,
                     qkv_a=qkv_a,
-                    q_rope=q if fuse_q_rope else None,
+                    q_rope=(
+                        (q.q_rope if isinstance(q, OpusPackedQ) else q)
+                        if fuse_q_rope
+                        else None
+                    ),
                 )
                 kv = None
 

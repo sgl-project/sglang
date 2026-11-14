@@ -180,6 +180,7 @@ def gather_dequant_requant_fp8_paged_dsv4(
     page_size: int,
     extra_rows: int = 0,
     out: Optional[torch.Tensor] = None,
+    rope_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Gather DeepSeek-V4 paged KV cache into a flat FP8 workspace.
 
@@ -189,7 +190,8 @@ def gather_dequant_requant_fp8_paged_dsv4(
     FP8, and writes the result as ``(num_tokens + extra_rows, 1, 512)`` FP8.
 
     ``extra_rows`` appends zero rows for kernels that map masked sparse indices
-    to a valid zero landing pad.
+    to a valid zero landing pad. ``rope_out`` ``(num_tokens + extra_rows, 64)``
+    BF16, if given, also receives each row's rope tail as stored, in the same pass.
     """
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
@@ -216,17 +218,28 @@ def gather_dequant_requant_fp8_paged_dsv4(
         assert out.dtype == fp8_dtype
         if extra_rows:
             out[num_tokens:].zero_()
+    if rope_out is not None:
+        assert rope_out.shape == (total_rows, DIM_ROPE), rope_out.shape
+        assert rope_out.dtype == torch.bfloat16 and rope_out.stride(1) == 1
+        if extra_rows:
+            rope_out[num_tokens:].zero_()
 
     if num_tokens == 0:
         return out
 
-    _gather_dequant_requant_fp8_paged_kernel[(num_tokens,)](
+    tokens_per_prog = 8
+    _gather_dequant_requant_fp8_paged_kernel[
+        (triton.cdiv(num_tokens, tokens_per_prog),)
+    ](
         out,
+        rope_out if rope_out is not None else out,
         buf_fp8,
         buf_bf16,
         buf_uint8,
         page_table_1_flattened,
         out.stride(0),
+        rope_out.stride(0) if rope_out is not None else 0,
+        num_tokens,
         BYTES_PER_PAGE=bytes_per_page,
         PAGE_SIZE=page_size,
         DIM_NOPE=DIM_NOPE,
@@ -236,6 +249,9 @@ def gather_dequant_requant_fp8_paged_dsv4(
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
         PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
         S_OFFSET_BYTES=s_offset_bytes,
+        TOKENS_PER_PROG=tokens_per_prog,
+        WRITE_ROPE=rope_out is not None,
+        num_warps=4,
     )
     return out
 
@@ -460,11 +476,14 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
 @triton.jit
 def _gather_dequant_requant_fp8_paged_kernel(
     output_ptr,
+    rope_output_ptr,
     buf_fp8_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
     page_table_ptr,
     output_stride_0,
+    rope_output_stride_0,
+    num_tokens,
     BYTES_PER_PAGE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     DIM_NOPE: tl.constexpr,
@@ -474,9 +493,16 @@ def _gather_dequant_requant_fp8_paged_kernel(
     NOPE_ROPE_BYTES: tl.constexpr,
     PADDED_SCALE_PER_TOKEN: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
+    TOKENS_PER_PROG: tl.constexpr,
+    WRITE_ROPE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    # Same TOKENS_PER_PROG grid as _dequantize_k_cache_paged_kernel: one token per
+    # program ran this pass at ~0.7 TB/s. Elementwise, so no output bit changes.
+    token_ids = tl.program_id(0).to(tl.int64) * TOKENS_PER_PROG + tl.arange(
+        0, TOKENS_PER_PROG
+    ).to(tl.int64)
+    tmask = token_ids < num_tokens
+    loc = tl.load(page_table_ptr + token_ids, mask=tmask, other=0).to(tl.int64)
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
@@ -484,26 +510,47 @@ def _gather_dequant_requant_fp8_paged_kernel(
     token_scale_base = (
         page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
     )
-    out_row_base = token_id * output_stride_0
+    out_row_base = token_ids * output_stride_0
 
-    nope_offs = tl.arange(0, TILE_SIZE)
-    for tile_id in tl.static_range(NUM_SCALE_TILES):
-        fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
-
-        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
-        scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
-
-        out_off = out_row_base + tile_id * TILE_SIZE + nope_offs
-        tl.store(
-            output_ptr + out_off,
-            (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
-        )
+    tiles = tl.arange(0, PADDED_SCALE_PER_TOKEN)
+    inner = tl.arange(0, TILE_SIZE)
+    tile_mask = tmask[:, None, None] & (tiles < NUM_SCALE_TILES)[None, :, None]
+    fp8_off = (
+        token_data_base[:, None, None]
+        + tiles[None, :, None] * TILE_SIZE
+        + inner[None, None, :]
+    )
+    fp8_vals = tl.load(buf_fp8_ptr + fp8_off, mask=tile_mask, other=0.0).to(tl.float32)
+    scale_u8 = tl.load(
+        buf_uint8_ptr + token_scale_base[:, None] + tiles[None, :],
+        mask=tmask[:, None],
+        other=0,
+    ).to(tl.int32)
+    scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+    out_off = (
+        out_row_base[:, None, None]
+        + tiles[None, :, None] * TILE_SIZE
+        + inner[None, None, :]
+    )
+    tl.store(
+        output_ptr + out_off,
+        (fp8_vals * scale_pow2[:, :, None]).to(output_ptr.dtype.element_ty),
+        mask=tile_mask,
+    )
 
     rope_offs = tl.arange(0, DIM_ROPE)
-    bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
-    rope_data = tl.load(buf_bf16_ptr + bf16_off)
+    bf16_off = (token_data_base[:, None] + DIM_NOPE) // 2 + rope_offs[None, :]
+    rope_data = tl.load(buf_bf16_ptr + bf16_off, mask=tmask[:, None], other=0.0)
     tl.store(
-        output_ptr + out_row_base + DIM_NOPE + rope_offs,
+        output_ptr + out_row_base[:, None] + DIM_NOPE + rope_offs[None, :],
         rope_data.to(output_ptr.dtype.element_ty),
+        mask=tmask[:, None],
     )
+    if WRITE_ROPE:
+        tl.store(
+            rope_output_ptr
+            + token_ids[:, None] * rope_output_stride_0
+            + rope_offs[None, :],
+            rope_data,
+            mask=tmask[:, None],
+        )
