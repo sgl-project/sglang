@@ -69,6 +69,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum cached IPC staging-buffer shape pairs. Cap this for multi-resolution serving to bound permanent staging memory.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_XPU_DEEPSYMM_RING_PRECISION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>off</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Intel XPU only: run ring attention (<code>--ring-degree</code> &gt; 1) on DeepSymm's IPC ring at <code>bf16</code>, <code>fp8</code>, <code>fp8_mixed</code> or <code>mxfp4</code>, for non-causal BF16 self-attention with head dim 64 or 128. Needs the <code>deep-symm</code> package. <code>fp8_mixed</code> / <code>mxfp4</code> run for batch 1 only (larger batches use the bf16 ring); GQA and head dim 64 use bf16; a ring group that spans hosts keeps the torch ring. A new ring shape (resolution, frame count, batch; also a joint text+image sequence whose prompt length varies) frees the previous request's arenas before allocating. An invalid value fails at startup.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>-1</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Head groups for pipelining the Ulysses exchange against dense attention over the copy engine. <code>-1</code> picks the largest count that divides the heads per rank while each group still fills the GPU; <code>0</code> keeps the sequential exchange; <code>N</code> forces <code>N</code> groups. Results are bit-identical either way.</td>

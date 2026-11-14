@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
+    SGLANG_DIFFUSION_XPU_DEEPSYMM_RING_PRECISION: str = "off"
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
     SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
     SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK: bool = False
@@ -262,6 +263,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Empty means automatic plugin activation followed by built-in detection.
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
         "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
+    ),
+    "SGLANG_DIFFUSION_XPU_DEEPSYMM_RING_PRECISION": _lazy_str(
+        "SGLANG_DIFFUSION_XPU_DEEPSYMM_RING_PRECISION", "off"
     ),
     # Import an installed package that registers out-of-tree diffusion models
     # and pipelines. This is shared with the SRT model plugin mechanism.
