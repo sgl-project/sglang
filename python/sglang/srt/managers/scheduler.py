@@ -2069,6 +2069,7 @@ class Scheduler(
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
+            "page_size": self.page_size,
             "startup_time": self.startup_time,
         }
 

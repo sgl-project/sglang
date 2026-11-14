@@ -37,6 +37,7 @@ from sglang.srt.elastic_ep.topology import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.dp_prefix_router import PrefixAwareSelector, prefix_block_size
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -108,6 +109,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AWARE = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -190,11 +192,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AWARE: self.prefix_aware_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.PREFIX_AWARE,
         )
 
         parallel = get_parallel()
@@ -252,6 +256,14 @@ class DataParallelController:
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
+
+        self.prefix_selector: PrefixAwareSelector | None = None
+        if (
+            self.load_balance_method == LoadBalanceMethod.PREFIX_AWARE
+            and get_parallel().node_rank == 0
+            and not get_exec().moe.is_ep_scale_joiner
+        ):
+            self.prefix_selector = self._make_prefix_selector()
 
         self.init_dispatcher()
 
@@ -808,6 +820,9 @@ class DataParallelController:
             self._scheduler_init_infos.extend(infos)
             self.max_total_num_tokens = infos[0]["max_total_num_tokens"]
             self.max_req_input_len = infos[0]["max_req_input_len"]
+            # From the scheduler, not get_schedule(): the dp_controller role may
+            # not read the schedule namespace (ROLE_NAMESPACE_SETS).
+            self.page_size = infos[0].get("page_size")
             self.startup_time = aggregate_scheduler_startup_times(
                 info.get("startup_time") for info in self._scheduler_init_infos
             )
@@ -906,6 +921,74 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def _make_prefix_selector(self) -> PrefixAwareSelector:
+        block_size = prefix_block_size(self.page_size)
+        # A rank's radix cache holds at most its KV pool (plus any HiCache
+        # tier). Tracking more than it holds only keeps stale affinities, which
+        # still route a session to one rank; tracking less drops live ones. Err
+        # on the large side.
+        capacity_tokens = 4 * self.max_total_num_tokens
+        selector = PrefixAwareSelector(
+            num_ranks=self.max_dp_size,
+            block_size=block_size,
+            capacity_blocks=max(1, capacity_tokens // block_size),
+            cache_threshold=envs.SGLANG_DP_PREFIX_ROUTING_CACHE_THRESHOLD.get(),
+            balance_abs_threshold=envs.SGLANG_DP_PREFIX_ROUTING_BALANCE_ABS_THRESHOLD.get(),
+            balance_rel_threshold=envs.SGLANG_DP_PREFIX_ROUTING_BALANCE_REL_THRESHOLD.get(),
+            # Stats line every decode_log_interval routed requests.
+            log_interval=get_observability().decode_log_interval,
+        )
+        logger.info(
+            "Prefix-aware DP routing: block_size=%d, capacity=%d tokens/rank, "
+            "cache_threshold=%.2f, balance_abs_threshold=%d, "
+            "balance_rel_threshold=%.2f",
+            block_size,
+            capacity_tokens,
+            selector.cache_threshold,
+            selector.balance_abs_threshold,
+            selector.balance_rel_threshold,
+        )
+        return selector
+
+    def prefix_aware_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        budget = self.dp_budget
+        active = [r for r in self._active_workers if r < budget.num_dp_ranks]
+        if not active:
+            raise RuntimeError("No active DP workers are available for routing.")
+        # input_embeds has no token ids, and mm_inputs still holds shared
+        # placeholder tokens here (per-item pad values are applied in the
+        # scheduler), so neither can be matched by token prefix at this layer.
+        if req.input_ids is None or getattr(req, "mm_inputs", None) is not None:
+            estimated_tokens = (
+                len(req.input_ids)
+                if req.input_ids is not None
+                else len(req.input_embeds)
+            )
+            target = min(
+                active,
+                key=lambda r: (budget.total_requests[r], budget.total_tokens[r]),
+            )
+        else:
+            lora_id = getattr(req, "lora_id", None)
+            extra_key = getattr(req, "extra_key", None)
+            cache_salt = getattr(req, "cache_salt", None)
+            seed = (
+                0
+                if lora_id is None and extra_key is None and cache_salt is None
+                else hash((lora_id, extra_key, cache_salt))
+            )
+            estimated_tokens = len(req.input_ids)
+            target = self.prefix_selector.select(
+                req.input_ids, budget.total_requests, active, seed=seed
+            )
+        # Same speculative increment as DPBudget.dispatch, until the next
+        # load snapshot replaces it.
+        budget.total_requests[target] += 1
+        budget.total_tokens[target] += estimated_tokens
+        sock_send(self.workers[target], req)
 
     def event_loop(self):
         while True:
