@@ -43,6 +43,18 @@ def prefix_hold(text: str, tokens: List[str]) -> Tuple[str, str]:
     return text[:-max_hold], text[-max_hold:]
 
 
+_MAX_TOKEN_LEN = len("<|constrain|>")
+
+# Same truthiness as `(?:^|\s)(?:assistant)?\s*(...)`, which backtracks
+# quadratically over whitespace runs.
+_TEXT_FORMAT_CHANNEL_REGEX = re.compile(
+    r"(?<!\S)(?:assistant\s*)?(analysis|commentary)", re.IGNORECASE
+)
+_TEXT_FORMAT_START_REGEX = re.compile(
+    r"(?<!\S)(?:assistant\s*)?(analysis|commentary|assistantfinal)", re.IGNORECASE
+)
+
+
 def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
     """Iterate over structural tokens in left-to-right order."""
     TOKENS = {
@@ -57,6 +69,7 @@ def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
 
     pos = start_pos
     has_unknown_tokens = False
+    next_close = None
     while pos < len(text):
         # Find next "<|"
         marker_pos = text.find("<|", pos)
@@ -77,8 +90,11 @@ def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
                 found_token = True
                 break
         if not found_token:
-            tail = text[marker_pos:]
-            is_partial = any(lit.startswith(tail) for lit in TOKENS)
+            # A tail longer than every literal cannot be a partial token; skip
+            # the slice, which would copy the rest of the text per unknown marker.
+            is_partial = len(text) - marker_pos <= _MAX_TOKEN_LEN and any(
+                lit.startswith(text[marker_pos:]) for lit in TOKENS
+            )
             if is_partial:
                 # Hold whole tail (partial token)
                 yield Token("TEXT", marker_pos, len(text))
@@ -90,8 +106,11 @@ def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
                 # Emit the "<|" as a TEXT token first
                 yield Token("TEXT", marker_pos, marker_pos + 2)
 
-                # Try to find a closing "|>" for this unknown token
-                close_pos = text.find("|>", marker_pos + 2)
+                # Try to find a closing "|>" for this unknown token, reusing the
+                # last lookup while it is ahead; a find per marker is quadratic.
+                if next_close is None or -1 < next_close < marker_pos + 2:
+                    next_close = text.find("|>", marker_pos + 2)
+                close_pos = next_close
                 if close_pos != -1:
                     # Look ahead to the next structural token after the unknown close
                     next_marker = text.find("<|", close_pos + 2)
@@ -421,16 +440,18 @@ class TextStrategy:
 
     def __init__(self):
         self.buffer_context = ""
+        # `(?:assistant\s*)?` and no `\s*` before `assistantfinal`: the
+        # `\s*X?\s*` and `(.*?)\s*` forms backtrack quadratically over whitespace.
         self.patterns = {
             "analysis_then_final": re.compile(
-                r"^\s*(?:assistant)?\s*(analysis|commentary)(.*?)\s*assistantfinal\s*(.*)\s*$",
+                r"^\s*(?:assistant\s*)?(analysis|commentary)(.*?)assistantfinal\s*(.*)\s*$",
                 re.IGNORECASE | re.DOTALL,
             ),
             "final_only": re.compile(
                 r"^\s*assistantfinal\s*(.*)\s*$", re.IGNORECASE | re.DOTALL
             ),
             "analysis_only": re.compile(
-                r"^\s*(?:assistant)?\s*(analysis|commentary)(.*)\s*$",
+                r"^\s*(?:assistant\s*)?(analysis|commentary)(.*)\s*$",
                 re.IGNORECASE | re.DOTALL,
             ),
         }
@@ -453,9 +474,7 @@ class TextStrategy:
             return events, ""
 
         # If assistantfinal appears to be incomplete (e.g., 'assistantfin'), hold entire buffer
-        if re.search(
-            r"(?:^|\s)(?:assistant)?\s*(analysis|commentary)", text, re.IGNORECASE
-        ):
+        if _TEXT_FORMAT_CHANNEL_REGEX.search(text):
             low = text.lower()
             if "assistantfin" in low and "assistantfinal" not in low:
                 return events, text
@@ -517,11 +536,7 @@ class HarmonyParser:
         if self.strategy is None:
             if "<|channel|>" in self._buffer or "<|start|>" in self._buffer:
                 self.strategy = CanonicalStrategy()
-            elif re.search(
-                r"(?:^|\s)(?:assistant)?\s*(analysis|commentary|assistantfinal)",
-                self._buffer,
-                re.IGNORECASE,
-            ):
+            elif _TEXT_FORMAT_START_REGEX.search(self._buffer):
                 self.strategy = TextStrategy()
             else:
                 # Not yet determined, hold
