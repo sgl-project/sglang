@@ -25,6 +25,11 @@ AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
 )  # 64KB, to prevent aiohttp's "Chunk too big" error
 
+# A server's /health and /health_generate run a one-token generation by default
+# and give up after SGLANG_HEALTH_CHECK_TIMEOUT (20 s by default) with a 503;
+# wait a little longer so the server's own answer arrives.
+HEALTH_CHECK_TIMEOUT_SECS = 30
+
 
 def maybe_wrap_ipv6_address(address: str) -> str:
     try:
@@ -274,21 +279,64 @@ app = FastAPI()
 lb: Optional[MiniLoadBalancer] = None
 
 
+async def _probe_backends(path: str) -> Response:
+    """GET `path` on every registered server; 200 only if all answer 200.
+
+    MiniLB routes to every registered server and does not track their health,
+    so a single dead server already fails part of the traffic. This is stricter
+    than the Rust gateway's /readiness, which skips unhealthy workers.
+    """
+    timeout = HEALTH_CHECK_TIMEOUT_SECS
+
+    async def probe(session, server):
+        try:
+            async with session.get(f"{server}{path}") as response:
+                return response.status, None
+        except asyncio.TimeoutError:
+            return None, f"no answer in {timeout} s"
+        except aiohttp.ClientError as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    roles = {"prefill": list(lb.prefill_urls), "decode": list(lb.decode_urls)}
+    backends = [(role, url) for role, urls in roles.items() for url in urls]
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout)
+    ) as session:
+        results = await asyncio.gather(*(probe(session, url) for _, url in backends))
+    unhealthy = [
+        {"role": role, "url": url, "status": status, "error": error}
+        for (role, url), (status, error) in zip(backends, results)
+        if status != 200
+    ]
+    # A role switch can briefly leave a role with no registered server.
+    unhealthy += [
+        {"role": role, "url": None, "status": None, "error": "no server registered"}
+        for role, urls in roles.items()
+        if not urls
+    ]
+    if not unhealthy:
+        return Response(status_code=200)
+    logger.warning(f"[MiniLB] {path}: unhealthy backends {unhealthy}")
+    return ORJSONResponse(
+        content={"unhealthy": unhealthy},
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+    )
+
+
+@app.get("/liveness")
+async def liveness():
+    """200 while the MiniLB process serves requests; ignores the backends."""
+    return Response(status_code=200)
+
+
 @app.get("/health")
 async def health_check():
-    return Response(status_code=200)
+    return await _probe_backends("/health")
 
 
 @app.get("/health_generate")
 async def health_generate():
-    async with aiohttp.ClientSession() as session:
-        # Create the tasks
-        tasks = []
-        for server in chain(lb.prefill_urls, lb.decode_urls):
-            tasks.append(session.get(f"{server}/health_generate"))
-        for i, response in enumerate(asyncio.as_completed(tasks)):
-            await response
-    return Response(status_code=200)
+    return await _probe_backends("/health_generate")
 
 
 async def _post_role_switch(worker_url, body):
