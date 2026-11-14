@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.watermarking.core import WatermarkState
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.spec_repetition_penalty import SpecRepetitionState
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -748,6 +749,7 @@ def eagle_sample(
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
+    repetition_state: Optional[SpecRepetitionState] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -813,7 +815,21 @@ def eagle_sample(
                 dim=0,
             )
         )
-    if sampling_info.acc_scaling_penalties is not None:
+    exact_repetition = (
+        repetition_state is not None
+        and sampling_info.spec_repetition_penalties is not None
+    )
+    if exact_repetition:
+        repetition_state.apply_verify(
+            logits=next_token_logits,
+            slots=batch.req_pool_indices,
+            candidates=verify_input.draft_token.reshape(
+                bs, verify_input.draft_token_num
+            ),
+            penalties=sampling_info.spec_repetition_penalties,
+            chain=verify_input.tree_topk == 1,
+        )
+    elif sampling_info.acc_scaling_penalties is not None:
         apply_scaling_penalties(
             next_token_logits,
             torch.repeat_interleave(
@@ -1225,6 +1241,13 @@ def eagle_sample(
     # name no longer flips semantics mid-function (naming doc C2).
     if accept_lens is None:
         accept_lens = num_correct_drafts + 1
+    if exact_repetition:
+        repetition_state.add_committed_tokens(
+            slots=batch.req_pool_indices,
+            roots=verify_input.draft_token[:: verify_input.draft_token_num],
+            predict=predict,
+            accept_index=accept_index,
+        )
     if watermark_state is not None and sampling_info.has_watermark_candidates:
         watermark_state.record_speculative(
             batch.req_pool_indices,

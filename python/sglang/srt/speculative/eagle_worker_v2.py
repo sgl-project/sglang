@@ -103,6 +103,10 @@ from sglang.srt.speculative.eagle_worker_common import (
 )
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_repetition_penalty import (
+    SpecRepetitionState,
+    create_spec_repetition_state,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
@@ -1319,6 +1323,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
     _simulated_acc_len_rng: Optional[torch.Generator] = None
     _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+    _repetition_state: Optional[SpecRepetitionState] = None
 
     @property
     def draft_parallel_layout(self):
@@ -1421,6 +1426,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
         ):
             self._init_post_verify_graphs()
+        self._repetition_state = create_spec_repetition_state(
+            req_generation=self.req_to_token_pool.req_generation,
+            vocab_size=self.target_worker.model_runner.model_config.vocab_size,
+            device=self.device,
+        )
 
     def _init_post_verify_graphs(self) -> None:
         # A key is captured at its first rounds, which attention-DP ranks do not reach
@@ -1605,6 +1615,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _forward_prefill_batch(
         self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None
     ):
+        if (
+            self._repetition_state is not None
+            and batch.forward_mode.is_mixed()
+            and batch.decoding_reqs
+            and batch.sampling_info.spec_repetition_penalties is not None
+        ):
+            # Running requests sit at the end of a mixed batch, one token each.
+            n = len(batch.decoding_reqs)
+            self._repetition_state.apply_mixed_tails(
+                reqs=batch.decoding_reqs,
+                slots=batch.req_pool_indices[-n:],
+                roots=batch.input_ids[-n:],
+                penalties=batch.sampling_info.spec_repetition_penalties[-n:],
+                scaling_penalties=batch.sampling_info.acc_scaling_penalties[-n:],
+            )
         # Target prefill
         target_capture_mode = (
             CaptureHiddenMode.NULL
@@ -2062,4 +2087,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             post_verify_graphs=self._post_verify_graphs,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             sparse_bonus_argmax=max_top_k is not None,
+            repetition_state=self._repetition_state,
         )

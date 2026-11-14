@@ -269,6 +269,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
     from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
+    from sglang.srt.speculative.spec_repetition_penalty import SpecRepetitionState
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -773,6 +774,7 @@ def run_eagle_verify(
     post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
+    repetition_state: Optional[SpecRepetitionState] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -931,7 +933,19 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+    if (
+        repetition_state is not None
+        and not batch.forward_mode.is_idle()
+        and batch.sampling_info.spec_repetition_penalties is not None
+    ):
+        repetition_state.sync_owners(batch.reqs)
+    else:
+        # Without the exact penalty the runtime hooks below may take this verify.
+        repetition_state = None
+    if (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        and repetition_state is None
+    ):
         watermark_full_mask = (
             target_worker.model_runner.attn_backend.verify_mask is None
             or target_worker.model_runner.attn_backend.verify_mask.mode
@@ -985,6 +999,7 @@ def run_eagle_verify(
             ),
             simulated_acc_len_rng=simulated_acc_len_rng,
             sparse_bonus_argmax=sparse_bonus_argmax,
+            repetition_state=repetition_state,
         )
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
