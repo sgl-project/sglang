@@ -44,12 +44,13 @@ class OpenAIServingTokenize(OpenAIServingBase):
     ) -> Union[TokenizeResponse, ErrorResponse]:
         try:
             tokenizer = self.tokenizer_manager.tokenizer
-            max_model_len = getattr(tokenizer, "model_max_length", -1)
-            # ORJSON accepts signed negative and unsigned positive 64-bit integers.
-            if isinstance(max_model_len, int) and not (
-                -(2**63) <= max_model_len < 2**64
-            ):
-                max_model_len = self.tokenizer_manager.model_config.context_len
+            # Report the limit the server actually enforces. Request
+            # validation rejects prompts at or above context_len, and
+            # /v1/models reports context_len as max_model_len, so the
+            # tokenizer's own model_max_length (often much larger, e.g.
+            # 131072 for a server running with context_len 40960) would
+            # mislead clients budgeting prompts against this field.
+            max_model_len = self.tokenizer_manager.model_config.context_len
 
             if request.messages is not None:
                 token_ids = self._tokenize_chat_request(request)
