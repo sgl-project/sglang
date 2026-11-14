@@ -66,7 +66,7 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
     def test_a_gsm8k(
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
             base_url=self.base_url,

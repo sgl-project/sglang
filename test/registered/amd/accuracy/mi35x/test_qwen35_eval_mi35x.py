@@ -69,7 +69,7 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
         )
 
         try:
-            requests.get(self.base_url + "/flush_cache")
+            requests.post(self.base_url + "/flush_cache")
 
             eval_config = yaml.safe_load(
                 Path(self.model_config_name).read_text(encoding="utf-8")

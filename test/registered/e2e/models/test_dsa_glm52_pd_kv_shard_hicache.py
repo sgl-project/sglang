@@ -317,7 +317,7 @@ class TestGLM52PDShardedHiCacheAccuracy(
         # Flush both servers before seeding; flushing after pressure would also
         # drop the host copy and turn this into a cold-cache accuracy test.
         for url in (self.prefill_url, self.decode_url):
-            response = requests.get(url + "/flush_cache", timeout=30)
+            response = requests.post(url + "/flush_cache", timeout=30)
             self.assertEqual(response.status_code, 200, response.text)
 
         data_path = download_and_cache_file(GSM8K_URL)

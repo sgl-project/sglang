@@ -39,10 +39,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // alias).
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
-        .route("/flush_cache", get(flush_cache).post(flush_cache))
+        .route("/flush_cache", post(flush_cache))
         .route("/weights_checker", get(check_weights).post(check_weights))
-        .route("/start_profile", get(start_profile).post(start_profile))
-        .route("/stop_profile", get(stop_profile).post(stop_profile))
+        .route("/start_profile", post(start_profile))
+        .route("/stop_profile", post(stop_profile))
         .route("/abort_request", post(abort_request))
         // Listener-to-listener: another DP rank's control request for this
         // rank's scheduler (see `api_server::core::peer`).
@@ -160,7 +160,7 @@ struct FlushCacheQuery {
     timeout: f64,
 }
 
-/// `GET|POST /flush_cache?timeout=<s>` — the scheduler flushes its caches in
+/// `POST /flush_cache?timeout=<s>` — the scheduler flushes its caches in
 /// its own loop, after waiting up to `timeout` seconds for running requests to
 /// finish. Python's status and plain-text body: 200 once flushed, 400 with the
 /// scheduler's reason otherwise.
@@ -334,7 +334,7 @@ struct StartProfileBody {
     options: ProfileOptions,
 }
 
-/// `GET|POST /start_profile` — the scheduler ranks start their profilers
+/// `POST /start_profile` — the scheduler ranks start their profilers
 /// with the body's options (Python's defaults for an absent or `null` body);
 /// which ranks under attention DP: see `ProfileReq`.
 /// Python's plain-text 200 once started.
@@ -366,7 +366,7 @@ async fn start_profile(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
     )
 }
 
-/// `GET|POST /stop_profile` — the scheduler ranks stop their profilers and
+/// `POST /stop_profile` — the scheduler ranks stop their profilers and
 /// write their traces (which ranks under attention DP: see `ProfileReq`);
 /// any body is ignored, as Python ignores it.
 async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
@@ -874,7 +874,7 @@ mod tests {
                  are running or waiting requests, the operation will not be performed.)\n",
             ),
             (
-                "GET",
+                "POST",
                 "/flush_cache",
                 0.0,
                 (false, "Timed out waiting for idle state."),
@@ -1422,7 +1422,7 @@ mod tests {
             (StatusCode::OK, None, "Start profiling.\n".to_owned())
         );
 
-        for (method, body) in [("GET", ""), ("POST", "null"), ("POST", "{}")] {
+        for (method, body) in [("POST", ""), ("POST", "null"), ("POST", "{}")] {
             let (header, response) =
                 profile_round_trip(method, "/start_profile", body, (true, "Succeeded")).await;
             assert_eq!(header.len(), 16, "{body:?}");
@@ -1501,7 +1501,11 @@ mod tests {
     /// a refused stop (nothing running) is Python's bare 500.
     #[tokio::test]
     async fn stop_profile_relays_the_scheduler_outcome() {
-        for (method, body) in [("POST", "{}"), ("GET", ""), ("POST", r#"{"num_steps": 5}"#)] {
+        for (method, body) in [
+            ("POST", "{}"),
+            ("POST", ""),
+            ("POST", r#"{"num_steps": 5}"#),
+        ] {
             let (header, response) =
                 profile_round_trip(method, "/stop_profile", body, (true, "Succeeded.")).await;
             assert_eq!(header.len(), 16, "{body:?}");

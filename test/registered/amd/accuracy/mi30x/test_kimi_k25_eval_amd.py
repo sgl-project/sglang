@@ -71,7 +71,7 @@ class TestKimiK25EvalAMD(CustomTestCase):
 
     def test_kimi_k25_gsm8k_accuracy(self):
         """Test Kimi-K2.5 with GSM8K few-shot completion benchmark."""
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
             num_shots=8,

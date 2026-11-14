@@ -50,7 +50,7 @@ class TestFlashAttention3LocalAttn(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
             base_url=self.base_url,

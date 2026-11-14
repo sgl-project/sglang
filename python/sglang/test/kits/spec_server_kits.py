@@ -199,7 +199,7 @@ class SpecAccuracyKit:
     gsm8k_accept_len_thres = None
 
     def test_gsm8k(self):
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
@@ -235,7 +235,7 @@ class SpecPerfKit:
     perf_output_throughput_thres = 50
 
     def test_max_token_one(self):
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,

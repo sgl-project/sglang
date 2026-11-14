@@ -71,7 +71,7 @@ class TestQwen3CoderNext(CustomTestCase):
 
     def test_a_gsm8k(self):
         """GSM8K few-shot accuracy (runs first to warm up server)."""
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
             num_shots=5,
@@ -137,7 +137,7 @@ class TestQwen3CoderNextMTP(CustomTestCase):
 
     def test_a_gsm8k(self):
         """GSM8K few-shot accuracy with MTP (runs first to warm up server)."""
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
             num_shots=5,

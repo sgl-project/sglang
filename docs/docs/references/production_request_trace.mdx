@@ -64,7 +64,7 @@ This section explains how to configure the request tracing and export the trace 
 
     **At runtime** — dynamically adjust via HTTP API without restarting:
     ```bash Command
-    curl http://0.0.0.0:30000/set_trace_level?level=2
+    curl -X POST "http://0.0.0.0:30000/set_trace_level?level=2"
     ```
     Replace `0.0.0.0:30000` with your actual server address, and replace `level=2` with the level you want to set.
 

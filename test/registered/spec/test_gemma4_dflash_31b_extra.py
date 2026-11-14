@@ -119,7 +119,7 @@ class TestGemma4DFlash31B(CustomTestCase):
                 timeout=SERVER_LAUNCH_TIMEOUT,
                 other_args=self._server_args(),
             )
-            requests.get(self.base_url + "/flush_cache", timeout=30)
+            requests.post(self.base_url + "/flush_cache", timeout=30)
 
             server_info = get_server_info(self.base_url)
             self.assertEqual(

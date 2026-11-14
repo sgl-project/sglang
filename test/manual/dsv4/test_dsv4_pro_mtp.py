@@ -101,7 +101,7 @@ class TestDSV4ProMTPSimulatedAcc(CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def _run_one_batch(self, input_len):
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
         server_args = ServerArgs(model_path=DSV4_PRO_MODEL_PATH)
         bench_args = OneBatchBenchArgs(
             run_name=f"dsv4_pro_simacc_isl{input_len}",
@@ -206,7 +206,7 @@ class TestDSV4ProMTPHongloumeng(CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def _run_custom_bench(self, dataset_path):
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
         args = SimpleNamespace(
             backend="sglang",
             base_url=self.base_url,

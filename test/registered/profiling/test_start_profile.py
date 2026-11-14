@@ -123,7 +123,7 @@ class TestStartProfile(CustomTestCase):
             )
         )
         self._post_request()
-        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/stop_profile")
+        response = requests.post(f"{DEFAULT_URL_FOR_TEST}/stop_profile")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.text, "Stop profiling. This will take some time.\n")
         self._check_non_empty_profile_dir()
