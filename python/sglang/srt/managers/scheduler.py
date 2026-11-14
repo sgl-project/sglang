@@ -1610,7 +1610,6 @@ class Scheduler(
         )
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
-        self.decode_lane_balancer = None
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
@@ -1714,15 +1713,14 @@ class Scheduler(
                 draft_kv_ring=draft_kv_ring,
             )
             margin = get_disagg().disaggregation_decode_lane_balance_margin
-            if margin > 0:
-                # A per-rank wait clock could make attention-TP/CP peers admit differently.
-                if get_parallel().attn_tp_size * get_parallel().attn_cp_size == 1:
-                    self.decode_lane_balancer = DecodeLaneBalancer(margin)
-                else:
-                    logger.warning(
-                        "--disaggregation-decode-lane-balance-margin needs "
-                        "attention TP and CP size 1; ignored."
-                    )
+            parallel = get_parallel()
+            # A per-rank wait clock could make attention-TP/CP peers admit differently.
+            if (
+                margin > 0
+                and parallel.attn_dp_enabled
+                and parallel.attn_tp_size * parallel.attn_cp_size == 1
+            ):
+                self.decode_lane_balancer = DecodeLaneBalancer(margin)
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.

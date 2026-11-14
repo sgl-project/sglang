@@ -4117,6 +4117,8 @@ class DecodeLaneBalancer:
 
 
 class SchedulerDisaggregationDecodeMixin:
+    decode_lane_balancer: Optional[DecodeLaneBalancer] = None
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
