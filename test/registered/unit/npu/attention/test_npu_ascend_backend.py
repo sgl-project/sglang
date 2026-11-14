@@ -4,6 +4,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 
 import sys
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -16,30 +17,63 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=5, suite="base-a-test-npu")
 
-# Mock NPU-only modules before importing the source module.
-for _ in (
-    "torch_npu",
-    "torch_npu.contrib",
-    "sgl_kernel_npu",
-    "sgl_kernel_npu.attention",
-    "sgl_kernel_npu.attention.sinks_attention",
-    "sgl_kernel_npu.operators",
-    "sgl_kernel_npu.operators.attention",
-    "sglang.srt.speculative",
-    "sglang.srt.speculative.decoupled_spec_io",
-    "sglang.srt.speculative.spec_info",
-    "sglang.srt.speculative.eagle_info",
-):
-    sys.modules.setdefault(_, MagicMock())
+_MODULE_STUBS = {
+    name: MagicMock()
+    for name in (
+        "torch_npu",
+        "torch_npu.contrib",
+        "sgl_kernel_npu",
+        "sgl_kernel_npu.attention",
+        "sgl_kernel_npu.attention.sinks_attention",
+        "sgl_kernel_npu.operators",
+        "sgl_kernel_npu.operators.attention",
+        "sglang.srt.speculative",
+        "sglang.srt.speculative.decoupled_spec_io",
+        "sglang.srt.speculative.spec_info",
+        "sglang.srt.speculative.eagle_info",
+    )
+}
+_module_stub_ctx = None
 
-from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
-    AscendAttnBackend,
-    AscendAttnMaskBuilder,
-    ForwardMetadata,
-    _expand_dsa_sparse_indices,
-    _reshape_kv_for_fia_nz,
-)
-from sglang.srt.model_executor.forward_mode import ForwardMode
+
+@contextmanager
+def _temporary_module_stubs(stubs):
+    inserted = []
+    for name, stub in stubs.items():
+        if name not in sys.modules:
+            sys.modules[name] = stub
+            inserted.append(name)
+    try:
+        yield
+    finally:
+        for name in inserted:
+            if sys.modules.get(name) is stubs[name]:
+                sys.modules.pop(name, None)
+
+
+def setUpModule():
+    global _module_stub_ctx
+    _module_stub_ctx = _temporary_module_stubs(_MODULE_STUBS)
+    _module_stub_ctx.__enter__()
+
+
+def tearDownModule():
+    global _module_stub_ctx
+    if _module_stub_ctx is not None:
+        _module_stub_ctx.__exit__(None, None, None)
+        _module_stub_ctx = None
+
+
+# Mock NPU-only modules only while importing the source module and running this test module.
+with _temporary_module_stubs(_MODULE_STUBS):
+    from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+        AscendAttnBackend,
+        AscendAttnMaskBuilder,
+        ForwardMetadata,
+        _expand_dsa_sparse_indices,
+        _reshape_kv_for_fia_nz,
+    )
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):

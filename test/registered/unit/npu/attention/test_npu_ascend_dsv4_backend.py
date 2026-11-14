@@ -5,6 +5,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.
 import math
 import sys
 import unittest
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -16,27 +17,6 @@ import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=4, suite="base-a-test-npu")
-
-for mod in (
-    "torch_npu",
-    "torch_npu.contrib",
-    "sgl_kernel_npu",
-    "sgl_kernel_npu.attention",
-    "sgl_kernel_npu.attention.sinks_attention",
-    "sgl_kernel_npu.norm",
-    "sgl_kernel_npu.norm.add_rmsnorm_bias",
-    "sglang.srt.speculative",
-    "sglang.srt.speculative.decoupled_spec_io",
-    "sglang.srt.speculative.spec_info",
-    "sglang.srt.speculative.eagle_info",
-    "sglang.srt.speculative.base_spec_worker",
-):
-    sys.modules.setdefault(mod, MagicMock())
-
-# Stub deepseek_v2._is_hip to avoid importing the heavy model.
-_ds2_stub = ModuleType("sglang.srt.models.deepseek_v2")
-_ds2_stub._is_hip = False
-sys.modules.setdefault("sglang.srt.models.deepseek_v2", _ds2_stub)
 
 # Stub eagle_utils with a faithful per_step_draft_out_cache_loc.
 _eagle_stub = ModuleType("sglang.srt.speculative.eagle_utils")
@@ -56,31 +36,85 @@ def _per_step_draft_out_cache_loc(out_cache_loc, batch_size, topk, num_steps):
 
 
 _eagle_stub.per_step_draft_out_cache_loc = _per_step_draft_out_cache_loc
-sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculative"))
-sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
-from sglang.srt.disaggregation.ascend.conn import AscendStateType
-from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
-    C4IndexerAscendBackendMixin,
-    CompressorAscendBackendMixin,
-    DeepseekV4AscendAttnBackend,
-    DeepseekV4AscendMultiStepDraftBackend,
-    _apply_hadamard,
-    _get_kv_indices,
-    _sparse_attn_kv_quant_kwargs,
-    _sparse_attn_ops,
-    _walsh_hadamard_matrix,
-)
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-    dsv4_state_payloads,
-)
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
-    DSV4NPUTokenToKVPool,
-    NPUCompressStatePool,
-)
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
-    DSV4ReqToTokenTablesMixin,
-)
+# Stub deepseek_v2._is_hip to avoid importing the heavy model.
+_ds2_stub = ModuleType("sglang.srt.models.deepseek_v2")
+_ds2_stub._is_hip = False
+
+_MODULE_STUBS = {
+    mod: MagicMock()
+    for mod in (
+        "torch_npu",
+        "torch_npu.contrib",
+        "sgl_kernel_npu",
+        "sgl_kernel_npu.attention",
+        "sgl_kernel_npu.attention.sinks_attention",
+        "sgl_kernel_npu.norm",
+        "sgl_kernel_npu.norm.add_rmsnorm_bias",
+        "sglang.srt.speculative",
+        "sglang.srt.speculative.decoupled_spec_io",
+        "sglang.srt.speculative.spec_info",
+        "sglang.srt.speculative.eagle_info",
+        "sglang.srt.speculative.base_spec_worker",
+    )
+}
+_MODULE_STUBS["sglang.srt.models.deepseek_v2"] = _ds2_stub
+_MODULE_STUBS["sglang.srt.speculative.eagle_utils"] = _eagle_stub
+
+_module_stub_ctx = None
+
+
+@contextmanager
+def _temporary_module_stubs(stubs):
+    inserted = []
+    for name, stub in stubs.items():
+        if name not in sys.modules:
+            sys.modules[name] = stub
+            inserted.append(name)
+    try:
+        yield
+    finally:
+        for name in inserted:
+            if sys.modules.get(name) is stubs[name]:
+                sys.modules.pop(name, None)
+
+
+def setUpModule():
+    global _module_stub_ctx
+    _module_stub_ctx = _temporary_module_stubs(_MODULE_STUBS)
+    _module_stub_ctx.__enter__()
+
+
+def tearDownModule():
+    global _module_stub_ctx
+    if _module_stub_ctx is not None:
+        _module_stub_ctx.__exit__(None, None, None)
+        _module_stub_ctx = None
+
+
+with _temporary_module_stubs(_MODULE_STUBS):
+    from sglang.srt.disaggregation.ascend.conn import AscendStateType
+    from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+        C4IndexerAscendBackendMixin,
+        CompressorAscendBackendMixin,
+        DeepseekV4AscendAttnBackend,
+        DeepseekV4AscendMultiStepDraftBackend,
+        _apply_hadamard,
+        _get_kv_indices,
+        _sparse_attn_kv_quant_kwargs,
+        _sparse_attn_ops,
+        _walsh_hadamard_matrix,
+    )
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+        dsv4_state_payloads,
+    )
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+        DSV4NPUTokenToKVPool,
+        NPUCompressStatePool,
+    )
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+        DSV4ReqToTokenTablesMixin,
+    )
 
 
 class TestVerifyCompressPositions(unittest.TestCase):

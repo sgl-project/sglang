@@ -1,7 +1,7 @@
 """CPU coverage for DSpark FlashMLA and default non-speculative NPU decode."""
 
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -14,25 +14,50 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-for name in (
-    "torch_npu",
-    "torch_npu.contrib",
-    "sgl_kernel_npu",
-    "sgl_kernel_npu.attention",
-    "sgl_kernel_npu.attention.sinks_attention",
-    "sgl_kernel_npu.operators",
-    "sgl_kernel_npu.operators.attention",
-    "sglang.srt.speculative",
-    "sglang.srt.speculative.decoupled_spec_io",
-    "sglang.srt.speculative.spec_info",
-    "sglang.srt.speculative.eagle_info",
-):
-    sys.modules.setdefault(name, MagicMock())
+_MODULE_STUBS = {
+    name: MagicMock()
+    for name in (
+        "torch_npu",
+        "torch_npu.contrib",
+        "sgl_kernel_npu",
+        "sgl_kernel_npu.attention",
+        "sgl_kernel_npu.attention.sinks_attention",
+        "sgl_kernel_npu.operators",
+        "sgl_kernel_npu.operators.attention",
+        "sglang.srt.speculative",
+        "sglang.srt.speculative.decoupled_spec_io",
+        "sglang.srt.speculative.spec_info",
+        "sglang.srt.speculative.eagle_info",
+    )
+}
 
-from sglang.srt.hardware_backend.npu import memory_pool_npu as pool_mod
-from sglang.srt.hardware_backend.npu.attention import ascend_backend as mod
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
-from sglang.srt.model_executor.forward_mode import ForwardMode
+
+@contextmanager
+def _temporary_module_stubs(stubs):
+    inserted = []
+    for name, stub in stubs.items():
+        if name not in sys.modules:
+            sys.modules[name] = stub
+            inserted.append(name)
+    try:
+        yield
+    finally:
+        for name in inserted:
+            if sys.modules.get(name) is stubs[name]:
+                sys.modules.pop(name, None)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _npu_module_stubs():
+    with _temporary_module_stubs(_MODULE_STUBS):
+        yield
+
+
+with _temporary_module_stubs(_MODULE_STUBS):
+    from sglang.srt.hardware_backend.npu import memory_pool_npu as pool_mod
+    from sglang.srt.hardware_backend.npu.attention import ascend_backend as mod
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 @pytest.fixture
