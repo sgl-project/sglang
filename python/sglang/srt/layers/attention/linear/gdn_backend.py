@@ -29,6 +29,10 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillTrackRows,
     build_track_rows,
 )
+from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
+    FlyDSLFusedGDNKernel,
+    FlyDSLGDNKernel,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
     stage_pool_states,
@@ -56,10 +60,11 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import is_gfx95_supported, is_pin_memory_available
 from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -336,7 +341,17 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     return "flashinfer"
 
 
+def _is_flydsl_gdn(backend: LinearAttnKernelBackend) -> bool:
+    return backend.is_flydsl() or backend.is_flydsl_fused()
+
+
 def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
+    if _is_flydsl_gdn(backends.decode) or _is_flydsl_gdn(backends.verify):
+        raise ValueError(
+            "The FlyDSL GDN backends support prefill only. Set "
+            "--linear-attn-prefill-backend flydsl or flydsl_fused and keep "
+            "decode/verify on Triton."
+        )
     if (
         get_exec().deterministic.enable_deterministic_inference
         and backends.prefill.is_flashinfer()
@@ -345,6 +360,26 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "FlashInfer GDN prefill is not supported with "
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
+        )
+    if get_exec().deterministic.enable_deterministic_inference and _is_flydsl_gdn(
+        backends.prefill
+    ):
+        raise ValueError(
+            "FlyDSL GDN prefill is not supported with "
+            "--enable-deterministic-inference. Use "
+            "--linear-attn-prefill-backend triton."
+        )
+
+
+def _validate_fused_flydsl_state_dtype(
+    prefill_backend: LinearAttnKernelBackend, ssm_dtype: torch.dtype
+) -> None:
+    # The fused kernel only takes a bf16 state pool; any other dtype would
+    # silently run the staged path on every batch.
+    if prefill_backend.is_flydsl_fused() and ssm_dtype != torch.bfloat16:
+        raise ValueError(
+            "--linear-attn-prefill-backend flydsl_fused requires "
+            f"--mamba-ssm-dtype bfloat16, got {ssm_dtype}."
         )
 
 
@@ -454,6 +489,17 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
+        elif _is_flydsl_gdn(prefill_backend):
+            if not _use_aiter or not is_gfx95_supported():
+                raise ValueError(
+                    "The FlyDSL GDN prefill backend requires AMD gfx95 and "
+                    "SGLANG_USE_AITER=1"
+                )
+            self.extend_kernel = (
+                FlyDSLFusedGDNKernel()
+                if prefill_backend.is_flydsl_fused()
+                else FlyDSLGDNKernel()
+            )
         elif prefill_backend.is_helion():
             raise ValueError(
                 "The Helion linear-attention backend supports KDA only, not GDN."
@@ -639,6 +685,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
+    kernel_prefill_metadata = None
 
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
@@ -663,6 +710,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        _validate_fused_flydsl_state_dtype(
+            backends.prefill, self.state_pool.mamba_cache.temporal.dtype
+        )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -818,6 +868,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        # Graph replay must not reuse an eager batch's schedule.
+        self.kernel_prefill_metadata = None
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
 
@@ -827,6 +879,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().init_forward_metadata(forward_batch)
         self._init_target_verify_qkv_routing(forward_batch)
         self.mis_metadata = None
+        self.kernel_prefill_metadata = None
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        if (
+            isinstance(extend_kernel, FlyDSLGDNKernel)
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_mixed()
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            self.kernel_prefill_metadata = extend_kernel.build_prefill_metadata(
+                forward_batch.extend_seq_lens_cpu,
+                cu_seqlens=self.forward_metadata.query_start_loc,
+            )
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
                 raise ValueError("GDN MIS metadata requires --enable-mis")
@@ -1563,6 +1628,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
                 output=kwargs.get("linear_attn_output"),
+                prefill_metadata=self.kernel_prefill_metadata,
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
                 track_state=h_track_buf,
