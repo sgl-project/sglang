@@ -2013,6 +2013,13 @@ class ModelRunner:
         COW/clear only happen at prefix match on extend.
         """
         pool = self.req_to_token_pool
+        if pool.holds_state_slots and not self.is_draft_worker:
+            from sglang.srt.layers.communication import k3_kda_tp
+
+            if k3_kda_tp.state_shard_width() > 1:
+                # Head-sharded KDA state: every rank applies every DP rank's ops.
+                k3_kda_tp.mirror_deferred_state_ops(self, forward_batch)
+                return
         if (
             not pool.holds_state_slots
             or self.is_draft_worker

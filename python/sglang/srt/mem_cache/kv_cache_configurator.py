@@ -137,6 +137,12 @@ from sglang.srt.utils.device import (
 logger = logging.getLogger(__name__)
 
 
+def _kda_state_shard_width() -> int:
+    from sglang.srt.layers.communication.k3_kda_tp import state_shard_width
+
+    return state_shard_width()
+
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
@@ -878,7 +884,8 @@ class KVCacheConfigurator:
                 # (SpeculativeState) buffers only the target pool consumes.
                 req_to_token_pool = req_to_token_pool.clone_with_new_mamba(
                     mamba_size=get_schedule().max_mamba_cache_size,
-                    mamba_spec_state_size=sizes.max_running_requests,
+                    mamba_spec_state_size=sizes.max_running_requests
+                    * _kda_state_shard_width(),
                     cache_params=self.mambaish_config.mamba2_cache_params,
                     device=self.device,
                     enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
@@ -1719,7 +1726,7 @@ class KVCacheConfigurator:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
-            mamba_spec_state_size=max_num_reqs,
+            mamba_spec_state_size=max_num_reqs * _kda_state_shard_width(),
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
@@ -3313,7 +3320,11 @@ class KVCacheConfigurator:
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            mamba_cap = get_schedule().max_mamba_cache_size // ratio
+            # Head-sharded KDA state (--enable-kda-tp): the pool holds every DP
+            # rank's slots, each DP rank allocates 1/W of them.
+            mamba_cap = (
+                get_schedule().max_mamba_cache_size // ratio // _kda_state_shard_width()
+            )
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
                 logger.warning(
@@ -3636,11 +3647,13 @@ class KVCacheConfigurator:
             assert get_schedule().max_running_requests is not None
 
         if get_schedule().max_mamba_cache_size is not None:
-            # Use explicitly set max_mamba_cache_size
+            # Use explicitly set max_mamba_cache_size (head-sharded KDA state: the
+            # pool holds every DP rank's slots, so it is not split per DP shard).
             get_context().override(
                 "mamba_pool.per_dp_shard",
                 max_mamba_cache_size=get_schedule().max_mamba_cache_size
-                // self.attn_dp_size,
+                // self.attn_dp_size
+                * _kda_state_shard_width(),
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
@@ -3648,7 +3661,10 @@ class KVCacheConfigurator:
             if reserves_spec_state:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
-                    max(1, get_schedule().max_running_requests // self.attn_dp_size),
+                    # Head-sharded KDA state: verify scratch rows cover every
+                    # DP rank's batch.
+                    max(1, get_schedule().max_running_requests // self.attn_dp_size)
+                    * _kda_state_shard_width(),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
@@ -3662,11 +3678,13 @@ class KVCacheConfigurator:
             and get_schedule().max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
+            # (head-sharded KDA state: the pool holds every DP rank's slots).
             get_context().override(
                 "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=max(
                     1, get_schedule().max_running_requests // self.attn_dp_size
-                ),
+                )
+                * _kda_state_shard_width(),
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm and on PD prefill.
@@ -3705,7 +3723,10 @@ class KVCacheConfigurator:
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
-                    max(1, get_schedule().max_running_requests // self.attn_dp_size),
+                    # Head-sharded KDA state: verify scratch rows cover every
+                    # DP rank's batch.
+                    max(1, get_schedule().max_running_requests // self.attn_dp_size)
+                    * _kda_state_shard_width(),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * (capped_reqs + 1) * D

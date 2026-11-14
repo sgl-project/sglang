@@ -363,6 +363,8 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
+        if mlp_sync_info.tp0_info_cpu is not None:
+            batch.dp_forward_modes = mlp_sync_info.tp0_info_cpu[:, 5].tolist()
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph

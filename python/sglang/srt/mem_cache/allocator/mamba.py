@@ -31,9 +31,12 @@ class MambaSlotAllocator:
     """Free-list of Mamba pool slot indices. Deliberately not a subclass of
     ``BaseTokenToKVPoolAllocator``: slots are per request, not per token."""
 
-    def __init__(self, size: int, device: str):
+    def __init__(self, size: int, device: str, first_slot: int = 1):
         self.size = size
         self.device = device
+        # Slots [first_slot, first_slot + size). A head-sharded KDA pool (--enable-kda-tp)
+        # holds every DP rank's slots; each DP rank allocates only its own range.
+        self.first_slot = first_slot
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
         self.clear()
@@ -93,5 +96,17 @@ class MambaSlotAllocator:
     def clear(self):
         # Slot 0 is reserved as a dummy write target for padded tokens.
         self.free_slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
+            self.first_slot,
+            self.first_slot + self.size,
+            dtype=torch.int64,
+            device=self.device,
         )
+
+
+def mamba_slot_capacity(req_to_token_pool) -> int:
+    """Slots this rank can allocate: its own range of a head-sharded KDA pool (--enable-kda-tp),
+    else the whole pool."""
+    alloc = getattr(req_to_token_pool, "mamba_allocator", None)
+    if isinstance(alloc, MambaSlotAllocator):
+        return alloc.size
+    return req_to_token_pool.mamba_pool.size

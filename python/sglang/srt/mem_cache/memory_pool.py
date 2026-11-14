@@ -1531,10 +1531,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
             replayssm_request_ring=replayssm_request_ring,
             allocate_intermediate_ssm=allocate_intermediate_ssm,
         )
-        self.mamba_allocator = MambaSlotAllocator(
-            size=mamba_size,
-            device=device,
-        )
+        from sglang.srt.layers.communication import k3_kda_tp
+
+        if k3_kda_tp.state_shard_width() > 1:
+            # Head-sharded KDA state: every rank's pool holds all DP ranks' slots; slot
+            # ids are global, this DP rank allocates its 1/W of them.
+            first_slot, per_rank = k3_kda_tp.slot_partition(mamba_size)
+            self.mamba_allocator = MambaSlotAllocator(
+                size=per_rank, device=device, first_slot=first_slot
+            )
+        else:
+            self.mamba_allocator = MambaSlotAllocator(
+                size=mamba_size,
+                device=device,
+            )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         # Qwen4-Exp PLE side states; built disabled rather than None without a config,

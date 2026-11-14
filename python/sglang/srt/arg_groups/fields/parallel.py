@@ -251,6 +251,14 @@ class Parallel(msgspec.Struct):
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",
     ] = False
+    enable_kda_tp: A[
+        bool,
+        "Kimi-K3 under attention DP == TP with attention TP 1: run the KDA layers "
+        "tensor-parallel over the whole TP group (MLA stays attention-DP). Each rank "
+        "keeps 1/TP of every KDA layer's weights and of every DP rank's KDA state; "
+        "the layer all-gathers the DP ranks' rows and reduce-scatters its o_proj "
+        "output back. Cuts the per-step KDA weight reads of small-batch decode by TP x.",
+    ] = False
     kda_weight_shard_size: A[
         Optional[int],
         "Kimi-K3 under attention DP: each group of this many attention-DP ranks "

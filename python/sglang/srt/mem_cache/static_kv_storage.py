@@ -726,12 +726,14 @@ class StaticKVStorage:
                 )
             ]
         if shape.has_state:
+            from sglang.srt.mem_cache.allocator.mamba import mamba_slot_capacity
+
             usage.append(
                 SubPoolUsage(
                     name="mamba",
                     metrics="mamba",
                     label="mamba",
-                    capacity=allocator.state.pool.size,
+                    capacity=mamba_slot_capacity(self.requests),
                     available=allocator.state_slots.available_size(),
                 )
             )

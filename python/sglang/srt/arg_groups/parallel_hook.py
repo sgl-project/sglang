@@ -310,6 +310,43 @@ def handle_kda_weight_shard(server_args: Any):
         )
 
 
+def handle_kda_tp(server_args: Any):
+    cfg = resolving_view(server_args)
+    if not cfg.enable_kda_tp:
+        return
+    view = resolved_view(server_args)
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if (
+        attn_tp_size != 1
+        or cfg.attn_dp_size != cfg.tp_size
+        or cfg.tp_size < 2
+        or view.attn_cp_size != 1
+    ):
+        raise ValueError(
+            "--enable-kda-tp needs attention DP == TP with attention TP 1 and no "
+            f"attention CP (attention DP {cfg.attn_dp_size}, TP {cfg.tp_size}, "
+            f"attention TP {attn_tp_size}, attention CP {view.attn_cp_size})."
+        )
+    if cfg.kda_weight_shard_size is not None:
+        raise ValueError(
+            "--enable-kda-tp and --kda-weight-shard-size are mutually exclusive: KDA TP "
+            "already shards the KDA weights over the TP group."
+        )
+    if cfg.pp_size > 1:
+        raise ValueError("--enable-kda-tp does not support pipeline parallelism.")
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError("--enable-kda-tp requires a Kimi-K3 model configuration.")
+    architecture = model_config_of(server_args).hf_config.architectures[0]
+    if architecture not in _KIMI_K3_ARCHITECTURES:
+        raise ValueError(
+            f"--enable-kda-tp is only supported for Kimi-K3 (got {architecture})."
+        )
+
+
 def handle_decode_context_parallelism(server_args: Any):
     run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)

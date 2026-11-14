@@ -543,9 +543,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
+        from sglang.srt.layers.communication.k3_kda_tp import state_shard_width
+
+        # --enable-kda-tp: a verify covers every DP rank's requests.
+        self._kda_tp_width = state_shard_width()
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
-                self.req_to_token_pool.size,
+                self.req_to_token_pool.size * self._kda_tp_width,
                 model_runner.device,
             )
         )
@@ -555,7 +559,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # accept_lens_pool holds last round's accept length per mamba slot;
         # extend stages fresh requests with 1 (read slot 0). Its presence is the
         # signal that switches the post-verify commit to conv-only.
-        if self._can_fuse_accept_state(verify_backend):
+        # The fused-accept pool is indexed by local slot ids; KDA TP slot ids are global.
+        if self._kda_tp_width == 1 and self._can_fuse_accept_state(verify_backend):
             self.accept_lens_pool = torch.ones(
                 self.req_to_token_pool.size + 1,
                 dtype=torch.int32,

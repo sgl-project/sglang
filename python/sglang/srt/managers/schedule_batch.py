@@ -2070,6 +2070,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Config / flags crossing to ForwardBatch (by-value) ===
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
+    # Every DP rank's forward mode value (ForwardMode.value; IDLE for ranks without a
+    # batch) from the MLP sync all-gather; None without attention DP.
+    dp_forward_modes: Optional[List[int]] = None
 
     # Full-DP metadata from the existing scheduler gather.
     dp_spec_prefill_coordination_metadata: Optional[tuple] = None
@@ -3528,6 +3531,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
             is_extend_in_batch=self.is_extend_in_batch,
+            dp_forward_modes=self.dp_forward_modes,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,

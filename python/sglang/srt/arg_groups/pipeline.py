@@ -179,6 +179,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_elastic_ep,
         handle_eplb_and_dispatch,
         handle_expert_distribution_metrics,
+        handle_kda_tp,
         handle_kda_weight_shard,
         handle_shared_experts_tp,
     )
@@ -318,6 +319,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_a2a_moe, server_args)
     run_hook(handle_shared_experts_tp, server_args)
     run_hook(handle_kda_weight_shard, server_args)
+    run_hook(handle_kda_tp, server_args)
     run_hook(handle_eplb_and_dispatch, server_args)
     run_hook(handle_expert_distribution_metrics, server_args)
     run_hook(handle_elastic_ep, server_args)

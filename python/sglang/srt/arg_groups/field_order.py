@@ -574,5 +574,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_token_space_processor",
     "indexer_kv_cache_dtype",
     "kda_weight_shard_size",
+    "enable_kda_tp",
 )
 # fmt: on
