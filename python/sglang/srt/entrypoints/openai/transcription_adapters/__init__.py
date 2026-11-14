@@ -2,25 +2,25 @@
 #   from ...transcription_adapters import TranscriptionAdapter, register_transcription_adapter
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (  # noqa: F401
     TranscriptionAdapter,
+    TranscriptionPrompt,
     register_transcription_adapter,
     resolve_adapter,
 )
 
 # Import built-in adapters so they self-register via @register_transcription_adapter.
-from sglang.srt.entrypoints.openai.transcription_adapters.glmasr import (  # noqa: F401
-    GlmAsrAdapter,
-)
-from sglang.srt.entrypoints.openai.transcription_adapters.granite_speech import (  # noqa: F401
-    GraniteSpeechAdapter,
-)
 from sglang.srt.entrypoints.openai.transcription_adapters.mimo_v2_asr import (  # noqa: F401
     MiMoV2ASRAdapter,
 )
-from sglang.srt.entrypoints.openai.transcription_adapters.qwen2_audio import (  # noqa: F401
-    Qwen2AudioAdapter,
-)
 from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (  # noqa: F401
     Qwen3ASRAdapter,
+)
+from sglang.srt.entrypoints.openai.transcription_adapters.speech_lm import (  # noqa: F401
+    Gemma4Adapter,
+    GlmAsrAdapter,
+    GraniteSpeechAdapter,
+    Qwen2AudioAdapter,
+    Qwen3OmniAdapter,
+    SpeechLMAdapter,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (  # noqa: F401
     WhisperAdapter,
@@ -28,12 +28,16 @@ from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (  # no
 
 __all__ = [
     "TranscriptionAdapter",
+    "TranscriptionPrompt",
     "register_transcription_adapter",
     "resolve_adapter",
     "WhisperAdapter",
     "Qwen3ASRAdapter",
     "MiMoV2ASRAdapter",
+    "SpeechLMAdapter",
     "GraniteSpeechAdapter",
     "Qwen2AudioAdapter",
     "GlmAsrAdapter",
+    "Gemma4Adapter",
+    "Qwen3OmniAdapter",
 ]
