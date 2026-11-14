@@ -1792,6 +1792,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         assert moe_runner_config.activation in [
             "silu",
             "gelu",
+            "gelu_tanh",  # Gemma 4 MoE (gelu_pytorch_tanh), e.g. DiffusionGemma.
             "relu2",  # Nemotron-H (NemotronHForCausalLM) uses squared-ReLU.
         ], f"activation = {moe_runner_config.activation} is not supported."
 
@@ -1799,6 +1800,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         if not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
+
+            # sgl-kernel-xpu's "gelu" is the tanh approximation (fused epilogue and
+            # gelu_tanh_and_mul alike) and the kernel has no separate "gelu_tanh" name.
+            kernel_activation = (
+                "gelu"
+                if moe_runner_config.activation == "gelu_tanh"
+                else moe_runner_config.activation
+            )
 
             topk_weights, topk_ids, _ = topk_output
             if moe_runner_config.apply_router_weight_on_input:
@@ -1816,7 +1825,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 topk_ids,
                 b1=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
-                activation=moe_runner_config.activation,
+                activation=kernel_activation,
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
                 gemm1_limit=moe_runner_config.gemm1_clamp_limit,

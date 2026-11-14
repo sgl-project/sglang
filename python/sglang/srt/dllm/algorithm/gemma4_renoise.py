@@ -76,15 +76,16 @@ class Gemma4Renoise(DllmAlgorithm):
     requires_separate_context_encoding = True
     required_attention_backend = "triton"
     reuse_forward_metadata = True
-    supported_attention_backends = ("triton", "fa4")
+    supported_attention_backends = ("triton", "fa4", "intel_xpu")
     capture_input_preparation = True
 
     @classmethod
     def configure_server_args(cls, server_args: ServerArgs) -> None:
         cfg = resolving_view(server_args)
-        if cfg.device != "cuda":
+        if cfg.device not in ("cuda", "xpu"):
             raise ValueError(
-                "DiffusionGemma currently supports CUDA/ROCm GPU execution only"
+                "DiffusionGemma currently supports CUDA/ROCm and Intel XPU GPU "
+                "execution only"
             )
 
         model_config = model_config_of(server_args)
