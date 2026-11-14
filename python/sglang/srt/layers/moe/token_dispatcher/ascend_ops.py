@@ -32,6 +32,9 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import AscendOpsConfig, DispatcherOutputDtype
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import is_npu
 
@@ -173,7 +176,9 @@ class AscendOpsDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
-        if get_is_extend_in_batch():
+        # Capture forces is_extend_in_batch False; the scope term keeps a
+        # prefill graph on the prefill path instead of the decode MC2 path.
+        if get_is_extend_in_batch() or is_in_prefill_graph_scope():
             if self.moe_ascend_ops_config.prefill == "allgather":
                 return self._dispatch_allgather(
                     hidden_states, topk_weights, topk_ids, self.tp_group
