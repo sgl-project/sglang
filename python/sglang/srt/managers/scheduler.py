@@ -1346,6 +1346,10 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}="
                 f"{self.startup_available_gpu_memory_gb:.2f} GB"
             )
+            model_runner.kv_cache_configurator.warn_if_mamba_checkpoint_capacity_is_insufficient(
+                token_capacity=self.max_total_num_tokens,
+                max_running_requests=self.max_running_requests,
+            )
 
     def emit_metrics_constants(self) -> None:
         if not get_observability().enable_metrics:

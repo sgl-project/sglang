@@ -252,6 +252,59 @@ MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
 
+def _warn_if_mamba_checkpoint_capacity_is_insufficient(
+    *,
+    token_capacity: int,
+    chunked_prefill_size: Optional[int],
+    max_mamba_cache_size: Optional[int],
+    max_running_requests: int,
+    tracking_slots_per_request: int,
+) -> None:
+    """Estimate checkpoint pressure for a KV pool filled with chunked prefixes.
+
+    One state per chunk is a workload assumption, not an upper bound: finished
+    short requests and branching can leave additional cached states. Live and
+    tracking slots are reserved at the finalized maximum request concurrency.
+    """
+    if (
+        token_capacity <= 0
+        or chunked_prefill_size is None
+        or chunked_prefill_size <= 0
+        or max_mamba_cache_size is None
+        or max_mamba_cache_size <= 0
+    ):
+        return
+
+    estimated_checkpoint_demand = (
+        token_capacity + chunked_prefill_size - 1
+    ) // chunked_prefill_size
+    slots_per_request = 1 + tracking_slots_per_request
+    reserved_slots = max_running_requests * slots_per_request
+    cached_state_slots = max(0, max_mamba_cache_size - reserved_slots)
+    if estimated_checkpoint_demand <= cached_state_slots:
+        return
+
+    logger.warning(
+        "Hybrid Mamba prefix-cache checkpoint capacity may be insufficient: "
+        "a KV pool filled with chunked prefixes (%d tokens) needs about %d "
+        "Mamba states (one per %d-token chunk). At max_running_requests=%d, "
+        "%d/%d slots remain for cached states after reserving %d live/tracking "
+        "slots (%d per request). Short requests and branching can change "
+        "checkpoint demand. Prefix-cache "
+        "branch reuse may degrade under LRU pressure. Consider increasing "
+        "--max-mamba-cache-size, adjusting --mamba-full-memory-ratio when the "
+        "Mamba pool is auto-sized, or increasing --chunked-prefill-size.",
+        token_capacity,
+        estimated_checkpoint_demand,
+        chunked_prefill_size,
+        max_running_requests,
+        cached_state_slots,
+        max_mamba_cache_size,
+        reserved_slots,
+        slots_per_request,
+    )
+
+
 def _pp_local_per_request_bytes(
     total_bytes: int,
     layer_ids: list[int],
@@ -3315,6 +3368,41 @@ class KVCacheConfigurator:
                 max_num_reqs,
             )
         return max_num_reqs
+
+    def warn_if_mamba_checkpoint_capacity_is_insufficient(
+        self, *, token_capacity: int, max_running_requests: int
+    ) -> None:
+        """Check final dedicated device pools after capture and PP agreement."""
+        if (
+            self.is_draft_worker
+            or self.mambaish_config is None
+            or get_memory().disable_radix_cache
+            or get_memory().enable_unified_memory
+        ):
+            return
+
+        mamba = get_exec().mamba
+        if (
+            mamba.enable_int8_mamba_checkpoint
+            or host_only_mamba_checkpoint()
+            or (mamba.hybrid_cache_checkpoints_level < 3 and not self.is_hybrid_swa)
+            or mamba.mamba_path_state_cap >= 0
+        ):
+            # The one-state-per-chunk estimate does not describe sparse/capped
+            # checkpoint policies or a separate host/quantized checkpoint pool.
+            return
+
+        _warn_if_mamba_checkpoint_capacity_is_insufficient(
+            token_capacity=token_capacity,
+            chunked_prefill_size=get_schedule().chunked_prefill_size,
+            max_mamba_cache_size=get_schedule().max_mamba_cache_size,
+            max_running_requests=max_running_requests,
+            tracking_slots_per_request=get_mamba_tracking_slots(
+                extra_buffer=mamba.enable_mamba_extra_buffer,
+                overlap=not get_schedule().disable_overlap_schedule,
+                lazy=mamba.enable_mamba_extra_buffer_lazy,
+            ),
+        )
 
     def _resolve_memory_pool_config(
         self, pre_model_load_memory: int
