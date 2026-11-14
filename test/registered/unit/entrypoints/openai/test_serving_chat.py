@@ -6114,6 +6114,138 @@ class ServingChatTestCase(CustomTestCase):
             result = self.chat._apply_conversation_template(req, is_multimodal=False)
         self.assertEqual(result.prompt, "BASE_PROMPT")
 
+    # ------------- include_reasoning -------------
+    def _build_reasoning_response(
+        self,
+        include_reasoning,
+        reasoning_parser="mock-reasoning-parser",
+        reasoning="想了一下",
+    ):
+        """Build a non-stream response whose reasoning parser splits think text."""
+        self.template_manager.force_reasoning = False
+        self.chat.reasoning_parser = reasoning_parser
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=False,
+            include_reasoning=include_reasoning,
+        )
+        ret = [
+            {
+                "text": "想了一下正式回答",
+                "meta_info": {
+                    "id": "test-id",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 9,
+                },
+            }
+        ]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.ReasoningParser"
+        ) as parser_mock:
+            parser_mock.return_value.parse_non_stream.return_value = (
+                reasoning,
+                "正式回答",
+            )
+            return self.chat._build_chat_response(req, ret, created=0)
+
+    def test_include_reasoning_false_drops_reasoning_content(self):
+        # #39103: the request field existed nowhere, so reasoning always came
+        # back even when the caller asked to suppress it.
+        resp = self._build_reasoning_response(False)
+        self.assertIsNone(resp.choices[0].message.reasoning_content)
+        # The reasoning split still runs, so the visible content stays clean.
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
+    def test_include_reasoning_default_keeps_reasoning_content(self):
+        resp = self._build_reasoning_response(None)
+        self.assertEqual(resp.choices[0].message.reasoning_content, "想了一下")
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
+    def test_include_reasoning_false_drops_k2_empty_reasoning_replay(self):
+        # K2 templates replay reasoning_content even when the parser split is
+        # empty; include_reasoning=False must win over that replay too.
+        resp = self._build_reasoning_response(
+            False, reasoning_parser="k2_horizon", reasoning=""
+        )
+        self.assertIsNone(resp.choices[0].message.reasoning_content)
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
+    def test_include_reasoning_default_keeps_k2_empty_reasoning_replay(self):
+        resp = self._build_reasoning_response(
+            None, reasoning_parser="k2_horizon", reasoning=""
+        )
+        self.assertEqual(resp.choices[0].message.reasoning_content, "")
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
+    def test_include_reasoning_stream_gate(self):
+        for include, expected in ((False, None), (None, "Let me think")):
+            with self.subTest(include_reasoning=include):
+                self.chat.reasoning_parser = "qwen3"
+                self.template_manager.force_reasoning = False
+                content = {
+                    "text": "thinking...",
+                    "meta_info": {
+                        "id": "chatcmpl-include-reasoning",
+                        "prompt_tokens": 5,
+                        "completion_tokens": 2,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop", "matched": None},
+                    },
+                    "index": 0,
+                }
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    stream=True,
+                    separate_reasoning=True,
+                    include_reasoning=include,
+                )
+                with patch.object(self.chat, "_process_reasoning_stream") as proc:
+                    proc.return_value = ("Let me think", "")
+                    chunks = get_or_create_event_loop().run_until_complete(
+                        self._collect_stream_content(content, None, req)
+                    )
+                values = [
+                    choice["delta"].get("reasoning_content")
+                    for chunk in self._parse_chunks(chunks)
+                    for choice in chunk["choices"]
+                ]
+                if expected is None:
+                    self.assertTrue(all(value is None for value in values))
+                else:
+                    self.assertTrue(values)
+                    self.assertIn(expected, values)
+
+    def test_include_reasoning_stream_k2_empty_replay(self):
+        self.template_manager.force_reasoning = True
+        self.chat.reasoning_parser = self.chat.tool_call_parser = "k2_horizon"
+        for include, expected in ((False, False), (None, True)):
+            with self.subTest(include_reasoning=include):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=self.stream_req.messages,
+                    stream=True,
+                    separate_reasoning=True,
+                    include_reasoning=include,
+                )
+
+                async def generate():
+                    ret = _spec_result(0)
+                    ret["text"] = "Hello"
+                    yield ret
+
+                self.tm.generate_request.return_value = generate()
+                chunks = self._parse_chunks(self._run_chat_stream(None, req))
+                values = [
+                    choice["delta"].get("reasoning_content")
+                    for chunk in chunks
+                    for choice in chunk["choices"]
+                ]
+                self.assertEqual(any(value == "" for value in values), expected)
+
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
