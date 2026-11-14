@@ -56,11 +56,11 @@ class TestLLaDA2MiniFDFO(CustomTestCase):
             )
             res = run_bench_serving(
                 model=model,
-                num_prompts=128,
-                random_input_len=3584,
-                random_output_len=1024,
+                num_prompts=32,
+                random_input_len=6144,
+                random_output_len=3072,
                 request_rate=float("inf"),
-                max_concurrency=16,
+                max_concurrency=8,
                 other_server_args=other_args,
             )
             TTFT = res["mean_ttft_ms"]
