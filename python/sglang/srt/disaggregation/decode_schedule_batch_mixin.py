@@ -11,7 +11,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 logger = logging.getLogger(__name__)
 

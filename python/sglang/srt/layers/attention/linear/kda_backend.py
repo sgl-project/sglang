@@ -28,7 +28,8 @@ from sglang.srt.layers.attention.linear.utils import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
-from sglang.srt.utils.common import is_gfx95_supported, rank0_log
+from sglang.srt.utils.device import is_gfx95_supported
+from sglang.srt.utils.log_utils import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -485,6 +486,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
+    # gfx950's one-kernel chain verify (kda_backend_hip), set in __init__.
+    _hip_chain_verify_fn = None
+
     def _create_kernel_dispatcher(self, backends):
         return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
 
@@ -537,13 +541,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             self._fused_chain_verify_fn = fused_kda_conv_gating_verify
             rank0_log("KDA fused chain-verify kernel enabled (topk==1 path).")
-        self._hip_chain_verify_fn = None
         if is_gfx95_supported() and verify_backend.is_triton():
             from sglang.srt.layers.attention.linear.kda_backend_hip import (
                 kda_chain_verify_gfx950,
             )
 
             self._hip_chain_verify_fn = kda_chain_verify_gfx950
+        if is_gfx95_supported():
+            from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
+
+            # Breakable prefill graphs capture the HIP extend; load it before capture.
+            kda_gfx950_prefill.preload()
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
@@ -1863,9 +1871,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if layer.conv_weights.dtype != torch.float32:
             return False
+        # fp32 or bf16 state (bf16 load/store, fp32 recurrence in-kernel).
+        if ssm_states.dtype == torch.float32:
+            state_align = 4
+        elif ssm_states.dtype == torch.bfloat16:
+            state_align = 8
+        else:
+            return False
+        # 16-byte cp.async of the state: slot pitch / offset in whole vectors.
         if (
-            ssm_states.dtype != torch.float32
-            or tuple(ssm_states.shape[-3:])
+            tuple(ssm_states.shape[-3:])
             != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
             or tuple(ssm_states.stride()[-3:])
             != (
@@ -1873,8 +1888,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 layer.head_k_dim,
                 1,
             )
-            or ssm_states.stride(0) % 4 != 0
-            or ssm_states.storage_offset() % 4 != 0
+            or ssm_states.stride(0) % state_align != 0
+            or ssm_states.storage_offset() % state_align != 0
         ):
             return False
         if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
@@ -1885,6 +1900,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # no recurrent fallback without intermediate_ssm).
             return replayssm_rawv is not None
         if intermediate_state_cache.shape[1] < draft_token_num:
+            return False
+        if intermediate_state_cache.dtype != ssm_states.dtype:
             return False
         if tuple(intermediate_state_cache.shape[-3:]) != (
             layer.num_v_heads,

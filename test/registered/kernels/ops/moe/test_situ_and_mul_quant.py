@@ -2,7 +2,9 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant
+from sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant import (
+    situ_and_mul_masked_post_quant,
+)
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -114,6 +116,47 @@ class TestSituAndMulQuant(CustomTestCase):
                 )
             )
             self.assertTrue(bool((raw_output[expert, valid_tokens:] == 0x7F).all()))
+
+
+class TestSituMulQuantContig(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if get_device_sm() < 100:
+            raise unittest.SkipTest("UE8M0 activation scales are Blackwell-only")
+
+    def test_ue8m0_scale_is_the_one_used_to_quantize(self):
+        import triton
+
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            _cast_to_e8m0_with_rounding_up,
+            _situ_mul_quant_contig_kernel,
+        )
+
+        torch.manual_seed(0)
+        rows, n = 64, 2048
+        kg = n // _GROUP_SIZE
+        gate_up = (torch.randn(rows, 2 * n, device="cuda") * 3).bfloat16()
+        q = torch.empty(rows, n, device="cuda", dtype=torch.float8_e4m3fn)
+        scale = torch.empty(rows, kg, device="cuda")
+        _situ_mul_quant_contig_kernel[(rows,)](
+            gate_up,
+            q,
+            scale,
+            n,
+            kg,
+            _BETA,
+            _LINEAR_BETA,
+            GROUP=_GROUP_SIZE,
+            KG_POW2=triton.next_power_of_2(kg),
+            num_warps=8,
+        )
+        e8m0 = _cast_to_e8m0_with_rounding_up(scale.unsqueeze(0)).squeeze(0)
+        e8m0 = e8m0.contiguous().view(torch.uint8).view(rows, -1)[:, :kg]
+        read_scale = (e8m0.to(torch.int32) << 23).view(torch.float32)
+        torch.testing.assert_close(read_scale, scale, rtol=0, atol=0)
+        dequant = q.float() * read_scale.repeat_interleave(_GROUP_SIZE, 1)
+        ref = _situ_reference(gate_up)
+        self.assertLess(((dequant - ref).norm() / ref.norm()).item(), 0.05)
 
 
 if __name__ == "__main__":

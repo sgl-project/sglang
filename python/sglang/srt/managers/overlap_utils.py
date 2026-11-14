@@ -124,7 +124,9 @@ def offer_future_relay_buffers(relay: FutureRelayBuffers) -> None:
     _offered_relay = relay
 
 
-def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> bool:
+def resolve_forward_inputs(
+    batch: ScheduleBatch, future_map: Optional[FutureMap]
+) -> bool:
     """Materialize input_ids at forward entry. Two sources:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
@@ -132,7 +134,9 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> bool:
 
     return whether a decode graph owns input resolution and sequence-length publication
     """
-    if not future_map.takes_deferred_relay(batch):
+    # future_map is None for standalone prefill callers (e.g. the LLaDA-Image
+    # conditioning stage), which have no deferred relay to flush.
+    if future_map is not None and not future_map.takes_deferred_relay(batch):
         future_map.flush_deferred_relay()
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)

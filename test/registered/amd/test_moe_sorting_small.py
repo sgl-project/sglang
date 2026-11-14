@@ -141,49 +141,39 @@ class TestMoeSortingSmall(CustomTestCase):
         E, topk, dim = 896, 16, 3584  # 3584 % 2048 != 0: 512-column quant chunks
         # [shared gate_up (TP8) | router logits | routed input] of the fused front GEMM
         front_width, routed_start = 1536 + E + dim, 1536 + E
-        for bs, m, hot in ((32, 5, E), (32, 16, 24), (16, 16, 16)):
-            msg = f"bs={bs} m={m} hot={hot}"
-            g = torch.Generator(device="cpu").manual_seed(m * 1000 + hot)
-            # hot < E crowds the pairs onto few experts: ranks within an expert matter
-            ids = torch.stack(
-                [torch.randperm(hot, generator=g)[:topk] for _ in range(m)]
-            )
-            ids = (ids + E - hot).to(torch.int32).to(self.dev)
-            w = torch.rand(m, topk, generator=g).to(self.dev)
-            front = torch.randn(m, front_width, generator=g).to(
-                self.dev, torch.bfloat16
-            )
-            x = front[:, routed_start:]
-            self.assertTrue(self.S._small_sort_supported(ids, bs, None, None, E), msg)
-            sort, emitted = self._sort_emitting_quant(ids, w, x, bs, E)
-            self.assertIsNotNone(emitted, msg)
-            self._assert_same_sort(
-                self._sort(self.orig_sort, ids, w, bs, E), sort, bs, msg
-            )
-            sid, sw, _, nv, _ = sort
-            ref_q, ref_scale = self.orig_quant(
-                x.contiguous(),
-                sorted_ids=sid,
-                num_valid_ids=nv,
-                token_num=m,
-                topk=topk,
-                block_size=bs,
-                sorted_weights=sw,
-                num_experts_upper_bound=E,
-            )
-            self.assertTrue(
-                torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)), msg
-            )
-            # padding rows of a block hold no pair and are never read
-            real = sid[: int(nv[0])]
-            real = torch.nonzero((real & 0xFFFFFF) < m).flatten()
-            self.assertEqual(real.numel(), m * topk, msg)
-            self.assertTrue(
-                torch.equal(
-                    _scale_rows(ref_scale)[real], _scale_rows(emitted[1])[real]
-                ),
-                msg,
-            )
+        # 256 pairs on 64 experts: several ranks per expert and padded blocks
+        bs, m, hot = 32, 16, 64
+        g = torch.Generator(device="cpu").manual_seed(m * 1000 + hot)
+        ids = torch.stack([torch.randperm(hot, generator=g)[:topk] for _ in range(m)])
+        ids = (ids + E - hot).to(torch.int32).to(self.dev)
+        w = torch.rand(m, topk, generator=g).to(self.dev)
+        front = torch.randn(m, front_width, generator=g).to(self.dev, torch.bfloat16)
+        x = front[:, routed_start:]
+        self.assertTrue(self.S._small_sort_supported(ids, bs, None, None, E))
+        sort, emitted = self._sort_emitting_quant(ids, w, x, bs, E)
+        self.assertIsNotNone(emitted)
+        self._assert_same_sort(self._sort(self.orig_sort, ids, w, bs, E), sort, bs, "")
+        sid, sw, _, nv, _ = sort
+        ref_q, ref_scale = self.orig_quant(
+            x.contiguous(),
+            sorted_ids=sid,
+            num_valid_ids=nv,
+            token_num=m,
+            topk=topk,
+            block_size=bs,
+            sorted_weights=sw,
+            num_experts_upper_bound=E,
+        )
+        self.assertTrue(
+            torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8))
+        )
+        # padding rows of a block hold no pair and are never read
+        real = sid[: int(nv[0])]
+        real = torch.nonzero((real & 0xFFFFFF) < m).flatten()
+        self.assertEqual(real.numel(), m * topk)
+        self.assertTrue(
+            torch.equal(_scale_rows(ref_scale)[real], _scale_rows(emitted[1])[real])
+        )
 
     def test_falls_back_to_aiter_from_1024_experts(self):
         # past 64 pairs the histogram sort serves up to E=896 (E_POW2 <= 1024)

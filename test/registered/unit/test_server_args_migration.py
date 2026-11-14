@@ -8,9 +8,13 @@ import argparse
 import unittest
 
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.multimodal.media_io import (
+    configure_media_url_security,
+    media_url_timeout,
+    read_local_media_file,
+)
 from sglang.srt.runtime_context import get_model, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import configure_media_url_security
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -105,12 +109,31 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         finally:
             configure_media_url_security([], max_file_size_mb=64)
 
+    def test_media_url_timeout_and_local_files_args(self):
+        try:
+            sa = self._parse([])
+            self.assertIsNone(sa.media_url_timeout)
+            self.assertTrue(sa.allow_local_media_files)
+            sa = self._parse(
+                ["--media-url-timeout", "2.5", "--no-allow-local-media-files"]
+            )
+            self.assertEqual(sa.media_url_timeout, 2.5)
+            self.assertFalse(sa.allow_local_media_files)
+            # Parsing applies the policy to this process.
+            self.assertEqual(media_url_timeout(3), 2.5)
+            with self.assertRaisesRegex(ValueError, "not allowed"):
+                read_local_media_file(__file__)
+        finally:
+            configure_media_url_security([], max_file_size_mb=64)
+
     def test_media_url_security_args_reject_invalid_values(self):
         try:
             with self.assertRaises(ValueError):
                 self._parse(["--allowed-media-domains", "https://media.example.com"])
             with self.assertRaises(ValueError):
                 self._parse(["--media-url-max-file-size-mb", "-1"])
+            with self.assertRaises(ValueError):
+                self._parse(["--media-url-timeout", "0"])
         finally:
             configure_media_url_security([], max_file_size_mb=64)
 

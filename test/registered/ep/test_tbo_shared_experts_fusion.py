@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -42,10 +41,6 @@ class TestTBOWithSharedExpertsFusion(CustomTestCase):
                 "--max-running-requests",
                 "512",
             ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
         )
 
     @classmethod

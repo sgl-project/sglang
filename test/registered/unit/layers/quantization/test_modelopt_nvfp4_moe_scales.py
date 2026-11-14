@@ -95,7 +95,6 @@ def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0):
     layer.scheme = None
     layer._has_fused_shared = False
     layer.use_flashinfer_trtllm_moe = method.enable_flashinfer_trtllm_moe
-    layer.use_triton_kernels = False
     layer.use_presharded_weights = False
     layer.moe_tp_size = 2
     layer.moe_tp_rank = tp_rank

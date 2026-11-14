@@ -27,6 +27,7 @@ import torch
 
 from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -39,7 +40,6 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
-from sglang.srt.utils.common import get_eager_max_batch_size
 
 if TYPE_CHECKING:
     from flashinfer.autotuner import AutoTuner
@@ -152,7 +152,14 @@ def should_run_flashinfer_autotune(
     else:
         fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
-    if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
+    from sglang.srt.layers.quantization.unquant import bf16_gemm_needs_autotune
+
+    if not (
+        moe_needs_autotune
+        or fp4_gemm_needs_autotune
+        or fp8_gemm_needs_autotune
+        or bf16_gemm_needs_autotune()
+    ):
         return False
 
     if torch.cuda.get_device_capability()[0] < 9:
@@ -185,6 +192,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     ]
     # Retune caches created before FlashInfer's default tactic joined the race.
     model_key_parts.append("candidate_selection=v2_default")
+    model_key_parts.append("dummy_tokens=varied")
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
@@ -429,6 +437,34 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
     logger.info("FlashInfer autotune completed.")
 
 
+@contextlib.contextmanager
+def autotune_dummy_run_ctx(model_runner: ModelRunner, buffers):
+    """Run context of an autotune dummy forward: canary manager and varied token ids."""
+    mr = model_runner
+    canary_run_ctx = (
+        c.with_active_single_forward_manager(0)
+        if (c := mr.canary_manager) is not None
+        else empty_context()
+    )
+    with canary_run_ctx:
+        input_ids = buffers.input_ids
+        vocab_size = mr.model_config.vocab_size
+        generator = torch.Generator().manual_seed(get_parallel().attn_dp_rank)
+        ids = torch.randint(
+            vocab_size, input_ids.shape, generator=generator, dtype=input_ids.dtype
+        )
+        log_info_on_rank0(
+            logger,
+            f"FlashInfer autotune: dummy forward runs varied token ids in [0, {vocab_size}).",
+        )
+        saved = input_ids.clone()
+        input_ids.copy_(ids)
+        try:
+            yield
+        finally:
+            input_ids.copy_(saved)
+
+
 def run_flashinfer_autotune_forward(
     model_runner: ModelRunner, forward_fn: Callable[[], None], *, run_lm_head: bool
 ) -> None:
@@ -531,17 +567,11 @@ def maybe_flashinfer_autotune_extend(
         num_tokens_per_req=per_req,
         allocate_logits_buffer=False,
     )
-    canary_run_ctx = (
-        c.with_active_single_forward_manager(0)
-        if (c := mr.canary_manager) is not None
-        else empty_context()
-    )
-
     forward_fn = functools.partial(
         runner._dummy_run,
         batch_size=batch_size,
         buffers=buffers,
-        run_ctx=canary_run_ctx,
+        run_ctx=autotune_dummy_run_ctx(mr, buffers),
         forward_mode_override=ForwardMode.EXTEND,
         extend_num_tokens_per_req=num_tokens_per_req,
     )

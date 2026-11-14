@@ -10,19 +10,15 @@
 // optionally snapshotting the stream into bank[:, nvb]: attn_res_hip's _agg_kernel, with the
 // scores' transcendentals run once per row and DPP wave reductions.
 //
-// Above the split-K tail's rows, the caller instead projects the RMSNorm'd latent onto the slice
-// itself (the replicated tail's GEMM on 1/8 of its columns) and the kernel only adds
+// Projected mode (batches past the split-K tail's row cap): the caller passes the slice's own GEMM
+// of the RMSNorm'd latent and the kernel only adds
 //     slice = bf16(proj + shared [+ prefix]).
 //
-// The all-gather is LL: each rank pushes its slice into every peer's scratch as 16-byte lines of
-// 8 payload bytes + an epoch flag, and the receiver polls its own scratch, so there is no
-// barrier. The bank rows are loaded and scored while the peers' lines are in flight.
+// The all-gather uses ll_hip.cuh's LL lines; the bank rows are loaded and scored while the peers'
+// lines are in flight.
 //
-// Scratch (receiver-owned, the post-Signal tail of a dedicated aiter CustomAllreduce's meta
-// buffer): [2 epochs][kWorld src ranks][kMaxRows rows][lines]. Row t is always handled by
-// workgroup t, whose flag epochs[t] + 1 is rank-local; every rank launches the same row counts,
-// so the flags agree. A line is rewritten two epochs later, by which point its receiver has
-// consumed it (the writer has since received the receiver's next-epoch row).
+// Scratch: [2 epochs][kWorld src ranks][kMaxRows rows][lines]. Row t is always workgroup t, whose
+// flag epochs[t] + 1 is rank-local; every rank launches the same row counts, so the flags agree.
 
 #pragma once
 
@@ -49,14 +45,14 @@ namespace k3_attn_res_read {
 using namespace k3_ll;
 
 inline constexpr int kWorld = 8;
-// The largest graphed target verify at TP8 AgentX concurrencies: 64 requests x 6 rows.
+// rows of the largest captured target verify at TP8: 64 requests x 6 tokens
 inline constexpr int kMaxRows = 384;
 inline constexpr int kSlice = kHidden / kWorld;  // all-gather columns per rank
 inline constexpr int kSliceThreads = kSlice / kVec;
 // 8 payload bytes per 16-byte line.
 inline constexpr int kAgLinesPerRow = kSlice * 2 / 8;
 inline constexpr int64_t kAgEpochLines = int64_t{kWorld} * kMaxRows * kAgLinesPerRow;
-// The scratch's first region and the row flags are the gather read's.
+// one epoch counter per row
 inline constexpr int kEpochs = kMaxRows;
 // The column-parallel latent-MoE tail the all-gather can finish: its GEMM's fp32 partials over
 // kTailSplits chunks of the kTailK latent dim (kimi_k3_latent_tail_hip.k3_latent_tail_partials).

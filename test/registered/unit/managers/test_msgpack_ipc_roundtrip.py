@@ -46,10 +46,14 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     _merge_checksum_payloads,
 )
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+from sglang.srt.model_executor.weight_checker import (
+    ChecksumInfo as PydanticChecksumInfo,
+)
+from sglang.srt.model_executor.weight_checker import (
+    ParallelismInfo as PydanticParallelismInfo,
+)
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
-from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
-from sglang.srt.utils.weight_checker import ParallelismInfo as PydanticParallelismInfo
 from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

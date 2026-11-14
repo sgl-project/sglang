@@ -17,6 +17,7 @@
 
 """Inference-only NemotronH model."""
 
+import logging
 from collections.abc import Iterable
 from functools import lru_cache, partial
 
@@ -59,6 +60,8 @@ from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -87,14 +90,13 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_schedule
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     get_current_device_stream_fast,
     is_cuda,
     is_sm120,
-    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 

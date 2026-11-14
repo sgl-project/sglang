@@ -128,7 +128,7 @@ def _build_explicit_state_block_table(
     seqused: torch.Tensor,
     max_input_capacity: int,
 ) -> torch.Tensor:
-    """Adapt GPU-style state locations to the A3 cache_mode=2 table ABI."""
+    """Map logical positions to state rows for the explicit cache_mode=2 ABI."""
     req_pool_indices = req_pool_indices.to(torch.int64)
     capacities = cu_seqlens[1:] - cu_seqlens[:-1]
     history_size = coff * compress_ratio
@@ -154,21 +154,6 @@ def _build_explicit_state_block_table(
         state_locs.to(torch.int32),
         state_pool.dummy_state_loc,
     ).contiguous()
-
-
-def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tensor:
-    """Build the Ascend 950 cache_mode=2 request-bank table.
-
-    Ascend 950 interprets this input as one bank id per request and computes the
-    in-bank ring offset itself.  It must never receive the A3 explicit
-    per-token location table.
-    """
-    if req_pool_indices.ndim != 1:
-        raise ValueError(
-            "Ascend 950 compressor requires a 1-D request-bank table, got "
-            f"shape={tuple(req_pool_indices.shape)}"
-        )
-    return req_pool_indices.to(dtype=torch.int32).contiguous()
 
 
 class CompressorAscendBackendMixin:
@@ -232,11 +217,6 @@ class CompressorAscendBackendMixin:
 
     def _build_npu_compress_metadata(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata
-        fm.dsv4_cycle_state_block_table = (
-            _build_cycle_state_block_table(forward_batch.req_pool_indices)
-            if is_npu_arch35()
-            else None
-        )
         is_decode = forward_batch.forward_mode.is_decode()
         is_verify = forward_batch.forward_mode.is_target_verify()
         fm.dsv4_explicit_state_block_tables = {}
@@ -493,27 +473,21 @@ class CompressorAscendBackendMixin:
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
-        if is_npu_arch35():
-            # Ascend 950 cache_mode=2 is CYCLE: one request bank per row.  The
-            # compressor derives the in-bank offset from start_pos; passing
-            # the A3 explicit [B, width] table here would be an ABI violation.
-            state_block_table = fm.dsv4_cycle_state_block_table
-        else:
-            table_cache = fm.dsv4_explicit_state_block_tables
-            if ratio not in table_cache:
-                table_cache[ratio] = _build_explicit_state_block_table(
-                    compress_ratio=ratio,
-                    coff=coff,
-                    state_pool=state_pool,
-                    token_to_kv_pool=pool,
-                    req_to_token=self.req_to_token,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    start_pos=fm.start_pos,
-                    cu_seqlens=fm.actual_seq_lengths_q_pa,
-                    seqused=fm.seqused,
-                    max_input_capacity=fm.dsv4_max_input_capacity,
-                )
-            state_block_table = table_cache[ratio]
+        table_cache = fm.dsv4_explicit_state_block_tables
+        if ratio not in table_cache:
+            table_cache[ratio] = _build_explicit_state_block_table(
+                compress_ratio=ratio,
+                coff=coff,
+                state_pool=state_pool,
+                token_to_kv_pool=pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                start_pos=fm.start_pos,
+                cu_seqlens=fm.actual_seq_lengths_q_pa,
+                seqused=fm.seqused,
+                max_input_capacity=fm.dsv4_max_input_capacity,
+            )
+        state_block_table = table_cache[ratio]
 
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
@@ -524,10 +498,7 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        # TODO: torch.ops.npu.compressor does not support Ascend 950 yet.
-        compressor_op = (
-            torch.ops.custom.compressor if is_npu_arch35() else torch.ops.npu.compressor
-        )
+        compressor_op = torch.ops.npu.compressor
         cmp_kv = compressor_op(
             x,
             compressor._fused_wkv_w,
@@ -1424,11 +1395,6 @@ class DeepseekV4AscendAttnBackend(
         metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
         metadata.c128_loc = torch.zeros(c128_pad, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
-        metadata.dsv4_cycle_state_block_table = (
-            torch.zeros(bs, dtype=torch.int32, device=device)
-            if is_npu_arch35()
-            else None
-        )
         metadata.dsv4_explicit_state_block_tables = {
             ratio: torch.full(
                 (
@@ -2015,11 +1981,6 @@ class DeepseekV4AscendAttnBackend(
             return
 
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
-
-        if is_npu_arch35():
-            ctx.fm.dsv4_cycle_state_block_table.copy_(
-                ctx.forward_batch.req_pool_indices[: ctx.bs]
-            )
 
         self._refresh_graph_seq_metadata(ctx)
         self._refresh_graph_compress_page_tables_direct(ctx)

@@ -13,33 +13,28 @@ _SSE_NL_B = b"\n\n"
 class StreamDelta(msgspec.Struct, omit_defaults=True):
     """Delta content for streaming responses.
 
-    Null fields are never emitted (omit_defaults): the K3 streaming format
-    requires reasoning_content to be a string whenever present, the end frame
-    to be an empty object, and increment frames not to mix in unrelated null
-    keys — matching OpenAI's own streaming output. Key absence is
-    the wire contract's state signal; always serializing null for one SDK's
-    attribute convenience fails strict conformance clients.
+    OpenAI Python SDK's ChoiceDelta does not declare reasoning_content; it is
+    surfaced via pydantic `extra`, so a missing key makes
+    `data.reasoning_content` raise AttributeError on the client. It is required
+    and serialized as null, except under the K3 streaming format, which passes
+    UNSET: there a present reasoning_content must be a string.
     """
 
-    reasoning_content: Optional[str] = None
+    reasoning_content: Union[Optional[str], msgspec.UnsetType]
     role: Optional[str] = None
     content: Optional[str] = None
 
 
 class StreamChoice(msgspec.Struct):
-    """A single choice in a streaming response.
-
-    Must NOT use omit_defaults: the finish_reason key has to appear on every
-    frame. usage is only filled on the end frame; middle frames serialize it as
-    null, which the K3 streaming format allows.
-    """
+    """A single choice in a streaming response. No omit_defaults: the
+    finish_reason key has to appear on every frame."""
 
     index: int
     delta: StreamDelta
     logprobs: Optional[dict] = None
     finish_reason: Optional[str] = None
     matched_stop: Union[None, int, str] = None
-    usage: Optional[dict] = None
+    usage: Union[dict, msgspec.UnsetType] = msgspec.UNSET
     internal_content: Union[list[dict], msgspec.UnsetType] = msgspec.UNSET
 
 
@@ -71,6 +66,7 @@ def build_sse_content(
     usage: Optional[dict] = None,
     internal_content: Optional[list[dict]] = None,
     choice_usage: Optional[dict] = None,
+    omit_null_reasoning: bool = False,
 ) -> str:
     """Build an SSE chunk string for content/reasoning updates.
 
@@ -90,6 +86,8 @@ def build_sse_content(
     Returns:
         SSE-formatted string "data: {...}\\n\\n"
     """
+    if reasoning_content is None and omit_null_reasoning:
+        reasoning_content = msgspec.UNSET
     delta = StreamDelta(
         role=role,
         content=content,
@@ -101,7 +99,7 @@ def build_sse_content(
         logprobs=logprobs,
         finish_reason=finish_reason,
         matched_stop=matched_stop,
-        usage=choice_usage,
+        usage=choice_usage if choice_usage is not None else msgspec.UNSET,
         internal_content=internal_content
         if internal_content is not None
         else msgspec.UNSET,

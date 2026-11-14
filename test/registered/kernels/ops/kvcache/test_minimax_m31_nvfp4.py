@@ -48,7 +48,7 @@ def _zeros(shape):
 
 def _tiny(shape):
     # Below the E4M3 scale underflow point, where the reference writes a zero
-    # scale and a saturated payload.
+    # scale and a zero payload.
     return torch.full(shape, 1e-4, dtype=torch.bfloat16, device="cuda")
 
 

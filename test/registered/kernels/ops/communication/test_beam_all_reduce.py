@@ -77,16 +77,17 @@ class TestBeamAllReduce(CustomTestCase):
                 "Beam collective test requires an NVLink V2 communicator"
             )
         register_comm_cleanup(cls.comm)
-        # Exercise the shared phase counters, regardless of platform tuning.
+        # Exercise the shared phase word, regardless of platform tuning.
         cls.comm.override_algo = AllReduceAlgo.ONE_SHOT_PUSH
-        # The same workspaces and counters without a multicast address take the
+        # The same workspaces and phase word without a multicast address take the
         # per-peer store path; the multicast plane is the control where it exists.
         unicast = Communicator(
             push=PushPlane(
                 cls.comm.rank,
                 cls.comm.world_size,
                 workspaces=cls.comm._push_workspaces,
-                counter=cls.comm._push_counter.view(-1, 1).view(torch.uint8),
+                counter=cls.comm._push_counter,
+                default_blocks=cls.comm.config.num_push_blocks,
             ),
             pull=cls.comm.obj.pull,
         )

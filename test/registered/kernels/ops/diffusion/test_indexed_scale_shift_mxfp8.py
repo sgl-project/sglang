@@ -12,20 +12,11 @@ from sglang.kernels.ops.diffusion.modulate.indexed_scale_shift_mxfp8_triton impo
     indexed_scale_shift_mxfp8_,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.mxfp8 import assert_matches_flashinfer_mxfp8
 
 register_cuda_ci(est_time=2, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 ROWS, HIDDEN = 333, 5376  # rows and scale columns both need padding
-
-
-def _assert_matches_flashinfer(
-    got: tuple[torch.Tensor, torch.Tensor], bf16: torch.Tensor
-) -> None:
-    import flashinfer
-
-    q, s = flashinfer.mxfp8_quantize(bf16.contiguous(), True)
-    assert torch.equal(got[0].view(torch.uint8), q.view(torch.uint8))
-    assert torch.equal(got[1].view(torch.uint8), s.view(torch.uint8))
 
 
 @pytest.mark.parametrize("keep_bf16", [True, False])
@@ -39,7 +30,7 @@ def test_indexed_scale_shift_mxfp8_is_byte_exact(keep_bf16: bool) -> None:
     kept, q, s = indexed_scale_shift_mxfp8_(
         x, shift, scale, indices, keep_bf16=keep_bf16
     )
-    _assert_matches_flashinfer((q, s), ref)
+    assert_matches_flashinfer_mxfp8((q, s), ref)
     assert (kept is x and torch.equal(x, ref)) if keep_bf16 else kept is None
 
 

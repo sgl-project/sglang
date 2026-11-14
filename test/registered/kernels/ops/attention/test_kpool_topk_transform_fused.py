@@ -14,6 +14,7 @@ The overfull-bin rescan is shared by CUDA and ROCm, so the tie and graph-replay
 cases run on both.
 """
 
+import sys
 import unittest
 
 import pytest
@@ -233,4 +234,4 @@ def test_graph_replay_short_rows_page_mapping_and_tail(long_length):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__, "-v"]))

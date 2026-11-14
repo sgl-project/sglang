@@ -466,12 +466,14 @@ class MultimemAllGatherer:
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
-        # None => always NCCL; _UNINIT => build on first eager call. ROCm has no
-        # multicast, so the build would only fall back to NCCL after a symmetric
-        # memory rendezvous, which hung server start on MI355X.
+        # None => always NCCL; _UNINIT => build on first eager call.
+        # ROCm has no multicast; the build's symm-mem rendezvous hung MI355X start.
         self._state = self._UNINIT if enabled and not is_hip() else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
+            from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+                is_one_nvlink_clique,
+            )
             from sglang.srt.distributed.parallel_state import (
                 get_tp_group,
                 in_the_same_node_as,
@@ -479,8 +481,7 @@ class MultimemAllGatherer:
 
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span
-            # nodes. Multicast spans nodes of one NVLink clique (MNNVL), so a
-            # cross-node group keeps multimem there. Check world_size first so a TP=1 gatherer short-circuits
+            # nodes. Check world_size first so a TP=1 gatherer short-circuits
             # before reading the parallel config (which may be unpublished on
             # offline paths). On a single node every TP rank is co-located, so skip the
             # in_the_same_node_as() all-reduce, which can segfault under some
@@ -489,17 +490,16 @@ class MultimemAllGatherer:
                 tp_group.world_size > 1
                 and get_parallel().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
-            ):
-                from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
-                    is_one_nvlink_clique,
+                and not is_one_nvlink_clique(
+                    tp_group.cpu_group,
+                    torch.device("cuda", torch.cuda.current_device()),
                 )
-
-                if not is_one_nvlink_clique(tp_group.cpu_group, tp_group.device):
-                    logger.warning(
-                        "multimem all-gather disabled because the TP group spans "
-                        "nodes outside one NVLink clique."
-                    )
-                    self._state = None
+            ):
+                logger.warning(
+                    "multimem all-gather disabled because the TP group spans "
+                    "nodes outside one NVLink clique."
+                )
+                self._state = None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         state = self._state

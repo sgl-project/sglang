@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils.arch import get_default_target_flags
+from sglang.kernels.jit.utils.arch import get_compile_arch, get_default_target_flags
 from sglang.kernels.jit.utils.common import is_hip_runtime, is_sail_runtime
 from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import (
@@ -127,7 +127,10 @@ def load_jit(
         cpp_wrappers=tuple(cpp_wrappers or ()),
         cuda_wrappers=tuple(cuda_wrappers or ()),
         cflags=tuple(DEFAULT_CFLAGS + (extra_cflags or [])),
-        cuda_cflags=tuple(get_default_target_flags() + (extra_cuda_cflags or [])),
+        cuda_cflags=tuple(
+            get_default_target_flags(get_compile_arch(module_args[0]))
+            + (extra_cuda_cflags or [])
+        ),
         ldflags=tuple(DEFAULT_LDFLAGS + (extra_ldflags or [])),
         include_paths=tuple(includes),
         header_only=header_only,

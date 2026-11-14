@@ -444,6 +444,11 @@ class Cosmos3SamplingParams(SamplingParams):
                     "'policy', 'forward_dynamics', or 'inverse_dynamics'."
                 )
             action_output = self.action_mode != "forward_dynamics"
+            if action_output and self.num_outputs_per_prompt > 1:
+                raise ValueError(
+                    "Cosmos3 policy and inverse-dynamics requests return one "
+                    "prediction per input; num_outputs_per_prompt must be 1"
+                )
 
         # Apply transfer per-hint defaults before the base resolves remaining
         # fields (e.g. flow_shift per mode), so an unset flow_shift can pick up

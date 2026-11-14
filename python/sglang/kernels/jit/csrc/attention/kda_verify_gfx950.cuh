@@ -141,16 +141,6 @@ SGL_DEVICE uint4 pack_bf16x8(const float (&f)[8]) {
   return r;
 }
 
-template <typename T>
-SGL_DEVICE T load_as(const void* ptr) {
-  return *reinterpret_cast<const T*>(ptr);
-}
-
-template <typename T>
-SGL_DEVICE void store_as(void* ptr, const T& value) {
-  *reinterpret_cast<T*>(ptr) = value;
-}
-
 // Raw bf16 input of channel `ch` at position `pos` of the conv sequence [cs0, cs1, cs2, x0, x1, ...]:
 // the conv state for pos < 3, else token pos - 3.
 SGL_DEVICE const uint16_t* seq_ptr(const KdaVerifyParams& p, const uint16_t* cs, int64_t bos, int pos, int64_t ch) {
@@ -216,7 +206,7 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
       p.state + static_cast<int64_t>(slot) * p.stride_state_slot + (static_cast<int64_t>(hv) * V + col) * K + r0;
 #pragma unroll
   for (int i = 0; i < KR; i += 4) {
-    const float4 v4 = load_as<float4>(hp + i);
+    const float4 v4 = device::load_as<float4>(hp + i);
     h[i] = v4.x;
     h[i + 1] = v4.y;
     h[i + 2] = v4.z;
@@ -233,11 +223,11 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
   uint4 hist[4];
 #pragma unroll
   for (int i = 0; i < 4; ++i)
-    hist[i] = load_as<uint4>(seq_ptr(p, cs, bos, conv_t + i, cch));
+    hist[i] = device::load_as<uint4>(seq_ptr(p, cs, bos, conv_t + i, cch));
   float4 w[8];
 #pragma unroll
   for (int i = 0; i < 8; ++i)
-    w[i] = load_as<float4>(p.conv_w + (cch + i) * 4);
+    w[i] = device::load_as<float4>(p.conv_w + (cch + i) * 4);
 
   // gate: token tid / kGateLanes, K rows [g0, g0 + kGateRows)
   const int gate_t = min(tid / kGateLanes, kT - 1);
@@ -247,8 +237,8 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
   float dt[kGateRows];
 #pragma unroll
   for (int i = 0; i < kGateRows; i += 2) {
-    a_raw[i / 2] = load_as<uint32_t>(p.a + (bos + gate_t) * p.stride_a_tok + hv * K + g0 + i);
-    const float2 d = load_as<float2>(p.dt_bias + hv * K + g0 + i);
+    a_raw[i / 2] = device::load_as<uint32_t>(p.a + (bos + gate_t) * p.stride_a_tok + hv * K + g0 + i);
+    const float2 d = device::load_as<float2>(p.dt_bias + hv * K + g0 + i);
     dt[i] = d.x;
     dt[i + 1] = d.y;
   }
@@ -265,7 +255,7 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
 #pragma unroll
     for (int i = 0; i < 4; ++i)
       v_hist[it][i] = *seq_ptr(p, cs, bos, idx / kCols + i, vc);
-    wv[it] = load_as<float4>(p.conv_w + vc * 4);
+    wv[it] = device::load_as<float4>(p.conv_w + vc * 4);
   }
   asm volatile("" ::: "memory");  // keep every load above ahead of the compute and stores below
 
@@ -279,8 +269,8 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
   const float rn = (1.0f / sqrtf(group_sum<16>(ss) + 1e-6f)) * (is_k ? 1.0f : p.scale);
   if (conv_valid) {
     float* dst = is_k ? &s_k[conv_t][c8] : &s_q[conv_t][c8];
-    store_as<float4>(dst, make_float4(y[0] * rn, y[1] * rn, y[2] * rn, y[3] * rn));
-    store_as<float4>(dst + 4, make_float4(y[4] * rn, y[5] * rn, y[6] * rn, y[7] * rn));
+    device::store_as<float4>(dst, make_float4(y[0] * rn, y[1] * rn, y[2] * rn, y[3] * rn));
+    device::store_as<float4>(dst + 4, make_float4(y[4] * rn, y[5] * rn, y[6] * rn, y[7] * rn));
   }
   const float exp_a_log = __expf(a_log);
   float g[kGateRows];
@@ -316,17 +306,17 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
         uint16_t* wp = iw + conv_t * p.stride_iw_step + cch;
 #pragma unroll
         for (int i = 0; i < 3; ++i)
-          store_as<uint4>(wp + i * p.stride_iw_win, hist[i + 1]);
+          device::store_as<uint4>(wp + i * p.stride_iw_win, hist[i + 1]);
       }
       if (is_k && conv_t < p.ring_len) {
-        store_as<uint4>(p.rawk + slot * p.stride_rawk_slot + (ring_head + conv_t) * K + c8, pack_bf16x8(y));
+        device::store_as<uint4>(p.rawk + slot * p.stride_rawk_slot + (ring_head + conv_t) * K + c8, pack_bf16x8(y));
       }
     }
     if (gate_valid && gate_t < p.ring_len) {
       float* gp = p.ring_g + slot * p.stride_g_slot + (ring_head + gate_t) * K + g0;
 #pragma unroll
       for (int i = 0; i < kGateRows; i += 2)
-        store_as<float2>(gp + i, make_float2(g[i], g[i + 1]));
+        device::store_as<float2>(gp + i, make_float2(g[i], g[i + 1]));
     }
     if (tid < kT && tid < p.ring_len) p.ring_beta[slot * p.stride_beta_slot + ring_head + tid] = beta;
   }
@@ -380,7 +370,7 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
             p.snap + widx * p.stride_snap_row + t * p.stride_snap_step + (static_cast<int64_t>(hv) * V + col) * K + r0;
 #pragma unroll
         for (int i = 0; i < KR; i += 4)
-          store_as<float4>(sp + i, make_float4(h[i], h[i + 1], h[i + 2], h[i + 3]));
+          device::store_as<float4>(sp + i, make_float4(h[i], h[i + 1], h[i + 2], h[i + 3]));
       }
     }
   }

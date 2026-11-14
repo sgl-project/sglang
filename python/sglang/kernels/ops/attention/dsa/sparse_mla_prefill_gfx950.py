@@ -82,9 +82,7 @@ def sparse_mla_prefill_gfx950(
 
 def sparse_mla_decode_splits(rows: int) -> int:
     """CTAs per row for sparse_mla_split_gfx950 on a decode / verify batch of ``rows`` query
-    rows (top-2048, 12 heads, MI355X, 2 stages; us at rows 6 / 24 / 48 / 96 / 192 / 288:
-    S16 17.9 / 24.0 / 30.3, S8 18.5 / 20.6 / 26.2 / 32.0 / 53.4, S4 36.6 / 47.5 / 71.1,
-    vs the Triton split-K 22.8 / 41.0 / 66.1 / 115 / 231 / 453)."""
+    rows (tuned on MI355X, top-2048, 12 heads)."""
     if rows <= 6:
         return 16
     if rows <= 128:

@@ -77,14 +77,10 @@ def all_gather_norm_residual_supported(
     if not current_arch().is_sm_at_least(10):
         return False
     try:
-        cluster_size, _, _ = norm_residual_launch_config(
-            hidden_size=hidden_size, num_tokens=num_tokens
-        )
+        norm_residual_launch_config(hidden_size=hidden_size, num_tokens=num_tokens)
     except RuntimeError:
         return False
-    return comm.config.num_push_blocks >= 2 and (
-        cluster_size == 1 or num_tokens * cluster_size <= comm.config.num_push_blocks
-    )
+    return True
 
 
 def all_gather_norm_residual(

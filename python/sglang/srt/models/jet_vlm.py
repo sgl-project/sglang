@@ -10,9 +10,9 @@ from torch import Tensor
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.siglip import SiglipVisionModel
 
+import sglang.srt.layers.utils as utils
 import sglang.srt.managers.mm_utils as mm_utils
 import sglang.srt.model_loader.weight_utils as weight_utils
-import sglang.srt.utils as utils
 from sglang.srt.configs.jet_vlm import JetVLMConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig

@@ -542,7 +542,7 @@ class SchedulerDisaggMixin:
         self._preallocated_slots: dict[int, object] = {}
         preallocated_slot_info = []
         if self._disagg_role.is_transfer_receiver:
-            capacity = getattr(sa, "disagg_prealloc_slots", 2)
+            capacity = 2
             typical_size = 64 * 1024 * 1024  # 64 MiB per slot
             for i in range(capacity):
                 slot = buffer.allocate(typical_size, f"prealloc_{i}")

@@ -55,6 +55,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 from sglang.srt.configs.model_config import is_kimi_k31, is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.dsa import capture_slots_hip
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 from sglang.srt.layers.cp.bcg.bcg import (
@@ -74,7 +75,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -140,6 +141,12 @@ def _has_chunked_local_attn(model_runner: Any) -> bool:
     )
 
 
+from sglang.srt.layers.dp_attention import (
+    get_cuda_graph_max_batch_size,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_tp_gather,
+)
 from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -171,16 +178,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    get_cuda_graph_max_batch_size,
-    is_cuda,
-    is_hip,
-    is_npu,
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_tp_gather,
-)
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
 
 if TYPE_CHECKING:
@@ -348,10 +346,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
         # companion never runs there and any prefix goes through sparse MLA.
-        backend = self.model_runner.attn_backend
         if self._kimi_k31_rocm_bcg:  # KDA + DSA: the hybrid backend wraps DSA
-            backend = backend.full_attn_backend
-        return isinstance(backend, DeepseekSparseAttnBackend)
+            backend = self.model_runner.attn_backend.full_attn_backend
+            return isinstance(backend, DeepseekSparseAttnBackend)
+        return isinstance(self.model_runner.attn_backend, DeepseekSparseAttnBackend)
 
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
@@ -373,7 +371,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         prefill_attn_backend = getattr(
             model_runner.attn_backend, "prefill_backend", model_runner.attn_backend
         )
-        self._fa4_prefill = getattr(prefill_attn_backend, "fa_impl_ver", None) == 4
+        self._fa4_prefill = getattr(
+            prefill_attn_backend, "fa_impl_ver", None
+        ) == 4 or getattr(prefill_attn_backend, "fa3_upgrades_to_fa4", False)
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -738,18 +738,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 None,
             )
 
-        # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata;
-        # capture keeps one bucket-sized buffer per shape and replay reuses it.
-        # Kimi-K3.1's DSA layers never read it, so its prefix extends keep replaying.
-        self._kimi_k31_rocm_bcg = is_hip() and is_kimi_k31(
-            model_runner.model_config.hf_config
+        # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata.
+        self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
+            model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
-        self._dcp_extend_active = (
-            get_parallel().attn_dcp_size > 1
-            and hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp")
-            and not self._kimi_k31_rocm_bcg
-        )
-        self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}
+        if is_hip() and is_kimi_k31(model_runner.model_config.hf_config):
+            self._kimi_k31_rocm_bcg = True
+            # Kimi-K3.1's DSA layers never read that gather buffer.
+            self._dcp_extend_active = False
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -1350,11 +1346,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
         if self._dcp_extend_active:
-            # Zero-prefix capture batch: its gather buffer is bucket-sized, so
-            # it doubles as the replay buffer for this shape.
-            metadata = self._plan_dcp_metadata(forward_batch)
-            forward_batch.attn_dcp_metadata = metadata
-            self._dcp_kv_buffers[shape_key] = metadata.dcp_kv_buffer
+            forward_batch.attn_dcp_metadata = self._plan_dcp_metadata(forward_batch)
         attn_backend = self.model_runner.attn_backend
         with forward_context(
             ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
@@ -1384,10 +1376,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         real seq_lens / prefix_lens; the captured kernels read the
         updated state at replay."""
         if self._dcp_extend_active:
-            # The gather and the attention are breaks reading the live batch: plan
-            # live indices, but use the bucket-sized buffer (k_nope/k_pe are padded).
+            # The gather and the attention are breaks reading the live batch, so
+            # its plan (live-sized buffer, prefix included) serves any prefix.
             metadata = self._plan_dcp_metadata(forward_batch)
-            metadata.dcp_kv_buffer = self._dcp_kv_buffers[shape_key]
             forward_batch.attn_dcp_metadata = metadata
             static_forward_batch.attn_dcp_metadata = metadata
         attn_backend = self.model_runner.attn_backend
@@ -1434,9 +1425,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         return attn_backend.resolve_prefill_shared_read_ends(
-            forward_batch,
-            num_qo_tokens=shape_key.size,
-            build_snapshot=build_snapshot,
+            forward_batch, build_snapshot=build_snapshot
         )
 
     @staticmethod
@@ -1516,10 +1505,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):
-            return False
-        # Under DCP only fresh prefills replay; a prefix hit needs the cross-rank
-        # prefix KV all-gather with per-batch shapes, which stays eager.
-        if self._dcp_extend_active and prefix_lens is not None and any(prefix_lens):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
@@ -1674,19 +1659,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_start_locs = [0]
         for seq_len in capture_seq_lens[:-1]:
             capture_start_locs.append(capture_start_locs[-1] + seq_len)
-        dcp_size = get_parallel().attn_dcp_size
-        if dcp_size > 1 and self._kimi_k31_rocm_bcg:
-            # Sharded DSA picks a rank's KV rows by slot owner (slot % dcp_size) but
-            # sizes its gather by position; slots p % dcp_size keep the two consistent
-            # and only touch each rank's padding row 0.
-            req_to_token = self.model_runner.req_to_token_pool.req_to_token
-            for row, seq_len in enumerate(capture_seq_lens):
-                req_to_token[row, :seq_len] = (
-                    torch.arange(
-                        seq_len, device=req_to_token.device, dtype=req_to_token.dtype
-                    )
-                    % dcp_size
-                )
+        if self._kimi_k31_rocm_bcg:
+            capture_slots_hip.fill_by_dcp_owner(self.model_runner, capture_seq_lens)
 
         with torch.device(self.device):
             shape_inputs = {

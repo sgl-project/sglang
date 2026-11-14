@@ -18,6 +18,7 @@ def is_activation_quantization_format(format: str) -> bool:
         CompressionFormat.nvfp4_pack_quantized.value,
         CompressionFormat.mxfp4_pack_quantized.value,
         CompressionFormat.pack_quantized.value,
+        CompressionFormat.mxfp8_quantized.value,
     ]
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 

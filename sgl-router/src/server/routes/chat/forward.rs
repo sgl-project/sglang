@@ -15,17 +15,18 @@ use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
-    StaleRequestOutcome, WorkerModeLabel,
+    classify_stream_end, outcome_from_status, MediaCounts, MetricsRegistry, RequestLogContext,
+    RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::StreamExt;
-use sglang_api_types::runtime::v1::DisaggregatedParams;
+use sglang_runtime_v1_types::DisaggregatedParams;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -811,12 +812,23 @@ fn spawn_prefill_request<T: Transport>(
 /// `prefill_failed`.
 async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
     let status = match result {
-        // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
+        // A streaming prefill reports a late failure as a 200 carrying an SSE
+        // error event; one with a 4xx code is the engine refusing the request.
         Ok(response) if response.status().is_success() => {
             let status = response.status();
             match axum::body::to_bytes(response.into_body(), usize::MAX).await {
                 Ok(body) if !sse::has_error_event(&body) => return None,
-                _ => status,
+                Ok(body) => match sse::client_error_event(&body) {
+                    Some((status, error)) => {
+                        let mut response = Response::new(Body::from(error));
+                        *response.status_mut() = status;
+                        let json = HeaderValue::from_static("application/json");
+                        response.headers_mut().insert(CONTENT_TYPE, json);
+                        return Some(Ok(response));
+                    }
+                    None => status,
+                },
+                Err(_) => status,
             }
         }
         Ok(response)
@@ -949,6 +961,7 @@ struct DispatchMetrics {
     worker_url: String,
     mode: WorkerModeLabel,
     streaming: bool,
+    media: MediaCounts,
     request_started_at: Instant,
     duration: Arc<RequestDurationGuard>,
 }
@@ -971,6 +984,7 @@ impl DispatchMetrics {
                 WorkerMode::Plain => WorkerModeLabel::Plain,
             },
             streaming: request.streaming,
+            media: request.media,
             request_started_at,
             duration: Arc::clone(duration),
         }
@@ -1049,6 +1063,7 @@ impl DispatchMetrics {
             streaming: self.streaming,
             outcome,
             engine_rid,
+            media: self.media,
         }
     }
 }
@@ -1095,6 +1110,7 @@ impl Drop for RequestDurationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
 
     #[tokio::test]
     async fn stream_after_prefill_waits_for_prefill() {
@@ -1115,5 +1131,73 @@ mod tests {
             assert!(response.is_ok() && blame.is_none());
             assert_eq!(done.load(Ordering::SeqCst), wait);
         }
+    }
+
+    fn sse(events: &[&str]) -> Result<Response<Body>, ApiError> {
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        Ok(Response::new(Body::from(body)))
+    }
+
+    async fn body_json(response: Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        serde_json::from_slice(&bytes.await.unwrap()).unwrap()
+    }
+
+    fn assert_prefill_failed(failure: PrefillFailure) {
+        match failure {
+            Some(Err(ApiError::PrefillFailed { status })) => {
+                assert_eq!(status, Some(StatusCode::OK));
+            }
+            other => panic!("expected prefill_failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn in_band_client_error_passes_through() {
+        // As sglang's OpenAI entrypoints stream a 4xx abort (`create_streaming_error_response`).
+        let error = r#"{"error": {"object": "error", "message": "Invalid grammar", "type": "BAD_REQUEST", "param": null, "code": 400}}"#;
+        let failure = prefill_failure(sse(&[error, "[DONE]"])).await;
+        let response = failure.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        let expected: serde_json::Value = serde_json::from_str(error).unwrap();
+        assert_eq!(body_json(response).await, expected);
+
+        // As native `/generate` streams it (compact orjson): an abort finish reason with a status code.
+        let native = r#"{"text":"","meta_info":{"finish_reason":{"type":"abort","message":"Invalid grammar","status_code":422}}}"#;
+        let failure = prefill_failure(sse(&[native, "[DONE]"])).await;
+        let response = failure.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({"error": {"message": "Invalid grammar", "code": 422}}),
+        );
+    }
+
+    #[tokio::test]
+    async fn in_band_server_error_stays_prefill_failed() {
+        let error = r#"{"error": {"object": "error", "message": "boom", "type": "INTERNAL_SERVER_ERROR", "param": null, "code": 500}}"#;
+        assert_prefill_failed(prefill_failure(sse(&[error, "[DONE]"])).await);
+        let native = r#"{"text":"","meta_info":{"finish_reason":{"type":"abort","message":"boom","status_code":503}}}"#;
+        assert_prefill_failed(prefill_failure(sse(&[native])).await);
+    }
+
+    #[tokio::test]
+    async fn unparseable_in_band_error_stays_prefill_failed() {
+        for event in [
+            r#"{"error": {"message": "truncated", "code": 40"#,
+            r#"{"error": {"message": "no code"}}"#,
+            r#"{"error": {"message": "string code", "code": "400"}}"#,
+            r#"{"error": {"message": "not a status", "code": 4000}}"#,
+            r#"{"error": "bare string"}"#,
+        ] {
+            assert_prefill_failed(prefill_failure(sse(&[event])).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_prefill_stream_is_not_a_failure() {
+        let chunk = r#"{"choices": [{"delta": {"content": "{\"error\": {\"code\": 400}}"}}]}"#;
+        assert!(prefill_failure(sse(&[chunk, "[DONE]"])).await.is_none());
     }
 }

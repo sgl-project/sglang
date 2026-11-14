@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one
+from sglang.srt.utils.device import is_mps
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,22 @@ def register_model_override_predicate(predicate: Callable[[str], bool]):
         return fn
 
     return decorator
+
+
+# --moe-a2a-backend values DSpark with DP attention is validated on, per
+# architecture that differs from the default.
+DSPARK_DP_A2A_BACKENDS_DEFAULT: Tuple[str, ...] = ("none", "megamoe", "mori")
+_DSPARK_DP_A2A_BACKENDS: Dict[str, Tuple[str, ...]] = {}
+
+
+def register_dspark_dp_a2a_backends(
+    architecture: str, backends: Tuple[str, ...]
+) -> None:
+    _DSPARK_DP_A2A_BACKENDS[architecture] = backends
+
+
+def dspark_dp_a2a_backends(architecture: str) -> Tuple[str, ...]:
+    return _DSPARK_DP_A2A_BACKENDS.get(architecture, DSPARK_DP_A2A_BACKENDS_DEFAULT)
 
 
 def _invoke_provider(
@@ -396,4 +412,15 @@ def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
         "mxfp4" in str(g.get("format", ""))
         for g in groups.values()
         if isinstance(g, dict)
+    )
+
+
+# TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
+# TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
+def is_no_spec_infer_or_topk_one(cfg):
+    """``cfg`` is a resolving config view, not the published record: the
+    resolution pipeline is the only caller, and it asks mid-resolution."""
+    return cfg.speculative_eagle_topk is None or (
+        cfg.speculative_eagle_topk == 1
+        and (cfg.page_size == 1 or cfg.page_size is None)
     )

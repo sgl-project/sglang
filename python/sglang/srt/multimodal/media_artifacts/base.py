@@ -41,8 +41,8 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS, load_image
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import load_image
 
 
 @runtime_checkable
@@ -157,9 +157,12 @@ class MediaArtifactCacheMixin:
         if isinstance(data, Image.Image):
             data.load()
             return data
-        image, _ = load_image(data, self.gpu_image_decode)
-        if isinstance(image, Image.Image):
-            image.load()
+        try:
+            image, _ = load_image(data, self.gpu_image_decode)
+            if isinstance(image, Image.Image):
+                image.load()
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            raise ValueError(f"Could not load image: {e}") from e
         return image
 
     def snapshot_media_source(self, source: Any, modality: Modality) -> MediaSnapshot:

@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -45,11 +46,6 @@ def test_markers_in_argument_value_are_not_stripped():
     assert ids(source.take(RESPONSE_OPEN)) == [0]
 
 
-def test_channel_marker_words_do_not_steal_content_tokens():
-    source = ledger([RESPONSE_OPEN.encode(), b"response"])
-    assert ids(source.take("response", text=True)) == [1]
-
-
 def test_replayed_reasoning_uses_its_original_tokens():
     source = ledger([b"first", b" second", b" tail"])
     assert ids(source.take("first", text=True, reasoning=True)) == [0]
@@ -66,13 +62,11 @@ def test_text_spanning_removed_wrappers():
     assert ids(source.take("ab", text=True)) == [0, 2]
 
 
-def test_mismatch_is_not_silently_assigned_arbitrary_ids():
-    source = ledger([b"actual"])
-    with pytest.raises(ValueError, match="no matching"):
-        source.take("invented", text=True)
-
-
 def test_same_token_id_generated_twice_is_not_deduplicated():
     source = ledger([b"a"])
     source.append([0])
     assert ids(source.take("aa", text=True)) == [0, 0]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

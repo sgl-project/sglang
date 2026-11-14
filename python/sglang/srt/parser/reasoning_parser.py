@@ -115,6 +115,10 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
+    @property
+    def in_reasoning(self) -> bool:
+        return self._in_reasoning
+
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
@@ -477,6 +481,40 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             # Qwen3.5 sometimes opens ``<tool_call>`` without closing
             # ``</think>``; treat it as an implicit reasoning close.
             tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
+class Ernie5_5ReasoningDetector(BaseReasoningFormatDetector):
+    """Reasoning of ERNIE 5.5 Flash: ``<ernie:think> ... </ernie:think>``.
+
+    A tool-call start inside the think block closes it implicitly.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<ernie:think>",
+            "</ernie:think>",
+            think_excluded_tokens=[
+                "<ernie:tool_call>",
+                "</ernie:tool_call>",
+                "<|ernie:im_end|>",
+                "<|ERNIE_MASK|>",
+            ],
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<ernie:tool_call>",
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             thinks_internally=True,
@@ -2337,6 +2375,7 @@ class ReasoningParser:
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
+        "ernie55": Ernie5_5ReasoningDetector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "minimax-m3": MiniMaxM3Detector,

@@ -7,31 +7,8 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from .common import _add, _encode_groups, _unpack_words, _weight_offset
 
-@gluon.jit
-def _add(a, b):
-    return a + b
-
-@gluon.jit
-def _encode_groups(x, shared):
-    peak = gl.max(gl.abs(x), 1)
-    divided = gl.div_rn(peak, 6.0)
-    bits = divided.to(gl.uint32, bitcast=True)
-    exponent = (bits >> 23 & 255).to(gl.int32) - 127 + (bits & 8388607 != 0)
-    peak_bits = peak.to(gl.uint32, bitcast=True)
-    floor_exp = (peak_bits >> 23 & 255).to(gl.int32) - 127
-    threshold = gl.exp2(floor_exp.to(gl.float32)) * 1.75
-    even_exp = floor_exp - 2 + (peak >= threshold).to(gl.int32)
-    exponent = gl.where(shared, even_exp, exponent)
-    exponent = gl.maximum(-127, gl.minimum(127, exponent))
-    scale = gl.exp2(exponent.to(gl.float32))
-    inverse_scale = gl.div_rn(1.0, scale)
-    a = gl.abs(x * inverse_scale[:, None])
-    low, high = gl.split(a.reshape((x.shape[0], 16, 2)))
-    packed = gl.inline_asm_elementwise('v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3;', constraints='=v,v,v,v', args=[low, high, gl.full(low.shape, 1.0, gl.float32, low.type.layout)], dtype=gl.uint32, is_pure=True, pack=1)
-    signs = gl.where(x < 0, 8, 0).to(gl.uint8)
-    low_sign, high_sign = gl.split(signs.reshape((x.shape[0], 16, 2)))
-    return (packed.to(gl.uint8) & 119 | low_sign | high_sign << 4, (exponent + 127).to(gl.uint8))
 
 @gluon.jit
 def _quantize_input(X, Q, QS, M: gl.constexpr, H: gl.constexpr, SX: gl.constexpr, GROUPS: gl.constexpr, CTA_OFFSET: gl.constexpr):
@@ -116,11 +93,6 @@ def _select_routes(L, Bias, Weights, Counts, Sorted, M: gl.constexpr, SPLITS: gl
     gl.store(Weights + m * 8 + e, selected_prob / total * SCALE, e < 8)
 
 @gluon.jit
-def _weight_offset(n, k, K: gl.constexpr):
-    byte = k // 2
-    return (((n // 16 * (K // 64) + byte // 32) * 2 + byte // 16 % 2) * 16 + n % 16) * 16 + byte % 16
-
-@gluon.jit
 def _load_packed_weight(W, S, expert, column, base, N: gl.constexpr, K: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, UP: gl.constexpr):
     WARPS: gl.constexpr = gl.num_warps()
     W = W + expert * (N * K // 2)
@@ -148,14 +120,6 @@ def _load_packed_weight(W, S, expert, column, base, N: gl.constexpr, K: gl.const
     packed_scales = _unpack_words(raw)
     scale_byte = gl.permute(packed_scales, (0, 5, 3, 1, 4, 2)).reshape((BN, BK // 32))
     return (words, scale_byte)
-
-@gluon.jit
-def _unpack_words(words):
-    b0 = words.to(gl.uint8)
-    b1 = (words >> 8).to(gl.uint8)
-    b2 = (words >> 16).to(gl.uint8)
-    b3 = (words >> 24).to(gl.uint8)
-    return gl.join(gl.join(b0, b2), gl.join(b1, b3))
 
 @gluon.jit
 def _project_tile(X, XS, W, WS, row, column, expert, N: gl.constexpr, K: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, UP: gl.constexpr):

@@ -12,22 +12,15 @@ from sglang.kernels.ops.attention.dsa.sparse_mla_decode_gfx950 import (
     supports_sparse_mla_decode_gfx950,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import dcp_localize_compact
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    from sglang.srt.layers.attention.dsa_backend import (
+        DeepseekSparseAttnBackend,
+        DSAMetadata,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
-
-
-def validate_dcp_backend_hip(prefill_impl: str, decode_impl: str) -> None:
-    # ROCm merges top-k with its HIP kernels; only the triton backends localize
-    # slots and return the DCP partials.
-    if prefill_impl != "triton" or decode_impl != "triton":
-        raise ValueError(
-            "DSA with --dcp-size > 1 on ROCm needs --dsa-prefill-backend and "
-            f"--dsa-decode-backend triton; got {prefill_impl} and {decode_impl}."
-        )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @functools.cache
@@ -46,8 +39,12 @@ def forward_triton_dcp_partial(
     """A decode or target-verify layer over this rank's KV shard: (o [T, H, D],
     natural-log lse [T, H]) for the merge, as _forward_flashmla_kv's
     dcp_partial returns."""
+    # the indexer's local slots (dcp_local_topk) and their counts
+    topk_length = backend.forward_metadata.dcp_topk_length
+    pad = page_table_1.shape[0] - topk_length.shape[0]
+    if pad > 0:  # padded rows (DP / attention-TP padding) select nothing
+        topk_length = torch.nn.functional.pad(topk_length, (0, pad))
     # Each rank holds about 1/N of the global top-k; bound rows by their share.
-    page_table_1, topk_length = dcp_localize_compact(page_table_1)
     expected_topk = -(-page_table_1.shape[-1] // backend.attn_dcp_size)
     if _gfx950_decode_enabled() and supports_sparse_mla_decode_gfx950(
         q_nope, kv_cache, layer.v_head_dim
@@ -82,3 +79,26 @@ def forward_triton_dcp_partial(
         expected_topk=expected_topk,
     )
     return o.squeeze(0), lse
+
+
+def dcp_gather_kv_cache(
+    backend: DeepseekSparseAttnBackend,
+    kv_cache: torch.Tensor,
+    forward_batch: ForwardBatch,
+    metadata: DSAMetadata,
+) -> torch.Tensor:
+    """``DeepseekSparseAttnBackend.dcp_gather_kv_cache``: the send buffer is read
+    straight from this rank's cache rows and the output is page-padded in place."""
+    from sglang.srt.layers.attention.dsa.dsa_dcp_sharded_hip import (
+        dcp_gather_request_rows,
+    )
+
+    assert metadata.dcp_local_kv_rows is not None
+    rows = kv_cache.view(torch.uint8).view(-1, backend.kv_cache_dim)
+    gathered = dcp_gather_request_rows(
+        rows,
+        forward_batch.seq_lens_cpu,
+        row_ids=metadata.dcp_local_kv_rows,
+        page_size=backend.physical_page_size,
+    )
+    return gathered.view(kv_cache.dtype)

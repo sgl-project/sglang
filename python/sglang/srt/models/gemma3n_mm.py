@@ -15,9 +15,11 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import AutoModel
 
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
@@ -32,8 +34,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import add_prefix, flatten_nested_list
-from sglang.srt.utils.hf_transformers import get_processor
+from sglang.srt.utils import flatten_nested_list
 
 logger = logging.getLogger(__name__)
 

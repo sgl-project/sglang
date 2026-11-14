@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_parallel,
 )
-from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
+from sglang.srt.utils.log_utils import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -522,7 +522,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     return StandardCombineInput(hidden_states=output)
 
 
-@register_fused_func("flashinfer", "flashinfer_cutedsl")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_cutedsl")
 def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,

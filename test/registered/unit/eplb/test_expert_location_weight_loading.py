@@ -103,7 +103,7 @@ def _stand_in_layer(
     for name in (
         "_map_global_expert_id_to_local_expert_id",
         "_local_routed_expert_ids",
-        "_weight_loader_physical",
+        "_weight_loader_expert_ids",
     ):
         setattr(layer, name, types.MethodType(getattr(FusedMoE, name), layer))
     return layer

@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.model_overrides.gemma4 import gemma4_attention_backends
 from sglang.srt.arg_groups.overrides import (
     _deepseek_moe_quant_resolution,
     _deepseek_spec_moe_resolution,
@@ -36,6 +37,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -45,11 +47,8 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.common import (
-    get_quantization_config,
-    is_mps,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.device import is_mps
 
 logger = logging.getLogger(__name__)
 
@@ -257,11 +256,9 @@ def handle_model_specific_adjustments(server_args: Any):
         apply_kimi_k3_linear_attn_defaults(server_args)
         apply_kimi_k3_spec_backend_defaults(server_args)
         if model_arch == "KimiK31ForConditionalGeneration" and get_platform().is_hip:
-            from sglang.srt.models.kimi_k3_amd.env_defaults import (
-                apply_kimi_k31_rocm_env_defaults,
-            )
+            from sglang.srt.models.kimi_k3_amd import env_defaults
 
-            apply_kimi_k31_rocm_env_defaults()
+            env_defaults.apply_kimi_k31_rocm_env_defaults()
 
     if model_arch == "Glm5NextForConditionalGeneration":
         from sglang.srt.arg_groups.glm5_next_hook import (
@@ -502,11 +499,10 @@ def handle_model_specific_adjustments(server_args: Any):
             if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             # The default top-k v2 path still requires unsupported resources.
-            envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-            if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
-                envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
             if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             # Out of the box the indexer runs the TileLang kernel (works on
@@ -518,16 +514,15 @@ def handle_model_specific_adjustments(server_args: Any):
             if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
         elif get_platform().is_hip:
-            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             _configure_rocm_fp8_wo_a_gemm(model_config, cfg.download_dir)
-            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-            envs.SGLANG_OPT_USE_TOPK_V2.set(True)
-            envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
-            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
-            envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
+            if not envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.is_set():
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
+            if not envs.SGLANG_EAGER_INPUT_NO_COPY.is_set():
+                envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
     elif model_arch in ["Xing4_0ForCausalLM"]:
         # Xing4_0 uses the TileLang mhc_pre/mhc_post kernels
@@ -593,11 +588,6 @@ def handle_model_specific_adjustments(server_args: Any):
 
         # The moe_runner_backend selection moved to the override registry
         # (arg_groups/overrides.py: _gpt_oss_overrides).
-
-        if resolved_view(server_args).moe_runner_backend == "triton_kernel":
-            assert resolved_view(server_args).ep_size == 1, (
-                "Triton kernel MoE is only supported when ep_size == 1"
-            )
 
     elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
@@ -672,20 +662,12 @@ def handle_model_specific_adjustments(server_args: Any):
         prefill_backend, decode_backend = attention_backends_of(
             resolved_view(server_args)
         )
-        accepted_backends = (
-            "trtllm_mha",
-            "triton",
-            "fa4",
-            "ascend",
-            "intel_xpu",
-            "intel_amx",
-            "aiter",
-        )
+        accepted_backends = gemma4_attention_backends()
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, fa4, ascend, intel_xpu, intel_amx, or "
-            f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
+            f"Gemma4 only supports attention backends in {accepted_backends}, "
+            f"got prefill={prefill_backend}, decode={decode_backend}"
         )
 
         # The quantization/moe_runner_backend resolution moved to the override

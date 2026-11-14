@@ -6,8 +6,8 @@ import unittest
 import psutil
 import requests
 
-from sglang.srt.utils.common import kill_process_tree
 from sglang.srt.utils.network import get_open_port
+from sglang.srt.utils.process import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -16,9 +16,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(
-    est_time=180, stage="nightly", runner_config="1-gpu-small", nightly=True
-)
+register_cuda_ci(est_time=180, stage="nightly", runner_config="1-gpu-small")
 
 MEM_FRACTION_STATIC = 0.6
 GATED_MEMORY_CEILING_MB = 8 * 1024

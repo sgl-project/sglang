@@ -19,11 +19,31 @@ pytestmark = pytest.mark.skipif(
 def _prepare(q, rope, indices):
     from sglang.kernels.ops.attention.dsa.flashmla_token_pack import (
         flashmla_token_pack_available,
+        flashmla_token_pack_prepare,
     )
 
     if not flashmla_token_pack_available():
         pytest.skip("installed FlashMLA predates token packing")
-    return torch.ops.sgl_kernel.flashmla_token_pack_prepare(q, rope, indices)
+    return flashmla_token_pack_prepare(q, rope, indices)
+
+
+def _sparse_decode(q, cache, indices, topk_length, heads_per_group):
+    from sglang.kernels.ops.attention import flash_mla_interface
+
+    return flash_mla_interface.flash_mla_with_kvcache(
+        q=q,
+        k_cache=cache,
+        block_table=None,
+        cache_seqlens=None,
+        head_dim_v=512,
+        tile_scheduler_metadata=flash_mla_interface.get_mla_metadata()[0],
+        softmax_scale=576**-0.5,
+        is_fp8_kvcache=True,
+        indices=indices,
+        topk_length=topk_length,
+        kv_format="V32",
+        heads_per_group=heads_per_group,
+    )
 
 
 def _check_union(indices, packed_indices, lengths, tokens, group):
@@ -156,22 +176,7 @@ def test_attention(heads, tokens, topk, pattern):
     packed_q, packed_indices, lengths = _prepare(q[:, :, :512], q[:, :, 512:], rows)
 
     def attend(query, idx, lens, group_heads):
-        return torch.ops.sgl_kernel.sparse_decode_fwd.default(
-            query,
-            cache,
-            idx.unsqueeze(1),
-            lens,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            512,
-            576**-0.5,
-            "V32",
-            group_heads,
-        )[:2]
+        return _sparse_decode(query, cache, idx.unsqueeze(1), lens, group_heads)
 
     reference, reference_lse = attend(
         q.unsqueeze(1), rows, (rows >= 0).sum(-1).int(), 0
@@ -211,22 +216,7 @@ def test_packed_attention_graph():
             rows.fill_(-1)
         q.normal_()
         graph.replay()
-        reference = torch.ops.sgl_kernel.sparse_decode_fwd.default(
-            q.unsqueeze(1),
-            cache,
-            rows.unsqueeze(1),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            512,
-            576**-0.5,
-            "V32",
-            0,
-        )[0]
+        reference = _sparse_decode(q.unsqueeze(1), cache, rows.unsqueeze(1), None, 0)[0]
         torch.testing.assert_close(actual, reference, atol=2e-3, rtol=1e-2)
 
 

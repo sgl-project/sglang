@@ -26,7 +26,8 @@ from sglang.srt.layers.quantization.marlin_utils import (
     moe_awq_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 
 if TYPE_CHECKING:
     from compressed_tensors.quantization import QuantizationArgs

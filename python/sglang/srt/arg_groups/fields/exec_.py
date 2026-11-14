@@ -291,7 +291,7 @@ class ExecKernel(msgspec.Struct):
     fp8_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only), 'halops' (MXFP8 w8a8 dense GEMM from the optional HALOps wheel; SM100 only). ",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only), 'halops' (MXFP8 w8a8 dense GEMM from the optional HALOps wheel; SM100 only), 'xpu_scaled_mm' (Intel XPU only; torch scaled_mm, which auto already selects on XPU). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -309,7 +309,7 @@ class ExecKernel(msgspec.Struct):
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; bias-free M <= 16 uses FlashInfer's autotuned CuTe DSL mm_bf16 except on SM107 or with --disable-flashinfer-autotune, other shapes dispatch between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=["auto", "cutedsl", "gemv", "torch"],
         ),
@@ -318,7 +318,7 @@ class ExecKernel(msgspec.Struct):
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
-            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103, fp8_e4m3 KV).",
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -383,7 +383,7 @@ class ExecKernel(msgspec.Struct):
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
-            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103, fp8_e4m3 KV).",
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -482,6 +482,16 @@ class ExecKernel(msgspec.Struct):
     enable_deepseek_v4_fp4_indexer: A[
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+    ] = False
+    enable_fp4_indexer: A[
+        bool,
+        "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer.",
+    ] = False
+    enable_dsa_fp4_indexer: A[
+        bool,
+        "Store the DSA indexer keys in MXFP4 and score them with AITER's FP4 MQA-logits kernels "
+        "(Kimi-K3.1 on gfx950 with DCP): the row-group kernel in decode and target verify, the "
+        "prefill kernel over the DCP-gathered keys in prefill.",
     ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],
@@ -629,14 +639,15 @@ class ExecMamba(msgspec.Struct):
     ] = False
     linear_replayssm_cache_len: A[
         int,
-        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
+        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps. With --enable-linear-replayssm-spec on GDN models it is also the spec-verify ring length, which must be a power of two, at least 16 and at least the number of draft tokens.",
     ] = 16
     # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via
     # fold-every-commit instead of per-draft full-state snapshots -- the verify
     # stores each draft step's raw inputs into a per-slot window and the commit
-    # replays the accepted prefix into the fp32 checkpoint. GDN sizes the window
-    # to the draft maximum; KDA folds a (raw v, pre-norm k, gate, beta) ring of
-    # length --linear-replayssm-cache-len. Linear-chain (topk <= 1) only.
+    # replays the accepted prefix into the fp32 checkpoint. GDN keeps a ring of
+    # length --linear-replayssm-cache-len (a power of two, at least 16, that
+    # holds the draft window); KDA folds a (raw v, pre-norm k, gate, beta) ring
+    # of the same length. Linear-chain (topk <= 1) only.
     enable_linear_replayssm_spec: A[
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
@@ -726,7 +737,7 @@ class ExecGraph(msgspec.Struct):
     ] = False
     enable_cudagraph_gc: A[
         bool,
-        "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
+        "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen and paused during capture, which speeds it up and keeps a collection from invalidating the graph.",
     ] = False
     debug_cuda_graph: A[
         bool,
@@ -889,7 +900,8 @@ class ExecMoe(msgspec.Struct):
             "nixl",
             "mori",
             "ascend_fuseep",
-            "flashinfer",
+            "flashinfer_nvlink_one_sided",
+            "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
             "megamoe",
             "deepep_v2",
             "ascend_ops",
@@ -897,7 +909,9 @@ class ExecMoe(msgspec.Struct):
             "flashinfer_megamoe",
         ],
         Arg(
-            help="Choose the backend for MoE A2A.",
+            help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
+            "FlashInfer's NVLink one-sided all-to-all; 'flashinfer' is a deprecated "
+            "alias for it.",
             choices=[
                 "none",
                 "deepep",
@@ -905,7 +919,8 @@ class ExecMoe(msgspec.Struct):
                 "nixl",
                 "mori",
                 "ascend_fuseep",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
+                "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",
@@ -1071,6 +1086,23 @@ class ExecMoe(msgspec.Struct):
             type_parser=_paged_experts_num_resident,
         ),
     ] = None
+    paged_experts_enable_disk: A[
+        bool,
+        "Let Paged Experts write to disk under $SGLANG_CACHE_DIR/paged_experts: each MoE "
+        "layer's experts are kept there (about the size of the experts), so that later starts "
+        "read them instead of loading and repacking them, and experts that do not fit the "
+        "host budget (--paged-experts-host-memory-gb) are served from there. Requires "
+        "--enable-paged-experts.",
+    ] = False
+    paged_experts_host_memory_gb: A[
+        Optional[float],
+        "Pinned host memory (GiB) for the experts of all MoE layers with --enable-paged-experts. "
+        "When not every expert fits, each layer keeps only some experts in pinned memory and "
+        "reads the others from its file under $SGLANG_CACHE_DIR/paged_experts, which needs "
+        "--paged-experts-enable-disk. Unset: every expert is pinned; with "
+        "--paged-experts-enable-disk, the experts that do not fit what is available at "
+        "startup within the container's memory limit go to disk, keeping 10 GiB free.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
@@ -1164,7 +1196,7 @@ class ExecOffload(msgspec.Struct):
             "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
             "where pinned host memory comes out of the same pool as the model "
             "weights. Requires a device that reports "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            "cudaDevAttrPageableMemoryAccess (GB10, or HMM).",
             choices=["pinned", "file"],
         ),
     ] = "pinned"

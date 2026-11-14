@@ -33,7 +33,10 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.kernels.ops.activation.softcap import (
     softcap_to_float32_logits,
 )
-from sglang.kernels.ops.sampling.softcap_row_argmax import softcap_row_argmax
+from sglang.kernels.ops.sampling.softcap_row_argmax import (
+    merge_row_argmax_shards,
+    softcap_row_argmax,
+)
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -66,7 +69,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     async_d2h,
     is_cpu,
     is_gfx1250_supported,
@@ -375,6 +378,18 @@ class LogitsProcessorOutput:
                     sequences[i] = [row for span in spans for row in span.tolist()]
 
 
+def extend_reads_input_logprobs(forward_batch: ForwardBatch) -> bool:
+    """Whether an extend batch returns logprobs for some token before a
+    segment's last, so the LM head reads more than the last rows."""
+    return forward_batch.return_logprob and any(
+        extend_len > start_len
+        for extend_len, start_len in zip(
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.extend_logprob_start_lens_cpu,
+        )
+    )
+
+
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
@@ -444,15 +459,14 @@ class LogitsMetadata:
             extend_token_ids_logprob = any(
                 x is not None for x in forward_batch.token_ids_logprobs
             )
-            extend_return_logprob = False
-            extend_logprob_pruned_lens_cpu = []
-            for extend_len, start_len in zip(
-                forward_batch.extend_seq_lens_cpu,
-                forward_batch.extend_logprob_start_lens_cpu,
-            ):
-                if extend_len - start_len > 0:
-                    extend_return_logprob = True
-                extend_logprob_pruned_lens_cpu.append(extend_len - start_len)
+            extend_return_logprob = extend_reads_input_logprobs(forward_batch)
+            extend_logprob_pruned_lens_cpu = [
+                extend_len - start_len
+                for extend_len, start_len in zip(
+                    forward_batch.extend_seq_lens_cpu,
+                    forward_batch.extend_logprob_start_lens_cpu,
+                )
+            ]
         else:
             extend_return_logprob = extend_return_top_logprob = (
                 extend_token_ids_logprob
@@ -1365,6 +1379,8 @@ class LogitsProcessor(nn.Module):
             (group.world_size, num_tokens, 2), dtype=local.dtype, device=local.device
         )
         group.all_gather_into_tensor(gathered.view(-1, 2), local)
+        if is_hip():
+            return merge_row_argmax_shards(gathered)
         best_rank = gathered[..., 0].argmax(dim=0, keepdim=True)
         return gathered[..., 1].gather(0, best_rank).squeeze(0).long()
 

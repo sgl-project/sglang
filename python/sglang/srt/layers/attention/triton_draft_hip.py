@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -29,7 +29,7 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
     # A DFLASH draft never runs forward_decode, so its graphs skip the split-KV
     # decode partials (all heads under DCP: ~14.5 GiB a rank for K3.1's MLA5 draft).
     backend.runs_decode = not algorithm.is_dflash()
-    # The monokernel's DFLASH MLA draft verifies on its own tuned copy of the
+    # The monokernel's DFLASH MLA draft verifies on its own tuning of the
     # grouped-head kernel (a sliding window, two heads a tile); nothing else does.
     if (
         algorithm.is_dflash()
@@ -39,9 +39,9 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
         and get_exec().kernel.enable_amd_monokernel
         and model_runner.model_config.is_dflash_mla_draft
     ):
-        from sglang.kernels.ops.attention.verify_mla_draft import verify_shared_kv_fwd
+        from sglang.kernels.ops.attention.verify_mla import verify_mla_draft_fwd
 
-        backend.verify_mla_draft_fwd = torch.compiler.disable(verify_shared_kv_fwd)
+        backend.verify_mla_draft_fwd = torch.compiler.disable(verify_mla_draft_fwd)
     if algorithm.is_dflash() and backend.use_mla and backend.dcp_size > 1:
         backend.mla_dcp_window_verify = MlaDcpWindowVerify(backend, model_runner)
         # Each layer applies its own window there, so the backend builds no
@@ -49,8 +49,9 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
         backend.sliding_window_size = None
 
 
-def check_dcp_mla_draft(draft_hf_config, draft_window_size: Optional[int]) -> None:
-    """Refuse the DFLASH MLA drafts this backend cannot serve under DCP."""
+def check_dcp_mla_draft(draft_hf_config) -> None:
+    """Refuse the DFLASH MLA drafts this backend cannot serve under DCP; a compact
+    draft window is settled later, as for the MLA-only backends."""
     from sglang.srt.speculative.dflash_utils import (
         get_dflash_layer_types,
         is_dflash_mla_draft_config,
@@ -59,13 +60,12 @@ def check_dcp_mla_draft(draft_hf_config, draft_window_size: Optional[int]) -> No
     if not is_dflash_mla_draft_config(draft_hf_config):
         return
     # Only the ROCm MLA forward (SGLANG_USE_AITER) hands this backend a DCP verify
-    # window with gathered heads and merges its rank-local partials; it reads owner
-    # rows through the shared req_to_token, not a compact draft table.
-    if not envs.SGLANG_USE_AITER.get() or draft_window_size is not None:
+    # window with gathered heads and merges its rank-local partials.
+    if not envs.SGLANG_USE_AITER.get():
         raise ValueError(
             "On ROCm, DFLASH mla drafts run on the triton draft attention backend "
-            "under --dcp-size > 1 only with SGLANG_USE_AITER=1 and without "
-            "--speculative-draft-window-size; otherwise serve them without DCP."
+            "under --dcp-size > 1 only with SGLANG_USE_AITER=1; otherwise serve "
+            "them without DCP."
         )
     layer_types = get_dflash_layer_types(draft_hf_config)
     if not layer_types or any(t != "sliding_attention" for t in layer_types):

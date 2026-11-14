@@ -5,7 +5,7 @@
 //! being admitted, as in Python. The listeners close when no client request
 //! is left in flight — or at once, skipping the wait, when the last health
 //! probe had failed or the drain was forced (Python's `UnHealthy` and
-//! `SGL_FORCE_SHUTDOWN` exits). There is no deadline: like Python, the
+//! `SGLANG_FORCE_SHUTDOWN` exits). There is no deadline: like Python, the
 //! orchestrator's kill is the only bound on a drain.
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 #[derive(Default)]
 pub(crate) struct DrainState {
     draining: AtomicBool,
-    /// Skip the wait for in-flight requests (`SGL_FORCE_SHUTDOWN`).
+    /// Skip the wait for in-flight requests (`SGLANG_FORCE_SHUTDOWN`).
     forced: AtomicBool,
     /// The last deep health probe stalled; a later healthy one clears it, as
     /// Python moves `server_status` between `UnHealthy` and `Up`.
@@ -63,6 +63,12 @@ impl DrainState {
 
     pub(crate) fn is_draining(&self) -> bool {
         self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Whether the drain was begun forced (`SGLANG_FORCE_SHUTDOWN`). A failed
+    /// health probe also skips the wait, but is not a request to force.
+    pub(crate) fn is_forced(&self) -> bool {
+        self.forced.load(Ordering::SeqCst)
     }
 
     pub(crate) fn set_unhealthy(&self, unhealthy: bool) {
@@ -169,6 +175,9 @@ mod tests {
             state.force_reason(),
             Some("Signal SIGTERM received while health check failed. Force exiting.")
         );
+        assert!(!state.is_forced(), "a failed probe is not a forced drain");
+        state.begin(true);
+        assert!(state.is_forced());
     }
 
     /// A request admitted after one waiter saw the drain end (on a connection

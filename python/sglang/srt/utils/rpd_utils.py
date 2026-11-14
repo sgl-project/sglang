@@ -314,37 +314,6 @@ def rpd_to_chrome_trace(
     except:
         print("Did not find SMI data")
 
-    # Create the (global) memory counter
-    """
-    sizes = {}    # address -> size
-    totalSize = 0
-    exp = re.compile("^ptr\((.*)\)\s+size\((.*)\)$")
-    exp2 = re.compile("^ptr\((.*)\)$")
-    for row in connection.execute("SELECT rocpd_api.end/1000.0 as ts, B.string, '1'  FROM rocpd_api INNER JOIN rocpd_string A ON A.id=rocpd_api.apiName_id INNER JOIN rocpd_string B ON B.id=rocpd_api.args_id WHERE A.string='hipFree' UNION ALL SELECT rocpd_api.start/1000.0, B.string, '0' FROM rocpd_api INNER JOIN rocpd_string A ON A.id=rocpd_api.apiName_id INNER JOIN rocpd_string B ON B.id=rocpd_api.args_id WHERE A.string='hipMalloc' ORDER BY ts asc"):
-        try:
-            if row[2] == '0':  #malloc
-                m = exp.match(row[1])
-                if m:
-                    size = int(m.group(2), 16)
-                    totalSize = totalSize + size
-                    sizes[m.group(1)] = size
-                    outfile.write(',{"pid":"0","name":"Allocated Memory","ph":"C","ts":%s,"args":{"depth":%s}}\n'%(row[0],totalSize))
-            else:              #free
-                m = exp2.match(row[1])
-                if m:
-                    try:    # Sometimes free addresses are not valid or listed
-                        size = sizes[m.group(1)]
-                        sizes[m.group(1)] = 0
-                        totalSize = totalSize - size;
-                        outfile.write(',{"pid":"0","name":"Allocated Memory","ph":"C","ts":%s,"args":{"depth":%s}}\n'%(row[0],totalSize))
-                    except KeyError:
-                        pass
-        except ValueError:
-            outfile.write("")
-    if T_end > 0:
-        outfile.write(',{"pid":"0","name":"Allocated Memory","ph":"C","ts":%s,"args":{"depth":%s}}\n'%(T_end,totalSize))
-    """
-
     # Create "faux calling stack frame" on gpu ops traceS
     stacks = {}  # Call stacks built from UserMarker entres.     Key is 'pid,tid'
     currentFrame = {}  # "Current GPU frame" (id, name, start, end).    Key is 'pid,tid'

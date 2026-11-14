@@ -2040,7 +2040,10 @@ export const Playground = ({ config }) => {
         ...((multinode || pdMode) ? fabricFlags.map((x) => "  " + x) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(npuDevices ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
+        ...[
+          ...(typeof config.dockerMounts === "function" ? config.dockerMounts(sel) : config.dockerMounts || []),
+          ...(cell.pd ? cell.dockerMounts || [] : []),
+        ].map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",

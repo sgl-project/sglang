@@ -1,6 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import asyncio
 import base64
 import contextlib
 import io
@@ -42,7 +41,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
+    form_model_kwargs,
     merge_image_input_list,
+    output_variant_index,
     process_generation_batch,
     request_extra_value,
     request_field_value,
@@ -50,6 +51,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     resolve_sampling_params_cls,
     sanitize_upload_filename,
     save_image_to_path,
+    select_output_variant,
     temp_dir_if_disabled,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -76,18 +78,6 @@ def _resolve_image_output_format(
 
 def _b64_encode_images(images: list[bytes]) -> list[str]:
     return [base64.b64encode(image).decode("utf-8") for image in images]
-
-
-async def _upload_and_cleanup_images(paths: list[str]) -> list[str | None]:
-    results = await asyncio.gather(
-        *(cloud_storage.upload_and_cleanup(path) for path in paths),
-        return_exceptions=True,
-    )
-    # join every upload before a cancellation or failure permits directory cleanup
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
-    return results
 
 
 def _fallback_image_urls(
@@ -118,47 +108,12 @@ def _raise_if_url_response_undeliverable(resp_format: str, is_persistent: bool) 
         )
 
 
-def _select_image_variant_path(item: dict, variant: str | None) -> str | None:
-    file_paths = item.get("file_paths")
-    if file_paths:
-        variant_idx = _image_variant_index(variant)
-        if variant_idx is None:
-            return None
-        if variant_idx < 0 or variant_idx >= len(file_paths):
-            return None
-        return file_paths[variant_idx]
-
-    if variant not in (None, "0", 0):
-        return None
-    return item.get("file_path")
-
-
-def _image_variant_index(variant: str | None) -> int | None:
-    try:
-        return 0 if variant is None else int(variant)
-    except (TypeError, ValueError):
-        return None
-
-
-def _select_image_variant_cloud_url(item: dict, variant: str | None) -> str | None:
-    variant_idx = _image_variant_index(variant)
-    if variant_idx is None:
-        return None
-
-    urls = item.get("urls")
-    if urls and 0 <= variant_idx < len(urls):
-        return urls[variant_idx]
-    if variant_idx == 0:
-        return item.get("url")
-    return None
-
-
 def _raise_if_image_variant_not_found(item: dict, variant: str | None) -> None:
     file_paths = item.get("file_paths")
     if not file_paths:
         return
 
-    variant_idx = _image_variant_index(variant)
+    variant_idx = output_variant_index(variant)
     if variant_idx is None or variant_idx < 0 or variant_idx >= len(file_paths):
         raise HTTPException(
             status_code=404,
@@ -174,9 +129,7 @@ def _build_image_response_kwargs(
     result: OutputBatch,
     *,
     b64_list: list[str] | None = None,
-    cloud_url: str | None = None,
     cloud_urls: list[str | None] | None = None,
-    fallback_url: str | None = None,
     fallback_urls: list[str] | None = None,
     is_persistent: bool = True,
     resize: str | None = None,
@@ -184,7 +137,7 @@ def _build_image_response_kwargs(
     """Build ImageResponse data list.
 
     For b64_json: uses b64_list, the base64 of the returned image bytes.
-    For url: uses cloud_url or fallback_url.
+    For url: uses cloud_urls or fallback_urls.
     file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
     ret = None
@@ -202,11 +155,6 @@ def _build_image_response_kwargs(
         ]
         ret = {"data": data}
     elif resp_format == "url":
-        if cloud_urls is None and cloud_url is not None:
-            cloud_urls = [cloud_url]
-        if fallback_urls is None and fallback_url is not None:
-            fallback_urls = [fallback_url]
-
         data = []
         for idx, path in enumerate(save_file_path_list):
             url = None
@@ -379,7 +327,7 @@ async def generations(
         )
 
         is_persistent = server_args.output_path is not None
-        cloud_urls = await _upload_and_cleanup_images(save_file_path_list)
+        cloud_urls = await cloud_storage.upload_all_and_cleanup(save_file_path_list)
         cloud_url = cloud_urls[0] if cloud_urls else None
         fallback_urls = _fallback_image_urls(
             request_id, len(save_file_path_list), is_persistent
@@ -459,9 +407,17 @@ async def edits(
     profile_all_stages: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
+    if mask is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Field 'mask' is not supported: no pipeline runs masked inpainting",
+        )
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
+    model_kwargs = form_model_kwargs(
+        await raw_request.form(), sampling_params_cls, "image"
+    )
     output_format = _resolve_image_output_format(output_format, sampling_params_cls)
     resp_format = (response_format or "b64_json").lower()
     _raise_if_url_response_undeliverable(
@@ -546,6 +502,7 @@ async def edits(
             profile=profile,
             num_profiled_timesteps=num_profiled_timesteps,
             profile_all_stages=profile_all_stages,
+            **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
@@ -567,7 +524,7 @@ async def edits(
 
         is_persistent = server_args.output_path is not None
         is_input_persistent = server_args.input_save_path is not None
-        cloud_urls = await _upload_and_cleanup_images(save_file_path_list)
+        cloud_urls = await cloud_storage.upload_all_and_cleanup(save_file_path_list)
         cloud_url = cloud_urls[0] if cloud_urls else None
         fallback_urls = _fallback_image_urls(
             request_id, len(save_file_path_list), is_persistent
@@ -619,9 +576,9 @@ async def download_image_content(
         raise HTTPException(status_code=404, detail="Image not found")
 
     _raise_if_image_variant_not_found(item, variant)
-    file_path = _select_image_variant_path(item, variant)
+    file_path = select_output_variant(item, variant, "file_paths", "file_path")
     if not file_path:
-        cloud_url = _select_image_variant_cloud_url(item, variant)
+        cloud_url = select_output_variant(item, variant, "urls", "url")
     else:
         cloud_url = None
     if not file_path and cloud_url:

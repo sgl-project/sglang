@@ -41,7 +41,7 @@ def pad_o_proj_rows(
 
 def row_shard_o_proj(o_proj: RowParallelLinear) -> None:
     """For a batch the bank reads on row shards, o_proj keeps its input instead
-    of multiplying it (o_proj_on_row_shard applies it). The decoder layer sets
+    of multiplying it (_o_proj_on_row_shard applies it). The decoder layer sets
     the batch predicate (row_shards); post-load sets the gathered full_weight."""
     inner_forward = o_proj.forward
     o_proj.row_shards = None
@@ -67,7 +67,7 @@ def row_shard_o_proj(o_proj: RowParallelLinear) -> None:
 
 def gather_full_o_proj(o_proj: RowParallelLinear) -> None:
     """Every rank gathers o_proj's full [H, heads x head_dim] weight from the
-    TP shards (rank-major input columns), for o_proj_on_row_shard (+176 MB a layer)."""
+    TP shards (rank-major input columns), for _o_proj_on_row_shard (+176 MB a layer)."""
     weight = o_proj.weight
     parallel = get_parallel()
     full_t = weight.new_empty(parallel.tp_size * weight.shape[1], weight.shape[0])

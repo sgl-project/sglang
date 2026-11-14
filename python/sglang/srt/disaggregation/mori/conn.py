@@ -27,7 +27,7 @@ from mori.io import (
     StatusCode,
 )
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_TAG,
     AbortNotification,
@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
+    align_window_tails,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     is_elided_entry,
@@ -1113,6 +1114,15 @@ class MoriKVManager(CommonKVManager):
             "MoriKVManager torn down (was role=%s)", self.disaggregation_mode.value
         )
 
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
+        relayout = super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
+        if relayout and getattr(self.kv_args, "dsa_index_k_token_bytes", None):
+            raise RuntimeError(
+                f"MoRI PD cannot relayout a DSA index-K from DCP-{self.dcp_size} "
+                f"to DCP-{dst_dcp_size}; use the same --dcp-size or Mooncake."
+            )
+        return relayout
+
     def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
         engine_key = register_info.engine_key
         if engine_key in self.decode_kv_args_table:
@@ -1650,6 +1660,9 @@ class MoriKVManager(CommonKVManager):
                 f"remote={len(peer_info.dst_state_mem_descs)})"
             )
 
+        src_state_indices = align_window_tails(
+            self.kv_args, src_state_indices, dst_state_indices
+        )
         src_state_item_lens = self.kv_args.state_item_lens
         src_state_dim_per_tensor = self.kv_args.state_dim_per_tensor
 
@@ -1718,7 +1731,9 @@ class MoriKVManager(CommonKVManager):
                 "qsa_pending",
                 "qsa_compressed",
                 "swa_ring",
+                "draft_ring",
                 "c128_state",
+                "request_row",
                 "minimax_index_k",
                 "minimax_dense_kv",
             ):
@@ -1920,7 +1935,9 @@ class MoriKVManager(CommonKVManager):
                 "qsa_pending",
                 "qsa_compressed",
                 "swa_ring",
+                "draft_ring",
                 "c128_state",
+                "request_row",
                 "minimax_dense_kv",
             ):
                 raise RuntimeError(
@@ -1936,6 +1953,16 @@ class MoriKVManager(CommonKVManager):
             )
             src_state_indices = src_state_indices[:common_len]
             dst_state_indices = dst_state_indices[:common_len]
+        if state_type in ("draft_ring", "request_row") and not (
+            src_state_mem_descs and dst_state_mem_descs
+        ):
+            # A side without the draft registered empty slots.
+            return []
+        if state_type == "draft_ring":
+            # Row 0 marks a position one side's DCP rank does not own.
+            owned = (src_state_indices != 0) & (dst_state_indices != 0)
+            src_state_indices = src_state_indices[owned]
+            dst_state_indices = dst_state_indices[owned]
 
         # Group contiguous indices and issue per-tensor transfers
         grouped_plan = GroupedIndexPlan.from_groups(
@@ -1943,13 +1970,38 @@ class MoriKVManager(CommonKVManager):
         )
 
         statuses: List[TransferStatus] = []
-        pairs = build_transfer_entry_pairs(
-            src_layer_ids,
-            dst_layer_ids,
-            len(src_state_mem_descs),
-            len(dst_state_mem_descs),
-            allow_positional_fallback=self.pp_size == 1,
-        )
+        n_src, n_dst = len(src_state_mem_descs), len(dst_state_mem_descs)
+        if (
+            state_type == StateType.DSA
+            and self.pp_size is not None
+            and self.pp_size > 1
+            and not src_layer_ids
+            and not dst_layer_ids
+            and n_src != n_dst
+            # A hybrid linear+DSA pool lists only its full-attention layers, so a
+            # model-layer slice would mispair them; it still needs layer ids.
+            and not self.is_hybrid_mla_backend
+        ):
+            # DSA state is registered without layer ids; slice the decode entries for
+            # this PP stage the same way Mooncake's no-layer-id path does.
+            src_entries, dst_entries, n_stage = self.get_mla_kv_ptrs_with_pp(
+                list(range(n_src)), list(range(n_dst)), StateType.DSA
+            )
+            if len(dst_entries) < n_stage:
+                raise RuntimeError(
+                    "Destination DSA state descriptors do not match prefill pp "
+                    f"configuration: start={self.kv_args.prefill_start_layer} "
+                    f"src={n_src} dst={n_dst}"
+                )
+            pairs = list(zip(src_entries[:n_stage], dst_entries[:n_stage]))
+        else:
+            pairs = build_transfer_entry_pairs(
+                src_layer_ids,
+                dst_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=self.pp_size == 1,
+            )
         for i, j in pairs:
             src_desc = src_state_mem_descs[i]
             dst_desc = dst_state_mem_descs[j]
