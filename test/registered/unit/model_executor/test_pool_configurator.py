@@ -9,6 +9,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
     make_page_shard_spec,
+    page_shard_row_bytes,
 )
 from sglang.srt.runtime_context import (
     get_context,
@@ -274,6 +275,7 @@ class TestDefaultConfigurator(CustomTestCase):
             max_running_requests=1,
         )
         mr.model_config.context_len = 8193
+        mr.page_shard_scratch_row_bytes = lambda: page_shard_row_bytes(mr)
         with (
             mock_cpu_env(),
             patch(

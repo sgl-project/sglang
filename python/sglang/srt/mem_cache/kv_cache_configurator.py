@@ -91,6 +91,7 @@ from sglang.srt.mem_cache.page_interleave import (
     get_kv_shard_group,
     get_shared_kv_shard_pool,
     make_page_shard_spec,
+    page_shard_row_bytes,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveDSATokenToKVPool,
@@ -374,6 +375,19 @@ def host_only_mamba_checkpoint() -> bool:
     return True
 
 
+def _draft_quant_config(draft_model_config: ModelConfig):
+    """The quant config the draft model keeps once built, which its `auto` KV
+    cache dtype resolves from; read before the draft loads."""
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.model_loader.loader import built_quant_config
+
+    load_config = LoadConfig(
+        download_dir=get_model().download_dir,
+        model_loader_extra_config=get_model().model_loader_extra_config,
+    )
+    return built_quant_config(draft_model_config, load_config)
+
+
 def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) -> int:
     execution_width = (
         mla_attention_dcp_size(hf_config, dcp_size=dcp_size, is_nextn=True)
@@ -529,6 +543,14 @@ class KVCacheConfigurator:
         self.kv_shard_rank = self.kv_shard_spec.shard_rank
         self.kv_shard_size = self.kv_shard_spec.shard_size
         self.kv_shard_group = get_kv_shard_group(self.use_mla_backend)
+
+    def page_shard_scratch_row_bytes(self) -> int:
+        """Bytes per token row of the logical-page KV sharding scratch.
+
+        Override when the sharded pool stores wider rows than the standard
+        K/V or MLA layout (for example grouped rows or embedded scales).
+        """
+        return page_shard_row_bytes(self)
 
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -956,9 +978,10 @@ class KVCacheConfigurator:
                 raise ValueError(
                     f"Fused draft KV: the draft resolved its KV cache dtype to "
                     f"{self.kv_cache_dtype}, but its region inside the target's "
-                    f"pages holds {region_kv_dtype}. Set "
-                    "--speculative-draft-kv-cache-dtype explicitly so the region "
-                    "is sized in the draft's KV dtype."
+                    f"pages holds {region_kv_dtype}: the draft model keeps a "
+                    "quant config other than the one its class declares through "
+                    "own_quant_config. Set --speculative-draft-kv-cache-dtype "
+                    "explicitly so the region is sized in the draft's KV dtype."
                 )
         return placement
 
@@ -970,6 +993,62 @@ class KVCacheConfigurator:
             self.model_config.hf_config
         )
         return has_window, has_state
+
+    def _unified_sparse_attention(self, full_layer_ids):
+        """How an MLA model's full layers store sparse attention on the unified
+        pool: their latent rows' format (layer-major FP8 rows with block scales)
+        and the indexer keys the layers that select top-k keep beside them; None
+        when its layers attend densely."""
+        hf_config = self.model_config.hf_config
+        if not is_deepseek_dsa(hf_config):
+            return None
+        from sglang.srt.mem_cache.kv.decl import (
+            FP8_DS_MLA,
+            FullLayerParts,
+            IndexKeyGeometry,
+            MLARowFormat,
+        )
+
+        if get_dsa_index_kpool(hf_config) != 1:
+            raise ValueError(
+                "--enable-unified-memory does not support pooled indexer keys yet; "
+                "drop --enable-unified-memory for this model."
+            )
+        if get_parallel().attn_dcp_size > 1:
+            raise ValueError(
+                "--enable-unified-memory does not support sparse attention with "
+                "decode context parallelism yet; drop --dcp-size or "
+                "--enable-unified-memory."
+            )
+        row_bytes = calculate_mla_kv_cache_dim(
+            model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+        )
+        if (
+            self.kv_cache_dtype != torch.float8_e4m3fn
+            or row_bytes
+            == self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim
+        ):
+            raise ValueError(
+                "--enable-unified-memory serves sparse attention from FP8 latent "
+                "rows with block scales, which the flashmla_kv DSA backends read; "
+                f"this configuration stores {row_bytes}-byte "
+                f"{self.kv_cache_dtype} rows."
+            )
+        row_format = MLARowFormat(
+            name=FP8_DS_MLA, row_bytes=row_bytes, scale_ue8m0=is_kimi_k31(hf_config)
+        )
+        index_keys = FullLayerParts(
+            layer_ids=tuple(
+                layer_id
+                for layer_id in full_layer_ids
+                if not dsa_layer_skips_topk(hf_config, layer_id)
+            ),
+            geometry=IndexKeyGeometry(
+                index_head_dim=get_dsa_index_head_dim(hf_config),
+                use_fp4=get_exec().kernel.enable_fp4_indexer,
+            ),
+        )
+        return row_format, index_keys
 
     def _kv_layer_decls(self) -> tuple:
         """This runner's per-layer KV and state declarations for the unified pool."""
@@ -1006,12 +1085,24 @@ class KVCacheConfigurator:
                 for i in self.mambaish_config.full_attention_layer_ids
                 if start <= i < end
             ]
+        full_layer_parts = ()
         if self.use_mla_backend:
+            sparse = self._unified_sparse_attention(full_layer_ids)
             full_geometry = MLAGeometry(
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 kv_cache_dtype=self.kv_cache_dtype,
             )
+            if sparse is not None:
+                row_format, index_keys = sparse
+                full_geometry = MLAGeometry(
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    row_format=row_format,
+                    layer_major=True,
+                )
+                full_layer_parts = (index_keys,)
         elif has_window:
             geometry = self._unified_swa_head_geometry()
             full_geometry = MHAGeometry(
@@ -1058,17 +1149,6 @@ class KVCacheConfigurator:
             replay_spec = mamba.enable_linear_replayssm_spec and (
                 self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
             )
-            if (
-                replay_spec
-                and cache_params.is_kda
-                and get_disagg().disaggregation_mode != "null"
-            ):
-                raise ValueError(
-                    "Unified KDA speculative ReplaySSM does not support PD "
-                    "disaggregation: prefill and decode have different state "
-                    "entry layouts. Disable --enable-linear-replayssm-spec "
-                    "or --enable-unified-memory."
-                )
             if mamba.enable_linear_replayssm or replay_spec:
                 geometry = with_state_replay(
                     geometry,
@@ -1115,6 +1195,7 @@ class KVCacheConfigurator:
         return kv_layer_decls(
             full_layer_ids=full_layer_ids,
             full_geometry=full_geometry,
+            full_layer_parts=full_layer_parts,
             **window,
             **state,
         )
@@ -1338,25 +1419,21 @@ class KVCacheConfigurator:
             if self.model_config.is_multi_layer_eagle
             else 1
         )
-        # The region holds the draft's own KV, in the dtype the draft runner
-        # resolves for itself by the same rules: its explicit dtype, else the
-        # host's dtype standing in for an `auto` (given or by default) that the
-        # draft resolves from its own quant config only when it loads (checked
-        # when the draft binds). A region has typed views of its own, so a
-        # draft dtype other than the host's still fuses.
-        from sglang.srt.mem_cache.kv_cache_dtype import (
-            TORCH_DTYPE_TO_KV_CACHE_STR,
-            configure_kv_cache_dtype,
-        )
+        # The region holds the draft's KV in the dtype its runner will resolve
+        # (rechecked at bind); regions have their own typed views, so it may
+        # differ from the host's.
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
+        kv_cache_dtype = get_model().kv_cache_dtype
         draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
-        if draft_kv_cache_dtype == "auto":
-            draft_kv_cache_dtype = None
+        resolves_auto = (
+            draft_kv_cache_dtype if draft_kv_cache_dtype is not None else kv_cache_dtype
+        ) == "auto"
         _, region_kv_dtype = configure_kv_cache_dtype(
-            server_args_kv_cache_dtype=TORCH_DTYPE_TO_KV_CACHE_STR.get(
-                self.kv_cache_dtype, "auto"
+            server_args_kv_cache_dtype=kv_cache_dtype,
+            quant_config=(
+                _draft_quant_config(aux.draft_model_config) if resolves_auto else None
             ),
-            model=None,
             model_dtype=aux.draft_model_config.dtype,
             is_draft_worker=True,
             is_dflash=self.spec_algorithm.is_dflash_family(),
