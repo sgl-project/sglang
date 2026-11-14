@@ -3,6 +3,8 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -50,6 +52,33 @@ class TestCompressedTensorsLlama3FP8(CustomTestCase):
             self.assertGreaterEqual(metrics["score"], 0.40)
         else:
             self.assertGreaterEqual(metrics["score"], 0.45)
+
+
+@unittest.skipIf(is_hip(), "This loading regression targets the CUDA backend")
+class TestStaticInt8CheckpointLoading(CustomTestCase):
+    def test_static_checkpoint_loads_and_decodes(self):
+        # CUDA currently quantizes activations dynamically; this checks that a
+        # static compressed-tensors checkpoint loads and decodes on CUDA.
+        model = "nm-testing/Qwen2.5-0.5B-W8A8_tensor_weight_static_per_tensor_act-e2e"
+        process = popen_launch_server(
+            model,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[],
+        )
+        try:
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            self.assertTrue(response.json()["text"])
+        finally:
+            kill_process_tree(process.pid)
 
 
 if __name__ == "__main__":
