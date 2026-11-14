@@ -465,7 +465,8 @@ class ExecKernel(msgspec.Struct):
         Optional[bool],
         Arg(
             help="Fuse q/k normalization and rope rotary embedding into one "
-            "kernel. By default this is enabled on XPU and disabled elsewhere. "
+            "kernel. By default this is enabled on XPU and for Qwen3 attention "
+            "on ROCm, and disabled elsewhere. "
             "Pass --enable-fused-qk-norm-rope or --no-enable-fused-qk-norm-rope "
             "to force it either way.",
             action=argparse.BooleanOptionalAction,

@@ -77,6 +77,26 @@ constexpr uint32_t active_mask() {
   }
 }
 
+// HIP shuffles take no mask (only active lanes take part) and default to width 64; lane ids here
+// index a logical 32-lane warp, so the width must be kWarpThreads on wave64.
+template <typename T>
+SGL_DEVICE T shfl_idx32(uint32_t mask, T v, uint32_t src_lane) {
+#ifndef USE_ROCM
+  return __shfl_sync(mask, v, src_lane);
+#else
+  return __shfl(v, src_lane, device::kWarpThreads);
+#endif
+}
+
+template <typename T>
+SGL_DEVICE T shfl_xor32(uint32_t mask, T v, uint32_t lane_mask) {
+#ifndef USE_ROCM
+  return __shfl_xor_sync(mask, v, lane_mask);
+#else
+  return __shfl_xor(v, lane_mask, device::kWarpThreads);
+#endif
+}
+
 template <typename CacheDType>
 SGL_DEVICE CacheDType load_cache_value(const CacheDType* ptr, int64_t idx) {
 #ifdef USE_ROCM
@@ -346,7 +366,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
           for (uint32_t j = 0; j < kVecSize; ++j) {
             auto partner_vec = output_vec[j];
             auto partner_bits = reinterpret_cast<const uint32_t&>(partner_vec);
-            partner_bits = __shfl_sync(kActiveMask, partner_bits, partner_lane);
+            partner_bits = shfl_idx32(kActiveMask, partner_bits, partner_lane);
             reinterpret_cast<uint32_t&>(partner_vec) = partner_bits;
             auto& values = unpack(output_vec[j]);
             const auto& partner_values = unpack(partner_vec);
@@ -425,7 +445,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
 
 #pragma unroll
         for (uint32_t i = 0; i < kElemsPerThread; ++i) {
-          float swapped = __shfl_sync(kActiveMask, elems[i], partner_lane);
+          float swapped = shfl_idx32(kActiveMask, elems[i], partner_lane);
           if (lane_id < kHalfRotaryLanes) {
             swapped = -swapped;
           }
@@ -586,8 +606,8 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
       }
 #pragma unroll
       for (uint32_t mask = kRowLanes / 2; mask >= 1; mask >>= 1) {
-        part[0] += __shfl_xor_sync(0xffffffffu, part[0], mask);
-        part[1] += __shfl_xor_sync(0xffffffffu, part[1], mask);
+        part[0] += shfl_xor32(0xffffffffu, part[0], mask);
+        part[1] += shfl_xor32(0xffffffffu, part[1], mask);
       }
       const float norm_factor = math::rsqrt((part[0] + part[1]) / kHeadDim + eps);
 
@@ -603,7 +623,7 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
 #pragma unroll
         for (uint32_t j = 0; j < kElems / 2; ++j) {
           auto bits = reinterpret_cast<const uint32_t&>(vec[j]);
-          bits = __shfl_sync(0xffffffffu, bits, partner_lane);
+          bits = shfl_idx32(0xffffffffu, bits, partner_lane);
           reinterpret_cast<uint32_t&>(partner_vec[j]) = bits;
         }
         if (row_lane < kRotaryLanes) {
@@ -658,8 +678,8 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
       }
 #pragma unroll
       for (uint32_t mask = kRowLanes / 2; mask >= 1; mask >>= 1) {
-        part[0] += __shfl_xor_sync(0xffffffffu, part[0], mask);
-        part[1] += __shfl_xor_sync(0xffffffffu, part[1], mask);
+        part[0] += shfl_xor32(0xffffffffu, part[0], mask);
+        part[1] += shfl_xor32(0xffffffffu, part[1], mask);
       }
       const float norm_factor = math::rsqrt((part[0] + part[1]) / static_cast<float>(kHeadDim) + eps);
 
