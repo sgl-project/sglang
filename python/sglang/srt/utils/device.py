@@ -34,7 +34,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils.common import check_pkg_version_at_least, get_bool_env_var, is_mlu
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,8 @@ __all__ = [
     "is_flashinfer_available",
     "is_nvidia_cublas_version_ge_12_9",
     "empty_device_cache",
+    "get_numa_node_available_bytes",
+    "parse_node_list",
     "get_available_gpu_memory",
     "is_pin_memory_available",
     "async_h2d",
@@ -440,6 +442,33 @@ def empty_device_cache(device_module: Optional[Any] = None) -> bool:
     return True
 
 
+def get_numa_node_available_bytes(node: int) -> int:
+    """
+    Estimate the available memory on a NUMA node in bytes.
+
+    Node meminfo has no MemAvailable field, so this adds MemFree, file-backed
+    page cache and reclaimable slab. The result can be slightly optimistic,
+    as not all of that cache can always be reclaimed.
+    """
+    with open(f"/sys/devices/system/node/node{node}/meminfo") as f:
+        fields = {p[2].rstrip(":"): int(p[3]) for p in map(str.split, f) if len(p) >= 4}
+    return (
+        fields["MemFree"]
+        + fields["Active(file)"]
+        + fields["Inactive(file)"]
+        + fields["SReclaimable"]
+    ) * 1024
+
+
+def parse_node_list(spec: str) -> list[int]:
+    """Parse a node list such as "2", "2,3" or "0-1". Returns the list of nodes as integers."""
+    nodes = []
+    for part in spec.split(","):
+        start, _, end = part.strip().partition("-")
+        nodes.extend(range(int(start), int(end or start) + 1))
+    return nodes
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -521,9 +550,24 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = get_free_cpu_memory()
-        n_node = len(get_cpu_ids_by_node()) or 1
-        free_gpu_memory = round(total_free_memory / n_node, 3)
+        parallel = get_parallel()
+        mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
+
+        nodes = None
+        if mem_bind_env and (
+            parallel.dp_size == 1 and parallel.pp_size == 1 and parallel.nnodes == 1
+        ):
+            nodes = parse_node_list(mem_bind_env)
+
+        if nodes and parallel.tp_size <= len(nodes):
+            free_gpu_memory = min(
+                get_free_cpu_memory() / len(nodes),
+                min(get_numa_node_available_bytes(n) for n in nodes),
+            )
+        else:
+            total_free_memory = get_free_cpu_memory()
+            n_node = len(get_cpu_ids_by_node()) or 1
+            free_gpu_memory = round(total_free_memory / n_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
