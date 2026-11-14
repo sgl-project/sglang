@@ -1555,6 +1555,346 @@ class TestEstimatedPrefillPerf(CustomTestCase):
             8 * 9 / 2 + (100 + 1) + (200 + 1),
         )
 
+    def test_weight_bytes_are_charged_once_per_chunk_not_per_token(self):
+        # Weights are read from HBM once per forward pass and reused across
+        # every row of the batched GEMM -- a 100-token chunk must not read
+        # 100x the weight bytes of a 1-token chunk.
+        self.reporter._weight_read_bytes_per_token = 500.0
+        _, read_bytes_small, _ = self.reporter._estimate_prefill_perf(
+            types.SimpleNamespace(extend_lens=[1], prefix_lens=[0])
+        )
+        _, read_bytes_large, _ = self.reporter._estimate_prefill_perf(
+            types.SimpleNamespace(extend_lens=[100], prefix_lens=[0])
+        )
+        self.assertEqual(read_bytes_small, 500.0)
+        self.assertEqual(read_bytes_large, 500.0)
+
+
+class TestEstimatedDecodePerf(CustomTestCase):
+    """``est. decode TFLOPS/s`` and read/write BW: see _estimate_decode_perf."""
+
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+        self.reporter._linear_flops_per_token = 0.0
+        self.reporter._attn_dot_flops_coeff = 0.0
+        self.reporter._weight_read_bytes_per_token = 0.0
+        self.reporter._qkv_act_bytes_per_token = 0.0
+        self.reporter._decode_q_read_bytes_per_token = 0.0
+        self.reporter._kv_cache_bytes_per_token = 0.0
+        self.reporter._ffn_act_bytes_per_token = 0.0
+
+    def _batch(self, seq_lens):
+        return types.SimpleNamespace(
+            seq_lens_cpu=None,
+            reqs=[_FakeReq(prompt_len=sl) for sl in seq_lens],
+        )
+
+    def test_weight_bytes_are_charged_once_per_step_not_per_batch_size(self):
+        # A batched decode step reads each weight matrix from HBM once and
+        # reuses it across every sequence's single-token GEMM row. Charging
+        # it per token/sequence would claim a 32-wide batch independently
+        # re-reads the whole model 32 times, which real GPU kernels don't do.
+        self.reporter._weight_read_bytes_per_token = 1000.0
+        _, read_bytes_bs1, _ = self.reporter._estimate_decode_perf(
+            self._batch([10]), num_tokens=1
+        )
+        _, read_bytes_bs32, _ = self.reporter._estimate_decode_perf(
+            self._batch([10] * 32), num_tokens=32
+        )
+        self.assertEqual(read_bytes_bs1, 1000.0)
+        self.assertEqual(read_bytes_bs32, 1000.0)
+
+    def test_kv_cache_bytes_still_scale_with_total_context(self):
+        # Unlike weights, KV-cache data is per-sequence and must still scale
+        # with the total context read across the batch.
+        self.reporter._kv_cache_bytes_per_token = 2.0
+        _, read_bytes, _ = self.reporter._estimate_decode_perf(
+            self._batch([10, 20]), num_tokens=2
+        )
+        self.assertEqual(read_bytes, 2.0 * 30)
+
+
+class TestEstimatedPerfConstantsTpSharding(CustomTestCase):
+    """MLP/FFN FLOPs and weight bytes must shrink with tp_size, the same way
+    attention heads are already divided via get_num_attention_heads/get_num_kv_heads
+    (see _init_estimated_perf_constants)."""
+
+    def _constants_at(self, tp_size):
+        scheduler = types.SimpleNamespace()
+        scheduler.waiting_queue = []
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.model_config = types.SimpleNamespace(
+            hidden_size=256.0,
+            num_attention_layers=2,
+            head_dim=0.0,  # zeroes every attention term, isolating the MLP term
+            dtype=types.SimpleNamespace(itemsize=2),
+            hf_text_config=types.SimpleNamespace(intermediate_size=1024.0),
+            get_num_attention_heads=lambda tp: 0.0,
+            get_num_kv_heads=lambda tp: 0.0,
+        )
+        reporter = _make_reporter(self, scheduler)
+        enter_scope(
+            self,
+            get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=0,
+                attn_tp_size=tp_size,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                attn_dp_rank=0,
+                dp_rank=0,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                moe_tp_size=tp_size,
+            ),
+        )
+        reporter._init_estimated_perf_constants()
+        return reporter
+
+    def test_mlp_flops_and_weight_bytes_shrink_with_tp_size(self):
+        tp1 = self._constants_at(1)
+        tp4 = self._constants_at(4)
+        self.assertAlmostEqual(
+            tp1._linear_flops_per_token / 4, tp4._linear_flops_per_token
+        )
+        self.assertAlmostEqual(
+            tp1._weight_read_bytes_per_token / 4, tp4._weight_read_bytes_per_token
+        )
+        self.assertGreater(tp1._linear_flops_per_token, 0.0)
+
+
+class TestEstimatedPerfConstantsHybridMambaSplit(CustomTestCase):
+    """Hybrid Mamba+attention+MLP architectures (NemotronH, etc.) mix
+    attention-only, MLP-only, and Mamba-only layers. Attention and MLP FLOPs
+    must be costed by their own per-layer counts, not by the model's total
+    layer count (see _init_estimated_perf_constants)."""
+
+    HIDDEN_SIZE = 16.0
+    HEAD_DIM = 8.0
+    NUM_HEADS = 4.0
+    NUM_KV_HEADS = 4.0
+    INTERMEDIATE_SIZE = 64.0
+    # Total layer count ModelConfig reports for hybrid stacks (no hybrid-Mamba
+    # special case there), deliberately wrong to use directly for FLOPs.
+    NUM_ATTENTION_LAYERS = 10
+
+    def _attn_linear_flops(self):
+        return (
+            2.0
+            * self.HIDDEN_SIZE
+            * self.HEAD_DIM
+            * (self.NUM_HEADS + 2.0 * self.NUM_KV_HEADS)
+            + 2.0 * self.HIDDEN_SIZE * self.HEAD_DIM * self.NUM_HEADS
+        )
+
+    def _mlp_flops(self):
+        return 6.0 * self.HIDDEN_SIZE * self.INTERMEDIATE_SIZE
+
+    def _constants(self, *, layers_block_type=None, full_attention_layer_ids=None):
+        scheduler = types.SimpleNamespace()
+        scheduler.waiting_queue = []
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        hf_text_config = types.SimpleNamespace(intermediate_size=self.INTERMEDIATE_SIZE)
+        if layers_block_type is not None:
+            hf_text_config.layers_block_type = layers_block_type
+        if full_attention_layer_ids is not None:
+            hf_text_config.full_attention_layer_ids = full_attention_layer_ids
+        scheduler.model_config = types.SimpleNamespace(
+            hidden_size=self.HIDDEN_SIZE,
+            num_attention_layers=self.NUM_ATTENTION_LAYERS,
+            head_dim=self.HEAD_DIM,
+            dtype=types.SimpleNamespace(itemsize=2),
+            hf_text_config=hf_text_config,
+            get_num_attention_heads=lambda tp: self.NUM_HEADS,
+            get_num_kv_heads=lambda tp: self.NUM_KV_HEADS,
+        )
+        reporter = _make_reporter(self, scheduler)
+        enter_scope(
+            self,
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                attn_dp_rank=0,
+                dp_rank=0,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                moe_tp_size=1,
+            ),
+        )
+        reporter._init_estimated_perf_constants()
+        return reporter
+
+    def test_layers_block_type_splits_attention_mlp_moe_and_ignores_mamba(self):
+        # 10 layers: 2 attention, 3 mlp, 2 moe, 3 mamba (left uncosted).
+        layers_block_type = (
+            ["attention"] * 2 + ["mlp"] * 3 + ["moe"] * 2 + ["mamba"] * 3
+        )
+        reporter = self._constants(layers_block_type=layers_block_type)
+        expected_linear = self._attn_linear_flops() * 2 + self._mlp_flops() * 5
+        expected_attn_coeff = 4.0 * self.NUM_HEADS * self.HEAD_DIM * 2
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+
+    def test_full_attention_layer_ids_fallback_still_costs_mlp_for_every_layer(self):
+        # Non-hybrid configs that expose full_attention_layer_ids (instead of
+        # layers_block_type) split out attention layers but keep MLP at the
+        # full layer count -- there are no Mamba-only layers to exclude.
+        reporter = self._constants(full_attention_layer_ids=[0, 3, 7])
+        expected_linear = self._attn_linear_flops() * 3 + self._mlp_flops() * (
+            self.NUM_ATTENTION_LAYERS
+        )
+        expected_attn_coeff = 4.0 * self.NUM_HEADS * self.HEAD_DIM * 3
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+
+    def test_no_hybrid_metadata_treats_every_layer_as_attention_and_mlp(self):
+        # Plain transformer configs expose neither field: every layer costs
+        # both attention and MLP, matching pre-hybrid-split behavior.
+        reporter = self._constants()
+        expected_linear = (
+            self._attn_linear_flops() + self._mlp_flops()
+        ) * self.NUM_ATTENTION_LAYERS
+        expected_attn_coeff = (
+            4.0 * self.NUM_HEADS * self.HEAD_DIM * self.NUM_ATTENTION_LAYERS
+        )
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+
+    def test_mixer_only_layer_labels_keep_full_mlp_layer_count(self):
+        # Qwen3-Next/Qwen3.5/GigaChat3.5/BailingHybrid style: layers_block_type
+        # only labels the *mixer* ("attention" vs "linear_attention"); every
+        # layer still builds its own FFN unconditionally. Counting "mlp"/"moe"
+        # strings against this vocabulary (as NemotronH's split does) would
+        # zero out num_mlp_layers and silently drop all FFN FLOPs/bytes.
+        layers_block_type = ["attention", "linear_attention"] * 5
+        full_attention_layer_ids = [
+            i
+            for i, block_type in enumerate(layers_block_type)
+            if block_type == "attention"
+        ]
+        reporter = self._constants(
+            layers_block_type=layers_block_type,
+            full_attention_layer_ids=full_attention_layer_ids,
+        )
+        expected_linear = self._attn_linear_flops() * 5 + self._mlp_flops() * (
+            self.NUM_ATTENTION_LAYERS
+        )
+        expected_attn_coeff = 4.0 * self.NUM_HEADS * self.HEAD_DIM * 5
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+        self.assertGreater(reporter._ffn_act_bytes_per_token, 0.0)
+
+    def test_uniform_single_label_costs_every_layer_as_attention_and_mlp(self):
+        # Falcon-H1 style: every layer shares one label ("falcon_h1") outside
+        # NemotronH's exclusive vocabulary entirely, and every layer has both
+        # full attention and a full FFN. Counting "attention"/"mlp"/"moe"
+        # strings against this label would zero out *both* counts -- worse
+        # than the overcounting bug this estimator set out to fix. Both must
+        # instead fall back to the full layer count via
+        # full_attention_layer_ids.
+        layers_block_type = ["falcon_h1"] * self.NUM_ATTENTION_LAYERS
+        full_attention_layer_ids = list(range(self.NUM_ATTENTION_LAYERS))
+        reporter = self._constants(
+            layers_block_type=layers_block_type,
+            full_attention_layer_ids=full_attention_layer_ids,
+        )
+        expected_linear = (
+            self._attn_linear_flops() + self._mlp_flops()
+        ) * self.NUM_ATTENTION_LAYERS
+        expected_attn_coeff = (
+            4.0 * self.NUM_HEADS * self.HEAD_DIM * self.NUM_ATTENTION_LAYERS
+        )
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+        self.assertGreater(reporter._linear_flops_per_token, 0.0)
+
+    def test_byte_estimates_scale_by_attention_and_mlp_layer_counts(self):
+        # The same per-component split that FLOPs use must also apply to the
+        # KV-cache/weight/activation byte estimates -- otherwise hybrid
+        # models keep the old per-total-layer-count overcount on the bytes
+        # side even after FLOPs are fixed (e.g. ~13x overcounted KV-cache
+        # bytes for the PR's own 52-layer/4-attention NemotronH example).
+        layers_block_type = (
+            ["attention"] * 2 + ["mlp"] * 3 + ["moe"] * 2 + ["mamba"] * 3
+        )
+        reporter = self._constants(layers_block_type=layers_block_type)
+        num_attn_layers, num_mlp_layers = 2.0, 5.0
+        dtype_bytes = 2.0
+
+        expected_kv_cache = (
+            2.0 * num_attn_layers * self.NUM_KV_HEADS * self.HEAD_DIM * dtype_bytes
+        )
+        expected_weight_read = (
+            self.HIDDEN_SIZE
+            * self.HEAD_DIM
+            * (self.NUM_HEADS + 2.0 * self.NUM_KV_HEADS)
+            * dtype_bytes
+            * num_attn_layers
+            + self.HIDDEN_SIZE
+            * self.HEAD_DIM
+            * self.NUM_HEADS
+            * dtype_bytes
+            * num_attn_layers
+            + 3.0
+            * self.HIDDEN_SIZE
+            * self.INTERMEDIATE_SIZE
+            * dtype_bytes
+            * num_mlp_layers
+        )
+        expected_qkv_act = (
+            self.HIDDEN_SIZE * dtype_bytes * num_attn_layers
+            + (self.NUM_HEADS + 2.0 * self.NUM_KV_HEADS)
+            * self.HEAD_DIM
+            * dtype_bytes
+            * num_attn_layers
+            + self.HEAD_DIM * self.NUM_HEADS * dtype_bytes * num_attn_layers
+            + self.HIDDEN_SIZE * dtype_bytes * num_attn_layers
+        )
+        expected_ffn_act = 3.0 * self.INTERMEDIATE_SIZE * dtype_bytes * num_mlp_layers
+        expected_prefill_attn_read = (
+            (self.NUM_HEADS + 2.0 * self.NUM_KV_HEADS)
+            * self.HEAD_DIM
+            * dtype_bytes
+            * num_attn_layers
+        )
+        expected_decode_q_read = (
+            self.NUM_HEADS * self.HEAD_DIM * dtype_bytes * num_attn_layers
+        )
+
+        self.assertAlmostEqual(reporter._kv_cache_bytes_per_token, expected_kv_cache)
+        self.assertAlmostEqual(
+            reporter._weight_read_bytes_per_token, expected_weight_read
+        )
+        self.assertAlmostEqual(reporter._qkv_act_bytes_per_token, expected_qkv_act)
+        self.assertAlmostEqual(reporter._ffn_act_bytes_per_token, expected_ffn_act)
+        self.assertAlmostEqual(
+            reporter._prefill_attn_act_read_per_token, expected_prefill_attn_read
+        )
+        self.assertAlmostEqual(
+            reporter._decode_q_read_bytes_per_token, expected_decode_q_read
+        )
+
+        # Regression guard for the reviewer's literal complaint: using the
+        # old unsplit total layer count would overcount KV-cache bytes by
+        # NUM_ATTENTION_LAYERS / num_attn_layers (5x here; ~13x for the PR's
+        # own 52-layer/4-attention NemotronH example).
+        stale_kv_cache = (
+            2.0
+            * self.NUM_ATTENTION_LAYERS
+            * self.NUM_KV_HEADS
+            * self.HEAD_DIM
+            * dtype_bytes
+        )
+        self.assertLess(reporter._kv_cache_bytes_per_token, stale_kv_cache)
+
 
 if __name__ == "__main__":
     unittest.main()
