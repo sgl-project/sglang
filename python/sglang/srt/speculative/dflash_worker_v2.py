@@ -632,6 +632,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
         self._fused_kv_helper: Optional[object] = None
+        self._batched_kv_layers = None
+        self._batched_kv_buffers = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
@@ -728,6 +730,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         if get_spec().speculative_dflash_draft_kv_ring:
             self._init_draft_kv_ring()
+        self._batched_kv_layers = None
+        self._batched_kv_buffers = None
+        if (
+            is_cuda()
+            and self._fused_kv_helper is not None
+            and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+        ):
+            self._init_batched_kv_write()
 
     def _init_draft_kv_ring(self) -> None:
         parallel = get_parallel()
@@ -1169,6 +1179,47 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
+
+    def _init_batched_kv_write(self) -> None:
+        from sglang.srt.mem_cache.kv.memory.views import MHAKVView
+
+        pool = self.draft_model_runner.token_to_kv_pool
+        bindings = []
+        for layer in self.draft_model.layers:
+            attn = layer.self_attn.attn
+            binding = pool.layer_router.layer(attn.layer_id)
+            view = binding.view
+            if (
+                not isinstance(view, MHAKVView)
+                or getattr(view, "is_quantized_kv_cache", False)
+                or getattr(view, "use_hnd", False)
+            ):
+                return
+            k, v = binding.key(), binding.value()
+            for buf in (k, v):
+                if (
+                    buf.dtype != self._fused_kv_helper.flat_kv_weight_t.dtype
+                    or buf.dtype not in (torch.float16, torch.bfloat16)
+                    or buf.device != self._fused_kv_helper.flat_kv_weight_t.device
+                    or buf.ndim != 3
+                    or buf.shape[1:]
+                    != (
+                        layer.self_attn.num_kv_heads,
+                        layer.self_attn.head_dim,
+                    )
+                    or buf.stride(1) != buf.shape[2]
+                    or buf.stride(2) != 1
+                    or buf.stride(0) < buf.shape[1] * buf.shape[2]
+                ):
+                    return
+            if k.shape != v.shape:
+                return
+            bindings.append((attn, binding, k, v))
+        self._batched_kv_layers = tuple(bindings)
+        self._batched_kv_buffers = (
+            tuple(item[2] for item in bindings),
+            tuple(item[3] for item in bindings),
+        )
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
@@ -2273,11 +2324,62 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
 
+        write_stacked_kv = (
+            self._make_stacked_kv_writer(
+                ctx_cache_loc, ctx_cache_loc_2d, commit_lens, ctx_swa_cache_loc
+            )
+            if self._batched_kv_layers is not None
+            else None
+        )
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
+            write_stacked_kv=write_stacked_kv,
         )
+
+    def _make_stacked_kv_writer(
+        self, ctx_cache_loc, ctx_cache_loc_2d, commit_lens, ctx_swa_cache_loc
+    ):
+        from sglang.kernels.ops.kvcache.batched_store_cache import (
+            batched_store_cache,
+        )
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        prefix = ctx_cache_loc_2d is not None and commit_lens is not None
+        loc = ctx_cache_loc_2d if prefix else ctx_cache_loc
+        swa_loc = ctx_swa_cache_loc
+        if prefix and swa_loc is not None:
+            swa_loc = swa_loc.view_as(loc)
+        locations = []
+        for attn, binding, _, _ in self._batched_kv_layers:
+            loc_info = KVWriteLoc(
+                loc,
+                window_locs=layer_window_locs(token_to_kv_pool, attn.layer_id, swa_loc),
+                physical=True,
+            )
+            write_loc = (
+                loc_info if binding.plain else binding._write_loc(attn, loc_info)
+            )
+            resolved_loc = unwrap_write_loc(write_loc)[0]
+            locations.append(
+                resolved_loc if resolved_loc.ndim == 1 else resolved_loc.reshape(-1)
+            )
+        k_buffers, v_buffers = self._batched_kv_buffers
+
+        def write_stacked_kv(cache_k, cache_v):
+            batched_store_cache(
+                cache_k,
+                cache_v,
+                k_buffers,
+                v_buffers,
+                locations,
+                commit_lens=commit_lens if prefix else None,
+                locs_row_width=loc.shape[1] if prefix else 1,
+            )
+
+        return write_stacked_kv
 
     def _update_target_mamba_state_after_verify(
         self,

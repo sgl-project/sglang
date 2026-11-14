@@ -1,4 +1,4 @@
-"""The scheduler's graph admission must reach the DFLASH draft runner."""
+"""DFlash graph admission and KV pool bindings reach the draft runner."""
 
 import unittest
 from contextlib import nullcontext
@@ -7,12 +7,15 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative import dflash_worker_v2
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -94,6 +97,98 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
             self.assertIs(forward_batch.can_run_decode_cuda_graph, allowed)
             self.assertEqual(forward_batch.forward_mode, ForwardMode.TARGET_VERIFY)
             torch.testing.assert_close(forward_batch.input_ids, torch.tensor([1, 2]))
+
+
+class TestDFlashBatchedKvAllocation(CustomTestCase):
+    def test_batched_write_uses_each_subpools_physical_locations(self):
+        """A window layer must never scatter at the full pool's physical ids."""
+        worker = object.__new__(DFlashWorkerV2)
+        worker._batched_kv_layers = None
+        worker._batched_kv_buffers = None
+        worker._fused_kv_helper = SimpleNamespace(
+            flat_kv_weight_t=torch.empty(1, dtype=torch.bfloat16)
+        )
+        buffers = [torch.zeros(32, 2, 4, dtype=torch.bfloat16) for _ in range(4)]
+        views = [MHAKVView() for _ in range(2)]
+        for i, view in enumerate(views):
+            view.get_key_buffer = Mock(return_value=buffers[2 * i])
+            view.get_value_buffer = Mock(return_value=buffers[2 * i + 1])
+        pool = SimpleNamespace()
+        pool.layer_router = KVLayerRouter.from_layer_maps(
+            pool, layer_maps=[("full", views[0], {0: 0}), ("window", views[1], {1: 0})]
+        )
+        worker.draft_model_runner = SimpleNamespace(token_to_kv_pool=pool)
+        worker.draft_model = SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(
+                        attn=SimpleNamespace(layer_id=i), num_kv_heads=2, head_dim=4
+                    )
+                )
+                for i in range(2)
+            ]
+        )
+        worker._init_batched_kv_write()
+        full_loc, window_loc = torch.tensor([3, 4]), torch.tensor([17, 18])
+        k = torch.ones(2, 2, 2, 4, dtype=torch.bfloat16)
+        v = 2 * k
+
+        def scatter(k, v, kc, vc, locs, **kwargs):
+            for i, loc in enumerate(locs):
+                kc[i][loc] = k[i]
+                vc[i][loc] = v[i]
+
+        with patch(
+            "sglang.kernels.ops.kvcache.batched_store_cache.batched_store_cache",
+            side_effect=scatter,
+        ):
+            writer = worker._make_stacked_kv_writer(full_loc, None, None, window_loc)
+            writer(k, v)
+        for index, loc in ((0, full_loc), (2, window_loc)):
+            torch.testing.assert_close(buffers[index][loc], k[0])
+            torch.testing.assert_close(buffers[index + 1][loc], v[0])
+        self.assertEqual(buffers[2][full_loc].count_nonzero().item(), 0)
+
+    def test_pool_replacement_rebuilds_batched_write_buffers(self):
+        """A pool rebuild must discard the previous buffers before binding writes."""
+        worker = object.__new__(DFlashWorkerV2)
+        worker.draft_parallel_layout = None
+        worker.use_compact_draft_cache = False
+        worker._fused_kv_helper = object()
+        worker._batched_kv_layers = ("old",)
+        worker._batched_kv_buffers = ("old",)
+        generation = []
+
+        def allocate(**kwargs):
+            generation.append(object())
+
+        def bind():
+            self.assertIsNone(worker._batched_kv_layers)
+            self.assertIsNone(worker._batched_kv_buffers)
+            worker._batched_kv_layers = (generation[-1],)
+            worker._batched_kv_buffers = (generation[-1],)
+
+        worker._draft_worker = SimpleNamespace(alloc_memory_pool=allocate)
+        worker._init_batched_kv_write = bind
+        with (
+            patch.object(
+                dflash_worker_v2, "draft_tp_context", return_value=nullcontext()
+            ),
+            patch.object(dflash_worker_v2, "is_cuda", return_value=True),
+            patch.object(
+                dflash_worker_v2,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_dflash_draft_kv_ring=False),
+            ),
+            patch.object(
+                dflash_worker_v2.envs.SGLANG_ENABLE_ASYNC_ASSERT,
+                "get",
+                return_value=False,
+            ),
+        ):
+            for _ in range(2):
+                worker.alloc_memory_pool()
+                self.assertIs(worker._batched_kv_buffers[0], generation[-1])
 
 
 if __name__ == "__main__":
