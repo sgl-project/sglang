@@ -189,13 +189,15 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             extras=["--transformer-path MickJ/Z-Image-Turbo-fp8"],
         ),
     ),
+    # LoRA paths name the exact weight file (owner/repo/file.safetensors) so a cached
+    # adapter loads without a Hub API call, which CI runners hit rate limits on.
     # Multi-LoRA test case for Z-Image-Turbo
     DiffusionTestCase(
         "zimage_image_t2i_multi_lora",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            lora_path="reverentelusarca/elusarca-anime-style-lora-z-image-turbo",
-            second_lora_path="tarn59/pixel_art_style_lora_z_image_turbo",
+            lora_path="reverentelusarca/elusarca-anime-style-lora-z-image-turbo/elusarca-anime-style.safetensors",
+            second_lora_path="tarn59/pixel_art_style_lora_z_image_turbo/pixel_art_style_z_image_turbo.safetensors",
         ),
         run_lora_basic_api_check=True,
         run_lora_dynamic_switch_check=True,
@@ -398,7 +400,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
             num_gpus=1,
-            dynamic_lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
+            dynamic_lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1/664463-csetiarcane-Nfj1nx-e15-e7-s5070-ipv.safetensors",
         ),
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
@@ -666,7 +668,7 @@ if not current_platform.is_hip():
             "wan2_1_t2v_1_3b_dynamic_lora_default_quality_1gpu",
             DiffusionServerArgs(
                 model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-                lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
+                lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1/664463-csetiarcane-Nfj1nx-e15-e7-s5070-ipv.safetensors",
                 extras=[
                     "--lora-merge-mode",
                     "dynamic",
@@ -1329,7 +1331,7 @@ TWO_GPU_CASES = [
         "wan2_1_i2v_14b_lora_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
-            lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
+            lora_path="starsfriday/Wan2.1-Divine-Power-LoRA/divine-power.safetensors",
             extras=["--ulysses-degree=2"],
         ),
         run_lora_basic_api_check=True,
