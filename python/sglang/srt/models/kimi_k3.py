@@ -3320,7 +3320,14 @@ class KimiK3LinearModel(nn.Module):
                 if self.pp_group.is_first_rank
                 else pp_proxy_tensors["attn_res_bank"]
             )
-            self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
+            # A bank sent to the next pipeline rank outlives this forward, so
+            # it cannot share the storage the next forward overwrites.
+            self.attn_bank.open(
+                hidden_states,
+                attn_res_block_num,
+                inherited,
+                reuse=self.pp_group.is_last_rank,
+            )
 
         packs_aux = self.packs_aux_hidden_states
         aux_hidden_states: AuxHiddenStateAccumulator = (

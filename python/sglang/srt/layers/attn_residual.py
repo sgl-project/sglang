@@ -16,6 +16,7 @@
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
+import math
 from typing import Optional
 
 import torch
@@ -444,11 +445,36 @@ def _aggregate(
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
 
 
+# Grow-only bank storage, keyed by (device, stream).
+_BANK_SCRATCH: dict = {}
+
+
+def _bank_scratch(shape, dtype, device) -> torch.Tensor:
+    """Bank storage shared by the forward passes on one stream. A bank
+    allocated per forward is sized by that step's token count (~1.8 GB at 16K
+    tokens), and the caching allocator keeps a segment for every larger size
+    it sees without merging them. Graph capture allocates as before: a
+    captured graph keeps its bank's address, which a grown buffer would free."""
+    if device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+        return torch.empty(shape, dtype=dtype, device=device)
+    nbytes = math.prod(shape) * dtype.itemsize
+    key = (device, torch.cuda.current_stream(device).cuda_stream)
+    buf = _BANK_SCRATCH.get(key)
+    if buf is None or buf.numel() < nbytes:
+        _BANK_SCRATCH.pop(key, None)
+        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        _BANK_SCRATCH[key] = buf
+    return buf[:nbytes].view(dtype).view(shape)
+
+
 class AttnResidual:
     """Snapshot bank + aggregation of one K3 attention-residual stream,
     backed by the capability-dispatched kernels above.
 
-    One instance lives for one model forward pass.
+    One instance lives for one model forward pass. With ``reuse`` its bank
+    is the stream's shared storage, which the next forward on that stream
+    overwrites; a bank that outlives the forward (the PP send) needs
+    ``reuse=False``.
     """
 
     def __init__(
@@ -456,12 +482,16 @@ class AttnResidual:
         hidden_states: torch.Tensor,
         block_num: int,
         block_residual: Optional[torch.Tensor] = None,
+        reuse: bool = True,
     ) -> None:
         num_tokens, hidden_size = hidden_states.shape
         # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
         # legacy kernel path.
-        self.block_residual = hidden_states.new_empty(
-            (num_tokens, block_num, hidden_size)
+        shape = (num_tokens, block_num, hidden_size)
+        self.block_residual = (
+            _bank_scratch(shape, hidden_states.dtype, hidden_states.device)
+            if reuse
+            else hidden_states.new_empty(shape)
         )
         self.num_valid_blocks = 0
         # Whether a write snapshotted only this rank's slice of the rows, which
