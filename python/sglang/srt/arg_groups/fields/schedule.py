@@ -148,7 +148,7 @@ class Schedule(msgspec.Struct):
     ] = "length"
     schedule_conservativeness: A[
         float,
-        "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
+        "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently. With --enable-dp-attention the value is multiplied by 0.3 at startup.",
     ] = 1.0
     page_size: A[
         Optional[int], Arg(help="The number of tokens in a page.", resolvable=True)

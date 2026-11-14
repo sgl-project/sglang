@@ -90,6 +90,34 @@ Guidelines:
 --hicache-storage-prefetch-policy timeout
 ```
 
+### Host Buffer Mode (`buffer_only`)
+
+```bash Command
+# Host memory is only a staging buffer between the GPU and the storage backend
+--hicache-host-memory-mode buffer_only
+--hicache-storage-backend mooncake     # required in buffer_only mode
+```
+
+With the default `--hicache-host-memory-mode cache`, the host pool is a persistent L2 tier.
+With `buffer_only`, it only stages pages moving between the GPU and L3, so it can be much smaller (the default `--hicache-ratio` is 1.2 instead of 2.0).
+Every reuse that misses the GPU pool is then served from L3.
+
+**Anchor lock.** When an L3 hit is staged, the device prefix it extends (its anchor) is pinned from I/O commit until the request consumes the hit, so eviction cannot discard the anchor and waste the fetch.
+`SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP` (default `0.5`) bounds the tokens these pins may hold on each rank:
+
+```text
+anchor_lock_cap_tokens = max(0, min(CAP * device_pool_tokens, device_pool_tokens - context_length))
+```
+
+- The startup log prints `BufferModePipeline anchor_lock_cap_tokens=N`. If it prints `anchor_lock_cap_tokens=0`, `--context-length` is as large as the device pool and no prefetch is pinned.
+- When a new pin would exceed the cap, the prefetch waits if its anchor alone fits under the cap, or launches unpinned if it does not. Both cases log `HiCache anchor-lock cap reached ... parking` or `... launching unlocked`.
+- `0` disables pinning.
+
+Tuning:
+
+- Pinned anchors are not evictable. With long contexts (hundreds of thousands of tokens) and high concurrency, the pins plus running chunked prefills can leave nothing evictable, and the scheduler fails with `Prefill out of memory` while every radix node is locked (`full_evictable_size_=0`, see [#45989](https://github.com/sgl-project/sglang/issues/45989)). Lowering the cap, for example to `0.2`, reduces how often this happens.
+- A lower cap means more prefetches wait or launch unpinned. If `anchor-lock cap reached` warnings become frequent, the cap is too low for the workload.
+
 ### Integration with PD Disaggregation
 
 HiCache works seamlessly with PD Disaggregation. You can choose between two configurations:
