@@ -27,6 +27,7 @@ class SchedulerIpcChannels:
         *,
         port_args: PortArgs,
         is_rank_zero: bool,
+        is_rpc_rank: bool,
         skip_tokenizer_init: bool,
         metrics_enabled: bool,
         enable_scripted_runtime: bool,
@@ -45,8 +46,12 @@ class SchedulerIpcChannels:
                 recv_from_tokenizer = ScriptedTokenizerRecvProxy(
                     underlying=recv_from_tokenizer
                 )
-            recv_from_rpc = get_zmq_socket(
-                context, zmq.DEALER, port_args.rpc_ipc_name, False
+            # The engine's bound DEALER round-robins over connected peers, so a
+            # second peer would take every other RPC and answer each one twice.
+            recv_from_rpc = (
+                get_zmq_socket(context, zmq.DEALER, port_args.rpc_ipc_name, False)
+                if is_rpc_rank
+                else None
             )
 
             send_to_tokenizer_raw = get_zmq_socket(
