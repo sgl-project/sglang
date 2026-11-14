@@ -32,9 +32,15 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _loc_info(virtual_loc, swa_phys=None, full_phys=None, physical=False):
+    """A write loc whose window sub-pool "swa" writes at ``swa_phys``."""
     from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
-    return KVWriteLoc(virtual_loc, swa_phys, full_phys, physical=physical)
+    return KVWriteLoc(
+        virtual_loc,
+        full_loc=full_phys,
+        physical=physical,
+        window_locs=None if swa_phys is None else {"swa": swa_phys},
+    )
 
 
 class _RecordingPool:
@@ -61,8 +67,9 @@ class _RecordingPool:
 class TestUnifiedSWARouting(unittest.TestCase):
     """`RoutedKVCache.set_kv_buffer` routing over an owner and a window: owner
     layers write `full_loc` when present (triton's capture-stable buffer), else
-    the rebound generic `loc` -- the same id space; window layers write the
-    swa-physical `swa_loc`, which has no fallback (a different id space)."""
+    the rebound generic `loc` -- the same id space; window layers write their
+    sub-pool's entry of `window_locs`, which has no fallback (a different id
+    space)."""
 
     def _make_bare_pool(self):
         from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
@@ -106,7 +113,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
         self.assertNotIn("already_physical", kwargs)
 
     def test_full_layer_falls_back_to_generic_loc(self):
-        """Bug regression: a 2-arg `KVWriteLoc(loc, swa)` with no explicit
+        """Bug regression: a write loc carrying window ids but no explicit
         `full_loc` must fall back to the rebound `loc` -- which IS the full-side
         physical id -- instead of failing the full-layer door."""
         pool = self._make_bare_pool()
@@ -126,7 +133,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
         self.assertIs(forwarded, rebound_loc)
         self.assertNotIn("already_physical", kwargs)
 
-    def test_swa_layer_writes_swa_loc(self):
+    def test_swa_layer_writes_its_window_loc(self):
         pool = self._make_bare_pool()
         virtual_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
@@ -147,12 +154,12 @@ class TestUnifiedSWARouting(unittest.TestCase):
         # Full pool untouched for an SWA layer.
         self.assertEqual(len(pool.full_kv_pool.calls), 0)
 
-    def test_swa_layer_requires_swa_loc(self):
+    def test_swa_layer_requires_its_window_loc(self):
         pool = self._make_bare_pool()
         virtual_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
 
         layer = types.SimpleNamespace(layer_id=1)  # SWA layer
-        # No swa_loc bundled -> the write-loc contract is violated; must assert
+        # No window loc bundled -> the write-loc contract is violated; must assert
         # rather than silently writing wrong (un-translated) locations.
         with self.assertRaises(AssertionError):
             pool.set_kv_buffer(

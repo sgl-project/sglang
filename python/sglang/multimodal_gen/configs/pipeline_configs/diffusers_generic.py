@@ -10,10 +10,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 @dataclass

@@ -19,13 +19,13 @@ from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
-    ModelTaskType,
     pack_latents_2x2,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.vision import preprocess_image
 
@@ -602,6 +602,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
                 return new_width, new_height
 
         return None
+
+    def prepare_calculated_size(self, image):
+        # An image that needs no resize still sets the output size, as in diffusers.
+        return super().prepare_calculated_size(image) or (image.width, image.height)
 
     def preprocess_condition_image(
         self, image, target_width, target_height, vae_image_processor: VaeImageProcessor

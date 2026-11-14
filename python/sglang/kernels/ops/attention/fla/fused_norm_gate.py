@@ -7,8 +7,8 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-import sglang.kernels.ops.attention.triton_block_ptr_compat  # noqa: F401
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -58,27 +58,26 @@ def layer_norm_gated_fwd_kernel(
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
 
-    i_t = tl.program_id(0)
+    i_t = tl.program_id(0).to(tl.int64)
 
+    o_t = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BD)
     m_d = o_d < D
+    m_t = o_t < T
+    m_x = m_t[:, None] & m_d[None, :]
 
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    p_x = x + o_t[:, None] * D + o_d[None, :]
+    b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     if HAS_RESIDUAL:
-        p_res = tl.make_block_ptr(
-            residual, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
-        )
-        b_x += tl.load(p_res, boundary_check=(0, 1)).to(tl.float32)
+        p_res = residual + o_t[:, None] * D + o_d[None, :]
+        b_x += tl.load(p_res, mask=m_x, other=0.0).to(tl.float32)
     if STORE_RESIDUAL_OUT:
-        p_res_out = tl.make_block_ptr(
-            residual_out, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
-        )
-        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), boundary_check=(0, 1))
+        p_res_out = residual_out + o_t[:, None] * D + o_d[None, :]
+        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), mask=m_x)
     if not IS_RMS_NORM:
         b_mean = tl.sum(b_x, axis=1) / D
-        p_mean = tl.make_block_ptr(mean, (T,), (1,), (i_t * BT,), (BT,), (0,))
-        tl.store(p_mean, b_mean.to(p_mean.dtype.element_ty), boundary_check=(0,))
+        p_mean = mean + o_t
+        tl.store(p_mean, b_mean.to(p_mean.dtype.element_ty), mask=m_t)
         b_xbar = tl.where(m_d[None, :], b_x - b_mean[:, None], 0.0)
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     else:
@@ -86,8 +85,8 @@ def layer_norm_gated_fwd_kernel(
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     b_rstd = 1 / tl.sqrt(b_var + eps)
 
-    p_rstd = tl.make_block_ptr(rstd, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), boundary_check=(0,))
+    p_rstd = rstd + o_t
+    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), mask=m_t)
 
     if HAS_WEIGHT:
         b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
@@ -116,16 +115,16 @@ def layer_norm_gated_fwd_kernel(
             other=0.0,
         ).to(tl.float32)
     else:
-        p_g = tl.make_block_ptr(g, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-        b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+        p_g = g + o_t[:, None] * D + o_d[None, :]
+        b_g = tl.load(p_g, mask=m_x, other=0.0).to(tl.float32)
     if ACTIVATION == "swish" or ACTIVATION == "silu":
         b_y = b_y * b_g * tl.sigmoid(b_g)
     elif ACTIVATION == "sigmoid":
         b_y = b_y * tl.sigmoid(b_g)
 
     # Write output
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    p_y = y + o_t[:, None] * D + o_d[None, :]
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -246,8 +245,7 @@ def layer_norm_gated_fwd(
         BT = 32
         use_bt8 = 8 <= T <= 256 if is_rms_norm and activation == "sigmoid" else T == 64
         if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
-            arch = get_jit_cuda_arch()
-            if (arch.major, arch.minor) == (10, 3):
+            if current_arch().is_sm(10, 3):
                 # Small sigmoid-gated RMSNorm batches use eight rows per CTA.
                 # Other norm modes retain their T=64 selection.
                 BT = 8

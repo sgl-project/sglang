@@ -919,7 +919,6 @@ def _causal_conv1d_update_kernel(
                     parent_idx_token,
                     parent_idx_tokens,
                 )
-            # tl.device_print("am", parent_idx_tokens)
 
             _idx_token = idx_token
             x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]

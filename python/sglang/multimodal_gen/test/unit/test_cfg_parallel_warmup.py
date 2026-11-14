@@ -21,7 +21,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
     Flux3ImageSamplingParams,
 )
@@ -45,6 +44,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     normalize_quality,
 )
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -60,6 +60,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.upsampling import (
+    LTX2HalveResolutionStage,
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
     format_warmup_req,
@@ -131,6 +134,32 @@ def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
 
 class TestWarmupReqCfgParallel(unittest.TestCase):
     """Warmup request construction and req-based warmup guards."""
+
+    def test_bcg_warmup_preserves_configured_prompt_and_references(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        server_args.enable_breakable_cuda_graph = True
+        defaults = _apply_warmup_sampling_overrides(
+            SimpleNamespace(
+                warmup_sampling_params={
+                    "prompt": "Use the palette of <Picture 2> in <Picture 1>.",
+                    "image_path": ["first.png", "second.png"],
+                }
+            ),
+            SamplingParams(),
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=defaults,
+        ):
+            requests = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["2048x2048"],
+                server_based_warmup=True,
+            )
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].prompt, defaults.prompt)
+        self.assertEqual(requests[0].image_path, defaults.image_path)
+        self.assertTrue(requests[0].is_warmup)
 
     def test_sampling_workload_override_accepts_json(self):
         defaults = SamplingParams(
@@ -869,9 +898,15 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 pipeline_class_name=pipeline_class_name,
                 enable_breakable_cuda_graph=True,
             )
-            return _resolve_default_warmup_resolution(
+            width, height = _resolve_default_warmup_resolution(
                 server_args, sampling_defaults, server_based_warmup=True
             )
+            if pipeline_class_name != "LTX2Pipeline":
+                # warmup output must be accepted by the actual stage-1 consumer
+                stage = object.__new__(LTX2HalveResolutionStage)
+                req = stage.forward(Req(width=width, height=height), server_args)
+                self.assertEqual((req.width, req.height), (width // 2, height // 2))
+            return width, height
 
         # 960x544 is LTX-2.5's stage-1 size; the halving stage rejects it as a request
         self.assertEqual(
@@ -883,10 +918,10 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(
             resolve("LTX2TwoStageHQPipeline", LTX23HQSamplingParams()), (1920, 1088)
         )
-        # doubling cannot fix this one, so the request stays as written
+        # an unservable default falls back to an aligned warmup resolution
         self.assertEqual(
             resolve("LTX2TwoStagePipeline", SamplingParams(width=1000, height=600)),
-            (1000, 600),
+            (768, 448),
         )
         # one-stage runs the default resolution as is
         self.assertEqual(resolve("LTX2Pipeline", LTX25SamplingParams()), (960, 544))

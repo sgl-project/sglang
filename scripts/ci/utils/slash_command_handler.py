@@ -989,13 +989,13 @@ def _extract_runner_configs(content):
     return out
 
 
-def _extract_suites(content, register_fn):
-    """Pull every single-string `suite=` from `<register_fn>(...)` calls."""
+def _extract_suites(content, register_fn, kwarg="suite"):
+    """Pull every single-string `<kwarg>=` from `<register_fn>(...)` calls."""
     out = []
     for args in re.finditer(
         rf"^[^#\n]*{register_fn}\s*\(([^)]*)\)", content, re.MULTILINE
     ):
-        m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        m = re.search(rf'{kwarg}\s*=\s*["\']([^"\']+)["\']', args.group(1))
         if m:
             out.append(m.group(1))
     return out
@@ -1018,6 +1018,7 @@ _OTHER_BACKEND_REGISTERS = {
     "register_mlx_ci": "MLX",
     "register_mps_ci": "MPS",
     "register_ppu_ci": "PPU",
+    "register_mlu_ci": "MLU",
 }
 
 
@@ -1105,7 +1106,8 @@ def detect_suite(file_path_from_test):
     `error` set.
 
     Each dict has keys: suite, runner_label, install_script,
-    install_timeout, rdma_devices, is_cpu, error.
+    install_timeout, rdma_devices, is_cpu, error; a dispatchable one also
+    has stage (the registered CI stage, e.g. `base-b`, or None).
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
@@ -1117,7 +1119,10 @@ def detect_suite(file_path_from_test):
         for rc, args_str in cuda_calls:
             stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
             suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
-            results.append(_resolve_runner_config(rc, full_path, suite))
+            stage = stage_m.group(1) if stage_m else None
+            results.append(
+                {**_resolve_runner_config(rc, full_path, suite), "stage": stage}
+            )
         return results
 
     legacy_suites = _extract_legacy_suites(content)
@@ -1139,9 +1144,18 @@ def detect_suite(file_path_from_test):
                     f"{workflow} workflow manually.",
                 )
             ]
+        stages = _extract_suites(content, "register_cpu_ci", kwarg="stage")
+        ubuntu_suites = sorted(set(cpu_suites) & _partition.UBUNTU_CPU_SUITES)
+        if stages:
+            stage = stages[0]
+        elif ubuntu_suites:
+            stage = ubuntu_suites[0].split("-test-", 1)[0]
+        else:
+            stage = None
         return [
             {
                 "suite": "cpu",
+                "stage": stage,
                 "runner_label": "ubuntu-latest",
                 "install_script": "",
                 "install_timeout": "",
@@ -1229,6 +1243,7 @@ def _resolve_test_spec(test_spec):
             "spec": test_spec,
             "test_command": test_command,
             "mode": "multimodal_gen",
+            "stage": None,
             "runs_on": runner_label,
             "install_script": "",
             "install_timeout": "",
@@ -1259,6 +1274,7 @@ def _resolve_test_spec(test_spec):
             "spec": test_spec,
             "test_command": test_command,
             "mode": mode,
+            "stage": info["stage"],
             "runs_on": info["runner_label"],
             "install_script": info["install_script"],
             "install_timeout": info["install_timeout"],
@@ -1386,6 +1402,7 @@ def _dispatch_batch(
             "specs": [r["spec"] for r in batch],
             "success": True,
             "test_commands": test_commands,
+            "stages": [r["stage"] for r in batch],
             "mode": mode,
             "runs_on": runs_on,
             "run_url": run_url,
@@ -1623,13 +1640,13 @@ def handle_rerun_test(
     for dr in dispatch_results:
         if dr["success"]:
             if dr["mode"] == "multimodal_gen":
-                cmds = "\n".join(
-                    f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]
-                )
+                cmds = [f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]]
             else:
-                cmds = "\n".join(
-                    f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
-                )
+                cmds = [f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]]
+            cmds = "\n".join(
+                f"{cmd}  # {stage}" if stage else cmd
+                for cmd, stage in zip(cmds, dr["stages"])
+            )
             marker = dr.get("reply_marker", "")
             label = dr["runs_on"] or dr["mode"]
             if dr.get("run_url"):

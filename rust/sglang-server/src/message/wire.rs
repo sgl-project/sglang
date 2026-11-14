@@ -87,7 +87,12 @@ pub fn media_item(item: api::MediaItem) -> Result<MmItem, Error> {
         // `load_image` reduces an item to `.url` the same way).
         Some(Value::Ref(r)) if !r.url.is_empty() => Ok(MmItem::Ref {
             url: r.url,
-            hints: MediaHints { fps: r.fps },
+            hints: MediaHints {
+                fps: r.fps,
+                detail: r.detail,
+                max_frames: r.max_frames,
+                max_tokens_per_frame: r.max_tokens_per_frame,
+            },
         }),
         Some(Value::Ref(_)) => Err(Error::Validation(
             "a multimodal item object needs a non-empty `url`".into(),
@@ -442,10 +447,17 @@ mod tests {
         let src = |s: &str| MmItem::Source(s.to_owned());
         assert_eq!(conv(r#""u""#), MmDataInput::One(src("u")));
         assert_eq!(
-            conv(r#"{"url": "u", "detail": "high", "fps": 2.0}"#),
+            conv(
+                r#"{"url": "u", "detail": "high", "fps": 2.0, "max_frames": 16, "max_tokens_per_frame": 64}"#
+            ),
             MmDataInput::One(MmItem::Ref {
                 url: "u".into(),
-                hints: MediaHints { fps: Some(2.0) },
+                hints: MediaHints {
+                    fps: Some(2.0),
+                    detail: Some("high".into()),
+                    max_frames: Some(16),
+                    max_tokens_per_frame: Some(64),
+                },
             })
         );
         assert_eq!(

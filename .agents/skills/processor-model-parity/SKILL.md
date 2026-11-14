@@ -13,9 +13,12 @@ the implementation, and SGLang code exists only where the two differ.
 
 Scope: the request -> prompt -> token ids path, plus the checks that let hosts
 serve the model's OpenAI requests through `/generate` (see "OpenAI layer").
-Multimodal preprocessing is not covered here: `render_request` fails on media
+Chat rendering with media is not covered here: `render_request` fails on media
 content parts, so hosts send those chats to the engine. The fixture generator
 serves every checkpoint text-only, so a media case records that rejection.
+
+Image preprocessing (`src/mm/`) has its own skill:
+[`processor-mm-parity`](../processor-mm-parity/SKILL.md).
 
 ## Done means
 
@@ -144,11 +147,15 @@ renders the model:
   inserted empty system turns. (`task_action`, `task_after_developer`, `consecutive_task`, `mid_system`)
 - **History**: the encoder's rules for earlier turns: reasoning kept or dropped,
   whole turns dropped, closing tags on empty reasoning. (`multi_turn`, `thinking_multi_turn`)
-- **Tokens**: Python's `tokenizer.encode` adds special tokens by default; the
-  continuation prefix is encoded alone and loses a leading BOS
+- **Tokens**: Python encodes the rendered prompt without the tokenizer's own
+  special tokens (`_render_and_encode_chat_template` passes
+  `add_special_tokens=False` to a tokenizer that adds them), and the continuation
+  prefix alone with them, less a leading BOS
   (`_append_assistant_prefix_to_prompt_ids`). `tests/parity.rs` does both, using the
   fixture's `bos_token_id`; `render_prompt` returns the prefix as its own segment so
-  hosts keep that boundary. (`continuation_bos`, `continuation_after_text`)
+  hosts keep that boundary. A template that prints `{{ bos_token }}` itself (StepFun)
+  over a tokenizer that adds BOS (`add_bos_token`) shows the difference.
+  (`continuation_bos`, `continuation_after_text`, StepFun's `continuation_starts_with_bos`)
 - **Errors**: reject what Python rejects. A case Python raises on is recorded with
   `error`, and `tests/parity.rs` then requires `render_request` to fail. That
   includes pydantic rejections and Python crashes (a 500 is still a rejection).
@@ -173,7 +180,15 @@ writes:
   something, so extend it;
 - the fixture-level `config` (the `config.json` fields the processor reads, plus
   resolved overrides such as the effort profile), `bos_token_id`, and for a Jinja
-  checkpoint its `chat_template`, so the test renders offline.
+  checkpoint its `chat_template` and the `special_tokens` its template context
+  carries (`bos_token`, `eos_token`, `unk_token`), so the test renders offline.
+
+The tokenizer is loaded with SGLang's `get_tokenizer`, which restores the
+`tokenizer.json` pipeline a transformers v5 tokenizer class rebuilds
+(`_fix_v5_tokenizer_components`): a bare `AutoTokenizer` can drop newlines
+(StepFun's `LlamaTokenizerFast` declaration). A multimodal engine tokenizes through
+its processor (`hf_transformers/processor.py`), which does not apply that fix, so
+check its tokenizer against `get_tokenizer`'s before trusting the token ids.
 
 ```sh
 cd rust/sglang-processor

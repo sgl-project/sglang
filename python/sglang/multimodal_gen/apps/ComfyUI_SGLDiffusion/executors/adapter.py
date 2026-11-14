@@ -90,7 +90,3 @@ def get_adapter_class(model_type: str) -> type[ComfyUIModelAdapter]:
             f"Registered: {sorted(_ADAPTERS)}"
         )
     return _ADAPTERS[model_type]
-
-
-def registered_model_types() -> list[str]:
-    return sorted(_ADAPTERS)

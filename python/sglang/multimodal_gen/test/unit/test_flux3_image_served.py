@@ -230,6 +230,23 @@ class TestFlux3ServedRegistration(unittest.TestCase):
             add_resolved_pipeline_config_cli_args(parser)
         self.assertEqual(parser.parse_args(args).flux3_alpha, 6.5)
 
+    def test_num_gpus_without_parallel_flags_resolves(self):
+        """The default guidance_scale is None (the package supplies it per
+        request), so the CFG-parallel auto rule must not compare it with 1."""
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+        from sglang.multimodal_gen.test.unit.conftest import mock_cuda_platform
+
+        for flow_map in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / _MODEL
+                _write_package(root, flow_map=flow_map)
+                with mock_cuda_platform():
+                    args = ServerArgs.from_dict(
+                        {"model_path": str(root), "num_gpus": 2}
+                    )
+                self.assertFalse(args.enable_cfg_parallel)
+                self.assertEqual(args.sp_degree, 2)
+
 
 class TestFlux3ServedOutput(unittest.TestCase):
     def test_decode_output_is_normalized_once_before_worker_materialization(self):

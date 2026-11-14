@@ -1,12 +1,14 @@
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
-from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -23,27 +25,26 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,
-    model: nn.Module | None,
+    quant_config: Optional["QuantizationConfig"],
     model_dtype: torch.dtype,
     is_draft_worker: bool,
     is_dflash: bool,
     speculative_draft_attention_backend: str,
     speculative_draft_kv_cache_dtype: Optional[str] = None,
-) -> tuple[Optional[str], torch.dtype]:
-    resolved_kv_cache_dtype: Optional[str] = None
+) -> tuple[str, torch.dtype]:
+    """(label, torch dtype) of a runner's KV cache; a pool in the compute
+    dtype is labelled "auto", which backends gate FP8 casts and descales on."""
     if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
         server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
-        if server_args_kv_cache_dtype != "auto":
-            resolved_kv_cache_dtype = server_args_kv_cache_dtype
+    kv_cache_dtype_str = server_args_kv_cache_dtype
     if server_args_kv_cache_dtype == "auto":
-        quant_config = getattr(model, "quant_config", None)
         kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
         if (
             isinstance(kv_cache_quant_algo, str)
             and kv_cache_quant_algo.upper() == "FP8"
         ):
             kv_cache_dtype = fp8_dtype if _is_hip else torch.float8_e4m3fn
-            resolved_kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[kv_cache_dtype]
+            kv_cache_dtype_str = TORCH_DTYPE_TO_KV_CACHE_STR[kv_cache_dtype]
         else:
             kv_cache_dtype = model_dtype
     elif server_args_kv_cache_dtype == "fp8_e5m2":
@@ -94,6 +95,6 @@ def configure_kv_cache_dtype(
         )
         kv_cache_dtype = model_dtype
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
-        resolved_kv_cache_dtype = "auto"
+        kv_cache_dtype_str = "auto"
 
-    return resolved_kv_cache_dtype, kv_cache_dtype
+    return kv_cache_dtype_str, kv_cache_dtype

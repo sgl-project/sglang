@@ -69,7 +69,8 @@ class TestAcceptTailParity(CustomTestCase):
                 model_config=SimpleNamespace(
                     hf_text_config=SimpleNamespace(model_type="test")
                 )
-            )
+            ),
+            random_seed=0,
         )
         executor = TargetVerifyExecutor(
             target_worker=target_worker,

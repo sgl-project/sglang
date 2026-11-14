@@ -620,7 +620,13 @@ install_sglang() {
         EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
     fi
     echo "Installing python extras: [${EXTRAS}]"
-    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    # editable checkout paths are identical across runner containers; keep
+    # distribution locks separate while reusing each runner's warm cache
+    local editable_cache_dir="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+    if [ -n "${RUNNER_NAME:-}" ]; then
+        editable_cache_dir="${editable_cache_dir}/runners/${RUNNER_NAME}"
+    fi
+    UV_CACHE_DIR="$editable_cache_dir" $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
 
     # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
     # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
@@ -811,7 +817,7 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.13.post1"
+    MOONCAKE_VERSION="0.3.14"
     NIXL_VERSION="1.3.0"
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
     MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -858,6 +864,10 @@ install_extra_deps() {
 }
 
 install_msa() {
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
     # MiniMax MSA sparse-attention kernels: MiniMax-M3.1 imports them at startup on
     # Blackwell. Same commit and layout as docker/Dockerfile.cu134; editable because
     # prefill JIT-compiles against its CUTLASS submodule.
@@ -1003,11 +1013,6 @@ main() {
     setup_cargo_cache
     install_sglang
     release_cargo_cache_lock
-    # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
-    # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
-    if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
-        setup_ld_library_path
-    fi
     install_sglang_kernel
     install_sglang_router
     install_flashinfer_cubin

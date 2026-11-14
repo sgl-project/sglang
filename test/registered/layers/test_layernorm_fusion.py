@@ -1,13 +1,15 @@
 import itertools
 import unittest
+from unittest import mock
 
 import torch
 
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers import layernorm
+from sglang.srt.layers.layernorm import Gemma3RMSNorm, RMSNorm
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -41,6 +43,42 @@ class TestRMSNormInputShape(CustomTestCase):
                     actual[0], expected[0], atol=1e-2, rtol=1.5e-2
                 )
                 torch.testing.assert_close(actual[1], expected[1], atol=1e-2, rtol=1e-2)
+
+
+class TestGemma3RMSNormInputShape(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+
+    def test_head_slice_uses_fused_kernel(self):
+        torch.manual_seed(0)
+        head_dim = 256
+        for dtype, num_tokens, num_heads in itertools.product(
+            (torch.bfloat16, torch.half), (1, 7, 83), (1, 8)
+        ):
+            with self.subTest(dtype=dtype, num_tokens=num_tokens, num_heads=num_heads):
+                layer = Gemma3RMSNorm(head_dim).to(device="cuda", dtype=dtype)
+                layer.weight.data.normal_(mean=0.0, std=0.1)
+                # q_norm and k_norm see a head slice of the fused qkv tensor.
+                qkv = torch.randn(
+                    num_tokens, (num_heads + 2) * head_dim, device="cuda", dtype=dtype
+                )
+                x = qkv[:, : num_heads * head_dim].unflatten(-1, (num_heads, head_dim))
+
+                with torch.inference_mode():
+                    expected = layer.forward_native(x)
+                    if torch.version.hip is None:
+                        with mock.patch.object(
+                            layernorm, "gemma_rmsnorm", wraps=layernorm.gemma_rmsnorm
+                        ) as fused:
+                            actual = layer(x)
+                        fused.assert_called_once()
+                    else:
+                        actual = layer(x)
+
+                self.assertEqual(actual.shape, x.shape)
+                torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
 class TestRMSNormFp8QuantFusion(CustomTestCase):

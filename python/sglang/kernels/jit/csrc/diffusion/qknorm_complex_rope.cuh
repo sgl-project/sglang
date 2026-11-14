@@ -13,7 +13,8 @@
 // One launch handles the Q rows and the K rows (source -> destination, in place
 // when they alias), copies the cached prefix K/V into rows [0:P] of the
 // [B, P+S, H, 128] K/V buffers and, with kCopyV, the raw V rows into [P:P+S].
-// A half-warp per row with 16-byte accesses and 32-bit work indices.
+// A half-warp per row with 16-byte accesses and 32-bit work indices; Q/K rows go two at a time,
+// both loaded before either computes.
 
 #pragma once
 
@@ -86,21 +87,29 @@ SGL_DEVICE bf16_t* row_ptr(const MutableRows& rows, int64_t b, int64_t t, int64_
 }
 
 /// \brief Normalize and rotate one 128-wide row held by a half-warp; lane l owns elements 8l..8l+7.
-template <bool kFuseRealSin>
-SGL_DEVICE void norm_rope_row(
-    const bf16_t* __restrict__ src,
-    bf16_t* __restrict__ dst,
-    const bf16_t* __restrict__ weight,
-    const fp32_t* __restrict__ rope_row,
-    float eps,
-    int lane) {
+struct RowIn {
   RowVec x;
   RowVec w;
   RopeVec r[2];
-  x.load(src + lane * kLaneElems);
-  w.load(weight + lane * kLaneElems);
-  r[0].load(rope_row + lane * kLaneElems);
-  r[1].load(rope_row + lane * kLaneElems + 4);
+};
+
+SGL_DEVICE void load_row(
+    const bf16_t* __restrict__ src,
+    const bf16_t* __restrict__ weight,
+    const fp32_t* __restrict__ rope_row,
+    int lane,
+    RowIn& in) {
+  in.x.load(src + lane * kLaneElems);
+  in.w.load(weight + lane * kLaneElems);
+  in.r[0].load(rope_row + lane * kLaneElems);
+  in.r[1].load(rope_row + lane * kLaneElems + 4);
+}
+
+template <bool kFuseRealSin>
+SGL_DEVICE void norm_rope_store(const RowIn& in, bf16_t* __restrict__ dst, float eps, int lane) {
+  const RowVec& x = in.x;
+  const RowVec& w = in.w;
+  const RopeVec* r = in.r;
 
   float value[kLaneElems];
 #pragma unroll
@@ -157,6 +166,19 @@ SGL_DEVICE void norm_rope_row(
   out.store(dst + lane * kLaneElems);
 }
 
+template <bool kFuseRealSin>
+SGL_DEVICE void norm_rope_row(
+    const bf16_t* __restrict__ src,
+    bf16_t* __restrict__ dst,
+    const bf16_t* __restrict__ weight,
+    const fp32_t* __restrict__ rope_row,
+    float eps,
+    int lane) {
+  RowIn in;
+  load_row(src, weight, rope_row, lane, in);
+  norm_rope_store<kFuseRealSin>(in, dst, eps, lane);
+}
+
 SGL_DEVICE void copy_row(const bf16_t* __restrict__ src, bf16_t* __restrict__ dst, int lane) {
   RowVec v;
   v.load(src + lane * kLaneElems);
@@ -178,8 +200,33 @@ __global__ void kernel(const Params __grid_constant__ params) {
   const uint32_t total = rows_q + rows_k + 2 * rows_p + rows_v;
   const uint32_t stride = gridDim.x * kRowsPerBlock;
 
+  // Q/K rows two at a time per half-warp: both rows' loads are issued before either row computes,
+  // so a half-warp keeps twice the bytes in flight. Same per-row arithmetic as norm_rope_row.
+  const uint32_t rows_qk = rows_q + rows_k;
+  auto qk_ptrs = [&](uint32_t r, const bf16_t*& src, bf16_t*& dst, const bf16_t*& weight, const fp32_t*& rope_row) {
+    const bool is_k = r >= rows_q;
+    const uint32_t rr = is_k ? r - rows_q : r;
+    const uint32_t h = rr % heads, t = rr / heads, s = t % seq, b = t / seq;
+    src = is_k ? row_ptr(params.k_src, b, s, h) : row_ptr(params.q_src, b, s, h);
+    dst = is_k ? row_ptr(params.k_dst, b, prefix + s, h) : row_ptr(params.q_dst, b, s, h);
+    weight = is_k ? params.k_weight : params.q_weight;
+    rope_row = params.rope + int64_t{s} * kHeadDim;
+  };
+  uint32_t row = blockIdx.x * kRowsPerBlock + slot;
+  for (; row + stride < rows_qk; row += 2 * stride) {
+    const bf16_t *src0, *src1, *w0, *w1;
+    bf16_t *dst0, *dst1;
+    const fp32_t *rope0, *rope1;
+    qk_ptrs(row, src0, dst0, w0, rope0);
+    qk_ptrs(row + stride, src1, dst1, w1, rope1);
+    RowIn in0, in1;
+    load_row(src0, w0, rope0, lane, in0);
+    load_row(src1, w1, rope1, lane, in1);
+    norm_rope_store<kFuseRealSin>(in0, dst0, params.eps, lane);
+    norm_rope_store<kFuseRealSin>(in1, dst1, params.eps, lane);
+  }
   // the shuffles are masked per half-warp, so the two rows of a warp may take different branches
-  for (uint32_t row = blockIdx.x * kRowsPerBlock + slot; row < total; row += stride) {
+  for (; row < total; row += stride) {
     uint32_t r = row;
     if (r < rows_q) {
       const uint32_t h = r % heads, t = r / heads, s = t % seq, b = t / seq;
@@ -366,7 +413,7 @@ struct Kernel {
   static void launch(const Params& params, int64_t rows, DLDevice device) {
     using namespace host;
     CHECK_HOST(rows <= int64_t{UINT32_MAX}) << "qknorm_complex_rope indexes its rows with 32 bits";
-    const int64_t needed = div_ceil(rows, static_cast<int64_t>(kRowsPerBlock));
+    const int64_t needed = div_ceil(rows, static_cast<int64_t>(2 * kRowsPerBlock));
     const auto blocks = static_cast<uint32_t>(std::min<int64_t>(needed, kMaxBlocks));
     LaunchKernel(blocks, kThreads, device)(kernel<kFuseRealSin, kCopyV>, params);
   }

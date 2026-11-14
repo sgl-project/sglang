@@ -19,7 +19,7 @@ def _get_float4_e2m1fn_x2_dtype():
     # torch dtype object torch.float4_e2m1fn_x2 in op-plugin on recent torch_npu
     # builds (it raises, or with None gives "output y must be same shape as input
     # x"), even though torch.float4_e2m1fn_x2 exists. This is fp4-specific: fp8 /
-    # float8_e8m0fnu is accepted from torch either way. Verified on A5 /
+    # float8_e8m0fnu is accepted from torch either way. Verified on Ascend 950 /
     # torch_npu 2.10.0.post2.dev20260704 (see llm/probe_fp4_w4a8_chain.py: dst=296
     # passes the full quant->format_cast->matmul chain, dst=torch dtype fails).
     #
@@ -40,7 +40,7 @@ def _require_e8m0_dtype():
     """Resolve the e8m0 block-scale dtype, failing loudly if it is unavailable.
 
     The grouped matmuls validate their scale-dtype arguments against torch_npu's
-    own dtype enum (``torch_npu.float8_e8m0fnu``, 293 on A5) and reject the torch
+    own dtype enum (``torch_npu.float8_e8m0fnu``, 293 on Ascend 950) and reject the torch
     dtype object with "weight_scale_dtype only supports float8_e8m0fnu or None,
     but the actual value is Float8_e8m0fnu" — hence torch_npu first, torch only
     as a fallback. Dense ``npu_quant_matmul`` accepts either, which is why
@@ -65,7 +65,7 @@ def _require_e8m0_dtype():
             _E8M0_DTYPE = _get_float8_e8m0fnu_dtype()
         if _E8M0_DTYPE is None:
             raise RuntimeError(
-                "float8_e8m0fnu dtype not found — MXFP8 MoE requires Ascend A5 "
+                "float8_e8m0fnu dtype not found — MXFP8 MoE requires Ascend 950 "
                 "with a torch_npu build exposing float8_e8m0fnu (torch_npu >= 2.9)."
             )
     return _E8M0_DTYPE

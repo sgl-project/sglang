@@ -28,11 +28,8 @@ from sglang.srt.layers.moe.utils import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.runtime_context import get_lora, get_parallel
-from sglang.srt.utils.common import (
-    get_bool_env_var,
-    get_device,
-    is_hip,
-)
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.device import get_device, is_hip
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -51,7 +48,7 @@ try:
         nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
     )
 
-    from sglang.srt.layers.quantization.modelopt_quant import (
+    from sglang.srt.layers.quantization.fp4_utils import (
         fp4_quantize as fp4_quantize_flashinfer,
     )
 except ImportError:
@@ -276,8 +273,6 @@ class StandardDispatcher(BaseDispatcher):
                     if _MASK_DP_PAD_MOE and is_dp_max_padding():
                         mask_dp_pad_moe_topk_ids(topk_ids_local)
                     topk_output = topk_output._replace(topk_ids=topk_ids_local)
-                elif TopKOutputChecker.format_is_triton_kernels(topk_output):
-                    raise NotImplementedError()
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,

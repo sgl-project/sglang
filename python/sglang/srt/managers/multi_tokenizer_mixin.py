@@ -27,10 +27,11 @@ import pickle
 import signal
 import sys
 import threading
+import traceback
 import zlib
 from functools import lru_cache
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
 import psutil
@@ -38,7 +39,6 @@ import setproctitle
 import zmq
 import zmq.asyncio
 
-from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
@@ -66,10 +66,9 @@ from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     zmq_reader_owner,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.trace import process_tracing_init
-from sglang.srt.runtime_context import get_disagg, get_observability
+from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -77,7 +76,6 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
@@ -178,230 +176,6 @@ def _extract_pooled_hidden_states_by_index(output: BatchEmbeddingOutput, i: int)
     return [states[i]]
 
 
-def _handle_output_by_index(output, i):
-    """NOTE: A maintainable method is better here."""
-    if isinstance(output, BatchTokenIDOutput):
-        new_output = BatchTokenIDOutput(
-            rids=[output.rids[i]],
-            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_num_correct_drafts=_extract_field_by_index(
-                output, "spec_num_correct_drafts", i
-            ),
-            spec_correct_drafts_histogram=_extract_field_by_index(
-                output, "spec_correct_drafts_histogram", i
-            ),
-            spec_num_block_accept_tokens=_extract_field_by_index(
-                output, "spec_num_block_accept_tokens", i
-            ),
-            spec_num_cap_tokens=_extract_field_by_index(
-                output, "spec_num_cap_tokens", i
-            ),
-            spec_cap_lens_histogram=_extract_field_by_index(
-                output, "spec_cap_lens_histogram", i
-            ),
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            **_extract_output_ids_by_indices(output, [i]),
-            detokenize_headers=_extract_field_by_index(output, "detokenize_headers", i),
-            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
-            reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            request_stats=_extract_field_by_index(output, "request_stats", i),
-            input_token_logprobs_val=_extract_field_by_index(
-                output, "input_token_logprobs_val", i, check_length=False
-            ),
-            input_token_logprobs_idx=_extract_field_by_index(
-                output, "input_token_logprobs_idx", i, check_length=False
-            ),
-            output_token_logprobs_val=_extract_field_by_index(
-                output, "output_token_logprobs_val", i, check_length=False
-            ),
-            output_token_logprobs_idx=_extract_field_by_index(
-                output, "output_token_logprobs_idx", i, check_length=False
-            ),
-            input_top_logprobs_val=_extract_field_by_index(
-                output, "input_top_logprobs_val", i, check_length=False
-            ),
-            input_top_logprobs_idx=_extract_field_by_index(
-                output, "input_top_logprobs_idx", i, check_length=False
-            ),
-            input_top_logprobs_val_flat=_extract_field_by_index(
-                output, "input_top_logprobs_val_flat", i, check_length=False
-            ),
-            input_top_logprobs_idx_flat=_extract_field_by_index(
-                output, "input_top_logprobs_idx_flat", i, check_length=False
-            ),
-            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
-                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
-            ),
-            output_top_logprobs_val=_extract_field_by_index(
-                output, "output_top_logprobs_val", i, check_length=False
-            ),
-            output_top_logprobs_idx=_extract_field_by_index(
-                output, "output_top_logprobs_idx", i, check_length=False
-            ),
-            input_token_ids_logprobs_val=_extract_field_by_index(
-                output, "input_token_ids_logprobs_val", i, check_length=False
-            ),
-            input_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "input_token_ids_logprobs_idx", i, check_length=False
-            ),
-            output_token_ids_logprobs_val=_extract_field_by_index(
-                output, "output_token_ids_logprobs_val", i, check_length=False
-            ),
-            output_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "output_token_ids_logprobs_idx", i, check_length=False
-            ),
-            output_token_entropy_val=_extract_field_by_index(
-                output, "output_token_entropy_val", i, check_length=False
-            ),
-            output_token_sampling_mask=_extract_field_by_index(
-                output, "output_token_sampling_mask", i, check_length=False
-            ),
-            output_hidden_states=_extract_field_by_index(
-                output, "output_hidden_states", i, check_length=False
-            ),
-            routed_experts=_extract_field_by_index(
-                output, "routed_experts", i, check_length=False
-            ),
-            indexer_topk=_extract_field_by_index(
-                output, "indexer_topk", i, check_length=False
-            ),
-            weight_versions=_extract_field_by_index(output, "weight_versions", i),
-            prefill_weight_versions=_extract_field_by_index(
-                output, "prefill_weight_versions", i
-            ),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-            beam_search_output=_extract_field_by_index(
-                output, "beam_search_output", i, check_length=True
-            ),
-            token_steps=_extract_field_by_index(
-                output, "token_steps", i, check_length=False
-            ),
-            customized_info=_extract_field_by_index(
-                output, "customized_info", i, check_length=False
-            ),
-            dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
-        )
-    elif isinstance(output, BatchEmbeddingOutput):
-        new_output = BatchEmbeddingOutput(
-            rids=[output.rids[i]],
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            embeddings=_extract_field_by_index(output, "embeddings", i),
-            tensor_embeddings=_extract_field_by_index(
-                output, "tensor_embeddings", i, check_length=False
-            ),
-            request_stats=_extract_field_by_index(output, "request_stats", i),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-            pooled_hidden_states=_extract_pooled_hidden_states_by_index(output, i),
-        )
-    elif isinstance(output, BatchStrOutput):
-        new_output = BatchStrOutput(
-            rids=[output.rids[i]],
-            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_num_correct_drafts=_extract_field_by_index(
-                output, "spec_num_correct_drafts", i
-            ),
-            spec_correct_drafts_histogram=_extract_field_by_index(
-                output, "spec_correct_drafts_histogram", i
-            ),
-            spec_num_block_accept_tokens=_extract_field_by_index(
-                output, "spec_num_block_accept_tokens", i
-            ),
-            spec_num_cap_tokens=_extract_field_by_index(
-                output, "spec_num_cap_tokens", i
-            ),
-            spec_cap_lens_histogram=_extract_field_by_index(
-                output, "spec_cap_lens_histogram", i
-            ),
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            output_strs=_extract_field_by_index(output, "output_strs", i),
-            **_extract_output_ids_by_indices(output, [i]),
-            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
-            reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            request_stats=_extract_field_by_index(output, "request_stats", i),
-            input_token_logprobs_val=_extract_field_by_index(
-                output, "input_token_logprobs_val", i, check_length=False
-            ),
-            input_token_logprobs_idx=_extract_field_by_index(
-                output, "input_token_logprobs_idx", i, check_length=False
-            ),
-            output_token_logprobs_val=_extract_field_by_index(
-                output, "output_token_logprobs_val", i, check_length=False
-            ),
-            output_token_logprobs_idx=_extract_field_by_index(
-                output, "output_token_logprobs_idx", i, check_length=False
-            ),
-            input_top_logprobs_val=_extract_field_by_index(
-                output, "input_top_logprobs_val", i, check_length=False
-            ),
-            input_top_logprobs_idx=_extract_field_by_index(
-                output, "input_top_logprobs_idx", i, check_length=False
-            ),
-            input_top_logprobs_val_flat=_extract_field_by_index(
-                output, "input_top_logprobs_val_flat", i, check_length=False
-            ),
-            input_top_logprobs_idx_flat=_extract_field_by_index(
-                output, "input_top_logprobs_idx_flat", i, check_length=False
-            ),
-            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
-                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
-            ),
-            output_top_logprobs_val=_extract_field_by_index(
-                output, "output_top_logprobs_val", i, check_length=False
-            ),
-            output_top_logprobs_idx=_extract_field_by_index(
-                output, "output_top_logprobs_idx", i, check_length=False
-            ),
-            input_token_ids_logprobs_val=_extract_field_by_index(
-                output, "input_token_ids_logprobs_val", i, check_length=False
-            ),
-            input_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "input_token_ids_logprobs_idx", i, check_length=False
-            ),
-            output_token_ids_logprobs_val=_extract_field_by_index(
-                output, "output_token_ids_logprobs_val", i, check_length=False
-            ),
-            output_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "output_token_ids_logprobs_idx", i, check_length=False
-            ),
-            output_token_entropy_val=_extract_field_by_index(
-                output, "output_token_entropy_val", i, check_length=False
-            ),
-            output_token_sampling_mask=_extract_field_by_index(
-                output, "output_token_sampling_mask", i, check_length=False
-            ),
-            output_hidden_states=_extract_field_by_index(
-                output, "output_hidden_states", i, check_length=False
-            ),
-            routed_experts=_extract_field_by_index(
-                output, "routed_experts", i, check_length=False
-            ),
-            indexer_topk=_extract_field_by_index(
-                output, "indexer_topk", i, check_length=False
-            ),
-            customized_info=_extract_field_by_index(
-                output, "customized_info", i, check_length=False
-            ),
-            dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-            beam_search_output=_extract_field_by_index(
-                output, "beam_search_output", i, check_length=True
-            ),
-            weight_versions=_extract_field_by_index(output, "weight_versions", i),
-            prefill_weight_versions=_extract_field_by_index(
-                output, "prefill_weight_versions", i
-            ),
-            token_steps=_extract_field_by_index(
-                output, "token_steps", i, check_length=False
-            ),
-        )
-    else:
-        new_output = output
-    return new_output
-
-
 class _CannotSplitBatch(Exception):
     pass
 
@@ -471,6 +245,7 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
         "token_steps",
         "customized_info",
         "dp_ranks",
+        "tensor_embeddings",
     }
 )
 _NOT_SPLIT_FIELDS = frozenset(
@@ -481,8 +256,39 @@ _NOT_SPLIT_FIELDS = frozenset(
         "placeholder_tokens_val",
         "output_ids_flat",
         "output_ids_offsets",
+        "pooled_hidden_states",
     }
 )
+
+
+def _handle_output_by_index(output, i):
+    if not isinstance(
+        output, (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput)
+    ):
+        return output
+
+    split_fields = {
+        field.name: _extract_field_by_index(
+            output,
+            field.name,
+            i,
+            check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
+        )
+        for field in _cached_output_fields(type(output))
+        if field.name not in _NOT_SPLIT_FIELDS
+    }
+    if isinstance(output, BatchEmbeddingOutput):
+        split_fields["pooled_hidden_states"] = _extract_pooled_hidden_states_by_index(
+            output, i
+        )
+    else:
+        split_fields.update(_extract_output_ids_by_indices(output, [i]))
+    return type(output)(
+        rids=[output.rids[i]],
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+        **split_fields,
+    )
 
 
 def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
@@ -629,7 +435,7 @@ class MultiTokenizerRouter:
             print_exception_wrapper(self.handle_loop), self._loop
         )
 
-        # In multi-tokenizer mode the N TokenizerWorker processes cannot each
+        # In multi-tokenizer mode the N tokenizer worker processes cannot each
         # bind the zmq PULL socket used for load snapshots, so the single
         # MultiTokenizerRouter process owns it (zmq -> SHM) and the workers
         # read SHM only. Drain it event-driven via the socket's fd instead of
@@ -658,7 +464,7 @@ class MultiTokenizerRouter:
         """Drain zmq load snapshots into SHM whenever the PULL socket is readable.
 
         zmq exposes an edge-triggered fd; ``poll()`` drains it until empty, which
-        also re-arms the fd, so TokenizerWorkers reading SHM stay up to date
+        also re-arms the fd, so tokenizer workers reading SHM stay up to date
         without any timer.
         """
         assert self.load_snapshot_reader is not None
@@ -814,108 +620,12 @@ def run_multi_detokenizer_router_process(
         router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"MultiDetokenizerRouter hit an exception: {traceback}")
+        logger.error(
+            f"MultiDetokenizerRouter hit an exception: {traceback.format_exc()}"
+        )
         if router is not None:
             router.socket_mapping.clear_all_sockets()
         parent_process.send_signal(signal.SIGQUIT)
-
-
-class TokenizerWorker(TokenizerManager):
-    """Tokenizer Worker in multi-http-worker mode"""
-
-    def __init__(
-        self,
-        server_args: ServerArgs,
-        port_args: PortArgs,
-    ):
-        setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
-        import torch
-
-        torch.set_num_threads(1)
-        super().__init__(
-            server_args,
-            port_args,
-            start_pd_bootstrap_service=False,
-        )
-
-        self.worker_id = os.getpid()
-        self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
-
-        # For PD disaggregation
-        self.disaggregation_transfer_backend = TransferBackend(
-            get_disagg().disaggregation_transfer_backend
-        )
-
-        # Register this worker with the router for pause/continue broadcasting
-        reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
-        self._dispatch_to_scheduler(reg)
-
-        # Future for awaiting pause/continue broadcast confirmation
-        self._pause_continue_future: Optional[asyncio.Future] = None
-
-        # Register PauseContinueBroadcastReq in the result dispatcher so
-        # handle_loop routes it to _handle_pause_continue_broadcast
-        from sglang.utils import TypeBasedDispatcher
-
-        self._result_dispatcher += TypeBasedDispatcher(
-            [(PauseContinueBroadcastReq, self._handle_pause_continue_broadcast)]
-        )
-
-    async def pause_generation(self, obj: PauseGenerationReqInput):
-        loop = asyncio.get_event_loop()
-        self._pause_continue_future = loop.create_future()
-        # Send to router which will broadcast to all workers
-        # (router also handles forwarding to scheduler for non-abort modes)
-        self._dispatch_to_scheduler(obj)
-        await self._pause_continue_future
-
-        if obj.mode == "abort":
-            # Abort polling: only the originator checks its own lock state
-            while True:
-                self.abort_request(abort_all=True)
-                is_locked = await self.model_update_lock.is_locked()
-                if not is_locked:
-                    break
-                await asyncio.sleep(1.0)
-
-    async def continue_generation(self, obj: ContinueGenerationReqInput):
-        loop = asyncio.get_event_loop()
-        self._pause_continue_future = loop.create_future()
-        self._dispatch_to_scheduler(obj)
-        await self._pause_continue_future
-
-    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
-        """Called from handle_loop when a broadcast arrives from the router."""
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._apply_pause_continue_broadcast(obj))
-
-    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
-        """Apply pause/continue state under the condition lock."""
-        async with self.is_pause_cond:
-            if obj.is_pause:
-                self.is_pause = True
-            else:
-                self.is_pause = False
-                self.is_pause_cond.notify_all()
-
-        # Resolve the pending future if this worker initiated the pause/continue
-        if self._pause_continue_future and not self._pause_continue_future.done():
-            self._pause_continue_future.set_result(True)
-            self._pause_continue_future = None
-
-
-def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerWorker]:
-    worker_class = server_args.get_tokenizer_worker_class()
-    if not isinstance(worker_class, type) or not issubclass(
-        worker_class, TokenizerWorker
-    ):
-        raise TypeError(
-            "ServerArgs.get_tokenizer_worker_class() must return a TokenizerWorker "
-            f"subclass, got {worker_class!r}"
-        )
-
-    return worker_class
 
 
 async def print_exception_wrapper(func):
@@ -926,8 +636,7 @@ async def print_exception_wrapper(func):
     try:
         await func()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"MultiTokenizerRouter hit an exception: {traceback}")
+        logger.error(f"MultiTokenizerRouter hit an exception: {traceback.format_exc()}")
         if hasattr(func, "__self__") and isinstance(
             func.__self__, MultiTokenizerRouter
         ):

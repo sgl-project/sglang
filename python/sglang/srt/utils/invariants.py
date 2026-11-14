@@ -226,6 +226,31 @@ def _signal(ok: torch.Tensor, *, inv: Invariant, level: InvariantCheckLevel, msg
     _reporter.record(f"{inv.name}@rank{_get_rank()}", inv.bucket, (~ok).sum(), msg)
 
 
+def expect_host(
+    inv: Invariant,
+    ok: bool,
+    *,
+    msg: str = "",
+    level: Optional[InvariantCheckLevel] = None,
+) -> None:
+    """Check a host-side condition per the (bucket x level) matrix, as `expect`
+    does for a tensor: raise where the bucket crashes at the current level,
+    count and log otherwise, nothing at OFF. ``level`` defaults to
+    `resolve_level()`."""
+    if level is None:
+        level = resolve_level()
+    if ok or level < InvariantCheckLevel.WARN:
+        return
+    if _crashes(inv.bucket, level):
+        raise AssertionError(f"invariant-check FAILED [{inv.name}]: {msg}")
+    _reporter.record(
+        f"{inv.name}@rank{_get_rank()}",
+        inv.bucket,
+        torch.ones(1, dtype=torch.int64),
+        msg,
+    )
+
+
 def expect(
     inv: Invariant,
     value: Optional[torch.Tensor],

@@ -410,11 +410,11 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
         EvenMoE stage=None for every real forward.
         """
         from sglang.srt.eplb import moe_load_balancer_glue as glue
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
         )
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         for mode, stage in (
             (ForwardMode.EXTEND, "prefill"),

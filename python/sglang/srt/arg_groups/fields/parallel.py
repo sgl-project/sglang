@@ -243,7 +243,8 @@ class Parallel(msgspec.Struct):
     shared_experts_tp_size: A[
         Optional[int],
         "Shared-expert TP size for Kimi-K3 with an expert-parallel all-to-all "
-        "backend. Must divide attention TP size. Overrides "
+        "backend. Must divide attention TP size, or attention TP x CP size "
+        "with interleave prefill CP; never crosses attention DP replicas. Overrides "
         "--enable-shared-experts-attn-tp when set; 1 replicates the weights.",
     ] = None
     enable_dense_mlp_attn_tp: A[
@@ -261,6 +262,18 @@ class Parallel(msgspec.Struct):
         "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
         "NVLink/NVSwitch.",
     ] = False
+    layernorm_sp_min_tokens: A[
+        int,
+        "With --enable-layernorm-sp, run a pass sequence-parallel only above this "
+        "token count; smaller passes take the replicated path. 0 (the default) "
+        "runs every extend sequence-parallel, as today. The SP collectives cost "
+        "the same per layer whatever the pass size, so small extends -- short "
+        "follow-up turns, small chunks, prefix-cache hits -- can be slower "
+        "sequence-parallel than replicated while large chunks are faster. The "
+        "crossover is deployment-specific: measure extend passes of a few sizes "
+        "on both paths. Must be a captured prefill CUDA graph bucket, or at or "
+        "above the largest one.",
+    ] = 0
     enable_megamoe_for_layernorm_sp: A[
         Optional[bool],
         Arg(

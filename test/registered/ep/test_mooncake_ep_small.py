@@ -21,7 +21,6 @@ register_cuda_ci(
     est_time=189,
     stage="base-c",
     runner_config="4-gpu-h100",
-    disabled="Temporarily disabled until the next Mooncake release includes the PyTorch 2.13 collective forwarding fix.",
 )
 
 ib_devices = get_rdma_devices_args()
@@ -38,6 +37,9 @@ class TestTP(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # Log each Mooncake EP JIT compile and cache event, to debug the
+            # intermittent nvcc exit_code=127 (kvcache-ai/Mooncake#5316).
+            env={"MOONCAKE_EP_JIT_LOG": "1"},
             other_args=[
                 "--trust-remote-code",
                 "--tp",

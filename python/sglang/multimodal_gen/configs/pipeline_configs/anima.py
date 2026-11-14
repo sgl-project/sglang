@@ -7,10 +7,8 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.anima import AnimaDiTConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,
-    ModelTaskType,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def anima_text_output(outputs, inputs):

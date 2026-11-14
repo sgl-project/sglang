@@ -10,9 +10,9 @@ from sglang.multimodal_gen.configs.models.vaes.hunyuan_image3 import (
     HunyuanImage3VAEConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
     SpatialImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 

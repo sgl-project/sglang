@@ -6,7 +6,7 @@ import unittest
 
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.test.single_test_file.cli_generate_common import (
     CLIBase,
     check_image_size,

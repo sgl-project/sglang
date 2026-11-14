@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.qknorm import torch_impl_qknorm
 
 register_cuda_ci(
-    est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 alt_stream = torch.cuda.Stream()

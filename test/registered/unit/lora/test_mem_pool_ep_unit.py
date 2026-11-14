@@ -24,6 +24,9 @@ import unittest.mock as mock
 
 import torch
 
+# Loaded before the patch.dict stub below, which unloads every module first
+# imported inside it while their torch op registrations stay.
+import sglang.srt.lora.utils  # noqa: F401
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 
 

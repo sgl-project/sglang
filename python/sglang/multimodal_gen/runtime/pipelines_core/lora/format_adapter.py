@@ -325,7 +325,6 @@ def _convert_via_diffusers_candidates(
     state_dict: Mapping[str, torch.Tensor],
     candidate_names: tuple[str, ...],
     log: logging.Logger,
-    unavailable_warning: str,
     no_converter_warning: str,
     success_info: str,
     all_failed_warning: str,
@@ -371,9 +370,6 @@ def _convert_xlabs_ai_via_diffusers(
             "convert_xlabs_flux_lora_to_diffusers",
         ),
         log=log,
-        unavailable_warning=(
-            "[LoRAFormatAdapter] XLabs FLUX detected but diffusers is unavailable."
-        ),
         no_converter_warning=(
             "[LoRAFormatAdapter] No XLabs FLUX converter found in diffusers."
         ),
@@ -397,9 +393,6 @@ def _convert_kohya_flux_via_diffusers(
             "convert_kohya_flux_lora_to_diffusers",
         ),
         log=log,
-        unavailable_warning=(
-            "[LoRAFormatAdapter] Kohya FLUX detected but diffusers is unavailable."
-        ),
         no_converter_warning="[LoRAFormatAdapter] No Kohya FLUX converter found.",
         success_info="[LoRAFormatAdapter] Converted Kohya FLUX LoRA using {name}",
         all_failed_warning=(

@@ -15,7 +15,7 @@ import torch
 
 import sglang.srt.arg_groups.mega_moe_hook as hook
 import sglang.srt.layers.moe.mega_moe_flydsl as mega
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -311,7 +311,6 @@ def _cfg(**overrides):
 
 @pytest.fixture
 def startup(monkeypatch):
-    monkeypatch.setenv("SGLANG_AMD_USE_FLYDSL_MEGA_MOE", "1")
     monkeypatch.setenv("SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR", str(LARGE))
     monkeypatch.setenv("SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR", str(DECODE))
     monkeypatch.setattr(hook, "get_platform", lambda: SimpleNamespace(is_hip=True))
@@ -369,19 +368,20 @@ def test_startup_rejects_attention_context_parallelism(startup):
 
 
 @pytest.mark.parametrize(
-    ("env", "overrides"),
+    ("env", "overrides", "is_hip"),
     [
-        ({}, dict(disaggregation_mode="prefill")),
-        ({"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR": "0"}, {}),
-        ({"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR": str(LARGE)}, {}),
-        ({"SGLANG_AMD_USE_FLYDSL_MEGA_MOE": "0"}, {}),
+        ({}, dict(disaggregation_mode="prefill"), True),
+        ({"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR": "0"}, {}, True),
+        ({"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR": str(LARGE)}, {}, True),
+        ({}, {}, False),
     ],
 )
 def test_startup_skips_runs_without_a_decode_capacity(
-    startup, monkeypatch, env, overrides
+    startup, monkeypatch, env, overrides, is_hip
 ):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setattr(hook, "get_platform", lambda: SimpleNamespace(is_hip=is_hip))
     startup(_cfg(max_running_requests=None, **overrides))
 
 

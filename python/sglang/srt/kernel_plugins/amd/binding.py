@@ -29,12 +29,12 @@ from sglang.kernels.plugin_kernels.amd.spec import (
     spec_registered,
 )
 from sglang.kernels.plugin_kernels.nvidia.spec import FLAG as NVIDIA_FLAG
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
     resolving_view,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.model_executor.forward_context import get_attn_backend

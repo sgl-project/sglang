@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.kernels.ops.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.plan import (
     ActFamily,
-    ActivationFn,
     ActSpec,
     AFamily,
     ASpec,
@@ -29,6 +29,7 @@ from sglang.srt.lora.moe.plan import (
     _tile_table,
 )
 from sglang.srt.lora.utils import Phase
+from sglang.test.kernels.moe_lora import cutedsl_ready
 
 _GB300 = "sm100"
 
@@ -69,19 +70,8 @@ def _make_plan(
     )
 
 
-def _cutedsl_ready() -> bool:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
-        return False
-    try:
-        import cuda.bindings.driver  # noqa: F401
-        import cutlass  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
 cutedsl_cuda_only = pytest.mark.skipif(
-    not _cutedsl_ready(),
+    not cutedsl_ready(),
     reason="the runner-level oracle runs the CuTeDSL providers",
 )
 
@@ -154,10 +144,6 @@ def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
     else:
         raise AssertionError(traffic)
     return pattern.repeat(-(-num_tokens // pattern.numel()))[:num_tokens].contiguous()
-
-
-def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
-    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
 
 
 def _into_base_pair():

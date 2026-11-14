@@ -21,11 +21,13 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     resolve_diffusers_pipeline_offload,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -541,18 +543,12 @@ class DiffusersPipeline(ComposedPipelineBase):
     def _apply_attention_backend(
         self, pipe: DiffusionPipeline, server_args: ServerArgs
     ) -> None:
-        """Apply attention backend setting from pipeline config or server_args.
+        """Apply the attention backend setting from server_args.
 
         See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
         Available backends: flash, _flash_3_hub, sage, xformers, native, etc.
         """
         backend = server_args.attention_backend
-
-        if backend is None:
-            backend = getattr(
-                server_args.pipeline_config, "diffusers_attention_backend", None
-            )
-
         if backend is None:
             return
 

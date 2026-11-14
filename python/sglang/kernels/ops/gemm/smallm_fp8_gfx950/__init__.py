@@ -1,26 +1,22 @@
 """gfx950 small-M W8A8 FP8 GEMM (per-token x per-channel, bf16 out) on aiter's (16, 16)-preshuffled weights.
 
 `smallm_fp8_gemm.hip` is built with hipcc at first use and launched like smallm_moe_gfx950. On by default for the
-Qwen3.5-397B AttnFP8 TP4 and TP2 projection shapes below, and the MiniMax-M3.1 shared expert's gate_up that
-m31_router runs in its fused launch; SGLANG_ROCM_SMALLM_FP8_PROJ=0 turns it off.
+Qwen3.5-397B AttnFP8 TP4 and TP2 projection shapes below.
 """
 
 import ctypes
 import logging
 import os
 import subprocess
-import tempfile
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.hipcc import (
     HipKernel,
-    check_hip,
-    hip_lib,
+    build_gfx950_module,
     hip_version,
-    hipcc_path,
 )
-from sglang.srt.environ import envs
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_fp8_gemm.hip")
 # (N, K) -> ((max M, n-tiles per block, k steps per wave, waves, LDS-staged activations), ...), first match wins.
@@ -34,8 +30,6 @@ SHAPES = {
     (10304, 4096): ((8, 1, 16, 4, 1), (16, 4, 8, 8, 1), (32, 4, 4, 16, 0)),
     (8704, 4096): ((4, 1, 16, 4, 1), (16, 4, 8, 8, 1)),
     (4096, 4096): ((8, 1, 8, 8, 0), (16, 1, 8, 8, 1), (40, 1, 4, 16, 0)),
-    # MiniMax-M3.1 TP4 shared expert gate_up, which m31_router fuses into its launch
-    (1536, 6144): ((8, 1, 12, 8, 1), (16, 1, 8, 12, 1)),
 }
 _mod = None
 _kernels = {}
@@ -51,29 +45,12 @@ class Args(ctypes.Structure):
 
 def smallm_fp8_gemm_enabled() -> bool:
     global _mod
-    if not envs.SGLANG_ROCM_SMALLM_FP8_PROJ.get():
-        return False
     if _mod is None:
         _mod = False
-        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-        if arch == "gfx950" and hip_version() >= (7, 2, 0):
-            co = os.path.join(tempfile.mkdtemp(prefix="sglang_smallm_fp8_"), "k.co")
-            cmd = [
-                hipcc_path(),
-                "--genco",
-                "--offload-arch=gfx950",
-                "-O3",
-                "-o",
-                co,
-                _SRC,
-            ]
+        hip = current_arch().hip
+        if hip is not None and hip.gcn_arch == "gfx950" and hip_version() >= (7, 2, 0):
             try:
-                subprocess.run(cmd, check=True, capture_output=True)
-                mod = ctypes.c_void_p()
-                check_hip(
-                    hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load"
-                )
-                _mod = mod
+                _mod = build_gfx950_module(_SRC, "sglang_smallm_fp8_")
             except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
                 logger.warning("smallm_fp8_gemm disabled: %s", e)
     return _mod is not False

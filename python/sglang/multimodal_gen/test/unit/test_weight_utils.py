@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for multimodal weight-loading utilities."""
 
+import json
 import os
 import shutil
 import tempfile
@@ -24,6 +25,9 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     _disable_runai_streamer_rank_discovery_collective,
     get_lock,
     safetensors_weights_iterator,
+)
+from sglang.multimodal_gen.runtime.post_training.tensor_update_checker import (
+    compute_tensor_sha256,
 )
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
@@ -291,6 +295,26 @@ def _write_pipeline(root: Path) -> None:
 class TestCheckpointComponentSizes(CustomTestCase):
     SIZES = {"transformer": (17, 58), "text_encoder": (4, 16)}
 
+    def test_batchnorm_step_counter_does_not_unsize_the_checkpoint(self):
+        # FLUX.2's VAE stores a BatchNorm, whose num_batches_tracked is int64
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_pipeline(root)
+            (root / "vae").mkdir()
+            bn = torch.nn.BatchNorm2d(8)
+            safetensors_save_file(
+                {f"bn.{k}": v for k, v in bn.state_dict().items()},
+                root / "vae" / "diffusion_pytorch_model.safetensors",
+            )
+            index = json.loads((root / "model_index.json").read_text())
+            index["vae"] = ["diffusers", "V"]
+            (root / "model_index.json").write_text(json.dumps(index))
+
+            self.assertEqual(
+                checkpoint_component_sizes(tmpdir, subfolder=None, revision=None),
+                {**self.SIZES, "vae": (32, 128)},
+            )
+
     def test_sizes_every_weighted_component(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             _write_pipeline(Path(tmpdir) / "sub")
@@ -484,6 +508,16 @@ class TestCheckpointReadFailure(unittest.TestCase):
                             )
                         )
                         torch.testing.assert_close(loaded["weight"], torch.ones(2))
+
+
+class TestPostTrainingTensorChecksum(unittest.TestCase):
+    def test_scalar_bfloat16_tensor_has_sha256_checksum(self):
+        scalar = torch.tensor(1.0, dtype=torch.bfloat16)
+
+        digest = compute_tensor_sha256(scalar)
+
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, compute_tensor_sha256(scalar))
 
 
 if __name__ == "__main__":

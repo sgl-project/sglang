@@ -22,18 +22,18 @@ the routed values to BF16, before the collective.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.communication.comm_registry import CommRegistry
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -55,25 +55,18 @@ _TWO_SHOT_GEOMETRY = {
     True: ((208, 1, 4), (232, 1, 3), (None, 2, 3)),
 }
 
-_COMM_MAP: dict[int, Communicator] = {}
+_COMMS = CommRegistry("all_reduce_fusion")
 
 
-def register_comm(comm: Communicator) -> None:
-    """Register the CustomAllReduceV2 communicator whose push plane the fused
-    kernel stages through. ``world_size`` is the whole key, so at most one
-    communicator per size may be registered in a process.
+def register_comm(provider: Callable[[], Communicator], *, world_size: int) -> None:
+    """Register the provider of the communicator these ops launch over; it runs on
+    first launch (see ``CommRegistry``). The fused kernels stage through its push plane.
     """
-    prev = _COMM_MAP.get(comm.world_size)
-    assert prev is None or prev is comm, (
-        f"a different communicator is already registered for world_size="
-        f"{comm.world_size}; these ops key only on world_size, so two groups of "
-        f"the same size cannot coexist in one process"
-    )
-    _COMM_MAP[comm.world_size] = comm
+    _COMMS.register(provider, world_size=world_size)
 
 
 def get_registered_comm(world_size: int) -> Optional[Communicator]:
-    return _COMM_MAP.get(world_size)
+    return _COMMS.get_optional(world_size)
 
 
 # Geometry
@@ -113,7 +106,7 @@ def default_cluster_size(hidden_dim: int) -> int:
 
 def fits_push_slot(max_push_size: int, num_tokens: int, hidden_dim: int) -> bool:
     """Whether a ``[num_tokens, hidden_dim]`` bf16 row view fits one push slot
-    (``CustomAllReduceV2.max_push_size``)."""
+    (``WorkspaceCapacity.push_slot_bytes``)."""
     return 0 < num_tokens * hidden_dim * 2 <= max_push_size
 
 
@@ -122,7 +115,7 @@ def fits_push_slot(max_push_size: int, num_tokens: int, hidden_dim: int) -> bool
 
 
 def require_cluster_launch_arch() -> None:
-    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+    if not current_arch().is_sm_at_least(9):
         raise RuntimeError(
             "fused all-reduce cluster kernels require CUDA SM90 or newer"
         )
@@ -170,11 +163,7 @@ def _moe_finalize_all_reduce_op(
     norm_eps: float,
     prefetch_metadata: bool,
 ) -> None:
-    comm = _COMM_MAP.get(world_size)
-    assert comm is not None, (
-        f"no communicator registered for world_size={world_size}; call "
-        "all_reduce_fusion.register_comm(comm.obj) first"
-    )
+    comm = _COMMS.get(world_size)
     _jit_module(world_size, hidden_dim, top_k, cluster_size, expert_weights.dtype).run(
         comm,
         out,
@@ -269,7 +258,7 @@ def _moe_finalize_all_reduce_residual_norm_op(
     _jit_module(
         world_size, hidden_dim, top_k, cluster_size, expert_weights.dtype
     ).run_residual_norm(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         out,
         gemm2_out,
         expanded_idx_to_permuted_idx,
@@ -301,7 +290,7 @@ def _all_reduce_residual_norm_op(
     vecs_per_thread: int,
 ) -> None:
     _jit_module(world_size, hidden_dim, 0, cluster_size, torch.bfloat16).run_plain(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         out,
         input,
         norm_weight,

@@ -9,6 +9,7 @@ import msgspec
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.utils import optional_positive_finite_float
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE,
     MINIMAX_H3_REFERENCE_RESIZE_MODES,
 )
 
@@ -54,7 +55,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
         default=None,
         metadata={"batch_sig_exclude": True},
     )
-    reference_resize_mode: str = field(default="diffusers")
+    reference_resize_mode: str = MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -97,7 +98,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
     def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any]:
         """Use the same independent-seed grouped path in serve and generate."""
 
-        from sglang.multimodal_gen.runtime.entrypoints.utils import (
+        from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
             expand_request_outputs,
         )
 
@@ -393,6 +394,8 @@ class FastH3OmniSamplingParams(MiniMaxH3SamplingParams):
     num_inference_steps: int = 8
     task: str | None = "ref2va"
     quality: str = "lossless"
+    # the native H3 resize change is not validated for this checkpoint
+    reference_resize_mode: str = "diffusers"
     # Trained with target-only flow: references stay clean.
     imgvid_cond_noise_aug_for_inference: float | None = 1.0
     audio_cond_noise_aug_for_inference: float | None = 1.0

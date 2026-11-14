@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mem_cache_utils import routed
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @pytest.mark.parametrize("requests", [1, 3, 8, 128])
@@ -123,7 +123,7 @@ def test_qsa_pool_routes_to_fused_prepare(monkeypatch, width):
     )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     storage = MHATokenToKVPool.__new__(MHATokenToKVPool)
     storage.quant_method = UnquantizedKVCacheMethod()
@@ -451,7 +451,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
     )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     storage = MHATokenToKVPool.__new__(MHATokenToKVPool)
     storage.dtype = torch.bfloat16

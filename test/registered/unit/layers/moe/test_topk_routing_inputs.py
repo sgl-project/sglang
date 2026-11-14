@@ -34,13 +34,14 @@ from sglang.srt.layers.moe.utils import (
     initialize_moe_config,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     get_context,
@@ -399,12 +400,6 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.assertEqual(capture.ids.tolist(), [[0], [1], [2], [3]])
 
     def test_in_kernel_formats_do_not_silently_ignore_expert_placement(self):
-        router = self._router(output_format=TopKOutputFormat.TRITON_KERNEL)
-        with self.assertRaisesRegex(
-            NotImplementedError, "placement remapping requires"
-        ):
-            router.forward_cuda(self.hidden, self.logits)
-
         router = self._router(output_format=TopKOutputFormat.BYPASSED)
         output = router.forward_cuda(self.hidden, self.logits)
         with self.assertRaisesRegex(
@@ -862,19 +857,10 @@ class TestTopKRoutingInputs(CustomTestCase):
             ep_num_redundant_experts=0,
             ep_dispatch_algorithm="dynamic",
         ):
-            for output_format in (
-                TopKOutputFormat.BYPASSED,
-                TopKOutputFormat.TRITON_KERNEL,
-            ):
-                with self.subTest(output_format=output_format):
-                    router = self._router(output_format=output_format)
-                    with patch.object(
-                        topk_module, "routing", return_value=(None, None, None, None, 2)
-                    ):
-                        output = router.forward_cuda(self.hidden, self.logits)
-                    self.assertEqual(output.format, output_format)
-                    if output_format == TopKOutputFormat.BYPASSED:
-                        self.assertIs(output.router_logits, self.logits)
+            router = self._router(output_format=TopKOutputFormat.BYPASSED)
+            output = router.forward_cuda(self.hidden, self.logits)
+            self.assertEqual(output.format, TopKOutputFormat.BYPASSED)
+            self.assertIs(output.router_logits, self.logits)
             for algorithm in ("fake",):
                 with (
                     self.subTest(algorithm=algorithm),

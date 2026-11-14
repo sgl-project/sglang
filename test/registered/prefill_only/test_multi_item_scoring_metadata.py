@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

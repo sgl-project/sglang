@@ -18,10 +18,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.quantization.aiter_fp8_quant_triton import (
-    swiglu_oai_fp8_outputs,
-    swiglu_oai_fp8_rows,
-)
 from sglang.kernels.ops.quantization.bf16x3_split import split_fp32_to_bf16x3
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
@@ -181,79 +177,6 @@ def _router_gemv_kernel(
 
 
 @triton.jit
-def _router_gemv_swiglu_kernel(
-    x_ptr,
-    w_ptr,
-    partials_ptr,
-    M,
-    K,
-    N,
-    stride_xm,
-    stride_wn,
-    num_n_blocks,
-    num_m_tiles,
-    gu_ptr,
-    q_ptr,
-    scale_ptr,
-    gu_n,
-    stride_gu,
-    BLOCK_M: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    ALPHA: tl.constexpr,
-    LIMIT: tl.constexpr,
-    GROUP: tl.constexpr,
-    TRANSPOSE_SCALE: tl.constexpr,
-    SW_BLOCK_M: tl.constexpr,
-    SW_BLOCK_N: tl.constexpr,
-):
-    """router_gemv_partials' programs (in their grid order), then swiglu_oai_fp8's."""
-    pid = tl.program_id(0)
-    num_gemv = num_n_blocks * num_m_tiles * SPLIT_K
-    if pid < num_gemv:
-        # Without the fixup, out_ptr, counter_ptr and stride_om are never read.
-        _router_gemv_tile(
-            x_ptr,
-            w_ptr,
-            partials_ptr,
-            partials_ptr,
-            partials_ptr,
-            M,
-            K,
-            N,
-            stride_xm,
-            stride_wn,
-            0,
-            pid % num_n_blocks,
-            pid // num_n_blocks % num_m_tiles,
-            pid // (num_n_blocks * num_m_tiles),
-            num_m_tiles,
-            BLOCK_M,
-            BLOCK_K,
-            BLOCK_N,
-            SPLIT_K,
-            False,
-        )
-    else:
-        swiglu_oai_fp8_rows(
-            gu_ptr,
-            q_ptr,
-            scale_ptr,
-            M,
-            gu_n,
-            stride_gu,
-            pid - num_gemv,
-            ALPHA,
-            LIMIT,
-            GROUP,
-            TRANSPOSE_SCALE,
-            SW_BLOCK_M,
-            SW_BLOCK_N,
-        )
-
-
-@triton.jit
 def _router_gemv_reduce_kernel(
     partials_ptr,  # [SPLIT_K, >= M, N] fp32, row tiles contiguous per split
     out_ptr,
@@ -271,7 +194,7 @@ def _router_gemv_reduce_kernel(
 
 
 _scratch: Dict[
-    Tuple[torch.device, int, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
+    Tuple[torch.device, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
 ] = {}
 
 
@@ -279,15 +202,7 @@ def _get_scratch(
     device: torch.device, n: int, w_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Sized for the weight dtype's own tiles, so the CUDA FP32 path keeps a small buffer.
-    # One per stream: launches on two streams could interleave on a shared ticket
-    # counter, and a caller's partials must survive another stream's router call. A
-    # capture that skipped warm-up on its own stream takes another stream's.
-    stream = torch.cuda.current_stream(device).cuda_stream
-    key = (device, stream, n, w_dtype)
-    if key not in _scratch and torch.cuda.is_current_stream_capturing():
-        for (dev, _, n_, dtype), bufs in _scratch.items():
-            if (dev, n_, dtype) == (device, n, w_dtype):
-                return bufs
+    key = (device, n, w_dtype)
     if key not in _scratch:
         configs = _configs(w_dtype)
         max_split_k = max(cfg[3] for _, cfg in configs)
@@ -349,17 +264,9 @@ def _launch(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, fixup: bool) ->
     return m_tiles * block_m
 
 
-def router_gemv_partials_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
-    """router_gemv_supported() at the row counts router_gemv_partials() takes."""
-    return x.shape[0] > _FIXUP_MAX_M and router_gemv_supported(x, w)
-
-
-def router_gemv_partials(x: torch.Tensor, w: torch.Tensor) -> Optional[torch.Tensor]:
-    """The [SPLIT_K, M, N] fp32 split-K partials router_gemv sums over dim 0 in order.
-
-    None up to _FIXUP_MAX_M rows; valid until the next router_gemv call on the stream.
-    Caller guards with router_gemv_supported().
-    """
+def _partials(x: torch.Tensor, w: torch.Tensor) -> Optional[torch.Tensor]:
+    """The [SPLIT_K, M, N] fp32 split-K partials, summed in order by the reduce launch;
+    None up to _FIXUP_MAX_M rows, where the kernel's fixup reduces them in place."""
     m = x.shape[0]
     if m <= _FIXUP_MAX_M:
         return None
@@ -370,70 +277,11 @@ def router_gemv_partials(x: torch.Tensor, w: torch.Tensor) -> Optional[torch.Ten
     return partials[: split_k * rows * n].view(split_k, rows, n)[:, :m]
 
 
-def router_gemv_partials_swiglu(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    gate_up: torch.Tensor,
-    alpha: float,
-    limit: float,
-    group_size: Optional[int] = None,
-    transpose_scale: bool = False,
-) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """(router_gemv_partials(x, w), swiglu_oai_fp8(gate_up, ...)) from one launch.
-
-    Bitwise equal to the two calls; both are latency-bound and come from the same MoE layer
-    input (router and shared expert). Caller guards with router_gemv_partials_supported().
-    """
-    m, k = x.shape
-    n = w.shape[0]
-    assert _FIXUP_MAX_M < m and gate_up.shape[0] == m
-    block_m, block_n, block_k, split_k, num_warps = _config(m, w.dtype)
-    q, scale, sw_block_m, sw_block_n = swiglu_oai_fp8_outputs(
-        gate_up, group_size, transpose_scale
-    )
-    # Both kernels launch with 4 warps on their own; sharing that count keeps their layouts.
-    assert num_warps == 4
-    partials, _ = _get_scratch(x.device, n, w.dtype)
-    m_tiles = triton.cdiv(m, block_m)
-    num_gemv = (n // block_n) * m_tiles * split_k
-    _router_gemv_swiglu_kernel[(num_gemv + triton.cdiv(m, sw_block_m),)](
-        x,
-        w,
-        partials,
-        m,
-        k,
-        n,
-        x.stride(0),
-        w.stride(0),
-        n // block_n,
-        m_tiles,
-        gate_up,
-        q,
-        scale,
-        q.shape[1],
-        gate_up.stride(0),
-        BLOCK_M=block_m,
-        BLOCK_K=block_k,
-        BLOCK_N=block_n,
-        SPLIT_K=split_k,
-        ALPHA=alpha,
-        LIMIT=limit,
-        GROUP=group_size or 0,
-        TRANSPOSE_SCALE=transpose_scale,
-        SW_BLOCK_M=sw_block_m,
-        SW_BLOCK_N=sw_block_n,
-        num_warps=num_warps,
-    )
-    rows = m_tiles * block_m
-    parts = partials[: split_k * rows * n].view(split_k, rows, n)[:, :m]
-    return parts, (q, scale.t() if group_size and transpose_scale else scale)
-
-
 def router_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Router logits in fp32; caller guards with router_gemv_supported()."""
     m, n = x.shape[0], w.shape[0]
     out = torch.empty(m, n, device=x.device, dtype=torch.float32)
-    partials = router_gemv_partials(x, w)
+    partials = _partials(x, w)
     if partials is None:
         _launch(x, w, out, fixup=True)
         return out

@@ -14,6 +14,7 @@ import msgspec
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.lora.moe.cutedsl.kernel_sm100_bf16 import (
     GroupedGemmKernelSm100Bf16,
 )
@@ -50,8 +51,9 @@ def _grouped_gemm_bf16_swap_ab(
 
 
 def _bf16_kernel_class_for(device: torch.device):
-    major, _minor = torch.cuda.get_device_capability(device)
-    if major >= 10:
+    cuda_arch = current_arch().cuda
+    major = cuda_arch.major
+    if major == 10:
         return GroupedGemmKernelSm100Bf16
     if major == 9:
         from sglang.kernels.ops.lora.moe.cutedsl.kernel_sm90_bf16 import (
@@ -60,7 +62,7 @@ def _bf16_kernel_class_for(device: torch.device):
 
         return GroupedGemmKernelSm90Bf16
     raise NotImplementedError(
-        f"the BF16 grouped GEMM needs SM90+; device is sm{major}x"
+        f"the BF16 grouped GEMM needs SM90 or SM100; device is sm{major}x"
     )
 
 
@@ -105,8 +107,9 @@ def _grouped_gemm_fp8_swap_ab(
 
 
 def _fp8_kernel_class_for(device: torch.device):
-    major, _minor = torch.cuda.get_device_capability(device)
-    if major >= 10:
+    cuda_arch = current_arch().cuda
+    major = cuda_arch.major
+    if major == 10:
         from sglang.kernels.ops.lora.moe.cutedsl.kernel_sm100_fp8 import (
             GroupedGemmKernelSm100Fp8,
         )
@@ -118,7 +121,9 @@ def _fp8_kernel_class_for(device: torch.device):
         )
 
         return GroupedGemmKernelSm90Fp8
-    raise NotImplementedError(f"the FP8 grouped GEMM needs SM90+; device is sm{major}x")
+    raise NotImplementedError(
+        f"the FP8 grouped GEMM needs SM90 or SM100; device is sm{major}x"
+    )
 
 
 class GroupedGemmConfig(msgspec.Struct, frozen=True, kw_only=True):

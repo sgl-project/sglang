@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.layout.token_major import (
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import get_device
-from sglang.srt.utils.common import get_device_module
+from sglang.srt.utils.device import get_device_module
 from sglang.test.test_utils import CustomTestCase
 
 # Backends the multi-type scatter is verified against; extend as others gain Triton.

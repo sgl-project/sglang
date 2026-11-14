@@ -16,6 +16,7 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
     def test_non_arch35_dsa_pool_uses_only_active_indexer_layers(self):
         """Shared layers must not consume indexer slots on non-arch35 NPU."""
         configurator = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        configurator.modelslim_cache_layout = None
         configurator.device = "cpu"
         configurator.is_draft_worker = False
         configurator.kv_cache_dtype = torch.bfloat16

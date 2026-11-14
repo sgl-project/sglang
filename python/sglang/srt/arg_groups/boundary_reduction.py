@@ -13,6 +13,7 @@ _RSV_ARCHITECTURES = {
 }
 _AR_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
     "KimiK3LinearForCausalLM",
     "Qwen3ForCausalLM",
     "Qwen3ForSequenceClassification",
@@ -73,7 +74,7 @@ def resolve_boundary_reduction(view):
             and draft_path is not None
             and draft_path != view.model_path
         ):
-            from sglang.srt.utils.hf_transformers_utils import get_config
+            from sglang.srt.hf_transformers import get_config
 
             kwargs = {}
             if view.decrypted_draft_config_file:

@@ -23,10 +23,13 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _splitk_bufs,
     triton_sparse_mla_decode_splitk,
 )
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
+# backend-specific: the topk_length prefill path is gfx950-only.
+register_amd_ci(est_time=35, suite="stage-b-test-1-gpu-small-amd-mi35x")
 pytestmark = pytest.mark.skipif(not is_hip(), reason="ROCm only")
 
 _IS_GFX950 = is_hip() and _is_gfx950_sparse_mla_fp8(
@@ -243,6 +246,70 @@ def test_dcp_owned_count_decode_merges_to_full_kv(fp8, heads, kv_splits):
     torch.testing.assert_close(
         merged_lse[non_empty], expected_lse[non_empty], rtol=0, atol=atol
     )
+
+
+def _scaled_fp8_ds_mla_kv(pool, seed):
+    """[pool, 1, 656] fp8_ds_mla rows from the cache writer Kimi-K3.1 uses, and the
+    fp32 keys they hold (fp8 NoPE x per-128 fp32 scale, bf16 RoPE)."""
+    torch.manual_seed(seed)
+    k = (torch.randn(pool, 1, 576, device="cuda") * 2).bfloat16()
+    kv = quantize_k_cache(k.unsqueeze(1), scale_ue8m0=True).view(pool, 1, -1)
+    raw = kv.view(torch.uint8)[:, 0]
+    nope = raw[:, :512].view(torch.float8_e4m3fn).float()
+    scales = raw[:, 512:528].contiguous().view(torch.float32)
+    rope = raw[:, 528:].contiguous().view(torch.bfloat16).float()
+    keys = torch.cat([nope * scales.repeat_interleave(128, -1), rope], -1)
+    return kv.view(torch.uint8), keys
+
+
+def _scaled_kv_reference(q_nope, q_rope, keys, idx, sm_scale):
+    q = torch.cat([q_nope.float(), q_rope.float()], -1)
+    rows = keys[idx.clamp(min=0).long()]
+    s = torch.einsum("thd,tkd->thk", q, rows) * sm_scale
+    s = s.masked_fill((idx < 0)[:, None, :], float("-inf"))
+    return torch.einsum("thk,tkd->thd", torch.softmax(s, -1), rows[..., :512])
+
+
+def _scaled_kv_case(seq, heads, topk, pool, seed):
+    kv, keys = _scaled_fp8_ds_mla_kv(pool, seed)
+    q_nope = torch.randn(seq, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    q_rope = torch.randn(seq, heads, 64, device="cuda", dtype=torch.bfloat16) * 0.1
+    idx = torch.randint(0, pool, (seq, topk), device="cuda", dtype=torch.int32)
+    idx[: max(1, seq // 4), -300:] = -1
+    return kv, keys, q_nope, q_rope, idx
+
+
+def _rel_err(out, ref):
+    return ((out.float() - ref).norm() / ref.norm()).item()
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.uint8, torch.float8_e4m3fn])
+@pytest.mark.parametrize("seq", [6, 1024])  # split-K, and single-pass past the CUs
+def test_scaled_kv_prefill_matches_reference(seq, kv_dtype):
+    """Kimi-K3.1's fp8_ds_mla rows (TP8: 12 heads) are dequantized before BF16 dots."""
+    kv, keys, q_nope, q_rope, idx = _scaled_kv_case(seq, 12, 2048, 8192, seed=seq)
+    sm_scale = 576**-0.5
+
+    out = triton_sparse_mla_fwd(
+        q_nope, q_rope, kv.view(kv_dtype), idx.unsqueeze(1), sm_scale
+    )
+
+    ref = _scaled_kv_reference(q_nope, q_rope, keys, idx, sm_scale)
+    assert _rel_err(out[0], ref) < 4e-3
+
+
+@pytest.mark.parametrize("kv_splits", [None, 1])
+@pytest.mark.parametrize("bs", [1, 8, 48])
+def test_scaled_kv_decode_matches_reference(bs, kv_splits):
+    kv, keys, q_nope, q_rope, idx = _scaled_kv_case(bs, 12, 2048, 8192, seed=bs)
+    sm_scale = 576**-0.5
+
+    out = triton_sparse_mla_decode_splitk(
+        q_nope, q_rope, kv, idx.unsqueeze(1), sm_scale, kv_splits=kv_splits
+    )
+
+    ref = _scaled_kv_reference(q_nope, q_rope, keys, idx, sm_scale)
+    assert _rel_err(out[0], ref) < 4e-3
 
 
 if __name__ == "__main__":

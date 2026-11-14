@@ -7,11 +7,20 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    mamba_extra_buffer_of,
+    model_config_of,
+    resolved_view,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import (
     _attention_backend_default,
     _attention_backend_fa3_fp8_fallback,
     _attention_backend_platform_fallbacks,
     _cutedsl_prefill_backend_fill,
+    _deterministic_aiter_prefill_page_size,
     _deterministic_allreduce_fusion_disable,
     _deterministic_attention_backend,
     _deterministic_rocm_rccl_check,
@@ -21,14 +30,8 @@ from sglang.srt.arg_groups.overrides import (
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
-    attention_backends_of,
     declare_resolution,
-    mamba_extra_buffer_of,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
-    use_mla_backend,
 )
 from sglang.srt.arg_groups.platform_hook import (
     handle_sail_attention_backend_compatibility,
@@ -286,6 +289,8 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
 
+    run_post_process_pass(server_args, _deterministic_aiter_prefill_page_size)
+
 
 def handle_linear_attn_backend(server_args: Any):
     cfg = resolving_view(server_args)
@@ -453,9 +458,10 @@ def handle_linear_attn_backend(server_args: Any):
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
     # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
     # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
-    # GDN sizes the window to the draft maximum; KDA (kda_backend) keeps a
-    # --linear-replayssm-cache-len window and folds via its own fused
-    # verify ring-write + commit_kda_replayssm_after_verify.
+    # GDN keeps a --linear-replayssm-cache-len ring that must hold the draft
+    # window (MambaPool checks it); KDA (kda_backend) keeps a window of the
+    # same length and folds via its own fused verify ring-write +
+    # commit_kda_replayssm_after_verify.
     if cfg.enable_linear_replayssm_spec:
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
@@ -587,7 +593,7 @@ def handle_multi_item_scoring(server_args: Any):
 
 
 def handle_deterministic_inference(server_args: Any):
-    from sglang.srt.server_args import (
+    from sglang.srt.arg_groups.choices import (
         RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
     )
 

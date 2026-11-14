@@ -34,7 +34,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +50,10 @@ class ForwardContext:
     # The active batch's mode; MoE routing policies that differ between
     # prefill and decode (sglang.srt.eplb.moe_load_balancer_glue) read it here.
     forward_mode: Optional[ForwardMode] = None
+    # A TBO child's rows within its parent batch; None outside a TBO child.
+    tbo_parent_token_range: Optional[tuple[int, int]] = None
+    # This DP rank's first parent row when the child's MoE sees gathered rows.
+    tbo_parent_dp_offset: Optional[int] = None
 
 
 _current: Optional[ForwardContext] = None

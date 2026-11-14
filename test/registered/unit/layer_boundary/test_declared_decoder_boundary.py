@@ -38,7 +38,7 @@ from sglang.srt.layers.layer_boundary import layout as comm_layout
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.adapters import branch
-from sglang.srt.layers.layer_boundary.construction import BatchVariant
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import fused_ffn_input
 from sglang.srt.layers.layer_boundary.ops import (
     attn_cp_reduce_scatter_output,
@@ -58,7 +58,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 )
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_forward
 from sglang.test.boundary_fixtures import (
     Norm,

@@ -3,12 +3,15 @@
 export const config = {
   modelName: "Unlimited-OCR-2",
 
-  supportedHardware: ["l20"],
+  supportedHardware: ["l20", "h100", "h200", "b200", "b300", "gb200", "gb300", "mac"],
 
-  // L20 is not in the shared HARDWARE_CATALOG.
+  // model-specific hardware outside the shared catalog
   hardware: [
     { id: "l20", label: "L20", vram: "48GB", vendor: "nvidia" },
+    { id: "mac", label: "Apple Silicon", vram: "M5 · 16GB unified", vendor: "apple" },
   ],
+
+  runModes: (s) => s.hw === "mac" ? ["python"] : ["python", "docker"],
 
   variants: [{ id: "default", label: "Default" }],
   quantizations: [{ id: "bf16", label: "BF16" }],
@@ -50,6 +53,12 @@ export const config = {
 
   dockerImages: {
     l20: "lmsysorg/sglang:dev",
+    h100: "lmsysorg/sglang:dev",
+    h200: "lmsysorg/sglang:dev",
+    b200: "lmsysorg/sglang:dev",
+    b300: "lmsysorg/sglang:dev",
+    gb200: "lmsysorg/sglang:dev",
+    gb300: "lmsysorg/sglang:dev",
   },
 
   github: {
@@ -61,7 +70,15 @@ export const config = {
   playgroundFeatures: {
     attention: {
       knobs: [
-        { id: "tp", label: "TP", values: [null, 1, 2] },
+        {
+          id: "tp",
+          label: "TP",
+          values: [
+            null,
+            1,
+            { value: 2, disable: { hw: ["mac"] }, disableReason: "Torch MPS supports TP1 only." },
+          ],
+        },
       ],
     },
   },
@@ -79,6 +96,162 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "mac",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: true,
+      env: ["SGLANG_USE_MLX=0"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device mps",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--max-total-tokens 32768",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // Starting recipes: the exact 8,000-token/page configurations below
+    // have not been validated on these platforms.
+    {
+      match: {
+        hw: "h100",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "h200",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "b200",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "b300",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "gb200",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "gb300",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
         "--chat-template unlimited-ocr",
         "--uocr-doc-split",
         "--enable-streaming-session",

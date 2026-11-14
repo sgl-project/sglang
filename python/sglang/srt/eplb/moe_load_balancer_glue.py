@@ -14,11 +14,11 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_exec
 
 _FORWARD_MODE_TO_STAGE = {

@@ -267,7 +267,7 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
   }
 
   __syncthreads();
-  epoch.flip();
+  epoch.commit();
 }
 
 template <typename T, bool kHasResidual, Primitive kPrim, bool kUsePDL, uint32_t kPullUnroll>
@@ -285,8 +285,8 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
   const auto num_warps = gridDim.x * (kPullCTASize / kWarpThreads);
 
   PDLWaitPrimary<kUsePDL>();
-  const auto barrier = distributed::McBarrier{params.sem_local, params.sem_mc, params.world_size, 2};
-  barrier.arrive_relaxed(/*n=*/0);
+  const auto barrier = distributed::McBarrier{params.sem_local, params.sem_mc, params.world_size};
+  barrier.arrive_relaxed();
   __syncthreads();
 
   const auto num_whole_chunks = params.num_vecs / kNumWarpVecs;
@@ -352,9 +352,9 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
   if constexpr (kPrim & Primitive::AG) {
-    barrier.arrive_rel_acq(/*n=*/1);
+    barrier.arrive_rel_acq();
   } else {  // no store multimem, only local store
-    barrier.arrive_relaxed(/*n=*/1);
+    barrier.arrive_relaxed();
   }
 }
 
@@ -511,7 +511,7 @@ struct NVLinkComm {
     };
     const auto kernel = residual.has_value() ? nvlink_push_kernel<T, true, kPrim, kWorldSize, kUsePDL>
                                              : nvlink_push_kernel<T, false, kPrim, kWorldSize, kUsePDL>;
-    host::LaunchKernel(push.num_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
+    host::LaunchKernel(push.default_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
   }
 
   template <Primitive kPrim, uint32_t kPullUnroll>
@@ -544,15 +544,15 @@ struct NVLinkComm {
     } else if constexpr (kPrim == Primitive::RS) {
       CHECK_HOST(out_tokens == routing.num_rank_tokens && in_mc_ptr != 0);
       in_mc_ptr += prefix_bytes;
-      if (num_blocks_hint == 0) num_blocks_hint = pull.num_blocks;  // use all the blocks for RS
+      if (num_blocks_hint == 0) num_blocks_hint = pull.default_blocks;  // use all the blocks for RS
     } else {
       static_assert(kPrim == Primitive::AG);
       CHECK_HOST(num_tokens == routing.num_rank_tokens && out_mc_ptr != 0);
       out_mc_ptr += prefix_bytes;
       if (num_blocks_hint == 0) num_blocks_hint = host::div_ceil(128u, kPullUnroll * world_size);
     }
-    /// NOTE: hard limit upper bound is `pull.num_blocks`
-    num_blocks_hint = std::min(num_blocks_hint, pull.num_blocks);
+    /// NOTE: hard limit upper bound is `pull.capacity`
+    num_blocks_hint = std::min(num_blocks_hint, pull.capacity);
 
     // Every pull primitive works on this rank's shard, so a full-length
     // residual is sliced onto it.

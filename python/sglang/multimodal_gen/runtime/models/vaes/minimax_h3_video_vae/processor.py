@@ -12,7 +12,6 @@ from torchvision.transforms import Normalize
 from sglang.kernels.ops.diffusion import (
     can_use_minimax_h3_vae_denorm_clamp,
     minimax_h3_vae_denorm_clamp,
-    minimax_h3_vae_output_device_supported,
 )
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 
@@ -72,7 +71,6 @@ def _denorm_kernel_candidate(tensor: torch.Tensor, gate: BitExactFusionGate) -> 
         and tensor.dtype == torch.float32
         and not torch.is_grad_enabled()
         and gate.can_attempt_once()
-        and minimax_h3_vae_output_device_supported(tensor.device)
     )
 
 

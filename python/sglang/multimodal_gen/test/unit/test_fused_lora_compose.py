@@ -353,11 +353,10 @@ def test_loader_composes_unequal_fused_sections():
     }
 
 
-def test_alpha_override_reloads_fused_sections():
+def test_alpha_override_reloads_fused_sections(tmp_path):
     pipeline = _make_loader_pipeline()
-    _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=8)
-    expected = pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"]
-    _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=4)
+    adapter_file = str(tmp_path / "adapter.safetensors")
+    save_file(_qkv_state_dict(), adapter_file)
     pipeline.lora_initialized = True
     for attr in (
         "cur_adapter_name",
@@ -373,14 +372,28 @@ def test_alpha_override_reloads_fused_sections():
         setattr(pipeline, attr, {})
     loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
     with (
-        patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
-        patch(f"{loader_mod}.load_file", return_value=_qkv_state_dict()),
+        patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
         patch(f"{loader_mod}.dist.is_initialized", return_value=False),
         patch(f"{loader_mod}.dist.get_rank", return_value=0),
     ):
-        pipeline.set_lora(
-            "adapter", None, target="transformer", merge_mode="dynamic", lora_alpha=8
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0, lora_alpha=8)
+        expected = pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"].clone()
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0, lora_alpha=4)
+        assert not torch.equal(
+            pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"], expected
         )
+        # only alpha changes; the same file stays available for the reload
+        with patch.object(
+            pipeline, "load_lora_adapter", wraps=pipeline.load_lora_adapter
+        ) as reload_adapter:
+            pipeline.set_lora(
+                "adapter",
+                None,
+                target="transformer",
+                merge_mode="dynamic",
+                lora_alpha=8,
+            )
+        reload_adapter.assert_called_once_with(adapter_file, "adapter", 0, lora_alpha=8)
 
     # the GQA composition bakes alpha into lora_B, so an override must reload
     torch.testing.assert_close(
