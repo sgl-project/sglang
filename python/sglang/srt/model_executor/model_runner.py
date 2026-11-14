@@ -2120,6 +2120,16 @@ class ModelRunner:
                     decode_graph_runner=self.decode_cuda_graph_runner,
                 )
 
+            if (
+                forward_batch.dp_kda_tp_state_imports is not None
+                and not self.is_draft_worker
+            ):
+                from sglang.srt.layers.communication import k3_kda_tp
+
+                # K3 KDA TP PD decode: every rank writes its heads of the states the
+                # prefill sent before anything (graph replay included) reads them.
+                k3_kda_tp.run_pd_imports(self.req_to_token_pool, forward_batch)
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(

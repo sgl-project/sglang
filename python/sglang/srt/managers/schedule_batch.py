@@ -2073,6 +2073,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Every DP rank's forward mode value (ForwardMode.value; IDLE for ranks without a
     # batch) from the MLP sync all-gather; None without attention DP.
     dp_forward_modes: Optional[List[int]] = None
+    # K3 KDA TP on a PD decode worker (k3_kda_tp.PdStateStaging): this rank's (stage, slot)
+    # state imports for this forward, and every DP rank's import count from the MLP sync.
+    kda_tp_state_imports: Optional[List[Tuple[int, int]]] = None
+    dp_kda_tp_state_imports: Optional[List[int]] = None
 
     # Full-DP metadata from the existing scheduler gather.
     dp_spec_prefill_coordination_metadata: Optional[tuple] = None
@@ -3532,6 +3536,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
             is_extend_in_batch=self.is_extend_in_batch,
             dp_forward_modes=self.dp_forward_modes,
+            kda_tp_state_imports=self.kda_tp_state_imports,
+            dp_kda_tp_state_imports=self.dp_kda_tp_state_imports,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,

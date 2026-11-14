@@ -29,7 +29,7 @@ import logging
 import math
 import os
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import KW_ONLY, dataclass, fields
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
@@ -528,6 +528,9 @@ class MambaPool:
     # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
     # class-level default for subclasses that skip MambaPool.__init__.
     _slot_siblings: Tuple = ()
+    # KDA TP PD decode (k3_kda_tp.PdStateStaging): full-width receive slots that replace
+    # this pool's head-sharded slots as the PD transfer destination.
+    pd_staging = None
 
     def register_slot_state(self, state) -> None:
         """Attach a state that rides along on clear / copy / host round-trip,
@@ -1320,8 +1323,20 @@ class MambaPool:
         }
     )
 
+    def state_allocation_region(self):
+        """The context the state buffers are allocated in (memory-saver region, and the
+        disaggregation memory pool when enabled)."""
+        stack = ExitStack()
+        stack.enter_context(self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE))
+        if self.enable_custom_mem_pool:
+            stack.enter_context(torch.cuda.use_mem_pool(self.custom_mem_pool))
+        return stack
+
     def _iter_transfer_state_entries(self):
         """Yield ``[slot, ...]`` state entries and their transfer metadata."""
+        if self.pd_staging is not None:
+            yield from self.pd_staging.iter_transfer_state_entries()
+            return
         for field, value in vars(self.mamba_cache).items():
             if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
                 continue
@@ -1760,6 +1775,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
+
+    def free(self, req: Req):
+        # Handoff cancellation can precede admission and state-slot ownership.
+        if getattr(req, "kda_tp_lazy_mamba", False):
+            self.state.release(self, req)
+        super().free(req)
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")

@@ -176,6 +176,9 @@ class MLPSyncBatchInfo:
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
 
+    # K3 KDA TP PD decode: PD-received states this rank imports in this forward.
+    kda_tp_state_imports: int = 0
+
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     any_health_check: bool = False
@@ -184,6 +187,7 @@ class MLPSyncBatchInfo:
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     global_attention_pairs: list[int] = None
+    global_kda_tp_state_imports: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -204,6 +208,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                self.kda_tp_state_imports,
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +230,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                0,  # kda_tp_state_imports
             ],
             device=device,
             dtype=dtype,
@@ -236,6 +242,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.global_attention_pairs = [self.attention_pairs]
+        self.global_kda_tp_state_imports = [self.kda_tp_state_imports]
         self.any_health_check = self.is_health_check
         self.any_shutting_down = self.is_shutting_down
         if _ENABLE_METRICS_DP_ATTENTION:
@@ -315,6 +322,7 @@ class MLPSyncBatchInfo:
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
         self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
+        self.global_kda_tp_state_imports = tp0_info_cpu[:, 13].tolist()
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -365,6 +373,7 @@ def _update_gather_batch(
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
         if mlp_sync_info.tp0_info_cpu is not None:
             batch.dp_forward_modes = mlp_sync_info.tp0_info_cpu[:, 5].tolist()
+            batch.dp_kda_tp_state_imports = mlp_sync_info.global_kda_tp_state_imports
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
@@ -715,6 +724,9 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        kda_tp_state_imports=len(
+            getattr(local_batch, "kda_tp_state_imports", None) or ()
+        ),
     )
 
     if num_dp_ranks == 1:

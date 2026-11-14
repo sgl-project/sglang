@@ -14,8 +14,13 @@ CPU (gloo, simulated ranks):
 - The stand-in batches _fast_context (every rank verifies) and _general_context (a rank in
   extend) build carry what KDAAttnBackend.forward_extend reads on target verify, up to
   its first kernel; a ragged verify layout is refused.
+- PD decode staging: stage lifecycle, transfer entries that match a full-width
+  (attention TP 1) prefill pool, the import collective (every rank ends up with exactly
+  its heads of every DP rank's staged states, untouched slots unchanged; gloo, and NCCL
+  with >= 4 GPUs), the MLP-sync import-count column, and retraction rebootstraps.
 """
 
+import contextlib
 import itertools
 import os
 import queue
@@ -32,6 +37,8 @@ import torch.multiprocessing as mp
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+
+HEADS, HEAD_DIM, KERNEL, LAYERS = 8, 4, 4, 3
 
 
 def _free_port():
@@ -76,6 +83,7 @@ class TestEnable(unittest.TestCase):
         mode="null",
         radix=False,
         unified=False,
+        decode_radix=False,
         spec="NEXTN",
     ):
         from sglang.srt import runtime_context
@@ -97,24 +105,27 @@ class TestEnable(unittest.TestCase):
                 disable_radix_cache=not radix,
             ),
             get_spec=lambda: NS(speculative_algorithm=spec),
-            get_disagg=lambda: NS(disaggregation_mode=mode),
+            get_disagg=lambda: NS(
+                disaggregation_mode=mode,
+                disaggregation_decode_enable_radix_cache=decode_radix,
+            ),
         ):
             k3_kda_tp._check_supported()
 
     def test_supported_features(self):
-        self._check()
-        self._check(radix=True)
-        self._check(spec=None)
-        self._check(spec="EAGLE")
+        self._check(mode="decode")
+        self._check(mode="decode", spec=None)
+        self._check(mode="decode", spec="EAGLE")
 
     def test_unsupported_features_raise(self):
         for kw, msg in (
-            (dict(replayssm=True), "ReplaySSM"),
-            (dict(hicache=True), "HiCache"),
-            (dict(spec="DSPARK"), "speculative algorithm DSPARK"),
-            (dict(unified=True), "unified-memory"),
-            (dict(mode="prefill"), "PD disaggregation"),
-            (dict(mode="decode"), "PD disaggregation"),
+            (dict(mode="null"), "PD decode role only"),
+            (dict(mode="prefill"), "PD decode role only"),
+            (dict(mode="decode", replayssm=True), "ReplaySSM"),
+            (dict(mode="decode", hicache=True), "HiCache"),
+            (dict(mode="decode", spec="DSPARK"), "speculative algorithm DSPARK"),
+            (dict(mode="decode", unified=True), "unified-memory"),
+            (dict(mode="decode", decode_radix=True), "PD decode radix"),
         ):
             with self.subTest(kw=kw), self.assertRaisesRegex(NotImplementedError, msg):
                 self._check(**kw)
@@ -141,6 +152,90 @@ class TestSlots(unittest.TestCase):
         self.assertEqual(flat, list(range(1, 41)))  # slot 0 stays the padding slot
 
 
+def _cache_params(world):
+    from sglang.srt.configs.mamba_utils import (
+        KimiLinearCacheParams,
+        KimiLinearStateShape,
+    )
+
+    shape = KimiLinearStateShape.create(
+        tp_world_size=world, num_heads=HEADS, head_dim=HEAD_DIM, conv_kernel_size=KERNEL
+    )
+    return KimiLinearCacheParams(shape=shape, layers=list(range(LAYERS)))
+
+
+def _staging(world, slots, rank=0, device="cpu"):
+    from sglang.srt.layers.communication import k3_kda_tp
+
+    pool = types.SimpleNamespace(
+        mamba_layer_ids=list(range(LAYERS)),
+        state_allocation_region=contextlib.nullcontext,
+    )
+    with unittest.mock.patch.object(
+        k3_kda_tp,
+        "get_parallel",
+        lambda: _par(tp_size=world, attn_dp_size=world, attn_dp_rank=rank),
+    ):
+        return k3_kda_tp.PdStateStaging(pool, _cache_params(world), slots, device)
+
+
+class TestStagingLifecycle(unittest.TestCase):
+    def test_transfer_entries_match_full_width_pool(self):
+        from sglang.srt.configs.mamba_utils import KimiLinearStateShape
+
+        st = _staging(4, 3)
+        full = KimiLinearStateShape.create(
+            tp_world_size=1, num_heads=HEADS, head_dim=HEAD_DIM, conv_kernel_size=KERNEL
+        )
+        entries = list(st.iter_transfer_state_entries())
+        self.assertEqual(
+            [e[0] for e in entries], ["conv"] * LAYERS + ["temporal"] * LAYERS
+        )
+        self.assertEqual([e[3] for e in entries], list(range(LAYERS)) * 2)
+        conv_item = torch.Size(full.conv[0]).numel() * 2  # bf16
+        temporal_item = torch.Size(full.temporal).numel() * 4  # fp32
+        self.assertEqual(
+            [e[1][0].nbytes for e in entries],
+            [conv_item] * LAYERS + [temporal_item] * LAYERS,
+        )
+        self.assertEqual(entries[0][1].shape[0], 3)
+
+    def test_lifecycle(self):
+        st = _staging(4, 2)
+        alloc = types.SimpleNamespace(free_slots=torch.tensor([], dtype=torch.int64))
+        a, b = st.assign(5), st.assign(6)
+        self.assertNotEqual(a, b)
+        self.assertFalse(st.has_room(alloc))
+        st.queue_import(5)
+        pairs = st.take_pending()
+        self.assertEqual(pairs, [(a, 5)])
+        self.assertEqual(st.take_pending(), [])
+        st.finish_import(pairs, None)  # CPU: no event, reusable at the next check
+        self.assertTrue(st.has_room(alloc))
+        # A request that leaves before its import returns its stage.
+        st.release_slot(6)
+        self.assertEqual(sorted(st._free), [0, 1])
+        # A slot reallocated without release reclaims its old stage.
+        st.assign(7)
+        st.assign(7)
+        self.assertEqual(len(st._free), 1)
+
+    def test_reclaims_stages_of_freed_slots(self):
+        st = _staging(4, 1)
+        st.assign(9)
+        busy = types.SimpleNamespace(free_slots=torch.tensor([3], dtype=torch.int64))
+        self.assertFalse(st.has_room(busy))
+        freed = types.SimpleNamespace(
+            free_slots=torch.tensor([3, 9], dtype=torch.int64)
+        )
+        self.assertTrue(st.has_room(freed))
+
+    def test_queue_import_needs_assignment(self):
+        st = _staging(4, 1)
+        with self.assertRaisesRegex(RuntimeError, "no staged state"):
+            st.queue_import(3)
+
+
 class _Group:
     """GroupCoordinator stand-in over the default process group."""
 
@@ -153,6 +248,97 @@ class _Group:
         parts = list(out.chunk(self.world_size))
         dist.all_gather(parts, x.contiguous())
         out.copy_(torch.cat(parts))
+
+
+def _full_state(rank, stage, device):
+    from sglang.srt.configs.mamba_utils import KimiLinearStateShape
+
+    full = KimiLinearStateShape.create(
+        tp_world_size=1, num_heads=HEADS, head_dim=HEAD_DIM, conv_kernel_size=KERNEL
+    )
+    g = torch.Generator().manual_seed(1000 * rank + stage)
+    conv = torch.randn((LAYERS,) + tuple(full.conv[0]), generator=g).to(torch.bfloat16)
+    temporal = torch.randn((LAYERS,) + tuple(full.temporal), generator=g)
+    return conv.to(device), temporal.to(device), full.conv_shard_groups
+
+
+def _import_worker(rank, world, port, backend, counts, q):
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    dist.init_process_group(backend, rank=rank, world_size=world)
+    try:
+        from sglang.srt.layers.communication import k3_kda_tp
+
+        device = (
+            torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
+        )
+        if backend == "nccl":
+            torch.cuda.set_device(device)
+        par = _par(
+            tp_size=world, attn_dp_size=world, attn_dp_rank=rank, tp_group=_Group(world)
+        )
+        per_rank_slots = 5
+        pool_slots = world * per_rank_slots
+        params = _cache_params(world)
+        conv_shape, temporal_shape = params.shape.conv[0], params.shape.temporal
+        cache = types.SimpleNamespace(
+            conv=[
+                torch.full(
+                    (LAYERS, pool_slots + 1) + tuple(conv_shape),
+                    -1.0,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+            ],
+            temporal=torch.full(
+                (LAYERS, pool_slots + 1) + tuple(temporal_shape), -1.0, device=device
+            ),
+        )
+        mamba_pool = types.SimpleNamespace(mamba_cache=cache)
+        with unittest.mock.patch.object(k3_kda_tp, "get_parallel", lambda: par):
+            st = _staging(world, 3, rank=rank, device=device)
+            local = []
+            for i in range(counts[rank]):
+                slot = (
+                    rank * per_rank_slots + 1 + 2 * i
+                )  # global ids of this rank's range
+                stage = st.assign(slot)
+                conv, temporal, _ = _full_state(rank, i, device)
+                st.conv[0][:, stage] = conv
+                st.temporal[:, stage] = temporal
+                st.queue_import(slot)
+                local.append((stage, slot))
+            pairs = st.take_pending()
+            assert pairs == local, (pairs, local)
+            st.import_states(mamba_pool, pairs, counts)
+            if backend == "nccl":
+                torch.cuda.synchronize()
+        # Expected: this rank's heads / channels of every rank's staged states.
+        errors, touched = [], set()
+        for j in range(world):
+            for i in range(counts[j]):
+                slot = j * per_rank_slots + 1 + 2 * i
+                touched.add(slot)
+                conv, temporal, groups = _full_state(j, i, device)
+                h = HEADS // world
+                want_t = temporal[:, rank * h : (rank + 1) * h]
+                cols, off = [], 0
+                for gdim in groups:
+                    s = gdim // world
+                    cols.append(conv[..., off + rank * s : off + (rank + 1) * s])
+                    off += gdim
+                want_c = torch.cat(cols, dim=-1)
+                if not torch.equal(cache.temporal[:, slot], want_t):
+                    errors.append(("temporal", j, i))
+                if not torch.equal(cache.conv[0][:, slot], want_c):
+                    errors.append(("conv", j, i))
+        untouched = [s for s in range(pool_slots + 1) if s not in touched]
+        if not bool((cache.temporal[:, untouched] == -1).all()):
+            errors.append("untouched temporal slot written")
+        if not bool((cache.conv[0][:, untouched] == -1).all()):
+            errors.append("untouched conv slot written")
+        q.put((rank, errors, len(st._free) + sum(len(s) for _, s in st._draining)))
+    finally:
+        dist.destroy_process_group()
 
 
 def _run_workers(target, backend, counts, timeout_sec=600):
@@ -196,6 +382,57 @@ def _run_workers(target, backend, counts, timeout_sec=600):
             if p.is_alive():
                 p.kill()
                 p.join()
+
+
+class TestImportCollective(unittest.TestCase):
+    def _check(self, backend, counts):
+        res, codes = _run_workers(_import_worker, backend, counts)
+        self.assertEqual(codes, [0] * len(counts))
+        for rank, errors, stages_back in res:
+            self.assertEqual(errors, [], f"rank {rank}")
+            self.assertEqual(stages_back, 3)  # every stage returned after its import
+
+    def test_uneven_counts_cpu(self):
+        self._check("gloo", [2, 0, 1, 3])
+
+    def test_single_source_cpu(self):
+        self._check("gloo", [0, 1])
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.device_count() >= 4, "needs 4 GPUs"
+    )
+    def test_uneven_counts_nccl(self):
+        self._check("nccl", [1, 3, 0, 2])
+
+
+class TestMlpSyncColumn(unittest.TestCase):
+    def test_import_count_column(self):
+        from sglang.srt.managers.scheduler_components import dp_attn
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=1,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=4,
+            num_tokens_for_logprob=4,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.DECODE.value,
+            kda_tp_state_imports=3,
+        )
+        local, fallback = (
+            info._get_local_tensor("cpu"),
+            info._get_fallback_tensor("cpu"),
+        )
+        self.assertEqual(local.numel(), fallback.numel())
+        self.assertEqual(local[13].item(), 3)
+        self.assertEqual(fallback[13].item(), 0)
+        info.finalize_local()
+        self.assertEqual(info.global_kda_tp_state_imports, [3])
 
 
 def _mamba_pool_spec():
@@ -625,6 +862,19 @@ class TestRows(unittest.TestCase):
         self.assertEqual(k3_kda_tp.padded_rows(2, [1, 3, 0, 2]), 3)
         with self.assertRaisesRegex(RuntimeError, "exceed the DP maximum"):
             k3_kda_tp.padded_rows(4, [1, 3])
+
+
+class TestRetraction(unittest.TestCase):
+    def test_kda_tp_retraction_rebootstraps(self):
+        from sglang.srt.layers.communication import k3_kda_tp
+        from sglang.srt.mem_cache import common
+
+        alloc = types.SimpleNamespace(get_kvcache=lambda: object())
+        for width, want in ((1, False), (8, True)):
+            with unittest.mock.patch.object(
+                k3_kda_tp, "state_shard_width", lambda: width
+            ):
+                self.assertEqual(common.retraction_needs_rebootstrap(alloc), want)
 
 
 if __name__ == "__main__":

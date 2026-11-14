@@ -313,6 +313,11 @@ def handle_kda_tp(server_args: Any):
     cfg = resolving_view(server_args)
     if not cfg.enable_kda_tp:
         return
+    if cfg.disaggregation_mode != "decode":
+        raise ValueError(
+            "--enable-kda-tp runs on the PD decode role only (--disaggregation-mode "
+            f"decode; got {cfg.disaggregation_mode!r})."
+        )
     view = resolved_view(server_args)
     attn_tp_size = derive_attn_tp_size(
         tp_size=cfg.tp_size,

@@ -26,6 +26,11 @@ rows:
 - general path (eager, some rank in extend): each rank's whole metadata is all-gathered and
   every KDA layer runs the core once per source DP rank on that rank's row block.
 
+On a PD decode worker each rank receives the prefill's full-width state of its own
+requests into full-width staging slots (``PdStateStaging``) and every rank imports its
+heads of every DP rank's staged states with one all-to-all before the forward that first
+reads them.
+
 The row collectives use K3's GB300 push collectives over the TP group when they apply
 (k3_sp_collective.tp_group_state), else NCCL.
 """
@@ -34,6 +39,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -90,8 +96,18 @@ def _check_supported() -> None:
         problems.append("HiCache (host copies of rank-local head shards)")
     if mem.enable_unified_memory:
         problems.append("--enable-unified-memory (state slots are global ids)")
-    if disagg.disaggregation_mode != "null":
-        problems.append("PD disaggregation (prefill state would be head-sharded)")
+    if disagg.disaggregation_mode != "decode":
+        problems.append(
+            f"disaggregation mode {disagg.disaggregation_mode!r}: KDA TP serves the PD "
+            "decode role only (a PD prefill would send head shards)"
+        )
+    if (
+        disagg.disaggregation_mode == "decode"
+        and disagg.disaggregation_decode_enable_radix_cache
+    ):
+        problems.append(
+            "the PD decode radix cache (rank-local state copies on prefix match)"
+        )
     if not mem.disable_radix_cache and not mamba.enable_mamba_extra_buffer:
         problems.append(
             "the no_buffer mamba radix strategy (eager slot copies on insert)"
@@ -758,3 +774,375 @@ def mirror_deferred_state_ops(model_runner, forward_batch) -> None:
 def end_forward() -> None:
     global _CTX
     _CTX = None
+
+
+# ---- PD decode: receiving prefill state into the head shards ----------------------------------
+
+
+def lazy_mamba_slot(enable_mamba_extra_buffer: bool) -> bool:
+    """Whether a PD decode request defers its head-sharded state slot to admission (it
+    holds only a staging slot through its handoff). Not with ping-pong tracking slots,
+    which are allocated with the main slot."""
+    return (
+        state_shard_width() > 1
+        and not enable_mamba_extra_buffer
+        and envs.SGLANG_K3_KDA_TP_LAZY_MAMBA_SLOT.get()
+    )
+
+
+def lazy_stage_key(req_pool_idx: int) -> int:
+    """Staging key of a request with no state slot yet: its request row, negated, so it
+    never collides with a state slot id (>= 1)."""
+    return -int(req_pool_idx)
+
+
+class FullStateStaging:
+    """Full-width (all heads) KDA state slots on this rank, and the all-to-alls over the TP
+    group that move such states between their owner DP rank and every rank's head shard of
+    the requests' global slots (``scatter``: owner -> shards, ``gather``: shards -> owner)."""
+
+    def __init__(self, pool, cache_params, num_slots: int, device):
+        from sglang.srt.configs.mamba_utils import KimiLinearStateShape
+
+        shape = cache_params.shape
+        if not isinstance(shape, KimiLinearStateShape):
+            raise TypeError(
+                f"KDA TP staging needs Kimi linear state, got {type(shape)}"
+            )
+        if num_slots < 1:
+            raise ValueError(f"KDA TP staging needs at least one slot, got {num_slots}")
+        full = KimiLinearStateShape.create(
+            tp_world_size=1,
+            num_heads=shape.num_heads,
+            head_dim=shape.head_dim,
+            num_k_heads=shape.num_k_heads,
+            head_k_dim=shape.head_k_dim,
+            conv_kernel_size=shape.conv_kernel,
+        )
+        W = width()
+        if full.temporal[0] % W:
+            raise ValueError(
+                f"KDA TP: {full.temporal[0]} heads do not split over {W} ranks"
+            )
+        self.layer_ids = list(pool.mamba_layer_ids)
+        L = len(self.layer_ids)
+        with pool.state_allocation_region():
+            self.conv = [
+                torch.zeros(
+                    (L, num_slots) + tuple(c),
+                    dtype=cache_params.dtype.conv,
+                    device=device,
+                )
+                for c in full.conv
+            ]
+            self.temporal = torch.zeros(
+                (L, num_slots) + tuple(full.temporal),
+                dtype=cache_params.dtype.temporal,
+                device=device,
+            )
+        self.conv_slice_axis = full.conv_slice_axis
+        # Full conv channels [g0 | g1 | ...] with every group head-sharded W ways, reordered
+        # rank-major so rank r's block is its local [g0_r | g1_r | ...] layout.
+        groups = full.conv_shard_groups
+        cols, off = [[] for _ in range(W)], 0
+        for g in groups:
+            if g % W:
+                raise ValueError(
+                    f"KDA TP: conv group {g} does not split over {W} ranks"
+                )
+            for r in range(W):
+                cols[r].extend(range(off + r * g // W, off + (r + 1) * g // W))
+            off += g
+        self._conv_rank_major = torch.tensor(
+            [c for r in cols for c in r], dtype=torch.int64, device=device
+        )
+        self.num_slots = num_slots
+
+    # Transfer registration, in MambaPool._iter_transfer_state_entries order and format.
+    def iter_transfer_state_entries(self):
+        for conv in self.conv:
+            for i, layer_id in enumerate(self.layer_ids):
+                yield "conv", conv[i], self.conv_slice_axis, layer_id
+        for i, layer_id in enumerate(self.layer_ids):
+            yield "temporal", self.temporal[i], 0, layer_id
+
+    def _rank_major(self, t: torch.Tensor, kind: str) -> torch.Tensor:
+        """[Lc, c, *full slot] -> [W, c, Lc, E]: rank r's heads of every (state, layer).
+        Sizes are explicit: a rank with nothing to send has c == 0."""
+        W = width()
+        Lc, c = t.shape[:2]
+        per = math.prod(t.shape[2:]) // W
+        if kind == "temporal":
+            t = t.reshape(Lc, c, W, per)
+            return t.permute(2, 1, 0, 3).contiguous()
+        # conv: [Lc, c, K-1, D] (channels last) -> [Lc, c, K-1, W, D/W]
+        k1, d = t.shape[2], t.shape[3]
+        t = t.index_select(3, self._conv_rank_major).reshape(Lc, c, k1, W, d // W)
+        return t.permute(3, 1, 0, 2, 4).reshape(W, c, Lc, per).contiguous()
+
+    def _from_rank_major(self, t: torch.Tensor, kind: str, full_shape) -> torch.Tensor:
+        """Inverse of ``_rank_major``: [W, c, Lc, E] -> [Lc, c, *full slot]."""
+        W, c, Lc = t.shape[:3]
+        if kind == "temporal":
+            return t.permute(2, 1, 0, 3).reshape(Lc, c, *full_shape)
+        k1, d = full_shape
+        t = t.view(W, c, Lc, k1, d // W).permute(2, 1, 3, 0, 4).reshape(Lc, c, k1, d)
+        return torch.empty_like(t).index_copy_(3, self._conv_rank_major, t)
+
+    def _state_pairs(self, mamba_pool):
+        cache = mamba_pool.mamba_cache
+        pairs = [(stage, shard, "conv") for stage, shard in zip(self.conv, cache.conv)]
+        pairs.append((self.temporal, cache.temporal, "temporal"))
+        return pairs
+
+    # Bounds the all-to-all buffers of one chunk of layers.
+    chunk_bytes = 256 << 20
+
+    def _layer_chunk(self, L: int, nbytes_per_layer: int) -> int:
+        """Layers per all-to-all; every rank must derive it from the same global sizes."""
+        return max(1, min(L, self.chunk_bytes // max(1, nbytes_per_layer)))
+
+    def scatter(
+        self, mamba_pool, stages: List[int], counts: List[int], dst: torch.Tensor
+    ) -> None:
+        """Collective over the TP group (every rank, ``counts`` agreed): write rank r's heads
+        of every DP rank's staged states (this rank's: ``stages``) into their global slots
+        ``dst`` (every rank's, in rank order)."""
+        g = group()
+        W = g.world_size
+        dev = self.temporal.device
+        n_max, n_total = max(counts), sum(counts)
+        c = len(stages)
+        stage_idx = torch.tensor(stages, dtype=torch.int64, device=dev)
+        L = len(self.layer_ids)
+        for src, dst_t, kind in self._state_pairs(mamba_pool):
+            Lc = self._layer_chunk(L, n_max * src[0, 0].nbytes)
+            for l0 in range(0, L, Lc):
+                l1 = min(L, l0 + Lc)
+                send = self._rank_major(src[l0:l1].index_select(1, stage_idx), kind)
+                per = send.shape[-1]
+                recv = torch.empty((n_total, l1 - l0, per), dtype=src.dtype, device=dev)
+                torch.distributed.all_to_all_single(
+                    recv.view(-1),
+                    send.view(-1),
+                    output_split_sizes=[n * (l1 - l0) * per for n in counts],
+                    input_split_sizes=[c * (l1 - l0) * per] * W,
+                    group=g.device_group,
+                )
+                slot_shape = dst_t.shape[2:]
+                dst_t[l0:l1, dst] = recv.view(n_total, l1 - l0, *slot_shape).transpose(
+                    0, 1
+                )
+
+    def gather(
+        self, mamba_pool, stages: List[int], counts: List[int], src: torch.Tensor
+    ) -> None:
+        """Collective over the TP group, the inverse of ``scatter``: every rank sends its
+        heads of each DP rank's global slots ``src`` (every rank's, in rank order) to that
+        rank, which assembles the full states into its staging slots ``stages``."""
+        g = group()
+        W = g.world_size
+        dev = self.temporal.device
+        n_total = sum(counts)
+        c = len(stages)
+        stage_idx = torch.tensor(stages, dtype=torch.int64, device=dev)
+        L = len(self.layer_ids)
+        for stage_t, shard_t, kind in self._state_pairs(mamba_pool):
+            full_shape = stage_t.shape[2:]
+            per = shard_t[0, 0].numel()
+            Lc = self._layer_chunk(
+                L, max(n_total, W * max(counts)) * shard_t[0, 0].nbytes
+            )
+            for l0 in range(0, L, Lc):
+                l1 = min(L, l0 + Lc)
+                send = shard_t[l0:l1].index_select(1, src).transpose(0, 1).contiguous()
+                recv = torch.empty(
+                    (W, c, l1 - l0, per), dtype=shard_t.dtype, device=dev
+                )
+                torch.distributed.all_to_all_single(
+                    recv.view(-1),
+                    send.view(-1),
+                    output_split_sizes=[c * (l1 - l0) * per] * W,
+                    input_split_sizes=[n * (l1 - l0) * per for n in counts],
+                    group=g.device_group,
+                )
+                if c:
+                    stage_t[l0:l1].index_copy_(
+                        1, stage_idx, self._from_rank_major(recv, kind, full_shape)
+                    )
+
+
+class PdStateStaging(FullStateStaging):
+    """KDA TP on a PD decode worker: receive buffers for the prefill's full KDA state.
+
+    The prefill (attention TP 1, KDA weight-sharded or replicated) sends every request's full
+    state (all heads) to the one decode DP rank that owns the request, but under KDA TP each rank
+    keeps heads/W of every slot. So the decode rank advertises these full-width staging
+    slots as its transfer destination (the prefill sees matching layouts and sends as usual),
+    and once the request joins the running batch every rank runs ``import_states`` before
+    the forward that first reads the slot: an all-to-all hands rank r its heads of every
+    staged state, written into the request's global slot.
+
+    Lifecycle of a stage: ``assign`` (prealloc, keyed by the request's main slot) ->
+    ``queue_import`` (the request joins the running batch) -> ``take_pending`` (the batch's
+    MLP sync advertises the count) -> ``finish_import`` (the forward enqueued the copies; the
+    stage is reused once they complete). ``release_slot`` drops a request that leaves first.
+    A scheduler that publishes destinations after admitting several requests ``reserve``s a
+    stage at admission so ``has_room`` counts it, and passes ``reserved=True`` to ``assign``.
+    With SGLANG_K3_KDA_TP_LAZY_MAMBA_SLOT the request has no state slot until it joins the
+    running batch, so its stage is keyed by ``lazy_stage_key`` (its request row) and moved
+    onto the slot it is given there with ``rekey``.
+    """
+
+    def __init__(self, pool, cache_params, num_slots: int, device):
+        super().__init__(pool, cache_params, num_slots, device)
+        self._free: List[int] = list(range(num_slots))
+        self._stage_of: Dict[int, int] = {}  # request main slot -> stage
+        self._pending: List[int] = []  # slots whose request joined the running batch
+        self._reserved = 0  # admitted requests whose assign is still to come
+        self._draining: List[
+            Tuple[Any, List[int]]
+        ] = []  # (event, stages) being imported
+        nbytes = sum(t.nbytes for t in self.conv) + self.temporal.nbytes
+        logger.info(
+            "KDA TP PD decode: %d staging slots for prefill state (%.2f GB)",
+            num_slots,
+            nbytes / 1e9,
+        )
+
+    def _reclaim(self) -> None:
+        still = []
+        for event, stages in self._draining:
+            if event is None or event.query():
+                self._free.extend(stages)
+            else:
+                still.append((event, stages))
+        self._draining = still
+
+    def has_room(self, allocator, req_pool=None) -> bool:
+        self._reclaim()
+        if len(self._free) <= self._reserved and self._stage_of:
+            # Stages left behind by a request freed outside free_mamba_cache: reclaim those
+            # whose slot the allocator holds as free (one sync, only when stages run out),
+            # and those keyed by a request row (lazy_stage_key) the request pool holds as free.
+            free_slots = set(allocator.free_slots.tolist())
+            free_rows = set(req_pool.free_slots) if req_pool is not None else set()
+            stale = [
+                s
+                for s in self._stage_of
+                if s not in self._pending
+                and ((s > 0 and s in free_slots) or (s < 0 and -s in free_rows))
+            ]
+            for slot in stale:
+                self.release_slot(slot)
+        return len(self._free) > self._reserved
+
+    def reserve(self) -> None:
+        """Hold a stage for an admitted request (after ``has_room``) until its ``assign``."""
+        if len(self._free) <= self._reserved:
+            raise RuntimeError(
+                "KDA TP PD staging: no stage to reserve (check has_room first)"
+            )
+        self._reserved += 1
+
+    def unreserve(self) -> None:
+        """Drop the reservation of a request that left before its ``assign``."""
+        if self._reserved <= 0:
+            raise RuntimeError("KDA TP PD staging: unreserve without a reservation")
+        self._reserved -= 1
+
+    def rekey(self, key: int, slot: int) -> None:
+        """Move a lazily keyed stage (lazy_stage_key) to the state slot its request was
+        given at admission; the import then writes into that slot."""
+        if key not in self._stage_of:
+            raise RuntimeError(f"KDA TP PD staging: key {key} has no staged state")
+        if slot in self._stage_of:
+            # The slot was freed and reallocated without release_slot (as in assign).
+            self.release_slot(slot)
+        if key in self._pending:
+            raise RuntimeError(
+                f"KDA TP PD staging: key {key} was queued before admission"
+            )
+        self._stage_of[slot] = self._stage_of.pop(key)
+
+    def assign(self, slot: int, reserved: bool = False) -> int:
+        if slot in self._stage_of:
+            # The slot was freed and reallocated without release_slot.
+            self.release_slot(slot)
+        if reserved:
+            self.unreserve()
+        if len(self._free) <= self._reserved:
+            raise RuntimeError(
+                "KDA TP PD staging: no free stage (check has_room first)"
+            )
+        stage = self._free.pop()
+        self._stage_of[slot] = stage
+        return stage
+
+    def queue_import(self, slot: int) -> None:
+        if slot not in self._stage_of:
+            raise RuntimeError(f"KDA TP PD staging: slot {slot} has no staged state")
+        if slot not in self._pending:
+            self._pending.append(slot)
+
+    def take_pending(self) -> List[Tuple[int, int]]:
+        """(stage, slot) of every request queued since the last call."""
+        out = [(self._stage_of[s], s) for s in self._pending]
+        self._pending = []
+        return out
+
+    def finish_import(self, pairs: List[Tuple[int, int]], event) -> None:
+        stages = []
+        for stage, slot in pairs:
+            if self._stage_of.get(slot) == stage:
+                del self._stage_of[slot]
+                stages.append(stage)
+        if stages:
+            self._draining.append((event, stages))
+
+    def release_slot(self, slot: int) -> None:
+        stage = self._stage_of.pop(slot, None)
+        if stage is None:
+            return
+        if slot in self._pending:
+            self._pending.remove(slot)
+        self._free.append(stage)
+
+    def import_states(
+        self, mamba_pool, local: List[Tuple[int, int]], counts: List[int]
+    ) -> None:
+        """Collective over the TP group (every rank, counts from the MLP sync): write rank r's
+        heads of every DP rank's staged states into the requests' global slots."""
+        dev = self.temporal.device
+        slots = torch.tensor([s for _, s in local], dtype=torch.int64, device=dev)
+        gathered = all_gather_padded(slots, max(counts), -1).view(
+            group().world_size, max(counts)
+        )
+        dst = torch.cat(
+            [gathered[j, : counts[j]] for j in range(len(counts)) if counts[j]]
+        )
+        self.scatter(mamba_pool, [st for st, _ in local], counts, dst)
+        event = None
+        if dev.type == "cuda":
+            event = torch.cuda.Event()
+            event.record()
+        self.finish_import(local, event)
+
+
+def run_pd_imports(pool, forward_batch) -> None:
+    """Import the PD-received states the MLP sync advertised for this forward (every rank,
+    before the KDA layers or a graph replay read them)."""
+    counts = forward_batch.dp_kda_tp_state_imports
+    local = forward_batch.kda_tp_state_imports or []
+    forward_batch.kda_tp_state_imports = None
+    if not counts or not any(counts):
+        return
+    staging = pool.mamba_pool.pd_staging
+    if staging is None:
+        raise RuntimeError("KDA TP: state imports advertised without PD staging")
+    rank = get_parallel().attn_dp_rank
+    if len(local) != counts[rank]:
+        raise RuntimeError(
+            f"KDA TP: {len(local)} local state imports, MLP sync advertised {counts[rank]}"
+        )
+    staging.import_states(pool.mamba_pool, local, counts)

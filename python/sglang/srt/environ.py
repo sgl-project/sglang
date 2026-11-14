@@ -2530,6 +2530,13 @@ class Envs:
     # all-gather / reduce-scatter on K3's GB300 push collectives over the TP group; 0 keeps
     # NCCL.
     SGLANG_K3_SHARED_TP_SP_COMM = EnvBool(True)
+    # --enable-kda-tp on a PD decode worker: full-width staging slots per rank that receive
+    # prefill KDA state (0.43 GB each for K3) until every rank imports its heads. Bounds
+    # the requests a rank has in transfer at once.
+    SGLANG_K3_KDA_TP_PD_STAGING_SLOTS = EnvInt(4)
+    # --enable-kda-tp PD decode: a request in its handoff holds only its staging slot; its
+    # head-sharded state slot is allocated when it joins the running batch.
+    SGLANG_K3_KDA_TP_LAZY_MAMBA_SLOT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

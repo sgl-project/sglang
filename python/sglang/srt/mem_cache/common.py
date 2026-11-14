@@ -285,14 +285,20 @@ def _evict_until_allocatable(
 def retraction_needs_rebootstrap(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> bool:
+    """Whether a retracted PD decode request is recomputed by the prefill instead of
+    backed up."""
+    from sglang.srt.layers.communication import k3_kda_tp
     from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     # Neither a DeepSeek-V4 pool nor a HiSparse allocator can take a host copy of a
-    # retracted request's KV, so the prefill recomputes it.
-    return isinstance(
-        token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
-    ) or isinstance(token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool)
+    # retracted request's KV, and under KDA TP a rank's host copy would hold only its
+    # own heads of the request's state, so the prefill recomputes it.
+    return (
+        isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator)
+        or isinstance(token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool)
+        or k3_kda_tp.state_shard_width() > 1
+    )
 
 
 def backup_kv_cache(

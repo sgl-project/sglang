@@ -109,7 +109,9 @@ class StateStorage:
 
     def pending_request_slots(self, table, req: Req) -> int:
         """Slots acquire will allocate for this request's working/tracking state."""
-        return int(not req.kv.holds_mamba) + (
+        return int(
+            not req.kv.holds_mamba and not getattr(req, "kda_tp_lazy_mamba", False)
+        ) + (
             table.mamba_initial_tracking_slots
             if table.enable_mamba_extra_buffer
             and req.kv.mamba_ping_pong_track_buffer is None
@@ -140,8 +142,22 @@ class StateStorage:
         hands out nothing."""
         assert len(rows) == len(reqs)
         tracking = table.enable_mamba_extra_buffer
-        needing = [req for req in reqs if not req.kv.holds_mamba]
-        needing_rows = [row for req, row in zip(reqs, rows) if not req.kv.holds_mamba]
+        # A KDA TP PD decode request in its handoff (kda_tp_lazy_mamba) takes
+        # its state slot at admission instead (_admit_lazy_mamba_slot).
+        lazy = [
+            getattr(req, "kda_tp_lazy_mamba", False) and not req.kv.holds_mamba
+            for req in reqs
+        ]
+        needing = [
+            req
+            for req, is_lazy in zip(reqs, lazy)
+            if not req.kv.holds_mamba and not is_lazy
+        ]
+        needing_rows = [
+            row
+            for req, row, is_lazy in zip(reqs, rows, lazy)
+            if not req.kv.holds_mamba and not is_lazy
+        ]
         untracked = (
             [req for req in reqs if req.kv.mamba_ping_pong_track_buffer is None]
             if tracking
@@ -184,7 +200,15 @@ class StateStorage:
         mamba_index_tensor = (
             mids
             if mids is not None and len(needing) == len(reqs)
-            else torch.stack([req.kv.mamba_pool_idx for req in reqs])
+            else torch.stack(
+                [
+                    # The padding slot until _admit_lazy_mamba_slot binds a real one.
+                    torch.zeros((), dtype=torch.int32, device=table.device)
+                    if is_lazy
+                    else req.kv.mamba_pool_idx.to(torch.int32)
+                    for req, is_lazy in zip(reqs, lazy)
+                ]
+            )
         ).to(dtype=torch.int32)
         table.req_index_to_mamba_index_mapping[row_ids] = mamba_index_tensor
         if tracking:
@@ -262,6 +286,16 @@ class StateStorage:
         the one kept for the radix cache. The request drops the slot tensors
         it frees here, so an open free group holds them without a copy."""
         mamba_index = req.kv.mamba_pool_idx
+        staged_slot = getattr(req, "kda_tp_staged_slot", None)
+        if staged_slot is not None:
+            self.pool.pd_staging.release_slot(staged_slot)
+            req.kda_tp_staged_slot = None
+        elif mamba_index is not None and self.pool.pd_staging is not None:
+            # Prebuilt completion can return the slot before a forward imports it.
+            self.pool.pd_staging.release_slot(int(mamba_index))
+        if mamba_index is None and getattr(req, "kda_tp_lazy_mamba", False):
+            req.kda_tp_lazy_mamba = False
+            return
         assert mamba_index is not None, "double free? mamba_index is None"
         self.slots.free(mamba_index.unsqueeze(0), owned=True)
         req.kv.mamba_pool_idx = None
