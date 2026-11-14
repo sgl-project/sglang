@@ -368,7 +368,9 @@ class TestMatchSequences:
         )
         assert matched == []
 
-    def test_prefix_tie_breaks_by_first_candidate_and_ignores_unrelated_first_tokens(self):
+    def test_prefix_tie_breaks_by_first_candidate_and_ignores_unrelated_first_tokens(
+        self,
+    ):
         """Prefix matching ignores unrelated first tokens and preserves tie-break order."""
         matched = _match_seqs(
             x={0: (99, 1, 2), 1: (10, 20), 2: (10, 20), 3: (50, 60)},
