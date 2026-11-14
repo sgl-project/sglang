@@ -108,6 +108,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    SHAPE_AWARE = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -123,6 +124,8 @@ class DPBudget:
         self.num_dp_ranks = num_dp_ranks
         self.total_requests = [0] * num_dp_ranks
         self.total_tokens = [0] * num_dp_ranks
+        self.input_token_load = [0] * num_dp_ranks
+        self.output_token_load = [0] * num_dp_ranks
         self.last_timestamp = [0.0] * num_dp_ranks
 
     def update_budget(self, loads):
@@ -135,8 +138,20 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.input_token_load[load.dp_rank] = load.input_token_load
+            self.output_token_load[load.dp_rank] = load.output_token_load
 
-    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
+    def dispatch(
+        self,
+        method: LoadBalanceMethod,
+        estimated_tokens: int = 0,
+        estimated_input_tokens: int = 0,
+        estimated_output_tokens: int = 0,
+        eligible_ranks: list[int] | None = None,
+    ):
+        ranks = (
+            eligible_ranks if eligible_ranks is not None else range(self.num_dp_ranks)
+        )
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
@@ -145,12 +160,26 @@ class DPBudget:
                 range(self.num_dp_ranks),
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
+        elif method == LoadBalanceMethod.SHAPE_AWARE:
+            target_rank = min(
+                ranks,
+                key=lambda i: (
+                    max(
+                        self.input_token_load[i] + estimated_input_tokens,
+                        self.output_token_load[i] + estimated_output_tokens,
+                    ),
+                    self.total_requests[i],
+                    i,
+                ),
+            )
         else:
             return None
 
         # Increment the load of that worker by one as a heuristic
         self.total_requests[target_rank] += 1
         self.total_tokens[target_rank] += estimated_tokens
+        self.input_token_load[target_rank] += estimated_input_tokens
+        self.output_token_load[target_rank] += estimated_output_tokens
         return target_rank
 
 
@@ -190,11 +219,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.SHAPE_AWARE: self.shape_aware_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.SHAPE_AWARE,
         )
 
         parallel = get_parallel()
@@ -904,6 +935,39 @@ class DataParallelController:
         )
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+        )
+        sock_send(self.workers[target_worker], req)
+
+    def shape_aware_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        eligible_ranks = [
+            rank
+            for rank in self._active_workers
+            if self.status[rank] and self.workers[rank] is not None
+        ]
+        if not eligible_ranks:
+            raise RuntimeError("No active DP workers are available for routing.")
+        # input_embeds requests carry input_ids=None.
+        input_tokens = (
+            len(req.input_ids) if req.input_ids is not None else len(req.input_embeds)
+        )
+        # `None` (unbounded) must not score as 0 or shape-aware routing would
+        # favor it; clamp to the same ceiling `_estimated_output_tokens`
+        # (load_inquirer.py) uses post-admission.
+        max_new_tokens = req.sampling_params.max_new_tokens
+        output_token_ceiling = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+        output_tokens = (
+            output_token_ceiling
+            if max_new_tokens is None
+            else min(max_new_tokens, output_token_ceiling)
+        )
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.SHAPE_AWARE,
+            estimated_tokens=input_tokens,
+            estimated_input_tokens=input_tokens,
+            estimated_output_tokens=output_tokens,
+            eligible_ranks=eligible_ranks,
         )
         sock_send(self.workers[target_worker], req)
 

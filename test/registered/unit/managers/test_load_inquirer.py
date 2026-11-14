@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.decode import DecodeRequest
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
     SchedulePolicy,
@@ -84,7 +85,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         inquirer = self.make_inquirer(waiting_queue_prefix_matched=False)
 
         self.assertEqual(
-            SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
+            SchedulerLoadInquirer.get_input_token_load(inquirer),
             65,
         )
 
@@ -92,7 +93,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         inquirer = self.make_inquirer(waiting_queue_prefix_matched=True)
 
         self.assertEqual(
-            SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
+            SchedulerLoadInquirer.get_input_token_load(inquirer),
             120,
         )
 
@@ -109,7 +110,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         ):
             with self.subTest(span=span):
                 inquirer = self.make_inquirer(storage_span=span)
-                self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), expected)
+                self.assertEqual(inquirer.get_input_token_load(), expected)
                 inquirer.get_waiting_storage_span.assert_called_once_with(
                     CacheRequestHandle("waiting", 0)
                 )
@@ -165,7 +166,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
                     waiting_queue_prefix_matched=prefix_matched,
                     storage_span=(20, 80),
                 )
-                self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), expected)
+                self.assertEqual(inquirer.get_input_token_load(), expected)
                 if not prefix_matched:
                     inquirer.get_waiting_storage_span.assert_not_called()
 
@@ -177,7 +178,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
                     storage_span=(20, 100),
                     disaggregation_mode=DisaggregationMode.DECODE,
                 )
-                self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), 0)
+                self.assertEqual(inquirer.get_input_token_load(), 0)
                 inquirer.get_waiting_storage_span.assert_not_called()
 
     def test_storage_exclusion_preserves_the_historical_hit_rate_estimate(self):
@@ -187,7 +188,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
                     waiting_queue_prefix_matched=False,
                     storage_span=span,
                 )
-                self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), 65)
+                self.assertEqual(inquirer.get_input_token_load(), 65)
                 inquirer.get_waiting_storage_span.assert_not_called()
 
     def test_historical_estimate_already_includes_storage_hits(self):
@@ -207,7 +208,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         )
 
         # One 80-token storage hit and one cold prompt need 20 + 100 tokens.
-        self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), 120)
+        self.assertEqual(inquirer.get_input_token_load(), 120)
         get_storage_span.assert_not_called()
 
     def test_storage_exclusion_without_a_provider_keeps_the_original_estimate(self):
@@ -215,7 +216,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             self.make_inquirer(),
             get_waiting_storage_span=None,
         )
-        self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), 120)
+        self.assertEqual(inquirer.get_input_token_load(), 120)
 
     def test_scheduler_wires_storage_provider(self):
         from sglang.srt.managers.scheduler import Scheduler
@@ -244,8 +245,69 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
 
         inquirer = scheduler.load_inquirer
         self.assertIs(inquirer.get_waiting_storage_span, get_storage_span)
-        self.assertEqual(inquirer.get_num_waiting_uncached_tokens(), 20)
+        self.assertEqual(inquirer.get_input_token_load(), 20)
         get_storage_span.assert_called_once_with(req.cache_request_handle)
+
+    def test_output_token_load_counts_total_generation_including_decoded(self):
+        """The 25 tokens `running` has already emitted stay in its score: the
+        load is the request's whole estimated generation, not what is left, so
+        it matches what the DP controller charged the rank at dispatch."""
+        running = SimpleNamespace(
+            sampling_params=SimpleNamespace(max_new_tokens=100),
+            output_ids=list(range(25)),
+        )
+        waiting = SimpleNamespace(
+            sampling_params=SimpleNamespace(max_new_tokens=40),
+            output_ids=[],
+        )
+        inquirer = SimpleNamespace(
+            get_running_batch=lambda: SimpleNamespace(reqs=[running]),
+            get_waiting_queue=lambda: [waiting],
+            get_chunked_req=lambda: None,
+        )
+
+        self.assertEqual(
+            SchedulerLoadInquirer.get_output_token_load(inquirer),
+            140,
+        )
+
+    def test_output_token_load_clamps_unbounded_request_to_ceiling(self):
+        """A `max_new_tokens=None` request is resolved scheduler-side to a
+        context-sized cap; scoring it at face value would let one request swamp
+        the rank's decode score, so it is clamped to
+        `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION`."""
+        unbounded = SimpleNamespace(
+            sampling_params=SimpleNamespace(max_new_tokens=131_000),
+            output_ids=[],
+        )
+        short = SimpleNamespace(
+            sampling_params=SimpleNamespace(max_new_tokens=40),
+            output_ids=[],
+        )
+        inquirer = SimpleNamespace(
+            get_running_batch=lambda: SimpleNamespace(reqs=[unbounded]),
+            get_waiting_queue=lambda: [short],
+            get_chunked_req=lambda: None,
+        )
+
+        with envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.override(4096):
+            self.assertEqual(
+                SchedulerLoadInquirer.get_output_token_load(inquirer),
+                4096 + 40,
+            )
+
+    def test_output_token_load_includes_chunked_req(self):
+        chunked = SimpleNamespace(
+            sampling_params=SimpleNamespace(max_new_tokens=30),
+            output_ids=[],
+        )
+        inquirer = SimpleNamespace(
+            get_running_batch=lambda: SimpleNamespace(reqs=[]),
+            get_waiting_queue=lambda: [],
+            get_chunked_req=lambda: chunked,
+        )
+
+        self.assertEqual(SchedulerLoadInquirer.get_output_token_load(inquirer), 30)
 
 
 if __name__ == "__main__":

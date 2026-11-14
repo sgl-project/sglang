@@ -26,6 +26,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
@@ -104,6 +105,7 @@ def _req(
         bootstrap_room=bootstrap_room,
         input_ids=None if input_embeds is not None else (input_ids or []),
         input_embeds=input_embeds,
+        sampling_params=SimpleNamespace(max_new_tokens=0),
     )
 
 
@@ -328,6 +330,35 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_tokens, [100, 50, 300])
 
 
+class TestDPBudgetShapeAware(CustomTestCase):
+    def test_shape_aware_balances_post_admission_bottleneck(self):
+        budget = DPBudget(num_dp_ranks=3)
+        budget.input_token_load = [100, 20, 60]
+        budget.output_token_load = [10, 90, 50]
+
+        rank = budget.dispatch(
+            LoadBalanceMethod.SHAPE_AWARE,
+            estimated_input_tokens=20,
+            estimated_output_tokens=20,
+        )
+
+        self.assertEqual(rank, 2)
+        self.assertEqual(budget.input_token_load, [100, 20, 80])
+        self.assertEqual(budget.output_token_load, [10, 90, 70])
+
+    def test_shape_aware_only_considers_eligible_ranks(self):
+        budget = DPBudget(num_dp_ranks=3)
+        budget.input_token_load = [0, 20, 40]
+        budget.output_token_load = [0, 20, 40]
+
+        rank = budget.dispatch(
+            LoadBalanceMethod.SHAPE_AWARE,
+            eligible_ranks=[1, 2],
+        )
+
+        self.assertEqual(rank, 1)
+
+
 class TestRoundRobinScheduler(CustomTestCase):
     def test_cycles_through_active_workers_in_order(self):
         ctl = _make_controller(num_dp_ranks=4)
@@ -520,6 +551,64 @@ class TestTotalTokensScheduler(CustomTestCase):
         ctl.workers[1].send_pyobj.assert_called_once()
         ctl.workers[0].send_pyobj.assert_not_called()
         self.assertEqual(ctl.dp_budget.total_tokens, [10, 3])
+
+
+class TestShapeAwareScheduler(CustomTestCase):
+    def test_dispatches_using_prompt_and_requested_output_shape(self):
+        ctl = _make_controller(num_dp_ranks=3)
+        ctl.dp_budget.input_token_load = [100, 20, 60]
+        ctl.dp_budget.output_token_load = [10, 90, 50]
+        req = _req(input_ids=list(range(20)))
+        req.sampling_params.max_new_tokens = 20
+
+        ctl.shape_aware_scheduler(req)
+
+        ctl.workers[2].send_pyobj.assert_called_once_with(req)
+
+    def test_skips_inactive_worker_even_when_it_has_lowest_load(self):
+        ctl = _make_controller(num_dp_ranks=3)
+        ctl.dp_budget.input_token_load = [100, 0, 50]
+        ctl.dp_budget.output_token_load = [100, 0, 50]
+        ctl.status[1] = False
+
+        ctl.shape_aware_scheduler(_req(input_ids=[1]))
+
+        ctl.workers[2].send_pyobj.assert_called_once()
+        ctl.workers[1].send_pyobj.assert_not_called()
+
+    def test_unbounded_output_scores_as_ceiling_not_zero(self):
+        """`max_new_tokens=None` (the /v1/chat/completions default) reaches the
+        controller unresolved. Scoring it as 0 would make unbounded requests --
+        the heaviest decode load there is -- look free to route."""
+        ctl = _make_controller(num_dp_ranks=2)
+        req = _req(input_ids=[1, 2, 3])
+        req.sampling_params.max_new_tokens = None
+
+        with envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.override(4096):
+            ctl.shape_aware_scheduler(req)
+
+        self.assertEqual(ctl.dp_budget.output_token_load, [4096, 0])
+
+    def test_output_estimate_is_clamped_to_ceiling(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        req = _req(input_ids=[1])
+        req.sampling_params.max_new_tokens = 131_000
+
+        with envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.override(4096):
+            ctl.shape_aware_scheduler(req)
+
+        self.assertEqual(ctl.dp_budget.output_token_load, [4096, 0])
+
+    def test_routed_dp_rank_bypasses_shape_budget(self):
+        ctl = _make_controller(num_dp_ranks=3)
+        before_input = ctl.dp_budget.input_token_load.copy()
+        before_output = ctl.dp_budget.output_token_load.copy()
+
+        ctl.shape_aware_scheduler(_req(routed_dp_rank=1, input_ids=[1, 2]))
+
+        ctl.workers[1].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.dp_budget.input_token_load, before_input)
+        self.assertEqual(ctl.dp_budget.output_token_load, before_output)
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):
