@@ -133,7 +133,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import discard_shm_features, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.req_types import (
@@ -254,6 +254,11 @@ def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     )
     if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
+
+
+def _discard_wrapped_shm_features(future: asyncio.Future) -> None:
+    if not future.cancelled() and future.exception() is None:
+        discard_shm_features(future.result())
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -1895,7 +1900,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             )
             if self._skip_dispatch_if_aborted(tokenized_obj.rid):
-                self._cancel_cuda_ipc_features((tokenized_obj,))
                 return
             prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(
                 (tokenized_obj,)
@@ -1905,7 +1909,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 hook.on_request_dispatched(
                     rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
                 )
-            tokenized_obj = wrap_shm_features(tokenized_obj)
+            tokenized_obj = await self._wrap_shm_features_async(tokenized_obj)
+            if self._skip_dispatch_if_aborted(tokenized_obj.rid):
+                discard_shm_features(tokenized_obj)
+                return
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
@@ -1920,6 +1927,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+                self._cancel_cuda_ipc_features((tokenized_obj,))
 
     def _drop_aborted_before_dispatch(self, tokenized_objs):
         """Return *tokenized_objs* without the requests aborted before dispatch.
@@ -1984,6 +1992,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for tensor in (item.feature, item.precomputed_embeddings):
                     if isinstance(tensor, CudaIpcTensorTransportProxy):
                         pool.cancel_proxy(tensor)
+
+    async def _wrap_shm_features_async(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
+        """Copy features into shared memory without blocking the event loop.
+
+        Decoded images reach hundreds of MB per request; copying them on the
+        loop stalls every other request and the health endpoint.
+        """
+        if tokenized_obj.mm_inputs is None:
+            return tokenized_obj
+        future = asyncio.get_running_loop().run_in_executor(
+            None, wrap_shm_features, tokenized_obj
+        )
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # cleanup must survive a second task cancellation or loop shutdown
+            future.add_done_callback(_discard_wrapped_shm_features)
+            raise
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
