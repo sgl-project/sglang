@@ -44,6 +44,20 @@ def register_kv_shard_transfer_backend(name: str) -> None:
     _KV_SHARD_TRANSFER_BACKENDS.add(name)
 
 
+# HiCache storage backends whose reads and writes cover only each shard rank's
+# own pages. None upstream.
+_KV_SHARD_STORAGE_BACKENDS: set = set()
+
+
+def register_kv_shard_storage_backend(name: str) -> None:
+    """Admit an out-of-tree HiCache storage backend for KV sharding."""
+    _KV_SHARD_STORAGE_BACKENDS.add(name)
+
+
+def kv_shard_storage_backend_supported(name: Optional[str]) -> bool:
+    return name in _KV_SHARD_STORAGE_BACKENDS
+
+
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
@@ -195,7 +209,11 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "--enable-kv-cache-sharding and --cp-kv-layout cannot be combined: "
             "each sets the KV cache layout across the prefill CP ranks."
         )
-    if cfg.enable_hierarchical_cache and cfg.hicache_storage_backend is not None:
+    if (
+        cfg.enable_hierarchical_cache
+        and cfg.hicache_storage_backend is not None
+        and not kv_shard_storage_backend_supported(cfg.hicache_storage_backend)
+    ):
         raise ValueError(
             "--enable-kv-cache-sharding supports HiCache host offload but not "
             "--hicache-storage-backend yet: the storage path reads and writes "

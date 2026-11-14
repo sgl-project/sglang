@@ -1530,6 +1530,7 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -4556,7 +4557,10 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        # After the early returns, so a full-batch pass does not scan the queue.
+        self._ack_waiting_health_checks()
         # Get priority queue
+        self.policy.poll_storage_prefetches(self.waiting_queue)
         self.waiting_queue.reorder(
             self.policy.calc_priority(
                 self.waiting_queue,
@@ -4622,6 +4626,7 @@ class Scheduler(
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                processed_tokens=self.processed_tokens_counter,
             )
             if adder.add_chunked_req(resumed_req) is None:
                 # Its last chunk is in this batch.
@@ -5009,8 +5014,9 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
-        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
-        if batch.extend_num_tokens:
+        # Accumulate the prefill-token counter used for HRRN and shortest-prefill-first aging.
+        # A batch reused for decode keeps its stale extend_num_tokens, so count extend batches only.
+        if batch.forward_mode.is_extend() and batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
 
         if self.scripted_scheduler_hook is not None:
@@ -5854,6 +5860,25 @@ class Scheduler(
                 step_us,
                 result.get_num_generated_tokens(batch_size),
             )
+
+    def _ack_waiting_health_checks(self) -> None:
+        probes = [r for r in self.waiting_queue if is_health_check_generate_req(r)]
+        # A lone probe runs: its forward pass is the check. Behind a prompt or a
+        # chunked prefill it would wait out every chunk, so it is acknowledged.
+        if not probes or (
+            len(probes) == len(self.waiting_queue) and self.chunked_req is None
+        ):
+            return
+        is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        for probe in probes:
+            self.return_health_check_ipcs.append(probe.http_worker_ipc)
+            # The acknowledgement is the probe's final output.
+            record_send(probe, "health_check")
+            # Released as _abort_waiting does, without an abort to the tokenizer.
+            if is_prefill:
+                self.release_prefill_sender(probe, abort_sender=True)
+            probe.finish_outside_step(FINISH_ABORT())
+            self.request_retirer.release(probe, checkpoint=False)
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
