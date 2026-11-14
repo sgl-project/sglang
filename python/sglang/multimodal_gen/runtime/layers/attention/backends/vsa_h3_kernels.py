@@ -564,7 +564,21 @@ def vsa_h3_gate_add(
     )
 
 
-@triton.jit
+# The tile counts, the strides and the alignment of `out` (the lists from row
+# `prefix` on) follow the prompt length and duration; specializing on them
+# compiled a new variant on the request path. Only VIDEO_POW2 picks one now.
+# The kernel only moves int32 tile indices, so the lists are unchanged.
+@triton.jit(
+    do_not_specialize=[
+        "num_video_tiles",
+        "prefix",
+        "stride_mh",
+        "stride_mr",
+        "stride_oh",
+        "stride_or",
+    ],
+    do_not_specialize_on_alignment=["out_ptr"],
+)
 def _topk_lists_kernel(
     mask_ptr,
     out_ptr,
