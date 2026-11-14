@@ -37,6 +37,24 @@ def is_npu_arch35() -> bool:
     return acl.rt.get_device_info(0, 601) == (3510, 0)
 
 
+# SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
+# SoCs report higher values and share the same capability gates.
+ASCEND_950_SOC_VERSION = 260
+
+
+def is_ascend_950() -> bool:
+    """Whether the runtime SoC is Ascend 950 (Atlas A5) or a later aclnn-only SoC.
+
+    The SoC query initializes NPU state, so this must not be called before
+    device selection (see the deferred setup in ``init_npu_backend``).
+    """
+    if not _is_npu:
+        return False
+    from torch_npu.npu._backends import get_soc_version
+
+    return get_soc_version() >= ASCEND_950_SOC_VERSION
+
+
 def use_npu_arch35_mxfp8_wo_a(
     quant_config, wo_a_keeps_quant_config: Optional[bool] = None
 ) -> bool:
@@ -236,10 +254,19 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
-        logger.warning("NPU custom kernel packages unavailable: %s", e)
+        logger.warning("Failed to import NPU kernel package 'sgl_kernel_npu': %s", e)
+
+    try:
+        import custom_ops  # noqa: F401
+    except ImportError as e:
+        if not (
+            "sglang.multimodal_gen" in sys.modules
+            and isinstance(e, ModuleNotFoundError)
+            and e.name == "custom_ops"
+        ):
+            logger.warning("Failed to import NPU kernel package 'custom_ops': %s", e)
 
     import torch_npu
 
@@ -250,7 +277,13 @@ def init_npu_backend():
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
-        torch_npu.npu.config.allow_internal_format = True
+
+        def configure_internal_format():
+            if not is_ascend_950():
+                torch_npu.npu.config.allow_internal_format = True
+
+        # The SoC query initializes NPU state; defer it until device selection.
+        torch_npu.npu._lazy_call(configure_internal_format)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
