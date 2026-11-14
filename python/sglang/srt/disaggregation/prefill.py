@@ -249,6 +249,10 @@ def _send_done(peer) -> bool:
     sender, queued_before = peer
     manager, room = sender.kv_mgr, sender.bootstrap_room
     if manager.request_status.get(room, KVPoll.Failed) == KVPoll.Failed:
+        if getattr(manager, "kvserve_enabled", False):
+            # A failed codec may still be reading these pages. The sender's
+            # gate closes admission and reports when those readers drain.
+            return sender.is_source_release_safe()
         # TODO(ch-wan): a failed or cleared room's send is released without
         # quiescence, so a move or reuse can land under a send still reading;
         # those bytes reach only the failed request's never-served destination.
@@ -472,7 +476,10 @@ class PrefillBootstrapQueue:
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
-            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            (
+                envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+                or getattr(kv_manager, "kvserve_enabled", False)
+            )
             and hasattr(kv_manager, "set_kv_buffer_tensors")
             and not self.is_mla_backend
         ):
@@ -491,6 +498,8 @@ class PrefillBootstrapQueue:
                     kv_pool.page_size,
                     slot_layer_ids=slot_layer_ids,
                 )
+        if getattr(kv_manager, "kvserve_enabled", False) and kv_manager.kvserve is None:
+            raise ValueError("KVServe requires a supported full-attention KV pool")
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> None:
@@ -689,10 +698,11 @@ class SchedulerDisaggregationPrefillMixin:
 
     def release_prefill_sender(
         self: Scheduler, req: Req, *, abort_sender: bool
-    ) -> None:
+    ) -> bool:
         """Release a retiring request's KV send and its metadata buffer.
         ``abort_sender`` aborts a live sender and clears its room; a failed one
-        already concluded through ``failure_exception``."""
+        already concluded through ``failure_exception``. Return whether KVServe
+        must defer releasing the request until source readers finish."""
         if abort_sender and req.disagg_kv_sender is not None:
             try:
                 req.disagg_kv_sender.abort()
@@ -700,12 +710,39 @@ class SchedulerDisaggregationPrefillMixin:
                 # Transport notification is best effort; local ownership must
                 # still be released or the next idle invariant check will fail.
                 logger.exception("Failed to notify KV sender of abort for %s", req.rid)
+            if self.defer_aborted_kvserve_source_release(req):
+                return True
             try:
                 req.disagg_kv_sender.clear()
             except Exception:
                 logger.exception("Failed to clear KV sender for %s", req.rid)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
+        return False
+
+    def defer_aborted_kvserve_source_release(self: Scheduler, req: Req) -> bool:
+        """Keep source pages owned until a cancelled codec reader has drained.
+
+        The sender must already be aborted, so queued chunks cannot start a new
+        read after this CPU-only ownership check. Terminal polling then releases
+        pages on this same scheduler thread through the normal failure path.
+        """
+        sender = getattr(req, "disagg_kv_sender", None)
+        safe = getattr(sender, "is_source_release_safe", None)
+        if safe is None or not getattr(
+            getattr(sender, "kv_mgr", None), "kvserve_enabled", False
+        ):
+            return False
+        # A later overlapping forward result may retire the same request after
+        # the codec has drained. The transfer queue remains the unique releaser.
+        if req.owner_list is self.disagg_prefill_transfer_queue:
+            req.pending_bootstrap = False
+            return True
+        if safe():
+            return False
+        req.pending_bootstrap = False
+        move([req], self.disagg_prefill_transfer_queue)
+        return True
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
@@ -1452,9 +1489,14 @@ class SchedulerDisaggregationPrefillMixin:
                     self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
+        output_reqs = [
+            req
+            for req in done_reqs
+            if not getattr(req, "_kvserve_abort_output_sent", False)
+        ]
         self.output_streamer.stream_output(
-            done_reqs,
-            any(req.return_logprob for req in done_reqs),
+            output_reqs,
+            any(req.return_logprob for req in output_reqs),
             None,
         )
         for req in done_reqs:
@@ -1506,11 +1548,14 @@ class SchedulerDisaggregationPrefillMixin:
 
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
-        self.release_prefill_sender(req, abort_sender=True)
+        if self.release_prefill_sender(req, abort_sender=True):
+            return False
         self.request_retirer.release(req, checkpoint=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+        if self.defer_aborted_kvserve_source_release(req):
+            return
         error_message = (
             f"Prefill bootstrap failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"

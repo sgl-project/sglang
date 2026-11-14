@@ -3898,7 +3898,9 @@ class Scheduler(
             return False
         return True
 
-    def _abort_unavailable(self, req: Req, *, message: str) -> None:
+    def _abort_unavailable(
+        self, req: Req, *, message: str, defer_release: bool = False
+    ) -> None:
         self.request_retirer.abort(
             req,
             reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
@@ -3907,7 +3909,10 @@ class Scheduler(
                 "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                 "message": message,
             },
+            defer_release=defer_release,
         )
+        if defer_release:
+            req._kvserve_abort_output_sent = True
         req.time_stats.trace_ctx.abort(abort_info={"reason": message})
 
     def _abort_uocr_doc_windows(
@@ -4176,12 +4181,17 @@ class Scheduler(
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.clear_requested_finish()
+        defer_source_release = False
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.release_prefill_sender(req, abort_sender=True)
+            defer_source_release = self.release_prefill_sender(req, abort_sender=True)
         # A client abort leaves the message to the tokenizer.
         self.request_retirer.abort(
-            req, finished_reason=req.discard_output_reason and reason.to_json()
+            req,
+            finished_reason=req.discard_output_reason and reason.to_json(),
+            defer_release=defer_source_release,
         )
+        if defer_source_release:
+            req._kvserve_abort_output_sent = True
 
         self._pending_chunked_abort_req = None
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
@@ -4781,9 +4791,12 @@ class Scheduler(
                 break
 
         for req in unschedulable:
+            defer_source_release = False
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # As a queued abort: the sender goes before the KV it reads.
-                self.release_prefill_sender(req, abort_sender=True)
+                defer_source_release = self.release_prefill_sender(
+                    req, abort_sender=True
+                )
             self._abort_unavailable(
                 req,
                 message=(
@@ -4791,6 +4804,7 @@ class Scheduler(
                     "pool only once memory held elsewhere is freed, and "
                     "nothing that holds memory will free it."
                 ),
+                defer_release=defer_source_release,
             )
 
         if mamba_allocator is not None:
@@ -5875,10 +5889,14 @@ class Scheduler(
             # The acknowledgement is the probe's final output.
             record_send(probe, "health_check")
             # Released as _abort_waiting does, without an abort to the tokenizer.
-            if is_prefill:
-                self.release_prefill_sender(probe, abort_sender=True)
+            defer_source_release = is_prefill and self.release_prefill_sender(
+                probe, abort_sender=True
+            )
             probe.finish_outside_step(FINISH_ABORT())
-            self.request_retirer.release(probe, checkpoint=False)
+            if defer_source_release:
+                probe._kvserve_abort_output_sent = True
+            else:
+                self.request_retirer.release(probe, checkpoint=False)
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
@@ -6444,15 +6462,23 @@ class Scheduler(
         is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
         for req in [r for r in self.waiting_queue if recv_req.matches(r.rid)]:
+            defer_source_release = False
             if is_prefill:
                 # A PD prefill request may hold KV its sender still reads; abort
                 # the sender before that KV is freed.
-                self.release_prefill_sender(req, abort_sender=True)
+                defer_source_release = self.release_prefill_sender(
+                    req, abort_sender=True
+                )
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.request_retirer.abort(
-                req, finished_reason=recv_req.finished_reason, checkpoint=is_decode
+                req,
+                finished_reason=recv_req.finished_reason,
+                checkpoint=is_decode,
+                defer_release=defer_source_release,
             )
+            if defer_source_release:
+                req._kvserve_abort_output_sent = True
             logger.debug(f"Abort queued request. {req.rid=}")
 
     def _abort_chunked(self, recv_req: AbortReq) -> None:

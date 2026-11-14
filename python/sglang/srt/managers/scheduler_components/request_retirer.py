@@ -59,18 +59,21 @@ class RequestRetirer:
         reason: Optional[FINISH_ABORT] = None,
         finished_reason: Optional[FinishReasonDict] = None,
         checkpoint: bool = False,
+        defer_release: bool = False,
     ) -> None:
         """Abort a request no launched step reports: one aborted in a queue or
         the chunked slot, or refused at the waiting-queue door. ``reason`` is the
         request's own finish reason and ``finished_reason`` what the tokenizer
-        receives."""
+        receives. With ``defer_release``, the caller must retain the request and
+        release it after its outstanding readers have finished."""
         # Finished in place, so a later abort in the same intake skips it.
         if req.finished_reason is None:
             req.finish_outside_step(reason or FINISH_ABORT())
         self.send_abort_output(
             make_abort_req(req, finished_reason=finished_reason), req
         )
-        self.release(req, checkpoint=checkpoint)
+        if not defer_release:
+            self.release(req, checkpoint=checkpoint)
 
     def retire_unadmitted(self, req: Req) -> None:
         """Finish a request rejected before it was queued. It holds no device KV,

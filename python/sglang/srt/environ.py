@@ -936,6 +936,11 @@ class Envs:
     # KV-transfer staging and Mooncake transport
     # ===================================================================
     # Staging buffer for heterogeneous TP KV transfer
+    # Optional fixed-profile KVServe compression of Mooncake PD transfers.
+    SGLANG_KVSERVE_CONFIG = EnvStr(None)
+    SGLANG_KVSERVE_STATS = EnvStr(None)
+    SGLANG_KVSERVE_VERIFY = EnvBool(False)
+
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     SGLANG_ENABLE_NIXL_KV_PACKING = EnvBool(False)
