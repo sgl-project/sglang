@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
@@ -544,8 +545,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         if enable_override is False:
             # The per-request kill switch wins over quality="high".
             desired_mode = None
-        elif batch.sampling_params.enable_spectrum:
-            # Spectrum skips the block stack; Cache-DiT wraps those blocks.
+        elif (
+            batch.sampling_params.enable_spectrum
+            or batch.sampling_params.enable_teacache
+            or envs.SGLANG_TEACACHE_CALIBRATE
+        ):
+            # skip-step accelerators and calibration own the unwrapped block stack
             desired_mode = None
         elif quality == "high":
             desired_mode = "high"
@@ -859,6 +864,23 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            # Arm/reset lossy TeaCache for this generation (no-op unless the DiT
+            # exposes it; also resets per-step state so calibration counts cleanly).
+            if hasattr(model, "h3_teacache_configure"):
+                tcp = getattr(sampling, "teacache_params", None)
+                num_steps = len(sigmas_video) - 1
+                if tcp is not None:
+                    start, end = tcp.get_skip_step_range(num_steps)
+                else:
+                    start, end = 1, num_steps - 1
+                # Lossy opt-in; lossless+teacache is already rejected in _validate.
+                model.h3_teacache_configure(
+                    enabled=bool(getattr(sampling, "enable_teacache", False)),
+                    coefficients=(tcp.get_coefficients() if tcp is not None else None),
+                    thresh=(tcp.get_thresh() if tcp is not None else 0.0),
+                    start_skipping=start,
+                    end_skipping=end,
+                )
             if model.final_layer._pdd_heads is not None:
                 initial_video, initial_audio = _scale_pdd_initial_noise(
                     ctx, positive, initial_video, initial_audio

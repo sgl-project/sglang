@@ -321,6 +321,10 @@ class DenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        # Tag MoE experts (Wan2.2) so TeaCache picks per-expert coefficients.
+        if transformer_2 is not None:
+            transformer._teacache_expert_tag = "high"
+            transformer_2._teacache_expert_tag = "low"
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         # Per-request Cache-DiT overrides for the batch being executed
@@ -603,7 +607,9 @@ class DenoisingStage(PipelineStage):
         over from the previous request.
         """
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            if batch.enable_teacache and hasattr(transformer, "reset_teacache_state"):
+            if (batch.enable_teacache or envs.SGLANG_TEACACHE_CALIBRATE) and hasattr(
+                transformer, "reset_teacache_state"
+            ):
                 transformer.reset_teacache_state()
             if batch.enable_spectrum and hasattr(transformer, "reset_spectrum_state"):
                 transformer.reset_spectrum_state(batch.spectrum_params)
