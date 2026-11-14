@@ -127,8 +127,8 @@ class TraceCustomIdGenerator(id_generator.IdGenerator):
     """Custom ID generator with support for pre-setting the next span ID.
 
     Why custom IDs are needed:
-      The default IdGenerator may produce duplicate trace IDs across
-      multiple TP scheduler processes.
+      IDs are drawn from the OS entropy pool. A PRNG may produce duplicate
+      IDs across scheduler processes forked or seeded at the same moment.
 
     Preset mechanism (used by async tracing):
       When SGLANG_TRACE_ASYNC=1, span creation is deferred to an exporter
@@ -147,14 +147,10 @@ class TraceCustomIdGenerator(id_generator.IdGenerator):
 
     # Thread-local storage for the next span ID to use preset.
     _preset_local = threading.local()
-
-    def __init__(self):
-        super().__init__()
-        self.local_random = random.Random()
-        self.local_random.seed(time.time())
+    _random = random.SystemRandom()
 
     def generate_trace_id(self) -> int:
-        return self.local_random.getrandbits(64)
+        return self._nonzero_bits(128)
 
     def generate_span_id(self) -> int:
         # If a preset span ID was injected, consume it (one-shot).
@@ -162,7 +158,13 @@ class TraceCustomIdGenerator(id_generator.IdGenerator):
         if preset is not None:
             self._preset_local.span_id = None
             return preset
-        return self.local_random.getrandbits(64)
+        return self._nonzero_bits(64)
+
+    def _nonzero_bits(self, bits: int) -> int:
+        # An all-zero ID is invalid in W3C trace context.
+        while True:
+            if value := self._random.getrandbits(bits):
+                return value
 
     @classmethod
     def preset_next_span_id(cls, span_id: int):
