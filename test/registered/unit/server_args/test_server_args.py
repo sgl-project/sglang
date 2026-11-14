@@ -2229,6 +2229,31 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(resolved_view(args).page_size, 128)
 
 
+class TestAiterWorkspaceMemFraction(CustomTestCase):
+    """Long-context aiter models keep 15% of the static fraction for workspace;
+    tlx extends the aiter backend and needs the same reservation."""
+
+    def _resolved_mem_fraction(self, attention_backend):
+        args = ServerArgs(model_path="dummy")
+        args.attention_backend = attention_backend
+        args.mem_fraction_static = 0.88
+        args._model_config = MagicMock(context_len=32768)
+
+        handle_attention_backend_compatibility(args)
+
+        from sglang.srt.arg_groups.model_override_base import resolved_view
+
+        return resolved_view(args).mem_fraction_static
+
+    @override_platform(is_hip=True)
+    def test_aiter_and_tlx_reserve_workspace(self):
+        for backend in ("aiter", "tlx"):
+            with self.subTest(backend=backend):
+                self.assertAlmostEqual(
+                    self._resolved_mem_fraction(backend), 0.88 * 0.85
+                )
+
+
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):
         self.parser = server_args_module.argparse.ArgumentParser()

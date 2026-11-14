@@ -92,6 +92,7 @@ ATTENTION_BACKEND_CHOICES = [
     "minicpm_flashinfer",
     # AMD specific
     "aiter",
+    "tlx",
     "wave",
     # Other platforms
     "intel_amx",

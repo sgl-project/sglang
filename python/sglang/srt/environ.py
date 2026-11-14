@@ -675,6 +675,10 @@ class Envs:
     SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # Bucket aiter paged_attention_ragged decode partitions by sequence length.
     SGLANG_AITER_DECODE_PARTITION_BUCKETS = EnvBool(True)
+    # Attention phases the tlx backend runs on uTLX (comma-separated); AITER runs the rest:
+    # decode (decode and speculative verify), prefill_window, prefill_short and
+    # prefill_long (full-attention prefill below / from 1024 query tokens).
+    SGLANG_TLX_PHASES = EnvStr("decode,prefill_window,prefill_short")
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
     # Index a compact-window DFLASH draft KV pool by the hybrid-SWA target's
