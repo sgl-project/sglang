@@ -161,6 +161,11 @@ class PrefillBudget:
     def remaining_window_tokens(self):
         return 0
 
+    def admission_capacity(self) -> tuple[int, ...] | None:
+        """Free plus evictable tokens left after this pass's admissions, which
+        a refused request waits on; None retries admission every round."""
+        return (self.remaining_current,)
+
     def has_capacity(self) -> bool:
         if is_cp_sharded_padded():
             # CP can reuse padding in already reserved pages when fresh capacity is zero.
@@ -326,6 +331,11 @@ class SWAPrefillBudget(PrefillBudget):
         if is_cp_sharded_padded():
             global_full_available_size = from_cp_sharded(global_full_available_size)
         return global_full_available_size + self.tree_cache.full_evictable_size()
+
+    def admission_capacity(self) -> tuple[int, ...] | None:
+        # Running decodes free window rows mid-step and finished backups make
+        # full rows evictable, so either may admit a request refused before.
+        return (self.remaining_current, self.remaining_window_tokens)
 
     @property
     def remaining_window_tokens(self):
@@ -546,6 +556,10 @@ class ChainPrefillBudget(PrefillBudget):
     requires_final_shape_check = True
     admits_whole_requests = True
     prices_by_demand = True
+
+    def admission_capacity(self) -> tuple[int, ...] | None:
+        # Demands are priced jointly across pools, so no single count tracks them.
+        return None
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         super().__init__(
