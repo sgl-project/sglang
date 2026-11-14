@@ -11,8 +11,16 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
+def _jit_module(
+    dtype: torch.dtype,
+    has_adapter_enabled: bool = False,
+    write_inactive_prefix_count: bool = False,
+) -> Module:
+    args = make_cpp_args(
+        dtype,
+        has_adapter_enabled,
+        write_inactive_prefix_count,
+    )
     return load_jit(
         "moe_lora_merged_align",
         *args,
@@ -35,6 +43,8 @@ def moe_lora_merged_align(
     do_skip: bool = True,
     compact: bool = False,
     fuse_scatter: Optional[bool] = None,
+    adapter_enabled: torch.Tensor | None = None,
+    return_inactive_prefix_count: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Fused replacement for (_fused_virtual_topk_ids + _align_block_size) on the
     merged-virtual-expert LoRA path.
@@ -44,13 +54,17 @@ def moe_lora_merged_align(
 
     Returns (sorted_token_ids, expert_ids, num_tokens_post_padded,
     token_lora_mask, virtual_num_experts).
+    With ``return_inactive_prefix_count``, the count is an aligned int32 pair
+    [total padded tokens, leading negative-expert blocks]; do_skip publishes zero.
     """
     device = topk_ids.device
     flat_topk_ids = topk_ids.reshape(-1)
-    if flat_topk_ids.dtype == torch.int64:
-        flat_topk_ids = flat_topk_ids.to(torch.int32)
     M, top_k = topk_ids.shape
     numel = M * top_k
+    if adapter_enabled is not None:
+        assert adapter_enabled.shape == (max_loras,)
+        assert adapter_enabled.dtype == torch.int32
+        assert adapter_enabled.device == device
 
     num_experts_for_weight = 1 if shared_outer else num_experts
     virtual_num_experts = num_experts_for_weight * max_loras
@@ -97,13 +111,19 @@ def moe_lora_merged_align(
     sorted_alloc = (max_num_tokens_padded + 3) & ~3
     sorted_token_ids = torch.empty((sorted_alloc,), dtype=torch.int32, device=device)
     expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
-    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
+    num_tokens_post_pad = torch.empty(
+        (2 if return_inactive_prefix_count else 1,), dtype=torch.int32, device=device
+    )
     # No memset: the align kernel writes cumsum[0..num_buckets] before
     # count_and_sort reads it (same as moe_align_block_size.py's empty cumsum).
     cumsum_buffer = torch.empty((bucket_experts + 2,), dtype=torch.int32, device=device)
     token_lora_mask = torch.empty((M,), dtype=torch.bool, device=device)
 
-    module = _jit_module(flat_topk_ids.dtype)
+    module = _jit_module(
+        flat_topk_ids.dtype,
+        adapter_enabled is not None,
+        return_inactive_prefix_count,
+    )
     module.moe_lora_merged_align(
         flat_topk_ids,
         token_lora_mapping,
@@ -124,6 +144,9 @@ def moe_lora_merged_align(
         do_skip,
         compact_eff,
         fuse_eff,
+        adapter_enabled,
+        max_loras,
+        adapter_enabled.stride(0) if adapter_enabled is not None else 0,
     )
 
     return (

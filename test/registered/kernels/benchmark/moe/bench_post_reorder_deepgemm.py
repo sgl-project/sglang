@@ -1,10 +1,7 @@
 import torch
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.ops.moe.ep_moe_kernels import (
-    post_reorder_deepgemm,
-    post_reorder_triton_kernel,
-)
+from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -51,25 +48,12 @@ def _new(down_output, src2dst, topk_ids, topk_weights):
     return out
 
 
-def _old(down_output, src2dst, topk_ids, topk_weights):
-    num_tokens = topk_ids.shape[0]
-    out = torch.empty(num_tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
-    post_reorder_triton_kernel[(num_tokens,)](
-        down_output, out, src2dst, topk_ids, topk_weights, TOP_K, HIDDEN, BLOCK_SIZE=512
-    )
-    out *= RSF
-    return out
-
-
-FN_MAP = {"fused": _new, "legacy": _old}
-
-
 @marker.parametrize("num_tokens", [1, 8, 64, 256, 1024, 4096, 16384], [64, 4096])
-@marker.benchmark("impl", ["fused", "legacy"])
+@marker.benchmark("impl", ["fused"])
 def benchmark(num_tokens: int, impl: str):
     down_output, src2dst, topk_ids, topk_weights = _build(num_tokens)
     return marker.do_bench(
-        FN_MAP[impl],
+        _new,
         input_args=(down_output, src2dst, topk_ids, topk_weights),
         graph_clone_args=(0,),
         memory_args=None,

@@ -1,5 +1,6 @@
 #include <sgl_kernel/tensor.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -36,13 +37,8 @@ __global__ void gelu_tanh_cat_kernel(
 #pragma unroll
       for (int j = 0; j < kVecN; ++j) {
         const float x = device::cast<fp32_t>(value[j]);
-        // Match aten's tanh GELU operation order, including the BF16 store
-        // that precedes the eager concatenation.
-        constexpr float kBeta = 0.7978845608028654f;
-        constexpr float kKappa = 0.044715f;
-        const float cube = x * x * x;
-        const float inner = kBeta * (x + kKappa * cube);
-        value[j] = device::cast<T>(0.5f * x * (1.0f + tanhf(inner)));
+        // Rounded to T like the eager GELU output that precedes the concatenation.
+        value[j] = device::cast<T>(device::activation::gelu_tanh<false>(x));
       }
     }
     value.store(output, i);
@@ -56,7 +52,7 @@ void gelu_tanh_cat(tvm::ffi::TensorView attn, tvm::ffi::TensorView mlp, tvm::ffi
   auto dtype = SymbolicDType{};
   dtype.set_options<T>();
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
   for (const auto tensor : {attn, mlp, output}) {
     dtype.verify(tensor.dtype());
     device_.verify(tensor.device());

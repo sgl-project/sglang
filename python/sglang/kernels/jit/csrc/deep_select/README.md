@@ -17,7 +17,7 @@ is the wrapper that compiles and calls them.
 | `cuda_kernels/{utils,bit_utils}.cuh` | small device helpers |
 | `cuda_kernels/common_parts.cuh` | the shared kernel body (TMA pipeline, radix pass, epilogue) |
 | `cuda_kernels/v3/topk_select.cuh` | bf16, one CTA per row |
-| `cuda_kernels/v3_cluster/topk_select.cuh` | bf16, one cluster per row (8 CTAs on SM90, 16 on SM100/SM103) |
+| `cuda_kernels/v3_cluster/topk_select.cuh` | bf16, one cluster per row (8 CTAs on SM90, 16 on SM100/SM103/SM107) |
 | `cuda_kernels/v3_fp32/topk_select.cuh` | fp32 |
 | `3rdparty/kerutils/` | upstream's header-only helper library, subset |
 

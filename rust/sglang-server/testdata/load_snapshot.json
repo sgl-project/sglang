@@ -1,0 +1,190 @@
+{
+  "payloads": [
+    "de0016a974696d657374616d70cb3ff4000000000000b06e756d5f72756e6e696e675f7265717307b06e756d5f77616974696e675f7265717303bb6e756d5f77616974696e675f756e6361636865645f746f6b656e73cd1000af6e756d5f757365645f746f6b656e73ce00014000b06e756d5f746f74616c5f746f6b656e73ce00016000b16e756d5f6163746976655f746f6b656e73ce000157c0b96e756d5f707265616c6c6f635f72656164795f746f6b656e73cd0200b46d61785f746f74616c5f6e756d5f746f6b656e73ce00100000b46d61785f72756e6e696e675f7265717565737473cd0100ab746f6b656e5f7573616765cb3fb4000000000000ae67656e5f7468726f756768707574cb40934a0000000000ae63616368655f6869745f72617465cb3fe4000000000000ab7574696c697a6174696f6ecb3fe0000000000000bd746f74616c5f70726566696c6c5f756e6361636865645f746f6b656e73ce3ade68b1b5746f74616c5f70726566696c6c5f627573795f7573ce075bcd15ae6465636f64655f6d6f6d656e747393cb4059000000000000cb4004000000000000cb3fc0000000000000a66d656d6f727994cb404e400000000000cb405e100000000000cb4000000000000000ce00100000ab73706563756c617469766592cb400c000000000000cb3fe8000000000000a46c6f7261930108cb3fc0000000000000ae6469736167677265676174696f6e98a66465636f64650000020000cb4029000000000000cb0000000000000000a6717565756573950301000204",
+    "de0001a764705f72616e6b01"
+  ],
+  "to_dict": {
+    "all": [
+      {
+        "timestamp": 1.25,
+        "dp_rank": 0,
+        "num_running_reqs": 7,
+        "num_waiting_reqs": 3,
+        "num_waiting_uncached_tokens": 4096,
+        "num_used_tokens": 81920,
+        "num_total_tokens": 90112,
+        "num_active_tokens": 88000,
+        "num_prealloc_ready_tokens": 512,
+        "max_total_num_tokens": 1048576,
+        "max_running_requests": 256,
+        "token_usage": 0.078125,
+        "gen_throughput": 1234.5,
+        "cache_hit_rate": 0.625,
+        "utilization": 0.5,
+        "total_prefill_uncached_tokens": 987654321,
+        "total_prefill_busy_us": 123456789,
+        "decode_moments": [
+          100.0,
+          2.5,
+          0.125
+        ],
+        "memory": {
+          "weight_gb": 60.5,
+          "kv_cache_gb": 120.25,
+          "graph_gb": 2.0,
+          "token_capacity": 1048576
+        },
+        "speculative": {
+          "accept_length": 3.5,
+          "accept_rate": 0.75
+        },
+        "lora": {
+          "slots_used": 1,
+          "slots_total": 8,
+          "utilization": 0.125
+        },
+        "disaggregation": {
+          "mode": "decode",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 2,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 12.5,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 3,
+          "grammar": 1,
+          "paused": 0,
+          "retracted": 2,
+          "prealloc_ready": 4
+        }
+      },
+      {
+        "timestamp": 0.0,
+        "dp_rank": 1,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 0,
+        "max_running_requests": 0,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 0,
+        "total_prefill_busy_us": 0,
+        "decode_moments": null
+      }
+    ],
+    "core": [
+      {
+        "timestamp": 1.25,
+        "dp_rank": 0,
+        "num_running_reqs": 7,
+        "num_waiting_reqs": 3,
+        "num_waiting_uncached_tokens": 4096,
+        "num_used_tokens": 81920,
+        "num_total_tokens": 90112,
+        "num_active_tokens": 88000,
+        "num_prealloc_ready_tokens": 512,
+        "max_total_num_tokens": 1048576,
+        "max_running_requests": 256,
+        "token_usage": 0.078125,
+        "gen_throughput": 1234.5,
+        "cache_hit_rate": 0.625,
+        "utilization": 0.5,
+        "total_prefill_uncached_tokens": 987654321,
+        "total_prefill_busy_us": 123456789,
+        "decode_moments": [
+          100.0,
+          2.5,
+          0.125
+        ]
+      },
+      {
+        "timestamp": 0.0,
+        "dp_rank": 1,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 0,
+        "max_running_requests": 0,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 0,
+        "total_prefill_busy_us": 0,
+        "decode_moments": null
+      }
+    ],
+    "core,queues": [
+      {
+        "timestamp": 1.25,
+        "dp_rank": 0,
+        "num_running_reqs": 7,
+        "num_waiting_reqs": 3,
+        "num_waiting_uncached_tokens": 4096,
+        "num_used_tokens": 81920,
+        "num_total_tokens": 90112,
+        "num_active_tokens": 88000,
+        "num_prealloc_ready_tokens": 512,
+        "max_total_num_tokens": 1048576,
+        "max_running_requests": 256,
+        "token_usage": 0.078125,
+        "gen_throughput": 1234.5,
+        "cache_hit_rate": 0.625,
+        "utilization": 0.5,
+        "total_prefill_uncached_tokens": 987654321,
+        "total_prefill_busy_us": 123456789,
+        "decode_moments": [
+          100.0,
+          2.5,
+          0.125
+        ],
+        "queues": {
+          "waiting": 3,
+          "grammar": 1,
+          "paused": 0,
+          "retracted": 2,
+          "prealloc_ready": 4
+        }
+      },
+      {
+        "timestamp": 0.0,
+        "dp_rank": 1,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 0,
+        "max_running_requests": 0,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 0,
+        "total_prefill_busy_us": 0,
+        "decode_moments": null
+      }
+    ]
+  },
+  "prometheus": {
+    "all": "# TYPE sglang_timestamp gauge\nsglang_timestamp{dp_rank=\"0\"} 1.25\nsglang_timestamp{dp_rank=\"1\"} 0.0\n# TYPE sglang_num_running_reqs gauge\nsglang_num_running_reqs{dp_rank=\"0\"} 7\nsglang_num_running_reqs{dp_rank=\"1\"} 0\n# TYPE sglang_num_waiting_reqs gauge\nsglang_num_waiting_reqs{dp_rank=\"0\"} 3\nsglang_num_waiting_reqs{dp_rank=\"1\"} 0\n# TYPE sglang_num_waiting_uncached_tokens gauge\nsglang_num_waiting_uncached_tokens{dp_rank=\"0\"} 4096\nsglang_num_waiting_uncached_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_used_tokens gauge\nsglang_num_used_tokens{dp_rank=\"0\"} 81920\nsglang_num_used_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_total_tokens gauge\nsglang_num_total_tokens{dp_rank=\"0\"} 90112\nsglang_num_total_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_active_tokens gauge\nsglang_num_active_tokens{dp_rank=\"0\"} 88000\nsglang_num_active_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_prealloc_ready_tokens gauge\nsglang_num_prealloc_ready_tokens{dp_rank=\"0\"} 512\nsglang_num_prealloc_ready_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_max_total_num_tokens gauge\nsglang_max_total_num_tokens{dp_rank=\"0\"} 1048576\nsglang_max_total_num_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_max_running_requests gauge\nsglang_max_running_requests{dp_rank=\"0\"} 256\nsglang_max_running_requests{dp_rank=\"1\"} 0\n# TYPE sglang_token_usage gauge\nsglang_token_usage{dp_rank=\"0\"} 0.078125\nsglang_token_usage{dp_rank=\"1\"} 0.0\n# TYPE sglang_gen_throughput gauge\nsglang_gen_throughput{dp_rank=\"0\"} 1234.5\nsglang_gen_throughput{dp_rank=\"1\"} 0.0\n# TYPE sglang_cache_hit_rate gauge\nsglang_cache_hit_rate{dp_rank=\"0\"} 0.625\nsglang_cache_hit_rate{dp_rank=\"1\"} 0.0\n# TYPE sglang_utilization gauge\nsglang_utilization{dp_rank=\"0\"} 0.5\nsglang_utilization{dp_rank=\"1\"} 0.0\n# TYPE sglang_total_prefill_uncached_tokens gauge\nsglang_total_prefill_uncached_tokens{dp_rank=\"0\"} 987654321\nsglang_total_prefill_uncached_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_total_prefill_busy_us gauge\nsglang_total_prefill_busy_us{dp_rank=\"0\"} 123456789\nsglang_total_prefill_busy_us{dp_rank=\"1\"} 0\n# TYPE sglang_memory_weight_gb gauge\nsglang_memory_weight_gb{dp_rank=\"0\"} 60.5\n# TYPE sglang_memory_kv_cache_gb gauge\nsglang_memory_kv_cache_gb{dp_rank=\"0\"} 120.25\n# TYPE sglang_memory_graph_gb gauge\nsglang_memory_graph_gb{dp_rank=\"0\"} 2.0\n# TYPE sglang_memory_token_capacity gauge\nsglang_memory_token_capacity{dp_rank=\"0\"} 1048576\n# TYPE sglang_spec_accept_length gauge\nsglang_spec_accept_length{dp_rank=\"0\"} 3.5\n# TYPE sglang_spec_accept_rate gauge\nsglang_spec_accept_rate{dp_rank=\"0\"} 0.75\n# TYPE sglang_lora_slots_used gauge\nsglang_lora_slots_used{dp_rank=\"0\"} 1\n# TYPE sglang_lora_slots_total gauge\nsglang_lora_slots_total{dp_rank=\"0\"} 8\n# TYPE sglang_lora_utilization gauge\nsglang_lora_utilization{dp_rank=\"0\"} 0.125\n# TYPE sglang_disagg_prefill_bootstrap_queue_reqs gauge\nsglang_disagg_prefill_bootstrap_queue_reqs{dp_rank=\"0\"} 0\n# TYPE sglang_disagg_prefill_inflight_queue_reqs gauge\nsglang_disagg_prefill_inflight_queue_reqs{dp_rank=\"0\"} 0\n# TYPE sglang_disagg_decode_prealloc_queue_reqs gauge\nsglang_disagg_decode_prealloc_queue_reqs{dp_rank=\"0\"} 2\n# TYPE sglang_disagg_decode_transfer_queue_reqs gauge\nsglang_disagg_decode_transfer_queue_reqs{dp_rank=\"0\"} 0\n# TYPE sglang_disagg_decode_retracted_queue_reqs gauge\nsglang_disagg_decode_retracted_queue_reqs{dp_rank=\"0\"} 0\n# TYPE sglang_disagg_kv_transfer_speed_gb_s gauge\nsglang_disagg_kv_transfer_speed_gb_s{dp_rank=\"0\"} 12.5\n# TYPE sglang_disagg_kv_transfer_latency_ms gauge\nsglang_disagg_kv_transfer_latency_ms{dp_rank=\"0\"} 0.0\n# TYPE sglang_queues_waiting gauge\nsglang_queues_waiting{dp_rank=\"0\"} 3\n# TYPE sglang_queues_grammar gauge\nsglang_queues_grammar{dp_rank=\"0\"} 1\n# TYPE sglang_queues_paused gauge\nsglang_queues_paused{dp_rank=\"0\"} 0\n# TYPE sglang_queues_retracted gauge\nsglang_queues_retracted{dp_rank=\"0\"} 2\n# TYPE sglang_queues_prealloc_ready gauge\nsglang_queues_prealloc_ready{dp_rank=\"0\"} 4\n",
+    "core": "# TYPE sglang_timestamp gauge\nsglang_timestamp{dp_rank=\"0\"} 1.25\nsglang_timestamp{dp_rank=\"1\"} 0.0\n# TYPE sglang_num_running_reqs gauge\nsglang_num_running_reqs{dp_rank=\"0\"} 7\nsglang_num_running_reqs{dp_rank=\"1\"} 0\n# TYPE sglang_num_waiting_reqs gauge\nsglang_num_waiting_reqs{dp_rank=\"0\"} 3\nsglang_num_waiting_reqs{dp_rank=\"1\"} 0\n# TYPE sglang_num_waiting_uncached_tokens gauge\nsglang_num_waiting_uncached_tokens{dp_rank=\"0\"} 4096\nsglang_num_waiting_uncached_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_used_tokens gauge\nsglang_num_used_tokens{dp_rank=\"0\"} 81920\nsglang_num_used_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_total_tokens gauge\nsglang_num_total_tokens{dp_rank=\"0\"} 90112\nsglang_num_total_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_active_tokens gauge\nsglang_num_active_tokens{dp_rank=\"0\"} 88000\nsglang_num_active_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_prealloc_ready_tokens gauge\nsglang_num_prealloc_ready_tokens{dp_rank=\"0\"} 512\nsglang_num_prealloc_ready_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_max_total_num_tokens gauge\nsglang_max_total_num_tokens{dp_rank=\"0\"} 1048576\nsglang_max_total_num_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_max_running_requests gauge\nsglang_max_running_requests{dp_rank=\"0\"} 256\nsglang_max_running_requests{dp_rank=\"1\"} 0\n# TYPE sglang_token_usage gauge\nsglang_token_usage{dp_rank=\"0\"} 0.078125\nsglang_token_usage{dp_rank=\"1\"} 0.0\n# TYPE sglang_gen_throughput gauge\nsglang_gen_throughput{dp_rank=\"0\"} 1234.5\nsglang_gen_throughput{dp_rank=\"1\"} 0.0\n# TYPE sglang_cache_hit_rate gauge\nsglang_cache_hit_rate{dp_rank=\"0\"} 0.625\nsglang_cache_hit_rate{dp_rank=\"1\"} 0.0\n# TYPE sglang_utilization gauge\nsglang_utilization{dp_rank=\"0\"} 0.5\nsglang_utilization{dp_rank=\"1\"} 0.0\n# TYPE sglang_total_prefill_uncached_tokens gauge\nsglang_total_prefill_uncached_tokens{dp_rank=\"0\"} 987654321\nsglang_total_prefill_uncached_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_total_prefill_busy_us gauge\nsglang_total_prefill_busy_us{dp_rank=\"0\"} 123456789\nsglang_total_prefill_busy_us{dp_rank=\"1\"} 0\n",
+    "core,queues": "# TYPE sglang_timestamp gauge\nsglang_timestamp{dp_rank=\"0\"} 1.25\nsglang_timestamp{dp_rank=\"1\"} 0.0\n# TYPE sglang_num_running_reqs gauge\nsglang_num_running_reqs{dp_rank=\"0\"} 7\nsglang_num_running_reqs{dp_rank=\"1\"} 0\n# TYPE sglang_num_waiting_reqs gauge\nsglang_num_waiting_reqs{dp_rank=\"0\"} 3\nsglang_num_waiting_reqs{dp_rank=\"1\"} 0\n# TYPE sglang_num_waiting_uncached_tokens gauge\nsglang_num_waiting_uncached_tokens{dp_rank=\"0\"} 4096\nsglang_num_waiting_uncached_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_used_tokens gauge\nsglang_num_used_tokens{dp_rank=\"0\"} 81920\nsglang_num_used_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_total_tokens gauge\nsglang_num_total_tokens{dp_rank=\"0\"} 90112\nsglang_num_total_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_active_tokens gauge\nsglang_num_active_tokens{dp_rank=\"0\"} 88000\nsglang_num_active_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_num_prealloc_ready_tokens gauge\nsglang_num_prealloc_ready_tokens{dp_rank=\"0\"} 512\nsglang_num_prealloc_ready_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_max_total_num_tokens gauge\nsglang_max_total_num_tokens{dp_rank=\"0\"} 1048576\nsglang_max_total_num_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_max_running_requests gauge\nsglang_max_running_requests{dp_rank=\"0\"} 256\nsglang_max_running_requests{dp_rank=\"1\"} 0\n# TYPE sglang_token_usage gauge\nsglang_token_usage{dp_rank=\"0\"} 0.078125\nsglang_token_usage{dp_rank=\"1\"} 0.0\n# TYPE sglang_gen_throughput gauge\nsglang_gen_throughput{dp_rank=\"0\"} 1234.5\nsglang_gen_throughput{dp_rank=\"1\"} 0.0\n# TYPE sglang_cache_hit_rate gauge\nsglang_cache_hit_rate{dp_rank=\"0\"} 0.625\nsglang_cache_hit_rate{dp_rank=\"1\"} 0.0\n# TYPE sglang_utilization gauge\nsglang_utilization{dp_rank=\"0\"} 0.5\nsglang_utilization{dp_rank=\"1\"} 0.0\n# TYPE sglang_total_prefill_uncached_tokens gauge\nsglang_total_prefill_uncached_tokens{dp_rank=\"0\"} 987654321\nsglang_total_prefill_uncached_tokens{dp_rank=\"1\"} 0\n# TYPE sglang_total_prefill_busy_us gauge\nsglang_total_prefill_busy_us{dp_rank=\"0\"} 123456789\nsglang_total_prefill_busy_us{dp_rank=\"1\"} 0\n# TYPE sglang_queues_waiting gauge\nsglang_queues_waiting{dp_rank=\"0\"} 3\n# TYPE sglang_queues_grammar gauge\nsglang_queues_grammar{dp_rank=\"0\"} 1\n# TYPE sglang_queues_paused gauge\nsglang_queues_paused{dp_rank=\"0\"} 0\n# TYPE sglang_queues_retracted gauge\nsglang_queues_retracted{dp_rank=\"0\"} 2\n# TYPE sglang_queues_prealloc_ready gauge\nsglang_queues_prealloc_ready{dp_rank=\"0\"} 4\n"
+  }
+}

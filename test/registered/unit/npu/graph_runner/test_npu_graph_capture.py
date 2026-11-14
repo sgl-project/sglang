@@ -6,7 +6,10 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
+# The only real-device case here: it captures an NPUGraph, so it needs one
+# Ascend card rather than the CPU mock runner the other NPU unit tests use.
+register_npu_ci(est_time=1, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=1, suite="nightly-1-npu-a3", nightly=True)
 
 
 @unittest.skipUnless(

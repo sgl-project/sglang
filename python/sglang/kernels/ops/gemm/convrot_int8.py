@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, get_jit_cuda_arch, load_jit
-from sglang.kernels.jit.utils.common import is_hip_runtime, is_musa_runtime
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -57,12 +57,10 @@ def _convrot_int8_cuda_flags() -> list[str]:
 
 
 def convrot_int8_local_capability() -> tuple[int, int] | None:
-    """(major, minor) the JIT build would target, or None off CUDA (ROCm and
-    MUSA capability numbers are not SM versions)."""
-    if is_hip_runtime() or is_musa_runtime():
-        return None
-    arch = get_jit_cuda_arch()
-    return (arch.major, arch.minor)
+    """(major, minor) of the local GPU, or None off CUDA (ROCm and MUSA
+    capability numbers are not SM versions)."""
+    cuda = current_arch().cuda
+    return None if cuda is None else cuda.capability
 
 
 @cache_once

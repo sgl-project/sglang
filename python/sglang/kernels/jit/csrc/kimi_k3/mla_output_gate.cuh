@@ -6,6 +6,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/type.cuh>   // For bf16_t, fp32_t, device::cast
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
@@ -27,7 +28,7 @@ template <int kThreads, bool kUsePDL>
 __global__ void mla_output_gate_kernel(const MlaOutputGateParams __grid_constant__ params) {
   using namespace device;
 
-  constexpr int kVecN = 8;
+  constexpr int kVecN = 4;
   using vec_bf16_t = AlignedVector<bf16_t, kVecN>;
 
   const uint32_t v = blockIdx.x * kThreads + threadIdx.x;
@@ -43,7 +44,7 @@ __global__ void mla_output_gate_kernel(const MlaOutputGateParams __grid_constant
     // Match torch.sigmoid(bf16): fp32 sigmoid, round to bf16, then the bf16
     // multiply upcasts both operands to fp32 and rounds once more.
     const float g = cast<fp32_t>(gv[i]);
-    const bf16_t s = cast<bf16_t>(1.0f / (1.0f + expf(-g)));
+    const bf16_t s = cast<bf16_t>(activation::sigmoid<false>(g));
     ov[i] = cast<bf16_t>(cast<fp32_t>(xv[i]) * cast<fp32_t>(s));
   }
   ov.store(params.out, v);
@@ -60,7 +61,7 @@ struct MlaOutputGateKernel {
 
     auto N_ = SymbolicSize{"numel"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N_}).with_dtype<bf16_t>().with_device(device).verify(x);
     TensorMatcher({N_}).with_dtype<bf16_t>().with_device(device).verify(gate);
@@ -74,7 +75,7 @@ struct MlaOutputGateKernel {
         .x = static_cast<const bf16_t*>(x.data_ptr()),
         .gate = static_cast<const bf16_t*>(gate.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
-        .n_vecs = N / 8,
+        .n_vecs = N / 4,
     };
     const uint32_t n_blocks = (params.n_vecs + kThreads - 1) / kThreads;
     LaunchKernel(n_blocks, kThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);

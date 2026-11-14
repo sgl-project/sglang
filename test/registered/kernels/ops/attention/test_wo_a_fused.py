@@ -6,27 +6,29 @@ import torch
 from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
     reason="wo_a_fused requires SM100/SM103",
 )
 
-LOCAL_HEADS = 16
+HEADS_PER_GROUP = 8
 HEAD_DIM = 512
 ROPE_DIM = 64
 MAX_POS = 4096
-N_OUT = 2048
+RANK = 1024
 
 
-def _inputs(tokens: int, padded: bool):
+def _inputs(tokens: int, padded: bool, groups: int = 2):
     device = "cuda"
     torch.manual_seed(1234)
-    heads = 64 if padded else LOCAL_HEADS
+    local_heads = groups * HEADS_PER_GROUP
+    heads = 64 if padded else local_heads
     backing = torch.randn(tokens, heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
-    o = backing[:, :LOCAL_HEADS, :]
-    weight = torch.randn(2, 1024, 4096, dtype=torch.bfloat16, device=device).mul_(0.05)
+    o = backing[:, :local_heads, :]
+    weight = torch.randn(groups, RANK, 4096, dtype=torch.bfloat16, device=device)
+    weight.mul_(0.05)
     angles = torch.outer(
         torch.arange(MAX_POS, device=device, dtype=torch.float32),
         1.0 / 10000.0 ** (torch.arange(32, device=device, dtype=torch.float32) / 32),
@@ -48,8 +50,10 @@ def _reference(o, weight, freqs, positions):
     im = tail[..., 1::2].clone()
     tail[..., 0::2] = (re * cos[:, None, :] + im * sin[:, None, :]).bfloat16().float()
     tail[..., 1::2] = (im * cos[:, None, :] - re * sin[:, None, :]).bfloat16().float()
-    x = rotated.reshape(o.shape[0], 2, -1).double()
-    return torch.einsum("tgd,grd->tgr", x, weight.double()).reshape(o.shape[0], N_OUT)
+    groups = weight.shape[0]
+    x = rotated.reshape(o.shape[0], groups, -1).double()
+    out = torch.einsum("tgd,grd->tgr", x, weight.double())
+    return out.reshape(o.shape[0], groups * RANK)
 
 
 def _ue8m0(amax: torch.Tensor):
@@ -71,11 +75,13 @@ def _sf_index(block: torch.Tensor, row: torch.Tensor) -> torch.Tensor:
     return (block >> 2) * 512 + ((row % 32) * 4 + ((row // 32) % 4)) * 4 + (block & 3)
 
 
+@pytest.mark.parametrize("groups", [2, 4])
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8, 13, 16, 17, 32])
 @pytest.mark.parametrize("padded", [False, True])
-def test_matches_reference(tokens: int, padded: bool):
-    o, weight, freqs, positions = _inputs(tokens, padded)
-    grouped = o.view(tokens, 2, -1)
+def test_matches_reference(tokens: int, padded: bool, groups: int):
+    o, weight, freqs, positions = _inputs(tokens, padded, groups)
+    grouped = o.view(tokens, groups, -1)
+    n_out = groups * RANK
     # The two output forms are mutually exclusive, so this also checks that the
     # bf16 path and the quantized path agree on the same inputs.
     (y,) = fused_rope_wo_a_bf16(grouped, weight, freqs, positions, out_mxfp8=False)
@@ -87,26 +93,28 @@ def test_matches_reference(tokens: int, padded: bool):
     assert err < 1e-2, f"relative error {err:.3g}"
 
     # The quantizer does: quantize(y) must match bit for bit.
-    yf = y.float().reshape(tokens, N_OUT // 32, 32)
+    yf = y.float().reshape(tokens, n_out // 32, 32)
     sf, inv = _ue8m0(yf.abs().amax(-1))
     want = (yf * inv[..., None]).clamp(max=448.0).to(torch.float8_e4m3fn)
     torch.testing.assert_close(
         q.reshape(tokens, -1, 32).float(), want.float(), rtol=0, atol=0
     )
 
-    blocks = torch.arange(N_OUT // 32)
+    blocks = torch.arange(n_out // 32)
     rows = torch.arange(tokens)[:, None]
     torch.testing.assert_close(
         scales.cpu()[_sf_index(blocks, rows)], sf.cpu(), rtol=0, atol=0
     )
 
 
-def test_scale_padding_is_zeroed():
+@pytest.mark.parametrize("groups", [2, 4])
+def test_scale_padding_is_zeroed(groups: int):
     """Rows >= T must be zeroed every launch: the buffer is reused by CUDA graphs."""
     tokens = 4
-    o, weight, freqs, positions = _inputs(tokens, padded=False)
-    _, scales = fused_rope_wo_a_bf16(o.view(tokens, 2, -1), weight, freqs, positions)
-    blocks = torch.arange(N_OUT // 32)
+    o, weight, freqs, positions = _inputs(tokens, padded=False, groups=groups)
+    grouped = o.view(tokens, groups, -1)
+    _, scales = fused_rope_wo_a_bf16(grouped, weight, freqs, positions)
+    blocks = torch.arange(groups * RANK // 32)
     rows = torch.arange(tokens, 128)[:, None]
     assert torch.count_nonzero(scales.cpu()[_sf_index(blocks, rows)]) == 0
 

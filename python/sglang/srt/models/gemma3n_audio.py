@@ -12,8 +12,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm
-from sglang.srt.utils import add_prefix, make_layers
 
 
 class Gemma3nCumulativeGroupNorm(nn.Module):

@@ -53,6 +53,10 @@ union Pack16B {
   __nv_bfloat16 u16[8];
 };
 
+// Elements per lane per iteration of the bf16 vectorized kernel; the launcher
+// gates on this so a row the kernel cannot cover never reaches it.
+constexpr int BF16_VEC = 16;
+
 template <int WARPS_PER_BLOCK>
 __global__ void moe_sum_reduce_warp_per_token_vec_kernel(
     const at::BFloat16* __restrict__ x,
@@ -64,7 +68,7 @@ __global__ void moe_sum_reduce_warp_per_token_vec_kernel(
     const int64_t stride_topk,       // in elements
     const int64_t out_stride_token,  // in elements
     const float scale) {
-  constexpr int VEC = 16;
+  constexpr int VEC = BF16_VEC;
   constexpr int PACKS = VEC / 8;
 
   const int warp_id = threadIdx.x / 32;
@@ -245,14 +249,15 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  const bool fast_bf16_vec_ok = (input.scalar_type() == at::kBFloat16) && (token_num > 256) && (hidden_dim % 8 == 0);
+  const bool fast_bf16_vec_ok =
+      (input.scalar_type() == at::kBFloat16) && (token_num > 256) && (hidden_dim % BF16_VEC == 0);
 
   // Fast path for bf16 vectorize
   if (fast_bf16_vec_ok) {
     constexpr int WARPS_PER_BLOCK = 8;
     constexpr int THREADS = WARPS_PER_BLOCK * 32;
 
-    const int64_t n_chunks = hidden_dim / 8;
+    const int64_t n_chunks = hidden_dim / BF16_VEC;
     int64_t grid_x = (n_chunks + 32 - 1) / 32;
     if (grid_x > 65535) grid_x = 65535;
 
@@ -261,8 +266,6 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
     dim3 block(THREADS);
     dim3 grid(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y));
-
-    auto stream = at::cuda::getCurrentCUDAStream();
 
     const float scale = static_cast<float>(routed_scaling_factor);
     moe_sum_reduce_warp_per_token_vec_kernel<WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(

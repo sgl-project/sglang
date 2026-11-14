@@ -173,7 +173,7 @@ def _make_forward_batch(
     req_pool_indices,
     input_ids: torch.Tensor,
 ):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     mode = ForwardMode.DECODE if is_decode else ForwardMode.EXTEND
 

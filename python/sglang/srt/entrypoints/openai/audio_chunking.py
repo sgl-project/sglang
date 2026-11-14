@@ -23,7 +23,7 @@ from typing import List, Tuple
 import numpy as np
 import soundfile as sf
 
-from sglang.srt.utils import load_audio
+from sglang.srt.multimodal.media_io import load_audio
 
 # Region at the tail of each max-length window in which to search for a
 # low-energy split point, in seconds.

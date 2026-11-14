@@ -12,7 +12,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 )
 from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 
 class ModelSlimW4A4Int4(ModelSlimLinearScheme):

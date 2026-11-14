@@ -47,6 +47,34 @@ Two groups sit outside that stack:
   `allocation_sizing.py`, `kv_cache_dtype.py`, `kv_vmm_backing.py`, and
   `hybrid_cache/hybrid_pool_assembler.py` decide the shapes and build the objects above.
 
+## Unified memory (`kv/`)
+
+With `--enable-unified-memory`, a hybrid model's full-attention KV, sliding-window KV
+and recurrent state live in one byte arena instead of the pools above. `kv/` owns that
+whole stack: declarations and plan (`decl.py`, `plan.py`, `sizing.py`), the arena and
+layouts (`memory/`, `layout/`), one allocator over every sub-pool (`alloc/chain.py`,
+`alloc/band.py`), the request table (`requests.py`), and `storage.py::KVStorage`, the
+interface the scheduler, the prefix tree, HiCache and PD use.
+
+Two rules hold anywhere its pages are touched:
+
+- **Freeing is logical at once; physical reuse is not.** A freed page stays pending
+  until the forward that may still touch it is processed, or a stream wait on that
+  forward settles it (`alloc/forward_steps.py`), and
+  every write into a page clears what the band's ledger records on it
+  (`alloc/page_usage.py::CLEARANCE`).
+- **Allocator decisions read logical state only** (counts, forwards processed,
+  transfers released), never whether an event fired, so TP ranks agree. Under
+  pipeline parallelism every stage asks each capacity question of every stage's
+  geometry (`alloc/stage_capacity.py`), so the stages agree too.
+
+Capacity decisions ask a concrete demand (`alloc/demand.py::KVDemand`, through
+`ChainAllocator.admits`, `units_fit` or `capacity.py`): sub-pools share bytes, so a
+scalar availability read is only an estimate for observers.
+
+Design, debugging tools and known limitations:
+[Unified Memory Design](https://docs.sglang.io/docs/advanced_features/unified_memory_design).
+
 ## Where does my class go?
 
 By base class, never by name:
