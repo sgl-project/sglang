@@ -47,6 +47,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
+from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -403,11 +404,16 @@ class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
     Drives both overlap and non-overlap scheduling, same as EAGLE: the
-    scheduler runs it synchronously when overlap is disabled.
+    scheduler runs it synchronously when overlap is disabled. On a pipelined
+    PD prefill, non-last PP stages run only the target; draft state belongs to
+    the last stage.
     """
 
+    # __init__ narrows this to the last PP stage.
+    _hosts_draft: bool = True
+
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        return [("draft", self.draft_model_runner)]
+        return [("draft", self.draft_model_runner)] if self._hosts_draft else []
 
     def __init__(
         self,
@@ -458,6 +464,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
+        # On a pipelined PD prefill only the last stage holds the draft: the
+        # aux hidden states reach it on the PP proxy, and it materializes and
+        # sends the prompt's draft KV. Earlier stages run the target only.
+        self._hosts_draft = get_parallel().pp_group.is_last_rank
+        if not self._hosts_draft:
+            self._draft_worker = None
+            self.draft_model_runner = None
+            self.draft_model = None
+            return
+        # The draft worker exists on the last stage only: it reuses the
+        # target's seed and loads within the stage, so no all-rank collective
+        # waits on the earlier stages (as DSPARK does).
+        load_group = get_pp_stage_load_group()
         with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -465,6 +484,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DFLASH",
+                random_seed=target_worker.random_seed,
+                load_group=load_group,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -702,6 +723,8 @@ class DFlashWorkerV2(BaseSpecWorker):
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        if not self._hosts_draft:
+            return super().spec_v2_attn_backends
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -713,6 +736,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if not self._hosts_draft:
+            return
         # Without draft windowing, the draft worker aliases the target
         # request->token mapping and allocation state. With draft windowing
         # enabled, the draft worker keeps a private compact req->token table
@@ -761,6 +786,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         return super()._build_hicache_draft_plan()
 
     def init_attention_backends(self):
+        if not self._hosts_draft:
+            return
         with (
             draft_pp_context(),
             draft_tp_context(self.draft_parallel_layout),
@@ -776,6 +803,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if not self._hosts_draft:
+            return
         target_dp_enabled = get_parallel().attn_dp_enabled
         with (
             draft_pp_context(),
@@ -879,7 +908,11 @@ class DFlashWorkerV2(BaseSpecWorker):
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Rehearse the non-greedy verify path so an undersized graph-pool
         borrow surfaces at startup rather than under traffic."""
-        if not is_cuda() or not is_dflash_sampling_verify_available():
+        if (
+            not self._hosts_draft
+            or not is_cuda()
+            or not is_dflash_sampling_verify_available()
+        ):
             return self.model_runner.prewarm_sampling()
 
         block_size = int(self.block_size)
@@ -2540,6 +2573,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        if not self._hosts_draft:
+            # An earlier pipeline stage of a PD prefill: the target forward,
+            # whose captured aux hidden states ride the PP proxy onward.
+            batch_output = self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            batch_output.new_seq_lens = batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+            return batch_output
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:

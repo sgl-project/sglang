@@ -36,6 +36,7 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -1539,6 +1540,7 @@ def build_staging_slot_metadata(
     num_draft_entries: int,
     kv_pool,
     draft_kv_pool,
+    num_hidden_layers: Optional[int] = None,
 ):
     """Buffers and per-slot layer ids for the staging gather.
 
@@ -1562,6 +1564,32 @@ def build_staging_slot_metadata(
             draft_kv_pool = inner
     if not isinstance(kv_pool, MHAKVView):
         return None
+
+    # Unified envelopes omit ids; staging needs the per-layer views' model ids.
+    target_ids = list(getattr(kv_pool, "model_layer_ids", ()))
+    if (
+        num_hidden_layers is not None
+        and len(target_ids) == len(kv_pool.k_buffer)
+        and len(kv_layer_ids or []) != 2 * len(kv_pool.k_buffer) + num_draft_entries
+    ):
+        k_buffers, v_buffers = list(kv_pool.k_buffer), list(kv_pool.v_buffer)
+        ids = target_ids
+        if num_draft_entries:
+            if not isinstance(draft_kv_pool, MHAKVView):
+                if get_parallel().pp_size > 1:
+                    raise RuntimeError("Muse staging requires an MHA draft KV view")
+                return k_buffers, v_buffers, []
+            draft_ids = list(getattr(draft_kv_pool, "model_layer_ids", ()))
+            if len(draft_ids) != len(draft_kv_pool.k_buffer):
+                raise RuntimeError("Staged draft buffers require per-layer model ids")
+            if len(draft_ids) * 2 != num_draft_entries:
+                raise RuntimeError(
+                    "Staged draft buffer count must match registered entries"
+                )
+            ids += remap_draft_layer_ids(draft_ids, num_hidden_layers)
+            k_buffers += list(draft_kv_pool.k_buffer)
+            v_buffers += list(draft_kv_pool.v_buffer)
+        return k_buffers, v_buffers, ids + ids
 
     ids = list(kv_layer_ids or [])
     num_target = len(ids) - num_draft_entries
@@ -1837,6 +1865,7 @@ def setup_state_kv_args(
     total_kv_layers: Optional[int] = None,
     window_tails: Optional[Dict[str, int]] = None,
     draft_kv_ring: Optional[DFlashDraftKVRing] = None,
+    label_swa_model_ids: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
@@ -1872,6 +1901,22 @@ def setup_state_kv_args(
     for entry in storage.wire_entries():
         region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)
+        layer_ids = list(region.layer_ids)
+        if (
+            label_swa_model_ids
+            and state_type == StateType.SWA
+            and not layer_ids
+            and region.kv_layout == "nhd"
+        ):
+            # Static SWA regions can omit global ids required for PP pairing.
+            view = storage.view(entry.sub_pool)
+            model_ids = list(getattr(view, "model_layer_ids", ()))
+            if model_ids and len(region.ptrs) == 2 * len(model_ids):
+                layer_ids = model_ids + model_ids
+            elif region.ptrs and get_parallel().pp_size > 1:
+                raise RuntimeError(
+                    "Muse PP SWA transfer requires one model layer id per K/V pair"
+                )
         append_state_component(
             kv_args,
             state_type,
@@ -1881,7 +1926,7 @@ def setup_state_kv_args(
             list(region.dim_per_tensor),
             list(region.conv_shard_groups),
             list(region.slice_outer_counts),
-            list(region.layer_ids),
+            layer_ids,
             sub_pool=storage.entry_sub_pool(entry),
             wire_key=storage.entry_wire_key(entry),
         )

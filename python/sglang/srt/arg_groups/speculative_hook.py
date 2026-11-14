@@ -326,9 +326,12 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
+        # A pipelined PD prefill keeps the draft on its last stage, which
+        # materializes the prompt's draft KV for the decode.
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; decode and "
+            "non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:

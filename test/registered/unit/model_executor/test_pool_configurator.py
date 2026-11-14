@@ -1394,6 +1394,37 @@ class TestDflashDraftKvBudget(CustomTestCase):
             0,
         )
 
+    def test_only_the_last_pipeline_stage_pays_for_the_draft(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            _dflash_draft_cell_size,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+            for pp_size, is_last_rank, expected in (
+                (1, True, 1024),
+                (2, False, 0),
+                (2, True, 1024),
+            ):
+                kvc = SimpleNamespace(
+                    is_draft_worker=False,
+                    spec_algorithm=algorithm,
+                    pp_size=pp_size,
+                    pp_group=SimpleNamespace(is_last_rank=is_last_rank),
+                    dflash_draft_cell_size_per_token=512,
+                    dflash_draft_loc_space_scale=2,
+                )
+                with self.subTest(
+                    algorithm=algorithm.name, pp_size=pp_size, last=is_last_rank
+                ):
+                    with patch(
+                        "sglang.srt.model_executor.pool_configurator.get_spec",
+                        return_value=SimpleNamespace(
+                            speculative_dflash_draft_kv_ring=False
+                        ),
+                    ):
+                        self.assertEqual(_dflash_draft_cell_size(kvc), expected)
+
     def test_pool_setup_prices_the_resolved_layout_and_handles_no_draft(self):
         import torch
 

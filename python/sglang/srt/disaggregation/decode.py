@@ -909,6 +909,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.metadata_buffers.get_buf_infos()
         )
 
+        muse_kv_layout = (
+            getattr(
+                getattr(self.scheduler.model_config, "hf_text_config", None),
+                "model_type",
+                None,
+            )
+            == "muse_spark_text"
+        )
         setup_state_kv_args(
             kv_args,
             storage,
@@ -916,6 +924,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
+            label_swa_model_ids=muse_kv_layout,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -1096,6 +1105,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     num_draft_entries=num_draft_entries,
                     kv_pool=kv_pool,
                     draft_kv_pool=self.draft_token_to_kv_pool,
+                    num_hidden_layers=(
+                        self.scheduler.model_config.num_hidden_layers
+                        if muse_kv_layout
+                        else None
+                    ),
                 )
                 if staging_slots is not None:
                     k_buffers, v_buffers, slot_layer_ids = staging_slots

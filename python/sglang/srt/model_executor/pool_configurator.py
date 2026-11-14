@@ -147,6 +147,7 @@ def _charges_dflash_draft_kv_per_token(kvc: KVCacheConfigurator) -> bool:
         not kvc.is_draft_worker
         and kvc.spec_algorithm.is_dflash_family()
         and not get_spec().speculative_dflash_draft_kv_ring
+        and (kvc.pp_size == 1 or kvc.pp_group.is_last_rank)
     )
 
 

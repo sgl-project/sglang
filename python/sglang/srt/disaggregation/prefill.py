@@ -448,6 +448,14 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
 
+        muse_kv_layout = (
+            getattr(
+                getattr(self.scheduler.model_config, "hf_text_config", None),
+                "model_type",
+                None,
+            )
+            == "muse_spark_text"
+        )
         setup_state_kv_args(
             kv_args,
             storage,
@@ -455,6 +463,7 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
+            label_swa_model_ids=muse_kv_layout,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -482,9 +491,20 @@ class PrefillBootstrapQueue:
                 num_draft_entries=num_draft_entries,
                 kv_pool=kv_pool,
                 draft_kv_pool=draft_kv_pool,
+                num_hidden_layers=(
+                    self.scheduler.model_config.num_hidden_layers
+                    if muse_kv_layout
+                    else None
+                ),
             )
             if staging_slots is not None:
                 k_buffers, v_buffers, slot_layer_ids = staging_slots
+                if muse_kv_layout and get_parallel().pp_size > 1:
+                    from sglang.srt.disaggregation.common.staging_buffer import (
+                        validate_staging_buffers,
+                    )
+
+                    validate_staging_buffers(k_buffers, v_buffers)
                 kv_manager.set_kv_buffer_tensors(
                     k_buffers,
                     v_buffers,

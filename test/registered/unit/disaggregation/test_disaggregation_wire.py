@@ -412,6 +412,67 @@ class TestDisaggregationWire(unittest.TestCase):
                 self.assertIsNotNone(reason)
                 self.assertIn("item lengths", reason)
 
+    def test_non_muse_swa_heterogeneous_tp_registration(self):
+        for pp, layout, dst_rank in (
+            (1, "nhd", 0),
+            (1, "nhd", 1),
+            (2, "nhd", 0),
+            (1, "hnd", 0),
+        ):
+            with self.subTest(pp=pp, layout=layout, dst_rank=dst_rank):
+                manager = object.__new__(MooncakeKVManager)
+                manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+                manager.attn_tp_size = manager.state_tp_size = 4
+                manager.pp_size = pp
+                manager.kv_args = SimpleNamespace(
+                    state_types=[StateType.SWA],
+                    state_data_ptrs=[[0x1000, 0x1100]],
+                    state_item_lens=[[256, 256]],
+                    state_layer_ids=[[]],
+                    swa_kv_cache_layout=layout,
+                    total_kv_head_num=16,
+                    kv_head_num=4,
+                    engine_rank=0,
+                    page_size=1,
+                    prefill_start_layer=0,
+                )
+                registration = SimpleNamespace(
+                    dst_attn_tp_size=8,
+                    dst_tp_rank=dst_rank,
+                    dst_state_data_ptrs=[[0x2000, 0x2100]],
+                    dst_state_item_lens=[[128, 128]],
+                    dst_state_layer_ids=[[]],
+                )
+                with get_context().override_server_args(speculative_algorithm=None):
+                    checked, reason = manager._validate_peer_state_layout(registration)
+                if pp == 1 and layout == "nhd":
+                    self.assertTrue(checked)
+                    self.assertIsNone(reason)
+                    blocks = manager._get_mha_head_slice_blocks(
+                        src_ptrs=[0x1000, 0x1100],
+                        src_item_lens=[256, 256],
+                        dst_ptrs=[0x2000, 0x2100],
+                        dst_item_lens=[128, 128],
+                        src_page_indices=np.array([3], dtype=np.int32),
+                        dst_page_indices=np.array([7], dtype=np.int32),
+                        dst_attn_tp_size=8,
+                        dst_tp_rank=dst_rank,
+                    )
+                    self.assertEqual(len(blocks), 2)
+                    for index, (src, dst, size) in enumerate(blocks):
+                        self.assertEqual(
+                            src.tolist(),
+                            [0x1000 + index * 256 + 3 * 256 + dst_rank * 128],
+                        )
+                        self.assertEqual(dst.tolist(), [0x2000 + index * 256 + 7 * 128])
+                        self.assertEqual(size, 128)
+                else:
+                    self.assertFalse(checked)
+                    self.assertIn(
+                        "pipeline parallelism" if pp == 2 else "NHD KV cache layout",
+                        reason,
+                    )
+
     def test_mooncake_validates_peer_state_layout_at_registration(self):
         """The verdict is reachable at registration, not just at transfer time."""
         for layer_ids in ([], [7]):
@@ -509,42 +570,56 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
         self.assertIs(manager.decode_kv_args_table["decode"], bad)
 
+    def _validate_dflash_tp_mismatch(
+        self, *, collapsed, num_draft_entries, draft_layer_ids, pp_size=1
+    ):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[],
+            num_draft_entries=num_draft_entries,
+            kv_layer_ids=draft_layer_ids,
+            kv_item_lens=[1024] * len(draft_layer_ids),
+        )
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = pp_size
+        manager.state_tp_size = 2
+        manager.attn_tp_size = 1
+        registration_info = SimpleNamespace(
+            mooncake_session_id="decode",
+            dst_attn_tp_size=8,
+            dst_draft_rows_dcp_collapsed=collapsed,
+            dst_kv_layer_ids=draft_layer_ids,
+            dst_kv_item_lens=[1024] * len(draft_layer_ids),
+            dst_dcp_size=1,
+            requires_dcp_relayout=False,
+        )
+        with get_context().override_server_args(
+            enable_unified_memory=False, speculative_algorithm="DFLASH"
+        ):
+            return manager._validate_peer_state_layout(registration_info)
+
     def test_mooncake_dflash_tp_mismatch_allows_dcp_collapsed_mla_draft(self):
         for collapsed in (False, True):
             with self.subTest(collapsed=collapsed):
-                manager = object.__new__(MooncakeKVManager)
-                manager.kv_args = SimpleNamespace(
-                    state_types=[],
-                    num_draft_entries=0,
-                    kv_layer_ids=[],
-                    kv_item_lens=[],
+                # An MHA-like draft: K and V entries of one draft layer.
+                fully_checked, reason = self._validate_dflash_tp_mismatch(
+                    collapsed=collapsed, num_draft_entries=2, draft_layer_ids=[5, 5]
                 )
-                manager.is_mla_backend = True
-                manager.is_hybrid_mla_backend = False
-                manager.pp_size = 1
-                manager.state_tp_size = 2
-                manager.attn_tp_size = 1
-                registration_info = SimpleNamespace(
-                    mooncake_session_id="decode",
-                    dst_attn_tp_size=8,
-                    dst_draft_rows_dcp_collapsed=collapsed,
-                    dst_kv_layer_ids=[],
-                    dst_kv_item_lens=[],
-                    dst_dcp_size=1,
-                    requires_dcp_relayout=False,
-                )
-                with get_context().override_server_args(
-                    enable_unified_memory=False, speculative_algorithm="DFLASH"
-                ):
-                    fully_checked, reason = manager._validate_peer_state_layout(
-                        registration_info
-                    )
                 if collapsed:
                     self.assertTrue(fully_checked)
                     self.assertIsNone(reason)
                 else:
                     self.assertFalse(fully_checked)
                     self.assertIn("same physical TP size", reason)
+
+    def test_mooncake_dflash_tp_mismatch_skips_a_stage_without_draft(self):
+        # An earlier stage of a pipelined PD prefill sends no draft KV.
+        fully_checked, reason = self._validate_dflash_tp_mismatch(
+            collapsed=False, num_draft_entries=0, draft_layer_ids=[], pp_size=2
+        )
+        self.assertTrue(fully_checked)
+        self.assertIsNone(reason)
 
     def test_mooncake_dflash_tp_mismatch_allows_a_draft_kv_ring(self):
         manager = object.__new__(MooncakeKVManager)
@@ -2216,6 +2291,36 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler._free_and_send_watermark = Mock()
         handler.num_writers_for = Mock(return_value=2)
         return handler, request, receiver
+
+    def test_repeated_writer_cannot_complete_or_requeue_a_chunk(self):
+        handler, request, receiver = self.make_deferred_handler()
+        self.assertFalse(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-0"))
+        self.assertFalse(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-0"))
+        self.assertFalse(handler._pending_scatters)
+        self.assertTrue(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-1"))
+        self.assertEqual(len(handler._pending_scatters), 1)
+        self.assertFalse(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-1"))
+        self.assertEqual(len(handler._pending_scatters), 1)
+
+    def test_fanin_geometry_mismatch_fails_the_room_without_scatter(self):
+        handler, request, receiver = self.make_deferred_handler()
+        self.assertFalse(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-0"))
+        self.assertFalse(handler.handle_chunk_arrived(7, 0, 1, 3, "writer-1"))
+        self.assertTrue(request._staging_failed)
+        self.assertFalse(handler._pending_scatters)
+
+    def test_new_room_registration_discards_previous_writer_fanin(self):
+        handler, request, receiver = self.make_deferred_handler(defer=False)
+        handler._writer_counts = {7: {0: [(0, 3, "writer-0")]}}
+        handler.kv_buffer_info = {"page_size": 1}
+        request.req = SimpleNamespace(kv=SimpleNamespace(cache_protected_len=0))
+        request.kv_receiver = receiver
+        old_token = handler._room_tokens[7]
+        handler.register_decode_req(7, request)
+        self.assertIsNot(handler._room_tokens[7], old_token)
+        self.assertFalse(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-1"))
+        self.assertFalse(request._staging_failed)
+        handler._scatter_region.assert_not_called()
 
     @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
     def test_deferred_fanin_uses_forward_stream_and_waits_before_free(self, make_event):

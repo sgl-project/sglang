@@ -3598,6 +3598,21 @@ class TestPipelineParallelCompat(CustomTestCase):
                     self._cfg(speculative_algorithm="DSPARK")
                 )
 
+    def test_dflash_pd_prefill_is_allowed(self):
+        # The draft lives on the last stage and materializes the prompt's
+        # draft KV for the decode.
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DFLASH"))
+
+    def test_dflash_is_rejected_outside_pd_prefill(self):
+        for mode in ("decode", "null"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(AssertionError, "DFLASH.*prefill"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm="DFLASH", disaggregation_mode=mode
+                        )
+                    )
+
     def test_eagle_is_allowed_on_prefill(self):
         check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
 

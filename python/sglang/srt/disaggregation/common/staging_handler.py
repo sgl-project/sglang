@@ -206,6 +206,7 @@ class DecodeStagingHandler:
         with self._staging_lifecycle:
             while room in self._closing_rooms:
                 self._staging_lifecycle.wait()
+            self._writer_counts.pop(room, None)
             self._room_tokens[room] = object()
             self._room_to_decode_req[room] = decode_req
             self._room_to_receiver[room] = decode_req.kv_receiver
@@ -391,7 +392,7 @@ class DecodeStagingHandler:
         chunk_idx: int,
         page_start: int,
         num_pages: int,
-        writer_id: str,
+        writer_id: Optional[str],
     ) -> bool:
         """Fan in all writers, then submit or queue a complete chunk."""
         submit_now = False
@@ -409,8 +410,23 @@ class DecodeStagingHandler:
                 return False
             room_counts = self._writer_counts.setdefault(room, {})
             arrivals = room_counts.setdefault(chunk_idx, [])
-            arrivals.append((page_start, num_pages, writer_id))
             num_writers = self.num_writers_for(receiver)
+            if writer_id is not None and any(
+                arrival[2] == writer_id for arrival in arrivals
+            ):
+                return False
+            if len(arrivals) >= num_writers:
+                return False
+            if arrivals and arrivals[0][:2] != (page_start, num_pages):
+                decode_req = self._room_to_decode_req[room]
+                decode_req._staging_failed = True
+                logger.error(
+                    "Staging writers disagree on chunk geometry room=%s chunk=%s",
+                    room,
+                    chunk_idx,
+                )
+                return False
+            arrivals.append((page_start, num_pages, writer_id))
             if len(arrivals) < num_writers:
                 return False
             if self._defer_scatter:
@@ -419,7 +435,7 @@ class DecodeStagingHandler:
                 )
             else:
                 submit_now = True
-            del room_counts[chunk_idx]
+            # Keep contributor ids until room teardown to reject late duplicates.
 
         if submit_now:
             self.submit_chunk_scatter(
@@ -885,6 +901,34 @@ def init_staging_allocator(register_fn, kv_args, *, device_type: str):
     return allocator
 
 
+def required_staging_bytes(
+    kv_args, kv_buffer_tensors, prefill_tp, decode_tp, chunk_pages
+):
+    from sglang.srt.disaggregation.common.staging_buffer import (
+        compute_staging_layout,
+        resolve_total_kv_heads,
+    )
+
+    total_heads = resolve_total_kv_heads(kv_args, decode_tp)
+    if kv_buffer_tensors and kv_buffer_tensors.get("k_buffers"):
+        buffers = kv_buffer_tensors["k_buffers"]
+        num_layers = len(buffers)
+        bytes_per_head = buffers[0].shape[-1] * buffers[0].element_size()
+    else:
+        num_layers = len(kv_args.kv_item_lens) // 2
+        dst_heads = max(1, total_heads // max(1, decode_tp))
+        bytes_per_head = kv_args.kv_item_lens[0] // kv_args.page_size // dst_heads
+    return compute_staging_layout(
+        prefill_tp,
+        decode_tp,
+        kv_args.engine_rank % max(1, decode_tp),
+        total_heads,
+        chunk_pages * kv_args.page_size,
+        bytes_per_head,
+        num_layers,
+    )[2]
+
+
 def handle_staging_req(
     msg,
     staging_allocator,
@@ -943,29 +987,12 @@ def handle_staging_req(
     ):
         offset, rnd, end = StagingAllocator.ALLOC_OVERSIZED, 0, -1
     else:
-        from sglang.srt.disaggregation.common.staging_buffer import (
-            compute_staging_layout,
-            resolve_total_kv_heads,
-        )
-
-        page_size = kv_args.page_size
-        kv_item_lens = kv_args.kv_item_lens
-        num_kv_layers = len(kv_item_lens) // 2
-        decode_bytes_per_token = kv_item_lens[0] // page_size
-        total_kv_heads = resolve_total_kv_heads(kv_args, attn_tp_size)
-        dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
-        bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
-        dst_tp_rank = kv_args.engine_rank % max(1, attn_tp_size)
-
-        chunk_tokens = chunk_num_pages * page_size
-        _, _, required = compute_staging_layout(
+        required = required_staging_bytes(
+            kv_args,
+            kv_buffer_tensors,
             prefill_attn_tp_size,
             attn_tp_size,
-            dst_tp_rank,
-            total_kv_heads,
-            chunk_tokens,
-            bytes_per_head_per_token,
-            num_kv_layers,
+            chunk_num_pages,
         )
         result = staging_allocator.assign(required)
         if result is None:

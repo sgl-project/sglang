@@ -27,7 +27,7 @@ from sglang.srt.layers.muse_spark.muse_spark_navit import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.muse_spark import MuseSparkTextForCausalLM
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
@@ -239,7 +239,12 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if not get_parallel().pp_group.is_first_rank:
+            return super().forward(
+                input_ids, positions, forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
         if input_ids is None:
             if input_embeds is None:
                 raise ValueError("input_embeds is required for multimodal forwarding")
