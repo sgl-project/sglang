@@ -200,6 +200,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     supports_sampling_mask,
 )
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
     resolve_watermark_request,
@@ -368,6 +369,9 @@ class ReqState:
     output_token_sampling_logprobs: List[Union[float, List[float]]] = dataclasses.field(
         default_factory=list
     )
+    output_token_sampling_mask_chunks: List[SamplingMaskChunk] = dataclasses.field(
+        default_factory=list
+    )
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
@@ -449,6 +453,29 @@ def _build_flat_top_logprobs_fields(
         f"{side}_top_logprobs_shape": [len(top_logprobs_val) - null_prefix, k],
         f"{side}_top_logprobs_null_prefix": null_prefix,
     }
+
+
+def _build_flat_sampling_mask_fields(
+    chunks: List[SamplingMaskChunk], return_b64: bool
+) -> Dict[str, Any]:
+    """A finished request's sampling masks as flat arrays, base64 with dtype markers if ``return_b64``."""
+    fields: Dict[str, Any] = {
+        "output_token_sampling_mask_length": sum(len(c.lengths) for c in chunks)
+    }
+    for name, attr, dtype in (
+        ("output_token_sampling_mask_flat", "token_ids", np.int32),
+        ("output_token_sampling_mask_lengths", "lengths", np.int32),
+        ("output_token_sampling_logprobs_flat", "logprobs", np.float32),
+    ):
+        values = np.concatenate(
+            [np.empty(0, dtype)] + [getattr(c, attr) for c in chunks]
+        )
+        if return_b64:
+            fields[f"{name}_b64"] = pybase64.b64encode(values.tobytes()).decode("utf-8")
+            fields[f"{name}_b64_dtype"] = np.dtype(dtype).name
+        else:
+            fields[name] = values.tolist()
+    return fields
 
 
 def _build_flat_top_logprobs_fields_from_arrays(
@@ -2798,21 +2825,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and state.obj.return_sampling_mask
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
-                if output_sampling_mask is not None:
-                    masks, logprobs = output_sampling_mask[i].to_lists(
-                        support_logprobs=state.obj.sampling_logprobs_mode == "support"
-                    )
-                    state.output_token_sampling_mask.extend(masks)
-                    state.output_token_sampling_logprobs.extend(logprobs)
-                    meta_info["output_token_sampling_mask"] = (
-                        state.output_token_sampling_mask
-                    )
-                    meta_info["output_token_sampling_logprobs"] = (
-                        state.output_token_sampling_logprobs
-                    )
-                    meta_info["output_token_sampling_mask_length"] = len(
-                        state.output_token_sampling_mask
-                    )
+                self.add_sampling_mask_to_meta_info(
+                    meta_info,
+                    state,
+                    None if output_sampling_mask is None else output_sampling_mask[i],
+                    finished=recv_obj.finished_reasons[i] is not None,
+                )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
@@ -3102,6 +3120,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state,
                 key,
                 values[index],
+            )
+
+    def add_sampling_mask_to_meta_info(
+        self,
+        meta_info: dict,
+        state: ReqState,
+        chunk: Optional[SamplingMaskChunk],
+        finished: bool,
+    ):
+        if chunk is not None:
+            if state.obj.return_flat_raw_sampling_mask:
+                state.output_token_sampling_mask_chunks.append(chunk)
+            else:
+                masks, logprobs = chunk.to_lists(
+                    support_logprobs=state.obj.sampling_logprobs_mode == "support"
+                )
+                state.output_token_sampling_mask.extend(masks)
+                state.output_token_sampling_logprobs.extend(logprobs)
+                meta_info["output_token_sampling_mask"] = (
+                    state.output_token_sampling_mask
+                )
+                meta_info["output_token_sampling_logprobs"] = (
+                    state.output_token_sampling_logprobs
+                )
+                meta_info["output_token_sampling_mask_length"] = len(
+                    state.output_token_sampling_mask
+                )
+        # Built once on the finished response; streaming is rejected.
+        if state.obj.return_flat_raw_sampling_mask and finished:
+            meta_info.update(
+                _build_flat_sampling_mask_fields(
+                    state.output_token_sampling_mask_chunks,
+                    return_b64=state.obj.return_flat_raw_sampling_mask_b64,
+                )
             )
 
     def add_logprob_to_meta_info(

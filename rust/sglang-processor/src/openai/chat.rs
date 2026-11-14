@@ -380,6 +380,7 @@ const UNSUPPORTED_FIELDS: &[&str] = &[
     "return_output_ids_in_sglext",
     "return_sampling_mask",
     "return_flat_raw_output_top_logprobs",
+    "return_flat_raw_sampling_mask",
     "sampling_logprobs_mode",
     "video_config",
     "max_dynamic_patch",
