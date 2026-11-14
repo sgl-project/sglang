@@ -36,6 +36,7 @@ from sglang.srt.layers.dcp import (
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -278,6 +279,13 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        # ROCm DFlash draft block (TARGET_VERIFY on the draft runner): split-KV
+        # SWA verify kernel + one-launch verify metadata.
+        self._use_dflash_draft_verify = (
+            _is_hip
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dflash()
         )
         # gfx1151 verify attention reads full-space slot ids straight from req_to_token
         self.use_verify_gfx115 = (
@@ -790,6 +798,49 @@ class TritonAttnBackend(AttentionBackend):
     ):
         """Fill all cuda-graph buffers for target_verify mode."""
         num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
+        windows = self.window_lengths
+        if (
+            self._use_dflash_draft_verify
+            and not self.verify_reads_window_kv_only
+            and (spec_info is None or spec_info.custom_mask is None)
+            and not self.runner_ids.reads_are_translated
+            and not isinstance(self.token_to_kv_pool, BaseSWAKVPool)
+            and set(windows) <= {IdSpaceKind.FULL.value}
+            and self.dcp_size == 1
+            and seq_lens.shape[0] == bs
+            and bs <= 1024
+        ):
+            from sglang.kernels.ops.attention.dflash_draft_verify_metadata import (
+                fill_draft_verify_metadata,
+            )
+
+            name = IdSpaceKind.FULL.value
+            swa = name in windows
+            fill_draft_verify_metadata(
+                bs=bs,
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=self.req_to_token,
+                num_tokens_per_req=num_tokens_per_req,
+                qo_indptr=self.qo_indptr,
+                kv_indptr=self.kv_indptr,
+                kv_indices=self.cuda_graph_kv_indices,
+                mask_indptr=self.mask_indptr,
+                window_size=windows[name] if swa else None,
+                window_kv_indptr=self.window_kv_indptr[name] if swa else None,
+                window_kv_indices=(
+                    self.cuda_graph_window_kv_indices[name] if swa else None
+                ),
+                window_kv_offsets=(
+                    self.cuda_graph_window_kv_offsets[name] if swa else None
+                ),
+            )
+            return (
+                self.qo_indptr[: bs + 1],
+                self.kv_indptr[: bs + 1],
+                None,
+                self.mask_indptr[: bs + 1],
+            )
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
@@ -1952,6 +2003,57 @@ class TritonAttnBackend(AttentionBackend):
         else:
             k_descale = 1.0
             v_descale = 1.0
+
+        # ROCm DFlash draft block (TARGET_VERIFY on the draft runner): split-KV
+        # GQA-packed sliding-window kernel; reads the strided q/k/v directly.
+        if (
+            self._use_dflash_draft_verify
+            and k is not None
+            and v is not None
+            and score_mod is None
+            and aux_tensors is None
+            and k_descale == 1.0
+            and v_descale == 1.0
+            and self.forward_metadata.custom_mask is None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            from sglang.kernels.ops.attention import dflash_draft_swa_verify as _dsv
+
+            q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            k3 = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+            v3 = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+            k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buf = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if _dsv.can_handle(
+                q3,
+                k3,
+                v3,
+                k_buf,
+                v_buf,
+                self.forward_metadata.qo_indptr,
+                self.forward_metadata.max_extend_len,
+                causal=causal,
+                sinks=sinks,
+                logit_cap=logits_soft_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                score_mod=score_mod,
+            ):
+                _dsv.draft_swa_verify_fwd(
+                    q3,
+                    k3,
+                    v3,
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    k_buf,
+                    v_buf,
+                    self.forward_metadata.qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    self.forward_metadata.max_extend_len,
+                    layer.scaling,
+                    sliding_window_size,
+                    self.req_to_token_pool.size,
+                )
+                return o
 
         if (
             self.use_verify_gfx115
