@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.llava import LlavaForConditionalGeneration
+from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,30 @@ class MistralForCausalLMMistralFormat(MistralForCausalLM):
 
 class Mistral3ForConditionalGeneration(LlavaForConditionalGeneration):
     MULTIMODAL_PROJECTOR_TYPE = Mistral3MultiModalProjector
+
+    # ``load_weights`` normalizes the v5 checkpoint layout into the sglang
+    # module tree (prefix renames below) and the Pixtral attention output
+    # projection is named ``proj`` where the checkpoint has ``o_proj``.
+    # Quantization configs use the checkpoint names, including in ``ignore``,
+    # so they must be mapped exactly like the weights.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "language_model.model.",
+            "model.vision_tower.": "vision_tower.",
+            "model.multi_modal_projector.": "multi_modal_projector.",
+            "lm_head.": "language_model.lm_head.",
+        },
+        orig_to_new_substr={".attention.o_proj": ".attention.proj"},
+    )
+
+    # The checkpoint stores the Pixtral vision q/k/v and gate/up projections
+    # separately while sglang fuses them. Without this mapping the fused
+    # modules cannot be matched against the per-shard entries of ``ignore``,
+    # so an ignored (BF16) vision tower is built quantized.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
