@@ -500,9 +500,14 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Set active HTTP connections count
-    pub fn set_http_connections_active(count: usize) {
-        gauge!("smg_http_connections_active").set(count as f64);
+    /// Increment active HTTP connections count
+    pub fn inc_http_connections_active() {
+        gauge!("smg_http_connections_active").increment(1.0);
+    }
+
+    /// Decrement active HTTP connections count
+    pub fn dec_http_connections_active() {
+        gauge!("smg_http_connections_active").decrement(1.0);
     }
 
     /// Record HTTP response.
