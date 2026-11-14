@@ -2844,6 +2844,39 @@ def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
     return _use_aiter and output_size % 64 == 0
 
 
+def apply_fp8_linear_deterministic(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Static FP8 linear with one reduction schedule across batch sizes."""
+    output_shape = [*input.shape[:-1], weight.shape[1]]
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
+    # Keep K reduction and N tiling fixed so prefill and cache hits agree.
+    # Only the row tile varies, avoiding wasted decode work and small tiles
+    # on long prefills without changing each row's reduction.
+    m = input_2d.shape[0]
+    block_m = 16 if m <= 16 else 32 if m < 128 else 128
+    output = triton_scaled_mm(
+        qinput,
+        weight,
+        x_scale,
+        weight_scale,
+        input.dtype,
+        bias,
+        block_size_m=block_m,
+        block_size_n=64,
+        block_size_k=128,
+        use_heuristic=False,
+        num_warps=4,
+        num_stages=3,
+    )
+    return output.view(*output_shape)
+
+
 # Measured on SM120: a tuned bmm_fp8 + add beat the bias epilogue by up to 1.6x
 # at small M and by 7% at 4096 rows; from 8192 rows on, the epilogue always won.
 _FP8_BIAS_EPILOGUE_MIN_ROWS = 8192

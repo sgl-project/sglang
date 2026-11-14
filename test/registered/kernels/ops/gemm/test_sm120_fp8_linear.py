@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang.kernels.ops.gemm import try_sm120_fp8_linear
+from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+from sglang.srt.layers.quantization import modelopt_quant
 from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear_bmm_flashinfer
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -90,6 +93,77 @@ def _run_sm120(args, *, m=None, vector_scales=False, bias=None):
         output_scale,
         bias,
     )
+
+
+@pytest.mark.parametrize("small_m,large_m", [(1, 64), (8, 128), (120, 248)])
+@pytest.mark.parametrize("n,k", [(4096, 4096), (16384, 5120), (5120, 6144), (96, 80)])
+def test_deterministic_modelopt_fp8_preserves_cached_suffix(
+    monkeypatch, small_m, large_m, n, k
+):
+    """Cold prefill and a shorter cache-hit batch must score identical rows."""
+    monkeypatch.setattr(
+        modelopt_quant,
+        "get_exec",
+        lambda: SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=True)
+        ),
+        raising=False,
+    )
+    method = object.__new__(modelopt_quant.ModelOptFp8LinearMethod)
+    method.use_marlin = False
+    method.use_sm120_fp8 = True
+    method.cutlass_fp8_supported = True
+    x, weight, weight_scale, input_scale = _make_inputs(large_m, n, k, seed=29)
+    layer = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        sm120_fp8_alpha=input_scale * weight_scale,
+        use_flashinfer_bmm=True,
+    )
+    full = method.apply(layer, x)
+    suffix = method.apply(layer, x[-small_m:].contiguous())
+    torch.testing.assert_close(suffix, full[-small_m:], rtol=0, atol=0)
+    quantized, _ = static_quant_fp8(x, input_scale, repeat_scale=False)
+    reference = (quantized.float() @ weight.float()) * input_scale * weight_scale
+    relative_rmse = (
+        full.float() - reference
+    ).square().mean().sqrt() / reference.square().mean().sqrt().clamp_min(1e-8)
+    assert relative_rmse < 0.005
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_deterministic_fp8_graph_replay_with_bias_and_strided_input(dtype):
+    deterministic_linear = modelopt_quant.apply_fp8_linear_deterministic
+    x, weight, weight_scale, input_scale = _make_inputs(6, 96, 80, seed=17)
+    x = x.to(dtype).view(2, 3, 80).transpose(0, 1)
+    bias = torch.randn(96, dtype=dtype, device="cuda")
+    args = (x, weight, weight_scale, input_scale, bias)
+    deterministic_linear(*args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = deterministic_linear(*args)
+
+    graph.replay()
+    before = actual.clone()
+    x.copy_(torch.randn_like(x).mul_(2))
+    graph.replay()
+    expected = deterministic_linear(*args)
+    assert actual.shape == (3, 2, 96)
+    assert actual.dtype == dtype
+    assert not torch.equal(actual, before)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    quantized, _ = static_quant_fp8(
+        x.reshape(-1, 80).contiguous(), input_scale, repeat_scale=False
+    )
+    reference = (
+        (quantized.float() @ weight.float()) * input_scale * weight_scale + bias
+    ).view_as(actual)
+    relative_rmse = (actual.float() - reference).square().mean().sqrt() / (
+        reference.square().mean().sqrt().clamp_min(1e-8)
+    )
+    assert relative_rmse < 0.005
 
 
 @pytest.mark.parametrize("seed", [0, 1, 7])
