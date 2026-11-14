@@ -773,7 +773,6 @@ class ComposedPipelineBase(ABC):
     def add_stage(
         self, stage: PipelineStage, stage_name: str | None = None
     ) -> "ComposedPipelineBase":
-
         assert self.modules is not None, "No modules are registered"
         if stage_name is None:
             stage_name = self._infer_stage_name(stage)
@@ -805,7 +804,6 @@ class ComposedPipelineBase(ABC):
     def add_stages(
         self, stages: list[PipelineStage | tuple[PipelineStage, str]]
     ) -> "ComposedPipelineBase":
-
         for item in stages:
             if isinstance(item, tuple):
                 stage, name = item
@@ -881,8 +879,9 @@ class ComposedPipelineBase(ABC):
         scheduler_key: str = "scheduler",
         vae_key: str | None = "vae",
         stage_name: str = "denoising_stage",
+        *,
+        stage_cls: type[DenoisingStage] = DenoisingStage,
     ) -> "ComposedPipelineBase":
-
         def create_stage() -> PipelineStage:
             kwargs = {
                 "transformer": self.get_module(transformer_key),
@@ -900,7 +899,7 @@ class ComposedPipelineBase(ABC):
                     kwargs["vae"] = vae
                     kwargs["pipeline"] = self
 
-            return DenoisingStage(**kwargs)
+            return stage_cls(**kwargs)
 
         return self.add_stage_factory(
             RoleType.DENOISER,
@@ -916,8 +915,9 @@ class ComposedPipelineBase(ABC):
         scheduler_key: str = "scheduler",
         vae_key: str | None = "vae",
         stage_name: str = "denoising_stage",
+        *,
+        standard_stage_cls: type[DenoisingStage] = DenoisingStage,
     ) -> "ComposedPipelineBase":
-
         def create_stage() -> PipelineStage:
             kwargs = {
                 "transformer": self.get_module(transformer_key),
@@ -934,7 +934,7 @@ class ComposedPipelineBase(ABC):
                 kwargs["vae"] = self.get_module(vae_key, None)
 
             return ProgressiveDenoisingStageRouter(
-                standard_stage=DenoisingStage(**kwargs),
+                standard_stage=standard_stage_cls(**kwargs),
                 progressive_stage_factory=lambda: progressive_stage_cls(**kwargs),
             )
 
@@ -949,7 +949,6 @@ class ComposedPipelineBase(ABC):
         vae_key: str = "vae",
         stage_name: str = "decoding_stage",
     ) -> "ComposedPipelineBase":
-
         def create_stage() -> PipelineStage:
             return DecodingStage(
                 vae=self.get_module(vae_key),
@@ -971,8 +970,9 @@ class ComposedPipelineBase(ABC):
         text_encoding_stage_name: str | None = None,
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
         progressive_denoising_stage_cls: type[ProgressiveDenoisingStage] | None = None,
+        *,
+        standard_denoising_stage_cls: type[DenoisingStage] = DenoisingStage,
     ) -> "ComposedPipelineBase":
-
         if include_input_validation:
             self.add_stage(InputValidationStage())
 
@@ -987,9 +987,14 @@ class ComposedPipelineBase(ABC):
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
         if progressive_denoising_stage_cls is None:
-            self.add_standard_denoising_stage()
+            self.add_standard_denoising_stage(
+                stage_cls=standard_denoising_stage_cls,
+            )
         else:
-            self.add_progressive_denoising_stage(progressive_denoising_stage_cls)
+            self.add_progressive_denoising_stage(
+                progressive_denoising_stage_cls,
+                standard_stage_cls=standard_denoising_stage_cls,
+            )
         self.add_standard_decoding_stage()
 
         return self
