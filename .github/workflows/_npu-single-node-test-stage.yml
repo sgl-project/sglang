@@ -469,3 +469,12 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
           exit ${test_exit_code}
+
+      - name: Upload test logs for failure analysis
+        if: ${{ always() && !inputs.use_coverage_runner && !inputs.is_nightly_pipeline_job }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-test-logs-${{ inputs.test_suite }}-part${{ matrix.partition }}-${{ github.run_attempt }}
+          path: /tmp/test-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7
