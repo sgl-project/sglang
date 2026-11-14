@@ -308,6 +308,7 @@ class RequestLogger:
                     "video_data",
                     "lora_path",
                     "sampling_params",
+                    "_question",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 1:
@@ -320,6 +321,7 @@ class RequestLogger:
                     "audio_data",
                     "video_data",
                     "lora_path",
+                    "_question",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 2:
@@ -425,7 +427,9 @@ def _dataclass_to_string_truncated(
         for k, v in data.items():
             if k in skip_names:
                 continue
-            rendered = _dataclass_to_string_truncated(_redact_field(k, v), max_length)
+            rendered = _dataclass_to_string_truncated(
+                _redact_field(k, v), max_length, skip_names=skip_names
+            )
             parts.append(f"'{k}': {rendered}")
         return "{" + ", ".join(parts) + "}"
     elif dataclasses.is_dataclass(data):
@@ -435,7 +439,7 @@ def _dataclass_to_string_truncated(
                 continue
             value = _redact_field(f.name, getattr(data, f.name))
             parts.append(
-                f"{f.name}={_dataclass_to_string_truncated(value, max_length)}"
+                f"{f.name}={_dataclass_to_string_truncated(value, max_length, skip_names=skip_names)}"
             )
         return f"{data.__class__.__name__}(" + ", ".join(parts) + ")"
     else:
@@ -456,24 +460,38 @@ def _transform_data_for_logging(
         if len(data) > max_length:
             half_length = max_length // 2
             return (
-                [_transform_data_for_logging(v, max_length) for v in data[:half_length]]
+                [
+                    _transform_data_for_logging(
+                        v, max_length, skip_names=skip_names
+                    )
+                    for v in data[:half_length]
+                ]
                 + ["..."]
                 + [
-                    _transform_data_for_logging(v, max_length)
+                    _transform_data_for_logging(
+                        v, max_length, skip_names=skip_names
+                    )
                     for v in data[-half_length:]
                 ]
             )
-        return [_transform_data_for_logging(v, max_length) for v in data]
+        return [
+            _transform_data_for_logging(v, max_length, skip_names=skip_names)
+            for v in data
+        ]
     elif isinstance(data, dict):
         return {
-            k: _transform_data_for_logging(_redact_field(k, v), max_length)
+            k: _transform_data_for_logging(
+                _redact_field(k, v), max_length, skip_names=skip_names
+            )
             for k, v in data.items()
             if k not in skip_names
         }
     elif dataclasses.is_dataclass(data):
         return {
             f.name: _transform_data_for_logging(
-                _redact_field(f.name, getattr(data, f.name)), max_length
+                _redact_field(f.name, getattr(data, f.name)),
+                max_length,
+                skip_names=skip_names,
             )
             for f in dataclasses.fields(data)
             if f.name not in skip_names
