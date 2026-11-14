@@ -12,7 +12,9 @@ from typing import (
     Dict,
     FrozenSet,
     List,
+    NamedTuple,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -280,7 +282,8 @@ def _fill_identity_request(
     """Rows [t, topk] of the -1 filled buffers: column j < lc holds compressed
     position j (its slot / its raw index) when j < lens_row, else -1. An identity
     request publishes no candidates: every reachable block is one."""
-    j = torch.arange(lc, device=lens.device)
+    # int32 throughout: an int64 j widens both [tokens, lc] temporaries before the cast
+    j = torch.arange(lc, device=lens.device, dtype=torch.int32)
     reach = j[None, :] < lens[:, None]
     page_rows[:, :lc] = torch.where(reach, slots_j[None, :], -1).to(torch.int32)
     if raw_rows is not None:
@@ -477,15 +480,88 @@ def low_ratio_index_topk_hip_decode(
 
 def _extend_k_slots(req_to_token, *, ratio, lc_per_req, req_pool_indices, device):
     """Per request, the c1/c2 pool slots of its visible compressed positions, and
-    each request's start offset in their concatenation."""
+    each request's start offset in their concatenation.
+
+    Every bound is known on the host (``total`` and both ``output_size=``), so the
+    gather launches without a device-to-host sync. Slots stay int32, the dtype of
+    req_to_token and of the buffers ``_fill_identity_request`` writes."""
     starts = [0, *itertools.accumulate(lc_per_req)][:-1]
-    counts = torch.tensor(lc_per_req, dtype=torch.int64, device=device)
-    req_rows = torch.repeat_interleave(req_pool_indices.to(torch.int64), counts)
-    j = torch.arange(int(counts.sum()), device=device) - torch.repeat_interleave(
-        torch.tensor(starts, dtype=torch.int64, device=device), counts
+    total = sum(lc_per_req)
+    num_reqs = len(lc_per_req)
+    # counts and start offsets in one host-to-device copy
+    bounds = torch.tensor([*lc_per_req, *starts], dtype=torch.int64, device=device)
+    counts, start_offsets = bounds[:num_reqs], bounds[num_reqs:]
+    req_rows = torch.repeat_interleave(
+        req_pool_indices.to(torch.int64), counts, output_size=total
     )
-    slots = req_to_token[req_rows, j * ratio].to(torch.int64) // ratio
+    j = torch.arange(total, device=device) - torch.repeat_interleave(
+        start_offsets, counts, output_size=total
+    )
+    slots = (req_to_token[req_rows, j * ratio] // ratio).to(torch.int32)
     return slots, starts
+
+
+class LowRatioExtendSlots(NamedTuple):
+    """One ratio's extend slot gather, hoisted out of its index-source layers.
+
+    The table is a pure function of (ratio, req_to_token, seq_lens, req_pool_indices),
+    none of which an attention layer writes, so every index-source layer of that ratio
+    shares one build per forward instead of repeating it. ``matches`` re-checks the
+    batch it was built for; a layer that does not recognise it rebuilds its own."""
+
+    slots: torch.Tensor
+    starts: List[int]
+    lc_per_req: List[int]
+    req_pool_indices: torch.Tensor
+
+    def matches(
+        self, lc_per_req: List[int], req_pool_indices: Optional[torch.Tensor]
+    ) -> bool:
+        return (
+            self.lc_per_req == lc_per_req and self.req_pool_indices is req_pool_indices
+        )
+
+
+def build_low_ratio_extend_k_slots(
+    req_to_token: torch.Tensor,
+    *,
+    ratios: Sequence[int],
+    seq_lens_cpu,
+    req_pool_indices: Optional[torch.Tensor],
+    index_topk: int,
+    identity_skip: bool,
+) -> Dict[int, LowRatioExtendSlots]:
+    """This forward's per-ratio extend slot tables, keyed by ratio.
+
+    Must run outside graph capture, next to the prefill workspace refresh: the
+    low-ratio index sources are driven eagerly at a graph break, so the index-source
+    layers read these tensors by value, not by a captured address."""
+    tables: Dict[int, LowRatioExtendSlots] = {}
+    if not identity_skip or not ratios or req_pool_indices is None:
+        return tables
+    seq_lens = _as_int_list(seq_lens_cpu)
+    if not seq_lens or req_pool_indices.numel() != len(seq_lens):
+        return tables
+    for ratio in ratios:
+        lc_per_req = [s // ratio for s in seq_lens]
+        # only the score-free identity fill resolves slots here; scored rows resolve
+        # inside the top-k transform
+        if not any(lc_per_req) or not any(lc <= index_topk for lc in lc_per_req):
+            continue
+        slots, starts = _extend_k_slots(
+            req_to_token,
+            ratio=ratio,
+            lc_per_req=lc_per_req,
+            req_pool_indices=req_pool_indices,
+            device=req_to_token.device,
+        )
+        tables[ratio] = LowRatioExtendSlots(
+            slots=slots,
+            starts=starts,
+            lc_per_req=lc_per_req,
+            req_pool_indices=req_pool_indices,
+        )
+    return tables
 
 
 def low_ratio_index_topk_hip_extend(
@@ -533,13 +609,20 @@ def low_ratio_index_topk_hip_extend(
     publish = [] if indexer.is_candidate_source else None
     if any(is_identity):
         # only the score-free fill resolves slots itself; scored rows resolve in the top-k transform
-        k_slots, starts = _extend_k_slots(
-            backend.req_to_token,
-            ratio=ratio,
-            lc_per_req=lc_per_req,
-            req_pool_indices=forward_batch.req_pool_indices.to(torch.int64),
-            device=pos.device,
-        )
+        hoisted = backend.low_ratio_extend_k_slots.get(ratio)
+        if hoisted is not None and hoisted.matches(
+            lc_per_req, forward_batch.req_pool_indices
+        ):
+            # built once this forward, shared by this ratio's other index-source layers
+            k_slots, starts = hoisted.slots, hoisted.starts
+        else:
+            k_slots, starts = _extend_k_slots(
+                backend.req_to_token,
+                ratio=ratio,
+                lc_per_req=lc_per_req,
+                req_pool_indices=forward_batch.req_pool_indices,
+                device=pos.device,
+            )
 
     def fill_identity_requests(req_lo, req_hi, tok_lo):
         """Identity requests req_lo..req_hi: rows written without scores, None published per request."""
