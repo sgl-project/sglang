@@ -16,7 +16,11 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.platform_kv_cache_dtype import (
+    registered_kv_cache_storage_dtype,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
@@ -105,6 +109,45 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
         raise ValueError(
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
+        )
+
+
+def handle_platform_kv_cache_dtype_compatibility(server_args: Any) -> None:
+    """A platform-registered KV cache dtype has no in-tree implementation."""
+    cfg = resolving_view(server_args)
+    kv_cache_dtype = cfg.kv_cache_dtype
+    if registered_kv_cache_storage_dtype(kv_cache_dtype) is None:
+        return
+    platform = (
+        f"{type(current_platform).__name__} (device {current_platform.device_name!r})"
+    )
+    if not (
+        current_platform.is_out_of_tree()
+        and current_platform.supports_kv_cache_dtype(kv_cache_dtype)
+    ):
+        raise ValueError(
+            f"--kv-cache-dtype {kv_cache_dtype} is not supported by {platform}: "
+            "it is registered by a platform plugin, has no in-tree implementation, "
+            "and this platform does not declare support for it. Choose another "
+            "--kv-cache-dtype, or use the platform that provides it."
+        )
+    # Core's KV transfer slices pages per head and its host pools copy the
+    # in-tree per-head layout; neither preserves a platform's packed pages.
+    unsupported = [
+        flag
+        for flag, enabled in (
+            ("--disaggregation-mode", cfg.disaggregation_mode != "null"),
+            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            ("--enable-lmcache", cfg.enable_lmcache),
+        )
+        if enabled
+    ]
+    if unsupported:
+        raise ValueError(
+            f"--kv-cache-dtype {kv_cache_dtype} on {platform} does not support "
+            f"{', '.join(unsupported)}: PD transfer and the host KV pools assume "
+            "the in-tree per-head KV layout. Disable them or choose another "
+            "--kv-cache-dtype."
         )
 
 
@@ -965,6 +1008,13 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
             "--prefill-only-disable-kv-cache does not currently support "
             "--kv-cache-dtype=mxfp8 because the MXFP8 pool stores separate "
             "scale-factor buffers."
+        )
+    if registered_kv_cache_storage_dtype(cfg.kv_cache_dtype) is not None:
+        raise ValueError(
+            "--prefill-only-disable-kv-cache does not currently support "
+            f"--kv-cache-dtype={cfg.kv_cache_dtype} because a platform-registered "
+            "KV cache dtype needs the platform's KV pool, which the no-op pool "
+            "cannot replace."
         )
 
     # Structural preconditions for the FA backend's fa_skip_kv_cache path,

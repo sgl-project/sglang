@@ -20,6 +20,7 @@ from sglang.srt.arg_groups.arg_utils import (
     nullable_str,
 )
 from sglang.srt.arg_groups.choices import (
+    KV_CACHE_DTYPE_CHOICES,
     LOAD_FORMAT_CHOICES,
     QUANTIZATION_CHOICES,
 )
@@ -209,18 +210,11 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. Out-of-tree "
+                "platform plugins can register further values for KV cache formats "
+                "that only their KV pool implements; in-tree platforms reject them."
             ),
-            choices=[
-                "auto",
-                "fp8_e5m2",
-                "fp8_e4m3",
-                "mxfp8",
-                "bf16",
-                "bfloat16",
-                "nvfp4",
-                "fp4_mx_block16",
-            ],
+            choices=KV_CACHE_DTYPE_CHOICES,
             resolvable=True,
         ),
     ] = "auto"

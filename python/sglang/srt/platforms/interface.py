@@ -285,6 +285,27 @@ class SRTPlatform(DeviceMixin):
         """Whether this out-of-tree platform supports Mamba cache snapshots."""
         return False
 
+    def supports_kv_cache_dtype(self, kv_cache_dtype: str) -> bool:
+        """Whether this out-of-tree platform serves a platform-registered KV
+        cache dtype.
+
+        Consulted only for ``--kv-cache-dtype`` values added with
+        ``register_kv_cache_dtype`` and only on out-of-tree platforms; in-tree
+        platforms always reject those values, and built-in dtypes are validated
+        as before. Return True only if the pools this platform returns from
+        ``get_kv_pool_cls`` store the format and its own attention backend reads
+        it: in-tree pools and attention backends have no path for it. The pool
+        is constructed with the registered storage dtype and reads the format
+        from the ``kv_cache_dtype`` server argument. Core rejects a model that
+        builds a pool kind this platform does not provide (a hybrid DSA model
+        with sliding-window layers builds both ``dsa`` and ``mla`` pools), and PD
+        disaggregation, hierarchical cache, LMCache and
+        ``--prefill-only-disable-kv-cache``. The platform must reject any pool
+        kind it provides but cannot serve with the format, which core cannot
+        detect, and any head size or feature it cannot serve.
+        """
+        return False
+
     # ------------------------------------------------------------------
     # Distributed
     # ------------------------------------------------------------------

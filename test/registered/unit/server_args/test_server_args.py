@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
 )
+from sglang.srt.arg_groups.choices import KV_CACHE_DTYPE_CHOICES
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
     finalize_cuda_graph_prefill_max_context,
@@ -47,6 +48,7 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
     handle_kv4_compatibility,
     handle_nvfp4_prefill_kv_dequant_dtype,
+    handle_platform_kv_cache_dtype_compatibility,
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.kv_shard_hook import (
@@ -109,6 +111,7 @@ from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
     get_flashinfer_a2a_dispatch_type,
 )
+from sglang.srt.mem_cache import platform_kv_cache_dtype
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -1735,6 +1738,68 @@ class TestKV4Compatibility(unittest.TestCase):
         args = self._make_nvfp4_args(enable_unified_memory=True)
         with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
             handle_kv4_compatibility(args)
+
+
+_PLATFORM_KV_CACHE_DTYPE = "example_platform_kv"
+
+
+def _register_platform_kv_cache_dtype(test):
+    """Register a platform KV cache dtype for ``test`` only; both stores are global."""
+    choices = list(KV_CACHE_DTYPE_CHOICES)
+    test.addCleanup(KV_CACHE_DTYPE_CHOICES.__setitem__, slice(None), choices)
+    registry = patch.dict(
+        platform_kv_cache_dtype._REGISTERED_KV_CACHE_DTYPES, clear=True
+    )
+    registry.start()
+    test.addCleanup(registry.stop)
+    platform_kv_cache_dtype.register_kv_cache_dtype(_PLATFORM_KV_CACHE_DTYPE)
+
+
+class TestPlatformKVCacheDtypeCompatibility(CustomTestCase):
+    """A registered KV cache dtype has no in-tree implementation: only an
+    out-of-tree platform that declares it may select it, and not with core's
+    per-head KV layout paths."""
+
+    def setUp(self):
+        _register_platform_kv_cache_dtype(self)
+
+    @staticmethod
+    def _resolve(
+        *, out_of_tree, declared, kv_cache_dtype=_PLATFORM_KV_CACHE_DTYPE, **overrides
+    ):
+        args = ServerArgs(
+            model_path="dummy", kv_cache_dtype=kv_cache_dtype, **overrides
+        )
+        with patch("sglang.srt.arg_groups.kv_cache_hook.current_platform") as platform:
+            platform.is_out_of_tree.return_value = out_of_tree
+            platform.supports_kv_cache_dtype.side_effect = lambda dtype: (
+                dtype in declared
+            )
+            handle_platform_kv_cache_dtype_compatibility(args)
+
+    def test_only_an_out_of_tree_platform_declaring_the_dtype_accepts_it(self):
+        name = _PLATFORM_KV_CACHE_DTYPE
+        for out_of_tree, declared in ((False, {name}), (True, set())):
+            with (
+                self.subTest(out_of_tree=out_of_tree, declared=declared),
+                self.assertRaisesRegex(ValueError, "does not declare support"),
+            ):
+                self._resolve(out_of_tree=out_of_tree, declared=declared)
+        self._resolve(out_of_tree=True, declared={name})
+
+    def test_built_in_dtypes_ignore_the_platform_declaration(self):
+        self._resolve(out_of_tree=True, declared=set(), kv_cache_dtype="fp8_e4m3")
+
+    def test_declared_dtype_rejects_pd_and_host_kv_pools(self):
+        for flag, overrides in (
+            ("--disaggregation-mode", {"disaggregation_mode": "prefill"}),
+            ("--enable-hierarchical-cache", {"enable_hierarchical_cache": True}),
+            ("--enable-lmcache", {"enable_lmcache": True}),
+        ):
+            with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, flag):
+                self._resolve(
+                    out_of_tree=True, declared={_PLATFORM_KV_CACHE_DTYPE}, **overrides
+                )
 
 
 class TestLoraForwardDomains(unittest.TestCase):
@@ -3546,6 +3611,11 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             with self.subTest(kv_cache_dtype=kv_cache_dtype):
                 with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
+
+    def test_rejects_platform_registered_kv_cache_dtype(self):
+        _register_platform_kv_cache_dtype(self)
+        with self.assertRaisesRegex(ValueError, "platform-registered"):
+            self._validate_prefill_only_args(kv_cache_dtype=_PLATFORM_KV_CACHE_DTYPE)
 
 
 class TestPipelineParallelCompat(CustomTestCase):

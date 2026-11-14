@@ -35,6 +35,10 @@ FP4 quantization is currently experimental.
 - **`nvfp4`**: NVIDIA FP4 with 16-value blocks, E4M3 block scales, and a per-tensor global scale.
 - **`fp4_mx_block16`**: An E2M1 block-size-16 compatibility recipe. It is distinct from the standard OCP MXFP4 block-size-32 format.
 
+### Platform-registered formats
+
+A hardware platform plugin can register further `--kv-cache-dtype` values for KV cache formats that only its own KV pool implements (see the [SGLang Plugin System](/docs/hardware-platforms/plugin#platform-registered-kv-cache-dtypes)). The platform defines each format's layout and attention kernels. Every in-tree platform rejects these values at startup, and PD disaggregation, hierarchical KV cache, LMCache and `--prefill-only-disable-kv-cache` are not supported with them.
+
 ## Usage
 
 ### Enabling Quantized KV Cache
