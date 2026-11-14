@@ -929,9 +929,8 @@ class _DcpGatherPrefetcher:
                 )
                 send_nope = _pad_dcp_packed_send(send_nope, plan, parallel.dcp_rank)
                 send_rope = _pad_dcp_packed_send(send_rope, plan, parallel.dcp_rank)
-                # The work handles are dropped on purpose: every collective
-                # is enqueued on this side stream, so the ready event below
-                # orders the compute stream after all of them.
+                # The helper waits for backend work before this stream's
+                # ready event can release the compute-stream consumer.
                 _dcp_issue_gather_chunks(parallel.dcp_group, out_nope, send_nope, plan)
                 _dcp_issue_gather_chunks(parallel.dcp_group, out_rope, send_rope, plan)
             self.ready[slot] = self.stream.record_event()
@@ -1157,8 +1156,8 @@ def _dcp_issue_gather_chunks(
     roughly 1-2 ms leave the inter-collective windows in which that work runs.
     See SGLANG_NPU_DCP_GATHER_CHUNKS for the measurement.
 
-    Returns the async work handles (empty when issued synchronously); the
-    prefetch and eager paths rely on stream ordering and drop them.
+    Order every chunk's completion before the caller consumes the prefix or
+    records its ready event; communication may use a separate backend stream.
     """
     c = plan.dcp_size
     if plan.chunks <= 1:
@@ -1176,6 +1175,9 @@ def _dcp_issue_gather_chunks(
             )
         )
         st += sz
+    for work in works:
+        if work is not None:
+            work.wait()
     return tuple(works)
 
 
