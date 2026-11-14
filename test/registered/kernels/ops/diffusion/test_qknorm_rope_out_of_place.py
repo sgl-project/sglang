@@ -66,7 +66,9 @@ def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
         (True, 96, False, False, True, torch.bfloat16, torch.float32, torch.int32),
     ],
 )
+@pytest.mark.parametrize("T", [1037, 24611])
 def test_two_rows_per_warp_match_one_row_per_warp(
+    T: int,
     out_of_place: bool,
     rope_dim: int,
     is_neox: bool,
@@ -77,12 +79,13 @@ def test_two_rows_per_warp_match_one_row_per_warp(
     pos_dtype: torch.dtype,
 ) -> None:
     """head_dim 128 runs two rows per warp; its bytes must equal the
-    one-row-per-warp kernel's on every arch, RoPE layout and rounding mode."""
+    one-row-per-warp kernel's on every arch, RoPE layout and rounding mode.
+    A token count above the resident warp count takes the token-major loop."""
     from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
         _jit_qknorm_rope_module,
     )
 
-    T, H, D = 1037, 7, 128  # an odd row count leaves the last warp one row
+    H, D = 7, 128
     g = torch.Generator(device="cpu").manual_seed(rope_dim)
     qkv = (3 * torch.randn(T, 3 * H * D, generator=g)).to("cuda", dtype)
     q = qkv[:, : H * D].view(T, H, D)
