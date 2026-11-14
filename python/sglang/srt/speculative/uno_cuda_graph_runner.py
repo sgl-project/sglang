@@ -72,6 +72,11 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         super().__init__(model_runner, record_nolora_graph=forward_width > 1, **kwargs)
 
     def capture_prepare(self, size, num_tokens=None):
+        if str(self.model_runner.device).startswith("npu"):
+            # Ascend aliases seq_lens while deriving final KV lengths. Each
+            # bucket and LoRA variant must start from dummy prefix lengths.
+            self.buffers.seq_lens.fill_(self.seq_len_fill_value)
+            self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
         forward_batch, attn_backend, pp_proxy_tensors = super().capture_prepare(
             size, num_tokens=num_tokens
         )
@@ -127,8 +132,8 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         attention_variant=None,
     ):
         if self._tree_draft_mode:
-            self._lora_state.capture_draft(size)
             try:
+                self._lora_state.capture_draft(size)
                 return super().capture_one_shape(
                     size,
                     forward,
@@ -150,20 +155,22 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             finally:
                 self.model_runner.lora_manager.reset_lora_batch()
 
-        if variant_label == "lora":
-            self._capture_spec_input_type = SpecInputType.UNO_DRAFT
-            self._lora_state.capture_draft(size)
-        else:
-            self._capture_spec_input_type = SpecInputType.UNO_VERIFY
-            self._lora_state.reset()
+        try:
+            if variant_label == "lora":
+                self._capture_spec_input_type = SpecInputType.UNO_DRAFT
+                self._lora_state.capture_draft(size)
+            else:
+                self._capture_spec_input_type = SpecInputType.UNO_VERIFY
+                self._lora_state.reset()
 
-        super().capture_one_shape(
-            size,
-            forward,
-            variant_label,
-            attention_variant,
-        )
-        self._lora_state.reset()
+            super().capture_one_shape(
+                size,
+                forward,
+                variant_label,
+                attention_variant,
+            )
+        finally:
+            self._lora_state.reset()
 
     def get_spec_info(self, num_tokens: int, ragged_verify_layout=None):
         if self._tree_draft_mode:

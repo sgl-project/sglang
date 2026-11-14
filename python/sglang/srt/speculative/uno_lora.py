@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.runtime_context import get_spec
@@ -18,12 +20,28 @@ _UNO_INTERNAL_LORA_NAME = "__uno_draft__"
 
 # LoRA pool capacity includes the base-model slot.
 _UNO_LORA_POOL_CAPACITY = 2
+logger = logging.getLogger(__name__)
+
+
+def uno_lora_backend_for_device(device: str) -> str:
+    """Select the internal UNO LoRA backend for the execution device."""
+    return "uno_ascend" if str(device).startswith("npu") else "uno_cublas"
 
 
 def init_uno_lora_manager(
     model_runner: ModelRunner,
 ) -> tuple[LoRAManager, str]:
     """Load and pin the single UNO draft adapter."""
+
+    if mambaish_config(model_runner.model_config) is not None:
+        # UNO writes a LoRA draft followed by a base-only verify into the same
+        # model. Recurrent states need separate draft state and accepted-prefix
+        # commit/rollback, which the UNO worker does not implement.
+        raise ValueError(
+            "UNO does not support recurrent or hybrid linear-attention models "
+            "(Mamba/GDN/KDA); draft-state isolation and accepted-state commit "
+            "are not implemented."
+        )
 
     lora_path = get_spec().uno_lora_path
 
@@ -44,7 +62,7 @@ def init_uno_lora_manager(
         load_config=model_runner.load_config,
         dtype=model_runner.dtype,
         server_args=model_runner.server_args,
-        lora_backend="uno_cublas",  # fast path
+        lora_backend=uno_lora_backend_for_device(model_runner.device),
         # Infer these from the one trained adapter.
         max_lora_rank=None,
         target_modules=None,
@@ -57,6 +75,12 @@ def init_uno_lora_manager(
     #   None             -> base model
     #   uno_ref.lora_id  -> base model + UNO draft LoRA
     manager.fetch_new_loras({None, uno_ref.lora_id})
+    logger.info(
+        "UNO LoRA initialized: backend=%s, rank=%s, adapter=%s",
+        manager.lora_backend.name,
+        manager.max_lora_rank,
+        lora_path,
+    )
 
     return manager, uno_ref.lora_id
 

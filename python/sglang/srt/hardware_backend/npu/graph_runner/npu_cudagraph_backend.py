@@ -184,7 +184,10 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                     seq_lens_cpu = forward_batch.seq_lens_cpu[: runner.raw_bs]
                     # DFlash/DSpark publish CPU mirrors including the verify
                     # block. Adding it again lets FIA see future candidates.
-                    if not runner.model_runner.spec_algorithm.is_dflash_family():
+                    if (
+                        not runner.model_runner.spec_algorithm.is_dflash_family()
+                        and not runner.model_runner.spec_algorithm.is_uno()
+                    ):
                         seq_lens_cpu = seq_lens_cpu + runner.captured_req_width
                 else:
                     seq_lens_cpu = (
@@ -337,8 +340,17 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                 is_encoder_decoder=runner.is_encoder_decoder,
             )
             runner.attn_backend.init_forward_metadata_out_graph(fb_view)
-        # Preserve the legacy NPU pre-planned replay key.
-        runner._replay_graph_key = runner._make_graph_key(runner.bs)
+        if runner.model_runner.spec_algorithm.is_uno():
+            runner._replay_graph_key = runner._make_graph_key(
+                runner.bs,
+                variant_label=runner._resolve_lora_variant(forward_batch),
+                attention_variant=runner._resolve_attention_variant(
+                    forward_batch, runner.bs
+                ),
+            )
+        else:
+            # Preserve the legacy NPU pre-planned replay key.
+            runner._replay_graph_key = runner._make_graph_key(runner.bs)
         return True
 
     @contextmanager

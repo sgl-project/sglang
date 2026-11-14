@@ -77,6 +77,13 @@ def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     )
 
 
+def _is_uno_forward(spec_info: Optional[SpecInput]) -> bool:
+    return spec_info is not None and spec_info.spec_input_type in {
+        SpecInputType.UNO_DRAFT,
+        SpecInputType.UNO_VERIFY,
+    }
+
+
 def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
     if topk_indices.dim() == 2:
@@ -634,6 +641,7 @@ class AscendAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
+            in_capture=in_capture,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -655,12 +663,11 @@ class AscendAttnBackend(AttentionBackend):
         ):
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
-                if (
+                if _is_uno_forward(forward_batch.spec_info) or (
                     forward_batch.spec_algorithm is not None
                     and forward_batch.spec_algorithm.is_dflash()
                 ):
-                    # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
-                    # one verify block, which already covers the draft block.
+                    # UNO and DFlash publish final host lengths including the query block.
                     seq_lens_max = forward_batch.seq_lens_cpu.max().item()
                 else:
                     # Overlap scheduling can publish the CPU sequence length one
@@ -752,17 +759,23 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
             if (
-                spec_algorithm is None or not spec_algorithm.is_dflash_family()
+                not _is_uno_forward(forward_batch.spec_info)
+                and (spec_algorithm is None or not spec_algorithm.is_dflash_family())
             ) and self.forward_metadata.seq_lens_cpu_int is not None:
-                self.forward_metadata.seq_lens_cpu_int += int(
-                    forward_batch.spec_info.draft_token_num
+                self.forward_metadata.seq_lens_cpu_int = (
+                    self.forward_metadata.seq_lens_cpu_int
+                    + int(forward_batch.spec_info.draft_token_num)
                 )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
             if self.forward_metadata.seq_lens_cpu_int is not None:
-                self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+                self.forward_metadata.seq_lens_cpu_int = (
+                    self.forward_metadata.seq_lens_cpu_int
+                    + self.speculative_step_id
+                    + 1
+                )
             else:
                 # Mirrorless decode: apply the draft offset to the device
                 # lengths consumed by _npu_paged_attention instead.
@@ -1231,6 +1244,7 @@ class AscendAttnBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
         origin_out_cache_loc: Optional[torch.Tensor] = None,
         max_seq_len_host: Optional[int] = None,
+        in_capture: bool = False,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -1247,10 +1261,14 @@ class AscendAttnBackend(AttentionBackend):
             )
         if seq_lens_cpu is not None:
             # Compute the host-side KV lengths visible to this attention step. Target
-            # verify adds the draft block except for DFlash, whose seq_lens_cpu already
-            # includes it; speculative decode adds tokens through the current draft step.
+            # Live UNO and DFlash host lengths already include the query block.
+            # UNO capture still supplies dummy prefixes, so add the width there.
             attention_kv_lens_cpu = seq_lens_cpu[:bs].int()
-            if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
+            if (
+                forward_mode.is_target_verify()
+                and not _is_dflash_verify(spec_info)
+                and not (_is_uno_forward(spec_info) and not in_capture)
+            ):
                 attention_kv_lens_cpu = (
                     attention_kv_lens_cpu + self.speculative_num_draft_tokens
                 )
@@ -1447,7 +1465,9 @@ class AscendAttnBackend(AttentionBackend):
             # recomputes it): gathering seq_lens[:bs] here would force a D2H
             # sync for models (e.g. DSA+MTP) whose replay path is otherwise
             # sync-free.
-            if _is_dflash_verify(spec_info):
+            if _is_uno_forward(spec_info):
+                metadata.seq_lens_cpu_list = attention_kv_lens_cpu.tolist()
+            elif _is_dflash_verify(spec_info):
                 if seq_lens_cpu is not None:
                     kv_lens = seq_lens_cpu[:bs]
                 else:
@@ -2017,7 +2037,6 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: torch.Tensor = None,
     ):
-
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
