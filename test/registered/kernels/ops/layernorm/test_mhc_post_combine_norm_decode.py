@@ -86,6 +86,59 @@ def test_matches_unfused_across_thread_transitions(quant: bool):
             assert q is None and sf is None
 
 
+@pytest.mark.parametrize("block_m", [64, 128])
+@pytest.mark.parametrize("m", [1, 37, 64, 65, 180, 257])
+def test_moe_input_matches_mega_moe_pre_dispatch(m: int, block_m: int):
+    from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
+        mhc_post_combine_norm_decode,
+    )
+    from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
+
+    def buffers():
+        x = torch.zeros((m, HIDDEN), device="cuda", dtype=torch.float8_e4m3fn)
+        sf = torch.zeros((m, HIDDEN // 128), device="cuda", dtype=torch.int32)
+        shared_rows = (m + block_m - 1) // block_m * ((block_m + 127) // 128 * 128)
+        shared_sf = torch.zeros(
+            (HIDDEN // 128, shared_rows), device="cuda", dtype=torch.int32
+        ).t()
+        return x, sf, shared_sf
+
+    x, residual, post, comb, pre, weight = _inputs(m)
+    moe_x, moe_sf, moe_shared_sf = buffers()
+    updated, y, _, _ = mhc_post_combine_norm_decode(
+        x,
+        residual,
+        post,
+        comb,
+        pre,
+        weight,
+        EPS,
+        moe_input=(moe_x, moe_sf, moe_shared_sf, block_m),
+    )
+    updated_ref, y_ref, _, _ = mhc_post_combine_norm_decode(
+        x, residual, post, comb, pre, weight, EPS
+    )
+    assert torch.equal(updated, updated_ref) and torch.equal(y, y_ref)
+
+    ref_x, ref_sf, ref_shared_sf = buffers()
+    top_k = 6
+    mega_moe_pre_dispatch(
+        y_ref,
+        torch.empty((m, top_k), device="cuda", dtype=torch.int32),
+        torch.empty((m, top_k), device="cuda", dtype=torch.float32),
+        ref_x,
+        ref_sf,
+        torch.empty((m, top_k), device="cuda", dtype=torch.int64),
+        torch.empty((m, top_k), device="cuda", dtype=torch.float32),
+        shared_x_sf=ref_shared_sf,
+        shared_block_m=block_m,
+        copy_topk=False,
+    )
+    assert torch.equal(moe_x.view(torch.uint8), ref_x.view(torch.uint8))
+    assert torch.equal(moe_sf, ref_sf)
+    assert torch.equal(moe_shared_sf, ref_shared_sf)
+
+
 def test_gate_skips_batch_invariant_and_large_batches(monkeypatch):
     import sglang.srt.models.deepseek_v4_mhc as mhc
     from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import MAX_ROWS

@@ -1,10 +1,12 @@
 import unittest
 from collections import deque
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -20,6 +22,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.invariant_checker import (
+    create_scheduler_watchdog,
+)
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -62,7 +68,7 @@ def _broadcast_local_rank(rank, init_file):
             server_args=None,
             model_config=None,
             max_recv_per_poll=-1,
-            stream_output=None,
+            request_retirer=None,
             get_last_batch=None,
             rust_server_mode=False,
         )
@@ -121,16 +127,26 @@ class TestSchedulerSingleIteration(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._event_loop_driver = None
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
+        scheduler.is_initializing = False
+        scheduler.forward_ct = 0
+        scheduler.watchdog_heartbeats = 0
+        scheduler.cur_batch_for_debug = None
+        scheduler.dump_requests_before_crash = Mock()
         scheduler.enable_overlap = overlap
         scheduler.enable_overlap_mlx = False
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.server_args = SimpleNamespace(enable_pd_role_switch=False)
+        scheduler.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[])
+        )
         scheduler.device = "cpu"
         scheduler.device_module = SimpleNamespace(StreamContext=lambda _: nullcontext())
         scheduler.schedule_stream = SimpleNamespace()
         scheduler.metrics_reporter = MagicMock()
         scheduler.invariant_checker = MagicMock()
+        scheduler.invariant_checker._check_all_pools.return_value = (None, [])
+        scheduler.pool_stats_observer = MagicMock()
         scheduler.result_queue = deque()
         scheduler.running_batch = "running"
         scheduler.last_batch = None
@@ -138,7 +154,6 @@ class TestSchedulerSingleIteration(CustomTestCase):
         scheduler.is_generation = True
         scheduler.enable_unified_memory = False
         scheduler.uocr_runtime = None
-        scheduler._deferred_input_requests = []
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.increment_scheduler_iterations = Mock()
         scheduler._record_scheduler_state_for_paused_engine = Mock()
@@ -151,7 +166,7 @@ class TestSchedulerSingleIteration(CustomTestCase):
             server_args=scheduler.server_args,
             model_config=None,
             max_recv_per_poll=-1,
-            stream_output=Mock(),
+            request_retirer=Mock(),
             get_last_batch=lambda: scheduler.last_batch,
             rust_server_mode=False,
         )
@@ -166,6 +181,7 @@ class TestSchedulerSingleIteration(CustomTestCase):
             return SimpleNamespace(running_batch="running", batch_to_run=batch)
 
         def run_batch(batch):
+            scheduler.forward_ct += 1
             events.append(f"run:{batch.name}")
             grad_modes.append(torch.is_grad_enabled())
             return f"result:{batch.name}"
@@ -222,7 +238,7 @@ class TestSchedulerSingleIteration(CustomTestCase):
     def test_pause_and_shutdown_leave_inflight_result_untouched(self):
         scheduler, events, _, _ = self._scheduler([_Batch("a"), None], overlap=True)
         scheduler.run_one_iteration()
-        scheduler._engine_paused = True
+        scheduler.pause_state.pause()
         scheduler.run_one_iteration()
         self.assertEqual([batch.name for batch, _ in scheduler.result_queue], ["a"])
         scheduler._record_scheduler_state_for_paused_engine.assert_called_once()
@@ -250,6 +266,131 @@ class TestSchedulerSingleIteration(CustomTestCase):
             scheduler.run_one_iteration()
 
         replacement.wait_stream.assert_called_once_with(original)
+
+    @contextmanager
+    def _watchdog(self, scheduler, *, soft=False):
+        # Drive the real polling loop with a fake clock, without a daemon or signals.
+        module = "sglang.srt.utils.watchdog."
+        with (
+            patch(module + "psutil.Process"),
+            patch(module + "pyspy_dump_schedulers"),
+        ):
+            with patch(module + "threading.Thread"):
+                watchdog = create_scheduler_watchdog(scheduler, 10, soft=soft)
+            yield watchdog
+
+    def test_watchdog_allows_long_gaps_after_nonempty_steps(self):
+        for overlap in (False, True):
+            for soft in (False, True):
+                with self.subTest(overlap=overlap, soft=soft):
+                    scheduler, _, _, _ = self._scheduler([_Batch("a")], overlap=overlap)
+                    scheduler.run_one_iteration()
+                    with (
+                        self._watchdog(scheduler, soft=soft) as watchdog,
+                        patch(
+                            "sglang.srt.utils.watchdog.time.perf_counter",
+                            side_effect=[0, 0, 20, 40],
+                        ),
+                        patch(
+                            "sglang.srt.utils.watchdog.time.sleep",
+                            side_effect=[None, None, StopIteration],
+                        ),
+                    ):
+                        self.assertFalse(watchdog.is_active())
+                        with self.assertRaises(StopIteration):
+                            watchdog._watchdog_once()
+                        watchdog.parent_process.send_signal.assert_not_called()
+                    self.assertEqual(scheduler.cur_batch_for_debug, _Batch("a"))
+                    if overlap:
+                        self.assertEqual(len(scheduler.result_queue), 1)
+
+    def test_watchdog_rearms_when_it_misses_the_gap_and_detects_a_stalled_call(self):
+        scheduler, _, _, _ = self._scheduler([None])
+        scheduler.run_one_iteration()
+        scheduler.pause_state.pause()
+        entered, release = Event(), Event()
+
+        def hold_input_processing(_requests):
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError("test did not release the scheduler")
+
+        scheduler.process_input_requests = hold_input_processing
+        now = 0
+        polls = 0
+        with self._watchdog(scheduler) as watchdog, ThreadPoolExecutor(1) as executor:
+            step = executor.submit(scheduler.run_one_iteration)
+
+            def advance_clock(_seconds):
+                nonlocal now, polls, step
+                polls += 1
+                if polls == 1:
+                    release.set()
+                    step.result(timeout=10)
+                    entered.clear()
+                    release.clear()
+                    # No watchdog poll sees the inactive interval. No forward
+                    # occurs in either paused step to refresh its counter.
+                    now = 100
+                    step = executor.submit(scheduler.run_one_iteration)
+                    self.assertTrue(entered.wait(10))
+                elif polls == 2:
+                    now = 105
+                elif polls == 3:
+                    now = 111
+                elif polls > 4:
+                    self.fail("watchdog did not time out the stalled call")
+
+            try:
+                self.assertTrue(entered.wait(10))
+                with (
+                    patch(
+                        "sglang.srt.utils.watchdog.time.perf_counter",
+                        side_effect=lambda: now,
+                    ),
+                    patch(
+                        "sglang.srt.utils.watchdog.time.sleep",
+                        side_effect=advance_clock,
+                    ),
+                ):
+                    watchdog._watchdog_once()
+                self.assertEqual(now, 111)
+                watchdog.parent_process.send_signal.assert_called_once()
+                scheduler.dump_requests_before_crash.assert_called_once()
+            finally:
+                release.set()
+                step.result(timeout=10)
+            self.assertFalse(watchdog.is_active())
+
+    def test_watchdog_disarms_on_exception_and_rearms_before_input_processing(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                scheduler, _, _, _ = self._scheduler([], overlap=overlap)
+                with self._watchdog(scheduler) as watchdog:
+                    previous_counter = watchdog.get_counter()
+
+                    def fail_input_processing(_requests):
+                        self.assertTrue(watchdog.is_active())
+                        self.assertNotEqual(watchdog.get_counter(), previous_counter)
+                        raise ValueError("input failed")
+
+                    scheduler.process_input_requests = fail_input_processing
+                    for _ in range(2):
+                        with self.assertRaisesRegex(ValueError, "input failed"):
+                            scheduler.run_one_iteration()
+                        self.assertFalse(watchdog.is_active())
+                        previous_counter = watchdog.get_counter()
+
+    def test_watchdog_preserves_initialization_and_continuous_loop_activity(self):
+        scheduler, _, _, _ = self._scheduler([_Batch("a")])
+        scheduler.run_one_iteration()
+        with self._watchdog(scheduler) as watchdog:
+            scheduler._event_loop_driver = "continuous"
+            self.assertTrue(watchdog.is_active())
+            scheduler.cur_batch_for_debug = None
+            self.assertFalse(watchdog.is_active())
+            scheduler.is_initializing = True
+            self.assertTrue(watchdog.is_active())
 
     def test_timeout_abort_reaches_every_tp_rank_without_socket_input(self):
         first, _, first_received, _ = self._scheduler([None])

@@ -125,12 +125,6 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
-    def format_is_triton_kernels(
-        dispatch_output: DispatchOutput,
-    ) -> TypeGuard[StandardDispatchOutput]:
-        return dispatch_output.format.is_standard()
-
-    @staticmethod
     def format_is_ascend_ops(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[AscendOpsDispatchOutput]:

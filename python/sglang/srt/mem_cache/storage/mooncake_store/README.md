@@ -71,6 +71,18 @@ ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
 Use matching model settings. KV format and host layout are not yet in the keys;
 use different `extra_backend_tag` values when these differ.
 
+### GPU staging capacity
+
+For Linker deployments using a transport that stages GPU data through host memory
+(such as TCP), set `local_buffer_size` in the SGLang Mooncake JSON configuration or
+storage extra configuration. The value is a non-negative byte count and defaults
+to 16 MiB. Size it for concurrent reads and writes, including large recurrent
+state objects. This is per-client transient memory, separate from the shared
+`global_segment_size`; include both in the host memory budget.
+
+To keep the storage engine independent of a PD NVLink engine, set
+`SGLANG_HICACHE_MOONCAKE_REUSE_TE=0`.
+
 ## Install Mooncake
 
 **Method 1: with pip**

@@ -16,7 +16,10 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=3600, suite="nightly-amd-accuracy-8-gpu-deepseek-v32", nightly=True
+    est_time=3600,
+    suite="nightly-amd-accuracy-8-gpu-deepseek-v32",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"

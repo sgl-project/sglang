@@ -3,12 +3,15 @@
 export const config = {
   modelName: "Unlimited-OCR-2",
 
-  supportedHardware: ["l20", "h100", "h200", "b200", "b300", "gb200", "gb300"],
+  supportedHardware: ["l20", "h100", "h200", "b200", "b300", "gb200", "gb300", "mac"],
 
-  // L20 is not in the shared HARDWARE_CATALOG.
+  // model-specific hardware outside the shared catalog
   hardware: [
     { id: "l20", label: "L20", vram: "48GB", vendor: "nvidia" },
+    { id: "mac", label: "Apple Silicon", vram: "M5 · 16GB unified", vendor: "apple" },
   ],
+
+  runModes: (s) => s.hw === "mac" ? ["python"] : ["python", "docker"],
 
   variants: [{ id: "default", label: "Default" }],
   quantizations: [{ id: "bf16", label: "BF16" }],
@@ -67,7 +70,15 @@ export const config = {
   playgroundFeatures: {
     attention: {
       knobs: [
-        { id: "tp", label: "TP", values: [null, 1, 2] },
+        {
+          id: "tp",
+          label: "TP",
+          values: [
+            null,
+            1,
+            { value: 2, disable: { hw: ["mac"] }, disableReason: "Torch MPS supports TP1 only." },
+          ],
+        },
       ],
     },
   },
@@ -90,6 +101,28 @@ export const config = {
         "--enable-streaming-session",
         "--uocr-max-page-tokens 8000",
         "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "mac",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: true,
+      env: ["SGLANG_USE_MLX=0"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device mps",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--max-total-tokens 32768",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

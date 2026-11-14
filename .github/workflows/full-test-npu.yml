@@ -181,6 +181,22 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
+  full-acc-8-npu-a3:
+    name: full-acc-8-npu-a3
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-8-
+      test_type: 'accuracy'
+      test_suite: full-acc-8-npu-a3
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      is_nightly_pipeline_job: true
+      install_sglang_deps: true
+      device_type_for_deps: 'a3'
+      skip_pr_test_health_check: 'true'
+    secrets: inherit
+
   full-acc-16-npu-a3:
     name: full-acc-16-npu-a3
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
@@ -298,6 +314,7 @@ jobs:
       - full-16-npu-a3
       - full-acc-2-npu-a3
       - full-acc-4-npu-a3
+      - full-acc-8-npu-a3
       - full-acc-16-npu-a3
       - full-perf-2-npu-a3
       - full-perf-4-npu-a3

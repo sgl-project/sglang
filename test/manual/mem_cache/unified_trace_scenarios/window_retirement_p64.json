@@ -1,4 +1,4 @@
-{"name": "window_retirement_p64", "chain": "swa", "page_size": 64, "lazy": true, "ops": [
+{"name": "window_retirement_p64", "chain": "swa", "page_size": 64, "ops": [
   {"op": "extend", "req": 0, "n": 320},
   {"op": "extend", "req": 1, "n": 138},
   {"op": "decode", "reqs": [0, 1]},

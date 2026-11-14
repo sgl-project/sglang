@@ -24,7 +24,9 @@ from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
     NVFP4_BIAS_GELU,
     QWEN_IMAGE_ADDED_QKV,
+    SANA_VIDEO2_SOFTMAX_ATTENTION,
     SANA_VIDEO_LINEAR_ATTENTION,
+    WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT,
     can_use_linear_gelu,
 )
 from sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site import (
@@ -56,6 +58,7 @@ requires_cuda = pytest.mark.skipif(
 
 # fusion -> why mounting it cannot drop an adapter's output
 _ADAPTER_SAFE_FUSIONS = {
+    WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT: "norm, modulation and residual only; no linear",
     FLUX2_NVFP4_SWIGLU_QUANT: "fuses only a linear_in that NVFP4 loading marked "
     "ready; a LoRA wrapper carries no such mark",
     NVFP4_BIAS_GELU: "rejects an fc_in without the ModelOpt FP4 method, "
@@ -70,6 +73,7 @@ _ADAPTER_SAFE_FUSIONS = {
     HELIOS_GATED_RESIDUAL: "residual update, no linear",
     MINIMAX_H3_NORM_MODULATE: "norm and modulation, no linear",
     SANA_VIDEO_LINEAR_ATTENTION: "runs on the projections' outputs",
+    SANA_VIDEO2_SOFTMAX_ATTENTION: "runs on the projections' outputs",
 }
 
 

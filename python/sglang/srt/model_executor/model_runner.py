@@ -106,12 +106,13 @@ from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -217,7 +218,6 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_memory,
     get_model,
-    get_observability,
     get_parallel,
     get_schedule,
     get_spec,
@@ -248,7 +248,6 @@ from sglang.srt.state_capturer.routed_experts import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    enable_show_time_cost,
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
@@ -456,10 +455,6 @@ class ModelRunner:
 
         # Auxiliary hidden capture: from the draft, or --enable-return-aux-hidden-states.
         self.init_spec_aux_hidden_state()
-
-        # Apply the rank zero filter to logger
-        if get_observability().show_time_cost:
-            enable_show_time_cost()
 
         misc_utils.maybe_disable_chunked_prefix_cache(
             use_mla_backend=self.use_mla_backend,
@@ -1306,6 +1301,8 @@ class ModelRunner:
                     self.max_token_pool_size
                 ),
                 max_running_requests=self.max_running_requests,
+                stage_start_layer=self.layer_info.start_layer,
+                stage_end_layer=self.layer_info.end_layer,
                 device=self.device,
             )
         )
@@ -1382,15 +1379,21 @@ class ModelRunner:
             load_format=draft_load_format,
         )
 
-        with self._load_format_scope(draft_load_format):
-            loaded = load_model_with_memory_saver(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device=self.device,
-                gpu_id=self.gpu_id,
-                memory_saver_adapter=self.memory_saver_adapter,
-                is_draft_worker=self.is_draft_worker,
-            )
+        try:
+            with self._load_format_scope(draft_load_format):
+                loaded = load_model_with_memory_saver(
+                    model_config=self.model_config,
+                    load_config=self.load_config,
+                    device=self.device,
+                    gpu_id=self.gpu_id,
+                    memory_saver_adapter=self.memory_saver_adapter,
+                    is_draft_worker=self.is_draft_worker,
+                )
+        finally:
+            if get_exec().moe.enable_paged_experts:
+                from sglang.srt.layers.moe.paged_experts import expert_cache
+
+                expert_cache.loading_done()
         self.loader = loaded.loader
         self.model = loaded.model
         current_platform.post_load_model(self.model)
@@ -1632,10 +1635,14 @@ class ModelRunner:
 
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
-        resolved_kv_cache_dtype, self.kv_cache_dtype = (
+        # Backends read this runner's own label, not get_model().kv_cache_dtype:
+        # a draft runner does not publish its args, so that would be the target's.
+        self.kv_cache_dtype_str, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=get_model().kv_cache_dtype,
-                model=getattr(self, "model", None),
+                quant_config=getattr(
+                    getattr(self, "model", None), "quant_config", None
+                ),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
                 is_dflash=(
@@ -1646,15 +1653,6 @@ class ModelRunner:
                 speculative_draft_attention_backend=self.draft_attention_backend,
                 speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
             )
-        )
-        # This runner's OWN resolved dtype string (target or draft). Attention
-        # backends read it directly instead of the process-global get_model()
-        # bag: a draft runner does not publish its args, so the bag would carry
-        # the target's dtype and mis-drive the draft's FP8 cast/descale paths.
-        self.kv_cache_dtype_str = (
-            resolved_kv_cache_dtype
-            if resolved_kv_cache_dtype is not None
-            else get_model().kv_cache_dtype
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
@@ -1888,6 +1886,10 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        # On the forward stream, outside every CUDA graph: orders a reused row's
+        # reset after its previous request's last forward.
+        self._reset_new_request_rows()
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = self.gpu_id if get_parallel().dp_size > 1 else None
@@ -1982,6 +1984,13 @@ class ModelRunner:
             self.maybe_join_ep_ranks()
 
         return output
+
+    def _reset_new_request_rows(self) -> None:
+        if self.req_to_token_pool is None or self.token_to_kv_pool_allocator is None:
+            return
+        kv_storage_of(
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
+        ).reset_new_rows()
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
         self, forward_batch: ForwardBatch

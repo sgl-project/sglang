@@ -132,6 +132,7 @@ def build_fixture(
         model_path="dummy",
         page_size=cfg.page_size,
         enable_int8_mamba_checkpoint=cfg.enable_int8_mamba_checkpoint,
+        hybrid_cache_checkpoints_level=cfg.hybrid_cache_checkpoints_level,
     )
     # The dummy HF config cannot supply mamba_cache_chunk_size, so preset
     # FLA_CHUNK_SIZE.
@@ -244,13 +245,18 @@ def build_fixture(
         # As the KV cache configurator does: the allocator carries the state.
         allocator.state = req_to_token_pool.state
 
+    # As the cache builder does: the storage owns each window's kept tail.
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+    kv_storage_of(req_to_token_pool, allocator).bind_window_retention(
+        cfg.sliding_window_size, {"swa": cfg.draft_swa_window}
+    )
     cache_init_params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
         page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
-        draft_window_reaches={"swa": cfg.draft_swa_window},
         decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
         tree_slots=tree_slots_of(
             cfg.components,

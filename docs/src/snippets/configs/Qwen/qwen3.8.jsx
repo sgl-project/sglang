@@ -517,7 +517,7 @@ export const config = {
     {
       // GB300 / NVFP4, high-throughput — full DP16 attention with EP16 MoE over
       // FlashInfer one-sided A2A, MTP off. flashinfer_trtllm_routed must stay:
-      // with a2a=flashinfer the auto runner resolution aborts at startup.
+      // with a2a=flashinfer_nvlink_one_sided the auto runner resolution aborts at startup.
       // SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK is load-bearing —
       // unset it falls back to 1024 and startup raises once 1024 x ep_size no
       // longer covers the largest CuteDSL MoE forward.
@@ -545,7 +545,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--linear-attn-prefill-backend flashinfer",
         "--moe-runner-backend flashinfer_trtllm_routed",
-        "--moe-a2a-backend flashinfer",
+        "--moe-a2a-backend flashinfer_nvlink_one_sided",
         "--ep-dispatch-algorithm static",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",

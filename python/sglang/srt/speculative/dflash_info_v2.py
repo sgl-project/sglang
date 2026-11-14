@@ -9,7 +9,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import (
+    add_spec_decode_headroom_pages,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.device import is_pin_memory_available
@@ -149,6 +152,13 @@ class DFlashDraftInputV2(SpecInput):
 
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
             batch.reqs,
+            reserve=reserve,
+            page_size=page_size,
+        )
+        nxt_kv_lens, num_needed_tokens = add_spec_decode_headroom_pages(
+            batch,
+            nxt_kv_lens,
+            num_needed_tokens,
             reserve=reserve,
             page_size=page_size,
         )

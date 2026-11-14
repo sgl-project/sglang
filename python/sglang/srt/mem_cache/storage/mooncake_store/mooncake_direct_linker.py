@@ -3,10 +3,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-from concurrent.futures import Future
+import time
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from queue import Empty, Queue
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -35,6 +38,9 @@ from sglang.srt.utils import freeze_gc, get_device_module
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+DEFAULT_LOAD_LAYER_GROUP = 8
+DEFAULT_LOAD_THREADS = 4
+
 
 def _storage_suffix(
     *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
@@ -44,6 +50,71 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
+
+
+_LEASE_RENEW_ATTEMPTS = 4
+
+
+def _shared_pool_suffix(
+    *,
+    tp_shared: bool,
+    tp_rank: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    dcp_sharded: bool,
+    dcp_size: int,
+    dcp_rank: int,
+) -> str:
+    """Key suffix for a pool whose pages are byte-identical across attention TP.
+    The versioned shared term keeps it from aliasing an older per-rank object."""
+    parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
+    if dcp_sharded:
+        parts.append(f"dcp{dcp_size}r{dcp_rank}")
+    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    return "_".join(parts)
+
+
+def _storage_sharing(
+    pools,
+    *,
+    rank_replicated: bool,
+    tp_rank: int,
+    tp_size: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    offload_owner: bool,
+    dcp_size: int,
+    dcp_rank: int,
+):
+    """Per-pool key suffixes and the pools this rank offloads. A pool replicated
+    across attention TP is written by TP rank 0 (or the first DCP block) only."""
+    dcp_sharded = {name for name, pool in pools.items() if pool.dcp_sharded}
+    tp_shared = {
+        name
+        for name, pool in pools.items()
+        if not rank_replicated and tp_size > 1 and pool.tp_replicated
+    }
+    suffixes = {
+        name: _shared_pool_suffix(
+            tp_shared=name in tp_shared,
+            tp_rank=tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            pp_rank=pp_rank,
+            dcp_sharded=name in dcp_sharded,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+        )
+        for name in tp_shared | dcp_sharded
+    }
+    offload_pools = {
+        name
+        for name in pools
+        if offload_owner
+        and (
+            name not in tp_shared or tp_rank < (dcp_size if name in dcp_sharded else 1)
+        )
+    }
+    return suffixes, offload_pools, tp_shared
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -78,6 +149,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config = deepcopy(extra_config or {})
+        self.load_layer_group = max(
+            1,
+            int(extra_config.get("linker_load_layer_group", DEFAULT_LOAD_LAYER_GROUP)),
+        )
+        self.load_threads = max(
+            1, int(extra_config.get("linker_load_threads", DEFAULT_LOAD_THREADS))
+        )
         self.load_mode = extra_config.pop("load_mode", "layer_wise")
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
@@ -113,14 +191,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
+        self.storage.pool_suffixes, self.offload_pools, tp_shared = _storage_sharing(
+            self.pools,
+            rank_replicated=rank_replicated,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            pp_rank=params.pp_rank,
+            offload_owner=self.offload_owner,
+            dcp_size=get_parallel().attn_dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
+        )
         logger.info(
             "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
+            "tp_shared=%s, offload_pools=%s",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
+            sorted(tp_shared),
+            sorted(self.offload_pools),
         )
 
         self.register_buffers()
@@ -155,6 +247,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.load_io_executor = ThreadPoolExecutor(
+            self.load_threads, thread_name_prefix=f"mooncake-load-io-tp{tp_rank}"
+        )
         self.load_thread = threading.Thread(
             target=self.load_thread_func,
             daemon=True,
@@ -341,11 +436,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if prefetch and not completion.set_running_or_notify_cancel():
                     continue
                 try:
-                    ready.synchronize()
                     if prefetch:
+                        ready.synchronize()
                         completion.set_result(self.load_all_layers(pending))
                     else:
-                        self.load_layer_wise(completion, list(pending.values()))
+                        self.load_layer_wise(completion, list(pending.values()), ready)
                 except BaseException as error:
                     if prefetch:
                         completion.set_result(False)
@@ -359,68 +454,167 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.load_queue.task_done()
 
     def load_layer_wise(
-        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
+        self,
+        counter_index: int,
+        request_transfers: list[list[PoolTransfer]],
+        ready_event=None,
     ) -> None:
-        started = []
+        session_keys = []
+        futures: list[list[Future]] = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
                 for transfer in transfers:
-                    keys, locations = batches.setdefault(transfer.name, ([], []))
+                    keys, _ = batches.setdefault(transfer.name, ([], []))
                     component_keys, _ = self.storage._get_hybrid_page_component_keys(
                         list(transfer.keys), transfer
                     )
                     keys.extend(self.storage._tag_keys(component_keys))
-                    locations.extend(
+            # Wait before opening sessions so the slot fence does not consume
+            # their leases. Key preparation above still overlaps the GPU work.
+            if ready_event is not None:
+                ready_event.synchronize()
+            # Track every submitted key: a failed batch can still open some sessions.
+            session_keys = [key for keys, _ in batches.values() for key in keys]
+            if session_keys:
+                result = self.storage.store.batch_get_session_start(session_keys)
+                if list(result) != [0] * len(session_keys):
+                    raise RuntimeError(
+                        f"Mooncake get session start failed: keys={len(session_keys)}, "
+                        f"results={result}"
+                    )
+            for transfers in request_transfers:
+                for transfer in transfers:
+                    batches[transfer.name][1].extend(
                         self.pools[transfer.name].prepare_locations(
                             transfer.host_indices
                         )
                     )
-            for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"results={result}"
-                    )
-                started.append(keys)
+            batches = {
+                name: (keys, np.asarray(locations, dtype=np.int64))
+                for name, (keys, locations) in batches.items()
+            }
 
-            for layer in range(self.num_layers):
+            groups = [
+                range(start, min(start + self.load_layer_group, self.num_layers))
+                for start in range(0, self.num_layers, self.load_layer_group)
+            ]
+            for group in groups:
+                group_futures = []
+                futures.append(group_futures)
                 for name, (keys, locations) in batches.items():
-                    meta = self.pools[name].get_prepared_layer_range_meta(
-                        locations, layer
-                    )
-                    if meta is None:
-                        continue
-                    ptrs, sizes, offsets = meta
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
-                    expected = [sum(item) for item in sizes]
-                    if (
-                        result is None
-                        or isinstance(result, int)
-                        or list(result) != expected
-                    ):
-                        raise RuntimeError(
-                            f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
-                            f"expected={expected}"
-                        )
-                self.layer_done_counter.complete(counter_index, layer)
+                    meta = self._group_range_meta(name, locations, group)
+                    if meta is not None:
+                        group_futures.extend(self._submit_range_gets(name, keys, *meta))
+            for group, group_futures in zip(groups, futures):
+                for future in group_futures:
+                    future.result()
+                for layer in group:
+                    self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
+            # Failure wakes consumers, which may release the destination rows.
+            # Stop every submitted write before publishing it.
+            pending = [future for group_futures in futures for future in group_futures]
+            for future in pending:
+                future.cancel()
+            wait(pending)
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
-            for keys in started:
+            if session_keys:
                 try:
-                    self.storage.store.batch_get_session_end(keys)
+                    self.storage.store.batch_get_session_end(session_keys)
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    def _group_range_meta(self, name: PoolName, locations: list[int], group: range):
+        merged = None
+        for layer in group:
+            meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+            if meta is None:
+                continue
+            if merged is None:
+                # Pool metadata may share read-only size/offset rows.
+                # Grouping extends each row, so give it independent ownership.
+                merged = tuple([list(row) for row in rows] for rows in meta)
+                continue
+            for merged_rows, rows in zip(merged, meta):
+                for merged_row, row in zip(merged_rows, rows):
+                    merged_row.extend(row)
+        return merged
+
+    def _submit_range_gets(
+        self, name: PoolName, keys: list[str], ptrs, sizes, offsets
+    ) -> Iterator[Future]:
+        if not keys:
+            return
+        step = -(-len(keys) // self.load_threads)
+        # Yield each future so the caller retains it even if a later submit fails.
+        for start in range(0, len(keys), step):
+            yield self.load_io_executor.submit(
+                self._range_get,
+                name,
+                keys[start : start + step],
+                ptrs[start : start + step],
+                sizes[start : start + step],
+                offsets[start : start + step],
+            )
+
+    def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
+        store = self.storage.store
+        result = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+        if result is None or isinstance(result, int):
+            return result
+        result = list(result)
+        if len(result) != len(keys):
+            return result
+        expected = [sum(item) for item in sizes]
+        # A long load can outlive its read leases: the first read of a lapsed key
+        # reports -707, later reads -600. A renewal can race reads still in flight
+        # on the old lease, so renew and retry a few times with backoff.
+        for attempt in range(_LEASE_RENEW_ATTEMPTS):
+            expired = [
+                i
+                for i, (value, want) in enumerate(zip(result, expected))
+                if value != want
+            ]
+            if not expired or any(result[i] not in (-707, -600) for i in expired):
+                return result
+            if attempt:
+                time.sleep(0.05 * 2 ** (attempt - 1))
+            lapsed = list(dict.fromkeys(keys[i] for i in expired))
+            renewed = list(store.batch_get_session_start(lapsed))
+            if renewed != [0] * len(lapsed):
+                raise RuntimeError(
+                    f"Mooncake get session renewal failed: keys={len(lapsed)}, "
+                    f"result_sample={renewed[:8]}"
+                )
+            retried = store.batch_get_into_multi_buffer_ranges(
+                [keys[i] for i in expired],
+                [ptrs[i] for i in expired],
+                [sizes[i] for i in expired],
+                [offsets[i] for i in expired],
+            )
+            if retried is None or isinstance(retried, int):
+                return retried
+            retried = list(retried)
+            if len(retried) != len(expired):
+                raise RuntimeError(
+                    "Mooncake renewed range get returned wrong result count"
+                )
+            for index, value in zip(expired, retried):
+                result[index] = value
+        return result
+
+    def _range_get(self, name: PoolName, keys, ptrs, sizes, offsets) -> None:
+        result = self._get_layer_ranges(keys, ptrs, sizes, offsets)
+        expected = [sum(item) for item in sizes]
+        if result is None or isinstance(result, int) or list(result) != expected:
+            raise RuntimeError(
+                f"Mooncake range get failed for pool={name}: "
+                f"transferred={result}, expected={expected}"
+            )
 
     def offload(
         self, transfers: list[PoolTransfer], session_id: str | None = None
@@ -429,7 +623,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self.freeze_gc_once()
-        if not self.offload_owner:
+        expanded = [t for t in expanded if t.name in self.offload_pools]
+        if not expanded:
             self.offload_results.put(True)
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
@@ -489,6 +684,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
+        self.load_io_executor.shutdown()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
         if self.mla_broadcaster is not None:

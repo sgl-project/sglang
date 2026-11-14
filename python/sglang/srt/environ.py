@@ -162,7 +162,7 @@ class EnvInt(EnvField):
 
 class _DeprecatedEnvFallback:
     """Mixin for EnvField subclasses: if the canonical env var is not set,
-    check *deprecated_name* and emit DeprecationWarning before reading it.
+    check *deprecated_name* and emit a FutureWarning before reading it.
 
     Usage:
         SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
@@ -180,7 +180,9 @@ class _DeprecatedEnvFallback:
                     f"Environment variable '{self.deprecated_name}' is deprecated; "
                     f"use '{self.name}' instead. "
                     "The alias will be removed in a future release.",
-                    DeprecationWarning,
+                    # FutureWarning is shown by default; a DeprecationWarning
+                    # raised from library code is hidden from users.
+                    FutureWarning,
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
@@ -337,6 +339,9 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # Name prefix of the usage accounting response headers on the kimi_k3 chat
+    # surface (<prefix>-Prompt-Tokens, <prefix>-Cached-Tokens). Empty: not sent.
+    SGLANG_USAGE_HEADER_PREFIX = EnvStr("")
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
@@ -411,7 +416,6 @@ class Envs:
     # ===================================================================
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
-    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
     # ===================================================================
     # Fault injection and regression tests
@@ -563,11 +567,18 @@ class Envs:
     # Argmax every draft row, sampling requests included, accepted as a one-hot
     # draft: no step logits kept, lower acceptance at high temperatures.
     SGLANG_DSPARK_USE_GREEDY_DRAFT = EnvBool(False)
+    # Ragged verify takes its confidences from the online acceptance estimator even
+    # when the draft checkpoint has a confidence head.
+    SGLANG_DSPARK_USE_ONLINE_ESTIMATOR = EnvBool(False)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
+    # Walk a vanilla rank-256 markov head with the fused int8 kernel in the folded
+    # draft graph (sm_90, graph buckets bs <= 64); near-tie draft tokens can differ
+    # from the bf16 walk.
+    SGLANG_DSPARK_OPT_INT8_MARKOV_WALK = EnvBool(False)
     # With the TP-sharded markov_w2, run the draft's vocab all-gathers (each
     # step's per-shard token candidates, and the step logits sampling keeps) over
     # the NVLink push collective (CustomAllReduceV2's multicast plane) instead of
@@ -583,7 +594,7 @@ class Envs:
     )
     SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS = EnvInt(1)
     SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS = EnvInt(0)
-    # Static verify graphs stage the draft context-KV commit; the next draft graph
+    # Static verify graphs stage the draft KV store; the next draft graph
     # writes it on a side stream forked at its head, joined at its first KV store.
     SGLANG_DSPARK_DEFER_CONTEXT_KV = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
@@ -611,8 +622,8 @@ class Envs:
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # The deferred commit's staging (hidden, write locations, positions, commit lengths)
-    # in one Triton launch instead of four copies and a fill.
+    # The deferred draft KV store's staging (write locations, positions, state slots,
+    # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
@@ -621,9 +632,8 @@ class Envs:
     # Memory pools and KV-cache sizing
     # ===================================================================
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
-    # Disable lazy compaction in the unified memory pool allocator and
-    # fall back to the per-free eager compaction. Used for production
-    # A/B and quick rollback. Default False (lazy compaction on).
+    # Must stay unset: the unified memory pool compacts only lazily, and
+    # startup refuses --enable-unified-memory with it set.
     SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
@@ -638,10 +648,10 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
-    # --enable-kv-cache-sharding: register single-node prefix gather scratch
-    # as NCCL symmetric memory and request copy engines on its dedicated
-    # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
-    # The engine defaults NCCL cuMem on for eligible single-node deployments.
+    # --enable-kv-cache-sharding: allocate single-node prefix gather scratch
+    # with PyTorch symmetric memory and gather it on copy engines through its
+    # CUDA multicast mapping (MulticastAllGather). Without multicast the
+    # gather stays an NCCL allgather.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
@@ -665,6 +675,11 @@ class Envs:
     SGLANG_AITER_DECODE_PARTITION_BUCKETS = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+    # Index a compact-window DFLASH draft KV pool by the hybrid-SWA target's
+    # sliding-window slots (pool and HiCache host pool sized like the target's
+    # SWA pool) instead of its full-attention slots. Needs draft window <= the
+    # target's sliding window; ignored (with the reason logged) where it does not apply.
+    SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(True)
 
     # ===================================================================
     # Scheduler token budgeting and admission
@@ -725,9 +740,8 @@ class Envs:
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
     SGLANG_ENABLE_DELAY_SAMPLE = EnvBool(False)
-    # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
-    # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
-    # already enabled regardless of this flag (see start_event_loop).
+    # Force-enable the WAR (write-after-read) barrier for the overlap and PP schedulers
+    # off CUDA (e.g. ROCm); it is always on on CUDA or with --enable-unified-memory.
     SGLANG_ENABLE_WAR_BARRIER = EnvBool(False)
     # Force the WAR barrier to wait for the whole forward instead of the
     # read-done fastpath event.
@@ -806,6 +820,9 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Seconds a unified-memory page move waits for network transfers before it
+    # fails; unset: past the bootstrap, waiting and deferred-release timeouts.
+    SGLANG_DISAGGREGATION_PAGE_MOVE_WAIT_TIMEOUT = EnvFloat(None)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
@@ -829,6 +846,11 @@ class Envs:
     # Distributed and model-parallel runtime
     # ===================================================================
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
+    # Trust the driver's P2P report instead of probing each peer in a subprocess.
+    SGLANG_SKIP_P2P_CHECK = EnvBool(False)
+    # Launch on node_rank >= 1 blocks until its schedulers exit; False returns
+    # instead, for an Engine used as a Python API.
+    SGLANG_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
@@ -899,6 +921,10 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # off: normal pages; prefer: hugepages with normal-page fallback;
+    # required: hugepages only, failing immediately when unavailable.
+    # Empty preserves compatibility: off when SIZE is empty, otherwise prefer.
+    SGLANG_HUGEPAGE_MODE = EnvStr("")
     # >0: prefault host pools with a private THP mapping using this many threads; 0 disables.
     SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS = EnvInt(0)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY = EnvFloat(None)
@@ -910,6 +936,8 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    SGLANG_ENABLE_NIXL_KV_PACKING = EnvBool(False)
+    SGLANG_NIXL_KV_PACK_BUFFER_SIZE_MB = EnvInt(64)
     # Queue incoming KV scatters between forwards; disabled by default.
     SGLANG_PLB_SCATTER_DEFER = EnvBool(False)
     # Decode stream priority relative to background KV scatters.
@@ -927,6 +955,11 @@ class Envs:
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
+    # "te" (classic mooncake.engine) or "tent" (native `tent` module).
+    SGLANG_MOONCAKE_TRANSFER_ENGINE = EnvStr("te")
+    # JSON object deep-merged into the generated TENT config, e.g.
+    # '{"transports": {"rdma": {"numa_penalties": [1.0, 1.5, 10.0]}}}'.
+    SGLANG_TENT_CONFIG_OVERRIDE = EnvStr(None)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(True)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
     SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S = EnvFloat(300.0)
@@ -1000,6 +1033,13 @@ class Envs:
     SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # MXFP4 trtllm-gen MoE on SM100 / SM103: calls with <= 256 tokens run the JIT
+    # routing + persistent FC1 / FC2 kernels (kernels/ops/moe/mxfp4_decode_moe.py) on
+    # every layer whose shape, activation (SiTU, or SwiGLU with a limit) and MXFP8
+    # activations they cover; anything else runs flashinfer.
+    SGLANG_USE_CUDA_MXFP4_DECODE_MOE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_K31_DECODE_MOE"
+    )
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
@@ -1068,6 +1108,22 @@ class Envs:
     # instead of a torch gather of num_tokens * topk bf16 rows. Needs
     # SGLANG_GFX1250_W4A8_BACKEND=triton; expert parallelism keeps the torch gather.
     SGLANG_GFX1250_W4A8_KERNEL_GATHER = EnvBool(False)
+    # gfx1250 GPT-OSS W4A8 MoE: one weight copy in FlyDSL's layout (dims padded to 256).
+    # Batches of at least SGLANG_GFX1250_W4A8_FLYDSL_MIN_TOKENS tokens run aiter.fused_moe
+    # (FlyDSL a8w4, MXFP8 activations); smaller ones run the gluon moe_gemm_a8w4 over a
+    # zero-copy view of the same weights (dims rounded up to 128). Off: the path above,
+    # unchanged. MIN_TOKENS: decode batches (up to 64) must stay on gluon, prefill chunks
+    # on FlyDSL; anything in between serves the same (per-layer crossover ~450 tokens
+    # at TP1, flat 320-768), and 16 put decode on FlyDSL (-19% throughput).
+    SGLANG_GFX1250_W4A8_FLYDSL = EnvBool(False)
+    SGLANG_GFX1250_W4A8_FLYDSL_MIN_TOKENS = EnvInt(384)
+    # gfx1250 GPT-OSS W4A8 MoE, torch-gather path: one Triton kernel gathers the
+    # expert-sorted rows, zero-pads them to the gluon K and downcasts them to static fp8,
+    # in place of pad + index math + gather + downcast (six kernels per layer at decode).
+    SGLANG_GFX1250_W4A8_FUSED_GATHER_QUANT = EnvBool(False)
+    # gfx1250 GPT-OSS W4A8 MoE routes from the raw router logits itself: bypass the
+    # model's TopK (one top-k softmax kernel and its glue per layer that nothing reads).
+    SGLANG_GFX1250_W4A8_BYPASS_TOPK = EnvBool(False)
     # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
@@ -1103,6 +1159,8 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Apply RoPE inside the ROCm fused MLA decode kernel instead of before it.
+    SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION = EnvBool(True)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
     # instead of `topk_gating`.
     SGLANG_ROCM_DISABLE_AITER_TOPK_GATING = EnvBool(False)
@@ -1116,6 +1174,16 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
+    # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP) or "aiter" (FlyDSL);
+    # any other value keeps the unfused KDA decode.
+    SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
+        "gfx950", deprecated_name="SGLANG_ROCM_K3_KDA_FUSED_BACKEND"
+    )
+    # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
+    # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
+    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
+    )
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
@@ -1124,11 +1192,6 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    # Kimi-K3 fused KDA decode on ROCm: "gfx950" (in-tree kernel) or "aiter";
-    # any other value keeps the unfused decode.
-    SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
-    # Kimi-K3 FlyDSL operators: "auto" (in-tree, then aiter), "sglang" or "aiter".
-    SGLANG_K3_FLYDSL_SOURCE = EnvStr("auto")
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
@@ -1158,9 +1221,14 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
-    # Select the AITER MLA kernel for decode, "asm" or "gluon".
+    # Select the AITER MLA kernel for decode: "asm" (aiter.mla.mla_decode_fwd),
+    # "gluon" (aiter mla_gluon where prefer_mla_gluon_decode holds, else ASM) or
+    # "triton" (aiter.ops.triton.attention.mla.mla_decode_fwd, not sglang's
+    # --decode-attention-backend triton; gfx1250 with bf16 activations, no DCP
+    # and qk_rope_head_dim > 0, else startup raises). "auto" is "triton" there,
+    # else "asm". Explicit values are honored as-is.
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
-        "asm", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
+        "auto", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
     )
     # Select the AITER MLA kernel for target verify, "asm" or "gluon".
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
@@ -1175,11 +1243,6 @@ class Envs:
     # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
-    # DSPARK: run the target lm_head projection (verify logits) in fp8 via
-    # torch._scaled_mm (per-token activation scale + per-output-channel weight
-    # scale, weight quantized once and cached). Halves the per-step head GEMM;
-    # off by default. Only engages for a floating-point (non-quantized) head.
-    SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD = EnvBool(False)
     # Pooled prefill-logits budget of the HIP FP4 indexer, in MiB.
     SGLANG_DSV4_FP4_LOGITS_BUDGET_MB = EnvInt(2048)
     # Split-K for HCA streams in the HIP unified-KV paged decode; 0 keeps the heuristic.
@@ -1297,6 +1360,11 @@ class Envs:
     # per-rank symmetric workspace; must be >= the largest padded per-rank batch
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
+    # Opt-in smaller MegaMOE workspace (per-call cost scales with capacity) for
+    # decode-only forwards of ModelOpt NVFP4 MoE; 0 is off. Unused when startup
+    # autotuning runs, whose profiles already size small batches. A forward that
+    # exceeds it on any EP rank, or extends on any DP rank, uses the main one.
+    SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK = EnvInt(0)
     # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
     # cutedsl mega kernels (NVFP4 W4A4 / W4A16 and MXFP8). Permits in-kernel
     # reduction; FlashInfer's tuning profile may still select external reduction.
@@ -1322,7 +1390,6 @@ class Envs:
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
-    SGLANG_OPT_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1494,6 +1561,11 @@ class Envs:
     # is a hit on the second run, and a cache hit has nothing to report, so pair
     # this with SGLANG_JIT_FORCE_RECOMPILE to see the report every time.
     SGLANG_JIT_LOG_RESOURCE_USAGE = EnvBool(False)
+    # Compile every JIT module with source-line info (nvcc -lineinfo, hipcc
+    # -gline-tables-only) for profiler source views. It only adds debug
+    # sections, the SASS is unchanged; like the flag above, it gets its own
+    # cache entry.
+    SGLANG_JIT_ENABLE_LINEINFO = EnvBool(False)
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
@@ -1584,6 +1656,7 @@ class Envs:
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
 
+    SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "helion" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
@@ -1726,6 +1799,9 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
+    # startup to off where it does not fit.
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
@@ -1754,6 +1830,9 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    # Read by the Rust preprocessing extension (rust/sglang-mm), not by Python:
+    # its CPU pool's thread count. None = unset = min(8, CPU cores).
+    SGLANG_MM_RS_THREADS = EnvInt(None)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
@@ -2022,6 +2101,9 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # Prefill index top-k by the sampled-threshold indexers of kernels/ops/attention/dsa/litetopk_prefill
+    # (after LiteTopK, https://arxiv.org/abs/2607.11976) instead of dense logits + top-k, on SM100.
+    SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -2063,7 +2145,7 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # DSpark static verify: build the target verify metadata on a side stream beside the
-    # draft graph, for requests up to the candidate span (needs the glue switch above).
+    # draft graph (needs the glue switch above).
     SGLANG_OPT_DSV41_TARGET_METADATA_EARLY = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
@@ -2072,6 +2154,10 @@ class Envs:
     SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Spec decode prep (DFlash family only so far): when a step must allocate KV pages,
+    # give every request this many pages of headroom in the same allocation (capped
+    # at 8; 0 = off). Skipped when free pages are low and under HiSparse.
+    SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES = EnvInt(2)
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(
@@ -2159,6 +2245,8 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Prefill indexer: bf16 instead of fp32 MQA logits, read by a bf16 top-k.
+    SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
@@ -2197,6 +2285,99 @@ class Envs:
     # ===================================================================
     # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
     SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
+    # Muse Spark on MI355X (gfx950): AgentX fast paths, all on by default. Each
+    # variable is the off-switch of one optimization; the paths are shape-gated, so
+    # they only engage on the Muse Spark shapes they were measured on.
+    # aiter attention backend (head_dim 64, GQA 8, page 16, SWA KV pool):
+    # extend reuses the page tables / query offsets init_forward_metadata built.
+    SGLANG_ROCM_MUSE_REUSE_EXTEND_METADATA = EnvBool(True)
+    # target-verify KV lengths once per batch / per graph replay, not per layer.
+    SGLANG_ROCM_MUSE_REUSE_VERIFY_LENGTHS = EnvBool(True)
+    # FP8 Q (per-tensor dynamic scale) for full-layer extend of >= 256 tokens.
+    SGLANG_ROCM_MUSE_EXTEND_FP8_Q = EnvBool(True)
+    # That FP8 extend on the gfx950 Gluon kernel (P kept in registers between the two MFMAs) instead of aiter's
+    # unified 2D kernel.
+    SGLANG_ROCM_MUSE_EXTEND_GLUON = EnvBool(True)
+    # Sliding layers on that Gluon kernel too (its 2047-token window variant, FP8 Q), 1.6x the aiter 2D kernel.
+    SGLANG_ROCM_MUSE_EXTEND_SWA_GLUON = EnvBool(True)
+    # Full-layer FP8 extend on the FlyDSL kernel; =0 keeps the Gluon kernel there.
+    SGLANG_ROCM_MUSE_EXTEND_FLYDSL = EnvBool(True)
+    # Spec-v2 decode without the per-step seq_lens_cpu D2H (the aiter Muse verify path reads GPU lengths only).
+    SGLANG_ROCM_MUSE_SYNC_FREE_VERIFY = EnvBool(True)
+    # Target verify: merge the split-KV attention partials inside the output norm-gate kernel (one launch for both).
+    SGLANG_ROCM_MUSE_VERIFY_REDUCE_NORM_GATE = EnvBool(True)
+    # Target verify full layers on FP8 Q / K MFMA and FP8 P (the prefill FP8 path's numerics); =0 keeps exact BF16.
+    SGLANG_ROCM_MUSE_VERIFY_FP8 = EnvBool(True)
+    # Target verify full layers on the FlyDSL kernel (exact BF16, 4.75 TB/s at TP4 n8) when flydsl is importable;
+    # =0 keeps the Triton pair kernel (SGLANG_ROCM_MUSE_VERIFY_FULL_V2 / _FP8).
+    SGLANG_ROCM_MUSE_VERIFY_FLYDSL = EnvBool(True)
+    # That FlyDSL full-layer verify with a length-balanced split-KV work list (equal KV chunks per program instead of
+    # equal splits per request), from 4 requests at 4 KV heads per rank and 8 at 2.
+    SGLANG_ROCM_MUSE_VERIFY_BALANCED = EnvBool(True)
+    # Sliding-layer verify on the FlyDSL kernel (fixed splits over the window), from 16 requests at 4 KV heads per
+    # rank and 48 at 2; Triton below.
+    SGLANG_ROCM_MUSE_VERIFY_SWA_FLYDSL = EnvBool(True)
+    # Verify kernels: sliding layers split-KV (<= 8 requests) / GQA-folded
+    # (> 8); full layers two-KV-head kernel, else GQA-folded from 8 requests.
+    SGLANG_ROCM_MUSE_VERIFY_SWA_SPLITKV = EnvBool(True)
+    SGLANG_ROCM_MUSE_VERIFY_SWA_GQA = EnvBool(True)
+    SGLANG_ROCM_MUSE_VERIFY_FULL_V2 = EnvBool(True)
+    SGLANG_ROCM_MUSE_VERIFY_FULL_GQA = EnvBool(True)
+    # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
+    SGLANG_ROCM_MUSE_DFLASH_SPLITKV = EnvBool(True)
+    # DFlash draft grouped conv: kernel projection on the row-major split-K GEMM with its partials summed inside
+    # the input conv kernel; the output conv runs inside the next residual add + RMSNorm.
+    SGLANG_ROCM_MUSE_DFLASH_FUSED_CONV = EnvBool(True)
+    # DFlash draft dense GEMMs up to 128 rows: TP4 QKV / MLP down / gate-up on the row-major split-K GEMM where it
+    # is tuned, gate/up from 33 rows on hipBLASLt instead of aiter's tuned table.
+    SGLANG_ROCM_MUSE_DFLASH_DENSE = EnvBool(True)
+    # DFlash selector candidates under TP: each rank's top-k values and global ids share one FP32 all-gather, and
+    # one kernel merges them into the global top-k with the unary-logit transform.
+    SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES = EnvBool(True)
+    # Split-K 17..128-row GEMMs (tiled copy or row-major) for the weight shapes the
+    # ROCm Muse Spark model registers (O projection, MoE pooler / unpooler, DFlash draft MLP).
+    SGLANG_ROCM_MUSE_DENSE_TILED = EnvBool(True)
+    # FP8-weight small-M GEMMs (activations quantized in-kernel per row and K group) for the attention QKV / O
+    # projections and the MoE unpooler at decode / verify widths; =0 keeps BF16 weights.
+    SGLANG_ROCM_MUSE_DENSE_FP8 = EnvBool(True)
+    # Prefill widths (plain extend, > 128 rows): the attention QKV / O projections and the MoE pooler / unpooler on
+    # those FP8 weight copies through aiter's CK a8w8 GEMM, activations quantized per row by the boundary kernels or
+    # one Triton pass; the Ulysses gathered projections are then kept in FP8 only. Needs SGLANG_ROCM_MUSE_DENSE_FP8;
+    # =0 keeps BF16 hipBLASLt.
+    SGLANG_ROCM_MUSE_PREFILL_DENSE_FP8 = EnvBool(True)
+    # Greedy / simulated target verify keeps the logits vocab-sharded: each rank all-gathers its per-row
+    # softcapped argmax ([rows, 2]), not the full logits.
+    SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS = EnvBool(True)
+    # DSpark sampling accept on ROCm: split the vocabulary over CTAs, with the softmax folded in.
+    SGLANG_ROCM_DSPARK_SPLIT_ACCEPT = EnvBool(True)
+    # ROCm Muse Spark model (sglang.srt.rocm_muse_spark): fused QKV projection /
+    # QK norm / RoPE / FP8 cache write, QK norm / RoPE / cache write, unpooler +
+    # FFN-boundary fusion, compact A4 verify MoE, a4w4 prefill MoE, sequence-
+    # parallel prefill, Ulysses attention, tuned verify-width dense GEMMs, shared
+    # and joint router/pooler projections.
+    SGLANG_ROCM_MUSE_FUSED_QKV_CACHE = EnvBool(True)
+    SGLANG_ROCM_MUSE_QK_ROPE_CACHE = EnvBool(True)
+    # Row cap of the fused QK norm / RoPE / cache-write kernel (one program per row and Q head, no limit of its own).
+    SGLANG_ROCM_MUSE_QK_ROPE_CACHE_MAX_ROWS = EnvInt(512)
+    # Row cap of the joint router + pooler GEMM; above 64 rows only the joint form (BM 128 row-major tile) serves.
+    SGLANG_ROCM_MUSE_JOINT_ROUTER_MAX_ROWS = EnvInt(128)
+    SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
+    SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY = EnvBool(True)
+    SGLANG_ROCM_MUSE_A4W4_MOE = EnvBool(True)
+    SGLANG_ROCM_MUSE_PREFILL_SP = EnvBool(True)
+    SGLANG_ROCM_MUSE_PREFILL_ULYSSES = EnvBool(True)
+    # Ulysses keeps the attention output gate on the token shard: the QKV all-to-all carries only q|k|v and the
+    # per-head norm-gate runs after the output all-to-all (same kernel, same values); =0 sends the gate along.
+    SGLANG_ROCM_MUSE_ULYSSES_LOCAL_GATE = EnvBool(True)
+    # Ulysses all-to-alls in row chunks on a side stream, overlapped with the chunks' QKV / O projections
+    # (needs SGLANG_ROCM_MUSE_ULYSSES_LOCAL_GATE).
+    SGLANG_ROCM_MUSE_ULYSSES_PIPELINE = EnvBool(True)
+    # TP4 / TP8 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
+    # FlyDSL finalize + aiter two-stage all-reduce).
+    SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH = EnvBool(True)
+    SGLANG_ROCM_MUSE_DENSE_TUNED = EnvBool(True)
+    SGLANG_ROCM_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
+    SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
@@ -2315,11 +2496,6 @@ class Envs:
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
-    # Kimi-K3.1 decode routed MoE on SM100/SM103: replace flashinfer's deferred-finalize
-    # trtllm-gen MXFP4 call with the JIT routing + persistent FC1/FC2 kernels
-    # (kernels/ops/moe/k31_decode_moe.py) for covered TP-MoE shapes (896 local
-    # experts, intermediate 384, top-16, <= 256 tokens); anything else runs flashinfer.
-    SGLANG_K31_DECODE_MOE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
@@ -2462,36 +2638,21 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
             "backend rather than the CuTe DSL fusion."
         )
     ),
-    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES": _DeprecatedEnv(
-        note="One workspace per process is now an invariant, not a limit."
-    ),
     # Removed without replacement.
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
     "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_OPT_SM120_MTP_ROUTER_TOP22": _DeprecatedEnv(
+        note="The default MoE router is faster for this shape."
+    ),
     "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
         note="DSpark draft sampling always uses Gumbel-max."
-    ),
-    "SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV": _DeprecatedEnv(
-        note="A one-row step of SGLANG_DSPARK_USE_GREEDY_DRAFT on a vanilla markov "
-        "head fuses the bias GEMV."
     ),
     "SGLANG_DSPARK_FOLDED_SAMPLING": _DeprecatedEnv(
         note="A folded DSpark draft proposal samples; set "
         "SGLANG_DSPARK_USE_GREEDY_DRAFT=1 for an argmax-only draft, or "
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0 to keep the proposal out of the graph."
-    ),
-    "SGLANG_SKIP_RUST_TESTS": _DeprecatedEnv(
-        note="The Rust tests run in pr-test-rust-workspace.yml now."
-    ),
-    "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),
-    "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
-        note="Buffer-mode anchor pinning is always on; set "
-        "SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP=0 to disable it."
-    ),
-    "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": _DeprecatedEnv(
-        note="Deterministic inference on triton no longer aligns prefill chunks."
     ),
     # Replaced by CLI flags.
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": _DeprecatedEnv(
@@ -2502,6 +2663,13 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
+    ),
+    "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD": _DeprecatedEnv(
+        note="Please use '--speculative-dspark-lm-head-dtype fp8' instead."
+    ),
+    "SGLANG_USE_SGL_XPU": _DeprecatedEnv(
+        note="Intel XPU always uses the sgl-kernel MoE kernels; pass "
+        "'--moe-runner-backend triton' for the Triton path."
     ),
 }
 
