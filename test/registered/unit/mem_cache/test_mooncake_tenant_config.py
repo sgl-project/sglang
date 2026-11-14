@@ -85,6 +85,8 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
         tp_lcm_size=None,
         should_split_heads=False,
         extra_config=extra_config,
+        unified_suffixes=None,
+        unified_chunk_spans=None,
     )
 
 

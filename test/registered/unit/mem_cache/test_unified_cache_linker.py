@@ -232,6 +232,7 @@ class TestMooncakePrefetch(CustomTestCase):
         linker.storage = MooncakeStore.__new__(MooncakeStore)
         linker.storage.registered_pools = linker.pools
         linker.storage.config_prefix = None
+        linker.storage.unified_suffixes = None
         linker.storage.mla_suffix = "cp0_pp0"
         linker.storage.store = SimpleNamespace(batch_get_into_multi_buffers=read)
         linker.load_thread = threading.Thread(target=linker.load_thread_func)
