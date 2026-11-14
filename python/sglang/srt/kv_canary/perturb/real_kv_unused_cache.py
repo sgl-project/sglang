@@ -148,15 +148,17 @@ def _translate_full_slots_to_swa_slots(
     slots: list[int],
     full_to_swa_index_mapping: Optional[torch.Tensor],
 ) -> list[int]:
-    if full_to_swa_index_mapping is None:
+    if full_to_swa_index_mapping is None or not slots:
         return []
 
-    lut = full_to_swa_index_mapping.detach().to("cpu").to(torch.int64)
-    translated: list[int] = []
-    for slot in slots:
-        if slot >= int(lut.shape[0]):
-            continue
-        physical_slot = int(lut[slot].item())
-        if physical_slot >= 0:
-            translated.append(physical_slot)
-    return translated
+    lut_list = (
+        full_to_swa_index_mapping.detach()
+        .to(device="cpu", dtype=torch.int64)
+        .tolist()
+    )
+    lut_len = len(lut_list)
+    return [
+        physical_slot
+        for slot in slots
+        if 0 <= slot < lut_len and (physical_slot := int(lut_list[slot])) >= 0
+    ]

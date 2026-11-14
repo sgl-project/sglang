@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 if TYPE_CHECKING:
@@ -11,8 +11,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ReqToTokenEntry:
+class ReqToTokenEntry(msgspec.Struct, frozen=True, kw_only=True):
     req_pool_idx: int
     position: int
     value: int
@@ -48,16 +47,17 @@ def collect_active_slots(
             )
             if valid_num_tokens is None:
                 valid_num_tokens = int(out_cache_loc.shape[0])
-            excluded = set(
+            excluded = {
                 int(x)
                 for x in out_cache_loc[:valid_num_tokens].detach().to("cpu").tolist()
-            )
+            }
 
     req_pool_indices_list = req_pool_indices.detach().to("cpu").tolist()
     seq_lens_list = seq_lens.detach().to("cpu").tolist()
     rows, cols = int(req_to_token.shape[0]), int(req_to_token.shape[1])
 
-    candidates: list[ReqToTokenEntry] = []
+    valid_reqs: list[tuple[int, int, int]] = []
+    max_upper = 0
     for req_pool_idx, seq_len in zip(req_pool_indices_list, seq_lens_list):
         req_pool_idx_int = int(req_pool_idx)
         seq_len_int = int(seq_len)
@@ -66,7 +66,20 @@ def collect_active_slots(
         upper = min(seq_len_int, cols)
         if upper <= 0:
             continue
-        row_values = req_to_token[req_pool_idx_int, :upper].detach().to("cpu").tolist()
+        valid_reqs.append((req_pool_idx_int, seq_len_int, upper))
+        if upper > max_upper:
+            max_upper = upper
+
+    if not valid_reqs:
+        return []
+
+    row_indices = [r[0] for r in valid_reqs]
+    batched_rows = req_to_token[row_indices, :max_upper].detach().to("cpu").tolist()
+
+    candidates: list[ReqToTokenEntry] = []
+    for (req_pool_idx_int, seq_len_int, upper), row_values in zip(
+        valid_reqs, batched_rows
+    ):
         candidates.extend(
             ReqToTokenEntry(
                 req_pool_idx=req_pool_idx_int,
@@ -74,7 +87,7 @@ def collect_active_slots(
                 value=value,
                 seq_len=seq_len_int,
             )
-            for pos, raw_value in enumerate(row_values)
+            for pos, raw_value in enumerate(row_values[:upper])
             if (value := int(raw_value)) >= 0 and value not in excluded
         )
     return candidates
