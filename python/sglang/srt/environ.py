@@ -298,6 +298,10 @@ class Envs:
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # Use FlashInfer HC sum for supported gated hyper-connections. Read at
+    # model construction; requires an HC-enabled FlashInfer build and rejects
+    # online weight updates.
+    SGLANG_ENABLE_FLASHINFER_HC_SUM = EnvBool(False)
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)

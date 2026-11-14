@@ -46,6 +46,15 @@ from sglang.srt.layers.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from sglang.srt.layers.hyperconnection_flashinfer import (
+    FlashInferGatedResidual,
+    FlashInferGatedResidualState,
+    FlashInferHCCheckpoint,
+    bind_flashinfer_hc,
+    create_gated_residual,
+    install_flashinfer_hc_load_guard,
+    zero_flashinfer_hc_padding,
+)
 from sglang.srt.layers.layer_boundary import (
     GatedResidualState,
     SumGroup,
@@ -1615,6 +1624,16 @@ class _HCNorms:
     output: Optional[torch.Tensor] = None
 
 
+class _HCSums(msgspec.Struct):
+    """FlashInfer HC sums (HCSumState) prepared for one layer invocation's
+    reads; never carried across PLE, PP or the final mix."""
+
+    attn_input: Any = None
+    next_reads_output: bool = False
+    ffn_input: Any = None
+    output: Any = None
+
+
 def _has_ple(layer_id, config) -> bool:
     return (layer_id + 1) in config.ple_layer_ids
 
@@ -1742,50 +1761,75 @@ class Qwen4ExpLayerExtensionMixin:
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        self.attn_hyper_connection = GatedResidual(
-            hc_config,
-            use_mix=True,
-            use_combine=True,
+        self.attn_hyper_connection = create_gated_residual(hc_config)
+        self.mlp_hyper_connection = create_gated_residual(hc_config)
+        self._flashinfer_hc = isinstance(
+            self.attn_hyper_connection, FlashInferGatedResidual
         )
-        self.mlp_hyper_connection = GatedResidual(
-            hc_config,
-            use_mix=True,
-            use_combine=True,
-        )
-        self.attn_boundary, self.ffn_boundary = _build_qwen4_exp_stages(
-            config,
-            layer_id,
-            GatedResidualState(
+        # The PLE embedding is computed for every row.
+        attn_reads_every_row = _has_ple(layer_id, config)
+        if self._flashinfer_hc:
+            residual = FlashInferGatedResidualState(
+                expand=self._widen_streams,
+                attn_mix=self._attn_mix_sums,
+                ffn_mix=self._ffn_mix_sums,
+                attn_combine=self._attn_combine_sums,
+                ffn_combine=self._ffn_combine_sums,
+                attn_reads_every_row=attn_reads_every_row,
+            )
+        else:
+            residual = GatedResidualState(
                 expand=self._widen_streams,
                 attn_mix=self._attn_mix,
                 ffn_mix=self._ffn_mix,
                 attn_combine=self._attn_combine,
                 ffn_combine=self._ffn_combine,
-                # The PLE embedding is computed for every row.
-                attn_reads_every_row=_has_ple(layer_id, config),
-            ).residual_ops(),
+                attn_reads_every_row=attn_reads_every_row,
+            )
+        self.attn_boundary, self.ffn_boundary = _build_qwen4_exp_stages(
+            config,
+            layer_id,
+            residual.residual_ops(),
             linear_attention=linear_attention,
         )
 
         self._decode_moe_comm = _prepare_decode_moe_comm(self.mlp)
 
     @contextmanager
-    def hc_norms(self, normalized_input, next_norm):
-        norms = _HCNorms(normalized_input, next_norm)
-        # A prepared norm can only follow its residual without row movement.
-        self._hc_norms = (
-            norms
-            if get_parallel().attn_dp_size == 1
-            and get_parallel().attn_cp_size == 1
-            and get_parallel().moe_ep_size == 1
-            and not get_attn_tp_context().input_scattered
-            and get_moe_a2a_backend().is_none()
-            else None
-        )
+    def hc_norms(self, prepared_input, next_reader):
+        """Prepared reads for one layer invocation: the attention read takes
+        ``prepared_input`` from the previous layer, and the layer prepares its
+        output for ``next_reader``, the next read's hyper-connection module
+        (None after a PLE or pipeline boundary), when that reads its kind."""
+        if self._flashinfer_hc:
+            norms = _HCSums(
+                attn_input=prepared_input,
+                next_reads_output=isinstance(next_reader, FlashInferGatedResidual),
+            )
+        else:
+            next_norm = (
+                next_reader.hc_norm if isinstance(next_reader, GatedResidual) else None
+            )
+            norms = _HCNorms(prepared_input, next_norm)
+        # A prepared norm or sum can only follow its residual without row
+        # movement; communication can rewrite rows in place.
+        self._hc_norms = norms if self._prepared_rows_stay() else None
         try:
             yield norms
         finally:
             self._hc_norms = None
+
+    def _prepared_rows_stay(self) -> bool:
+        parallel = get_parallel()
+        return (
+            parallel.attn_dp_size == 1
+            and parallel.attn_cp_size == 1
+            # FlashInfer HC sum also keeps its sums under EP without all-to-all,
+            # which leaves every row on every rank.
+            and (self._flashinfer_hc or parallel.moe_ep_size == 1)
+            and not get_attn_tp_context().input_scattered
+            and get_moe_a2a_backend().is_none()
+        )
 
     def _widen_streams(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Open the layer stack's input into one stream per hyper connection.
@@ -1837,6 +1881,33 @@ class Qwen4ExpLayerExtensionMixin:
             )
         )
         return hidden_states
+
+    def _attn_mix_sums(self, residual: torch.Tensor):
+        """_attn_mix on FlashInfer HC sum: it returns an HCApplyContext."""
+        if self.ple is not None:
+            residual = self._add_ple_embedding(residual)
+        prepared = (
+            self._hc_norms.attn_input
+            if self._hc_norms is not None and self.ple is None
+            else None
+        )
+        return self.attn_hyper_connection.mix(residual, prepared)
+
+    def _attn_combine_sums(self, hidden_states, context):
+        prepared = context.apply(hidden_states)
+        if self._hc_norms is not None:
+            self._hc_norms.ffn_input = prepared
+        return prepared.residual
+
+    def _ffn_mix_sums(self, residual):
+        prepared = self._hc_norms.ffn_input if self._hc_norms is not None else None
+        return self.mlp_hyper_connection.mix(residual, prepared)
+
+    def _ffn_combine_sums(self, hidden_states, context):
+        prepared = context.apply(hidden_states)
+        if self._hc_norms is not None and self._hc_norms.next_reads_output:
+            self._hc_norms.output = prepared
+        return prepared.residual
 
     def _add_ple_embedding(self, residual: torch.Tensor) -> torch.Tensor:
         forward_batch, ple_batch = self._ple_forward_batch, self._ple_batch
@@ -2263,7 +2334,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
         aux_hidden_states = AuxHiddenStateList()
-        normalized_input = None
+        prepared_input = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -2275,16 +2346,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         next_ple.start_prefetch(
                             batch=ple_batch, forward_batch=forward_batch
                         )
-            next_norm = None
+            next_reader = None
             if i + 1 < self.end_layer:
                 next_layer = self.layers[i + 1]
                 if next_layer.ple is None:
-                    next_norm = next_layer.attn_hyper_connection.hc_norm
+                    next_reader = next_layer.attn_hyper_connection
             elif self.pp_group.is_last_rank:
-                next_norm = self.hyper_connection_mixer.hc_norm
+                next_reader = self.hyper_connection_mixer
             with (
                 get_global_expert_distribution_recorder().with_current_layer(i),
-                layer.hc_norms(normalized_input, next_norm) as norms,
+                layer.hc_norms(prepared_input, next_reader) as norms,
             ):
                 hidden_states = layer(
                     positions=positions,
@@ -2298,7 +2369,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     ),
                 )
 
-            normalized_input = norms.output
+            prepared_input = norms.output
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
@@ -2317,7 +2388,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states = residual_batch.final_norm(
             hidden_states,
             forward_batch,
-            _MixStreams(self.hyper_connection_mixer, normalized_input),
+            _MixStreams(self.hyper_connection_mixer, prepared_input),
         )
         if shards_rows:
             hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
@@ -2408,6 +2479,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.deepstack_visual_indexes = (
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
+        install_flashinfer_hc_load_guard(self)
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
@@ -2469,6 +2541,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        hc_checkpoint = FlashInferHCCheckpoint(self)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -2674,6 +2747,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ):
                 continue
 
+            if hc_checkpoint.stage(name, loaded_weight):
+                continue
             if self._load_qwen4_exp_ple_buffer(
                 name, loaded_weight, buffers, loaded_buffers
             ):
@@ -2836,12 +2911,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
+        loaded_params.update(hc_checkpoint.finish())
 
         return loaded_params
+
+    def post_load_weights(self) -> None:
+        zero_flashinfer_hc_padding(self)
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics
 
+        bind_flashinfer_hc(self)
         if precompile_splitk_tactics():
             logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
 
