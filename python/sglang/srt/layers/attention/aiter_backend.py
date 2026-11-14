@@ -48,6 +48,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import (
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     print_info_once,
 )
@@ -634,6 +635,57 @@ def _unified_extend_q(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.T
     return q.contiguous().view(-1, num_heads, head_dim)
 
 
+# Smallest KV page that unified_attention target_verify is measured to beat the
+# legacy extend kernel at (MI300X, 16 query heads per KV head, head_dim 256).
+_UNIFIED_VERIFY_MIN_PAGE_SIZE = 16
+
+
+def _unified_verify_enabled(
+    use_mla: bool,
+    eagle_topk: Optional[int],
+    page_size: int,
+    *,
+    speculative: bool = True,
+    use_triton_unified_attention: bool = False,
+    kv_cache_is_vectorized_5d: bool = False,
+) -> bool:
+    """Whether EAGLE target_verify runs on unified_attention.
+
+    With topk == 1 the draft chain is linear, so the verify mask is pure causal
+    and unified_attention's split-K kernel reads the long paged KV in parallel,
+    where the legacy extend_attention_fwd walks each request's KV serially.
+    MLA has its own verify path, a topk > 1 tree mask is not causal, and the
+    vectorized_5d KV pool cannot be viewed as the 4D paged cache it reads.
+
+    With SGLANG_USE_AITER_UNIFIED_ATTN=1 verify follows the other phases onto
+    unified_attention, as before. Without it, verify alone moves on gfx942,
+    where it is measured, and only with KV pages of at least
+    _UNIFIED_VERIFY_MIN_PAGE_SIZE tokens: unified_attention tiles the KV by
+    page and is slower than the legacy kernel with one-token pages.
+    SGLANG_AITER_UNIFIED_VERIFY=0 keeps the legacy path.
+    """
+    if not speculative or use_mla or kv_cache_is_vectorized_5d:
+        return False
+    if eagle_topk is not None and int(eagle_topk) != 1:
+        return False
+    if not get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1"):
+        return False
+    if use_triton_unified_attention:
+        return True
+    return is_gfx942_supported() and page_size >= _UNIFIED_VERIFY_MIN_PAGE_SIZE
+
+
+def _unified_draft_extend_enabled(
+    use_unified_verify: bool, use_triton_unified_attention: bool
+) -> bool:
+    """Whether EAGLE draft_extend runs on unified_attention.
+
+    Unchanged by the target_verify default above: draft_extend still moves only
+    with SGLANG_USE_AITER_UNIFIED_ATTN=1 (and SGLANG_AITER_UNIFIED_DRAFT_EXTEND).
+    """
+    return use_unified_verify and use_triton_unified_attention
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -646,6 +698,9 @@ class AiterAttnBackend(AttentionBackend):
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
     deterministic_prefill_max_q: Optional[int] = None
+    # Set in __init__; declared here for tests that build the backend without it
+    # and set only _use_unified_verify.
+    _use_unified_draft_extend: bool = False
 
     def __init__(
         self,
@@ -867,15 +922,18 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
         )
 
-        # When topk == 1 the EAGLE draft chain is linear, so target_verify's
-        # mask reduces to pure causal and can go through unified_attention
-        # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
-        # (MLA has its own verify path) and env var for opt-out.
-        self._use_unified_verify = (
-            self.use_triton_unified_attention
-            and not self.use_mla
-            and self.topk == 1
-            and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+        # The registry builds this backend without the EAGLE topk (self.topk
+        # stays at its default), so read it from the speculative config.
+        self._use_unified_verify = _unified_verify_enabled(
+            self.use_mla,
+            get_spec().speculative_eagle_topk,
+            self.page_size,
+            speculative=get_spec().speculative_algorithm is not None,
+            use_triton_unified_attention=self.use_triton_unified_attention,
+            kv_cache_is_vectorized_5d=self.kv_cache_is_vectorized_5d,
+        )
+        self._use_unified_draft_extend = _unified_draft_extend_enabled(
+            self._use_unified_verify, self.use_triton_unified_attention
         )
 
         # Muse Spark TP8 shapes on gfx950: head_dim 64, GQA 8, SWA KV pool, unified
@@ -1540,7 +1598,7 @@ class AiterAttnBackend(AttentionBackend):
         """Convert ragged token-level KV indices to a dense block page table."""
         page_size = self.page_size
         if max_blocks is None:
-            max_blocks = (self.max_context_len + page_size - 1) // page_size
+            max_blocks = self._unified_page_table_blocks()
 
         swa_slot_mapping = None
         swa_page_table = None
@@ -1580,6 +1638,19 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         return page_table, swa_page_table
+
+    def _unified_page_table_blocks(self) -> int:
+        """Columns of a unified_attention page table that must hold any request.
+
+        A request row in req_to_token is wider than context_len: it also holds
+        the speculative tokens of a verify step, so seq_len + draft tokens can
+        exceed context_len near the end of a request. Size the page tables by
+        the req_to_token row, which is the most a request can address.
+        """
+        max_kv_len = self.max_context_len
+        if self.req_to_token is not None:
+            max_kv_len = max(max_kv_len, self.req_to_token.shape[1])
+        return (max_kv_len + self.page_size - 1) // self.page_size
 
     def _build_unified_page_table_from_spec(
         self,
@@ -1623,7 +1694,7 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         page_size = self.page_size
-        max_blocks = (self.max_context_len + page_size - 1) // page_size
+        max_blocks = self._unified_page_table_blocks()
 
         swa_slot_mapping = None
         swa_page_table = None
@@ -3572,13 +3643,12 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if self.decode_uses_page_table:
-            # Keep a distinct page-table buffer for page-table decode.  Sharing
-            # cuda_graph_kv_indices with flat per-token indices makes
-            # page-table width ambiguous after the token buffer is expanded.
-            max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
-            ) // self.page_size
+        if self.decode_uses_page_table or self._use_unified_verify:
+            # Keep a distinct page-table buffer for page-table decode and for
+            # unified target_verify.  Sharing cuda_graph_kv_indices with flat
+            # per-token indices makes page-table width ambiguous after the
+            # token buffer is expanded.
+            max_num_blocks_per_seq = self._unified_page_table_blocks()
             self.cuda_graph_page_table = torch.zeros(
                 (max_bs, max_num_blocks_per_seq),
                 dtype=torch.int32,
@@ -3674,9 +3744,7 @@ class AiterAttnBackend(AttentionBackend):
             self.reduce_partial_map = None
 
         if self.use_sliding_window_kv_pool:
-            max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
-            ) // self.page_size
+            max_num_blocks_per_seq = self._unified_page_table_blocks()
             self.cuda_graph_swa_page_table = torch.zeros(
                 (max_bs, max_num_blocks_per_seq),
                 dtype=torch.int32,
@@ -4070,9 +4138,7 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 max_q_len = verify_tokens_per_req
                 if self._use_unified_verify:
-                    max_num_blocks_per_seq = (
-                        self.max_context_len + self.page_size - 1
-                    ) // self.page_size
+                    max_num_blocks_per_seq = self._unified_page_table_blocks()
                     page_table = self.cuda_graph_page_table[:bs]
 
                     swa_page_table = None
@@ -5120,7 +5186,7 @@ class AiterAttnBackend(AttentionBackend):
             # Route it through unified_attention (GQA-packed + split-KV), exactly
             # like target_verify, so it runs near the memory floor.
             if (
-                self._use_unified_verify
+                self._use_unified_draft_extend
                 and forward_batch.forward_mode.is_draft_extend_v2()
                 and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
             ):
