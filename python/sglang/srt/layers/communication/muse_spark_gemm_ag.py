@@ -4,8 +4,8 @@
 (e.g. an all-reduced tensor) and every rank needs the full result. Each rank
 runs the bf16 GEMM dispatcher on its contiguous ``N / world`` row block of the
 weight (reading ``1 / world`` of the bytes), then one kernel multicast-stores the
-slice into every peer's CustomAllReduceV2 push workspace and Lamport-spins the
-full rows together. Any TP world size; needs the plane's multicast mapping.
+slice into every peer's push slots of the TP symmetric workspace and Lamport-spins
+the full rows together. Any TP world size; needs the plane's multicast mapping.
 """
 
 from __future__ import annotations
@@ -20,33 +20,75 @@ from sglang.kernels.ops.communication.muse_spark_all_gather import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceLease,
     )
 
+# The Muse Spark collectives' lease on the TP group's symmetric workspace, and the
+# gathered projection's slot declared before it is taken.
+_LEASE: Optional[WorkspaceLease] = None
+_PROJECTION_SLOT_BYTES = 0
 
-def reserve_projection_workspace(comm: Optional[CustomAllReduceV2], n: int) -> None:
-    """Reserve shared push storage during model construction, before capture.
 
-    Keep the all-reduce thresholds and counter/launch geometry unchanged.
-    The gather strides over its output using the existing counter capacity.
+def muse_workspace() -> Optional[WorkspaceLease]:
+    """The Muse Spark collectives' lease on the TP workspace.
+
+    Every Muse collective (projection all-gather, unpool gather, finalize all-reduce)
+    stages through one slot: the TP custom all-reduce's, grown to the gathered
+    projection's when :func:`reserve_projection_workspace` declared one.
     """
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
+    global _LEASE
+    if _LEASE is None:
+        from sglang.srt.distributed.device_communicators.symm_workspace import (
+            WorkspaceRequest,
+            request_group_workspace,
+            v2_push_slot_bytes,
+        )
+        from sglang.srt.runtime_context import get_parallel
 
+        tp_group = get_parallel().tp_group
+        v2_slot = v2_push_slot_bytes(tp_group.cpu_group)
+        if get_parallel().tp_size <= 1 or v2_slot is None:
+            return None
+        _LEASE = request_group_workspace(
+            tp_group,
+            WorkspaceRequest(
+                owner="muse_spark",
+                push_slot_bytes=max(v2_slot, _PROJECTION_SLOT_BYTES),
+            ),
+        )
+    return _LEASE
+
+
+def reserve_projection_workspace(n: int) -> None:
+    """Declare the gathered projection's slot during model construction.
+
+    Callers gate on the architecture. A larger slot than the lease already taken
+    declares it again on the next :func:`muse_workspace` call.
+    """
+    global _LEASE, _PROJECTION_SLOT_BYTES
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        is_multicast_supported,
+    )
+    from sglang.srt.runtime_context import get_parallel
+
+    tp_group = get_parallel().tp_group
+    # Only the shapes gemm_ag_supported routes past the small-projection bound.
     if (
-        isinstance(comm, CustomAllReduceV2)
-        and not comm.disabled
-        and comm.has_multicast
-        and comm.world_size in (4, 8)
+        get_parallel().tp_size in (4, 8)
         and n in (4096, 8192)
+        and is_multicast_supported(tp_group.cpu_group, tp_group.device)
     ):
-        comm.reserve_push_capacity(MAX_TOKENS * n * 2)
+        _PROJECTION_SLOT_BYTES = max(_PROJECTION_SLOT_BYTES, MAX_TOKENS * n * 2)
+        if (
+            _LEASE is not None
+            and _LEASE.request.push_slot_bytes < _PROJECTION_SLOT_BYTES
+        ):
+            _LEASE = None
 
 
 def gemm_local(
-    comm: CustomAllReduceV2, x: torch.Tensor, weight: torch.Tensor
+    comm: WorkspaceLease, x: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
     """This rank's ``[M, N / world]`` column slice of ``x @ weight.T``."""
     from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
@@ -57,7 +99,7 @@ def gemm_local(
 
 
 def gemm_ag(
-    comm: CustomAllReduceV2,
+    comm: WorkspaceLease,
     x: torch.Tensor,
     weight: torch.Tensor,
     b: Optional[torch.Tensor] = None,

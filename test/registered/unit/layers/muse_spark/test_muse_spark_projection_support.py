@@ -1,13 +1,14 @@
 """Keep automatic B200 projection dispatch inside the validated TP8 envelope."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.kernels.ops.communication import muse_spark_all_gather as gather
-from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-    CustomAllReduceV2,
+from sglang.srt.distributed.device_communicators.symm_workspace import (
+    WorkspaceLease,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -17,11 +18,10 @@ register_cpu_ci(est_time=1, stage="base-a", runner_config="cpu")
 
 class TestMuseSparkProjectionSupport(CustomTestCase):
     def setUp(self):
-        self.comm = Mock(spec=CustomAllReduceV2)
-        self.comm.disabled = False
-        self.comm.has_multicast = True
+        self.comm = Mock(spec=WorkspaceLease)
         self.comm.world_size = 8
-        self.comm.max_push_size = 512 * 8192 * 2
+        self.comm.has_multicast = True
+        self.comm.request = SimpleNamespace(push_slot_bytes=512 * 8192 * 2)
 
     def supported(self, m=16, n=4096, capability=(10, 0), *, x=None, weight=None):
         x = torch.empty(m, 64, dtype=torch.bfloat16) if x is None else x
@@ -66,12 +66,13 @@ class TestMuseSparkProjectionSupport(CustomTestCase):
         self.assertFalse(self.supported(weight=weight))
 
     def test_communicator_and_workspace_fallbacks(self):
-        for field in ("disabled", "has_multicast"):
-            with patch.object(self.comm, field, field == "disabled"):
-                self.assertFalse(self.supported())
+        with patch.object(self, "comm", None):
+            self.assertFalse(self.supported())
+        with patch.object(self.comm, "has_multicast", False):
+            self.assertFalse(self.supported())
         with patch.object(self.comm, "world_size", 1):
             self.assertFalse(self.supported())
-        with patch.object(self.comm, "max_push_size", 16 * 4096 * 2 - 1):
+        with patch.object(self.comm.request, "push_slot_bytes", 16 * 4096 * 2 - 1):
             self.assertFalse(self.supported())
 
 
