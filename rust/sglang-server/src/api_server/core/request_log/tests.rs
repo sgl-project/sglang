@@ -1,8 +1,10 @@
 use super::*;
+use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
 use crate::message::finish_reason::{AbortReason, FinishKind, FinishReason};
 use crate::message::ids::Rid;
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::response::ChunkEvent;
+use crate::tokenizer_manager::wiring::{AbortSource, TmEvent};
 use sglang_api_types::api::v1 as api;
 
 /// Python's lines for the same requests, from
@@ -42,6 +44,234 @@ fn config_in(fixture: &Value, format: &str, level: &str) -> RequestLogConfig {
 
 fn config(fixture: &Value, level: &str) -> RequestLogConfig {
     config_in(fixture, "text", level)
+}
+
+fn batch_handle(
+    log: Option<Arc<RequestLog>>,
+    rendezvous: bool,
+) -> (
+    CoreHandle,
+    flume::Receiver<TmEvent>,
+    flume::Receiver<AbortSource>,
+) {
+    let (intake_tx, intake_rx) = if rendezvous {
+        flume::bounded(0)
+    } else {
+        flume::unbounded()
+    };
+    let (abort_tx, abort_rx) = flume::unbounded();
+    let handle = CoreHandle::new(
+        intake_tx,
+        abort_tx,
+        CoreConfig {
+            response_capacity: 8,
+            response_activity: Default::default(),
+            startup_ready: true,
+            is_disaggregation: false,
+            mm_limits: Vec::new(),
+            multimodal: false,
+            peer_endpoints: Vec::new(),
+            metadata: CoreMetadata::default(),
+            metrics: None,
+            request_log: log,
+            generate_validator: None,
+        },
+    );
+    (handle, intake_rx, abort_rx)
+}
+
+#[test]
+fn logged_headers_keep_only_nonempty_whitelisted_values() {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let mut settings = config(&fixture, "1");
+    settings.headers = vec!["x-present".into(), "x-empty".into(), "x-absent".into()];
+    let log = RequestLog::for_test(Some(settings), false);
+    let headers = header_map(&serde_json::json!({
+        "x-present": "kept",
+        "x-empty": "",
+        "x-unlisted": "omitted",
+    }));
+    let captured = log.logged_headers(&headers);
+    let cloned = captured.clone();
+    drop(captured);
+    assert_eq!(&*cloned, &[("x-present".into(), "kept".into())]);
+    assert!(log.logged_headers(&http::HeaderMap::new()).is_empty());
+    assert!(
+        RequestLog::for_test(None, true)
+            .logged_headers(&headers)
+            .is_empty()
+    );
+}
+
+/// Optional records must not truncate an unlogged batch or shift records
+/// between requests when logging or crash recording is enabled.
+#[tokio::test]
+async fn generation_batches_preserve_requests_with_optional_diagnostics() {
+    use crate::api_server::core::{CoreEvent, CoreOutput};
+    use crate::message::request::RequestKind;
+
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    for logging in [false, true] {
+        for recording in [false, true] {
+            for (count, native) in [(0, false), (1, false), (3, false), (128, false), (3, true)] {
+                let log = (logging || recording).then(|| {
+                    let mut settings = config(&fixture, "1");
+                    settings.headers = vec!["x-test".into()];
+                    RequestLog::for_test(logging.then_some(settings), recording)
+                });
+                let (handle, intake_rx, abort_rx) = batch_handle(log.clone(), false);
+                let ids: Vec<_> = (0..count).map(|i| format!("request-{i}")).collect();
+                let requests = ids
+                    .iter()
+                    .map(|rid| GenerateRequest {
+                        rid: Rid::from_client(rid),
+                        ..Default::default()
+                    })
+                    .collect();
+                let headers = header_map(&serde_json::json!({"x-test": "kept"}));
+                let body = serde_json::json!({"rid": ids, "input_ids": vec![vec![0]; count]});
+                let received = if native {
+                    ReceivedAs::Body(handle.snapshot_body(&body, None, &headers))
+                } else {
+                    ReceivedAs::Typed(handle.logged_headers(&headers))
+                };
+                let mut calls = handle.generate_batch(requests, received).await.unwrap();
+                assert_eq!(calls.len(), count);
+                if recording {
+                    let snapshot: Value =
+                        serde_json::from_slice(&handle.crash_dump_snapshot().unwrap()).unwrap();
+                    let unfinished = snapshot["unfinished"].as_array().unwrap();
+                    assert_eq!(unfinished.len(), count);
+                    if native {
+                        assert_eq!(snapshot["bodies"].as_object().unwrap().len(), 1);
+                        for record in unfinished {
+                            let i = record["batch_index"].as_u64().unwrap() as usize;
+                            assert_eq!(record["rid"], ids[i]);
+                            assert_eq!(snapshot["bodies"][record["body"].to_string()], body);
+                        }
+                    }
+                }
+                for (call, expected) in calls.iter_mut().zip(&ids) {
+                    assert_eq!(call.public_id(), expected);
+                    let TmEvent::Intake { request, admission } = intake_rx.try_recv().unwrap()
+                    else {
+                        panic!("expected generation intake");
+                    };
+                    assert!(admission.try_accept());
+                    let RequestKind::Generate(generate) = &request.kind else {
+                        panic!("expected generation request");
+                    };
+                    assert_eq!(generate.rid.client_facing(), expected);
+                    request
+                        .sink
+                        .try_send(ResponseItem::Done(ChunkEvent {
+                            text: expected.clone(),
+                            ..Default::default()
+                        }))
+                        .unwrap();
+                    assert!(matches!(call.recv().await,
+                        Some(CoreEvent::Finished(CoreOutput { text, .. })) if text == *expected));
+                    assert!(call.recv().await.is_none());
+                }
+                drop(calls);
+                assert!(intake_rx.try_recv().is_err());
+                assert!(abort_rx.try_recv().is_err());
+                if logging {
+                    let lines = log.as_ref().unwrap().logged_lines();
+                    assert_eq!(lines.len(), if count == 0 { 0 } else { count + 1 });
+                    assert!(lines.iter().all(|line| line.contains("kept")));
+                }
+                if recording {
+                    let snapshot: Value =
+                        serde_json::from_slice(&handle.crash_dump_snapshot().unwrap()).unwrap();
+                    assert_eq!(snapshot["unfinished"], serde_json::json!([]));
+                    let finished = snapshot["finished"].as_array().unwrap();
+                    assert_eq!(finished.len(), count);
+                    for (record, expected) in finished.iter().zip(&ids) {
+                        assert_eq!(record["rid"], *expected);
+                        assert_eq!(record["out"]["text"], *expected);
+                    }
+                } else {
+                    assert!(handle.crash_dump_snapshot().is_none());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_batch_slot_keeps_diagnostic_records_aligned() {
+    use crate::api_server::core::CoreEvent;
+    use crate::api_server::handlers::AbortEnding::CancelledError;
+
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let log = RequestLog::for_test(Some(config(&fixture, "1")), true);
+    let (handle, intake_rx, abort_rx) = batch_handle(Some(log), true);
+    let requests = ["A", "B", "C"]
+        .into_iter()
+        .map(|rid| GenerateRequest {
+            rid: Rid::from_client(rid),
+            ..Default::default()
+        })
+        .collect();
+    let mut batch = Box::pin(handle.generate_batch(requests, ReceivedAs::without_headers()));
+    assert!(futures::poll!(batch.as_mut()).is_pending());
+    let TmEvent::Intake {
+        request: first,
+        admission,
+    } = intake_rx.recv_async().await.unwrap()
+    else {
+        panic!("expected generation intake");
+    };
+    assert!(admission.try_accept());
+    assert!(futures::poll!(batch.as_mut()).is_pending());
+    assert!(handle.abort(Some("B"), CancelledError));
+    assert!(futures::poll!(batch.as_mut()).is_pending());
+    let TmEvent::Intake {
+        request: last,
+        admission,
+    } = intake_rx.recv_async().await.unwrap()
+    else {
+        panic!("expected generation intake");
+    };
+    assert!(admission.try_accept());
+    let mut calls = batch.await.unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.public_id())
+            .collect::<Vec<_>>(),
+        ["A", "B", "C"]
+    );
+    for (request, text) in [(first, "first"), (last, "last")] {
+        request
+            .sink
+            .try_send(ResponseItem::Done(ChunkEvent {
+                text: text.into(),
+                ..Default::default()
+            }))
+            .unwrap();
+    }
+    for (index, call) in calls.iter_mut().enumerate() {
+        let event = call.recv().await;
+        if index == 1 {
+            assert!(matches!(event, Some(CoreEvent::Failed(_))));
+        } else {
+            assert!(matches!(event, Some(CoreEvent::Finished(_))));
+        }
+        assert!(call.recv().await.is_none());
+    }
+    drop(calls);
+    assert!(intake_rx.try_recv().is_err());
+    assert!(abort_rx.try_recv().is_err());
+    let snapshot: Value = serde_json::from_slice(&handle.crash_dump_snapshot().unwrap()).unwrap();
+    assert_eq!(snapshot["unfinished"], serde_json::json!([]));
+    let finished = snapshot["finished"].as_array().unwrap();
+    assert_eq!(finished.len(), 2);
+    assert_eq!(finished[0]["rid"], "A");
+    assert_eq!(finished[0]["out"]["text"], "first");
+    assert_eq!(finished[1]["rid"], "C");
+    assert_eq!(finished[1]["out"]["text"], "last");
 }
 
 /// `line` with its JSON `timestamp` (the time it was logged) replaced by the
