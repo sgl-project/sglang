@@ -112,6 +112,7 @@ class KimiK3ChatEncodingAdapter:
     renders_response_format = True
     uncounted_prompt_tokens = GENERATION_STUB_TOKENS
     output = None
+    native_encoder = None
 
     def __init__(self, *, tokenizer: Any, hf_config: Any, chat_hooks: ChatOutputHooks):
         self._tokenizer = tokenizer

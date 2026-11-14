@@ -999,6 +999,10 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.tool_call_parser or request._response_parser_json_response_format:
             return False
+        if request._drops_unlisted_tool_calls and request.tool_choice == "none":
+            # The history showed the model tools, so it can still write a call;
+            # parsing drops it, where skipping the parser would return its markup.
+            return True
         if not self._effective_tools(request):
             # With no tools declared, tool_choice only holds its default and limits nothing.
             detector = FunctionCallParser.ToolCallParserEnum[self.tool_call_parser]
@@ -1733,25 +1737,7 @@ class OpenAIServingChat(OpenAIServingBase):
         output_constrained: bool = False,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
-        if self.is_minimax_m3:
-            # Settle the request's own thinking and effort first; server defaults
-            # only fill what it left unset.
-            _normalize_minimax_m3_request(request)
-        if self.default_chat_template_kwargs:
-            ctk = dict(request.chat_template_kwargs or {})
-            for k, v in self.default_chat_template_kwargs.items():
-                ctk.setdefault(k, v)
-            request.chat_template_kwargs = ctk
-            effort = ctk.get("reasoning_effort")
-            if effort is not None and request.reasoning_effort is None:
-                request.reasoning_effort = effort
-
-        if self.is_minimax_m3:
-            _normalize_minimax_m3_request(request)
-
-        normalize_hunyuan_reasoning_effort(
-            request, self.reasoning_parser, self.template_manager.reasoning_config
-        )
+        self._apply_request_defaults(request)
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -1893,7 +1879,7 @@ class OpenAIServingChat(OpenAIServingBase):
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
-                image_data=None,
+                image_data=request._input_image_data,
                 audio_data=None,
                 video_data=None,
                 modalities=[],
@@ -1952,6 +1938,71 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result.reasoning_end_token_ids = list(token_ids)
         return result
+
+    def _apply_request_defaults(self, request: ChatCompletionRequest) -> None:
+        """Settle the thinking and effort that rendering reads; repeating it
+        changes nothing."""
+        if self.is_minimax_m3:
+            # Settle the request's own thinking and effort first; server defaults
+            # only fill what it left unset.
+            _normalize_minimax_m3_request(request)
+        if self.default_chat_template_kwargs:
+            ctk = dict(request.chat_template_kwargs or {})
+            for k, v in self.default_chat_template_kwargs.items():
+                ctk.setdefault(k, v)
+            request.chat_template_kwargs = ctk
+            effort = ctk.get("reasoning_effort")
+            if effort is not None and request.reasoning_effort is None:
+                request.reasoning_effort = effort
+
+        if self.is_minimax_m3:
+            _normalize_minimax_m3_request(request)
+
+        normalize_hunyuan_reasoning_effort(
+            request, self.reasoning_parser, self.template_manager.reasoning_config
+        )
+
+    @property
+    def native_tool_loading(self) -> bool:
+        """Whether Responses and Messages requests that load tools mid-conversation
+        render from their own wire form (see `prepare_native_prompt`)."""
+        return (
+            self._encoding_adapter is not None
+            and self._encoding_adapter.native_encoder is not None
+        )
+
+    def prepare_native_prompt(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        protocol: chat_encoding_adapters.NativeProtocol,
+        body: dict[str, Any],
+    ) -> chat_encoding_adapters.NativePrompt:
+        """Render `body`, the Responses or Messages form of `request`, into its
+        `input_ids` and images, and set its `tools` to the tools the model can call
+        after the history; rendering then keeps only grammar, stops and parsing."""
+        self._apply_request_defaults(request)
+        response_format = request.response_format
+        prompt = self._encoding_adapter.native_encoder.encode_native(
+            protocol=protocol,
+            body=body,
+            thinking=self._get_reasoning_from_request(request),
+            effort=request.reasoning_effort,
+            response_schema=(
+                response_format.json_schema.schema_
+                if response_format is not None and response_format.json_schema
+                else None
+            ),
+            continue_final_message=request.continue_final_message,
+        )
+        if prompt.image_data and not self.tokenizer_manager.model_config.is_multimodal:
+            raise ValueError("image input is not supported for this model")
+        request.input_ids = prompt.prompt_ids
+        request.tools = prompt.tools or None
+        request._input_image_data = prompt.image_data or None
+        request._drops_unlisted_tool_calls = True
+        request._continued_turn = prompt.continued_turn
+        return prompt
 
     def _apply_jinja_template(
         self,

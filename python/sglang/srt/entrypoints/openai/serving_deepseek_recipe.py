@@ -11,11 +11,15 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
     ADAPTER_OUTPUT_PARSERS,
     OPENAI_CHAT_WIRE,
+    NativePrompt,
+    NativeProtocol,
     select_new_output_ids,
     token_output_sse_chunks,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    Function,
     FunctionResponse,
+    Tool,
     ToolCall,
 )
 from sglang.srt.environ import envs
@@ -29,7 +33,9 @@ from sglang.srt.parser.deepseek_recipe_output import (
     whole_tool_calls,
 )
 from sglang.srt.parser.deepseek_recipe_renderer import (
+    BUDGET_TIER,
     DeepSeekRecipe,
+    loaded_tools,
     parse_effort_budget,
 )
 from sglang.srt.runtime_context import get_serving
@@ -39,7 +45,6 @@ if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import (
         ChatCompletionRequest,
         ResponsesRequest,
-        Tool,
     )
 
 DEFAULT_EFFORT_ENVS = {
@@ -47,6 +52,12 @@ DEFAULT_EFFORT_ENVS = {
     "dsv41": envs.SGLANG_DSV41_REASONING_EFFORT,
 }
 JSON_RESPONSE_FORMATS = ("json_object", "json_schema")
+# V4 renders deferred tools up front and never loads one mid-conversation.
+NATIVE_TOOL_LOADING_SPEC = "dsv41"
+NATIVE_EFFORT_FIELDS: dict[str, str] = {
+    "responses": "reasoning",
+    "messages": "output_config",
+}
 
 
 class DeepSeekRecipeChatEncodingAdapter:
@@ -105,6 +116,10 @@ class DeepSeekRecipeChatEncodingAdapter:
     def validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         return None
 
+    @property
+    def native_encoder(self) -> Optional[DeepSeekRecipeChatEncodingAdapter]:
+        return self if self._spec == NATIVE_TOOL_LOADING_SPEC else None
+
     def encode_messages(
         self,
         *,
@@ -160,6 +175,66 @@ class DeepSeekRecipeChatEncodingAdapter:
             prompt_ids += self.deepseek_recipe.encode_text(task_prefix)
         return prompt_ids
 
+    def encode_native(
+        self,
+        *,
+        protocol: NativeProtocol,
+        body: dict[str, Any],
+        thinking: bool,
+        effort: Union[str, int, float, None],
+        response_schema: Optional[dict[str, Any]],
+        continue_final_message: bool,
+    ) -> NativePrompt:
+        tier, budget = self._effort(effort)
+        # recipe reads an effort as a request to think.
+        if thinking and tier is not None:
+            body = {**body, NATIVE_EFFORT_FIELDS[protocol]: {"effort": tier}}
+        conversation = self.deepseek_recipe.with_host_settings(
+            self.deepseek_recipe.convert_native(protocol, body, thinking=thinking),
+            response_schema=response_schema,
+            continue_final_message=continue_final_message,
+        )
+        last = conversation.messages[-1] if conversation.messages else None
+        # recipe's Messages conversion drops `strict`, which SGLang's grammar enforces.
+        strict = {tool.get("name") for tool in body["tools"] if tool.get("strict")}
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=tool.parameters,
+                    strict=True if tool.name in strict else tool.strict,
+                ),
+            )
+            for tool in loaded_tools(conversation)
+        ]
+        return NativePrompt(
+            prompt_ids=self.deepseek_recipe.encode_conversation(
+                conversation, effort_budget=budget
+            ),
+            tools=tools,
+            image_data=[
+                ImageData(url=url)
+                for url in self.deepseek_recipe.image_urls(conversation)
+            ],
+            namespace_names=(
+                self.deepseek_recipe.namespace_tool_names(_responses_namespaces(body))
+                if protocol == "responses"
+                else {}
+            ),
+            continued_turn=(
+                {"role": "assistant", "content": last.content}
+                | (
+                    {"reasoning_content": last.reasoning_content}
+                    if last.reasoning_content is not None
+                    else {}
+                )
+                if last is not None and last.prefix
+                else None
+            ),
+        )
+
     def _encode(
         self,
         body: dict[str, Any],
@@ -168,21 +243,28 @@ class DeepSeekRecipeChatEncodingAdapter:
         task: Optional[str] = None,
         image_urls: Optional[list[str]] = None,
     ) -> list[int]:
-        effort = _numeric_effort(effort)
-        if effort is None or effort == "none":
-            effort = self._default_effort
-        budget = None
-        if effort is not None and not isinstance(effort, str):
-            if self._spec != "dsv41":
-                raise ValueError(
-                    f"DeepSeek-V4 reasoning_effort must be a named tier, got {effort!r}"
-                )
-            budget = parse_effort_budget(effort)
-        elif effort is not None:
-            body["reasoning_effort"] = effort
+        tier, budget = self._effort(effort)
+        if budget is None and tier is not None:
+            body["reasoning_effort"] = tier
         return self.deepseek_recipe.encode(
             body, task=task, effort_budget=budget, image_urls=image_urls
         )
+
+    def _effort(
+        self, effort: Union[str, int, float, None]
+    ) -> tuple[Optional[str], Optional[int]]:
+        """The named tier recipe renders and, for a V4.1 integer budget, the budget
+        that replaces the tier's line."""
+        effort = _numeric_effort(effort)
+        if effort is None or effort == "none":
+            effort = self._default_effort
+        if effort is None or isinstance(effort, str):
+            return effort, None
+        if self._spec != "dsv41":
+            raise ValueError(
+                f"DeepSeek-V4 reasoning_effort must be a named tier, got {effort!r}"
+            )
+        return BUDGET_TIER, parse_effort_budget(effort)
 
     def parse_chat_response(
         self,
@@ -332,7 +414,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         self, request: ChatCompletionRequest
     ) -> DeepSeekRecipeOutputParser:
         response_format = request.response_format
-        continued = (
+        continued = request._continued_turn or (
             _trailing_assistant_turn(
                 _null_content_as_empty(
                     [
@@ -360,6 +442,11 @@ class DeepSeekRecipeChatEncodingAdapter:
             separate_reasoning=self._separate_reasoning and request.separate_reasoning,
             stream_reasoning=request.stream_reasoning,
             stop=_stop_strings(request.stop),
+            callable_names=(
+                _native_callable_names(request.tools or [], request.tool_choice)
+                if request._drops_unlisted_tool_calls
+                else None
+            ),
         )
 
     def _new_responses_parser(
@@ -369,12 +456,25 @@ class DeepSeekRecipeChatEncodingAdapter:
         separate_reasoning: bool,
         parse_tool_calls: bool,
     ) -> DeepSeekRecipeOutputParser:
+        native = request._tool_state.chat_tools is not None
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
             thinking_stage=self.deepseek_recipe.parse_start(thinking=require_reasoning),
             parse_tool_calls=parse_tool_calls,
+            # Under `none` the tool parser runs only to drop calls; a JSON answer
+            # must be read as JSON, or a call marker spelled in a string ends it.
+            parse_json_output=native
+            and request.tool_choice == "none"
+            and request.has_json_schema_constraint(),
             separate_reasoning=separate_reasoning,
             stop=_stop_strings(request.stop),
+            callable_names=(
+                _native_callable_names(
+                    request._tool_state.chat_tools, request.tool_choice
+                )
+                if native
+                else None
+            ),
         )
 
     def _tool_call_id(self, index: int, name: str, history_tool_calls_cnt: int) -> str:
@@ -404,6 +504,20 @@ class DeepSeekRecipeResponsesStream:
         else:
             delta = self._parser.finish(new_output_ids, finish_reason)
         return delta.reasoning, delta.content, _tool_call_items(delta.tool_calls)
+
+
+def _responses_namespaces(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """The namespace tools a Responses body declares and its history discovers, in
+    the order recipe's conversion names their members."""
+    discovered = [
+        tool
+        for item in body["input"]
+        if isinstance(item, dict) and item.get("type") == "tool_search_output"
+        for tool in item["tools"]
+    ]
+    return [
+        tool for tool in [*body["tools"], *discovered] if tool["type"] == "namespace"
+    ]
 
 
 def _null_content_as_empty(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -437,6 +551,18 @@ def _numeric_effort(
 
 def _stop_strings(stop: Union[str, list[str], None]) -> list[str]:
     return [stop] if isinstance(stop, str) else stop or []
+
+
+def _native_callable_names(
+    tools: list[Tool], tool_choice: Any
+) -> Optional[frozenset[str]]:
+    """The names of `tools`, all that a natively rendered prompt shows the model;
+    None when calls to other tools are returned. `none` allows no call at all."""
+    if tool_choice == "none":
+        return frozenset()
+    if envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+        return None
+    return frozenset(tool.function.name for tool in tools)
 
 
 def _tool_call_items(

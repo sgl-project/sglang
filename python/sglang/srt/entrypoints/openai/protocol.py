@@ -1079,6 +1079,15 @@ class ChatCompletionRequest(PDRoutingFields):
     # renders these, while ``tools`` (flattened to ``<namespace>.<function>``) still
     # drives tool-call parsing.
     _template_tools: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)
+    # Set with ``input_ids`` by a caller that rendered them itself: the images the
+    # prompt's placeholders stand for, in order.
+    _input_image_data: Optional[List[Any]] = PrivateAttr(default=None)
+    # Whether ``tools`` are the only tools the rendered prompt shows, so a call
+    # to any other tool is dropped rather than returned.
+    _drops_unlisted_tool_calls: bool = PrivateAttr(default=False)
+    # Set with ``input_ids`` under ``continue_final_message``: the final assistant
+    # message the prompt continues, where output parsing resumes.
+    _continued_turn: Optional[Dict[str, Any]] = PrivateAttr(default=None)
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
@@ -2097,6 +2106,32 @@ class ResponseToolState(msgspec.Struct, frozen=True):
     public_tools: list[ResponseTool] | None = None
     public_choice: str | dict[str, Any] | None = None
     names: dict[str, dict[str, str]] = {}
+    # The tools the model can call after the history, from a request rendered in
+    # its own wire form; None when `tools` alone declares them.
+    chat_tools: list[Tool] | None = None
+    # ``custom`` tools a ``tool_search_output`` loaded, beside the declared ones.
+    discovered_custom_names: frozenset[str] = frozenset()
+
+
+class ResponseToolSearchCall(BaseModel):
+    """A client-executed ``tool_search`` call; the pinned openai SDK has no type."""
+
+    id: str
+    type: Literal["tool_search_call"] = "tool_search_call"
+    call_id: str
+    execution: Literal["client"] = "client"
+    arguments: Dict[str, Any]
+    status: Literal["in_progress", "completed", "incomplete"]
+
+
+class ResponseToolSearchCallEvent(BaseModel):
+    """``response.output_item.added`` / ``.done`` for a tool search call, which the
+    SDK's event types reject."""
+
+    type: Literal["response.output_item.added", "response.output_item.done"]
+    sequence_number: int
+    output_index: int
+    item: ResponseToolSearchCall
 
 
 class ResponseInputMessageParam(EasyInputMessageParam, total=False):
@@ -2126,6 +2161,9 @@ class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
 
     _tool_state: ResponseToolState = PrivateAttr(default_factory=ResponseToolState)
+    # By call_id, the name the model called a tool by when the output item
+    # reports another; the stored history replays the call under it.
+    _called_tool_names: Dict[str, str] = PrivateAttr(default_factory=dict)
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
@@ -2451,6 +2489,7 @@ class ResponsesResponse(BaseModel):
             ResponseOutputItem,
             ResponseReasoningItem,
             ResponseFunctionToolCall,
+            ResponseToolSearchCall,
         ]
     ] = Field(default_factory=list)
     status: Literal[
@@ -2516,6 +2555,7 @@ class ResponsesResponse(BaseModel):
                 ResponseOutputItem,
                 ResponseReasoningItem,
                 ResponseFunctionToolCall,
+                ResponseToolSearchCall,
             ]
         ],
         status: str,

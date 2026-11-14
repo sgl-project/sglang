@@ -41,6 +41,7 @@ class InklingChatEncodingAdapter:
     renders_response_format = False
     uncounted_prompt_tokens = 0
     wire = OPENAI_CHAT_WIRE
+    native_encoder = None
 
     def __init__(
         self,
