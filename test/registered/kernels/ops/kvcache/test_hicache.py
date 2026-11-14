@@ -1033,7 +1033,10 @@ def test_hybrid_draft_restores_full_and_swa_layers():
             ),
         )
     )
-    with patch.object(assembler, "_get_allocator_type", return_value="default"):
+    with (
+        patch.object(assembler, "_get_allocator_type", return_value="default"),
+        patch.object(assembler, "target_window_host_pool", return_value=PoolName.SWA),
+    ):
         specs, entries = assembler.build_hicache_draft_sidecars(
             draft_device_pools=(draft,), tree_cache=tree_cache
         )

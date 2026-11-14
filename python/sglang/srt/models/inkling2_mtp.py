@@ -115,7 +115,9 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             raise ValueError(
                 "Inkling2 MTP does not support attention projection biases"
             )
-        DFlashDraftModel.__init__(self, config, quant_config=None, prefix=prefix)
+        DFlashDraftModel.__init__(
+            self, config, quant_config=quant_config, prefix=prefix
+        )
         hidden, eps = config.hidden_size, config.rms_norm_eps
         self.block_size = config.block_size
         self.gamma = self.block_size - 1
