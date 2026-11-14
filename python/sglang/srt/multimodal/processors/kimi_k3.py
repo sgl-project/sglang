@@ -10,6 +10,7 @@ at load time.
 
 import asyncio
 import functools
+import logging
 import math
 import re
 from typing import Dict, List, Optional, Union
@@ -60,10 +61,12 @@ from sglang.srt.multimodal.processors.kimi_common import (
     unwrap_kimi_images,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
+    _MAX_GPU_RESIZE_PIXELS,
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
     _gpu_preprocess_images,
     _grid_thw_from_resize_config,
+    _release_preprocess_cache,
     navit_resize_config,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -71,6 +74,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
+logger = logging.getLogger(__name__)
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
@@ -371,7 +376,9 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             self._patch_size,
             to_chw=_k3_to_cuda_chw,
             post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+            max_gpu_resize_pixels=_MAX_GPU_RESIZE_PIXELS,
         )
+        _release_preprocess_cache()
 
         return {
             "input_ids": input_ids,
@@ -456,20 +463,38 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             for width, height in image_sizes
         ]
 
+        pixel_values = None
         if images and torch.cuda.is_available():
             image_scale, image_bias = self._get_gpu_norm_tensors()
-            pixel_values, grid_thws = _gpu_preprocess_images(
-                images,
-                resize_configs,
-                image_scale,
-                image_bias,
-                self._patch_size,
-                to_chw=_k3_to_cuda_chw,
-                post_resize=lambda x: _fill_transparent_bg(
-                    x, self._transparent_bg_config
-                ),
-            )
-        else:
+            gpu_oom = False
+            try:
+                pixel_values, grid_thws = _gpu_preprocess_images(
+                    images,
+                    resize_configs,
+                    image_scale,
+                    image_bias,
+                    self._patch_size,
+                    to_chw=_k3_to_cuda_chw,
+                    post_resize=lambda x: _fill_transparent_bg(
+                        x, self._transparent_bg_config
+                    ),
+                    max_gpu_resize_pixels=_MAX_GPU_RESIZE_PIXELS,
+                )
+                _release_preprocess_cache()
+            except torch.OutOfMemoryError:
+                gpu_oom = True
+            if gpu_oom:
+                # Outside the except block, so the failed attempt's tensors
+                # are no longer held by the traceback. The tokenizer shares
+                # GPU 0 with the scheduler's static pools; serve the request on
+                # the CPU path once instead of failing it.
+                logger.warning(
+                    "Kimi-K3 GPU image preprocessing ran out of memory for "
+                    "%d images; falling back to CPU preprocessing.",
+                    len(images),
+                )
+                torch.cuda.empty_cache()
+        if pixel_values is None:
             # The checkpoint CPU processor couples prompt composition with media
             # preprocessing. A synthetic prompt keeps that API but is discarded;
             # image features and grids are independent of its text.
@@ -729,6 +754,9 @@ class KimiK3ImageProcessor(
                     grid_thw=grid,
                     feature=feature,
                 )
+            # the artifacts hold CPU copies; free the GPU features first
+            del features, feature
+            _release_preprocess_cache()
 
         # 3. return artifacts in the original processor-input order
         if any(artifact is None for artifact in artifacts):
