@@ -635,7 +635,15 @@ class TestPPMambaPoolSizing(CustomTestCase):
 
 class TestExtraMambaCacheSizing(CustomTestCase):
     @staticmethod
-    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+    def _size(
+        extra_bytes,
+        *,
+        pp_size=1,
+        dp_size=1,
+        draft_tokens=None,
+        tuple_bytes_per_req=None,
+        **schedule,
+    ):
         from sglang.srt import runtime_context as rc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
@@ -654,6 +662,10 @@ class TestExtraMambaCacheSizing(CustomTestCase):
             pp_size=pp_size,
             model_config=SimpleNamespace(num_hidden_layers=4),
             _calculate_mamba_ratio=lambda: 2,
+            _linear_lossless_verify_enabled=lambda: tuple_bytes_per_req is not None,
+        )
+        fake._spec_intermediate_bytes = MethodType(
+            KVCacheConfigurator._spec_intermediate_bytes, fake
         )
         args = dict(
             disable_radix_cache=False,
@@ -664,7 +676,14 @@ class TestExtraMambaCacheSizing(CustomTestCase):
             speculative_num_draft_tokens=draft_tokens,
         )
         args.update(schedule)
-        with rc.get_context().override_server_args(**args):
+        # The tuple verify's per-request scratch, as memory_pool prices it.
+        with (
+            rc.get_context().override_server_args(**args),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.spec_intermediate_bytes_per_req",
+                return_value=tuple_bytes_per_req,
+            ),
+        ):
             remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
             return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
 
@@ -692,6 +711,45 @@ class TestExtraMambaCacheSizing(CustomTestCase):
     def test_speculative_auto_capacity_keeps_scratch_separate(self):
         self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
         self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
+
+    def test_tuple_verify_auto_capacity_never_shrinks_slots_or_kv(self):
+        """The auto solve prices each running request's scratch as per-draft
+        snapshots. The tuple verify spends the difference on slots only while
+        they cap the running requests, and leaves the rest to the KV cache."""
+        # Snapshot: 3 slots // ratio 2 -> 1 running req, 2 rows of 2 x 4 MiB.
+        self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
+        # The freed 2 x 7 MiB lifts the cap to 2 running reqs (one more slot
+        # and tuple row); the other 9 MiB goes to KV.
+        self.assertEqual(
+            self._size(0, draft_tokens=2, tuple_bytes_per_req=1 << 20),
+            (4, 97 << 20),
+        )
+        # Already at max_running_requests: every freed byte goes to KV.
+        self.assertEqual(
+            self._size(
+                0,
+                draft_tokens=2,
+                tuple_bytes_per_req=1 << 20,
+                max_running_requests=1,
+            ),
+            (3, 102 << 20),
+        )
+
+    def test_tuple_verify_fixed_capacity_frees_scratch_for_kv(self):
+        """With the slots fixed, the tuple verify only shrinks each request's
+        scratch row, and the difference goes to the KV cache."""
+        for schedule, scratch_rows in (
+            (dict(max_mamba_cache_size=8), 5),
+            (dict(disable_radix_cache=True, max_running_requests=8), 9),
+        ):
+            with self.subTest(**schedule):
+                slots, kv = self._size(0, draft_tokens=2, **schedule)
+                tuple_slots, tuple_kv = self._size(
+                    0, draft_tokens=2, tuple_bytes_per_req=1 << 20, **schedule
+                )
+                self.assertEqual(tuple_slots, slots)
+                # Each row drops 2 x 4 MiB of snapshots for 1 MiB of tuples.
+                self.assertEqual(tuple_kv - kv, scratch_rows * (7 << 20))
 
     def test_pd_prefill_does_not_reserve_speculative_scratch(self):
         """A PD prefill server's hybrid req pool never allocates the per-draft-token
