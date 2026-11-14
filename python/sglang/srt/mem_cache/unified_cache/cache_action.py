@@ -27,6 +27,8 @@ class FreeDeviceKVFullOnly(msgspec.Struct, frozen=True):
     FreeDeviceKV would release the SWA side twice."""
 
     indices: list[torch.Tensor]
+    # Whether the slots were a tree node's value rather than the inserting request's.
+    tree_owned: bool = False
 
 
 class ComponentAction(msgspec.Struct, frozen=True):
