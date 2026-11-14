@@ -1,0 +1,42 @@
+name: 'Download prebuilt sgl-router'
+description: >
+  Put sgl-router at sgl-router-bin/sgl-router (artifact, else cache, else source
+  build) and export SGLANG_TEST_PD_ROUTER_BINARY. Kept in the checkout so
+  containers that mount the workspace see it.
+
+inputs:
+  artifact_name:
+    description: "sgl-router-build's artifact in this run; empty uses only the cache."
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # continue-on-error: the artifact expires in a day, so a re-run falls through
+    # to the cache below.
+    - name: Download prebuilt sgl-router
+      id: artifact
+      if: inputs.artifact_name != ''
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: sgl-router-bin
+
+    - name: Ensure zstd so the cache entry is readable
+      if: steps.artifact.outcome != 'success'
+      shell: bash
+      run: bash scripts/ci/utils/ensure_zstd.sh
+
+    - name: Restore prebuilt sgl-router from cache
+      id: cache
+      if: steps.artifact.outcome != 'success'
+      uses: actions/cache/restore@v4
+      with:
+        path: sgl-router-bin/sgl-router
+        key: sgl-router-${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+
+    - name: Build sgl-router if neither had it, and export its path
+      shell: bash
+      run: bash scripts/ci/utils/prepare_sgl_router.sh
