@@ -122,7 +122,7 @@ def l2norm_fwd(
     return y.view(x_shape_og)
 
 
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["num_tokens"])
 def gdn_prefill_qkv_prepare_kernel(
     q,
     k,
@@ -130,71 +130,67 @@ def gdn_prefill_qkv_prepare_kernel(
     q_out,
     k_out,
     v_out,
-    q_stride_t,
-    q_stride_h,
-    q_stride_d,
-    k_stride_t,
-    k_stride_h,
-    k_stride_d,
-    v_stride_t,
-    v_stride_h,
-    v_stride_d,
-    T,
-    H_QK: tl.constexpr,
-    H_V: tl.constexpr,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
+    num_tokens,
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,
+    stride_k_t,
+    stride_k_h,
+    stride_k_d,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
+    eps,
+    Q_HEADS: tl.constexpr,
+    K_HEADS: tl.constexpr,
+    V_HEADS: tl.constexpr,
+    Q_DIM: tl.constexpr,
+    K_DIM: tl.constexpr,
+    V_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
 ):
-    """Materialize strided Q/K/V into token-major tensors in one launch."""
-    token_block = tl.program_id(0).to(tl.int64)
-    head_idx = tl.program_id(1)
+    pid = tl.program_id(0).to(tl.int64)
+    # Flatten token/head rows like l2norm_fwd, preserving its reduction tree.
+    q_rows = num_tokens * Q_HEADS
+    k_rows = num_tokens * K_HEADS
+    v_rows = num_tokens * V_HEADS
+    q_blocks = tl.cdiv(q_rows, BLOCK_ROWS)
+    k_blocks = tl.cdiv(k_rows, BLOCK_ROWS)
 
-    o_t = token_block * BT + tl.arange(0, BT)
-    o_d = tl.arange(0, BD)
-    m_x = (o_t[:, None] < T) & (o_d[None, :] < D)
-    if head_idx < H_QK:
-        # Match l2norm_fwd_kernel's block layout so the BF16 reduction tree is
-        # unchanged for strided inputs.
-        q_block = (
-            q
-            + head_idx * q_stride_h
-            + o_t[:, None] * q_stride_t
-            + o_d[None, :] * q_stride_d
+    rows = tl.arange(0, BLOCK_ROWS)[:, None]
+    cols = tl.arange(0, BLOCK_DIM)[None, :]
+
+    if pid < q_blocks:
+        row = pid * BLOCK_ROWS + rows
+        token = row // Q_HEADS
+        head = row % Q_HEADS
+        mask = (row < q_rows) & (cols < Q_DIM)
+        offsets = token * stride_q_t + head * stride_q_h + cols * stride_q_d
+        q_values = tl.load(q + offsets, mask=mask, other=0.0).to(tl.float32)
+        q_values = (
+            q_values / tl.sqrt(tl.sum(q_values * q_values, axis=1) + eps)[:, None]
         )
-        k_block = (
-            k
-            + head_idx * k_stride_h
-            + o_t[:, None] * k_stride_t
-            + o_d[None, :] * k_stride_d
+        tl.store(q_out + row * Q_DIM + cols, q_values, mask=mask)
+    elif pid < q_blocks + k_blocks:
+        row = (pid - q_blocks) * BLOCK_ROWS + rows
+        token = row // K_HEADS
+        head = row % K_HEADS
+        mask = (row < k_rows) & (cols < K_DIM)
+        offsets = token * stride_k_t + head * stride_k_h + cols * stride_k_d
+        k_values = tl.load(k + offsets, mask=mask, other=0.0).to(tl.float32)
+        k_values = (
+            k_values / tl.sqrt(tl.sum(k_values * k_values, axis=1) + eps)[:, None]
         )
-        q_values = tl.load(q_block, mask=m_x, other=0.0).to(tl.float32)
-        k_values = tl.load(k_block, mask=m_x, other=0.0).to(tl.float32)
-        q_output_block = q_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
-        k_output_block = k_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
-        tl.store(
-            q_output_block,
-            q_values.to(q_output_block.dtype.element_ty),
-            mask=m_x,
-        )
-        tl.store(
-            k_output_block,
-            k_values.to(k_output_block.dtype.element_ty),
-            mask=m_x,
-        )
+        tl.store(k_out + row * K_DIM + cols, k_values, mask=mask)
     else:
-        value_head = head_idx - H_QK
-        v_block = (
-            v
-            + value_head * v_stride_h
-            + o_t[:, None] * v_stride_t
-            + o_d[None, :] * v_stride_d
-        )
-        v_values = tl.load(v_block, mask=m_x, other=0.0)
-        v_output_block = (
-            v_out + value_head * D + o_t[:, None] * (H_V * D) + o_d[None, :]
-        )
-        tl.store(v_output_block, v_values, mask=m_x)
+        row = (pid - q_blocks - k_blocks) * BLOCK_ROWS + rows
+        token = row // V_HEADS
+        head = row % V_HEADS
+        mask = (row < v_rows) & (cols < V_DIM)
+        offsets = token * stride_v_t + head * stride_v_h + cols * stride_v_d
+        v_values = tl.load(v + offsets, mask=mask)
+        tl.store(v_out + row * V_DIM + cols, v_values, mask=mask)
 
 
 def gdn_prefill_qkv_prepare_fwd(
@@ -203,7 +199,10 @@ def gdn_prefill_qkv_prepare_fwd(
     v: torch.Tensor,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepare Q/K/V for FlashInfer, materializing only strided inputs."""
+    """Normalize Q/K and materialize strided Q/K/V in a single launch.
+
+    Match l2norm_fwd rounding and retain contiguous V storage.
+    """
     if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
         raise ValueError(
             "GDN fused prepare requires equal Q/K [T, Hqk, D] shapes and "
@@ -224,15 +223,17 @@ def gdn_prefill_qkv_prepare_fwd(
     H_V = v.shape[1]
     if D > 512:
         raise ValueError(f"GDN fused prepare supports head dim <= 512, got {D}")
-    if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
-        return l2norm_fwd(q, eps), l2norm_fwd(k, eps), v
-
     q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-    v_out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
-    BT = 16
-    BD = triton.next_power_of_2(D)
-    grid = (triton.cdiv(T, BT), H_QK + H_V)
+    copy_v = not v.is_contiguous()
+    v_out = torch.empty(v.shape, dtype=v.dtype, device=v.device) if copy_v else v
+    if T == 0:
+        return q_out, k_out, v_out
+    block_rows = 16
+    grid = (
+        2 * triton.cdiv(T * H_QK, block_rows)
+        + (triton.cdiv(T * H_V, block_rows) if copy_v else 0),
+    )
     gdn_prefill_qkv_prepare_kernel[grid](
         q,
         k,
@@ -240,6 +241,7 @@ def gdn_prefill_qkv_prepare_fwd(
         q_out,
         k_out,
         v_out,
+        T,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -249,16 +251,19 @@ def gdn_prefill_qkv_prepare_fwd(
         v.stride(0),
         v.stride(1),
         v.stride(2),
-        T=T,
-        H_QK=H_QK,
-        H_V=H_V,
-        D=D,
-        BT=BT,
-        BD=BD,
-        num_warps=4,
-        num_stages=2,
+        eps,
+        Q_HEADS=H_QK,
+        K_HEADS=H_QK,
+        V_HEADS=H_V,
+        Q_DIM=D,
+        K_DIM=D,
+        V_DIM=D,
+        BLOCK_DIM=triton.next_power_of_2(D),
+        BLOCK_ROWS=block_rows,
+        num_warps=8,
+        num_stages=3,
     )
-    return l2norm_fwd(q_out, eps), l2norm_fwd(k_out, eps), v_out
+    return q_out, k_out, v_out
 
 
 class L2NormFunction(torch.autograd.Function):
