@@ -2505,6 +2505,27 @@ class Envs:
     # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
     # gemm_ag_up_fits). Online weight updates are rejected while on.
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
+    # --kda-weight-shard-size gather mover: "ce" (copy-engine peer pulls from the shard
+    # buffers mapped on every group rank, on one stream, no collective) or "ce_ms" (one copy
+    # stream per peer).
+    SGLANG_K3_KDA_WS_MOVER = EnvStr("ce")
+    # --kda-weight-shard-size: KDA layers gathered ahead of the running one (slots = depth + 1).
+    SGLANG_K3_KDA_WS_PREFETCH_DEPTH = EnvInt(1)
+    # --kda-weight-shard-size: where a KDA layer issues the next layer's gather: "layer"
+    # (its start) or "core" (after its in-projection GEMM, at the KDA core).
+    SGLANG_K3_KDA_WS_ISSUE_AT = EnvStr("layer")
+    # --kda-weight-shard-size: time the MoE-stage wait for the layer's gather (CUDA events;
+    # debug log per forward, aggregate counters on the store).
+    SGLANG_K3_KDA_WS_STATS = EnvBool(False)
+    # --kda-weight-shard-size: when the MoE stage waits for the gathers its layer issued
+    # (keeps gather NVLink traffic off the MoE all-to-all): "always", "never" (the gather
+    # runs through the MoE stage; the consuming layer's start still waits), or a token
+    # count N (wait only in forwards whose largest per-DP-rank token count is >= N).
+    SGLANG_K3_KDA_WS_MOE_WAIT = EnvStr("always")
+    # --kda-weight-shard-size, mover ce: issue a gather from per-unit copy views and reused
+    # CUDA events built once (host cost only; the copies are unchanged). 0 restores the
+    # per-issue slicing and event creation.
+    SGLANG_K3_KDA_WS_LEAN_ISSUE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

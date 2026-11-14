@@ -254,6 +254,62 @@ def handle_shared_experts_tp(server_args: Any):
         )
 
 
+_KIMI_K3_ARCHITECTURES = (
+    "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
+    "KimiK3LinearForCausalLM",
+)
+
+
+def handle_kda_weight_shard(server_args: Any):
+    cfg = resolving_view(server_args)
+    size = cfg.kda_weight_shard_size
+    if size is None:
+        return
+    if cfg.disaggregation_mode != "prefill":
+        raise ValueError(
+            "--kda-weight-shard-size runs on PD prefill workers only "
+            f"(--disaggregation-mode prefill; got {cfg.disaggregation_mode!r}): a "
+            "decoding server would re-gather the sharded weights every step (about "
+            "54 GB per rank for K3 at attention TP 1 and N=8)."
+        )
+    if size < 2 or cfg.tp_size % size != 0:
+        raise ValueError(
+            f"--kda-weight-shard-size ({size}) must be >= 2 and divide TP size "
+            f"({cfg.tp_size})."
+        )
+    view = resolved_view(server_args)
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if cfg.attn_dp_size <= 1 or cfg.attn_dp_size % size != 0:
+        raise ValueError(
+            f"--kda-weight-shard-size ({size}) needs attention DP and must divide the "
+            f"attention-DP size ({cfg.attn_dp_size}; attention TP {attn_tp_size})."
+        )
+    if view.attn_cp_size > 1:
+        raise ValueError("--kda-weight-shard-size does not support --attn-cp-size > 1.")
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError(
+            "--kda-weight-shard-size requires a Kimi-K3 model configuration."
+        )
+    architecture = model_config_of(server_args).hf_config.architectures[0]
+    if architecture not in _KIMI_K3_ARCHITECTURES:
+        raise ValueError(
+            f"--kda-weight-shard-size is only supported for Kimi-K3 (got {architecture})."
+        )
+    graph = cfg.cuda_graph_config
+    if graph is not None and graph.decode.backend == Backend.FULL:
+        raise ValueError(
+            "--kda-weight-shard-size issues its layer-weight gathers between graph "
+            "segments and cannot run inside a full decode CUDA graph; use "
+            "--cuda-graph-backend-decode breakable or disabled (weight sharding is "
+            "meant for prefill)."
+        )
+
+
 def handle_decode_context_parallelism(server_args: Any):
     run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
