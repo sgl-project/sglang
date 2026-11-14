@@ -40,11 +40,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.hyperconnection import (
-    GatedResidual,
-    GroupedGemmaRMSNorm,
-    HyperConnectionConfig,
-)
+from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 from sglang.srt.layers.layer_boundary import (
     GatedResidualState,
     SumGroup,
@@ -1537,24 +1533,48 @@ class _MixStreams:
     """The layer stack's terminal read: the gated mix down to one stream. The
     stack ends on the mix, with no final norm after it."""
 
-    def __init__(self, hyper_connection_mixer, normalized_input=None):
+    def __init__(self, hyper_connection_mixer, prepared=None):
         self.hyper_connection_mixer = hyper_connection_mixer
-        self.normalized_input = normalized_input
+        self.prepared = prepared
 
     def __call__(self, hidden_states):
+        read = _prepared_read(self.prepared, hidden_states)
+        if read is not None:
+            return read[0]
         return self.hyper_connection_mixer.mix(
-            hidden_states, normalized_input=self.normalized_input
+            hidden_states, normalized_input=_prepared_norm(self.prepared)
         )[0]
 
 
 @dataclass
-class _HCNorms:
-    """Prepared norms for one layer invocation; never carried across PLE or PP."""
+class _SeamRead:
+    """A read the HC seam already ran inside the write-back that produced its
+    residual (``residuals[0]``): its output and residuals, as ``mix`` returns them."""
 
-    attn_input: Optional[torch.Tensor]
-    next_norm: Optional[GroupedGemmaRMSNorm]
+    mixed: torch.Tensor
+    residuals: tuple
+
+
+def _prepared_read(prepared, residual):
+    """The prepared read of ``residual``, or None."""
+    if isinstance(prepared, _SeamRead) and prepared.residuals[0] is residual:
+        return prepared.mixed, prepared.residuals
+    return None
+
+
+def _prepared_norm(prepared):
+    return None if isinstance(prepared, _SeamRead) else prepared
+
+
+@dataclass
+class _HCNorms:
+    """What a layer invocation prepares for the next HC read: its norm or, where
+    the seam runs, the read itself. Never carried across PLE or PP."""
+
+    attn_input: Optional[Union[torch.Tensor, _SeamRead]]
+    next_hc: Optional[GatedResidual]
     ffn_input: Optional[torch.Tensor] = None
-    output: Optional[torch.Tensor] = None
+    output: Optional[Union[torch.Tensor, _SeamRead]] = None
 
 
 def _has_ple(layer_id, config) -> bool:
@@ -1646,6 +1666,7 @@ class Qwen4ExpLayerExtensionMixin:
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         linear_attention: bool = False,
+        is_nextn: bool = False,
     ) -> None:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
@@ -1684,15 +1705,19 @@ class Qwen4ExpLayerExtensionMixin:
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
+        # MTP draft layers keep the existing path until the HC seam is
+        # validated with speculative decoding.
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            seam=not is_nextn,
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            seam=not is_nextn,
         )
         self.attn_boundary, self.ffn_boundary = _build_qwen4_exp_stages(
             config,
@@ -1703,6 +1728,7 @@ class Qwen4ExpLayerExtensionMixin:
                 ffn_mix=self._ffn_mix,
                 attn_combine=self._attn_combine,
                 ffn_combine=self._ffn_combine,
+                ffn_combine_mix=self.mlp_hyper_connection.seam_combine_mix,
                 # The PLE embedding is computed for every row.
                 attn_reads_every_row=_has_ple(layer_id, config),
             ).residual_ops(),
@@ -1712,8 +1738,8 @@ class Qwen4ExpLayerExtensionMixin:
         self._decode_moe_comm = _prepare_decode_moe_comm(self.mlp)
 
     @contextmanager
-    def hc_norms(self, normalized_input, next_norm):
-        norms = _HCNorms(normalized_input, next_norm)
+    def hc_norms(self, prepared, next_hc):
+        norms = _HCNorms(prepared, next_hc)
         # A prepared norm can only follow its residual without row movement.
         self._hc_norms = (
             norms
@@ -1743,13 +1769,16 @@ class Qwen4ExpLayerExtensionMixin:
         own contribution to the streams and joins them before the read."""
         if self.ple is not None:
             residual = self._add_ple_embedding(residual)
-        normalized_input = (
+        prepared = (
             self._hc_norms.attn_input
             if self._hc_norms is not None and self.ple is None
             else None
         )
+        read = _prepared_read(prepared, residual)
+        if read is not None:
+            return read
         return self.attn_hyper_connection.mix(
-            residual, normalized_input=normalized_input
+            residual, normalized_input=_prepared_norm(prepared)
         )
 
     def _attn_combine(self, hidden_states, residuals):
@@ -1771,11 +1800,17 @@ class Qwen4ExpLayerExtensionMixin:
         )
 
     def _ffn_combine(self, hidden_states, residuals):
-        if self._hc_norms is None:
+        next_hc = self._hc_norms.next_hc if self._hc_norms is not None else None
+        if next_hc is None:
             return self.mlp_hyper_connection.combine(hidden_states, residuals)
+        # The next read's seam folds this write-back in: one call for both.
+        read = next_hc.seam_combine_mix(hidden_states, residuals)
+        if read is not None:
+            self._hc_norms.output = _SeamRead(*read)
+            return read[1][0]
         hidden_states, self._hc_norms.output = (
             self.mlp_hyper_connection.combine_and_normalize(
-                hidden_states, residuals, self._hc_norms.next_norm
+                hidden_states, residuals, next_hc.hc_norm
             )
         )
         return hidden_states
@@ -1872,7 +1907,12 @@ class Qwen4ExpLinearDecoderLayer(
             build_stages=False,
         )
         self._init_qwen4_exp_layer_extensions(
-            config, layer_id, quant_config, prefix, linear_attention=True
+            config,
+            layer_id,
+            quant_config,
+            prefix,
+            linear_attention=True,
+            is_nextn=is_nextn,
         )
 
     def forward(
@@ -1929,7 +1969,9 @@ class Qwen4ExpAttentionDecoderLayer(
                 prefix=f"{prefix}.indexer" if prefix else "indexer",
                 rotary_emb=self.rotary_emb,
             )
-        self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        self._init_qwen4_exp_layer_extensions(
+            config, layer_id, quant_config, prefix, is_nextn=is_nextn
+        )
 
     def _compute_qsa_topk_indices(
         self,
@@ -2147,7 +2189,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = (
-            GatedResidual(hc_config, use_combine=False)
+            GatedResidual(hc_config, use_combine=False, seam=not is_nextn)
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
@@ -2205,7 +2247,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
         aux_hidden_states = AuxHiddenStateList()
-        normalized_input = None
+        prepared = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -2217,16 +2259,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         next_ple.start_prefetch(
                             batch=ple_batch, forward_batch=forward_batch
                         )
-            next_norm = None
+            next_hc = None
             if i + 1 < self.end_layer:
                 next_layer = self.layers[i + 1]
                 if next_layer.ple is None:
-                    next_norm = next_layer.attn_hyper_connection.hc_norm
+                    next_hc = next_layer.attn_hyper_connection
             elif self.pp_group.is_last_rank:
-                next_norm = self.hyper_connection_mixer.hc_norm
+                next_hc = self.hyper_connection_mixer
             with (
                 get_global_expert_distribution_recorder().with_current_layer(i),
-                layer.hc_norms(normalized_input, next_norm) as norms,
+                layer.hc_norms(prepared, next_hc) as norms,
             ):
                 hidden_states = layer(
                     positions=positions,
@@ -2240,7 +2282,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     ),
                 )
 
-            normalized_input = norms.output
+            prepared = norms.output
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
@@ -2259,7 +2301,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states = residual_batch.final_norm(
             hidden_states,
             forward_batch,
-            _MixStreams(self.hyper_connection_mixer, normalized_input),
+            _MixStreams(self.hyper_connection_mixer, prepared),
         )
         if shards_rows:
             hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
