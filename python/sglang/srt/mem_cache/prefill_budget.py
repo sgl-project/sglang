@@ -252,10 +252,10 @@ class PrefillBudget:
         available_tokens = int(self.remaining_total)
         if is_cp_sharded_padded():
             available_tokens = get_cp_sharded_padded_available_tokens(available_tokens)
-        available = min(
-            chunk_limit,
-            available_tokens,
-        )
+        # Cap by the KV alloc_extend can really get (it over-asks one page).
+        free = self._available_and_evictable() - self.current_offset - self.page_size
+        free = free // self.page_size * self.page_size
+        available = min(chunk_limit, available_tokens, free)
         # Park the continuation rather than take running decodes' headroom.
         return available if available > 0 else None
 
