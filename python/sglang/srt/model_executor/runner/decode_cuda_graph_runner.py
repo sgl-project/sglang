@@ -71,6 +71,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     GraphSlot,
     PaddingPolicy,
     build_decode_registry,
+    same_tensor_view,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -300,6 +301,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     num_prefilled_input_skips = 0
     # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
     _skip_glued_replay_view = False
+    # input_ids kept out of the shared pool: the DSpark draft graph may write the verify
+    # ids straight into it (the early verify metadata runner only).
+    private_input_ids = False
 
     def __init__(
         self,
@@ -572,9 +576,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
         )
         # The early verify metadata writes these slots beside the draft graph, which
-        # must not share their storage through the process-wide pool.
+        # must not share their storage through the process-wide pool. Nor may input_ids,
+        # which the DSpark draft graph may write the verify ids into: its own inputs
+        # must not alias it.
+        self.private_input_ids = self._wants_early_verify_metadata()
         self.buffers.share_buffers(
-            exclude=STAGED_SLOTS if self._wants_early_verify_metadata() else ()
+            exclude=(
+                STAGED_SLOTS | {"input_ids"} if self.private_input_ids else frozenset()
+            )
         )
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
@@ -2028,8 +2037,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
         # The plan-time load (or the early stage it took) filled these from the very
         # same tensors.
-        if prefilled is None or forward_batch.input_ids is not prefilled[0]:
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+        input_ids_dst = self.buffers.input_ids[: self.raw_num_token]
+        if (
+            prefilled is None or forward_batch.input_ids is not prefilled[0]
+        ) and not same_tensor_view(input_ids_dst, forward_batch.input_ids):
+            input_ids_dst.copy_(forward_batch.input_ids)
         if prefilled is None or forward_batch.positions is not prefilled[1]:
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
         if prefilled is not None:

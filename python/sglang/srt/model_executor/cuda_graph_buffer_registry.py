@@ -500,6 +500,9 @@ class CudaGraphBufferRegistry:
                     dst = slot.buffer
                 else:
                     dst = slot.buffer[:raw_n]
+            if same_tensor_view(dst, src):
+                # the producer wrote the slot in place
+                continue
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":

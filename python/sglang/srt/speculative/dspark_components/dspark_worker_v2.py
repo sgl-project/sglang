@@ -705,7 +705,41 @@ class DSparkWorkerV2(BaseSpecWorker):
                 else None
             ),
             acceptance_estimator=self._acceptance_estimator,
+            verify_ids_out=self._target_verify_input_ids(),
         )
+
+    def _target_verify_input_ids(self) -> Optional[torch.Tensor]:
+        """The target verify graphs' input_ids slot as the mid fold's
+        [max_bs, gamma + 1] verify ids, so the verify replay copies none; or None."""
+        if not envs.SGLANG_OPT_DSV41_DSPARK_MID_FOLD.get():
+            return None
+        runner = self.target_worker.model_runner.decode_cuda_graph_runner
+        max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
+        width = self.gamma + 1
+        input_ids = None if runner is None else runner.buffers.input_ids
+        eligible = (
+            input_ids is not None
+            and runner.private_input_ids
+            and runner.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not runner.ragged_verify_mode
+            and runner.captured_req_width == width
+            and self.verify_num_draft_tokens == width
+            and input_ids.dtype == torch.int64
+            and input_ids.is_contiguous()
+            and input_ids.numel() >= max_bs * width
+        )
+        if self._target_tp_rank == 0:
+            logger.info(
+                "DSpark verify ids written in place into the verify graph inputs: %s.",
+                (
+                    "on"
+                    if eligible
+                    else "off (no private input_ids slot of the verify layout)"
+                ),
+            )
+        if not eligible:
+            return None
+        return input_ids[: max_bs * width].view(max_bs, width)
 
     def clear_cache_pool(self):
         if not self._hosts_draft:
