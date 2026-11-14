@@ -680,6 +680,7 @@ mod tests {
                 request_log: None,
                 peer_endpoints: Vec::new(),
                 generate_validator: None,
+                abort_hook: None,
             },
         )
     }

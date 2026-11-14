@@ -37,7 +37,11 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.scheduler_components.request_list import move
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_MODEL_END_SAMPLING,
     CONTENT_THINKING,
@@ -109,9 +113,7 @@ def _make_req(
     custom_params=None,
 ):
     """Create a mock request with sampling params."""
-    req = MagicMock()
-    req.rid = rid
-    req.owner_list = None
+    req = MagicMock(rid=rid, owner_list=None)
     req.sampling_params.json_schema = json_schema
     req.sampling_params.regex = regex
     req.sampling_params.ebnf = ebnf
@@ -966,8 +968,8 @@ class TestStrictReasoningPaths(unittest.TestCase):
         req.origin_input_ids = []
         compiled = mgr.process_req_with_grammar(req)
         if compiled:
-            # As the scheduler does, which moves the ready requests on.
-            mgr.grammar_queue._leave(mgr.get_ready_grammar_requests())
+            # As the scheduler does, which moves the ready requests to waiting.
+            move(mgr.get_ready_grammar_requests(), IndexedReqList(ListKind.WAITING))
         return compiled, req.grammar
 
     def _thinking_tokens_allowed(self, grammar, limit=16):

@@ -126,7 +126,10 @@
 /python/sglang/srt/models/laguna.py @Jiminator
 /python/sglang/srt/configs/laguna.py @Jiminator
 /tools/sglang-simulator @littlefatfat @hzh0425 @zhuzi-z @LinSiyuan814
-/python/sglang/kernels/**/paged_experts.* @N3mezis @BBuf
+/python/sglang/kernels/**/paged_experts* @N3mezis @BBuf
 /python/sglang/srt/layers/moe/paged_experts/ @N3mezis @BBuf
+/test/registered/unit/layers/moe/paged_experts/ @N3mezis @BBuf
+/test/registered/**/test_paged_experts* @N3mezis @BBuf
+/docs/docs/advanced_features/paged_experts.mdx @N3mezis @BBuf
 /python/sglang/srt/layers/cp/ @Fridge003 @Shunkangz
 /python/sglang/srt/mem_cache/page_interleave.py @Shunkangz

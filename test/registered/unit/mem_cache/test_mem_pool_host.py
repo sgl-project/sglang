@@ -1544,6 +1544,63 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
                 pool.get_mapping_lengths(), [rows * 3 * 512 * 2, rows * 3 * 64 * 2]
             )
 
+    def test_storage_buffers_cover_every_page_segment(self):
+        for packed_fp8 in (False, True):
+            for indexer in (False, True):
+                with self.subTest(packed_fp8=packed_fp8, indexer=indexer):
+                    pool = self._pool(packed_fp8=packed_fp8, indexer=indexer)
+                    self.addCleanup(pool.destroy)
+                    expected = [pool.kv_buffer]
+                    if not packed_fp8:
+                        expected.append(pool.v_buffer)
+                    if indexer:
+                        expected.extend(
+                            [pool.index_k_buffer, pool.index_k_scale_buffer]
+                        )
+                    buffers = pool.get_hybrid_pool_buffer()
+                    self.assertEqual(
+                        [id(b) for b in buffers], [id(b) for b in expected]
+                    )
+                    # Check a nonzero page and the final page, including FP32
+                    # scale byte sizes. Counting buffers alone misses bad ranges.
+                    indices = torch.cat([torch.arange(16, 32), torch.arange(64, 80)])
+                    pointers, sizes = pool.get_page_buffer_meta(indices)
+                    self.assertEqual(len(pointers), 2 * len(buffers))
+                    self.assertEqual(len(sizes), len(pointers))
+                    for i, (ptr, size) in enumerate(zip(pointers, sizes)):
+                        buf = buffers[i % len(buffers)]
+                        self.assertGreaterEqual(ptr, buf.data_ptr())
+                        self.assertGreater(size, 0)
+                        self.assertLessEqual(
+                            ptr + size,
+                            buf.data_ptr() + buf.numel() * buf.element_size(),
+                        )
+                    if indexer:
+                        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float32)
+                        self.assertEqual(sizes[len(buffers) - 1], 2 * 16 * 4)
+
+    def test_storage_buffer_enumeration_filters_optional_buffers(self):
+        pool = self._pool()
+        self.addCleanup(pool.destroy)
+        # Preserve allocator-owned tensors for destroy(); only the accessor's
+        # optional views are replaced during this check.
+        with (
+            unittest.mock.patch.object(pool, "index_k_buffer", None),
+            unittest.mock.patch.object(pool, "index_k_scale_buffer", torch.empty(0)),
+        ):
+            self.assertEqual(
+                [id(b) for b in pool.get_hybrid_pool_buffer()],
+                [id(pool.kv_buffer), id(pool.v_buffer)],
+            )
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            with (
+                self.subTest(layout=layout),
+                unittest.mock.patch.object(pool, "layout", layout),
+            ):
+                self.assertEqual(
+                    [id(b) for b in pool.get_hybrid_pool_buffer()], [id(pool.kv_buffer)]
+                )
+
 
 class TestStridedStateDetection(CustomTestCase):
     def test_contiguous_slots_are_not_strided(self):

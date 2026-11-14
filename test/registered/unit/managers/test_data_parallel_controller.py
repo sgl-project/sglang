@@ -199,6 +199,7 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.startup_time = {}
         scheduler.page_size = 64
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.kv_events_publisher = component
         publisher = MagicMock()
         publisher.describe_local_source.return_value = self._source(4, 256)

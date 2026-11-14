@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.attention.unlimited_ocr_dash.page2d_rope import (
+from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
     apply_page2d_rope_pair,
 )
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
