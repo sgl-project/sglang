@@ -14,8 +14,10 @@
 
 import dataclasses
 import faulthandler
+import gc
 import logging
 import math
+import operator
 import os
 import signal
 import sys
@@ -28,6 +30,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Deque,
     Dict,
     List,
@@ -58,6 +61,7 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
+from sglang.srt.utils import overlap_events, scheduler_affinity
 
 from sglang.srt.utils.log_utils import suppress_noisy_warnings  # isort: skip
 
@@ -123,7 +127,7 @@ from sglang.srt.distributed.parallel_state import (
     close_custom_all_reduce,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, freeze_env_reads
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import (
@@ -395,6 +399,7 @@ from sglang.srt.rust_server.server import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative import post_verify_late_join
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
@@ -445,6 +450,20 @@ logger = logging.getLogger(__name__)
 
 # Cap on rids printed per --log-schedule-decisions line.
 _MAX_LOGGED_RIDS = 16
+
+_BATCH_FIELD_SNAPSHOT = envs.SGLANG_OPT_SCHEDULE_BATCH_FIELD_SNAPSHOT.get()
+_BATCH_FIELD_GETTERS: dict = {}
+
+
+def _batch_field_getter(cls) -> tuple:
+    """(field names, itemgetter over an instance __dict__) of a dataclass, built once.
+    Plain dataclass fields live in the instance dict, so reading / updating it is
+    getattr / setattr without the per-field Python calls."""
+    entry = _BATCH_FIELD_GETTERS.get(cls)
+    if entry is None:
+        names = tuple(f.name for f in dataclasses.fields(cls))
+        entry = _BATCH_FIELD_GETTERS[cls] = (names, operator.itemgetter(*names))
+    return entry
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -526,6 +545,8 @@ class Scheduler(
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
+    # SGLANG_OPT_SPEC_STAGED_SEQ_LENS (init_overlap); a class default for harnesses without it
+    _staged_seq_lens: Optional[Callable] = None
 
     def __init__(
         self,
@@ -1803,6 +1824,13 @@ class Scheduler(
             self._confidence_budget_prepare = (
                 self.draft_worker.get_confidence_budget_prepare()
             )
+        # SGLANG_OPT_SPEC_STAGED_SEQ_LENS: a staged decode round's lengths from the
+        # previous round's post-verify graph instead of the FutureMap gather
+        self._staged_seq_lens = (
+            getattr(self.draft_worker, "take_staged_seq_lens", None)
+            if envs.SGLANG_OPT_SPEC_STAGED_SEQ_LENS.get() and self.enable_overlap
+            else None
+        )
 
         # If enable async D2H copy when overlap is enabled
         # Currently used by NVIDIA Confidential Computing (CC) only
@@ -2155,6 +2183,17 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _join_schedule_stream(self, batch: ScheduleBatch, staged_seq_lens) -> None:
+        """Order the forward after the schedule stream's work since the last join, and with it
+        after the WAR barrier queued there. SGLANG_OPT_SPEC_STAGED_SEQ_LENS: a pass whose lengths
+        come from the post-verify graph and whose decode preparation launched nothing on the
+        schedule stream (no KV allocation) has nothing there to wait for."""
+        if staged_seq_lens is not None:
+            sched_idle, batch.spec_prep_sched_idle = batch.spec_prep_sched_idle, False
+            if sched_idle:
+                return
+        overlap_events.wait_stream(self.forward_stream, self.schedule_stream)
+
     def increment_scheduler_iterations(self) -> None:
         if get_observability().enable_metrics:
             self.metrics_collector.increment_scheduler_iterations()
@@ -2194,10 +2233,22 @@ class Scheduler(
             self.last_batch = batch
             self.invariant_checker.run(CheckPhase.BUSY, batch)
 
+    def _start_overlap_host_loop(self) -> bool:
+        """Host-path switches applied when an overlap event loop starts; True when
+        the main thread was pinned (the idle branch then calls maybe_repin)."""
+        pin = envs.SGLANG_OPT_SCHEDULER_MAIN_THREAD_AFFINITY.get()
+        if pin:
+            scheduler_affinity.pin_main_thread(get_device().gpu_id)
+        if envs.SGLANG_OPT_FREEZE_ENV_READS.get():
+            freeze_env_reads()
+            logger.info("Environment reads frozen for the overlap event loop.")
+        return pin
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
+        pinned = self._start_overlap_host_loop()
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -2248,6 +2299,8 @@ class Scheduler(
             else:
                 batch_result = None
                 self._sched_idled = True
+                # No batch carries the late join; finish the commit before results free its rows.
+                post_verify_late_join.sync("idle_pass")
 
             # Process the last batch
             if self.last_batch:
@@ -2256,6 +2309,8 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+                if pinned:
+                    scheduler_affinity.maybe_repin()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -2365,6 +2420,11 @@ class Scheduler(
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
                 continue
 
+            if not self._tokenized_requests(recv_req) and not isinstance(
+                recv_req, AbortReq
+            ):
+                # A control request may touch state a late-joined commit writes.
+                post_verify_late_join.sync("control_request")
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
@@ -3337,6 +3397,7 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
+                parent_session_id=recv_req.parent_session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
@@ -5103,6 +5164,8 @@ class Scheduler(
             if self.decode_offload_manager is not None:
                 # Pending offload copies may still read the device KV that retraction frees.
                 self.decode_offload_manager.drain_before_retraction()
+            # A late-joined commit may still write the rows retraction frees.
+            post_verify_late_join.wait("retract")
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = self.tree_cache.token_to_kv_pool_allocator.state_slots
@@ -5174,9 +5237,12 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        if _BATCH_FIELD_SNAPSHOT:
+            attr_snapshot = list(_batch_field_getter(type(batch))[1](batch.__dict__))
+        else:
+            attr_snapshot = [
+                getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+            ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         retired = self.batch_record_buf[self.batch_record_ct]
         # List (not tuple) so that workers can register additional refs via
@@ -5210,11 +5276,15 @@ class Scheduler(
         """
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
-        sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-            if snapshot_v2_full
-            else None
-        )
+        if _BATCH_FIELD_SNAPSHOT and snapshot_v2_full:
+            names, getter = _batch_field_getter(type(batch))
+            sched_snapshot = dict(zip(names, getter(batch.__dict__)))
+        else:
+            sched_snapshot = (
+                {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+                if snapshot_v2_full
+                else None
+            )
         sched_sampling_info = batch.sampling_info
 
         # 2. sampling_info substitute
@@ -5228,7 +5298,9 @@ class Scheduler(
         try:
             yield
         finally:
-            if snapshot_v2_full:
+            if snapshot_v2_full and _BATCH_FIELD_SNAPSHOT:
+                batch.__dict__.update(sched_snapshot)
+            elif snapshot_v2_full:
                 for name, value in sched_snapshot.items():
                     setattr(batch, name, value)
             else:
@@ -5309,13 +5381,20 @@ class Scheduler(
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )
+                staged_seq_lens = (
+                    self._staged_seq_lens(batch)
+                    if self._staged_seq_lens is not None and not gpu_only_lens
+                    else None
+                )
                 if not gpu_only_lens:
-                    self.future_map.resolve_seq_lens_cpu(batch)
+                    self.future_map.resolve_seq_lens_cpu(
+                        batch, staged_seq_lens=staged_seq_lens
+                    )
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    self._join_schedule_stream(batch, staged_seq_lens)
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
@@ -5375,7 +5454,9 @@ class Scheduler(
                                 )
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_done = overlap_events.copy_done_event(
+                            self.device_module
+                        )
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
@@ -5565,7 +5646,9 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    overlap_events.wait_stream(
+                        self.forward_stream, self.schedule_stream
+                    )
                     self.resolve_forward_inputs(batch, self.future_map)
                     pooler_output, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_embedding(batch)
@@ -5713,7 +5796,7 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
-        self.copy_stream.wait_stream(self.forward_stream)
+        overlap_events.wait_stream(self.copy_stream, self.forward_stream)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
@@ -5734,7 +5817,7 @@ class Scheduler(
             return
 
         with self.forward_stream_ctx:
-            self.forward_stream.wait_stream(self.schedule_stream)
+            overlap_events.wait_stream(self.forward_stream, self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
@@ -6211,6 +6294,7 @@ class Scheduler(
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
+            post_verify_late_join.sync("flush")
             self.cur_batch_for_debug = None
             self.last_batch = None
             if self.uocr_runtime is not None:
@@ -7073,8 +7157,28 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args)
 
+        if get_serving().enable_decode_warmup:
+            from sglang.srt.managers.startup_warmup import run_decode_warmup
+
+            run_decode_warmup(
+                scheduler,
+                batch_sizes=get_serving().decode_warmup_batch_sizes,
+                prompt_len=get_serving().decode_warmup_prompt_len,
+                sampling=get_serving().preferred_sampling_params,
+            )
+
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
+
+        if (
+            envs.SGLANG_OPT_SCHEDULER_GC_FREEZE.get()
+            or get_device().freeze_gc_after_startup
+        ):
+            # Startup objects (model, kernels, caches) leave the tracked set, so a
+            # full collection walks only what serving allocates.
+            gc.collect()
+            gc.freeze()
+            logger.info(f"Scheduler GC frozen: {gc.get_freeze_count()} objects")
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()

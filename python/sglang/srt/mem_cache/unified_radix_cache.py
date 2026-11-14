@@ -36,6 +36,7 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
@@ -61,6 +62,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
+from sglang.srt.mem_cache.cache_residency import CacheResidency
 from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
@@ -135,6 +137,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import get_device_module
+from sglang.srt.utils.log_utils import print_info_once
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -218,6 +221,8 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Opt-in residency switch (cache_residency.py); init_hicache sets it.
+    _residency: Optional[CacheResidency] = None
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
     # Whether eviction walks every component in one joint LRU order; set from the
@@ -644,6 +649,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self._residency = CacheResidency(
+            tree_core=self.tree_core, is_write_back=self.is_write_back
+        )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -683,6 +691,12 @@ class UnifiedRadixCache(BasePrefixCache):
         ],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if (
+            self._residency is not None
+            and self._residency.subagents is not None
+            and params.req is not None
+        ):
+            self._residency.subagents.on_admit(params.req)
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -775,7 +789,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:
+        if params.mamba_num > 0:
+            self._reap_parked_mamba_slots()
         return self._evict(params)
+
+    def _reap_parked_mamba_slots(self) -> None:
+        # Host-only checkpoints need the HiCache controller; without it nothing parks.
+        if self.cache_controller is not None and self._mamba_host_only_checkpoint():
+            # Host-only keeps no device Mamba state in the tree, so the slots a finished
+            # request parked (its checkpoint still copying to host) are the only reclaim.
+            self.components[ComponentType.MAMBA].reap_parked_slots(force=True)
 
     @rank_consensus(same_params=True, same_results=True)
     def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
@@ -790,6 +813,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         if self.disable:
             return EvictResult()
+        if demand.state_slots > 0:
+            self._reap_parked_mamba_slots()
         return super().evict_for_alloc(demand)
 
     def reclaim_jointly(
@@ -1050,6 +1075,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        if self._residency is not None:
+            self._residency.maybe_log()
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             mamba_num_evicted=tracker.get(self.slot_id(TREE_STATE), 0),
@@ -1339,9 +1366,49 @@ class UnifiedRadixCache(BasePrefixCache):
         if not node_ids:
             return
         self.writing_check(write_back=True)
+        full_ct = self.slot_id(TREE_TOKEN)
+        if (
+            envs.SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES.get()
+            and len(node_ids) > 1
+            and self._grouped_frees_allocator_ok(full_ct)
+        ):
+            self._demote_batch_grouped_frees(node_ids, tracker, full_ct=full_ct)
+            return
         for node_id in node_ids:
             self._demote(node_id, tracker)
         node_ids.clear()
+
+    def _demote_batch_grouped_frees(
+        self,
+        node_ids: list[NodeId],
+        tracker: dict[ComponentType, int],
+        *,
+        full_ct: ComponentType,
+    ) -> None:
+        """_demote_backed_up's loop with the batch's token-KV frees drained once.
+
+        Each demote is its own tree step with one FULL segment, so per-step
+        grouping never sees two. Only the stock paged allocator holds these pages
+        and nothing between the demotes allocates, so one free of the held
+        segments leaves the free list the per-demote frees would. A step with cache
+        actions takes the held segments ahead of its own, keeping their order
+        against the actions; its own drain then owns them."""
+        held: list[torch.Tensor] = []
+        try:
+            for node_id in node_ids:
+                result = self.tree_core.demote(node_id)
+                if result.cache_actions:
+                    if held:
+                        result.device_frees.setdefault(full_ct, [])[:0] = held
+                        held = []
+                else:
+                    held.extend(result.device_frees.pop(full_ct, ()))
+                self._apply_eviction_result(result)
+                self._accumulate_tracker(tracker, result.tracker)
+            node_ids.clear()
+        finally:
+            if held:
+                self._drain_device_frees({full_ct: held})
 
     def _evict_by_joint_lru(
         self,
@@ -1558,6 +1625,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self._residency is not None and self._residency.subagents is not None:
+            self._residency.subagents.on_release(req)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1853,10 +1922,57 @@ class UnifiedRadixCache(BasePrefixCache):
         self, device_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
         # Free per component device slots, consuming each entry as it frees.
+        grouped = envs.SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES.get()
         for ct in list(device_frees):
-            self._apply_cache_action(
-                FreeComponentDeviceSlot(device_frees.pop(ct), component_type=ct)
-            )
+            values = device_frees.pop(ct)
+            if grouped:
+                values = self._group_page_exact_frees(ct, values)
+            self._apply_cache_action(FreeComponentDeviceSlot(values, component_type=ct))
+
+    def _group_page_exact_frees(
+        self, ct: ComponentType, values: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """The token-KV segments as one page-exact segment for the stock paged
+        allocator, else ``values``.
+
+        Each free_segment(s) puts s[::ps] // ps in front of the free list, so k
+        of them leave [p_k, ..., p_1, free]; one free_segment of cat(s_k, ...,
+        s_1) leaves the same list when every s is whole pages."""
+        if len(values) < 2 or not self._grouped_frees_allocator_ok(ct):
+            return values
+        ps = self.token_to_kv_pool_allocator.page_size
+        first = values[0]
+        for value in values:
+            if (
+                value.dim() != 1
+                or value.numel() % ps != 0
+                or value.dtype != first.dtype
+                or value.device != first.device
+            ):
+                return values
+        print_info_once(
+            "HiCache device frees grouped: page-exact token-KV segments of a tree "
+            "step freed as one segment (SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES)"
+        )
+        return [torch.cat(values[::-1])]
+
+    def _grouped_frees_allocator_ok(self, ct: Optional[ComponentType]) -> bool:
+        """``ct`` is the FullComponent whose pages the stock
+        PagedTokenToKVPoolAllocator alone hands out, with no free group open."""
+        if ct is None or type(self.components.get(ct)) is not FullComponent:
+            return False
+        allocator = self.token_to_kv_pool_allocator
+        paged = PagedTokenToKVPoolAllocator
+        if (
+            type(allocator).free_segment is not paged.free_segment
+            or type(allocator).free_page_ids is not paged.free_page_ids
+            or type(allocator)._release_page_ids is not paged._release_page_ids
+            or allocator.has_window_pool
+            or allocator.free_group is not None
+        ):
+            return False
+        storage, sub_pool = self.components[ct].storage_and_sub_pool()
+        return storage._band(sub_pool) is allocator
 
     def _drain_host_frees(
         self, host_frees: dict[ComponentType, list[torch.Tensor]]
@@ -4319,6 +4435,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 "write_back duplicate-reclaim victims diverged across TP ranks"
             )
 
+        if self._mamba_host_only_checkpoint():
+            self.components[ComponentType.MAMBA].reap_parked_slots()
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
@@ -4396,9 +4514,18 @@ class UnifiedRadixCache(BasePrefixCache):
             # ongoing_load_back is keyed by anchor. A host-only mamba
             # checkpoint stays off the device after its load, so another
             # request can reach this anchor before the first H->D is acked.
+            # A state-only fetch may go beside it: the H->D fills the request's
+            # own slot, and its forward waits on that later load, which the
+            # load stream orders after the anchor's.
             if (
                 self._mamba_host_only_checkpoint()
                 and best_match_node_id in self.ongoing_load_back
+                and not (
+                    envs.SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH.get()
+                    and params.host_hit_length == 0
+                    and not any(req.window_host_hit_lengths.values())
+                    and not self.tree_core.is_full_device_evicted(best_match_node_id)
+                )
             ):
                 return None
             if self.load_back(best_match_node_id, mem_quota, req=req):
@@ -4795,9 +4922,14 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def mamba_protected_size(self) -> int:
-        return self.tree_core.mamba_protected_size() + (
+        size = self.tree_core.mamba_protected_size() + (
             self.linker.prefetch_size(PoolName.MAMBA) if self.linker is not None else 0
         )
+        if self._mamba_host_only_checkpoint():
+            # Parked slots (a finished request's checkpoint still copying to host)
+            # are neither free, evictable nor held by a request.
+            size += self.components[ComponentType.MAMBA].parked_slot_count()
+        return size
 
     def total_size(self) -> tuple[int, int]:
         return self.tree_core.total_size()

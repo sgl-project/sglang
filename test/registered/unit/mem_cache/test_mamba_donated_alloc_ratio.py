@@ -13,7 +13,7 @@ eviction -- which is why the peak, not the decode steady state, sets the floor.
 import unittest
 from array import array
 from types import MethodType, SimpleNamespace
-from unittest.mock import PropertyMock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
@@ -730,6 +730,102 @@ class TestExtraMambaCacheSizing(CustomTestCase):
                     ),
                     (8, 44 << 20),
                 )
+
+
+class _FakeCopyEvent:
+    def __init__(self):
+        self.synchronize = Mock()
+
+
+def _host_only_component():
+    """A MambaComponent whose HiCache D2H copy and state storage are recorded, not run."""
+    comp = MambaComponent.__new__(MambaComponent)
+    comp._parked, comp._step = [], 0
+    done = _FakeCopyEvent()
+    engine = SimpleNamespace(
+        device_to_host_stream=SimpleNamespace(wait_event=Mock()),
+        host_to_device_stream=SimpleNamespace(wait_event=Mock()),
+        submit_device_to_host=Mock(return_value=SimpleNamespace(finish_event=done)),
+    )
+    controller = SimpleNamespace(
+        l2_transfer_engine=engine,
+        write_fence_stream=SimpleNamespace(wait_event=Mock()),
+        _move_write_operation=lambda op: (None, None, op.pool_transfers),
+        _l2_transfers=lambda host, device, pools: pools,
+    )
+    comp.cache = SimpleNamespace(cache_controller=controller)
+    comp._mamba_pool_host = SimpleNamespace(alloc=lambda n: torch.tensor([7]))
+    storage = SimpleNamespace(free_state_slots=Mock())
+    comp._state = lambda: (storage, "state")
+    return comp, controller, engine, done, storage
+
+
+class TestHostOnlyParkedCheckpointCopy(CustomTestCase):
+    """SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT: the host waits for a checkpoint copy only
+    when its source slot is freed right after the insert; a finished request's tracking
+    slot is parked until its copy lands, and later forwards and loads wait on the copy."""
+
+    def _copy(self, comp, *, finished, keep_idx):
+        params = InsertParams()
+        comp._stash_host_checkpoint_source(
+            params, torch.tensor([3]), is_finished=finished, keep_idx=keep_idx
+        )
+        comp._copy_mamba_slot_to_host(params, params.mamba_host_src)
+        return params
+
+    def test_only_a_freed_unparked_source_waits_on_the_host(self):
+        for finished, keep_idx, host_wait, parked, forward_waits in (
+            (
+                False,
+                None,
+                False,
+                False,
+                True,
+            ),  # a running request keeps writing the slot
+            (
+                True,
+                None,
+                True,
+                False,
+                False,
+            ),  # the request slot is freed after the insert
+            (True, 1, False, True, False),  # the tracking slot is parked instead
+        ):
+            comp, controller, engine, done, _ = _host_only_component()
+            with self.subTest(finished=finished, keep_idx=keep_idx):
+                params = self._copy(comp, finished=finished, keep_idx=keep_idx)
+                self.assertEqual(done.synchronize.called, host_wait)
+                self.assertIs(params.mamba_host_parked, parked)
+                self.assertEqual(params.mamba_keep_idx, keep_idx if parked else None)
+                self.assertEqual(len(comp._parked), int(parked))
+                self.assertEqual(
+                    controller.write_fence_stream.wait_event.called, forward_waits
+                )
+                self.assertEqual(
+                    engine.host_to_device_stream.wait_event.called, not host_wait
+                )
+                self.assertTrue(torch.equal(params.mamba_host_value, torch.tensor([7])))
+
+    def test_no_fence_stream_keeps_the_host_wait(self):
+        comp, controller, _, done, _ = _host_only_component()
+        controller.write_fence_stream = None
+        self._copy(comp, finished=False, keep_idx=None)
+        done.synchronize.assert_called_once()
+
+    def test_parked_slots_are_freed_two_steps_later_or_on_demand(self):
+        comp, _, _, done, storage = _host_only_component()
+        self._copy(comp, finished=True, keep_idx=0)
+        self.assertEqual(comp.parked_slot_count(), 1)
+        comp.reap_parked_slots()
+        storage.free_state_slots.assert_not_called()
+        comp.reap_parked_slots()
+        done.synchronize.assert_called_once()
+        storage.free_state_slots.assert_called_once()
+        self.assertEqual(comp.parked_slot_count(), 0)
+        self._copy(comp, finished=True, keep_idx=0)
+        comp.reap_parked_slots(force=True)
+        self.assertEqual(storage.free_state_slots.call_count, 2)
+        self.assertEqual(comp.parked_slot_count(), 0)
 
 
 if __name__ == "__main__":

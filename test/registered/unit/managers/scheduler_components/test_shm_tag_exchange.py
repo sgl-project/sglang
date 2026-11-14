@@ -1,6 +1,8 @@
 """Unit tests for srt/managers/scheduler_components/shm_tag_exchange.py."""
 
+import socket
 import sys
+import threading
 import time
 import unittest
 from contextlib import nullcontext
@@ -179,6 +181,38 @@ class TestShmTagExchange(CustomTestCase):
                 nprocs=2,
                 join=True,
             )
+
+
+class TestLeaderLinkSpin(CustomTestCase):
+    def _link(self, sock, spin, timeout_s=5.0):
+        link = shm_tag_exchange._LeaderLink.__new__(shm_tag_exchange._LeaderLink)
+        link.sock, link.timeout_s, link.spin = sock, timeout_s, spin
+        if spin:
+            sock.setblocking(False)
+        else:
+            sock.settimeout(timeout_s)
+        return link
+
+    def test_spinning_and_blocking_leaders_swap_the_same_payloads(self):
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        spinning, blocking = self._link(left, True), self._link(right, False)
+        got = {}
+        peer = threading.Thread(
+            target=lambda: got.update(blocking=blocking.swap(b"b" * 70000))
+        )
+        peer.start()
+        got["spinning"] = spinning.swap(b"spin")
+        peer.join()
+        self.assertEqual(got, {"spinning": b"b" * 70000, "blocking": b"spin"})
+
+    def test_spinning_leader_times_out_on_a_silent_peer(self):
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            self._link(left, True, timeout_s=0.05).swap(b"x")
 
 
 class TestHiCacheReadyCountsThroughShm(CustomTestCase):

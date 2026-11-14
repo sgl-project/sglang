@@ -114,6 +114,30 @@ class Serving(msgspec.Struct):
         ),
     ] = None
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
+    enable_decode_warmup: A[
+        bool,
+        "Before the scheduler reports ready, run one prefill and one speculative "
+        "decode round on dummy requests at each --decode-warmup-batch-sizes, so the "
+        "first decode round's one-time costs (JIT builds, first-call setup) land at "
+        "startup. The requests sample with --preferred-sampling-params, else the "
+        "SamplingParams defaults, as a request without sampling parameters on the "
+        "native or Engine path; with the OpenAI server's --sampling-defaults model, "
+        "set --preferred-sampling-params to the served mode. They never enter the "
+        "radix tree, and their slots and the RNG states are restored. EAGLE v2 "
+        "speculative decoding only; skipped with a warning on PD prefill, pipeline, "
+        "DP-attention or HiSparse servers. A failed round stops the server. Requires "
+        "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1.",
+    ] = False
+    decode_warmup_batch_sizes: A[
+        List[int],
+        "Batch sizes of the --enable-decode-warmup rounds, each capped at "
+        "--max-running-requests.",
+    ] = msgspec.field(default_factory=lambda: [16, 4, 2, 1])
+    decode_warmup_prompt_len: A[
+        int,
+        "Prompt tokens per dummy request of the --enable-decode-warmup rounds, "
+        "capped so each batch fits the prefill budget.",
+    ] = 2048
     warmups: A[
         Optional[str],
         "Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",

@@ -26,6 +26,8 @@ from typing import Iterator, Optional
 
 import torch
 
+from sglang.srt.speculative import post_verify_late_join
+
 
 class MambaSlotAllocator:
     """Free-list of Mamba pool slot indices. Deliberately not a subclass of
@@ -36,6 +38,9 @@ class MambaSlotAllocator:
         self.device = device
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
+        # Slots freed under a late-joined post-verify commit; the group's [first dirty, next index].
+        self._late_join_guard = post_verify_late_join.FreeListGuard()
+        self._late_join_group: Optional[list] = None
         self.clear()
 
     def translate(self, slot_ids: torch.Tensor) -> torch.Tensor:
@@ -57,10 +62,13 @@ class MambaSlotAllocator:
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch of slots for match_prefix to amortize overhead."""
         self._alloc_iter = None
+        self._late_join_group = None
         if num_reqs > 0:
-            result = self._do_alloc(num_reqs)
-            if result is not None:
+            taken = self._take(num_reqs)
+            if taken is not None:
+                result, first_dirty = taken
                 self._alloc_iter = iter(result.split(1))
+                self._late_join_group = [first_dirty, 0]
 
     def alloc_group_end(self):
         """Return any unused pre-allocated slots from the current group."""
@@ -69,27 +77,42 @@ class MambaSlotAllocator:
             if remaining:
                 self.free(torch.cat(remaining))
         self._alloc_iter = None
+        self._late_join_group = None
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if self._alloc_iter is not None and need_size == 1:
             slot = next(self._alloc_iter, None)
             if slot is not None:
+                first_dirty, index = self._late_join_group
+                self._late_join_group[1] = index + 1
+                self._late_join_guard.handing_out(first_dirty=first_dirty, index=index)
                 return slot
         return self._do_alloc(need_size)
 
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        taken = self._take(need_size)
+        if taken is None:
+            return None
+        select_index, first_dirty = taken
+        self._late_join_guard.handing_out(first_dirty=first_dirty, index=need_size - 1)
+        return select_index
+
+    def _take(self, need_size: int) -> Optional[tuple]:
         if need_size > len(self.free_slots):
             return None
+        first_dirty = self._late_join_guard.taken(need_size)
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        return select_index
+        return select_index, first_dirty
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        self._late_join_guard.freed(free_len_before=len(self.free_slots))
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
+        self._late_join_guard.reset()
         # Slot 0 is reserved as a dummy write target for padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device

@@ -19,6 +19,7 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
+from sglang.srt.speculative import staged_next_draft
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     make_post_verify_io,
@@ -31,11 +32,59 @@ logger = logging.getLogger(__name__)
 
 # Eager rounds per post-verify key before its graphs are captured.
 _NUM_WARMUP = 2
-# Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
-# past it runs SGLang's eager path.
-_MAX_POST_VERIFY_STATES = 64
+
+
+def _max_graph_keys() -> int:
+    """Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
+    past it runs SGLang's eager path."""
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return 64
+    return envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS.get()
+
+
+_MAX_POST_VERIFY_STATES = _max_graph_keys()
 # SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: a round's inputs and its forced length staged in one launch.
 _ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
+
+
+def _bonus_dtype() -> torch.dtype:
+    """SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64: the bonus tokens in the relay buffer's
+    dtype (int64), so the next round's relay does not cast them."""
+    return (
+        torch.int64 if envs.SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64.get() else torch.int32
+    )
+
+
+_BONUS_DTYPE = _bonus_dtype()
+# SGLANG_OPT_SPEC_STAGED_SEQ_LENS: a batch's lengths may be a slot's new_seq_lens output
+_STAGED_SEQ_LENS = envs.SGLANG_OPT_SPEC_STAGED_SEQ_LENS.get()
+# Arbitrary headroom for the body's large temporaries besides its two sampling buffers.
+_PRESIZE_MARGIN = 64 << 20
+
+
+def pool_presize_bytes(
+    *, max_requests: int, tokens_per_request: int, vocab: int, free_bytes: int
+) -> int:
+    """The post-verify body's peak scratch at the largest key: two fp32
+    [requests * tokens, vocab] sampling buffers live at once, plus a margin. 0 when the
+    device has less than that plus 1 GiB free: the pool then grows per key."""
+    nbytes = 2 * max_requests * tokens_per_request * vocab * 4 + _PRESIZE_MARGIN
+    if free_bytes < nbytes + (1 << 30):
+        logger.warning(
+            "The post-verify graph pool is not presized: %.2f GiB free for %.2f GiB",
+            free_bytes / 2**30,
+            nbytes / 2**30,
+        )
+        return 0
+    logger.info(
+        "The post-verify graph pool is presized to %.2f GiB (%d requests x %d tokens, "
+        "vocab %d)",
+        nbytes / 2**30,
+        max_requests,
+        tokens_per_request,
+        vocab,
+    )
+    return nbytes
 
 
 class EaglePostVerifyGraphs:
@@ -53,10 +102,43 @@ class EaglePostVerifyGraphs:
         self._speculative_runtime_hooks = speculative_runtime_hooks
         # Whether the commit writes recurrent state slots; resolved at first use.
         self._stages_state_slots: Optional[bool] = None
+        # SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT: the draft extend's layout in the
+        # commit-outputs launch
+        self._extend_layout = envs.SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT.get()
+        self._extend_mrope = (
+            self._extend_layout
+            and target_worker.model_runner.model_config.model_is_mrope
+        )
         self._graphs = _PostVerifyGraphs(
             body=self._body,
             commit=self._commit,
             sim_rng=simulated_acc_len_rng,
+        )
+        # SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT (enable_staged_next_draft): the graphs also
+        # stage the next round's draft inputs; next_draft is the last run's staging
+        self._staging: Optional[SimpleNamespace] = None
+        self.next_draft: Optional[staged_next_draft.NextDraft] = None
+
+    def enable_staged_next_draft(
+        self,
+        *,
+        num_steps: int,
+        window: int,
+        seq_len_fill_value: int,
+        mrope: bool,
+        req_to_token: torch.Tensor,
+        runner_buffers: Any,
+    ) -> None:
+        """Each graph also writes the next round's draft inputs into
+        ``runner_buffers`` (the draft graph runner's static inputs) and its write window
+        into the slot's own buffer."""
+        self._staging = SimpleNamespace(
+            num_steps=num_steps,
+            window=window,
+            seq_len_fill_value=seq_len_fill_value,
+            mrope=mrope,
+            req_to_token=req_to_token,
+            runner_buffers=runner_buffers,
         )
 
     def run(
@@ -73,12 +155,13 @@ class EaglePostVerifyGraphs:
         sampling and commit run eagerly. max_top_k: the compact top-k branch's
         support (compact_verify_max_top_k), None for the dense branch."""
         self.join()
+        self.next_draft = None
         key = self._key(
             batch, verify_input, logits_output, can_run_cuda_graph, max_top_k
         )
         if key is None:
             return None
-        return self._graphs.run(
+        outputs = self._graphs.run(
             key=key,
             inputs=_post_verify_inputs(
                 batch, verify_input, self._verify_state_slots(batch)
@@ -88,6 +171,9 @@ class EaglePostVerifyGraphs:
             ),
             sim_max_len=verify_input.max_tree_depth,
         )
+        if outputs is not None and self._staging is not None:
+            self.next_draft = self._graphs.last_slot.next_draft
+        return outputs
 
     def _verify_state_slots(self, batch: ScheduleBatch) -> Optional[ForwardStateSlots]:
         """The verify forward's state slots, which the mamba commit writes; None
@@ -115,6 +201,25 @@ class EaglePostVerifyGraphs:
         """Order the current stream after the last side-stream mamba state commit; the
         worker calls it once the draft extend is enqueued."""
         self._graphs.join()
+
+    def enable_pool_presize(self) -> None:
+        """SGLANG_OPT_POST_VERIFY_POOL_PRESIZE: the pool's first capture takes the
+        scratch of the largest batch a verify graph replays and frees it at once, so
+        every later key splits that segment instead of adding segments the private pool
+        never returns."""
+        self._graphs.presize = self._pool_presize_bytes
+
+    def _pool_presize_bytes(self, slot: SimpleNamespace) -> int:
+        # Return the allocator's unused cached blocks first, so the free reading counts
+        # them; this runs once, before the pool's first capture.
+        torch.cuda.empty_cache()
+        graph_sizes = self._target_worker.model_runner.decode_cuda_graph_capture_bs
+        return pool_presize_bytes(
+            max_requests=max([slot.num_requests, *graph_sizes]),
+            tokens_per_request=slot.tokens_per_request,
+            vocab=slot.logits.shape[-1],
+            free_bytes=torch.cuda.mem_get_info()[0],
+        )
 
     def _key(
         self,
@@ -175,7 +280,19 @@ class EaglePostVerifyGraphs:
         from sglang.srt.runtime_context import mamba_track_grid
 
         info = batch.sampling_info
+        staging = self._staging
         return SimpleNamespace(
+            next_draft=(
+                None
+                if staging is None
+                else staged_next_draft.make_next_draft(
+                    num_requests=len(batch.seq_lens),
+                    num_steps=staging.num_steps,
+                    window=staging.window,
+                    mrope=staging.mrope,
+                    runner_buffers=staging.runner_buffers,
+                )
+            ),
             num_requests=len(batch.seq_lens),
             tokens_per_request=verify_input.draft_token_num,
             max_tree_depth=verify_input.max_tree_depth,
@@ -214,8 +331,22 @@ class EaglePostVerifyGraphs:
                 slot.staged["seq_lens"],
                 num_draft_tokens=slot.tokens_per_request,
                 mamba_track_interval=slot.track_interval,
+                bonus_dtype=_BONUS_DTYPE,
+                extend_layout=self._extend_layout,
+                extend_mrope=self._extend_mrope,
             )
         )
+        if slot.next_draft is not None:
+            staging = self._staging
+            staged_next_draft.stage_next_draft(
+                slot.next_draft,
+                req_pool_indices=slot.staged["req_pool_indices"],
+                new_seq_lens=new_seq_lens,
+                req_to_token=staging.req_to_token,
+                num_steps=staging.num_steps,
+                window=staging.window,
+                seq_len_fill_value=staging.seq_len_fill_value,
+            )
         return (
             predict,
             accept_lens,
@@ -334,13 +465,18 @@ class _PostVerifyGraphs:
         self._sim_rng = sim_rng
         self._states: dict[tuple, SimpleNamespace] = {}
         self._pool = None
+        # slot -> bytes the pool's first capture takes and frees (enable_pool_presize)
+        self.presize: Optional[Callable] = None
         self._side_stream = self._main_done = self._commit_done = None
         self._commit_pending = False
         # The host runs up to ~2 rounds ahead; a pinned slot is rewritten only after
         # the event behind its last copy has completed.
         self._sim_host: list[torch.Tensor] = []
+        self._sim_np: Optional[list] = None
         self._sim_done: list[Optional[torch.cuda.Event]] = []
         self._sim_turn = 0
+        # the slot of the last run that returned outputs
+        self.last_slot: Optional[SimpleNamespace] = None
 
     def run(
         self, *, key: tuple, inputs: dict, make_slot: Callable, sim_max_len: int
@@ -355,6 +491,8 @@ class _PostVerifyGraphs:
         turn, state.turn = state.turn, state.turn ^ 1
         sim_len, sim_turn = self._draw_sim_len(sim_max_len)
         slot = state.slots[turn]
+        if _STAGED_SEQ_LENS and slot is not None and slot.graph is not None:
+            _check_lengths_outlive(slot, inputs["seq_lens"])
         if slot is None:
             staged = {name: src.clone() for name, src in inputs.items()}
             if sim_len is not None:
@@ -369,6 +507,7 @@ class _PostVerifyGraphs:
         self._load(slot, inputs, sim_len)
         if sim_len is not None:
             self._record_sim_done(sim_turn)
+        self.last_slot = slot
         if slot.graph is None:
             if state.warmups < _NUM_WARMUP * 2:
                 state.warmups += 1
@@ -415,6 +554,7 @@ class _PostVerifyGraphs:
     def _draw_sim_len(
         self, max_len: int
     ) -> tuple[Optional[torch.Tensor], Optional[int]]:
+        from sglang.srt.speculative import spec_utils
         from sglang.srt.speculative.spec_utils import (
             SIMULATE_ACC_LEN,
             SIMULATE_ACC_METHOD,
@@ -428,15 +568,23 @@ class _PostVerifyGraphs:
                 torch.zeros((1,), dtype=torch.int64, pin_memory=True) for _ in range(4)
             ]
             self._sim_done = [None] * len(self._sim_host)
+            # numpy views write the drawn length without a torch indexing call.
+            self._sim_np = (
+                [h.numpy() for h in self._sim_host] if spec_utils._SIM_PREDRAW else None
+            )
         turn = self._sim_turn
         self._sim_turn = (turn + 1) % len(self._sim_host)
         done = self._sim_done[turn]
         if done is not None and not done.query():
             done.synchronize()
         host = self._sim_host[turn]
-        host[0] = sample_simulated_acc_len(
+        value = sample_simulated_acc_len(
             SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len, generator=self._sim_rng
         )
+        if self._sim_np is not None:
+            self._sim_np[turn][0] = value
+        else:
+            host[0] = value
         return host, turn
 
     def draw_sim_len_on(
@@ -457,10 +605,13 @@ class _PostVerifyGraphs:
     def _capture(self, slot: SimpleNamespace) -> None:
         from sglang.srt.distributed.parallel_state import graph_capture
 
+        presize = 0
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
             self._side_stream = torch.cuda.Stream()
             self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
+            if self.presize is not None:
+                presize = self.presize(slot)
         graph = torch.cuda.CUDAGraph()
         with graph_capture(stream=torch.cuda.current_stream()) as ctx:
             with torch.cuda.graph(
@@ -469,6 +620,13 @@ class _PostVerifyGraphs:
                 stream=ctx.stream,
                 capture_error_mode="thread_local",
             ):
+                if presize:
+                    # A private pool never frees a segment: size its first one for the
+                    # largest key.
+                    scratch = torch.empty(
+                        presize, dtype=torch.uint8, device=slot.device
+                    )
+                    del scratch
                 outputs = self._body(slot)
         # Captured after the main graph in the same pool and replayed after it.
         commit_graph = torch.cuda.CUDAGraph()
@@ -485,6 +643,17 @@ class _PostVerifyGraphs:
         logger.info(
             "Captured the EAGLE post-verify graphs for batch size %d",
             slot.num_requests,
+        )
+
+
+def _check_lengths_outlive(slot: SimpleNamespace, seq_lens: torch.Tensor) -> None:
+    """Lengths taken from a slot's new_seq_lens (SGLANG_OPT_SPEC_STAGED_SEQ_LENS) are read
+    through the whole next round, so that slot must not be the one about to replay: the
+    slots alternate, and the lengths are retaken from the other slot every round."""
+    if seq_lens.data_ptr() == slot.outputs[3].data_ptr():
+        raise RuntimeError(
+            "The post-verify slot about to replay holds this batch's lengths; its "
+            "readers in this round would see the overwrite"
         )
 
 

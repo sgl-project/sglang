@@ -122,6 +122,8 @@ class IterationIds:
         self.write_physical = write_slots
         self._full_key = full.key
         self._write_ids: Dict[Hashable, Optional[torch.Tensor]] = {}
+        # (cols, ids): write_virtual's cols already laid out in a buffer of their own
+        self._staged_cols: Optional[tuple] = None
         if write_slots is not None:
             # A runner's capture-stable buffer is already in its pool's ids.
             # Without virtual ids, other sub-pools use sink slots at capture.
@@ -201,6 +203,12 @@ class IterationIds:
         names."""
         return self._cols(self.write_virtual, cols)
 
+    def take_staged_cols(self, cols: slice, ids: torch.Tensor) -> None:
+        """``ids`` holds ``write_virtual``'s ``cols`` contiguously already (the draft
+        steps' slots a post-verify graph staged, SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS); a
+        reader of the virtual ids takes it for those columns instead of a copy."""
+        self._staged_cols = (cols, ids)
+
     def _cols(self, ids: Optional[torch.Tensor], cols: Optional[Cols]):
         if ids is None or cols is None:
             return ids
@@ -208,6 +216,9 @@ class IterationIds:
             return ids[cols.start : cols.stop]
         if isinstance(cols, torch.Tensor):
             return torch.where(cols >= 0, ids[cols.clamp(min=0)], 0)
+        staged = self._staged_cols
+        if staged is not None and ids is self.write_virtual and cols == staged[0]:
+            return staged[1]
         bs = int(self.req_pool_indices.numel())
         if bs == 1:
             return ids[cols]
@@ -258,6 +269,7 @@ class IterationIds:
         plan.write_virtual = self.write_virtual
         plan.write_physical = self.write_physical
         plan._write_ids = self._write_ids
+        plan._staged_cols = self._staged_cols
         return plan
 
     # -- reads -----------------------------------------------------------------

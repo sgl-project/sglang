@@ -706,6 +706,7 @@ def _fast_copy_enabled() -> bool:
     # Preserve the original EAGLE runtime policy without the resource-pool dependency.
     return (
         current_platform.is_cuda()
+        and envs.SGLANG_OPT_SPEC_HOST_SAMPLING_COPY.get()
         and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
         and (get_spec().speculative_algorithm or "").upper() == "EAGLE"
         and (get_spec().speculative_eagle_topk or 1) == 1

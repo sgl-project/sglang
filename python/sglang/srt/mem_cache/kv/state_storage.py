@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.speculative import post_verify_late_join
 from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
@@ -133,6 +134,8 @@ class StateStorage:
         the extra buffer, its ping-pong tracking slots, and writes them into
         the table's columns. A request that already holds a slot (a radix hit,
         a continuing chunk) keeps it."""
+        # A row or slot bound here may still be folded into by a late-joined commit.
+        post_verify_late_join.wait("row_bind")
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         # What this call hands out, given back if a later request finds no slot.

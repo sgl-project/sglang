@@ -42,6 +42,17 @@ def _default_on_in_ci() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+_UNREAD = object()
+# freeze_env_reads(): get() serves each field's first value read after the freeze; set,
+# clear and override drop it. A direct os.environ write after the freeze is not seen.
+_FROZEN = False
+
+
+def freeze_env_reads() -> None:
+    global _FROZEN
+    _FROZEN = True
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -51,6 +62,7 @@ class EnvField:
         # whether the env var is explicitly set to None.
         self._set_to_none = False
         self.secret = secret
+        self._frozen_value = _UNREAD
 
     def __set_name__(self, owner, name):
         assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
@@ -65,6 +77,14 @@ class EnvField:
         return self.default() if callable(self.default) else self.default
 
     def get(self) -> Any:
+        if _FROZEN:
+            value = self._frozen_value
+            if value is _UNREAD:
+                value = self._frozen_value = self._get()
+            return value
+        return self._get()
+
+    def _get(self) -> Any:
         value = os.getenv(self.name)
 
         # Explicitly set to None
@@ -91,6 +111,7 @@ class EnvField:
     def set(self, value: Any):
         self._set_to_none = value is None
         os.environ[self.name] = str(value)
+        self._frozen_value = _UNREAD
 
     @contextmanager
     def override(self, value: Any):
@@ -106,10 +127,12 @@ class EnvField:
             else:
                 os.environ.pop(self.name, None)
             self._set_to_none = backup_set_to_none
+            self._frozen_value = _UNREAD
 
     def clear(self):
         os.environ.pop(self.name, None)
         self._set_to_none = False
+        self._frozen_value = _UNREAD
 
     def __bool__(self):
         raise RuntimeError(
@@ -150,6 +173,13 @@ class EnvBool(EnvField):
         if value in ["false", "0", "no", "n"]:
             return False
         raise ValueError(f'"{value}" is not a valid boolean value')
+
+
+class EnvRuntimeBool(EnvBool):
+    """A runtime child cannot enable an optimization while its master is off."""
+
+    def get(self) -> bool:
+        return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() and super().get()
 
 
 class EnvInt(EnvField):
@@ -282,8 +312,212 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
-    # Explicit child values override this default for megakernel runtime optimizations.
+    # Hard master for megakernel runtime optimizations; children may only disable them.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # Reuse overlap-loop stream joins and its generation-result completion events.
+    SGLANG_OPT_OVERLAP_EVENT_REUSE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # GDN ReplaySSM verify commit: the tiled Triton compact commit (one single-warp program per
+    # [32-row V tile, request, layer x 4 value heads], software-pipelined over the heads), bit
+    # for bit the stock commit's math, for the shapes it supports. Opt-in.
+    SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT = EnvRuntimeBool(False)
+    # Spec verify commit: the conv-window rollback (every conv type) and the PLE side states
+    # (any dtype), working and track rows, as one multi-pair launch each instead of one
+    # scatter (plus its index casts) per pair and row set; the same bytes. Opt-in.
+    SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER = EnvRuntimeBool(False)
+    # EAGLE verify target-only tree sampling (fp32, vocab >= 65536, <= 64 rows) as
+    # multi-CTA kernels that keep the stock reduction orders (bitwise).
+    SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Mooncake PD prefill: spread KV transfers over the transfer queues by room
+    # instead of by destination sessions (one decode worker uses one queue).
+    SGLANG_OPT_DISAGG_TRANSFER_SHARD_BY_ROOM = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # HiCache device eviction: a tree step's, or a write-back batch's, page-exact
+    # token-KV frees reach the stock paged allocator as one segment (same free pages).
+    SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # EAGLE draft extend, top-1: take the token with the sampler's split-row argmax
+    # (the verify's) instead of torch.argmax's one block per row; same token unless NaN.
+    SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Host-only Mamba checkpoints: a request whose anchor KV is on the device fetches
+    # its state beside the anchor's in-flight load instead of retrying admission.
+    SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Scheduler request poll: recv from a zmq socket only when ZMQ_EVENTS says a message
+    # is waiting, instead of a NOBLOCK recv that raises on an empty socket.
+    SGLANG_OPT_SCHEDULER_ZMQ_EVENTS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # GenerationBatchResult.copy_to_cpu opens its profiler range only while a torch profiler
+    # runs (the record_function decorator calls into the dispatcher every round).
+    SGLANG_OPT_RESULT_COPY_PROFILER_FAST_PATH = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # A speculative decode result's readback (next token ids, accept lengths) copies into a
+    # ring of pinned buffers kept per shape instead of a fresh pinned allocation per tensor.
+    SGLANG_OPT_RESULT_COPY_PINNED_RING = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # The forward isolation's ScheduleBatch snapshot / restore and its 2-iter keep-alive record
+    # read the fields from the instance dict (one cached itemgetter) instead of
+    # dataclasses.fields() + getattr / setattr per field.
+    SGLANG_OPT_SCHEDULE_BATCH_FIELD_SNAPSHOT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # The FutureMap's per-round seq-lens gather and publish scatter as index_select /
+    # index_copy_ for int64 indices instead of advanced indexing (same rows, less dispatch).
+    SGLANG_OPT_FUTURE_MAP_INDEX_OPS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # A spec decode step that needs no new KV pages (most steps at page size 64) skips the
+    # length tensors and their two H2D copies, which only the allocation reads.
+    SGLANG_OPT_SPEC_DECODE_EMPTY_ALLOCATION = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # From an overlap event loop's start, envs.X.get() serves each variable's first read
+    # (freeze_env_reads; set / clear / override still refresh it): dozens of os.environ
+    # lookups per round.
+    SGLANG_OPT_FREEZE_ENV_READS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # The scheduler's main thread on two reserved cores of its NUMA node, the process's other
+    # threads off them (utils/scheduler_affinity.py), from an overlap event loop's start.
+    SGLANG_OPT_SCHEDULER_MAIN_THREAD_AFFINITY = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # The two-host leader link of SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP receives by
+    # spinning on a non-blocking socket instead of sleeping in a blocking recv.
+    SGLANG_OPT_SCHEDULER_LEADER_LINK_SPIN = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Graph-input staging (_grouped_foreach_copy_ of the decode / draft / draft-extend runners)
+    # through a JIT small-field copy plan cached per destination layout, ahead of the Triton
+    # small_copy whose per-call checks and launch cost ~100 us of host time.
+    SGLANG_OPT_CUDA_GRAPH_FIELD_COPY_PLAN = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # CudaGraphBufferRegistry.fill_from replays a per-shape plan (which slots reset their
+    # padding, each copy slot's destination view, the post-fill hooks) instead of walking
+    # and slicing every slot on each call.
+    SGLANG_OPT_CUDA_GRAPH_FILL_PLAN = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # With SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: priority of the forward path's helper
+    # streams (named streams incl. the graph capture stream, HC gate, PLE prefetch); None
+    # keeps torch's default. Lower is higher.
+    SGLANG_FORWARD_HELPER_STREAM_PRIORITY = EnvInt(None)
+    # The EAGLE draft graph runner stages an unpadded round's inputs, hidden states and draft
+    # probs included, with one small-field copy into destination views cached per input
+    # layout, instead of slicing every buffer, a grouped copy and separate copy_ calls.
+    SGLANG_OPT_SPEC_DRAFT_GRAPH_INPUT_PLAN = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # The decode round's index outputs (draft cache locations, chain-tree verify inputs,
+    # draft-extend layout) come from rings of 8 tensors per shape instead of torch.empty;
+    # each is written whole by its kernel and read within the round.
+    SGLANG_OPT_SPEC_INDEX_OUTPUT_RING = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # With SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: post-verify graph sets (batch shape x
+    # verify logits buffer) kept before a new one runs eager (64 without the master).
+    SGLANG_POST_VERIFY_MAX_GRAPH_KEYS = EnvInt(64)
+    # The post-verify graph writes the bonus tokens as int64, the dtype the relay and the
+    # next draft read, so an unchanged batch's relay needs no cast.
+    SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64 = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # EAGLE chain verify (topk 1): accept the drafts in one fused kernel where
+    # _chain_accept_applies holds (same accepted tokens as the stock accept).
+    SGLANG_OPT_SPEC_FUSED_CHAIN_ACCEPT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # With the EAGLE post-verify graphs: SamplingBatchInfo.copy_for_forward copies the
+    # fields directly instead of dataclasses.replace (same fields).
+    SGLANG_OPT_SPEC_HOST_SAMPLING_COPY = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Forced acceptance lengths (SGLANG_SIMULATE_ACC_LEN, match-expected): pre-draw the
+    # generator's exponentials in blocks and take each draw's torch.multinomial outcome
+    # from them (same outcomes, checked once against single draws on a copy).
+    SGLANG_OPT_SPEC_SIM_ACC_LEN_PREDRAW = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # The post-verify graph stages the next round's draft lengths, positions and write
+    # slots into the draft graph runner; a round that keeps its batch skips their launch
+    # and copies. A chain EAGLE draft reserves three verify windows per decode step for it.
+    SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # With SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: a round that takes the staging also takes its
+    # lengths from the previous round's post-verify output instead of the FutureMap gather.
+    SGLANG_OPT_SPEC_STAGED_SEQ_LENS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # With SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: a staged draft reads its write slots from the
+    # staged buffer instead of a strided copy of the window's first columns (batch > 1).
+    SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # The post-verify graph's commit-outputs launch also writes the draft extend's layout
+    # (prefix / extend / post lengths, positions, start offsets, M-RoPE rows), which the
+    # draft extend takes instead of its own prepare_draft_extend_layout launch.
+    SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # TRT-LLM MHA graph metadata: 8 programs per batch row rebuild its page table, page
+    # blocks dealt round-robin (same writes), instead of one program walking the row.
+    SGLANG_OPT_TRTLLM_MHA_METADATA_ROW_SPLIT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # A top-1 chain's draft-extend graph takes the next draft's top-1 itself (the eager
+    # path's argmax, captured), so the replay is not followed by an argmax and a fill.
+    SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1 = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Each scheduler runs gc.collect() and gc.freeze() right before its event loop, so a
+    # full collection while serving no longer walks the startup objects.
+    SGLANG_OPT_SCHEDULER_GC_FREEZE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # A text-only extend batch's mrope rows repeat self.positions on the device instead
+    # of a per-request host loop and a pageable copy (same values, no host stall).
+    SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # The EAGLE post-verify graph pool's first capture takes the sampling scratch of the
+    # largest decode-graph batch and frees it, so later batch sizes split that segment
+    # instead of each adding one the private pool keeps.
+    SGLANG_OPT_POST_VERIFY_POOL_PRESIZE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # The post-verify side-stream Mamba state commit joins before the next verify or
+    # prefill, with every other reader and writer of that state ordered after it
+    # (speculative/post_verify_late_join.py). Opt-in.
+    SGLANG_OPT_POST_VERIFY_LATE_JOIN = EnvRuntimeBool(False)
+    # HiCache Mamba side-state rows (PLE short-conv / n-gram) of a checkpoint slot are
+    # backed up to the pinned host pool by a stream-ordered kernel instead of blocking copies
+    # (and loaded the same way under SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT); same bytes.
+    SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # HiCache write_back: when a session's next request arrives, rank its finished
+    # sub-agent sessions' nodes first for host eviction (needs requests'
+    # parent_session_id and a Rust TreeCore built with the cache-residency bindings,
+    # so it is opt-in).
+    SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST = EnvRuntimeBool(False)
+    # Qwen4-Exp's pinned PLE host table on transparent huge pages (anonymous mapping,
+    # MADV_HUGEPAGE, cudaHostRegister) instead of cudaHostAlloc, so the gather's random 160 B
+    # rows are not bound by address translation; same bytes, cudaHostAlloc if a step fails.
+    # Opt-in: it needs THP available to the process.
+    SGLANG_OPT_PLE_PINNED_HUGEPAGE = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -707,6 +941,17 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Shortest-prefill-first: requests that waited more than N batch formations go
+    # first, oldest first (0 = off). With SGLANG_SPF_AGE_CAP, an aged request sorts as
+    # if its prefill were one chunked-prefill budget instead of jumping the queue.
+    SGLANG_SPF_AGE_ROUNDS = EnvInt(0)
+    SGLANG_SPF_AGE_CAP = EnvBool(False)
+    # Shortest-prefill-first: the in-progress chunk keeps at least this percent of the
+    # budget when shorter waiting requests are reserved room (0 = one page).
+    SGLANG_SPF_CHUNK_MIN_PCT = EnvInt(0)
+    # Shortest-prefill-first: re-match a waiting request's prefix for the sort only
+    # every N batch formations (0 or 1 = every time; admission always re-matches).
+    SGLANG_SPF_MATCH_EVERY = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -894,6 +1139,25 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # Pages must be at least this many bytes for the staged write-back to issue one
+    # cudaMemcpyBatchAsync instead of per-page cudaMemcpyAsync. None keeps the kernel's
+    # 128 KiB default; the JIT kernel reads it from the environment once, at first use
+    # (sgl-project/sglang#40910).
+    SGLANG_HICACHE_BATCH_COPY_THRESHOLD = EnvInt(None)
+    # With SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: CTA quota of the HiCache per-layer
+    # KV load (layer_first / page_first JIT kernel); None keeps the stock quota.
+    SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(None)
+    # With the master: CTA quotas of the HiCache Mamba state copies of a page_first host
+    # pool (load / backup). Set, each state item is split over up to that many CTAs
+    # (transfer_mamba_split.cuh, same bytes); None keeps the stock kernel.
+    SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA = EnvInt(None)
+    SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(None)
+    # With the master: the recurrent-state host pool's GB of --hicache-size (sglang#47867's
+    # --hicache-mamba-size-gb); the other host pools split the rest. None keeps the
+    # split proportional to the device pools.
+    SGLANG_HICACHE_MAMBA_SIZE_GB = EnvFloat(None)
+    # Seconds between cumulative cache-residency counter log lines; 0 disables them.
+    SGLANG_HICACHE_RESIDENCY_LOG_INTERVAL = EnvInt(300)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -2552,6 +2816,10 @@ class Envs:
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
+    # A prebuilt TreeCore extension loaded in place of the bundled or locally built
+    # one; its SHA-256 is required and must match the file.
+    SGLANG_RUST_TREE_CORE_EXTENSION = EnvStr(None)
+    SGLANG_RUST_TREE_CORE_EXTENSION_SHA256 = EnvStr(None)
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 

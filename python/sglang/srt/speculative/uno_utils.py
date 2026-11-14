@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from flashinfer import top_k as _flashinfer_top_k
+from flashinfer import top_k as _flashinfer_top_k_impl
 
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
@@ -17,6 +17,11 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.spec_utils import fast_sample
 
 _SPARSE_TOP_K_LIMIT = 128
+
+# Kept out of torch.compile: FlashInfer 0.7.3's top_k picks its row-state scratch on
+# torch.cuda.is_current_stream_capturing(), so a compiled caller traced outside capture
+# retraces, and fails, when a CUDA graph first captures it. Eager, it is the same launch.
+_flashinfer_top_k = torch.compiler.disable(_flashinfer_top_k_impl)
 
 
 def _normalize_sparse_topk_probs(

@@ -778,6 +778,200 @@ def fused_conv_window_scatter_multi(
     )
 
 
+_STATE_MULTI_MAX_PAIRS = 8
+_STATE_MULTI_META_COLS = 14
+_STATE_MULTI_BLOCK = 1024
+# Copy words by width in bytes: an entry moves as words whatever its dtype.
+_STATE_MULTI_WORDS = {1: tl.int8, 2: tl.int16, 4: tl.int32, 8: tl.int64}
+_state_multi_meta_cache: dict = {}
+
+
+@triton.jit
+def _fused_state_scatter_multi_kernel(
+    meta_ptr,  # int64 [num_pairs, 14]: src_ptr, dst_ptr, words, s_l, s_r, s_s, d_l, d_r, src_reqs, src_steps, dst_reqs, blocks_per_layer, block_start, block_end
+    idx1_ptr,
+    step1_ptr,
+    idx2_ptr,
+    step2_ptr,
+    n1,
+    NUM_PAIRS: tl.constexpr,
+    META_COLS: tl.constexpr,
+    WORD: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_req = tl.program_id(0)
+    pid_block = tl.program_id(1).to(tl.int64)
+
+    is1 = pid_req < n1
+    is2 = pid_req >= n1
+    off2 = pid_req - n1
+    # Through int32, as the per-pair launch casts its rows.
+    s1 = tl.load(step1_ptr + pid_req, mask=is1, other=-1).to(tl.int32)
+    s2 = tl.load(step2_ptr + off2, mask=is2, other=-1).to(tl.int32)
+    step_idx = tl.where(is2, s2, s1).to(tl.int64)
+    if step_idx < 0:
+        return
+    d1 = tl.load(idx1_ptr + pid_req, mask=is1, other=-1).to(tl.int32)
+    d2 = tl.load(idx2_ptr + off2, mask=is2, other=-1).to(tl.int32)
+    dst_idx = tl.where(is2, d2, d1).to(tl.int64)
+    src_idx = tl.where(is2, off2, pid_req).to(tl.int64)
+
+    for t in tl.static_range(NUM_PAIRS):
+        row = meta_ptr + t * META_COLS
+        block_start = tl.load(row + 12)
+        in_pair = (pid_block >= block_start) & (pid_block < tl.load(row + 13))
+        in_bounds = (
+            (dst_idx >= 0)
+            & (dst_idx < tl.load(row + 10))
+            & (src_idx < tl.load(row + 8))
+            & (step_idx < tl.load(row + 9))
+        )
+        if in_pair & in_bounds:
+            blocks_per_layer = tl.load(row + 11)
+            local = pid_block - block_start
+            layer = local // blocks_per_layer
+            e = (local % blocks_per_layer) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = e < tl.load(row + 2)
+            src_ptr = tl.load(row + 0).to(tl.pointer_type(WORD))
+            dst_ptr = tl.load(row + 1).to(tl.pointer_type(WORD))
+            src_off = (
+                layer * tl.load(row + 3)
+                + src_idx * tl.load(row + 4)
+                + step_idx * tl.load(row + 5)
+            )
+            dst_off = layer * tl.load(row + 6) + dst_idx * tl.load(row + 7)
+            data = tl.load(src_ptr + src_off + e, mask=mask)
+            tl.store(dst_ptr + dst_off + e, data, mask=mask)
+
+
+def _state_multi_eligible(pairs) -> bool:
+    """CUDA (dst, src) pairs that fused_mamba_state_scatter_with_mask accepts, each
+    in one dtype (it would convert otherwise)."""
+    if not 0 < len(pairs) <= _STATE_MULTI_MAX_PAIRS:
+        return False
+    device = pairs[0][0].device
+    for dst, src in pairs:
+        if not (dst.is_cuda and dst.device == src.device == device):
+            return False
+        if dst.dtype != src.dtype or dst.ndim < 2 or src.ndim < 3:
+            return False
+        if dst.shape[0] != src.shape[0] or dst.shape[2:] != src.shape[3:]:
+            return False
+        if dst.numel() == 0 or not (dst[0, 0].is_contiguous() and src.is_contiguous()):
+            return False
+    return True
+
+
+def _state_multi_word(pairs) -> int:
+    """The widest copy word (up to 8 bytes) dividing every pair's base addresses,
+    strides and entry, so the words tile each entry exactly."""
+    word = 8
+    for dst, src in pairs:
+        size = dst.element_size()
+        for value in (
+            dst.data_ptr(),
+            src.data_ptr(),
+            dst[0, 0].numel() * size,
+            *(stride * size for stride in (*dst.stride()[:2], *src.stride()[:3])),
+        ):
+            while value % word:
+                word //= 2
+    return word
+
+
+def _state_multi_build_meta(pairs):
+    word = _state_multi_word(pairs)
+    rows, block = [], 0
+    for dst, src in pairs:
+        size = dst.element_size()
+        words = dst[0, 0].numel() * size // word
+        per_layer = triton.cdiv(words, _STATE_MULTI_BLOCK)
+        end = block + per_layer * dst.shape[0]
+        rows.append(
+            [
+                src.data_ptr(),
+                dst.data_ptr(),
+                words,
+                *(stride * size // word for stride in src.stride()[:3]),
+                *(stride * size // word for stride in dst.stride()[:2]),
+                src.shape[1],
+                src.shape[2],
+                dst.shape[1],
+                per_layer,
+                block,
+                end,
+            ]
+        )
+        block = end
+    return make_ptr_table(rows, device=pairs[0][0].device), word, block
+
+
+def fused_state_scatter_multi(
+    pairs,
+    dst_indices_raw: torch.Tensor,
+    step_indices_raw: torch.Tensor,
+    dst_indices2_raw: torch.Tensor | None = None,
+    step_indices2_raw: torch.Tensor | None = None,
+) -> None:
+    """Single-launch ``fused_mamba_state_scatter_with_mask`` over (dst, src) pairs of
+    any dtypes that pass ``_state_multi_eligible``, for up to two request-index sets
+    whose source rows are the requests' positions in their set (the accept commit
+    and the optional interval-crossing track set): the same bytes, moved as words."""
+    n1 = step_indices_raw.shape[0]
+    n2 = 0 if step_indices2_raw is None else step_indices2_raw.shape[0]
+    if n1 + n2 == 0:
+        return
+
+    key = tuple(
+        (dst.data_ptr(), src.data_ptr(), dst.element_size())
+        + tuple(dst.shape)
+        + tuple(dst.stride())
+        + tuple(src.shape)
+        + tuple(src.stride())
+        for dst, src in pairs
+    )
+    cached = _state_multi_meta_cache.get(key)
+    if cached is None:
+        cached = _state_multi_build_meta(pairs)
+        _state_multi_meta_cache.clear()
+        _state_multi_meta_cache[key] = cached
+    meta, word, total_blocks = cached
+
+    idx1, st1 = dst_indices_raw.contiguous(), step_indices_raw.contiguous()
+    if n2 > 0:
+        idx2, st2 = dst_indices2_raw.contiguous(), step_indices2_raw.contiguous()
+    else:
+        idx2, st2 = idx1, st1
+    _fused_state_scatter_multi_kernel[(n1 + n2, total_blocks)](
+        meta,
+        idx1,
+        st1,
+        idx2,
+        st2,
+        n1,
+        NUM_PAIRS=len(pairs),
+        META_COLS=_STATE_MULTI_META_COLS,
+        WORD=_STATE_MULTI_WORDS[word],
+        BLOCK_SIZE=_STATE_MULTI_BLOCK,
+    )
+
+
+def int32_scatter_rows(
+    dst_indices: torch.Tensor,
+    steps: torch.Tensor,
+    src_indices: torch.Tensor | None = None,
+):
+    """One index set's rows as the per-pair scatters cast them (int32, contiguous,
+    source rows defaulting to the request positions), built once for several of
+    those launches, whose own casts then launch nothing."""
+    steps = steps.to(torch.int32).contiguous()
+    return (
+        dst_indices.to(torch.int32).contiguous(),
+        steps,
+        _prepare_src_rows(src_indices, steps),
+    )
+
+
 def scatter_mamba_states_after_mtp_verify(
     mamba_caches,
     state_indices_tensor: torch.Tensor,

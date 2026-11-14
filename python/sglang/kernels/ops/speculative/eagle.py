@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cpu, next_power_of_2
+from sglang.srt.utils import is_cpu, next_power_of_2, round_outputs
 
 _is_cpu = is_cpu()
 
@@ -114,6 +114,15 @@ def _verify_commit_outputs_kernel(
     ids,
     DRAFT_WIDTH: tl.constexpr,
     TRACK_INTERVAL: tl.constexpr,
+    prefix=None,
+    extend=None,
+    post_lens=None,
+    positions=None,
+    start_locs=None,
+    mrope=None,
+    MROPE_STRIDE=0,
+    EXTEND_LAYOUT: tl.constexpr = False,
+    EXTEND_MROPE: tl.constexpr = False,
 ):
     row = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     valid = row < BS
@@ -149,6 +158,23 @@ def _verify_commit_outputs_kernel(
                 - row * DRAFT_WIDTH
             )
             tl.store(track_steps + row, tl.where(crossing, track, -1), valid)
+    if EXTEND_LAYOUT:
+        # prepare_draft_extend_layout of the pre-verify lengths (the draft extend's window)
+        tl.store(prefix + row, tl.maximum(length, 0), valid)
+        tl.store(extend + row, DRAFT_WIDTH, valid)
+        tl.store(post_lens + row, length + DRAFT_WIDTH, valid)
+        tl.store(start_locs + row, row * DRAFT_WIDTH, valid)
+        tokens = row < BS * DRAFT_WIDTH
+        base = tl.load(seq_lens + (row // DRAFT_WIDTH) * SEQ_STRIDE, tokens, other=0)
+        position = tl.maximum(base.to(tl.int64), 0).to(tl.int32) + (
+            row % DRAFT_WIDTH
+        ).to(tl.int32)
+        tl.store(positions + row, position.to(tl.int64), tokens)
+        if EXTEND_MROPE:
+            for axis in tl.static_range(3):
+                tl.store(
+                    mrope + axis * MROPE_STRIDE + row, position.to(tl.int64), tokens
+                )
     idx = tl.where(idx < 0, idx + PREDICT_SIZE, idx)
     token = tl.load(predict + idx * PREDICT_STRIDE, valid, other=0)
     tl.store(new_seq_lens + row, length + accepted, valid)
@@ -163,7 +189,13 @@ def prepare_verify_commit_outputs(
     num_draft_tokens=0,
     mamba_track_interval=0,
     bonus_dtype=torch.int32,
+    extend_layout=False,
+    extend_mrope=False,
 ):
+    """``extend_layout`` (SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT, with
+    ``num_draft_tokens``): the same launch also writes
+    ``prepare_draft_extend_layout(seq_lens, num_draft_tokens, extend_mrope)``, appended to
+    the draft-extend inputs."""
     bs = accept_lens.numel()
     new_seq_lens = torch.empty(
         (bs,),
@@ -179,8 +211,28 @@ def prepare_verify_commit_outputs(
         correct = torch.empty_like(accept_lens, memory_format=torch.contiguous_format)
         select = torch.empty_like(last_steps)
         ids = torch.empty((predict.numel(),), device=predict.device, dtype=torch.int64)
+    layout = None
+    if num_draft_tokens and extend_layout:
+        tokens = bs * num_draft_tokens
+        device = seq_lens.device
+        layout = (
+            torch.empty((bs,), dtype=torch.int32, device=device),
+            torch.empty((bs,), dtype=torch.int32, device=device),
+            torch.empty((bs,), dtype=seq_lens.dtype, device=device),
+            (
+                torch.empty((tokens,), dtype=torch.int64, device=device),
+                torch.empty((bs,), dtype=torch.int32, device=device),
+                (
+                    torch.empty((3, tokens), dtype=torch.int64, device=device)
+                    if extend_mrope
+                    else None
+                ),
+            ),
+        )
     if bs:
         size = max(bs, predict.numel()) if num_draft_tokens else bs
+        if layout is not None:
+            size = max(size, bs * num_draft_tokens)
         _verify_commit_outputs_kernel[(triton.cdiv(size, 128),)](
             predict,
             accept_index,
@@ -203,9 +255,25 @@ def prepare_verify_commit_outputs(
             ids=ids,
             DRAFT_WIDTH=num_draft_tokens,
             TRACK_INTERVAL=mamba_track_interval,
+            **(
+                dict(
+                    prefix=layout[0],
+                    extend=layout[1],
+                    post_lens=layout[2],
+                    positions=layout[3][0],
+                    start_locs=layout[3][1],
+                    mrope=layout[3][2],
+                    MROPE_STRIDE=bs * num_draft_tokens,
+                    EXTEND_LAYOUT=True,
+                    EXTEND_MROPE=layout[3][2] is not None,
+                )
+                if layout is not None
+                else {}
+            ),
         )
     if num_draft_tokens:
-        return new_seq_lens, bonus, (last_steps, track_steps), (correct, select, ids)
+        draft = (correct, select, ids) + (() if layout is None else (layout,))
+        return new_seq_lens, bonus, (last_steps, track_steps), draft
     return new_seq_lens, bonus
 
 
@@ -462,19 +530,15 @@ def prepare_draft_extend_lengths(seq_lens, num_draft_tokens, front_offset):
 
 def prepare_draft_extend_layout(seq_lens, num_draft_tokens, with_mrope):
     bs = seq_lens.numel()
-    prefix = torch.empty((bs,), dtype=torch.int32, device=seq_lens.device)
-    extend = torch.empty_like(prefix)
-    post = torch.empty((bs,), dtype=seq_lens.dtype, device=seq_lens.device)
-    positions = torch.empty(
-        (bs * num_draft_tokens,), dtype=torch.int64, device=seq_lens.device
-    )
-    starts = torch.empty_like(prefix)
+    device = seq_lens.device
+    empty = round_outputs.empty_fn()
+    prefix = empty((bs,), torch.int32, device)
+    extend = empty((bs,), torch.int32, device)
+    post = empty((bs,), seq_lens.dtype, device)
+    positions = empty((bs * num_draft_tokens,), torch.int64, device)
+    starts = empty((bs,), torch.int32, device)
     mrope = (
-        torch.empty(
-            (3, bs * num_draft_tokens), dtype=torch.int64, device=seq_lens.device
-        )
-        if with_mrope
-        else None
+        empty((3, bs * num_draft_tokens), torch.int64, device) if with_mrope else None
     )
     if bs:
         _prepare_draft_extend_lengths_kernel[
@@ -566,25 +630,23 @@ def build_chain_tree(
     bs, depth = draft_tokens.shape
     width = depth + 1
     assert bonus_tokens.numel() == seq_lens.numel() == bs
+    device = seq_lens.device
+    empty = round_outputs.empty_fn()
     mask = tree_mask_buf
     if mask is None:
-        mask = torch.empty(
-            (bs * width * width,), dtype=torch.bool, device=seq_lens.device
-        )
+        mask = empty((bs * width * width,), torch.bool, device)
     assert mask.is_contiguous() and mask.numel() >= bs * width * width
-    positions = torch.empty((bs * width,), dtype=torch.int64, device=seq_lens.device)
-    retrieve = torch.empty((3, bs, width), dtype=torch.int64, device=seq_lens.device)
-    tokens = torch.empty(
+    positions = empty((bs * width,), torch.int64, device)
+    retrieve = empty((3, bs, width), torch.int64, device)
+    tokens = empty(
         (bs * width,),
-        dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
-        device=seq_lens.device,
+        torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
+        device,
     )
-    out_cache_loc = torch.empty_like(positions) if req_to_token is not None else None
-    mrope = (
-        torch.empty((3, bs * width), dtype=torch.int64, device=seq_lens.device)
-        if with_mrope
-        else None
+    out_cache_loc = (
+        empty((bs * width,), torch.int64, device) if req_to_token is not None else None
     )
+    mrope = empty((3, bs * width), torch.int64, device) if with_mrope else None
     if req_to_token is not None:
         assert req_pool_indices is not None and req_pool_indices.numel() == bs
     if bs:

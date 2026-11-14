@@ -412,6 +412,13 @@ class Engine(EngineScoreMixin, EngineBase):
 
         self.loop = self._ensure_event_loop()
 
+        if get_device().freeze_gc_after_startup:
+            # Startup objects leave the tracked set, so later collections in the
+            # tokenizer manager's process walk only what serving allocates.
+            gc.collect()
+            gc.freeze()
+            logger.info(f"Engine GC frozen: {gc.get_freeze_count()} objects")
+
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""
         return self._scheduler_init_result.all_child_pids
@@ -500,6 +507,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
@@ -542,6 +550,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
+            parent_session_id=parent_session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -615,6 +624,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
@@ -657,6 +667,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
+            parent_session_id=parent_session_id,
             session_params=session_params,
             priority=priority,
         )

@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeK
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     TransferIntent,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -574,6 +575,31 @@ class TestMooncakeEarlySend(CustomTestCase):
         self.assertIs(chunk.indices_event, indices_ready)
         ready.synchronize.assert_not_called()
         indices_ready.synchronize.assert_not_called()
+
+    def test_manager_shards_by_room_under_the_runtime_option(self):
+        def shard(room, shard_by_room):
+            queues = [SimpleQueue() for _ in range(4)]
+            manager = SimpleNamespace(
+                disaggregation_mode=DisaggregationMode.PREFILL,
+                request_status={room: KVPoll.WaitingForInput},
+                check_status=lambda room: KVPoll.WaitingForInput,
+                transfer_infos={room: {"127.0.0.1:80": object()}},
+                transfer_queues=queues,
+                send_record=MagicMock(),
+                note_send_enqueued=MagicMock(),
+            )
+            with (
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                envs.SGLANG_OPT_DISAGG_TRANSFER_SHARD_BY_ROOM.override(shard_by_room),
+            ):
+                MooncakeKVManager.add_transfer_request(
+                    manager, room, [0], slice(0, 1), False
+                )
+            return [i for i, queue in enumerate(queues) if not queue.empty()]
+
+        rooms = [(i << 16) | 3 for i in range(4)]
+        self.assertEqual([shard(room, False) for room in rooms], [[0]] * 4)
+        self.assertEqual([shard(room, True) for room in rooms], [[i] for i in range(4)])
 
     def _worker(self, event):
         chunk = TransferKVChunk(

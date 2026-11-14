@@ -21,17 +21,22 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_draft_cuda_graph_runner as draft_graph
+from sglang.srt.speculative import (
+    eagle_draft_extend_cuda_graph_runner as draft_extend_graph,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.staged_next_draft import STAGED_INPUTS
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -300,6 +305,40 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 runner.execute(forward_batch, select_index)
                 self.assertEqual(keys[0].attention_variant, label)
 
+    def test_draft_extend_replay_hands_on_the_top1_its_graph_took(self):
+        """SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1: after a replay of a graph that took
+        the top-1, the runner holds its rows for the replayed requests; after any other
+        replay, none. The graph's top-1 is the eager path's argmax."""
+        for raw_bs, captured in ((1, True), (1, False), (2, True)):
+            runner, forward_batch, select_index = _extend_runner(raw_bs)
+            out = SimpleNamespace(
+                next_token_logits=torch.zeros((2, 4)),
+                hidden_states=torch.zeros((2, 2)),
+            )
+            keys = []
+            runner._replay_graph = lambda key, fb: keys.append(key) or out
+            top1 = (torch.ones(2, 1), torch.arange(2).view(2, 1))
+            runner.execute(forward_batch, select_index)
+            if captured:
+                runner._graph_top1 = {keys[0]: top1}
+                runner.execute(forward_batch, select_index)
+            with self.subTest(raw_bs=raw_bs, captured=captured):
+                if captured:
+                    for got, buf in zip(runner.replayed_top1, top1):
+                        self.assertEqual(got.data_ptr(), buf.data_ptr())
+                        self.assertEqual(got.shape[0], raw_bs)
+                else:
+                    self.assertIsNone(runner.replayed_top1)
+        logits = torch.randn(3, 33)
+        logits[1, 4] = logits[1, 20] = logits.max() + 1  # tie: lowest index
+        index = torch.empty((3, 1), dtype=torch.int64)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX.override(True),
+        ):
+            draft_extend_graph.draft_top1_into(logits, index)
+        self.assertTrue(torch.equal(index, torch.argmax(logits, -1, keepdim=True)))
+
     def test_draft_extend_shared_read_fence_and_kv_reuse(self):
         cases = (
             # External markers let shared reads finish before KV writes.
@@ -431,6 +470,111 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         output = runner.execute(forward_batch)
 
         self.assertIs(output[-1], pooled_probs)
+
+    def test_planned_inputs_stage_what_the_default_copies_stage(self):
+        from sglang.kernels.ops.memory import small_field_copy
+
+        class _CopyPlan:
+            def __call__(self, dsts, srcs):
+                assert len(dsts) == len(srcs)
+                for dst, src in zip(dsts, srcs):
+                    dst.copy_(src)
+                return True
+
+        staged = {}
+        for planned in (False, True):
+            backend = _RecordingDraftBackend()
+            runner = self._build_runner(backend)
+            runner._planned_inputs = {}
+            for buf in vars(runner.buffers).values():
+                if buf is not None:
+                    buf.fill_(-1)
+            forward_batch = self._build_forward_batch([3, 4, 5, 6], 18)
+            forward_batch.spec_info.hidden_states = torch.arange(8.0).view(4, 2)
+            with (
+                patch.object(draft_graph, "_GRAPH_INPUT_PLAN", planned),
+                patch.object(small_field_copy, "SmallFieldCopyPlan", _CopyPlan),
+            ):
+                runner.execute(forward_batch)
+            self.assertEqual(len(runner._planned_inputs), int(planned))
+            staged[planned] = {
+                name: buf.clone()
+                for name, buf in vars(runner.buffers).items()
+                if buf is not None
+            }
+        for name, buf in staged[False].items():
+            self.assertTrue(torch.equal(staged[True][name], buf), name)
+
+    def test_a_staged_round_copies_none_of_the_staged_inputs(self):
+        """SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: a round whose lengths, write slots,
+        positions and request slots the previous post-verify graph wrote into the
+        buffers copies none of them, planned or not, and the rest as before; those
+        inputs stay out of the shared input pool only under the switch."""
+        from sglang.kernels.ops.memory import small_field_copy
+
+        class _CopyPlan:
+            def __call__(self, dsts, srcs):
+                assert len(dsts) == len(srcs) > 0
+                for dst, src in zip(dsts, srcs):
+                    dst.copy_(src)
+                return True
+
+        staged_names = ("seq_lens", "out_cache_loc", "positions", "req_pool_indices")
+        for planned in (False, True):
+            runner = self._build_runner(_RecordingDraftBackend())
+            runner._planned_inputs = {}
+            for buf in vars(runner.buffers).values():
+                if buf is not None:
+                    buf.fill_(-1)
+            for name in staged_names:
+                getattr(runner.buffers, name).fill_(99)
+            forward_batch = self._build_forward_batch([3, 4, 5, 6], 18)
+            forward_batch.spec_info.hidden_states = torch.arange(8.0).view(4, 2)
+            with (
+                self.subTest(planned=planned),
+                patch.object(draft_graph, "_GRAPH_INPUT_PLAN", planned),
+                patch.object(small_field_copy, "SmallFieldCopyPlan", _CopyPlan),
+            ):
+                runner.execute(forward_batch, inputs_staged=True)
+                for name in staged_names:
+                    self.assertTrue(
+                        torch.all(getattr(runner.buffers, name) == 99), name
+                    )
+                spec_info = forward_batch.spec_info
+                for name in ("topk_p", "topk_index", "hidden_states"):
+                    self.assertTrue(
+                        torch.equal(
+                            getattr(runner.buffers, name), getattr(spec_info, name)
+                        ),
+                        name,
+                    )
+        for switch in (False, True):
+            with (
+                self.subTest(switch=switch),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                envs.SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT.override(switch),
+                patch.object(
+                    draft_graph, "spec_relay_bypass_enabled", return_value=False
+                ),
+            ):
+                private = draft_graph._relay_private_inputs()
+                self.assertEqual(private, STAGED_INPUTS if switch else frozenset())
+
+    def test_a_refused_input_plan_falls_back_and_stays_refused(self):
+        from sglang.kernels.ops.memory import small_field_copy
+
+        runner = self._build_runner(_RecordingDraftBackend())
+        runner._planned_inputs = {}
+        forward_batch = self._build_forward_batch([3, 4, 5, 6], 18)
+        with (
+            patch.object(draft_graph, "_GRAPH_INPUT_PLAN", True),
+            patch.object(
+                small_field_copy, "SmallFieldCopyPlan", lambda: lambda d, s: False
+            ),
+        ):
+            runner.execute(forward_batch)
+        self.assertEqual(list(runner._planned_inputs.values()), [None])
+        self.assertTrue(torch.equal(runner.buffers.seq_lens, forward_batch.seq_lens))
 
 
 if __name__ == "__main__":

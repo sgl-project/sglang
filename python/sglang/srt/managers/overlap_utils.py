@@ -72,6 +72,7 @@ _is_npu = is_npu()
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
+_INDEX_OPS = envs.SGLANG_OPT_FUTURE_MAP_INDEX_OPS.get()
 
 
 def spec_relay_bypass_enabled(
@@ -680,11 +681,16 @@ class FutureMap:
         ]
 
     def resolve_seq_lens_cpu(
-        self, batch: ScheduleBatch, stream_ordered: bool = False
+        self,
+        batch: ScheduleBatch,
+        stream_ordered: bool = False,
+        staged_seq_lens: Optional[torch.Tensor] = None,
     ) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+        # staged_seq_lens (SGLANG_OPT_SPEC_STAGED_SEQ_LENS): the previous decode round's
+        # published lengths, which this unchanged batch takes as they are: no wait, no gather.
         draft_input = batch.spec_info
         if draft_input is None:
             return
@@ -692,6 +698,7 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
+        gather = staged_seq_lens is None
         if self.publish_ready is not None and stream_ordered:
             self._publish_fresh = False
         elif self.publish_ready is not None:
@@ -700,19 +707,26 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
+            if gather and _is_hip:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 self.publish_ready.synchronize()
-            else:
+            elif gather:
                 self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
+        if not gather:
+            batch.seq_lens = staged_seq_lens
+        elif _INDEX_OPS and fi.dtype is torch.int64:
+            batch.seq_lens = torch.index_select(self.new_seq_lens_buf, 0, fi)
+        else:
+            batch.seq_lens = self.new_seq_lens_buf[fi]
+        # rows only a gather consumed are poisoned; staged lengths never read them
+        poison = _DEBUG_ASSERT and gather
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
             batch.seq_lens_sum = None
-            if _DEBUG_ASSERT:
+            if poison:
                 # Poison consumed rows: each row must be re-published/seeded
                 # before the next resolve gathers it (safe here: the forward's
                 # re-publish is fenced behind this stream via wait_stream).
@@ -722,7 +736,7 @@ class FutureMap:
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            if _DEBUG_ASSERT:
+            if poison:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
@@ -736,7 +750,7 @@ class FutureMap:
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-        if _DEBUG_ASSERT:
+        if poison:
             # After the D2H copy completed (synchronize above), so the pinned
             # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
@@ -753,6 +767,11 @@ class FutureMap:
         relay = self._relay
         if relay is not None and new_seq_lens is relay.published_seq_lens:
             relay.published_seq_lens = None
+        elif _INDEX_OPS and indices.dtype is torch.int64:
+            # req pool indices are distinct, so the copy order does not matter
+            self.new_seq_lens_buf.index_copy_(
+                0, indices, new_seq_lens.to(self.new_seq_lens_buf.dtype)
+            )
         else:
             self.new_seq_lens_buf[indices] = new_seq_lens.to(
                 self.new_seq_lens_buf.dtype

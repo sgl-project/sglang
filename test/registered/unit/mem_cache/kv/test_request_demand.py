@@ -420,6 +420,66 @@ class TestDecodeRowsAllocatedAhead(CustomTestCase):
         self.assertEqual(with_lag, without)
 
 
+class TestEmptySpecDecodeAllocation(CustomTestCase):
+    """A spec decode step whose rows are all allocated ahead hands the
+    allocation only the host lengths under SGLANG_OPT_SPEC_DECODE_EMPTY_ALLOCATION."""
+
+    def _prepare(self, *, fast, committed):
+        from sglang.srt.speculative import eagle_utils
+
+        reqs = [
+            SimpleNamespace(
+                kv=SimpleNamespace(kv_allocated_len=128, kv_committed_len=c),
+                decode_batch_idx=0,
+            )
+            for c in committed
+        ]
+        batch = SimpleNamespace(
+            reqs=reqs,
+            maybe_evict_swa=Mock(),
+            sampling_info=SimpleNamespace(
+                penalizer_orchestrator=SimpleNamespace(is_required=False)
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
+            seq_lens_cpu=None,
+            device="cpu",
+            tree_cache=Mock(),
+            req_to_token_pool=Mock(),
+            req_pool_indices=torch.arange(len(reqs)),
+        )
+        with (
+            patch.object(eagle_utils, "_DECODE_EMPTY_ALLOCATION", fast),
+            patch.object(eagle_utils, "get_alloc_reserve_per_decode", return_value=8),
+            patch.object(
+                eagle_utils,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_eagle_topk=1),
+            ),
+            patch.object(eagle_utils, "alloc_for_spec_decode") as alloc,
+        ):
+            eagle_utils.eagle_prepare_for_decode(batch)
+        self.assertEqual([r.decode_batch_idx for r in reqs], [1] * len(reqs))
+        return batch, alloc.call_args.kwargs
+
+    def test_no_new_rows_pass_only_the_host_lengths(self):
+        batch, kwargs = self._prepare(fast=True, committed=[100, 64])
+        self.assertEqual(kwargs["num_needed_tokens"], 0)
+        self.assertEqual(kwargs["nxt_kv_lens_list"], [128, 128])
+        self.assertIsNone(kwargs["cur_kv_lens"])
+        self.assertIsNone(kwargs["nxt_kv_lens_cpu"])
+        self.assertEqual(batch.max_seq_len_host, 128)
+
+    def test_stock_path_when_off_or_rows_are_needed(self):
+        for fast, committed, needed in ((False, [100], 0), (True, [125], 64)):
+            with self.subTest(fast=fast, committed=committed):
+                batch, kwargs = self._prepare(fast=fast, committed=committed)
+                self.assertEqual(kwargs["num_needed_tokens"], needed)
+                self.assertNotIn("nxt_kv_lens_list", kwargs)
+                self.assertEqual(kwargs["cur_kv_lens_cpu"].tolist(), [128])
+                self.assertEqual(kwargs["nxt_kv_lens_cpu"].tolist(), [128 + needed])
+                self.assertEqual(batch.max_seq_len_host, 128)
+
+
 class TestWindowDemandBoundsTheRetiredPeak(CustomTestCase):
     """The window demand bounds, in whole pages, the most rows the
     scheduler's own retirement keeps live, over seeded random requests."""

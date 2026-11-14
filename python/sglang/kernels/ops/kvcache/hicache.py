@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -92,6 +93,17 @@ TMA_STORE_WARPS = 4
 # Each CTA is capped by its SM's write port, so the host link needs four of
 # them; the register kernel keeps DEFAULT_BLOCK_QUOTA.
 TMA_BLOCK_QUOTA = 4
+
+
+def hicache_block_quota_from_env(env) -> int | None:
+    """A HiCache copy CTA quota from its env field, read only with
+    SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION; None keeps the stock quota."""
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return None
+    quota = env.get()
+    if quota is not None and quota <= 0:
+        raise ValueError(f"{env.name} must be a positive CTA count, got {quota}")
+    return quota
 
 
 @cache_once

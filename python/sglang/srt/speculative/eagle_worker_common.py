@@ -38,7 +38,8 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.speculative.staged_next_draft import NextDraft, takes_staging
+from sglang.srt.utils import is_cpu, round_outputs
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -48,6 +49,8 @@ from sglang.srt.utils.device import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+# SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS: a staged draft's write slots are the staged buffer itself
+_STAGED_DRAFT_LOCS = envs.SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS.get()
 
 
 _provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
@@ -330,9 +333,12 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     iteration_ids: Optional[IterationIds] = None,
+    prepared_layout: Optional[tuple] = None,
 ):
     """``iteration_ids``: the iteration's plan, whose window the draft extend
-    writes again (the verify window); a widened window plans its own."""
+    writes again (the verify window); a widened window plans its own.
+    ``prepared_layout``: ``prepare_draft_extend_layout``'s outputs for these lengths
+    from the post-verify graph (SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT)."""
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
     # rows below the boundary. Locs/positions arrive precomputed; token/hidden
@@ -376,13 +382,20 @@ def prepare_for_draft_extend(
     fused_lengths = gpu_only and batch.seq_lens.is_cuda
     extend_position_info = None
     if fused_lengths and not widen and draft_extend_input.positions is None:
-        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
-            prepare_draft_extend_layout(
-                batch.seq_lens,
-                num_draft_tokens,
-                draft_model_runner.model_config.model_is_mrope
-                and all(x is None for x in batch.multimodal_inputs),
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if (
+            prepared_layout is not None
+            and (prepared_layout[3][2] is not None) == with_mrope
+        ):
+            layout = prepared_layout
+        else:
+            layout = prepare_draft_extend_layout(
+                batch.seq_lens, num_draft_tokens, with_mrope
             )
+        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
+            layout
         )
     elif fused_lengths:
         batch.prefix_lens, batch.extend_lens, post_seq_lens = (
@@ -458,11 +471,14 @@ def prepare_for_draft(
     *,
     target_translator: Optional[RunnerIds] = None,
     num_draft_tokens: Optional[int] = None,
+    staged: Optional[NextDraft] = None,
 ) -> tuple[ForwardBatch, bool, Optional[IterationIds]]:
     """The draft-decode batch. With ``target_translator``, a chain draft plans
     the iteration's whole write window (the ``num_draft_tokens`` slots past
     ``seq_lens`` that verify and draft extend also write) and writes its first
-    ``num_steps`` columns; that plan is returned, else None."""
+    ``num_steps`` columns; that plan is returned, else None. ``staged``: those
+    slots and positions as the previous post-verify graph wrote them
+    (SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT), taken instead of a launch when they fit."""
     prepared_positions = None
     prepared_mrope_positions = None
     iteration_ids = None
@@ -481,20 +497,41 @@ def prepare_for_draft(
         # A chain draft's slots lead the iteration's window: gather the whole
         # window in the same launch.
         window_cols = num_draft_tokens if plans_window else num_steps
-        if page_size == 1 or topk == 1:
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * window_cols,),
-                dtype=torch.int64,
-                device=batch.device,
+        if staged is not None and takes_staging(
+            staged,
+            num_requests=bs,
+            plans_window=plans_window,
+            with_mrope=draft_model_runner.model_config.model_is_mrope
+            and all(x is None for x in batch.multimodal_inputs),
+        ):
+            batch.out_cache_loc = staged.window
+            prepared_positions = staged.positions
+            prepared_mrope_positions = staged.mrope
+            iteration_ids = target_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                write_virtual=batch.out_cache_loc,
+                read_extent=num_draft_tokens,
+            )
+            if _STAGED_DRAFT_LOCS:
+                # the same launch wrote them from the same slots as the window's first cols
+                iteration_ids.take_staged_cols(
+                    slice(0, num_steps), staged.draft_out_cache_loc
+                )
+        elif page_size == 1 or topk == 1:
+            empty = round_outputs.empty_fn()
+            batch.out_cache_loc = empty(
+                (bs * topk * window_cols,), torch.int64, batch.device
             )
             if batch.seq_lens.is_cuda and topk == 1:
-                prepared_positions = torch.empty_like(batch.seq_lens)
+                prepared_positions = empty(
+                    (bs,), batch.seq_lens.dtype, batch.seq_lens.device
+                )
                 if draft_model_runner.model_config.model_is_mrope and all(
                     x is None for x in batch.multimodal_inputs
                 ):
-                    prepared_mrope_positions = torch.empty(
-                        (3, bs), dtype=torch.int64, device=batch.device
-                    )
+                    prepared_mrope_positions = empty((3, bs), torch.int64, batch.device)
             # TODO(lsyin): align with the default code path
             assign_draft_cache_locs_contiguous_func(
                 batch.req_pool_indices,

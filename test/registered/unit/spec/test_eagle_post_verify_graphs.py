@@ -13,10 +13,13 @@ the fused chain a replay takes and accept the forced lengths. With the NVIDIA
 megakernel's fused chain acceptance, eagle_sample's tail (greedy check, injected
 acceptance, accept lengths) must leave every output bitwise as the unfused tail does,
 greedy, compact top-k and dense sampled, at batch sizes up to 64, and the graphs must
-still match eager sampling."""
+still match eager sampling. On CPU too: the pool presize (its own switch) is sized for
+the largest decode-graph batch and taken once, inside the first capture before its
+body."""
 
+import random
 import unittest
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +27,7 @@ import torch
 
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -33,7 +37,9 @@ from sglang.srt.speculative import (
     eagle_utils,
     eagle_worker_common,
     eagle_worker_v2,
+    post_verify_late_join,
     spec_utils,
+    staged_next_draft,
 )
 from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
 from sglang.srt.speculative.eagle_utils import compact_verify_max_top_k, eagle_sample
@@ -276,6 +282,261 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertIsNone(worker._post_verify_graphs)
                 self.assertIsNone(worker._simulated_acc_len_rng)
 
+    def test_graph_key_bound_is_raised_only_under_the_runtime_master(self):
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        keys = envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS
+        for master_on, value, expected in (
+            (False, "512", 64),
+            (True, None, 64),
+            (True, "512", 512),
+        ):
+            with (
+                self.subTest(master=master_on, value=value),
+                master.override(master_on),
+            ):
+                with keys.override(value) if value else nullcontext():
+                    self.assertEqual(
+                        eagle_post_verify_graphs._max_graph_keys(), expected
+                    )
+
+    def test_pool_presize_is_on_under_its_switch(self):
+        """SGLANG_OPT_POST_VERIFY_POOL_PRESIZE (follows the runtime master) hands the
+        graphs a presize for the pool's first capture; off, the pool grows per key."""
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        child = envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE
+        for master_on, value, expected in (
+            (False, None, False),
+            (True, None, True),
+            (True, "0", False),
+            (False, "1", False),
+        ):
+            with (
+                self.subTest(master=master_on, value=value),
+                master.override(master_on),
+                # the fake target worker has no model config for the extend layout
+                envs.SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT.override("0"),
+                child.override(value) if value else nullcontext(),
+            ):
+                graphs = _worker(switch=True)._post_verify_graphs._graphs
+                self.assertIs(graphs.presize is not None, expected)
+
+    def test_pool_presize_is_the_largest_graph_batchs_sampling_scratch(self):
+        """Two fp32 [requests * tokens, vocab] buffers at the largest decode-graph batch
+        plus a 64 MiB margin; nothing when the device lacks that plus 1 GiB."""
+        nbytes = 2 * 128 * 4 * 248320 * 4 + (64 << 20)
+        size = eagle_post_verify_graphs.pool_presize_bytes
+        kwargs = dict(max_requests=128, tokens_per_request=4, vocab=248320)
+        self.assertEqual(size(free_bytes=nbytes + (1 << 30), **kwargs), nbytes)
+        self.assertEqual(size(free_bytes=nbytes + (1 << 30) - 1, **kwargs), 0)
+        owner = EaglePostVerifyGraphs.__new__(EaglePostVerifyGraphs)
+        owner._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(decode_cuda_graph_capture_bs=[1, 8, 96])
+        )
+        slot = SimpleNamespace(
+            num_requests=3, tokens_per_request=4, logits=torch.empty(12, 1000)
+        )
+        with (
+            patch.object(torch.cuda, "empty_cache") as empty_cache,
+            patch.object(torch.cuda, "mem_get_info", return_value=(1 << 40, 1 << 40)),
+        ):
+            got = owner._pool_presize_bytes(slot)
+        empty_cache.assert_called_once()
+        self.assertEqual(got, 2 * 96 * 4 * 1000 * 4 + (64 << 20))
+
+    def test_pool_presize_runs_once_inside_the_first_capture_before_the_body(self):
+        events = []
+        graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+            body=lambda slot: events.append(("body", slot.num_requests)) or ("out",),
+            commit=lambda slot, outputs: None,
+            sim_rng=torch.Generator(),
+        )
+        graphs.presize = lambda slot: events.append(("size", slot.num_requests)) or 4096
+        native_empty = torch.empty
+
+        def empty(*args, **kwargs):
+            if kwargs.get("dtype") is torch.uint8:
+                events.append(("presize", args[0]))
+            return native_empty(*args, **kwargs)
+
+        @contextmanager
+        def graph(*args, **kwargs):
+            events.append(("capture",))
+            yield
+
+        cuda = torch.cuda
+        with (
+            patch.object(cuda, "graph_pool_handle", return_value="pool"),
+            patch.object(cuda, "Stream", MagicMock),
+            patch.object(cuda, "Event", MagicMock),
+            patch.object(cuda, "CUDAGraph", MagicMock),
+            patch.object(cuda, "current_stream", MagicMock()),
+            patch.object(cuda, "graph", graph),
+            patch.object(torch, "empty", empty),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            for bs in (4, 9):
+                graphs._capture(SimpleNamespace(num_requests=bs, device="cpu"))
+        self.assertEqual(
+            events,
+            [
+                ("size", 4),
+                ("capture",),
+                ("presize", 4096),
+                ("body", 4),
+                ("capture",),
+                ("capture",),
+                ("body", 9),
+                ("capture",),
+            ],
+        )
+
+    def test_bonus_tokens_take_the_relay_dtype_only_under_their_switch(self):
+        """SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64: the graphs' commit-outputs launch
+        writes the bonus tokens as int64, the relay buffer's dtype, so the next round's
+        relay keeps them uncast; otherwise int32 as before."""
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        child = envs.SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64
+        for master_on, value, expected in (
+            (False, "1", torch.int32),
+            (True, None, torch.int64),
+            (True, "0", torch.int32),
+        ):
+            with (
+                self.subTest(master=master_on, value=value),
+                master.override(master_on),
+                child.override(value) if value else nullcontext(),
+            ):
+                self.assertIs(eagle_post_verify_graphs._bonus_dtype(), expected)
+        graphs = EaglePostVerifyGraphs(
+            target_worker=_target_worker(),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+        slot = SimpleNamespace(
+            staged={"seq_lens": torch.tensor([5])},
+            tokens_per_request=4,
+            track_interval=0,
+            next_draft=None,
+        )
+        for dtype in (torch.int32, torch.int64):
+            commit = MagicMock(return_value=(None, None, None, None))
+            with (
+                self.subTest(dtype=dtype),
+                patch.object(eagle_post_verify_graphs, "_BONUS_DTYPE", dtype),
+                patch.object(
+                    eagle_post_verify_graphs, "_sample", return_value=(1, 2, 3)
+                ),
+                patch(
+                    "sglang.kernels.ops.speculative.eagle."
+                    "prepare_verify_commit_outputs",
+                    commit,
+                ),
+            ):
+                graphs._body(slot)
+                self.assertIs(commit.call_args.kwargs["bonus_dtype"], dtype)
+
+    def test_the_draft_extend_takes_the_layout_the_graph_wrote(self):
+        """SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT: the graphs' commit-outputs launch
+        also writes the draft extend's layout (M-RoPE rows for an M-RoPE target), and
+        prepare_for_draft_extend lays the batch out from it when its M-RoPE choice is
+        the batch's, instead of its own launch; otherwise it launches as before."""
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        child = envs.SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT
+        for on, mrope in ((False, True), (True, False), (True, True)):
+            target = _target_worker()
+            target.model_runner.model_config = SimpleNamespace(model_is_mrope=mrope)
+            with master.override(True), child.override(on):
+                graphs = EaglePostVerifyGraphs(
+                    target_worker=target,
+                    simulated_acc_len_rng=simulated_acc_len_generator(0),
+                )
+            commit = MagicMock(return_value=(None, None, None, None))
+            slot = SimpleNamespace(
+                staged={"seq_lens": torch.tensor([5])},
+                tokens_per_request=4,
+                track_interval=0,
+                next_draft=None,
+            )
+            with (
+                self.subTest(on=on, mrope=mrope),
+                patch.object(
+                    eagle_post_verify_graphs, "_sample", return_value=(1, 2, 3)
+                ),
+                patch(
+                    "sglang.kernels.ops.speculative.eagle."
+                    "prepare_verify_commit_outputs",
+                    commit,
+                ),
+            ):
+                graphs._body(slot)
+                kwargs = commit.call_args.kwargs
+                self.assertEqual(kwargs["extend_layout"], on)
+                self.assertEqual(kwargs["extend_mrope"], on and mrope)
+
+        def layout(with_mrope):
+            return (
+                torch.zeros(2, dtype=torch.int32),
+                torch.full((2,), 4, dtype=torch.int32),
+                torch.tensor([21, 44]),
+                (
+                    torch.arange(8),
+                    torch.tensor([0, 4], dtype=torch.int32),
+                    torch.zeros((3, 8), dtype=torch.int64) if with_mrope else None,
+                ),
+            )
+
+        for prepared, batch_mrope, taken in (
+            (None, False, False),
+            (layout(True), False, False),
+            (layout(False), False, True),
+            (layout(True), True, True),
+        ):
+            # device lengths without host ones: the GPU-only layout path
+            seq_lens = MagicMock(is_cuda=True)
+            seq_lens.__len__.return_value = 2
+            batch = SimpleNamespace(
+                seq_lens=seq_lens,
+                seq_lens_cpu=None,
+                forward_mode=ForwardMode.DECODE,
+                multimodal_inputs=[None, None],
+                model_config=SimpleNamespace(vocab_size=100),
+            )
+            launch = MagicMock(return_value=layout(batch_mrope))
+            init_new = MagicMock(
+                return_value=SimpleNamespace(
+                    seq_lens=None, mark_forward_metadata_ready=MagicMock()
+                )
+            )
+            with (
+                self.subTest(prepared=prepared is not None, taken=taken),
+                patch.object(
+                    eagle_worker_common, "prepare_draft_extend_layout", launch
+                ),
+                patch.object(eagle_worker_common.ForwardBatch, "init_new", init_new),
+            ):
+                forward_batch = eagle_worker_common.prepare_for_draft_extend(
+                    SimpleNamespace(num_front_tokens=0, positions=None),
+                    batch,
+                    torch.zeros(8, dtype=torch.int64),
+                    4,
+                    SimpleNamespace(
+                        model_config=SimpleNamespace(model_is_mrope=batch_mrope),
+                        spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
+                    ),
+                    SimpleNamespace(can_run_graph=lambda fb: True),
+                    return_hidden_states_before_norm=False,
+                    prepared_layout=prepared,
+                )
+                self.assertEqual(launch.called, not taken)
+                used = prepared if taken else launch.return_value
+                self.assertIs(batch.prefix_lens, used[0])
+                self.assertIs(batch.extend_lens, used[1])
+                self.assertIs(forward_batch.seq_lens, used[2])
+                self.assertIs(
+                    init_new.call_args.kwargs["extend_position_info"], used[3]
+                )
+
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
         """The post-verify graphs skip the eager verify's cleanup of rejected c128
         draft states (DeepSeek-V4), so a KV pool that has one never reaches them;
@@ -413,6 +674,34 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertEqual(drawn, before)
         self.assertTrue(torch.equal(torch.get_rng_state(), state))
 
+    def test_predrawn_forced_lengths_are_the_single_draws(self):
+        """SGLANG_OPT_SPEC_SIM_ACC_LEN_PREDRAW: the lengths come from pre-drawn blocks of
+        the generator's exponentials, the same lengths in the same order as one
+        torch.multinomial per draw, across blocks and acceptance means."""
+        for acc_len, max_len in ((2.32, 4), (3.51, 4), (4.8, 7), (1.0, 4)):
+            ref_rng = simulated_acc_len_generator(5)
+            new_rng = simulated_acc_len_generator(5)
+            with patch.object(spec_utils, "_SIM_PREDRAW", False):
+                ref = [
+                    spec_utils.sample_simulated_acc_len(
+                        acc_len, "match-expected", max_len, generator=ref_rng
+                    )
+                    for _ in range(9000)
+                ]
+            spec_utils._SIM_STREAMS.clear()
+            try:
+                with patch.object(spec_utils, "_SIM_PREDRAW", True):
+                    new = [
+                        spec_utils.sample_simulated_acc_len(
+                            acc_len, "match-expected", max_len, generator=new_rng
+                        )
+                        for _ in range(9000)
+                    ]
+                self.assertIsNotNone(spec_utils._SIM_STREAMS[id(new_rng)][1])
+            finally:
+                spec_utils._SIM_STREAMS.clear()
+            self.assertEqual(new, ref, (acc_len, max_len))
+
     def test_compact_top_k_sampling_takes_only_batches_of_finite_top_k(self):
         """With SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING a verify samples on the
         top-k support when every request has a finite top-k within the compact
@@ -539,13 +828,359 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertEqual(int(staged["sim_accept_len"]), 3)
 
 
+def _round_cpu(bs):
+    """A greedy chain verify round's batch and verify input on the CPU, for the host
+    side of the graphs."""
+    width = 4
+    batch = SimpleNamespace(
+        device="cpu",
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        seq_lens=torch.arange(16, 16 + bs),
+        req_pool_indices=torch.arange(bs),
+        sampling_info=SimpleNamespace(
+            is_all_greedy=True, need_top_k_sampling=False, need_top_p_sampling=False
+        ),
+        mamba_track_indices=None,
+        tree_cache=SimpleNamespace(page_size=64),
+        return_logprob=False,
+    )
+    verify_input = SimpleNamespace(
+        draft_token=torch.zeros(bs * width, dtype=torch.int64),
+        draft_token_num=width,
+        max_tree_depth=width,
+        retrieve_index=torch.zeros((bs, width), dtype=torch.int64),
+        retrieve_next_token=torch.zeros((bs, width), dtype=torch.int64),
+        retrieve_next_sibling=torch.zeros((bs, width), dtype=torch.int64),
+    )
+    return batch, verify_input, None
+
+
+def _runner_buffers(max_bs=8, steps=3):
+    return SimpleNamespace(
+        seq_lens=torch.zeros(max_bs, dtype=torch.int64),
+        positions=torch.zeros(max_bs, dtype=torch.int64),
+        mrope_positions=torch.zeros((3, max_bs), dtype=torch.int64),
+        out_cache_loc=torch.zeros(max_bs * steps, dtype=torch.int64),
+    )
+
+
+def _decode_batch(slots, *, allocated=64, committed=40):
+    return SimpleNamespace(
+        reqs=[
+            SimpleNamespace(
+                kv=SimpleNamespace(
+                    req_pool_idx=slot,
+                    kv_allocated_len=allocated,
+                    kv_committed_len=committed,
+                )
+            )
+            for slot in slots
+        ]
+    )
+
+
+class TestStagedNextDraft(CustomTestCase):
+    """SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT on CPU: the graphs' staging, which rounds take
+    it, the draft preparation that takes it, and the reserve it needs."""
+
+    def test_the_graphs_stage_the_next_draft_once_enabled(self):
+        """Enabled, a slot holds views of the draft graph runner's inputs and its own
+        write window, its body stages them from the round's new lengths and request
+        slots, and run() hands the run slot's staging on; otherwise none of it."""
+        rb = _runner_buffers()
+        new_seq_lens = torch.tensor([20, 31])
+        for enabled in (False, True):
+            graphs = EaglePostVerifyGraphs(
+                target_worker=_target_worker(),
+                simulated_acc_len_rng=simulated_acc_len_generator(0),
+            )
+            graphs._stages_state_slots = False  # no recurrent state in this double
+            if enabled:
+                graphs.enable_staged_next_draft(
+                    num_steps=3,
+                    window=4,
+                    seq_len_fill_value=1,
+                    mrope=True,
+                    req_to_token=torch.zeros((4, 64), dtype=torch.int32),
+                    runner_buffers=rb,
+                )
+            batch, verify_input, _ = _round_cpu(bs=2)
+            slot = graphs._make_slot(
+                {"seq_lens": batch.seq_lens, "req_pool_indices": torch.tensor([3, 1])},
+                batch,
+                verify_input,
+                SimpleNamespace(
+                    next_token_logits=torch.zeros(1),
+                    next_token_logits_vocab_shard=None,
+                ),
+            )
+            stage = MagicMock()
+            with (
+                self.subTest(enabled=enabled),
+                patch.object(
+                    eagle_post_verify_graphs, "_sample", return_value=(1, 2, 3)
+                ),
+                patch(
+                    "sglang.kernels.ops.speculative.eagle."
+                    "prepare_verify_commit_outputs",
+                    return_value=(new_seq_lens, None, None, None),
+                ),
+                patch.object(staged_next_draft, "prepare_draft_window", stage),
+            ):
+                graphs._body(slot)
+                self.assertEqual(stage.called, enabled)
+                if enabled:
+                    nd = slot.next_draft
+                    self.assertEqual(nd.num_requests, 2)
+                    for view, buf in (
+                        (nd.seq_lens, rb.seq_lens),
+                        (nd.positions, rb.positions),
+                        (nd.mrope, rb.mrope_positions),
+                        (nd.draft_out_cache_loc, rb.out_cache_loc),
+                    ):
+                        self.assertEqual(view.data_ptr(), buf.data_ptr())
+                    self.assertEqual(tuple(nd.mrope.shape), (3, 2))
+                    self.assertEqual(nd.draft_out_cache_loc.numel(), 6)
+                    self.assertEqual(nd.window.numel(), 8)
+                    args, kwargs = stage.call_args
+                    self.assertTrue(torch.equal(args[0], torch.tensor([3, 1])))
+                    self.assertIs(args[1], new_seq_lens)
+                    self.assertIs(kwargs["write_virtual"], nd.window)
+                    self.assertIs(kwargs["seq_lens_out"], nd.seq_lens)
+                    self.assertEqual((kwargs["num_steps"], kwargs["window"]), (3, 4))
+                else:
+                    self.assertIsNone(slot.next_draft)
+            outputs = tuple(range(6))
+            with (
+                patch.object(graphs, "_key", return_value=("key",)),
+                patch.object(graphs._graphs, "run", return_value=outputs),
+            ):
+                graphs._graphs.last_slot = slot
+                self.assertIs(
+                    graphs.run(
+                        batch=batch,
+                        verify_input=verify_input,
+                        logits_output=None,
+                        can_run_cuda_graph=True,
+                    ),
+                    outputs,
+                )
+                self.assertIs(graphs.next_draft, slot.next_draft)
+            with patch.object(graphs, "_key", return_value=None):
+                graphs.run(
+                    batch=batch,
+                    verify_input=verify_input,
+                    logits_output=None,
+                    can_run_cuda_graph=False,
+                )
+                self.assertIsNone(graphs.next_draft)
+
+    def test_a_round_takes_the_staging_only_when_it_still_holds(self):
+        """The previous decode round's staging is taken only by the same requests in
+        the same order, at a captured size, with the next window allocated (three
+        windows past the committed length), and once a post-verify graph staged it."""
+        staging = object()
+        tracker = staged_next_draft.StagedDraftTracker(width=4, graph_sizes=[1, 2])
+        cases = (
+            # (noted batch, next round's batch, staging, expected reason)
+            (None, _decode_batch([3]), staging, "no_previous_decode"),
+            (_decode_batch([3, 5]), _decode_batch([5, 3]), staging, "batch_changed"),
+            (_decode_batch([3, 5, 7]), _decode_batch([3, 5, 7]), staging, "padded"),
+            (
+                _decode_batch([3], allocated=51, committed=40),
+                _decode_batch([3]),
+                staging,
+                "window_not_allocated",
+            ),
+            (
+                _decode_batch([3]),
+                _decode_batch([3]),
+                None,
+                "not_staged_by_post_verify_graph",
+            ),
+            (
+                _decode_batch([3], allocated=52, committed=40),
+                _decode_batch([3]),
+                staging,
+                "staged",
+            ),
+        )
+        for noted, batch, nd, reason in cases:
+            with self.subTest(reason=reason):
+                if noted is None:
+                    tracker.forget()
+                else:
+                    tracker.note_extend(noted, nd)
+                before = tracker.counts[reason]
+                got = tracker.count_draft(batch)
+                self.assertIs(got, staging if reason == "staged" else None)
+                self.assertEqual(tracker.counts[reason], before + 1)
+                # consumed: the next round has no note until the next decode round's end
+                self.assertIsNone(tracker.noted)
+        tracker.note_extend(_decode_batch([3]), staging)
+        tracker.forget()
+        self.assertIsNone(tracker.count_draft(_decode_batch([3])))
+
+    def test_a_staged_round_takes_the_lengths_its_staging_came_from(self):
+        """SGLANG_OPT_SPEC_STAGED_SEQ_LENS: before a decode round's resolve, a round that
+        will take its staging takes the lengths the previous round published, without
+        consuming the note; any other round, a prefill, or no worker staging, gathers."""
+        staging, lengths = object(), torch.tensor([52])
+        tracker = staged_next_draft.StagedDraftTracker(width=4, graph_sizes=[1])
+        tracker.note_extend(_decode_batch([3], allocated=52), staging, lengths)
+        self.assertIsNone(tracker.take_seq_lens(_decode_batch([4])))
+        self.assertIs(tracker.take_seq_lens(_decode_batch([3])), lengths)
+        self.assertIs(tracker.count_draft(_decode_batch([3])), staging)
+        self.assertEqual(tracker.seq_lens_taken_ct, 1)
+        tracker.note_extend(_decode_batch([3], allocated=52), staging, None)
+        self.assertIsNone(tracker.take_seq_lens(_decode_batch([3])))
+
+        worker = eagle_worker_v2.EAGLEWorkerV2.__new__(eagle_worker_v2.EAGLEWorkerV2)
+        decode = _decode_batch([3])
+        decode.forward_mode = ForwardMode.DECODE
+        prefill = _decode_batch([3])
+        prefill.forward_mode = ForwardMode.EXTEND
+        self.assertIsNone(worker.take_staged_seq_lens(decode))
+        worker._staged_draft = tracker
+        tracker.note_extend(_decode_batch([3], allocated=52), staging, lengths)
+        self.assertIsNone(worker.take_staged_seq_lens(prefill))
+        self.assertIs(worker.take_staged_seq_lens(decode), lengths)
+
+    def test_a_slot_about_to_replay_must_not_hold_the_batch_lengths(self):
+        """Lengths taken from a slot's output are read through the whole round, so a
+        replay of that very slot is refused; the other slot's replay is fine."""
+        held, other = torch.tensor([20]), torch.tensor([20])
+        slot = SimpleNamespace(outputs=(None, None, None, held))
+        eagle_post_verify_graphs._check_lengths_outlive(slot, other)
+        with self.assertRaises(RuntimeError):
+            eagle_post_verify_graphs._check_lengths_outlive(slot, held)
+
+    def test_the_draft_takes_a_fitting_staging_instead_of_its_launch(self):
+        """prepare_for_draft takes a staging of this batch's size and M-RoPE choice
+        for a round that plans its window: the window and positions are the staged
+        buffers and the slot / position launch does not run; any other staging, or
+        none, leaves the stock launch."""
+        bs, steps, width = 2, 3, 4
+        staging = staged_next_draft.make_next_draft(
+            num_requests=bs,
+            num_steps=steps,
+            window=width,
+            mrope=False,
+            runner_buffers=_runner_buffers(),
+        )
+        mismatched = staged_next_draft.make_next_draft(
+            num_requests=bs + 1,
+            num_steps=steps,
+            window=width,
+            mrope=False,
+            runner_buffers=_runner_buffers(),
+        )
+        for staged, taken, draft_locs in (
+            (None, False, True),
+            (mismatched, False, True),
+            (staging, True, False),
+            (staging, True, True),
+        ):
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                seq_lens=torch.tensor([17, 40]),
+                seq_lens_cpu=None,
+                req_pool_indices=torch.tensor([3, 1]),
+                multimodal_inputs=[None, None],
+                token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
+                device="cpu",
+                out_cache_loc=None,
+            )
+            iteration_ids = MagicMock()
+            translator = SimpleNamespace(plan=MagicMock(return_value=iteration_ids))
+            draft_runner = SimpleNamespace(
+                model_config=SimpleNamespace(model_is_mrope=False),
+                spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
+            )
+            launch = MagicMock()
+            init_new = MagicMock(return_value=SimpleNamespace())
+            with (
+                self.subTest(
+                    staged=staged is not None, taken=taken, draft_locs=draft_locs
+                ),
+                patch.object(eagle_worker_common, "_is_cpu", False),
+                patch.object(eagle_worker_common, "_STAGED_DRAFT_LOCS", draft_locs),
+                patch.object(
+                    eagle_worker_common,
+                    "assign_draft_cache_locs_contiguous_func",
+                    launch,
+                ),
+                patch.object(eagle_worker_common.ForwardBatch, "init_new", init_new),
+            ):
+                draft_input = SimpleNamespace()
+                _, _, plan = eagle_worker_common.prepare_for_draft(
+                    draft_input,
+                    SimpleNamespace(req_to_token=torch.zeros((4, 64))),
+                    batch,
+                    None,
+                    draft_runner,
+                    1,
+                    steps,
+                    target_translator=translator,
+                    num_draft_tokens=width,
+                    staged=staged,
+                )
+                self.assertEqual(launch.called, not taken)
+                self.assertIs(plan, iteration_ids)
+                # SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS: the draft steps' slots as staged
+                if taken and draft_locs:
+                    iteration_ids.take_staged_cols.assert_called_once_with(
+                        slice(0, steps), staging.draft_out_cache_loc
+                    )
+                else:
+                    iteration_ids.take_staged_cols.assert_not_called()
+                self.assertIs(
+                    translator.plan.call_args.kwargs["write_virtual"],
+                    batch.out_cache_loc,
+                )
+                if taken:
+                    self.assertIs(batch.out_cache_loc, staging.window)
+                    self.assertIs(draft_input.positions, staging.positions)
+                else:
+                    self.assertEqual(batch.out_cache_loc.numel(), bs * width)
+
+    def test_a_chain_eagle_draft_reserves_a_third_window_under_the_switch(self):
+        from sglang.srt.mem_cache import allocation_sizing
+
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        child = envs.SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT
+        for algo, topk, master_on, value, windows in (
+            ("NEXTN", 1, False, None, 2),
+            ("NEXTN", 1, True, "0", 2),
+            ("NEXTN", 1, True, None, 3),
+            ("EAGLE", 1, True, "1", 3),
+            ("EAGLE", 2, True, "1", 2),
+            ("DFLASH", 1, True, "1", 2),
+        ):
+            spec = SimpleNamespace(
+                speculative_algorithm=algo, speculative_eagle_topk=topk
+            )
+            with (
+                self.subTest(algo=algo, topk=topk, master=master_on, value=value),
+                master.override(master_on),
+                child.override(value) if value else nullcontext(),
+                patch.object(allocation_sizing, "get_spec", return_value=spec),
+                patch.object(
+                    allocation_sizing, "get_alloc_len_per_decode", return_value=4
+                ),
+            ):
+                self.assertEqual(
+                    allocation_sizing.get_alloc_reserve_per_decode(), 4 * windows
+                )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestPostVerifyGraphsMatchEager(CustomTestCase):
     def setUp(self):
         publish(ServerArgs(model_path="dummy"), role="test")
         self.addCleanup(reset_context)
 
-    def _check(self, *, sim_acc_len, fused=False):
+    def _check(self, *, sim_acc_len, fused=False, stage=False, extend_layout=False):
         # the worker's forced lengths, drawn by its graphs and its eager rounds alike;
         # the all-eager reference draws the same stream from its own generator
         worker_rng = simulated_acc_len_generator(0)
@@ -556,7 +1191,38 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
             ),
             simulated_acc_len_rng=worker_rng,
         )
+        # SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT, with M-RoPE rows
+        graphs._extend_layout = graphs._extend_mrope = extend_layout
         generator = torch.Generator(device="cuda").manual_seed(0)
+        if stage:
+            # SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT into a draft runner's static inputs
+            max_bs = max(BATCH_SIZES)
+            rb = SimpleNamespace(
+                seq_lens=torch.zeros(max_bs, dtype=torch.int64, device="cuda"),
+                positions=torch.zeros(max_bs, dtype=torch.int64, device="cuda"),
+                mrope_positions=torch.zeros(
+                    (3, max_bs), dtype=torch.int64, device="cuda"
+                ),
+                out_cache_loc=torch.zeros(
+                    max_bs * (TOKENS - 1), dtype=torch.int64, device="cuda"
+                ),
+            )
+            req_to_token = torch.randint(
+                0,
+                1 << 20,
+                (max_bs, 1024),
+                dtype=torch.int32,
+                device="cuda",
+                generator=generator,
+            )
+            graphs.enable_staged_next_draft(
+                num_steps=TOKENS - 1,
+                window=TOKENS,
+                seq_len_fill_value=1,
+                mrope=True,
+                req_to_token=req_to_token,
+                runner_buffers=rb,
+            )
         stream = torch.cuda.Stream()
         forced = []
         with (
@@ -624,6 +1290,10 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                             want[1:5],
                         ):
                             self.assertTrue(torch.equal(g, w), name)
+                        if stage:
+                            self._check_staging(graphs, batch, want[3], req_to_token)
+                        if extend_layout and graphed:
+                            self._check_extend_layout(got[5], batch.seq_lens)
                         # the host may still read a round's outputs in the next round
                         if previous is not None:
                             for kept, snapshot in zip(*previous):
@@ -634,8 +1304,59 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
             self.assertEqual(set(forced), {4, 5})
             self.assertAlmostEqual(sum(forced) / len(forced), sim_acc_len, delta=0.25)
 
+    def _check_staging(self, graphs, batch, new_seq_lens, req_to_token):
+        """The staged next draft equals what the stock draft launch writes for the
+        new lengths; a round the graphs did not run staged nothing."""
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_draft_cache_locs_contiguous_func,
+        )
+
+        nd = graphs.next_draft
+        if nd is None:
+            return
+        bs = len(new_seq_lens)
+        window = torch.empty(bs * TOKENS, dtype=torch.int64, device="cuda")
+        positions = torch.empty(bs, dtype=torch.int64, device="cuda")
+        mrope = torch.empty((3, bs), dtype=torch.int64, device="cuda")
+        assign_draft_cache_locs_contiguous_func(
+            batch.req_pool_indices,
+            req_to_token,
+            new_seq_lens,
+            window,
+            1,
+            TOKENS,
+            positions=positions,
+            mrope=mrope,
+        )
+        steps = window.view(bs, TOKENS)[:, : TOKENS - 1].reshape(-1)
+        for name, staged, stock in (
+            ("window", nd.window, window),
+            ("seq_lens", nd.seq_lens, new_seq_lens),
+            ("positions", nd.positions, positions),
+            ("mrope", nd.mrope, mrope),
+            ("draft_out_cache_loc", nd.draft_out_cache_loc, steps),
+        ):
+            self.assertTrue(torch.equal(staged, stock.to(staged.dtype)), name)
+
     def test_greedy(self):
         self._check(sim_acc_len=-1.0)
+
+    def _check_extend_layout(self, draft_extend_inputs, seq_lens):
+        """The layout the commit-outputs launch wrote equals the draft extend's own."""
+        from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_layout
+
+        got = draft_extend_inputs[3]
+        want = prepare_draft_extend_layout(seq_lens, TOKENS, True)
+        for name, g, w in zip(("prefix", "extend", "post"), got[:3], want[:3]):
+            self.assertTrue(g.dtype == w.dtype and torch.equal(g, w), name)
+        for name, g, w in zip(("positions", "starts", "mrope"), got[3], want[3]):
+            self.assertTrue(g.dtype == w.dtype and torch.equal(g, w), name)
+
+    def test_greedy_with_the_extend_layout(self):
+        self._check(sim_acc_len=-1.0, extend_layout=True)
+
+    def test_greedy_with_the_staged_next_draft(self):
+        self._check(sim_acc_len=-1.0, stage=True)
 
     def test_forced_acceptance(self):
         self._check(sim_acc_len=4.8)
@@ -850,6 +1571,229 @@ class TestFusedAcceptMatchesUnfused(CustomTestCase):
                         )
                 for stock, optimized in zip(*outputs):
                     self.assertTrue(torch.equal(stock, optimized))
+
+
+class _LateJoinGpu:
+    """A fake GPU timeline: commit ``n`` is the n-th side-stream replay; commits <= ``completed`` have finished."""
+
+    def __init__(self):
+        self.pending = 0
+        self.completed = 0
+        self.waits = []  # the commit sequence each stream wait covers
+
+
+class _LateJoinEvent:
+    gpu = None
+
+    def __init__(self):
+        self.seq = None
+
+    def record(self, stream=None):
+        self.seq = _LateJoinEvent.gpu.pending
+
+    def query(self):
+        return self.seq is None or self.seq <= _LateJoinEvent.gpu.completed
+
+    def synchronize(self):
+        _LateJoinEvent.gpu.completed = max(_LateJoinEvent.gpu.completed, self.seq)
+
+
+class _LateJoinStream:
+    def wait_event(self, event):
+        _LateJoinEvent.gpu.waits.append(event.seq)
+
+
+def _late_join_fake_cuda(gpu):
+    _LateJoinEvent.gpu = gpu
+    stack = ExitStack()
+    stack.enter_context(patch.object(torch.cuda, "Event", _LateJoinEvent))
+    stream = _LateJoinStream()
+    stack.enter_context(patch.object(torch.cuda, "current_stream", lambda *a: stream))
+    return stack
+
+
+def _late_join_schedule(seed, *, active, size=64, steps=400):
+    """A serving-like schedule of commits, frees of finished rows, group and direct allocations and GPU progress.
+
+    Returns (hand-outs of a slot a running commit still writes without a covering wait, hand-outs that waited
+    needlessly, total waits, the slot order)."""
+    rng = random.Random(seed)
+    gpu = _LateJoinGpu()
+    graphs = SimpleNamespace(
+        _commit_pending=False, _commit_done=_LateJoinEvent(), _side_stream=None
+    )
+    misses = needless = 0
+    order = []
+    with (
+        _late_join_fake_cuda(gpu),
+        patch.object(post_verify_late_join, "_graphs", graphs if active else None),
+    ):
+        alloc = MambaSlotAllocator(size=size, device="cpu")
+        live, written_by, freed_under = set(), {}, {}
+
+        def hand_out(slot, waits_before):
+            nonlocal misses, needless
+            order.append(slot)
+            seq = freed_under.pop(slot, 0)
+            running = seq > gpu.completed
+            covered = any(w is not None and w >= seq for w in gpu.waits[waits_before:])
+            misses += running and not covered
+            needless += not running and len(gpu.waits) > waits_before
+            live.add(slot)
+
+        for _ in range(steps):
+            if live:  # a decode pass: the commit replays over the batch's slots
+                gpu.pending += 1
+                graphs._commit_pending = True
+                graphs._commit_done.seq = gpu.pending
+                for slot in live:
+                    written_by[slot] = gpu.pending
+            for slot in [
+                s for s in sorted(live) if rng.random() < 0.08
+            ]:  # finished rows
+                live.discard(slot)
+                freed_under[slot] = written_by.get(slot, 0)
+                alloc.free(torch.tensor([slot]))
+            if rng.random() < 0.5:
+                gpu.completed = max(gpu.completed, gpu.pending - rng.choice([0, 0, 1]))
+            if rng.random() < 0.6:
+                n = rng.randint(1, 6)
+                alloc.alloc_group_begin(n)
+                for _ in range(rng.randint(0, n + 1)):
+                    waits_before = len(gpu.waits)
+                    got = alloc.alloc(1)
+                    if got is None:
+                        break
+                    hand_out(int(got[0]), waits_before)
+                alloc.alloc_group_end()
+            if rng.random() < 0.4 and alloc.available_size() >= 2:
+                waits_before = len(gpu.waits)
+                for slot in alloc.alloc(rng.choice([1, 2])).tolist():
+                    hand_out(slot, waits_before)
+            if rng.random() < 0.3:  # the next verify joined
+                graphs._commit_pending = False
+            if rng.random() < 0.05:
+                gpu.completed = gpu.pending
+    return misses, needless, len(gpu.waits), order
+
+
+class TestPostVerifyLateJoin(CustomTestCase):
+    def test_no_slot_reaches_a_new_owner_before_its_commit(self):
+        """A finished row's slot is freed while its commit may still run; whoever takes it next must wait first.
+        Inactive, the allocator hands out the same slots in the same order and never waits."""
+        total_waits = 0
+        for seed in range(150):
+            misses, needless, waits, order_on = _late_join_schedule(seed, active=True)
+            self.assertEqual(misses, 0, seed)
+            total_waits += waits
+            _, _, waits_off, order_off = _late_join_schedule(seed, active=False)
+            self.assertEqual(waits_off, 0, seed)
+            self.assertEqual(order_on, order_off, seed)
+        self.assertGreater(total_waits, 0)  # the schedules do exercise the guard
+
+    def _refusal(self, **overrides):
+        shape = dict(
+            mode="null",
+            tp=1,
+            pp=1,
+            no_overlap=False,
+            unified=False,
+            int8=False,
+            extra=True,
+        )
+        shape.update(overrides)
+        ns = SimpleNamespace
+        getters = dict(
+            get_disagg=lambda: ns(disaggregation_mode=shape["mode"]),
+            get_parallel=lambda: ns(tp_size=shape["tp"], pp_size=shape["pp"]),
+            get_schedule=lambda: ns(disable_overlap_schedule=shape["no_overlap"]),
+            get_memory=lambda: ns(enable_unified_memory=shape["unified"]),
+            get_exec=lambda: ns(
+                mamba=ns(
+                    enable_int8_mamba_checkpoint=shape["int8"],
+                    enable_mamba_extra_buffer=shape["extra"],
+                )
+            ),
+        )
+        with ExitStack() as stack:
+            for name, fn in getters.items():
+                stack.enter_context(patch(f"sglang.srt.runtime_context.{name}", fn))
+            return post_verify_late_join.late_join_refusal()
+
+    def test_only_the_guarded_shape_is_accepted(self):
+        self.assertIsNone(self._refusal())
+        for overrides in (
+            dict(mode="decode"),
+            dict(mode="prefill"),
+            dict(tp=2),
+            dict(pp=2),
+            dict(no_overlap=True),
+            dict(unified=True),
+            dict(int8=True),
+            dict(extra=False),
+        ):
+            self.assertIsNotNone(self._refusal(**overrides), overrides)
+
+    def test_wait_orders_and_keeps_the_join_sync_finishes_it(self):
+        gpu = _LateJoinGpu()
+        with _late_join_fake_cuda(gpu):
+            graphs = SimpleNamespace(
+                _commit_pending=False, _commit_done=_LateJoinEvent(), _side_stream=None
+            )
+            with patch.object(post_verify_late_join, "_graphs", None):
+                self.assertFalse(
+                    post_verify_late_join.wait("x") or post_verify_late_join.sync("x")
+                )
+            with patch.object(post_verify_late_join, "_graphs", graphs):
+                # nothing pending
+                self.assertFalse(
+                    post_verify_late_join.wait("x") or post_verify_late_join.sync("x")
+                )
+                gpu.pending = 5
+                graphs._commit_done.seq = 5
+                graphs._commit_pending = True
+                d2h = _LateJoinStream()
+                self.assertTrue(post_verify_late_join.wait("hicache_write", stream=d2h))
+                self.assertEqual(gpu.waits[-1], 5)
+                self.assertTrue(
+                    graphs._commit_pending
+                )  # the forward stream still joins
+                self.assertTrue(post_verify_late_join.sync("idle_pass"))
+                self.assertEqual(gpu.completed, 5)
+                self.assertFalse(graphs._commit_pending)
+                self.assertFalse(post_verify_late_join.sync("idle_pass"))
+
+    def test_the_switch_moves_the_join_only_when_the_guard_accepts(self):
+        """SGLANG_OPT_POST_VERIFY_LATE_JOIN (opt-in, under the runtime master): accepted, the worker joins before
+        the verify instead of after the draft extend and presizes the pool; refused or off, the early join stays."""
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        for value, refusal, expected in (
+            (None, None, False),
+            ("1", None, True),
+            ("1", "tp=2 pp=1", False),
+        ):
+            with (
+                self.subTest(value=value, refusal=refusal),
+                master.override(True),
+                envs.SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT.override("0"),
+                envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE.override("0"),
+                envs.SGLANG_OPT_POST_VERIFY_LATE_JOIN.override(value)
+                if value
+                else nullcontext(),
+                patch.object(
+                    post_verify_late_join, "late_join_refusal", return_value=refusal
+                ),
+                patch.object(post_verify_late_join, "_graphs", None),
+            ):
+                worker = _worker(switch=True)
+                self.assertIs(worker._late_join, expected)
+                self.assertIs(post_verify_late_join._graphs is not None, expected)
+                self.assertIs(
+                    worker._post_verify_graphs._graphs.presize is not None, expected
+                )
+                with patch.object(worker._post_verify_graphs, "join") as join:
+                    _verify_kwargs(worker)
+                self.assertEqual(join.call_count, int(expected))
 
 
 if __name__ == "__main__":

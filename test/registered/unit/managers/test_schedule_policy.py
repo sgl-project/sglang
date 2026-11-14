@@ -1,7 +1,9 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
@@ -181,6 +183,96 @@ class TestShortestPrefillFirst(CustomTestCase):
         self.policy._sort_by_shortest_prefill(queue, set(), processed_tokens=0)
         self.assertEqual(queue, [short, replay])
 
+    def make_aged_policy(self, rounds, cap=False):
+        with (
+            envs.SGLANG_SPF_AGE_ROUNDS.override(rounds),
+            envs.SGLANG_SPF_AGE_CAP.override(cap),
+        ):
+            self.setUp()
+
+    def sort_rounds(self, queue, n, chunked_prefill_size=4096):
+        schedule = SimpleNamespace(chunked_prefill_size=chunked_prefill_size)
+        with (
+            patch.object(self.policy, "_compute_prefix_matches", return_value=set()),
+            patch(
+                "sglang.srt.managers.schedule_policy.get_schedule",
+                return_value=schedule,
+            ),
+        ):
+            for _ in range(n):
+                queue = self.policy.calc_priority(queue)
+        return [req.rid for req in queue]
+
+    def test_aging_is_off_by_default(self):
+        queue = [self.make_req("long", 8192), self.make_req("short", 32)]
+        self.assertEqual(self.sort_rounds(queue, 4), ["short", "long"])
+
+    def test_aged_request_goes_first_oldest_first(self):
+        self.make_aged_policy(2)
+        old = self.make_req("old", 8192)
+        older = self.make_req("older", 16384)
+        self.sort_rounds([older, self.make_req("s1", 32)], 1)
+        self.sort_rounds([older, old, self.make_req("s2", 32)], 1)
+        # "older" has waited three formations, "old" two.
+        self.assertEqual(
+            self.sort_rounds([old, self.make_req("s3", 32), older], 1),
+            ["older", "s3", "old"],
+        )
+        self.assertEqual(
+            self.sort_rounds([old, self.make_req("s4", 32), older], 1),
+            ["older", "old", "s4"],
+        )
+
+    def test_aging_forgets_admitted_requests(self):
+        self.make_aged_policy(1)
+        long = self.make_req("long", 8192)
+        short = self.make_req("short", 32)
+        self.sort_rounds([long, short], 1)
+        self.sort_rounds([short], 1)
+        self.assertEqual(self.sort_rounds([long, short], 1), ["short", "long"])
+
+    def test_age_cap_sorts_an_aged_request_as_one_budget(self):
+        self.make_aged_policy(1, cap=True)
+        aged = self.make_req("aged", 16384)
+        short = self.make_req("short", 32)
+        budget = self.make_req("budget", 4096)
+        young = self.make_req("young", 8192)
+        self.sort_rounds([aged], 1)
+        # aged ties with "budget" at 4096 and goes first; younger long work waits.
+        self.assertEqual(
+            self.sort_rounds([young, aged, budget, short], 1),
+            ["short", "aged", "budget", "young"],
+        )
+        # Without a chunked-prefill budget there is nothing to cap at.
+        self.assertEqual(
+            self.sort_rounds([young, aged, short], 1, chunked_prefill_size=None)[0],
+            "aged",
+        )
+
+    def count_matches(self, rounds, every, prefix_len=4096):
+        with envs.SGLANG_SPF_MATCH_EVERY.override(every):
+            self.setUp()
+        queue = [self.make_req("a", 32), self.make_req("b", 64)]
+        for req in queue:
+            req.prefix_len = prefix_len
+        with patch(
+            "sglang.srt.managers.schedule_policy.match_kv_cache"
+        ) as match_kv_cache:
+            for _ in range(rounds):
+                self.policy._compute_prefix_matches(
+                    queue, CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+                )
+        return match_kv_cache.call_count
+
+    def test_prefix_rematch_every_n_formations(self):
+        self.assertEqual(self.count_matches(4, every=0), 8)
+        # Matched in rounds 1 and 4 only.
+        self.assertEqual(self.count_matches(4, every=3), 4)
+
+    def test_short_prefixes_are_always_rematched(self):
+        # In-batch prefix caching needs a fresh match for short prefixes.
+        self.assertEqual(self.count_matches(4, every=3, prefix_len=0), 8)
+
     def test_chunk_limit_reserves_complete_short_prefills(self):
         continuation = self.make_req("continuation", 16384)
         waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
@@ -228,6 +320,39 @@ class TestShortestPrefillFirst(CustomTestCase):
                         continuation, waiting, budget, 256, processed_tokens=0
                     )
                 )
+
+    def test_chunk_floor_keeps_a_share_of_the_budget(self):
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 1024), self.make_req("b", 2048)]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, processed_tokens=0
+            ),
+            1024,
+        )
+        with envs.SGLANG_SPF_CHUNK_MIN_PCT.override(50):
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, 4096, 256, processed_tokens=0
+                ),
+                3072,
+            )
+
+    def test_chunk_floor_skips_requests_not_shorter_than_the_chunk(self):
+        continuation = self.make_req("continuation", 4096)
+        waiting = [self.make_req("aged", 8192), self.make_req("short", 512)]
+        self.assertIsNone(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, processed_tokens=0
+            )
+        )
+        with envs.SGLANG_SPF_CHUNK_MIN_PCT.override(25):
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, 4096, 256, processed_tokens=0
+                ),
+                3584,
+            )
 
     def test_other_policy_keeps_normal_chunk_limit(self):
         self.policy.policy = CacheAwarePolicy.HRRN

@@ -310,7 +310,7 @@ def _host_pool_recorders():
 
 
 class TestHostStack(CustomTestCase):
-    def _build(self, name, *, backend):
+    def _build(self, name, *, backend, hicache_size=0):
         bundle = _bundle(name)
         allocator = bundle.token_to_kv_pool_allocator
         # The tree's components, numbered as the storage's slots number them.
@@ -330,7 +330,7 @@ class TestHostStack(CustomTestCase):
         )
         memory = SimpleNamespace(
             hicache_ratio=2.0,
-            hicache_size=0,
+            hicache_size=hicache_size,
             hicache_mem_layout="page_first",
             hicache_storage_backend=backend,
             hicache_write_policy="write_through",
@@ -424,6 +424,33 @@ class TestHostStack(CustomTestCase):
                     self.assertEqual(entry.device_translate, expected[sub_pool])
                     self.assertEqual(entry.device_translate, storage.host_ids(sub_pool))
                 self.assertEqual(seen, set(storage.sub_pool_names()))
+
+    def _host_sizes(self, pinned, master=True):
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+            envs.SGLANG_HICACHE_MAMBA_SIZE_GB.override(pinned),
+        ):
+            result, _, _ = self._build("mamba", backend=None, hicache_size=10)
+        return {
+            name: entry.host_pool.host_size
+            for name, entry in result.host_pool_group.entry_map.items()
+        }
+
+    def test_pinned_state_host_share_takes_its_gb_and_the_rest_splits(self):
+        """SGLANG_HICACHE_MAMBA_SIZE_GB: the state host pool takes that many GB of
+        --hicache-size; the other sub-pools split the rest in their stock ratio."""
+        stock = self._host_sizes(None)
+        self.assertEqual(len(stock), 2)
+        self.assertAlmostEqual(sum(stock.values()), 10)
+        (kv, state) = stock
+        self.assertEqual(self._host_sizes(None, master=False), stock)
+        self.assertEqual(self._host_sizes(3, master=False), stock)
+        self.assertEqual(self._host_sizes(3), {kv: 7.0, state: 3.0})
+        for bad in (0, 10, 12):
+            with self.assertRaises(ValueError):
+                self._host_sizes(bad)
 
     def test_owner_host_pool_is_named_by_its_sub_pool(self):
         result, _, _ = self._build("swa", backend="file")

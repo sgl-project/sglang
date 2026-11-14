@@ -477,6 +477,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -504,6 +505,8 @@ class Req(ReqDllmMixin):
         # media added by this turn, excluding the session's borrowed history
         self._session_mm_items: List[MultimodalDataItem] = []
         self.session_id = session_id
+        # The session that spawned this one; cache residency hints only.
+        self.parent_session_id = parent_session_id
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds
@@ -2097,6 +2100,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
+    # SGLANG_OPT_SPEC_STAGED_SEQ_LENS: this iteration's decode preparation launched nothing on
+    # the schedule stream; set by eagle_prepare_for_decode, consumed by the forward's join
+    spec_prep_sched_idle: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False

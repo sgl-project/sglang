@@ -867,6 +867,21 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def component_protected_size(self, component_type: ComponentType) -> int:
         return self._binding.component_protected_size(self._ids.core(component_type))
 
+    # ---- Cache-residency bindings (cache_residency.py; Rust TreeCore built with them) ----
+
+    def configure_cache_residency(
+        self, *, keep_backed_mamba_states: bool, host_evict_first: bool
+    ) -> None:
+        self._binding.configure_cache_residency(
+            keep_backed_mamba_states, host_evict_first
+        )
+
+    def cache_residency_stats(self) -> dict[str, int]:
+        return self._binding.cache_residency_stats()
+
+    def mark_host_evict_first(self, node_ids: Sequence[NodeId]) -> int:
+        return self._binding.mark_host_evict_first(list(node_ids))
+
     def full_evictable_size(self) -> int:
         return self._binding.full_evictable_size()
 

@@ -259,12 +259,16 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         cache_actions: &mut CacheActions,
     ) {
         let ct = FULL;
-        let arena = &tree_core.arena;
-        let strategy = &tree_core.eviction_strategy;
+        // Marked (host evict-first) leaves rank ahead of the policy's order.
         let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = tree_core
             .evictable_host_leaves
             .iter()
-            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
+            .map(|id| {
+                Reverse((
+                    tree_core.host_eviction_priority_(tree_core.arena.node(id)),
+                    id,
+                ))
+            })
             .collect();
         while tracker[&ct] < num_tokens {
             let Some(Reverse((_, x))) = heap.pop() else {
@@ -273,15 +277,17 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             if !tree_core.evictable_host_leaves.contains(x) {
                 continue;
             }
+            if tree_core.is_host_evict_first_(tree_core.arena.node(x)) {
+                let tokens = tree_core.arena.host_value_len(x, FULL);
+                tree_core.note_host_evict_first_eviction_(FULL, tokens);
+            }
             // The parent id is captured before the eviction frees the leaf.
             let parent = tree_core.arena.node(x).try_parent();
             tree_core.evict_host_leaf_(x, tracker, device_frees, host_frees, cache_actions);
             if let Some(parent) = parent
                 && tree_core.evictable_host_leaves.contains(parent)
             {
-                let key = tree_core
-                    .eviction_strategy
-                    .get_priority(tree_core.arena.node(parent));
+                let key = tree_core.host_eviction_priority_(tree_core.arena.node(parent));
                 heap.push(Reverse((key, parent)));
             }
         }

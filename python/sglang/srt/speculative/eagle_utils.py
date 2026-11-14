@@ -12,6 +12,7 @@ import torch
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.kernels.ops.speculative import multi_cta_verify_sampling
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -31,7 +32,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -66,6 +67,7 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
+_DECODE_EMPTY_ALLOCATION = envs.SGLANG_OPT_SPEC_DECODE_EMPTY_ALLOCATION.get()
 
 # The binding defaults probe this explicit capability once instead of relying on
 # exception handling in the hot path.  Runtime itself remains independent of the
@@ -80,7 +82,7 @@ logger = logging.getLogger(__name__)
 
 
 def _fused_accept_enabled() -> bool:
-    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+    return envs.SGLANG_OPT_SPEC_FUSED_CHAIN_ACCEPT.get()
 
 
 def per_step_draft_out_cache_loc(
@@ -1078,6 +1080,13 @@ def eagle_sample(
             top_p_renorm_prob,
         )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        if not use_rejection_sampling and multi_cta_verify_sampling.applies(
+            target_probs
+        ):
+            # Bitwise to the stock tree sampler.
+            sampling_fn = (
+                multi_cta_verify_sampling.tree_speculative_sampling_target_only
+            )
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling
@@ -1326,7 +1335,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
+    penalized = batch.sampling_info.penalizer_orchestrator.is_required
+    if penalized:
         batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
@@ -1339,6 +1349,33 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     )
     for r in batch.reqs:
         r.decode_batch_idx += 1
+
+    if num_needed_tokens == 0 and _DECODE_EMPTY_ALLOCATION:
+        # Nothing to allocate (nxt == cur, already checked against the row width):
+        # only the recorded lengths rise, from the host lists.
+        if batch.seq_lens_cpu is None:
+            batch.max_seq_len_host = max(cur_kv_lens)
+        alloc_for_spec_decode(
+            batch.tree_cache,
+            batch.req_to_token_pool,
+            reqs=batch.reqs,
+            req_pool_indices=None,
+            cur_kv_lens=None,
+            cur_kv_lens_cpu=None,
+            nxt_kv_lens=None,
+            nxt_kv_lens_cpu=None,
+            num_needed_tokens=0,
+            batch=batch,
+            nxt_kv_lens_list=nxt_kv_lens,
+        )
+        # SGLANG_OPT_SPEC_STAGED_SEQ_LENS: no launch on the schedule stream in this preparation
+        batch.spec_prep_sched_idle = not (
+            penalized
+            or batch.tree_cache.supports_swa()
+            or get_exec().mamba.enable_mamba_extra_buffer_lazy
+        )
+        return
+    batch.spec_prep_sched_idle = False
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")

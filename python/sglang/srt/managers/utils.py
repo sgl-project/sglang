@@ -30,8 +30,37 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import is_cuda, is_pin_memory_available
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
+
+_RESULT_COPY_FAST_PATH = envs.SGLANG_OPT_RESULT_COPY_PROFILER_FAST_PATH.get()
+_D2H_RING = envs.SGLANG_OPT_RESULT_COPY_PINNED_RING.get()
+# A ring slot is rewritten 8 readbacks later; the scheduler consumes a result one
+# pass after its copy, so a slot is always read before it comes round again.
+_D2H_RING_SLOTS = 8
+_d2h_rings: dict = {}
+
+
+def _ring_d2h(tensor: torch.Tensor) -> torch.Tensor:
+    """_async_d2h into the next pinned buffer of this shape's ring."""
+    if tensor.device.type == "cpu" or not is_pin_memory_available(tensor.device):
+        return _async_d2h(tensor)
+    key = (tuple(tensor.shape), tensor.dtype)
+    ring = _d2h_rings.get(key)
+    if ring is None:
+        ring = _d2h_rings[key] = [
+            [
+                torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+                for _ in range(_D2H_RING_SLOTS)
+            ],
+            0,
+        ]
+    host = ring[0][ring[1]]
+    ring[1] = (ring[1] + 1) % _D2H_RING_SLOTS
+    host.copy_(tensor, non_blocking=True)
+    tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
+    return host
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
@@ -195,12 +224,17 @@ class GenerationBatchResult:
     def get_num_generated_tokens(self, batch_size: int) -> int:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
-    @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        if _RESULT_COPY_FAST_PATH and not torch.autograd._profiler_enabled():
+            return self._copy_to_cpu(return_logprob, return_hidden_states)
+        with torch.profiler.record_function("copy_result_to_cpu"):
+            return self._copy_to_cpu(return_logprob, return_hidden_states)
+
+    def _copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool):
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
@@ -229,10 +263,12 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
+        # speculative decode rounds only (accept_lens set)
+        d2h = _ring_d2h if _D2H_RING and self.accept_lens is not None else _async_d2h
+        self.next_token_ids = d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
-            self.accept_lens = _async_d2h(self.accept_lens)
+            self.accept_lens = d2h(self.accept_lens)
 
         if self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)

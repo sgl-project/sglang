@@ -20,7 +20,9 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+from sglang.srt.mem_cache.pool_host import slot_state_copy
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -235,6 +237,133 @@ class TestHiCacheMambaSlotSideStates(CustomTestCase):
             host.load_to_device_per_layer(
                 device_pool, torch.tensor([0]), torch.tensor([1]), 0, "direct"
             )
+
+
+class TestSlotStateAsyncCopy(CustomTestCase):
+    """SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC: the side-state legs as stream-ordered
+    copies through the pinned host buffers, the load leg only under host-only
+    checkpoints; anything the kernel cannot serve keeps the blocking copy."""
+
+    def setUp(self):
+        self._saved = dict(slot_state_copy._state)
+        slot_state_copy._state["off_reason"] = None
+        self.addCleanup(slot_state_copy._state.update, self._saved)
+
+    def _switches(self, *, async_on=True, host_only=False):
+        return (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC.override(async_on),
+            envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.override(host_only),
+        )
+
+    def test_cpu_states_keep_the_blocking_copy(self):
+        host, device_pool = _make_pools(True)
+        short_conv, ngram = (s.tensor for s in device_pool._slot_siblings)
+        short_conv[1], ngram[1] = 2.5, torch.tensor([7, 9])
+        master, switch, host_only = self._switches()
+        pf_lf, lf_pf = _stub_conv_and_temporal_copies()
+        with master, switch, host_only, pf_lf, lf_pf:
+            host.backup_from_device_all_layer(
+                device_pool, torch.tensor([2]), torch.tensor([1]), "direct"
+            )
+            self.assertIn("CUDA", slot_state_copy._state["off_reason"])
+            host.load_to_device_per_layer(
+                device_pool, torch.tensor([2]), torch.tensor([3]), 0, "direct"
+            )
+        self.assertTrue(torch.equal(short_conv[3], short_conv[1]))
+        self.assertEqual(ngram[3].tolist(), [7, 9])
+
+    def test_legs_take_the_stream_ordered_copy(self):
+        host, device_pool = _make_pools(True)
+        short_conv = device_pool._slot_siblings[0].tensor
+        short_conv[1] = 4.0
+        for host_only in (False, True):
+            master, switch, host_only_env = self._switches(host_only=host_only)
+            with (
+                self.subTest(host_only=host_only),
+                master,
+                switch,
+                host_only_env,
+                mock.patch.object(slot_state_copy, "applies", return_value=True),
+                mock.patch.object(
+                    slot_state_copy, "backup_rows", return_value=True
+                ) as backup,
+                mock.patch.object(
+                    slot_state_copy, "load_rows", return_value=True
+                ) as load,
+            ):
+                host._transfer_slot_states(
+                    torch.tensor([2]), torch.tensor([1]), to_device=False
+                )
+                host._transfer_slot_states(
+                    torch.tensor([2]), torch.tensor([3]), to_device=True
+                )
+            backup.assert_called_once()
+            self.assertEqual(backup.call_args.kwargs["host_indices"].tolist(), [2])
+            # the backup went to the kernel, so the host rows stay as they were
+            self.assertFalse(bool(host.slot_state_buffers[0][2].any()))
+            self.assertEqual(load.call_count, int(host_only))
+
+    def test_a_failed_launch_falls_back_to_the_blocking_copy(self):
+        host, device_pool = _make_pools(True)
+        short_conv = device_pool._slot_siblings[0].tensor
+        short_conv[1] = 3.0
+        master, switch, host_only = self._switches()
+        with (
+            master,
+            switch,
+            host_only,
+            mock.patch.object(slot_state_copy, "applies", return_value=True),
+            mock.patch.object(
+                slot_state_copy, "_launch", side_effect=RuntimeError("no UVA")
+            ),
+        ):
+            host._transfer_slot_states(
+                torch.tensor([2]), torch.tensor([1]), to_device=False
+            )
+        self.assertIn("no UVA", slot_state_copy._state["off_reason"])
+        self.assertTrue(torch.equal(host.slot_state_buffers[0][2], short_conv[1]))
+
+    def test_switch_off_or_master_off_never_applies(self):
+        state = torch.zeros(4, 8)
+        host = torch.zeros(4, 8)
+        for master_on, async_on in ((True, False), (False, True)):
+            with (
+                self.subTest(master=master_on, switch=async_on),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master_on),
+                envs.SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC.override(async_on),
+            ):
+                self.assertFalse(slot_state_copy.applies([state], [host]))
+        self.assertIsNone(slot_state_copy._state["off_reason"])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_round_trip_matches_the_blocking_copy(self):
+        states = [
+            torch.randn(6, 5, 3, device="cuda").bfloat16(),
+            torch.randint(0, 1 << 20, (6, 2), device="cuda"),
+            torch.randint(0, 255, (6, 7), device="cuda", dtype=torch.uint8),
+        ]
+        hosts = [
+            torch.zeros((8,) + tuple(s.shape[1:]), dtype=s.dtype).pin_memory()
+            for s in states
+        ]
+        master, switch, host_only = self._switches(host_only=True)
+        with master, switch, host_only:
+            self.assertTrue(slot_state_copy.applies(states, hosts))
+            dev, hst = torch.tensor([4, 1], device="cuda"), torch.tensor([7, 0])
+            self.assertTrue(slot_state_copy.backup_rows(states, hosts, dev, hst))
+            torch.cuda.synchronize()
+            for state, host in zip(states, hosts):
+                self.assertTrue(torch.equal(host[[7, 0]], state[[4, 1]].cpu()))
+            targets = [torch.zeros_like(s) for s in states]
+            self.assertTrue(
+                slot_state_copy.load_rows(
+                    targets, hosts, torch.tensor([2, 5], device="cuda"), hst
+                )
+            )
+            torch.cuda.synchronize()
+            for target, state in zip(targets, states):
+                self.assertTrue(torch.equal(target[[2, 5]], state[[4, 1]]))
 
 
 if __name__ == "__main__":
