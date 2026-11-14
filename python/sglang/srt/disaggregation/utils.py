@@ -1913,6 +1913,7 @@ def setup_state_kv_args(
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types
     )
     if isinstance(owner_view, NPUMLATokenToKVPool):
+        owner_view.configure_pd_dcp(kv_args)
         kv_args.kv_buf_groups = 3 if owner_view.index_head_dim is not None else 2
         kv_args.hidden_kv_layers = total_kv_layers
         kv_args.draft_kv_layers = (

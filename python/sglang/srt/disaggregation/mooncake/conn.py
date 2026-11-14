@@ -957,6 +957,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         reason, if any.
         """
         kv_layout_mismatch = self._kv_layout_mismatch(decode_kv_args)
+        prepare = getattr(self.kv_args, "dcp_prepare_token_item_lens", None)
+        if prepare is not None and decode_kv_args.requires_dcp_relayout:
+            try:
+                decode_kv_args.dcp_token_item_lens = prepare(
+                    self.kv_args, decode_kv_args
+                )
+            except (ValueError, RuntimeError) as exc:
+                kv_layout_mismatch = str(exc)
         fully_checked, state_mismatch = self._validate_peer_state_layout(decode_kv_args)
         mismatch = kv_layout_mismatch or state_mismatch
         self.check_peer_aux_buffer_count(
@@ -1703,8 +1711,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
                     self.kv_args.kv_item_lens, dst_kv_item_lens
                 )
-        num_draft = self.kv_args.num_draft_entries
-        num_target = len(src_kv_ptrs) - num_draft
+        num_replicated = getattr(
+            self.kv_args, "dcp_num_replicated_entries", self.kv_args.num_draft_entries
+        )
+        num_target = len(src_kv_ptrs) - num_replicated
 
         plan = build_dcp_token_transfer_plan(
             prefill_kv_indices,
@@ -1764,7 +1774,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         sliced_draft_params = []
         draft_to_pack = []
-        if num_draft > 0 and plan.draft_src_token_indices.size:
+        if num_replicated > 0 and plan.draft_src_token_indices.size:
             if not dst_kv_item_lens and dst_attn_tp_size not in (
                 None,
                 self.attn_tp_size,
@@ -1776,7 +1786,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 plan.draft_src_token_indices,
                 plan.draft_dst_token_indices,
             )
-            for entry in range(num_target, num_target + num_draft):
+            for entry in range(num_target, len(src_kv_ptrs)):
                 src_width = dcp_token_item_lens[entry]
                 dst_width = src_width
                 if dst_kv_item_lens:
@@ -3310,7 +3320,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         decode_kv_args.dst_dcp_size,
                         decode_kv_args.dst_dcp_rank,
                     )
-                    if decode_kv_args.requires_dcp_relayout:
+                    if decode_kv_args.requires_dcp_relayout and not hasattr(
+                        self.kv_args, "dcp_prepare_token_item_lens"
+                    ):
                         num_entries = len(self.kv_args.kv_item_lens)
                         num_draft = self.kv_args.num_draft_entries
                         dst_item_lens: List[Optional[int]] = [
