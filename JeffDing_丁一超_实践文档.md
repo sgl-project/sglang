@@ -154,6 +154,34 @@ Max ITL (ms):                            27724.73
 ==================================================
 ```
 
+相对原命令的改动及依据
+
+| 参数 | 原值 | 新值 | 原因 |
+|---|---|---|---|
+| `--disable-radix-cache` | 开启 | 删除 | 90% 共享前缀必须靠 radix cache 命中；关闭后每条请求全量 prefill 128k，用例失真 |
+| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | 160 | 32 | 官方公式：per-rank 并发 × draft = (16/4)×6 = 24，32 留余量；160 每步 padding，抬高 TPOT |
+| `--max-running-requests` | 64 | 16 | 128k KV 占用大；dp4 下每 rank 4 并发，TPOT 更稳 |
+| `--chunked-prefill-size` | 65536 | 32768 | 长 prefill 切片，减少对 decode 的阻塞；降低激活显存 |
+| `--max-prefill-tokens` | 65536 | 32768 | 与 chunk 对齐；90% 命中后实际仅约 12800 token，单批完成 |
+| `--cuda-graph-bs-decode` | 1 2 4 8 16 | 1 2 4 6 8 | 按 per-rank 4 并发覆盖并留扫描余量，减少 graph 捕获显存 |
+| `SGLANG_NPU_USE_MULTI_STREAM` | 未设 | 1 | 官方 DeepSeek-V4-Flash 配置项，共享专家与路由专家重叠执行 |
+| `--moe-a2a-backend` / `--deepep-mode` | 未显式 | deepep / auto | 对齐官方 V4-Flash 8P 混合部署配置 |
+| `INF_NAN_MODE_FORCE_DISABLE` | 未设 | 1 | 官方 V4-Flash 配置项，关闭 INF/NAN 检查开销 |
+
+未加入的项：
+
+- `HCCL_OP_EXPANSION_MODE=AIV`：官方 V4-Flash 脚本有，但文档明确 Atlas A2 + DeepEP 下会报未知算子错误。确认是 A3 再加。
+- `--quantization modelslim` / `--kv-cache-dtype bfloat16`：原命令能正常启动，说明权重加载方式已确定，避免引入启动风险。
+- `SGLANG_RAGGED_VERIFY_MODE=static`、`SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0`、`ZBAL_*` / `SGLANG_ZBAL_*`：官方 8P 配置项，但与当前版本/部署形态强相关，先不动，作为后续候选。
+
+### 3. 精度测试命令
+```bash
+sgl-eval run gsm8k \
+ --model /workspace/shared_assets/OssSGLangMeetup/model/DeepSeek-V4-Flash-0731 \
+ --base-url http://localhost:6688/v1 \
+ --num-examples 10 --max-tokens 2048
+```
+
 ### TPOT=20ms场景
 
 #### 1. 启动命令
@@ -194,7 +222,6 @@ export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-# 主机侧抖动抑制（官方 batch checklist：always）
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -295,6 +322,25 @@ P99 ITL (ms):                            335.14
 Max ITL (ms):                            8299.24   
 ==================================================
 ```
+相对 TPOT ≤ 50ms 配置的改动
+
+| 参数 | TPOT50 配置 | TPOT20 配置 | 原因 |
+|---|---|---|---|
+| `--max-running-requests` | 16 | **8** | dp4 后每 rank 2 并发，decode batch 减半，单步时间显著下降 |
+| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | 32 | **16** | 官方公式：2 × 7 = 14，16 留最小余量；过大时每步 padding 抬高 TPOT |
+| `--speculative-num-draft-tokens` | 6 | **7** | 对齐官方 V4-Flash 8P 值，单步多验证 1 个 token，摊薄 TPOT |
+| `--speculative-dspark-block-size` | 5 | **6** | 与 draft tokens 配套（block + 1 = draft tokens） |
+| `SGLANG_SCHEDULER_SKIP_ALL_GATHER` | 未设 | **保持不设/0** | 实测本镜像开启后 DSPARK verify 报 `DP CUDA graph replay requires raw per-rank request counts`，不可用 |
+
+保持不变的项：`--chunked-prefill-size 32768`、`--max-prefill-tokens 32768`、`--mem-fraction-static 0.72`、`--cuda-graph-bs-decode 1 2 4 6 8`、radix cache 保持开启（**不要加回 `--disable-radix-cache`**）。
+
+### 3. 精度测试命令
+```bash
+sgl-eval run gsm8k \
+ --model /workspace/shared_assets/OssSGLangMeetup/model/DeepSeek-V4-Flash-0731 \
+ --base-url http://localhost:6688/v1 \
+ --num-examples 10 --max-tokens 2048
+```
 
 ---
 
@@ -313,12 +359,12 @@ Max ITL (ms):                            8299.24
 
 ### 发现的问题
 
-1. 操作文档使用的是python3在hidevlab环境中可能找不到sglang，但是实际是安装了sglang，实际是需要使用python启动
+1. 根据活动给出的操作文档操作，文档中在拉起服务的时候使用的是`python3`，但是在hidevlab环境中可能会报错找不到sglang，但是实际是安装了sglang。这个问题解决方法是要使用`python`启动部署
 2. 
 3. 
 
 ### 改进建议
 
-1. 
+1. 暂无
 2. 
 3. 
