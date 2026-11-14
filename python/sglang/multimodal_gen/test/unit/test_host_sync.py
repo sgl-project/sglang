@@ -53,9 +53,9 @@ def _plain(tensors):
 # --- the guards ---
 
 
-def _read_device_value():
+def _read_device_value(backend="CUDA"):
     # what torch's sync debug mode emits for an implicit sync
-    warnings.warn("called a synchronizing CUDA operation")
+    warnings.warn(f"called a synchronizing {backend} operation")
 
 
 def _synchronize_explicitly():
@@ -142,18 +142,21 @@ class TestNoCudaSync(unittest.TestCase):
         return modes, synchronize
 
     def test_reports_each_sync_with_its_call_site(self):
-        modes, synchronize = self._fake_cuda()
-        with self.assertRaises(AssertionError) as raised:
-            with no_cuda_sync():
-                _read_device_value()
-                _synchronize_explicitly()
-        message = str(raised.exception)
-        self.assertIn("2 host-device sync(s)", message)
-        self.assertIn("_read_device_value", message)
-        self.assertIn("_synchronize_explicitly", message)
-        # the explicit synchronize still ran, and the debug mode was restored
-        synchronize.assert_called_once()
-        self.assertEqual(modes, ["warn", 0])
+        for backend in ("CUDA", "HIP"):
+            with self.subTest(backend=backend):
+                modes, synchronize = self._fake_cuda()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with self.assertRaises(AssertionError) as raised:
+                        with no_cuda_sync():
+                            _read_device_value(backend)
+                            _synchronize_explicitly()
+                message = str(raised.exception)
+                self.assertIn("2 host-device sync(s)", message)
+                self.assertIn("_read_device_value", message)
+                self.assertIn("_synchronize_explicitly", message)
+                synchronize.assert_called_once()
+                self.assertEqual(modes, ["warn", 0])
 
     def test_allow_names_intentional_syncs(self):
         self._fake_cuda()

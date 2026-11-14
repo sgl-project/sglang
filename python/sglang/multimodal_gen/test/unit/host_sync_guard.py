@@ -31,6 +31,7 @@ on CUDA whatever tensor they read::
 """
 
 import os
+import re
 import traceback
 import unittest
 import warnings
@@ -46,7 +47,7 @@ from sglang.multimodal_gen.runtime.layers.attention import layer as attention_la
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
-_SYNC_WARNING = "called a synchronizing CUDA operation"
+_SYNC_WARNING = re.compile(r"called a synchronizing (?:CUDA|HIP) operation")
 _TORCH_DIR = os.path.dirname(torch.__file__) + os.sep
 
 
@@ -96,12 +97,12 @@ def no_cuda_sync(allow: Sequence[str] = ()):
         show_other = warnings.showwarning
 
         def show(message, category, filename, lineno, file=None, line=None):
-            if _SYNC_WARNING in str(message):
+            if _SYNC_WARNING.search(str(message)):
                 syncs.append(traceback.extract_stack()[:-1])
             else:
                 show_other(message, category, filename, lineno, file, line)
 
-        warnings.filterwarnings("always", message=_SYNC_WARNING)
+        warnings.filterwarnings("always", message=_SYNC_WARNING.pattern)
         warnings.showwarning = show
         previous_mode = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode("warn")

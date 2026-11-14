@@ -3,6 +3,7 @@ it computes with AITER off: AITER's expert layout is for AITER's kernels only.
 """
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -98,10 +99,12 @@ def _triton_moe(layer, hidden_states, topk_output):
 )
 class TestFp8MoeTritonRunnerWithAiter(CustomTestCase):
     def setUp(self):
-        self.enterContext(
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
             get_context().override_server_args(model_path="dummy", device="cuda")
         )
-        self.enterContext(
+        stack.enter_context(
             get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON)
         )
 
