@@ -68,6 +68,7 @@ class SGLDiffusionProfiler:
         num_steps: int | None = None,
         num_inference_steps: int | None = None,
         log_dir: str | None = None,
+        record_execution_trace: bool = False,
     ):
         self.request_id = request_id or "profile_trace"
         self.rank = rank
@@ -101,6 +102,13 @@ class SGLDiffusionProfiler:
                 else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
             ),
         )
+
+        self._et_observer = self._create_execution_trace_observer(
+            record_execution_trace=record_execution_trace
+        )
+        if self._et_observer is not None:
+            common_torch_profiler_args["execution_trace_observer"] = self._et_observer
+
         if self.full_profile:
             # profile all stages
             self.profiler = torch.profiler.profile(**common_torch_profiler_args)
@@ -129,9 +137,51 @@ class SGLDiffusionProfiler:
         SGLDiffusionProfiler._instance = self
         self.start()
 
+    def _create_execution_trace_observer(
+        self, record_execution_trace: bool
+    ) -> "torch.profiler.ExecutionTraceObserver | None":
+        if not record_execution_trace:
+            return None
+
+        # torch_npu's patched profiler does not take execution_trace_observer.
+        if current_platform.is_npu() or current_platform.is_mps():
+            logger.warning(
+                "Execution trace capture is unsupported on NPU and MPS; skipping it."
+            )
+            return None
+
+        if not hasattr(torch.profiler, "ExecutionTraceObserver"):
+            logger.warning(
+                "This torch build has no ExecutionTraceObserver; "
+                "skipping execution trace capture."
+            )
+            return None
+
+        et_path = os.path.abspath(
+            os.path.join(
+                self.log_dir, f"{self.request_id}-global-rank{self.rank}.et.json"
+            )
+        )
+        observer = torch.profiler.ExecutionTraceObserver()
+        observer.register_callback(et_path)
+        logger.info(f"Will save execution trace to: {CYAN}{et_path}{RESET}")
+        return observer
+
+    def _unregister_execution_trace_observer(self):
+        if self._et_observer is None:
+            return
+        self._et_observer.unregister_callback()
+        self._et_observer = None
+
     def start(self):
         logger.info("Starting Profiler...")
-        self.profiler.start()
+        try:
+            self.profiler.start()
+        except Exception:
+            # A profiler that never started will never flush the observer, so the
+            # callback would outlive this instance and leak into the next profile.
+            self._unregister_execution_trace_observer()
+            raise
 
     def _step(self):
         self.profiler.step()
@@ -166,6 +216,8 @@ class SGLDiffusionProfiler:
             torch.npu.synchronize()
             export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
         self.profiler.stop()
+        # unregister_callback() is what finalizes the .et.json file.
+        self._unregister_execution_trace_observer()
 
         if export_trace:
             if dump_rank is not None and dump_rank != self.rank:
