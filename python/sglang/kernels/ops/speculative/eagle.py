@@ -7,7 +7,30 @@ from sglang.srt.utils import is_cpu, next_power_of_2
 _is_cpu = is_cpu()
 
 if _is_cpu:
-    from sgl_kernel import fill_accept_out_cache_loc_cpu, fill_bonus_tokens_cpu
+    try:
+        from sgl_kernel import fill_accept_out_cache_loc_cpu, fill_bonus_tokens_cpu
+    except ImportError as _e:
+        _import_err = str(_e)
+
+        def fill_accept_out_cache_loc_cpu(*args, **kwargs):
+                raise RuntimeError(
+                    f"fill_accept_out_cache_loc_cpu is unavailable: sgl_kernel failed to "
+                    f"import ({_import_err}). CPU hosts need a "
+                    "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
+                    "wheel is CUDA-only and cannot even import on a "
+                    "GPU-less host."
+                )
+    except ImportError as _e:
+        _import_err = str(_e)
+
+        def fill_bonus_tokens_cpu(*args, **kwargs):
+                raise RuntimeError(
+                    f"fill_bonus_tokens_cpu is unavailable: sgl_kernel failed to "
+                    f"import ({_import_err}). CPU hosts need a "
+                    "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
+                    "wheel is CUDA-only and cannot even import on a "
+                    "GPU-less host."
+                )
 
 
 @triton.jit

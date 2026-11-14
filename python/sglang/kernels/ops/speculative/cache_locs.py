@@ -25,10 +25,33 @@ _is_musa = is_musa()
 _is_xpu = is_xpu()
 
 if _is_cpu:
-    from sgl_kernel import (
-        assign_draft_cache_locs_contiguous_cpu,
-        assign_extend_cache_locs_cpu,
-    )
+    try:
+        from sgl_kernel import (
+            assign_draft_cache_locs_contiguous_cpu,
+            assign_extend_cache_locs_cpu,
+        )
+    except ImportError as _e:
+        _import_err = str(_e)
+
+        def assign_draft_cache_locs_contiguous_cpu(*args, **kwargs):
+                raise RuntimeError(
+                    f"assign_draft_cache_locs_contiguous_cpu is unavailable: sgl_kernel failed to "
+                    f"import ({_import_err}). CPU hosts need a "
+                    "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
+                    "wheel is CUDA-only and cannot even import on a "
+                    "GPU-less host."
+                )
+    except ImportError as _e:
+        _import_err = str(_e)
+
+        def assign_extend_cache_locs_cpu(*args, **kwargs):
+                raise RuntimeError(
+                    f"assign_extend_cache_locs_cpu is unavailable: sgl_kernel failed to "
+                    f"import ({_import_err}). CPU hosts need a "
+                    "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
+                    "wheel is CUDA-only and cannot even import on a "
+                    "GPU-less host."
+                )
 
 
 def _get_oot_speculative_cache_locs_fn() -> Callable[..., torch.Tensor] | None:
