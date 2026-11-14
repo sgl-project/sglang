@@ -367,6 +367,7 @@ class Kandinsky6Attention(nn.Module):
         )
         self.attention = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=self.num_heads,
             head_size=head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,

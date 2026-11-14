@@ -181,6 +181,7 @@ class LLaDAImageAttention(nn.Module):
         )
         self.sgl_attention = USPAttention(
             num_heads=self.local_heads,
+            global_num_heads=self.heads,
             head_size=self.head_dim,
             causal=False,
             supported_attention_backends=LLADA_IMAGE_ATTENTION_BACKENDS,
