@@ -75,7 +75,17 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         return o, pool
 
     def _check_shape(
-        self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42
+        self,
+        B,
+        T_per_seq,
+        H,
+        K,
+        V,
+        pool_size,
+        sequential_indices=False,
+        seed=42,
+        key_heads=None,
+        cuda_graph=False,
     ):
         """Run correctness check for one (B, T_per_seq, H, K, V, pool_size) config."""
         device = get_device()
@@ -98,8 +108,8 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
             torch.arange(1, B + 1, dtype=torch.long, device=device) * T_per_seq
         )
 
-        q = torch.randn(1, T, H, K, dtype=dtype, device=device)
-        k = torch.randn(1, T, H, K, dtype=dtype, device=device)
+        q = torch.randn(1, T, key_heads or H, K, dtype=dtype, device=device)
+        k = torch.randn(1, T, key_heads or H, K, dtype=dtype, device=device)
         v = torch.randn(1, T, H, V, dtype=dtype, device=device)
         g = torch.nn.functional.logsigmoid(
             torch.randn(1, T, H, dtype=dtype, device=device)
@@ -121,15 +131,21 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
             f"{(o_ref.float() - o_new.float()).abs().max().item():.2e}",
         )
 
-        ref_slots = pool_ref[cache_indices].contiguous()
-        new_slots = pool_new[cache_indices].contiguous()
         self.assertTrue(
-            torch.allclose(
-                ref_slots.float(), new_slots.float(), atol=self.ATOL, rtol=self.RTOL
-            ),
-            f"State mismatch: max_diff="
-            f"{(ref_slots.float() - new_slots.float()).abs().max().item():.2e}",
+            torch.allclose(pool_ref, pool_new, atol=self.ATOL, rtol=self.RTOL),
+            f"State mismatch: max_diff={(pool_ref - pool_new).abs().max().item():.2e}",
         )
+
+        if cuda_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_out, graph_pool = self._run_chunk(
+                    pool_init, cache_indices, q, k, v, g, beta, cu_seqlens
+                )
+            for _ in range(2):
+                graph.replay()
+                torch.testing.assert_close(graph_out, o_new, rtol=0, atol=0)
+                torch.testing.assert_close(graph_pool, pool_new, rtol=0, atol=0)
 
     # ------------------------------------------------------------------
     # Production-style configs (Qwen3-Next)
@@ -375,6 +391,22 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
             V=128,
             pool_size=32,
             sequential_indices=True,
+        )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and not is_hip(), "NVIDIA CUDA required"
+    )
+    def test_long_gqa_prefill_matches_recurrent_reference(self):
+        """Long GQA prefill preserves outputs and states, including graph replay."""
+        self._check_shape(
+            B=1,
+            T_per_seq=2048,
+            H=16,
+            K=128,
+            V=128,
+            pool_size=4,
+            key_heads=8,
+            cuda_graph=True,
         )
 
     # ------------------------------------------------------------------
