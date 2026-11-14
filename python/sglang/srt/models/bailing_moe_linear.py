@@ -34,6 +34,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import RouterGate
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -189,34 +190,6 @@ class BailingMLP(nn.Module):
         return x
 
 
-class BailingMoEGate(nn.Module):
-    def __init__(
-        self,
-        config,
-        params_dtype: Optional[torch.dtype] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
-        self.params_dtype = params_dtype
-        self.weight = nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.hidden_size),
-                dtype=self.params_dtype,
-            ),
-        )
-        if getattr(config, "moe_router_enable_expert_bias", False):
-            self.expert_bias = nn.Parameter(
-                torch.empty((config.num_experts,), dtype=torch.float32),
-            )
-        else:
-            self.expert_bias = None
-
-    def forward(self, hidden_states):
-        return F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
-
-
 class BailingMoE(nn.Module):
     def __init__(
         self,
@@ -267,9 +240,14 @@ class BailingMoE(nn.Module):
 
         self.num_experts = config.num_experts
 
-        self.gate = BailingMoEGate(
-            config=config,
+        self.gate = RouterGate(
+            hidden_size=config.hidden_size,
+            num_experts=config.num_experts,
             params_dtype=self.router_dtype,
+            has_correction_bias=bool(
+                getattr(config, "moe_router_enable_expert_bias", False)
+            ),
+            correction_bias_name="expert_bias",
             prefix=add_prefix("gate", prefix),
         )
         self.correction_bias = (

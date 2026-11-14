@@ -16,6 +16,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.model_config import is_glm_moe_dsa
+from sglang.srt.layers.moe import router_gate as rg_mod
 from sglang.srt.models.deepseek_v2 import MoEGate
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -52,7 +53,10 @@ class TestMoEGateCorrectionBiasDtype(CustomTestCase):
         # deterministic across CPU and GPU CI runners.
         import sglang.srt.models.deepseek_v2 as dv2
 
-        with patch.object(dv2, "_use_aiter", True), patch.object(dv2, "_is_cpu", False):
+        with (
+            patch.object(dv2, "_use_aiter", True),
+            patch.object(rg_mod, "_is_cpu", False),
+        ):
             return MoEGate(config=config, quant_config=quant_config)
 
     def test_glm_main_keeps_fp32(self):

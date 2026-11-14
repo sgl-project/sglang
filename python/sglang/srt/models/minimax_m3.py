@@ -61,11 +61,11 @@ from sglang.srt.layers.linear import (
     LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     ReplicatedParallelGroup,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import RouterGate
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -109,7 +109,6 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
-    tiny_router_gemm_max_tokens,
 )
 from sglang.srt.models.minimax_common.minimax_weight_loader import (
     mxfp8_linear_scale_alias,
@@ -138,20 +137,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_gfx95_supported = _is_hip and is_gfx95_supported()
 _device_sm = get_device_sm()
-
-if _is_gfx95_supported:
-    from sglang.kernels.ops.gemm.router_gemv import (
-        router_gemv,
-        router_gemv_supported,
-    )
-else:
-    router_gemv = router_gemv_supported = None
-
-# Import-time CUDA kernels would block processor imports on CPU CI.
-if _is_cuda:
-    from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
-else:
-    tiny_gemm_bf16 = None
 
 _FP8_KV_DTYPES = (
     torch.float8_e4m3fn,
@@ -482,18 +467,11 @@ class MiniMaxM3MoE(nn.Module):
             self.shared_experts = None
 
         self.bf16_router_gemm = envs.SGLANG_OPT_USE_BF16_ROUTER_GEMM.get()
-        self.gate = ReplicatedLinear(
-            config.hidden_size,
-            config.num_local_experts,
-            bias=False,
-            params_dtype=torch.bfloat16 if self.bf16_router_gemm else torch.float32,
-            quant_config=None,
-            prefix=add_prefix("gate", prefix),
-        )
-        self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
-            num_experts=config.num_local_experts,
+        self.gate = RouterGate(
             hidden_size=config.hidden_size,
-            weight_dtype=self.gate.weight.dtype,
+            num_experts=config.num_local_experts,
+            fp32_compute=not self.bf16_router_gemm,
+            prefix=add_prefix("gate", prefix),
         )
 
         self.layer_id = layer_id
@@ -556,7 +534,7 @@ class MiniMaxM3MoE(nn.Module):
         if num_tokens:
             output = self.topk(
                 hidden_states,
-                self._compute_router_logits(hidden_states),
+                self.gate(hidden_states),
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
@@ -661,7 +639,7 @@ class MiniMaxM3MoE(nn.Module):
     def _forward_router_experts(
         self, hidden_states: torch.Tensor, *, defer_finalize: bool = False
     ):
-        router_logits = self._compute_router_logits(hidden_states)
+        router_logits = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             return self.experts.forward_deferred_finalize(hidden_states, topk_output)
@@ -678,7 +656,7 @@ class MiniMaxM3MoE(nn.Module):
             or forward_batch.forward_mode.is_decode()
         )
         if hidden_states.shape[0] > 0:
-            router_logits = self._compute_router_logits(hidden_states)
+            router_logits = self.gate(hidden_states)
             if enable_npu_dual_stream:
                 # Overlap shared experts with router/experts on a separate stream.
                 shared_output = process_shared_expert(
@@ -704,32 +682,6 @@ class MiniMaxM3MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
-
-    def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.bf16_router_gemm:
-            if router_gemv is not None and router_gemv_supported(
-                hidden_states, self.gate.weight
-            ):
-                return router_gemv(hidden_states, self.gate.weight)
-            if _is_npu:
-                # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
-                return torch.mm(hidden_states, self.gate.weight.t()).float()
-            if (
-                not get_exec().deterministic.enable_deterministic_inference
-                and hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens
-            ):
-                # N is num_local_experts, so cuBLAS splits K and runs the
-                # projection as two launches; the tiny GEMM does it in one.
-                return tiny_gemm_bf16(
-                    hidden_states,
-                    self.gate.weight,
-                    out_dtype=torch.float32,
-                )
-            return torch.mm(
-                hidden_states, self.gate.weight.t(), out_dtype=torch.float32
-            )
-        router_logits, _ = self.gate(hidden_states.to(torch.float32))
-        return router_logits
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):

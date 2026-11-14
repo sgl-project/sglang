@@ -36,7 +36,6 @@ from typing import (
 )
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -69,7 +68,6 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.utils import (
@@ -111,6 +109,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    RouterGate,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     post_experts_all_reduce,
@@ -202,8 +201,6 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_common.utils import (
     _get_llama_4_scaling,
     _is_block_scale_fp8,
-    _is_cpu,
-    _is_cpu_amx_available,
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
@@ -215,7 +212,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
-    tiny_router_gemm_max_tokens,
 )
 from sglang.srt.models.utils import is_non_idle_and_non_empty
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
@@ -240,9 +236,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
-if _use_aiter:
-    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
-
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
         get_dsv3_gemm_output_zero_allocator_size,
@@ -258,9 +251,7 @@ else:
     _hip_act = None
     _hip_moe = None
 
-if _is_cuda:
-    from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
-elif _is_npu:
+if _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
@@ -501,7 +492,7 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
-class MoEGate(nn.Module):
+class MoEGate(RouterGate):
     def __init__(
         self,
         config,
@@ -511,50 +502,39 @@ class MoEGate(nn.Module):
         is_deepseek_v4: bool = False,
         vl_correction_bias: bool = False,
     ):
-        super().__init__()
-        self.is_deepseek_v4 = is_deepseek_v4
-        self.weight = nn.Parameter(
-            torch.empty(
-                (config.n_routed_experts, config.hidden_size),
-                dtype=(
-                    torch.float32
-                    if getattr(config, "router_fp32", False)
-                    else torch.get_default_dtype()
-                ),
-            )
+        has_correction_bias = config.topk_method == "noaux_tc" and not is_hash_moe
+        correction_bias_dtype = torch.float32
+        # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
+        # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
+        if (
+            has_correction_bias
+            and quant_config is not None
+            and not is_glm_moe_dsa(config)
+        ):
+            if _use_aiter and quant_config.get_name() in (
+                "fp8",
+                "compressed_tensors",
+                "quark",
+            ):
+                correction_bias_dtype = torch.bfloat16
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_experts=config.n_routed_experts,
+            fp32_compute=bool(getattr(config, "router_fp32", False)),
+            has_correction_bias=has_correction_bias,
+            correction_bias_dtype=correction_bias_dtype,
+            zero_init_correction_bias=(
+                quant_config is not None and quant_config.get_name() == "expert_pack"
+            ),
+            prefix=prefix,
         )
-        if config.topk_method == "noaux_tc" and not is_hash_moe:
-            correction_bias_dtype = torch.float32
-            # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
-            # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
-            if quant_config is not None and not is_glm_moe_dsa(config):
-                if _use_aiter and quant_config.get_name() in (
-                    "fp8",
-                    "compressed_tensors",
-                    "quark",
-                ):
-                    correction_bias_dtype = torch.bfloat16
-            correction_bias = torch.empty(
-                (config.n_routed_experts), dtype=correction_bias_dtype
-            )
-            if quant_config is not None and quant_config.get_name() == "expert_pack":
-                correction_bias.zero_()
-            self.e_score_correction_bias = nn.Parameter(correction_bias)
-        else:
-            self.e_score_correction_bias = None
+        self.is_deepseek_v4 = is_deepseek_v4
         self.e_score_correction_bias_vl = None
         if vl_correction_bias:
             self.e_score_correction_bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
-        if _is_cpu and _is_cpu_amx_available:
-            self.quant_method = PackWeightMethod(weight_names=["weight"])
-        self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
-            num_experts=config.n_routed_experts,
-            hidden_size=config.hidden_size,
-            weight_dtype=self.weight.dtype,
-        )
         # Rows up to which the ROCm split-K router serves the gate (-1: never)
         self.rocm_router_max_tokens = (
             _hip_moe.router_max_tokens(self, config, is_hash_moe) if _is_hip else -1
@@ -566,39 +546,7 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
-        if self.weight.dtype == torch.float32:
-            return F.linear(hidden_states.float(), self.weight)
-
-        if use_intel_amx_backend(self):
-            return torch.ops.sgl_kernel.weight_packed_linear(
-                hidden_states,
-                self.weight,
-                None,  # bias
-                True,  # is_vnni
-            )
-
-        if get_exec().deterministic.enable_deterministic_inference:
-            if _is_cuda or _is_hip:
-                return torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
-            return F.linear(hidden_states.float(), self.weight.float(), None)
-
-        if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
-            logits = tiny_gemm_bf16(
-                hidden_states,
-                self.weight,
-                out_dtype=torch.float32,
-            )
-        elif _use_aiter:
-            logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-        elif not _is_cuda:
-            logits = F.linear(hidden_states, self.weight, None)
-        else:
-            # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
-            from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
-
-            logits = linear_bf16_fp32(hidden_states, self.weight)
-
-        return logits
+        return super().forward(hidden_states)
 
 
 class MoEOutput(NamedTuple):

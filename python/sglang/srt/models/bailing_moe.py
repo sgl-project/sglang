@@ -23,7 +23,6 @@ import logging
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -53,6 +52,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    RouterGate,
     get_deepep_mode,
     get_moe_a2a_backend,
 )
@@ -145,34 +145,6 @@ class BailingMoEMLP(nn.Module):
         return hidden_states
 
 
-class BailingMoEGate(nn.Module):
-    def __init__(
-        self,
-        config,
-        params_dtype: Optional[torch.dtype] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
-        self.params_dtype = params_dtype
-        self.weight = nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.hidden_size),
-                dtype=self.params_dtype,
-            ),
-        )
-        if getattr(config, "moe_router_enable_expert_bias", False):
-            self.expert_bias = nn.Parameter(
-                torch.empty((config.num_experts,), dtype=torch.float32),
-            )
-        else:
-            self.expert_bias = None
-
-    def forward(self, hidden_states):
-        return F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
-
-
 class BailingMoESparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -228,9 +200,14 @@ class BailingMoESparseMoeBlock(nn.Module):
 
         self.num_experts = config.num_experts + get_exec().moe.ep_num_redundant_experts
 
-        self.gate = BailingMoEGate(
-            config=config,
+        has_expert_bias = bool(getattr(config, "moe_router_enable_expert_bias", False))
+        self.gate = RouterGate(
+            hidden_size=config.hidden_size,
+            num_experts=config.num_experts,
+            fp32_compute=False,
             params_dtype=self.router_dtype,
+            has_correction_bias=has_expert_bias,
+            correction_bias_name="expert_bias",
             prefix=add_prefix("gate", prefix),
         )
         self.correction_bias = (
@@ -242,14 +219,22 @@ class BailingMoESparseMoeBlock(nn.Module):
         self.image_correction_bias = None
         self.audio_correction_bias = None
         if self.multi_gate:
-            self.image_gate = BailingMoEGate(
-                config=config,
+            self.image_gate = RouterGate(
+                hidden_size=config.hidden_size,
+                num_experts=config.num_experts,
+                fp32_compute=False,
                 params_dtype=self.router_dtype,
+                has_correction_bias=has_expert_bias,
+                correction_bias_name="expert_bias",
                 prefix=add_prefix("image_gate", prefix),
             )
-            self.audio_gate = BailingMoEGate(
-                config=config,
+            self.audio_gate = RouterGate(
+                hidden_size=config.hidden_size,
+                num_experts=config.num_experts,
+                fp32_compute=False,
                 params_dtype=self.router_dtype,
+                has_correction_bias=has_expert_bias,
+                correction_bias_name="expert_bias",
                 prefix=add_prefix("audio_gate", prefix),
             )
             self.image_correction_bias = (

@@ -35,6 +35,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import RouterGate
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
@@ -112,16 +113,12 @@ class KimiMoE(nn.Module):
             )
 
         # Gate always runs at half / full precision for now.
-        self.gate = ReplicatedLinear(
-            hidden_size,
-            num_experts,
-            bias=False,
-            quant_config=None,
+        self.gate = RouterGate(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            has_correction_bias=True,
+            fp32_compute=False,
             prefix=f"{prefix}.gate",
-        )
-
-        self.gate.e_score_correction_bias = nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32)
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -183,7 +180,7 @@ class KimiMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states.clone())
 
             with torch.cuda.stream(self.alt_stream):
-                router_logits, _ = self.gate(hidden_states)
+                router_logits = self.gate(hidden_states)
                 topk_output = self.topk(hidden_states, router_logits)
                 final_hidden_states = self.experts(hidden_states, topk_output)
 
@@ -191,7 +188,7 @@ class KimiMoE(nn.Module):
         else:
             if self.num_shared_experts is not None and hidden_states.shape[0] > 0:
                 shared_output = self.shared_experts(hidden_states)
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
