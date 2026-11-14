@@ -1,5 +1,4 @@
 import os
-import subprocess
 import unittest
 
 import requests
@@ -22,6 +21,8 @@ class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
     Optional:
     - SGLANG_MORI_E2E_TEST_MODEL: override model (defaults to a small test model)
     - SGLANG_TEST_PD_DISAGG_DEVICES: RDMA devices string, e.g. "mlx5_roce0,mlx5_roce4"
+
+    Needs sgl-router on PATH, or SGLANG_TEST_PD_ROUTER_BINARY set to its path.
     """
 
     @classmethod
@@ -68,31 +69,6 @@ class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
     def tearDownClass(cls):
         os.environ.pop("SGLANG_TEST_PD_DISAGG_BACKEND", None)
         super().tearDownClass()
-
-    @classmethod
-    def launch_lb(cls):
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang_router.launch_router",
-            "--pd-disaggregation",
-            "--mini-lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-        print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(lb_command, stdout=None, stderr=None)
-        cls.wait_server_ready(
-            cls.lb_url + "/health",
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            process=cls.process_lb,
-        )
 
     @classmethod
     def start_prefill(cls):
@@ -211,31 +187,6 @@ class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
     def tearDownClass(cls):
         os.environ.pop("SGLANG_TEST_PD_DISAGG_BACKEND", None)
         super().tearDownClass()
-
-    @classmethod
-    def launch_lb(cls):
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang_router.launch_router",
-            "--pd-disaggregation",
-            "--mini-lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-        print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(lb_command, stdout=None, stderr=None)
-        cls.wait_server_ready(
-            cls.lb_url + "/health",
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            process=cls.process_lb,
-        )
 
     @classmethod
     def start_prefill(cls):
