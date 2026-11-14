@@ -498,6 +498,9 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         attention_layers = []
         for layer in language_model.layers:
             if hasattr(layer, "self_attn"):
+                # Sharing readers use the writer's layer_id but do not own its scales.
+                if getattr(layer.self_attn, "is_kv_shared_layer", False):
+                    continue
                 if hasattr(layer.self_attn, "attn"):
                     attention_layers.append(layer.self_attn.attn)
                 elif hasattr(layer.self_attn, "attn_mqa"):
