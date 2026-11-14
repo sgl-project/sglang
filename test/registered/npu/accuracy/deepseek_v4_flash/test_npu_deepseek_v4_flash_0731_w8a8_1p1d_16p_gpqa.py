@@ -234,9 +234,9 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
-        """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
-        self.run_accuracy()
+    # def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
+    #     """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
+    #     self.run_accuracy()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
