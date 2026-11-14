@@ -545,8 +545,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
+            positions = (
+                torch.add(positions, offsets) if offsets is not None else positions
+            )
             return rotary_embedding_cpu(
                 positions, query, key, self.head_size, self.cos_sin_cache, False
             )
