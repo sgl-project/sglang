@@ -111,12 +111,20 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
-            partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
-                string=current_text,
-                flags=re.DOTALL,
-            )
-            if partial_match:
+            # Match the first complete call in the buffer, not the last: a
+            # greedy (.*) spans two coalesced calls and swallows the first one.
+            # Loop so every complete call already in the buffer is emitted in
+            # this increment (the serving layer calls us once per delta and has
+            # no end-of-stream flush).
+            while True:
+                current_text = self._buffer
+                partial_match = re.search(
+                    pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```.*",
+                    string=current_text,
+                    flags=re.DOTALL,
+                )
+                if not partial_match:
+                    break
                 func_name = partial_match.group(2).strip()
                 func_args_raw = partial_match.group(3).strip()
 
@@ -189,11 +197,13 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         else:
                             self._buffer = ""
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
-                        return result
+                        # The buffer may already hold the next complete call.
+                        continue
+                    # Arguments still streaming in; wait for the next delta.
+                    break
 
             return StreamingParseResult(normal_text="", calls=calls)
 
