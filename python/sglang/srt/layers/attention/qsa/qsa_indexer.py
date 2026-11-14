@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
 )
 from sglang.srt.layers.attention.qsa.mqa import (
     HAS_TILELANG,
+    QSA_DECODE_Q_PREP_ALIGNMENT,
     qsa_mqa_decode,
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
@@ -737,8 +738,9 @@ class QSAIndexer(MultiPlatformOp):
             pool=indexer_metadata.token_to_kv_pool,
             cache_loc=state_slots,
             q_heads_padded=(
-                # The tilelang decode MQA kernel needs query heads in multiples of 8.
-                ((self.index_n_heads + 7) // 8) * 8
+                # Pad to the indexer Q-prep alignment (see mqa.py).
+                -(-self.index_n_heads // QSA_DECODE_Q_PREP_ALIGNMENT)
+                * QSA_DECODE_Q_PREP_ALIGNMENT
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
