@@ -1000,13 +1000,15 @@ def test_h3_text_encoder_default_preserves_overrides(
 # MiniMax-H3 integration: optional linear hooks and real backend dispatch.
 
 
-@pytest.mark.parametrize("precision,ring_degree", [("fp8", 1), ("bf16", 2)])
+@pytest.mark.parametrize("precision,ring_degree", [("fp8", 1), ("bf16", 2), (None, 2)])
 def test_denoising_builds_scoped_fa_metadata(precision, ring_degree):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
         DenoisingStage,
     )
 
-    config = {"precision": precision, "head_chunk_size": 2, "qk_rotation": False}
+    config = {"head_chunk_size": 2, "qk_rotation": False}
+    if precision is not None:
+        config["precision"] = precision
     stage = SimpleNamespace(attn_backend=AscendFABackend)
     metadata = DenoisingStage._build_attn_metadata(
         stage,
@@ -1018,7 +1020,6 @@ def test_denoising_builds_scoped_fa_metadata(precision, ring_degree):
         precision=precision,
         head_chunk_size=2,
         qk_rotation=False,
-        ring_degree=ring_degree,
     )
     config["precision"] = "mxfp4"
     assert metadata.precision == precision

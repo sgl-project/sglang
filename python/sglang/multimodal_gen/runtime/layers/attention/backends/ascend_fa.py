@@ -220,7 +220,6 @@ class AscendFAMetadata:
     fp8_fa_mode: str | None = "HIGH_PRECISION"
     head_chunk_size: int = 4
     qk_rotation: bool | None = None
-    ring_degree: int = 1
 
 
 class AscendFAMetadataBuilder(AttentionMetadataBuilder):
@@ -245,7 +244,6 @@ class AscendFAMetadataBuilder(AttentionMetadataBuilder):
             fp8_fa_mode=config.get("fp8_fa_mode", "HIGH_PRECISION"),
             head_chunk_size=config.get("head_chunk_size", 4),
             qk_rotation=config.get("qk_rotation"),
-            ring_degree=ring_degree,
         )
 
 
@@ -373,7 +371,6 @@ class AscendFAImpl(AttentionImpl):
                 head_size=self._head_size,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
-                ring_degree=metadata.ring_degree,
                 **self._extra_impl_args,
             )
             self._sd_executor = executor
@@ -702,15 +699,12 @@ class AscendQuantAttention:
         head_size: int,
         causal: bool,
         softmax_scale: float | None,
-        ring_degree: int = 1,
         **extra_impl_args,
     ) -> None:
         if causal:
             raise ValueError("Quantized Ascend FA does not support causal attention")
         if extra_impl_args.get("dropout_p", 0.0):
             raise ValueError("Quantized Ascend FA does not support attention dropout")
-        if ring_degree > 1:
-            raise ValueError("Quantized Ascend FA does not support Ring/LSE")
         self.precision = config["precision"]
         if not isinstance(self.precision, str) or not self.precision:
             raise ValueError("precision must be a non-empty string")
