@@ -444,10 +444,16 @@ def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
             #              (MAX_REPEAT, (1, MAXREPEAT, [(IN, [(CATEGORY, CATEGORY_DIGIT)])]))]))]
             _, _, _, inner_subpattern = value
             total += _max_length_from_subpattern(inner_subpattern)
+        elif token == sre_parse.ATOMIC_GROUP:
+            total += _max_length_from_subpattern(value)
         elif token == sre_parse.BRANCH:
             _, branches = value
             total += max(_max_length_from_subpattern(branch) for branch in branches)
-        elif token in {sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT}:
+        elif token in {
+            sre_parse.MAX_REPEAT,
+            sre_parse.MIN_REPEAT,
+            sre_parse.POSSESSIVE_REPEAT,
+        }:
             _, max_num_repeat, inner_subpattern = value
             if max_num_repeat == sre_parse.MAXREPEAT:
                 total += MAX_LEN

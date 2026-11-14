@@ -741,6 +741,49 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
 
 
 class TestRegexMaxLength(CustomTestCase):
+    def test_atomic_groups_keep_finite_stop_windows(self):
+        """Atomic backtracking rules must not turn finite stops into full-history scans."""
+        for pattern, longest in [
+            (r"(?>STOP)", "STOP"),
+            (r"x(?>a|bc){2}y", "xbcbcy"),
+            (r"(?>x(?>ab|c))d", "xabd"),
+        ]:
+            with self.subTest(pattern=pattern):
+                self.assertIsNotNone(re.fullmatch(pattern, longest))
+                self.assertEqual(get_max_seq_length(pattern), len(longest))
+
+    def test_possessive_repeats_keep_finite_stop_windows(self):
+        """Possessive repetition has the same maximum consumed length as bounded repetition."""
+        for pattern, longest in [
+            (r"a{2,4}+b", "aaaab"),
+            (r"(?:ab|c){2}+d", "ababd"),
+            (r"a?+b", "ab"),
+            (r"a{0}+b", "b"),
+            (r"(?>a{2,4}+)b", "aaaab"),
+        ]:
+            with self.subTest(pattern=pattern):
+                self.assertIsNotNone(re.fullmatch(pattern, longest))
+                self.assertEqual(get_max_seq_length(pattern), len(longest))
+
+    def test_atomic_unbounded_and_assertion_windows_remain_conservative(self):
+        """An atomic wrapper must not hide an unbounded body or look-around context."""
+        for pattern in (r"(?>a*)b", r"a++b", r"a*+b", r"(?>a(?=b))b"):
+            with self.subTest(pattern=pattern):
+                self.assertGreaterEqual(get_max_seq_length(pattern), MAX_LEN)
+
+    def test_atomic_stop_normalization_keeps_the_longest_finite_window(self):
+        """Normalization must carry finite atomic bounds across the request wire round trip."""
+        patterns = [r"(?>STOP)", r"a{2,6}+Z"]
+        sp = SamplingParams(stop_regex=patterns)
+        sp.normalize(tokenizer=object())
+        self.assertEqual(sp.stop_regex_max_len, 7)
+        self.assertEqual(sp.stop_regex_strs, patterns)
+        rebuilt = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(sp), type=SamplingParams
+        )
+        self.assertEqual(rebuilt.stop_regex_max_len, 7)
+        self.assertEqual(rebuilt.stop_regex_strs, patterns)
+
     def test_literal_string(self):
         """Test that plain string 'abc' gives max length 3."""
         self.assertEqual(get_max_seq_length("abc"), 3)
