@@ -361,9 +361,12 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         core = SimpleNamespace(
             unified=SimpleNamespace(
                 pf_state_slot=torch.tensor([7, 7, 7, 7], dtype=torch.int32),
-                pf_chunk_start=torch.tensor([5, 5, 5, 0], dtype=torch.int64),
-                pf_cu_q=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
+                # apply_cp_reindex already took this rank's query rows.
+                pf_chunk_start=torch.tensor([5, 0], dtype=torch.int64),
+                pf_cu_q=torch.tensor([0, 0], dtype=torch.int64),
                 pf_final_pos=torch.tensor([7, 7, 7, 128], dtype=torch.int64),
+                pf_cp_state_slot=torch.tensor([7, 7], dtype=torch.int32),
+                pf_indices={},
             ),
             c128_page_indices=None,
             c4_sparse_page_indices=None,
@@ -382,6 +385,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         with (
             mock.patch(f"{_HIP_RADIX}.is_cp_active", return_value=True),
+            mock.patch(f"{_HIP_RADIX}._CACHE_PREFILL_INDICES", True),
             mock.patch(
                 f"{_HIP_RADIX}.get_parallel",
                 return_value=SimpleNamespace(attn_cp_size=2, attn_cp_rank=1),
@@ -394,6 +398,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                     torch.tensor([0, 0, 0], dtype=torch.int32),
                     torch.empty(0, dtype=torch.int32),
                     torch.tensor([0, 0, 0], dtype=torch.int32),
+                    None,
                 ),
             ) as build_indices,
             mock.patch.object(runtime, "prefill", return_value=output),
@@ -533,6 +538,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         )
         capture_core = capture_metadata.core_attn_metadata
         replay_core = replay_metadata.core_attn_metadata
+        capture_core.unified.pf_indices[(128, 1)] = (torch.tensor([17]),)
         captured_core_tensors = {
             field.name: getattr(capture_core, field.name)
             for field in dataclasses.fields(capture_core)
@@ -566,6 +572,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(replay_metadata)
 
+        self.assertEqual(capture_core.unified.pf_indices, {})
         for field_name, captured_tensor in captured_core_tensors.items():
             current = getattr(capture_core, field_name)
             self.assertIs(current, captured_tensor, field_name)

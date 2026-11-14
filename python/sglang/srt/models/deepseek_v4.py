@@ -416,6 +416,8 @@ def _tbo_collective_sizes(
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+# Store the verify kv from the strided qkv_a slice. TODO: try gfx950/gfx942.
+_VERIFY_KV_STRIDED = _is_gfx1250_supported
 
 
 if _use_aiter:
@@ -2381,16 +2383,15 @@ class MQALayer(MqaAttentionBase):
                 # store run unchanged; we fuse just the norm+RoPE. swa_loc is not
                 # computed -- it only addresses the kernel store this path drops.
                 #
-                # kv is a strided slice of qkv_a and the ring store requires a
-                # contiguous buffer, so materialise it before the kernel norms
-                # it in place. The unfused path pays the same copy inside
-                # _compute_kv_bf16.
+                # kv stays the strided slice of qkv_a when the ring store takes
+                # the row stride: the kernel norms it in place.
                 #
                 # Under fp8, verify takes the decode arm below instead: the ring
                 # rows are per token (swa_loc is built for verify too) and are
                 # written before attention either way, so the kernel stores them
                 # itself, off the strided kv.
-                kv = kv.contiguous()
+                if not _VERIFY_KV_STRIDED:
+                    kv = kv.contiguous()
                 swa_cache, swa_loc = None, None
                 swa_page_size, bf16_store = 1, True
             elif unified and fuse_prefill:
