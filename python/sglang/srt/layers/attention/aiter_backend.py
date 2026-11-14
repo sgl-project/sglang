@@ -143,6 +143,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
     log_mla_gluon_capability,
     mla_gluon_decode,
+    mla_gluon_kv_len_hint,
     prefer_mla_gluon_decode,
 )
 from sglang.srt.layers.attention.aiter_triton_mla import (
@@ -2221,6 +2222,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
                 min_kv_seq_len=self._resolve_mla_gluon_min_kv_seq_len(forward_batch),
                 qlen=max_q_len,
+                kv_len_hint=mla_gluon_kv_len_hint(self.max_context_len),
             )
 
         work_metadata = self.forward_metadata.work_metadata
@@ -2332,6 +2334,11 @@ class AiterAttnBackend(AttentionBackend):
             kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
             min_kv_seq_len=1,
             return_lse=True,
+            kv_len_hint=mla_gluon_kv_len_hint(
+                self.max_context_len,
+                local_shard=True,
+                dcp_world_size=self.dcp_world_size,
+            ),
         )
         return out, lse.view(bs, num_heads)
 
@@ -2478,6 +2485,11 @@ class AiterAttnBackend(AttentionBackend):
             min_kv_seq_len=1,
             return_lse=True,
             use_2d_view=True,
+            kv_len_hint=mla_gluon_kv_len_hint(
+                self.max_context_len,
+                local_shard=True,
+                dcp_world_size=self.dcp_world_size,
+            ),
         )
         lse_a = lse_a.view(n_rows, num_heads)
 
@@ -2500,6 +2512,7 @@ class AiterAttnBackend(AttentionBackend):
             min_kv_seq_len=1,
             qlen=q_len,
             return_lse=True,
+            # Window KV is q_len tokens. A context-capacity hint would over-split it.
         )
         return merge_state_triton(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
 
@@ -4807,6 +4820,7 @@ class AiterAttnBackend(AttentionBackend):
                             forward_batch
                         ),
                         qlen=self.forward_metadata.max_q_len or 1,
+                        kv_len_hint=mla_gluon_kv_len_hint(self.max_context_len),
                     )
 
                 work_metadata = self.forward_metadata.work_metadata
