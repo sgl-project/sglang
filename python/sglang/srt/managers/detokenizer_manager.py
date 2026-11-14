@@ -129,7 +129,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.disable_tokenizer_batch_decode = (
             get_serving().disable_tokenizer_batch_decode
         )
-        self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
+        self.harmony_call_token_id = self._resolve_harmony_call_token_id(
+            get_serving().tool_call_parser
+        )
         self.tool_close_token_ids = tool_close_token_ids(
             get_serving().tool_call_parser, self.tokenizer
         )
@@ -143,6 +145,25 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
+
+    def _resolve_harmony_call_token_id(
+        self, tool_call_parser: Optional[str]
+    ) -> Optional[int]:
+        if tool_call_parser != "gpt-oss" or self.tokenizer is None:
+            return None
+
+        convert_tokens_to_ids = getattr(self.tokenizer, "convert_tokens_to_ids", None)
+        if not callable(convert_tokens_to_ids):
+            return None
+
+        token_id = convert_tokens_to_ids("<|call|>")
+        if (
+            isinstance(token_id, int)
+            and token_id >= 0
+            and token_id != getattr(self.tokenizer, "unk_token_id", None)
+        ):
+            return token_id
+        return None
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -189,12 +210,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if isinstance(matched, int) and isinstance(output, list):
             if no_stop_trim:
                 return output
-            # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
-            if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
+            assert len(output) > 0
+            # Harmony consumes <|call|> as part of the tool-call format.
+            if output[-1] == self.harmony_call_token_id:
                 return output
             if output[-1] in self.tool_close_token_ids:
                 return output
-            assert len(output) > 0
             # NOTE: We can always assume the last token is the matched stop token
             return output[:-1]
         return output

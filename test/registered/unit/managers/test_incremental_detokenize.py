@@ -108,7 +108,7 @@ def _detokenizer(capacity=16):
     detok.vocab_size = None
     detok.detokenize_state_table = DetokenizeStateTable(capacity=capacity)
     detok.disable_tokenizer_batch_decode = False
-    detok.is_tool_call_parser_gpt_oss = False
+    detok.harmony_call_token_id = None
     detok.tool_close_token_ids = frozenset()
     return detok
 
