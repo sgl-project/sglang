@@ -96,6 +96,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
                 enable_metrics=False,
                 warmup_mode="off",
                 progress_endpoint=None,
+                cancel_endpoint=None,
                 broker_port=port,
                 prompt_enhancer_config=None,
                 log_requests=False,

@@ -48,8 +48,8 @@ def parse_args():
         "--launch-module",
         type=str,
         default="sglang.launch_server",
-        help="server entry module (e.g. sglang_meta.launch_server for "
-        "Meta-internal model families)",
+        help="server entry module; downstream distributions can point this "
+        "at their own launcher",
     )
     parser.add_argument(
         "--modes",
@@ -83,9 +83,8 @@ def parse_args():
         "--storage-backend",
         type=str,
         default="file",
-        help="L3 backend: file, or meta_cache_store (spawns a local-mode store "
-        "under the run's storage dir; requires --launch-module "
-        "sglang_meta.launch_server)",
+        help="L3 backend passed to --hicache-storage-backend (e.g. file, "
+        "fast_file); backend-specific settings go in --storage-extra-config",
     )
     parser.add_argument(
         "--sub-question-input-length",
@@ -108,7 +107,7 @@ def parse_args():
         type=str,
         default="",
         help="JSON merged over the backend's default extra-config "
-        '(e.g. \'{"capacity_gb": "120"}\')',
+        "(e.g. '{\"read_workers\": 8}')",
     )
     parser.add_argument(
         "--extra-server-args",
@@ -158,17 +157,6 @@ class Server:
     def launch(self):
         a = self.args
         extra_config = {"prefetch_threshold": 64}
-        if a.storage_backend == "meta_cache_store":
-            # Local-mode store: in-process server on rank 0, data under the
-            # run's storage dir (same isolation as the file backend).
-            extra_config.update(
-                {
-                    "cluster": "mks",
-                    "local_mode": "true",
-                    "data_root": os.path.join(self.storage_dir, "mcs"),
-                    "capacity_gb": "120",
-                }
-            )
         if a.storage_extra_config:
             extra_config.update(json.loads(a.storage_extra_config))
         cmd = [
@@ -264,6 +252,10 @@ def run_multiturn(server, args):
         os.path.join(BENCH_DIR, "bench_multiturn.py"),
         "--model-path",
         args.model,
+        # The server binds 127.0.0.1; bench_multiturn's default "localhost"
+        # resolves to ::1 first on IPv6-preferring hosts.
+        "--host",
+        "127.0.0.1",
         "--port",
         str(args.port),
         "--disable-auto-run",

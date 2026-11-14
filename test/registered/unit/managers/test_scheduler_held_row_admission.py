@@ -1,4 +1,5 @@
-"""A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537)."""
+"""A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537),
+and a parked chunked request lets no one be admitted ahead of it."""
 
 import unittest
 from types import SimpleNamespace
@@ -9,10 +10,16 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -21,17 +28,18 @@ NUM_ROWS = 4
 
 
 class _Req:
+    owner_list = None
+
     def __init__(self, holds_row):
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
         self.token_indices_to_pool = None
-        self.inflight_middle_chunks = 0
 
-    def init_next_round_input(self, tree_cache=None):
+    def init_next_round_input(self, tree_cache=None, **_):
         pass
 
 
-class _Adder:
+class _Adder(PrefillAdder):
     """Admits whatever the gate lets through; the final chunk joins first."""
 
     def __init__(self, *args, **kwargs):
@@ -52,20 +60,32 @@ class _Adder:
         return AddReqResult.CONTINUE
 
 
+class _ParkingAdder(_Adder):
+    """The chunked request finds no budget and stays out of the batch."""
+
+    def add_chunked_req(self, req):
+        return req
+
+
 class _BatchBuilt(Exception):
     pass
 
 
 class TestHeldRowAdmission(CustomTestCase):
-    def _scheduler(self, disaggregation_mode, running, final_chunk, waiting):
+    def _scheduler(
+        self, disaggregation_mode, running, final_chunk, waiting, adder_class=_Adder
+    ):
         s = Scheduler.__new__(Scheduler)
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
-        s.waiting_queue = waiting
-        s.chunked_req = final_chunk
+        s.waiting_queue = IndexedReqList(ListKind.WAITING)
+        move(waiting, s.waiting_queue)
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        move([final_chunk], s.chunked_reqs)
         s.min_free_slots_delayer = None
-        s.policy = Mock()
+        s.invariant_checker = Mock()
+        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
@@ -73,12 +93,15 @@ class TestHeldRowAdmission(CustomTestCase):
         s.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
-        s.get_prefill_adder_class = lambda: _Adder
+        s.get_prefill_adder_class = lambda: adder_class
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
         )
-        s.token_to_kv_pool_allocator = None
+        s.token_to_kv_pool_allocator = SimpleNamespace(
+            state_slots=None, pools_share_memory=False
+        )
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False
@@ -88,8 +111,11 @@ class TestHeldRowAdmission(CustomTestCase):
         s.dllm_config = None
         s.enable_lora = False
         s.disaggregation_mode = disaggregation_mode
+        s.disagg_prefill_bootstrap_queue = None
+        s.disagg_prefill_transfer_queue = []
         s.enable_hicache_storage = False
         s.enable_lmcache = False
+        s.enable_unified_cache_external_linker = False
         s.truncation_align_size = None
         s.model_config = None
         s.enable_overlap = False
@@ -98,7 +124,11 @@ class TestHeldRowAdmission(CustomTestCase):
         s.req_to_token_pool = SimpleNamespace(
             available_size=lambda: NUM_ROWS - len(running) - 1
         )
-        s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        s.beam_coordinator = SimpleNamespace(
+            pending_member_rows=lambda batch: 0, pending_member_rows_of=lambda reqs: 0
+        )
+        s.running_reqs = KeyedReqList(ListKind.DECODING)
+        s.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         return s
 
     def _admitted(self, disaggregation_mode):
@@ -133,6 +163,26 @@ class TestHeldRowAdmission(CustomTestCase):
                 can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
+
+    def test_parked_chunk_admits_no_waiting_request(self):
+        running = [_Req(holds_row=True)]
+        parked = _Req(holds_row=True)
+        waiting = _Req(holds_row=False)
+        running_batch = ScheduleBatch(reqs=running)
+        s = self._scheduler(
+            DisaggregationMode.NULL, running, parked, [waiting], _ParkingAdder
+        )
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            patch.object(ScheduleBatch, "init_new", side_effect=_BatchBuilt),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            new_batch, _ = s._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=None, running_batch=running_batch
+            )
+        self.assertIsNone(new_batch)
+        self.assertIs(s.chunked_req, parked)
+        self.assertEqual(list(s.waiting_queue), [waiting])
 
 
 if __name__ == "__main__":

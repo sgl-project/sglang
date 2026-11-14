@@ -13,14 +13,22 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import (
     SanaWMArchConfig,
     SanaWMConfig,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.models.dits import sana_wm
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+    SanaWMBlock,
+    SanaWMTransformer3DModel,
+)
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     _CACHE_TYPE_STATE,
     _SLOT_CAM_K,
     _SLOT_FFN_TCONV,
@@ -28,15 +36,11 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _SLOT_TYPE_FLAG,
     _SLOT_V,
     BidirectionalGDNUCPESinglePathLiteLA,
-    SanaWMBlock,
-    SanaWMTransformer3DModel,
     WanRotaryPosEmbed,
     _build_ucpe_apply_fns,
     _slice_rope_to_current_chunk,
-    process_camera_conditions_ucpe,
-)
-from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     compute_chunk_plucker,
+    process_camera_conditions_ucpe,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -464,7 +468,8 @@ def test_forward_long_windows_chunk_inputs_once():
     assert {block[_SLOT_TYPE_FLAG].device.type for block in caches[0]} == {"cpu"}
 
 
-def test_self_forcing_chunk_never_reads_device_timesteps():
+@pytest.mark.parametrize("cancel_after", [None, 1, 3])
+def test_self_forcing_chunk_step_boundaries(cancel_after):
     scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
     set_timesteps = scheduler.set_timesteps
 
@@ -480,6 +485,13 @@ def test_self_forcing_chunk_never_reads_device_timesteps():
         return latents * 0.5, ["cache"]
 
     chunk = {"lat": torch.randn(1, 3, 2, 2, 2)}
+    steps = 0
+
+    def on_step():
+        nonlocal steps
+        steps += 1
+        if steps == cancel_after:
+            raise RequestCancelledError(["job"])
 
     def run(forward_ctx):
         chunk["lat"] = torch.ones(1, 3, 2, 2, 2)
@@ -503,7 +515,14 @@ def test_self_forcing_chunk_never_reads_device_timesteps():
             target_dtype=torch.float32,
             device=torch.device("cpu"),
             forward_ctx=forward_ctx,
+            on_step=on_step,
         )
+
+    if cancel_after is not None:
+        with pytest.raises(RequestCancelledError):
+            run(None)
+        assert steps == cancel_after
+        return
 
     assert run(None) == ["cache"]
     realtime = chunk["lat"].as_subclass(torch.Tensor).clone()

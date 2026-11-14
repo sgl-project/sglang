@@ -31,7 +31,6 @@ backend:
       data-parallel-size: 16
 
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715
   attention_backend: dsv4
   # RoCE HCAs (8/node) for mori MoE all-to-all AND the P->D KV transfer.
   ib_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7

@@ -120,7 +120,7 @@ than restating.
   ∈ `config.accuracyLabels`.
 - A benchmark's quantization must match a variant actually listed — `(BF16)` on a model
   that only released FP8/FP4 is a factual bug.
-- `benchmarkCommands.speed` is `python3 -m sglang.bench_serving` (the workload), separate
+- `benchmarkCommands.speed` is `python3 -m sglang.benchmark.serving` (the workload), separate
   from the `sglang serve` deploy command, and should carry `--flush-cache`: bench_serving's
   `random` prompts are deterministic, so a warm rerun hits the radix cache and inflates
   throughput — speed numbers are measured cache-cold.

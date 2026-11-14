@@ -332,16 +332,6 @@ def build_replay_plan(
     )
 
 
-def dense_token_mask(plan: ReplayPlan) -> torch.Tensor:
-    """Expand the run-level truth table to tokens: ``[queries, current + ring + captions]`` (tests)."""
-    rows = plan.query_run_ids
-    columns = plan.key_run_ids
-    mask = torch.zeros(rows.numel(), columns.numel(), dtype=torch.bool)
-    real = columns >= 0
-    mask[:, real] = plan.allowed[rows][:, columns[real]]
-    return mask
-
-
 class ReplayBlockMask(msgspec.Struct, eq=False):
     """FlexAttention block mask over the padded query and key streams of one plan."""
 

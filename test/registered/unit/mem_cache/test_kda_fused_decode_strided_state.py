@@ -73,7 +73,7 @@ def _conv_dim(heads: int) -> int:
 
 
 def _make_strided_temporal_view(heads: int):
-    """Envelope-strided temporal (SSM) view as UnifiedMambaPool / the
+    """Envelope-strided temporal (SSM) view as the unified state view / the
     page-major MambaPool serve it to the KDA backend: shape
     ``(num_layers, max_slots, H, V, K)`` with the slot pitch spanning ALL
     layers' state, not H*V*K."""

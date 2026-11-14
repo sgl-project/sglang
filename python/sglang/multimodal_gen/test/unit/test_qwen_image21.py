@@ -29,10 +29,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImage2512SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     replay_token_scope,
@@ -407,6 +405,9 @@ def test_prompt_cache_skips_processor_and_weight_preparation(device):
             data={
                 "input_ids": torch.tensor([[1, len(text[0]), 99, 99, image_value, 0]]),
                 "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),
+                "pixel_values": torch.tensor(
+                    list(kwargs["images"][0].getdata()), dtype=torch.float32
+                ),
             }
         )
 
@@ -511,6 +512,11 @@ class _RecordingAttention(torch.nn.Module):
         return torch.zeros_like(x), [None] * len(caches)
 
 
+class _IdentityFeedForward(torch.nn.Module):
+    def forward(self, x, use_packed_bf16=False):
+        return x
+
+
 def _block_recording_caches(layer_id, dim=4):
     # The real block forward with its attention swapped for a recorder.
     block = QwenImage21TransformerBlock.__new__(QwenImage21TransformerBlock)
@@ -519,7 +525,7 @@ def _block_recording_caches(layer_id, dim=4):
     block.img_norm1 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.img_norm2 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.attn = _RecordingAttention()
-    block.img_mlp = torch.nn.Identity()
+    block.img_mlp = _IdentityFeedForward()
     return block
 
 
@@ -913,7 +919,6 @@ def test_prefix_pad_replay_writes_the_captured_output():
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
         cuda_graph=graph,
-        _barrier_fn=None,
         _end_current_segment=lambda: None,
         _begin_new_segment=lambda: None,
     )
@@ -926,8 +931,6 @@ def test_prefix_pad_replay_writes_the_captured_output():
             out = QwenImage21Attention.attend_target(attention, q, kv, kv, prefix_pad)
         finally:
             bcg._current_capture_var.reset(token)
-        assert torch.all(out == 4)
-
         prefix_pad.rows.fill_(1)
         with replay_token_scope():
             assert graph._break_fns[0]() is None

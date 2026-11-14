@@ -80,8 +80,8 @@ class BitExactFusionGate:
     The first-sight check runs the eager reference chain plus a host sync, so
     it must never happen inside ``torch.compile`` tracing or CUDA graph
     capture. :meth:`run` applies both guards in either mode; hand-written
-    sites get them from :meth:`can_attempt_once` (once-for-all) or keep their
-    own compile/capture checks next to the signature lookup (FLUX / Sana).
+    sites get them from :meth:`can_attempt_once` (once-for-all) or
+    :meth:`can_attempt` (per-signature).
     """
 
     __slots__ = ("name", "disabled", "verified", "verified_sigs")
@@ -113,6 +113,14 @@ class BitExactFusionGate:
         if self.disabled:
             return False
         if self.verified:
+            return True
+        return _can_verify_now()
+
+    def can_attempt(self, sig: Any) -> bool:
+        """Per-signature mode: may we launch the fused kernel for ``sig`` right now?"""
+        if self.disabled:
+            return False
+        if self.is_verified(sig):
             return True
         return _can_verify_now()
 
@@ -217,7 +225,9 @@ def _can_verify_now() -> bool:
     # verified, the fused kernel runs alone and is compile/capture-safe.
     if torch.compiler.is_compiling():
         return False
-    return not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return False
+    return not (torch.xpu.is_available() and torch.xpu.is_current_stream_capturing())
 
 
 def tensors_equal(a: Any, b: Any) -> bool:

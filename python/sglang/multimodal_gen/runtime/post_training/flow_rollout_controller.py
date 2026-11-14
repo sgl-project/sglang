@@ -289,7 +289,6 @@ class FlowRolloutController:
 
             weighted_variance_noise = variance_noise * noise_std_dev
             prev_sample = prev_sample_mean + weighted_variance_noise
-            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
         elif effective_sde_type == "cps":
             model_output = model_output.float()
@@ -306,7 +305,6 @@ class FlowRolloutController:
 
             weighted_variance_noise = variance_noise * noise_std_dev
             prev_sample = prev_sample_mean + weighted_variance_noise
-            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
         elif effective_sde_type == "ode":
             if self.ode_transition is None:
@@ -316,14 +314,9 @@ class FlowRolloutController:
                     model_output=model_output, sample=sample, step_index=step_index
                 )
             prev_sample_mean = prev_sample
-            variance_noise = torch.zeros_like(model_output)
+            variance_noise = torch.zeros_like(model_output) if self.debug_mode else None
             noise_std_dev = torch.zeros(
                 (), device=model_output.device, dtype=model_output.dtype
-            )
-            log_prob_no_const_val = torch.zeros(
-                self.latents_shape,
-                device=model_output.device,
-                dtype=torch.float32,
             )
             # Only enforce the "no full log-prob with ODE" constraint when the
             # user explicitly chose ODE globally.
@@ -335,20 +328,34 @@ class FlowRolloutController:
         else:
             raise ValueError(f"Unsupported sde_type: {self.sde_type}")
 
-        reduce_dims = list(range(1, len(log_prob_no_const_val.shape)))
-        local_elem_count = log_prob_no_const_val.new_full(
-            (log_prob_no_const_val.shape[0],),
-            float(math.prod(log_prob_no_const_val.shape[1:])),
+        # log_prob is computed on the full pre-shard latents shape (not
+        # model_output's local SP shard) so every SP rank sums over the same
+        # element count -- see the comment above on full_variance_noise.
+        reduce_dims = list(range(1, len(self.latents_shape)))
+        local_elem_count = model_output.new_full(
+            (self.latents_shape[0],),
+            float(math.prod(self.latents_shape[1:])),
+            dtype=torch.float32,
         )
 
-        if self.log_prob_no_const or effective_sde_type == "ode":
-            log_prob_local_sum = log_prob_no_const_val.sum(dim=reduce_dims)
+        if effective_sde_type == "ode":
+            # p_ode is always 0: skip allocating and summing a full-size zero
+            # tensor for a result that is deterministically zero.
+            log_prob_local_sum = local_elem_count.new_zeros(local_elem_count.shape)
+        elif self.log_prob_no_const:
+            log_prob_local_sum = -((full_variance_noise * noise_std_dev) ** 2).sum(
+                dim=reduce_dims
+            )
         else:
-            log_prob_local_sum = (
-                log_prob_no_const_val / (2 * (noise_std_dev**2))
-                - torch.log(noise_std_dev)
-                - _LOG_SQRT_2PI
-            ).sum(dim=list(range(1, len(log_prob_no_const_val.shape))))
+            # -((fvn*std)**2) / (2*std**2) == -0.5*fvn**2 (std cancels, it is a
+            # scalar here); -log(std) - C is the same scalar at every position,
+            # so summed over reduce_dims it is just local_elem_count * that
+            # scalar. Moving both out of the per-element sum turns 2 full-size
+            # elementwise passes (divide, then two broadcast subtracts) into a
+            # single reduction plus a cheap per-batch-row correction.
+            log_prob_local_sum = -0.5 * (full_variance_noise**2).sum(
+                dim=reduce_dims
+            ) - local_elem_count * (torch.log(noise_std_dev) + _LOG_SQRT_2PI)
 
         if self.debug_mode:
             self.append_local_rollout_debug_tensors(

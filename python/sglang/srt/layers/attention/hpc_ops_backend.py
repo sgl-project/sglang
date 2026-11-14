@@ -357,7 +357,7 @@ class HPCOpsAttnBackend(AttentionBackend):
             )
 
     def _paged_kv_buffers(self, layer: RadixAttention):
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
         v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
         return k_cache, v_cache
@@ -551,7 +551,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         self._check_layer_supported(layer)
 
         if save_kv_cache and k is not None:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer,
                 KVWriteLoc(forward_batch.out_cache_loc),
                 k,
@@ -605,7 +605,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         self._check_layer_supported(layer)
 
         if save_kv_cache and k is not None:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer,
                 KVWriteLoc(forward_batch.out_cache_loc),
                 k,
@@ -671,7 +671,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         """Graph-splitting wrapper for the fused QKNorm+RoPE+FP8-quant+StoreKV op.
 
         Like ``RadixAttention._eager_attention``, this runs eagerly between captured
-        prefill-graph segments (at capture and at every replay), so the Python
+        prefill-graph segments (at every replay), so the Python
         hand-off of the dynamic Q scales to the following attention op stays
         alive. ``out_q`` is preallocated by the captured segment and mutated in
         place, which is what stitches the surrounding graph segments together.

@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_xpu_ci(est_time=900, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_xpu_ci(est_time=1800, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 
 @unittest.skipUnless(torch.xpu.is_available(), "needs Intel XPU")
@@ -23,6 +23,12 @@ class TestXPUDCPGSM8K(GSM8KMixin, CustomTestCase):
     gsm8k_score_threshold = 0.80
     gsm8k_num_examples = 200
     gsm8k_num_threads = 32
+    gsm8k_backend = "sgl_eval"
+    gsm8k_max_tokens = 8192
+    # Greedy thinking loops re-checking the boxed answer; sample like the
+    # model's generation_config instead.
+    gsm8k_temperature = 1.0
+    gsm8k_top_p = 0.95
 
     @classmethod
     def setUpClass(cls):

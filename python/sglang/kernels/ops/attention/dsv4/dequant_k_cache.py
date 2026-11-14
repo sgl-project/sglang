@@ -4,7 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported
@@ -115,10 +116,10 @@ def dequantize_k_cache_paged_v41(
     if is_hip_runtime():
         supported = is_gfx95_supported()
     else:
-        supported = get_jit_cuda_arch().major >= 10
+        supported = current_arch().is_sm_at_least(9)
     if not supported:
         raise RuntimeError(
-            "DeepSeek V4.1 KV cache dequantization requires CUDA SM100 or newer, or gfx950"
+            "DeepSeek V4.1 KV cache dequantization requires CUDA SM90 or newer, or gfx950"
         )
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
@@ -150,11 +151,13 @@ def dequantize_k_cache_paged_v41(
         else _dequantize_k_cache_paged_v41_fp4_kernel
     )
     data_stride, scale_base, scale_stride = layout.row_addressing(page_size)
-    kernel[(num_tokens,)](
+    tokens_per_program = 8
+    kernel[(triton.cdiv(num_tokens, tokens_per_program),)](
         out,
         buf_fp8,
         buf_uint8,
         page_table_1_flattened,
+        num_tokens,
         out.stride(0),
         BYTES_PER_PAGE=bytes_per_page,
         PAGE_SIZE=page_size,
@@ -165,6 +168,8 @@ def dequantize_k_cache_paged_v41(
         SCALE_BASE=scale_base,
         SCALE_STRIDE=scale_stride,
         IS_HIP=is_hip_runtime(),
+        TOKENS_PER_PROGRAM=tokens_per_program,
+        num_warps=2,
     )
     return out
 
@@ -355,6 +360,7 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     buf_fp8_ptr,
     buf_uint8_ptr,
     page_table_ptr,
+    num_tokens,
     output_stride_0,
     BYTES_PER_PAGE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -365,11 +371,15 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     SCALE_BASE: tl.constexpr,
     SCALE_STRIDE: tl.constexpr,
     IS_HIP: tl.constexpr,
+    TOKENS_PER_PROGRAM: tl.constexpr,
 ):
     # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
     tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
-    token_id = tl.program_id(0).to(tl.int64)
-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    token_id = tl.program_id(0).to(tl.int64) * TOKENS_PER_PROGRAM + tl.arange(
+        0, TOKENS_PER_PROGRAM
+    ).to(tl.int64)
+    token_mask = token_id < num_tokens
+    loc = tl.load(page_table_ptr + token_id, mask=token_mask, other=0).to(tl.int64)
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
@@ -377,12 +387,20 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
     offs = tl.arange(0, DATA_BYTES)
-    vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
-    scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + offs // TILE_SIZE)
+    mask = token_mask[:, None]
+    vals = tl.load(
+        buf_fp8_ptr + token_data_base[:, None] + offs[None, :], mask=mask
+    ).to(tl.float32)
+    scale_u8 = tl.load(
+        buf_uint8_ptr + token_scale_base[:, None] + (offs // TILE_SIZE)[None, :],
+        mask=mask,
+        other=0,
+    )
     out = vals * _ue8m0_to_fp32(scale_u8)
     tl.store(
-        output_ptr + token_id * output_stride_0 + offs,
+        output_ptr + token_id[:, None] * output_stride_0 + offs[None, :],
         _v41_dequant_to_bf16(out, IS_HIP),
+        mask=mask,
     )
 
 
@@ -392,6 +410,7 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     buf_fp8_ptr,
     buf_uint8_ptr,
     page_table_ptr,
+    num_tokens,
     output_stride_0,
     BYTES_PER_PAGE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -402,12 +421,16 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     SCALE_BASE: tl.constexpr,
     SCALE_STRIDE: tl.constexpr,
     IS_HIP: tl.constexpr,
+    TOKENS_PER_PROGRAM: tl.constexpr,
 ):
     # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
     # then 32 e4m3 scales (one per 16 values).
     tl.static_assert(DATA_BYTES == 256 and SCALE_BYTES == 32 and TILE_SIZE == 16)
-    token_id = tl.program_id(0).to(tl.int64)
-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    token_id = tl.program_id(0).to(tl.int64) * TOKENS_PER_PROGRAM + tl.arange(
+        0, TOKENS_PER_PROGRAM
+    ).to(tl.int64)
+    token_mask = token_id < num_tokens
+    loc = tl.load(page_table_ptr + token_id, mask=token_mask, other=0).to(tl.int64)
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
@@ -415,16 +438,23 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
     boffs = tl.arange(0, DATA_BYTES)
-    packed = tl.load(buf_uint8_ptr + token_data_base + boffs)
-    # Byte j holds elements 2j (low nibble) and 2j + 1, both in tile (2j) // 16.
-    scale = tl.load(buf_fp8_ptr + token_scale_base + (2 * boffs) // TILE_SIZE).to(
-        tl.float32
+    mask = token_mask[:, None]
+    packed = tl.load(
+        buf_uint8_ptr + token_data_base[:, None] + boffs[None, :], mask=mask, other=0
     )
-    lo = _e2m1_code_to_fp32(packed & 0xF) * scale
-    hi = _e2m1_code_to_fp32(packed >> 4) * scale
-    out_base = output_ptr + token_id * output_stride_0
-    tl.store(out_base + 2 * boffs, _v41_dequant_to_bf16(lo, IS_HIP))
-    tl.store(out_base + 2 * boffs + 1, _v41_dequant_to_bf16(hi, IS_HIP))
+    # Byte j holds elements 2j (low nibble) and 2j + 1, both in tile (2j) // 16.
+    scale = tl.load(
+        buf_fp8_ptr + token_scale_base[:, None] + ((2 * boffs) // TILE_SIZE)[None, :],
+        mask=mask,
+    ).to(tl.float32)
+    lo = _v41_dequant_to_bf16(_e2m1_code_to_fp32(packed & 0xF) * scale, IS_HIP)
+    hi = _v41_dequant_to_bf16(_e2m1_code_to_fp32(packed >> 4) * scale, IS_HIP)
+    cols = tl.arange(0, 2 * DATA_BYTES)
+    tl.store(
+        output_ptr + token_id[:, None] * output_stride_0 + cols[None, :],
+        tl.interleave(lo, hi),
+        mask=mask,
+    )
 
 
 @triton.jit

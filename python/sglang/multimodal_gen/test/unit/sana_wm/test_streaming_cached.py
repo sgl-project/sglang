@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     BidirectionalGDNUCPESinglePathLiteLA,
     GLUMBConvTemp,
     _gdn_scan_bidirectional,

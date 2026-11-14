@@ -1,5 +1,5 @@
 // One entry per cell `match` tuple (same 5 keys as the config cells). Speed
-// measured with python3 -m sglang.bench_serving on Modal cloud GPUs (one GPU,
+// measured with python3 -m sglang.benchmark.serving on Modal cloud GPUs (one GPU,
 // TP=1): latency = 10 prompts at concurrency 1, throughput = 1000 prompts at
 // concurrency 100 (`random` dataset, 1024/1024 token caps). Accuracy comes
 // from the config's `defaultAccuracy` (Liquid-AI-reported GPQA / AIME25).

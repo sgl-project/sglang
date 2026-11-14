@@ -341,7 +341,7 @@ sglang serve \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model stepfun-ai/Step-3.5-Flash \
   --dataset-name random \
@@ -398,7 +398,7 @@ Max ITL (ms):                            20.77
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model stepfun-ai/Step-3.5-Flash \
   --dataset-name random \
@@ -455,7 +455,7 @@ Max ITL (ms):                            460.85
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model stepfun-ai/Step-3.5-Flash \
   --dataset-name random \

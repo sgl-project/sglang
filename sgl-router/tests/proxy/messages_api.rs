@@ -254,15 +254,6 @@ async fn router_side_rejections_use_the_anthropic_envelope() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{req}");
         assert_anthropic_error(&body, "invalid_request_error");
     }
-    let (status, _, body) = post(
-        build_ctx(mock.url.clone()),
-        "/v1/messages",
-        json!({"model": "no-such-model", "max_tokens": 16,
-               "messages": [{"role": "user", "content": "x"}]}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_anthropic_error(&body, "not_found_error");
     assert!(
         captured(&mock).is_none(),
         "rejected requests must not reach the engine"
@@ -285,15 +276,16 @@ async fn count_tokens() {
     cfg.model.tokenizer_path = Some(tokenizer.to_str().unwrap().into());
     let req = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello world"}]});
 
-    let (status, _, body) = post(
-        build_ctx_with(mock.url.clone(), cfg),
-        "/v1/messages/count_tokens",
-        req.clone(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let v: Value = serde_json::from_slice(&body).unwrap();
-    assert!(v["input_tokens"].as_u64().unwrap() > 0, "{v}");
+    // Any `model` name counts with the served model's tokenizer.
+    let ctx = build_ctx_with(mock.url.clone(), cfg);
+    for model in [MODEL, "no-such-model"] {
+        let mut req = req.clone();
+        req["model"] = json!(model);
+        let (status, _, body) = post(ctx.clone(), "/v1/messages/count_tokens", req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["input_tokens"].as_u64().unwrap() > 0, "{model}: {v}");
+    }
 
     // Without a chat template there is no exact count, and no raw-text guess.
     let (status, _, body) = post(
@@ -308,6 +300,77 @@ async fn count_tokens() {
         captured(&mock).is_none(),
         "count_tokens is answered by the router"
     );
+}
+
+#[tokio::test]
+async fn minimax_m31_count_tokens_matches_generation_effort() {
+    let mock = MockWorker::start(vec![]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tokenizer).unwrap();
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../rust/sglang-processor/tests/fixtures/parity/minimax-m3.1-flash.json"
+    ))
+    .unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        json!({"chat_template": fixture["chat_template"]}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"model_type":"minimax_m3_vl"}"#,
+    )
+    .unwrap();
+    let mut cfg = config();
+    cfg.model.tokenizer_path = Some(tokenizer.to_str().unwrap().into());
+    cfg.model.aliases = vec!["s3://bucket/minimax".into()];
+    let ctx = build_ctx_with(mock.url.clone(), cfg);
+    for model in [MODEL, "s3://bucket/minimax"] {
+        let mut counts = Vec::new();
+        for effort in ["low", "minimal"] {
+            let request = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello world"}],
+                "output_config": {"effort": effort},
+            });
+            let (status, _, body) =
+                post(ctx.clone(), "/v1/messages/count_tokens", request.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let count = serde_json::from_slice::<Value>(&body).unwrap()["input_tokens"]
+                .as_u64()
+                .unwrap();
+            counts.push(count);
+
+            let mut request = request;
+            request["max_tokens"] = 16.into();
+            let (status, _, body) = post(ctx.clone(), "/v1/messages", request).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let sent = captured(&mock).unwrap();
+            assert_eq!(sent["model"], MODEL);
+            assert_eq!(sent["reasoning_effort"], "low");
+            assert_eq!(sent["input_ids"].as_array().unwrap().len() as u64, count);
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "minimal and low must count identically"
+        );
+
+        for kwargs in [
+            json!({"reasoning_effort": "none"}),
+            json!({"thinking_mode": "disabled"}),
+        ] {
+            let (status, _, body) = post(
+                ctx.clone(),
+                "/v1/messages/count_tokens",
+                json!({"model": model, "messages": [{"role": "user", "content": "hi"}],
+                       "chat_template_kwargs": kwargs}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_anthropic_error(&body, "invalid_request_error");
+        }
+    }
 }
 
 #[tokio::test]

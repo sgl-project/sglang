@@ -10,11 +10,16 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 class TboAttnBackend(AttentionBackend):
+    def window_capacity_children(self) -> list:
+        return [self.primary, *self.children]
+
     def __init__(self, primary: AttentionBackend, children: List[AttentionBackend]):
         super().__init__()
         self.primary = primary
@@ -23,7 +28,7 @@ class TboAttnBackend(AttentionBackend):
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
-        self.kv_index_translator = primary.kv_index_translator
+        self.runner_ids = primary.runner_ids
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             primary, "extend_dummy_seqs_capped_by_req_pool", False
         )
@@ -161,6 +166,15 @@ class TboAttnBackend(AttentionBackend):
                 if forward_batch_child.batch_size > 0:
                     child.init_forward_metadata(forward_batch=forward_batch_child)
 
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        # Children read the same capture label;
+        # init_new builds them with the primary's creator.
+        return self.primary.get_decode_graph_variants(
+            capture_forward_mode, captured_req_width
+        )
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
         if not self._children_use_cuda_graph():
@@ -255,10 +269,13 @@ def _build_tbo_child_replay_fb_view(
     child_seq_lens_cpu = fb_view.seq_lens_cpu[seq_slice]
     parent_input_ids = getattr(fb_view, "input_ids", None)
     parent_out_cache_loc = getattr(fb_view, "out_cache_loc", None)
-    plan = getattr(fb_view, "kv_loc_plan", None)
+    plan = getattr(fb_view, "iteration_ids", None)
     return SimpleNamespace(
         batch_size=child_bs,
         forward_mode=fb_view.forward_mode,
+        # TBO is mutually exclusive with ragged verify; a parent layout would
+        # describe the full batch, not this child slice.
+        ragged_verify_layout=None,
         actual_forward_mode=getattr(
             fb_view, "actual_forward_mode", fb_view.forward_mode
         ),
@@ -278,11 +295,11 @@ def _build_tbo_child_replay_fb_view(
         # Unified memory refuses two-batch overlap, so the plan's reads stay in
         # `req_to_token`, which each child indexes at its own rows; each child
         # writes its own tokens of the plan's window.
-        kv_loc_plan=plan,
-        kv_loc_cols=(
+        iteration_ids=plan,
+        iteration_cols=(
             None
             if plan is None
-            else plan.cols_slice(getattr(fb_view, "kv_loc_cols", None), tok_slice)
+            else plan.cols_slice(getattr(fb_view, "iteration_cols", None), tok_slice)
         ),
         spec_info=child_spec_info,
         max_seq_len_override=fb_view.max_seq_len_override,

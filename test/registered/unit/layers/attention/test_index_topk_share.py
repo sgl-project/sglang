@@ -8,7 +8,7 @@ import torch
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -176,6 +176,8 @@ def _capture(
     )
     # Exercise the real seed export method without initializing GPU resources.
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.dsa_shards_index_k = False
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend.use_fused_topk = fused
     backend.get_topk_transform_method = Mock(
         return_value=TopkTransformMethod.RAGGED if ragged else TopkTransformMethod.PAGED
@@ -200,7 +202,6 @@ def _capture(
                 q_lora=None,
                 positions=None,
                 forward_batch=batch,
-                layer_id=0,
             )
             assert indexer.call_args.kwargs["return_indices"]
         else:

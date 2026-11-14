@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -17,7 +18,7 @@ from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_parallel,
 )
-from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
+from sglang.srt.utils.log_utils import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -44,32 +45,21 @@ _cutedsl_logged_scalarize: set = set()
 # ---------------------------------------------------------------------------
 
 
-def interleave_w13_halves(
-    tensor: torch.Tensor, group_size: int = 64, dim: int = 1
-) -> torch.Tensor:
-    """Interleave the two logical W13 halves for CuteDSL's SwiGLU GEMM1 layout.
+def use_cutedsl_moe_swap_ab(device: torch.device) -> bool:
+    """Select the same weight and execution layout on Blackwell SM100/SM103."""
+    if device.type != "cuda":
+        return False
+    # Resolve the current device before caching so an unindexed "cuda" device
+    # cannot reuse another GPU's result after torch.cuda.set_device().
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _use_cutedsl_moe_swap_ab(device_index)
 
-    The caller is responsible for loading W13 in the expected two-half order.
-    This helper only rewrites the first and second halves into alternating
-    `group_size` chunks along `dim`.
-    """
-    if tensor.shape[dim] % 2 != 0:
-        raise ValueError(
-            "Expected even size on interleave dimension for W13 half split."
-        )
-    split = tensor.shape[dim] // 2
-    if split % group_size != 0:
-        raise ValueError(
-            f"Expected split dim divisible by group_size={group_size}, got {split}."
-        )
-    first_half = tensor.narrow(dim, 0, split)
-    second_half = tensor.narrow(dim, split, split)
-    first_half_groups = first_half.split(group_size, dim=dim)
-    second_half_groups = second_half.split(group_size, dim=dim)
-    interleaved = [
-        item for pair in zip(first_half_groups, second_half_groups) for item in pair
-    ]
-    return torch.cat(interleaved, dim=dim)
+
+@lru_cache(maxsize=None)
+def _use_cutedsl_moe_swap_ab(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
 
 
 def cutedsl_quant_scale_to_scalar(
@@ -228,13 +218,14 @@ def resolve_cutedsl_standard_scales(
 
 
 def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) -> Any:
-    if activation == "silu":
+    # FlashInfer selects SiTU as the gated Swiglu path plus situ_beta.
+    if activation in ("silu", "situ"):
         return activation_type_cls.Swiglu
     if activation == "relu2":
         return activation_type_cls.Relu2
     raise ValueError(
-        f"CuteDSL MoE wrapper supports 'silu' (gated) or 'relu2' (non-gated) "
-        f"activation, got {activation!r}."
+        f"CuteDSL MoE wrapper supports 'silu'/'situ' (gated) or 'relu2' "
+        f"(non-gated) activation, got {activation!r}."
     )
 
 
@@ -349,6 +340,13 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     # _dummy_run which runs under inference_mode(); inference tensors cannot
     # be inplace-updated during later CUDA graph capture (which runs outside
     # inference_mode), so we must opt out here.
+    situ_kwargs = {}
+    if layer.moe_runner_config.activation == "situ":
+        # SiTU's beta / linear beta, applied in the GEMM1 epilogue.
+        situ_kwargs = dict(
+            situ_beta=layer.moe_runner_config.gemm1_alpha,
+            situ_linear_beta=layer.moe_runner_config.gemm1_clamp_limit,
+        )
     with torch.inference_mode(False):
         layer._cutedsl_wrapper = CuteDslMoEWrapper(
             num_experts=layer.num_experts,
@@ -366,6 +364,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
             quant_mode=quant_mode,
+            swap_ab=use_cutedsl_moe_swap_ab(layer.w13_weight.device),
+            **situ_kwargs,
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
@@ -447,9 +447,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
     ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+        f"CuteDSL MoE supports 'silu'/'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
@@ -512,7 +513,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     return StandardCombineInput(hidden_states=output)
 
 
-@register_fused_func("flashinfer", "flashinfer_cutedsl")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_cutedsl")
 def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,
@@ -540,9 +541,10 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
 
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
     ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+        f"CuteDSL MoE supports 'silu'/'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 

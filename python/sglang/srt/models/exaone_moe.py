@@ -53,6 +53,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -60,8 +62,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_pp_layers
+from sglang.srt.utils import LazyValue, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +200,10 @@ class ExaoneMoESparseMoEBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(parallel_group="replicated")
-                    if get_moe_a2a_backend().is_deepep()
+                    if (
+                        get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_ascend_ops()
+                    )
                     else {}
                 ),
             )
@@ -269,7 +275,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
             return self._forward_deepep(hidden_states, forward_batch)
 
         if (
@@ -305,9 +311,11 @@ class ExaoneMoEAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.alt_stream = alt_stream
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -404,13 +412,14 @@ class ExaoneMoEAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = q.reshape(-1, self.head_dim)
-        q = self.q_norm(q)
-        q = q.reshape(-1, self.num_heads * self.head_dim)
-
-        k = k.reshape(-1, self.head_dim)
-        k = self.k_norm(k)
-        k = k.reshape(-1, self.num_kv_heads * self.head_dim)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+            alt_stream=self.alt_stream,
+        )
 
         if self.sliding_window or self.apply_rope_all_layers:
             q, k = self.rotary_emb(positions, q, k)
@@ -461,6 +470,7 @@ class ExaoneMoEDecoderLayer(nn.Module):
             quant_config=quant_config,
             bias=attention_bias,
             prefix=add_prefix("self_attn", prefix),
+            alt_stream=alt_stream,
         )
 
         attn, ffn = self.stage_facts(config, layer_id)
@@ -693,46 +703,6 @@ class ExaoneMoEForCausalLM(nn.Module):
             )
         else:
             return hidden_states
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
 
     @property
     def start_layer(self):

@@ -1,8 +1,10 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, Callable
 
 from tqdm.auto import tqdm
@@ -214,36 +216,62 @@ def build_client_warmup_reqs(
     return warmup_reqs
 
 
+async def _warm_replica(
+    server_args: ServerArgs,
+    forward: Callable[..., Awaitable[OutputBatch]],
+    replica: int,
+    warmup_reqs: list[Req],
+) -> None:
+    for req in warmup_reqs:
+        response = await forward(req, replica=replica)
+        for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
+            if response.error is None or not _is_out_of_memory(response.error):
+                break
+            lighter = _degrade_after_oom(server_args, req)
+            if lighter is None:
+                break
+            req = lighter
+            response = await forward(req, replica=replica)
+        if response.error is not None:
+            raise RuntimeError(response.error)
+
+
 async def run_async_client_warmup(
     server_args: ServerArgs,
-    forward: Callable[[Req], Awaitable[OutputBatch]],
+    forward: Callable[..., Awaitable[OutputBatch]],
     *,
     fail_open: bool = False,
     rewarm: bool = False,
     step_limit: int | None = None,
 ) -> None:
+    """Warm every replica with the full request list.
+
+    `forward(req, replica=i)` must deliver to replica i: each replica compiles
+    and allocates on its own GPUs, and each counts the same `warmup_total`.
+    """
     try:
         warmup_input_path = None
         if should_include_warmup_image(server_args, server_based_warmup=True):
             warmup_input_path = prepare_warmup_image_path(server_args)
 
-        for req in build_client_warmup_reqs(
+        warmup_reqs = build_client_warmup_reqs(
             server_args,
             warmup_input_path=warmup_input_path,
             rewarm=rewarm,
             step_limit=step_limit,
-        ):
-            response = await forward(req)
-            for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
-                if response.error is None or not _is_out_of_memory(response.error):
-                    break
-                lighter = _degrade_after_oom(server_args, req)
-                if lighter is None:
-                    break
-                req = lighter
-                response = await forward(req)
-            if response.error is not None:
-                raise RuntimeError(response.error)
+        )
+        # let every replica finish before judging, so a failed one does not
+        # leave its siblings warming in the background of live traffic
+        results = await asyncio.gather(
+            *(
+                _warm_replica(server_args, forward, replica, warmup_reqs)
+                for replica in range(len(server_args.scheduler_endpoints))
+            ),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
     except Exception:
         if fail_open:
             logger.warning(
@@ -253,18 +281,14 @@ async def run_async_client_warmup(
         raise
 
 
-def run_sync_client_warmup(
+def _warm_replica_sync(
     server_args: ServerArgs,
-    forward: Callable[[Req], OutputBatch],
+    forward: Callable[..., OutputBatch],
+    replica: int,
+    warmup_reqs: list[Req],
 ) -> None:
-    warmup_input_path = None
-    if should_include_warmup_image(server_args, server_based_warmup=True):
-        warmup_input_path = prepare_warmup_image_path(server_args)
-
-    for req in build_client_warmup_reqs(
-        server_args, warmup_input_path=warmup_input_path
-    ):
-        response = forward(req)
+    for req in warmup_reqs:
+        response = forward(req, replica=replica)
         for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
             if response.error is None or not _is_out_of_memory(response.error):
                 break
@@ -272,9 +296,33 @@ def run_sync_client_warmup(
             if lighter is None:
                 break
             req = lighter
-            response = forward(req)
+            response = forward(req, replica=replica)
         if response.error is not None:
             raise RuntimeError(response.error)
+
+
+def run_sync_client_warmup(
+    server_args: ServerArgs,
+    forward: Callable[..., OutputBatch],
+) -> None:
+    """Warm every replica with the full request list; see the async variant."""
+    warmup_input_path = None
+    if should_include_warmup_image(server_args, server_based_warmup=True):
+        warmup_input_path = prepare_warmup_image_path(server_args)
+
+    warmup_reqs = build_client_warmup_reqs(
+        server_args, warmup_input_path=warmup_input_path
+    )
+    replicas = range(len(server_args.scheduler_endpoints))
+    # leaving the pool waits for every replica, so a failed one does not leave
+    # its siblings warming in the background
+    with ThreadPoolExecutor(max_workers=max(len(replicas), 1)) as pool:
+        futures = [
+            pool.submit(_warm_replica_sync, server_args, forward, replica, warmup_reqs)
+            for replica in replicas
+        ]
+    for future in futures:
+        future.result()
 
 
 def prepare_warmup_image_path(server_args: ServerArgs) -> str:

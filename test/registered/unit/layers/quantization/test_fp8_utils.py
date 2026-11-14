@@ -28,6 +28,81 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
 
 
+class TestFlashinferBmmPrequantContract(unittest.TestCase):
+    def test_e4m3_rows_bypass_quantization_and_restore_producer_dtype(self):
+        for output_dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(output_dtype=output_dtype):
+                self._assert_prequantized_dtype(output_dtype)
+
+    def _assert_prequantized_dtype(self, output_dtype):
+        qinput = torch.empty((2, 4), dtype=torch.float8_e4m3fn, device="cpu")
+        weight = torch.empty((4, 3), dtype=torch.float8_e4m3fn, device="cpu")
+        input_scale = torch.tensor([0.02], device="cpu")
+        weight_scale = torch.tensor([0.01], device="cpu")
+        expected = torch.empty((2, 3), dtype=output_dtype, device="cpu")
+
+        with (
+            patch.object(fp8_utils, "static_quant_fp8") as quantize,
+            patch.object(
+                fp8_utils,
+                "flashinfer_bmm_fp8",
+                return_value=expected,
+                create=True,
+            ) as bmm,
+        ):
+            actual = fp8_utils.apply_fp8_linear_bmm_flashinfer(
+                qinput,
+                weight,
+                weight_scale,
+                input_scale,
+                pre_quant_output_dtype=output_dtype,
+            )
+
+        quantize.assert_not_called()
+        bmm.assert_called_once()
+        got_input, got_weight, got_input_scale, got_weight_scale, got_dtype = (
+            bmm.call_args.args
+        )
+        self.assertEqual(got_input.data_ptr(), qinput.data_ptr())
+        self.assertEqual(tuple(got_input.shape), tuple(qinput.shape))
+        self.assertIs(got_weight, weight)
+        self.assertIs(got_input_scale, input_scale)
+        self.assertIs(got_weight_scale, weight_scale)
+        self.assertIs(got_dtype, output_dtype)
+        self.assertEqual(actual.data_ptr(), expected.data_ptr())
+        self.assertEqual(tuple(actual.shape), (2, 3))
+
+
+class TestFlashinferBmmBiasEpilogueGate(unittest.TestCase):
+    def test_bias_epilogue_starts_at_min_rows(self):
+        """Biased calls below the threshold keep bmm_fp8 + add, which a tuned bmm_fp8
+        makes faster there; both paths give the same output, so only this catches a
+        gate that always or never takes the epilogue."""
+        min_rows = fp8_utils._FP8_BIAS_EPILOGUE_MIN_ROWS
+        for rows, uses_epilogue in ((min_rows - 1, False), (min_rows, True)):
+            with self.subTest(rows=rows):
+                self.assertIs(self._uses_epilogue(rows), uses_epilogue)
+
+    def _uses_epilogue(self, rows):
+        output = torch.zeros((rows, 3), dtype=torch.bfloat16)
+        with (
+            patch.object(
+                fp8_utils, "flashinfer_bmm_fp8", return_value=output, create=True
+            ) as bmm,
+            patch.object(torch, "_scaled_mm", return_value=output) as scaled_mm,
+        ):
+            fp8_utils.apply_fp8_linear_bmm_flashinfer(
+                input=torch.empty((rows, 4), dtype=torch.float8_e4m3fn),
+                weight=torch.empty((4, 3), dtype=torch.float8_e4m3fn),
+                weight_scale=torch.tensor([0.01]),
+                input_scale=torch.tensor([0.02]),
+                bias=torch.zeros(3, dtype=torch.bfloat16),
+                pre_quant_output_dtype=torch.bfloat16,
+            )
+        self.assertNotEqual(bmm.called, scaled_mm.called)
+        return scaled_mm.called
+
+
 class TestMxfp8MoeScaleLayout(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -449,6 +524,49 @@ class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):
         for dtype in self.DTYPES:
             with self.subTest(dtype=dtype):
                 self._run(dtype)
+
+
+class TestApplyFp8LinearBmmFlashinferBias(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not (
+            torch.cuda.is_available()
+            and fp8_utils.flashinfer_per_tensor_fp8_supported()
+        ):
+            raise unittest.SkipTest(
+                "FlashInfer per-tensor FP8 GEMM needs SM90 or newer"
+            )
+
+    def test_bias_matches_separate_add(self):
+        torch.manual_seed(0)
+        m, k, n = fp8_utils._FP8_BIAS_EPILOGUE_MIN_ROWS, 1024, 3072
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                input = torch.randn(m, k, dtype=dtype, device="cuda")
+                weight = (
+                    torch.randn(n, k, device="cuda")
+                    .mul_(32)
+                    .to(torch.float8_e4m3fn)
+                    .t()
+                )
+                weight_scale = torch.tensor(0.02, dtype=torch.float32, device="cuda")
+                input_scale = torch.tensor(0.025, dtype=torch.float32, device="cuda")
+                bias = torch.randn(n, dtype=dtype, device="cuda")
+
+                args = dict(
+                    input=input,
+                    weight=weight,
+                    weight_scale=weight_scale,
+                    input_scale=input_scale,
+                )
+                out = fp8_utils.apply_fp8_linear_bmm_flashinfer(**args, bias=bias)
+                ref = fp8_utils.apply_fp8_linear_bmm_flashinfer(**args)
+                self.assertEqual(out.dtype, dtype)
+                # The epilogue adds the bias before rounding and the reference after it,
+                # so outputs of magnitude ~20 may differ by one rounding step.
+                torch.testing.assert_close(
+                    out.float(), ref.float() + bias.float(), rtol=1.6e-2, atol=0.5
+                )
 
 
 if __name__ == "__main__":

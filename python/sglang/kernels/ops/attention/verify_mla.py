@@ -92,6 +92,7 @@ def _verify_mla_prefix_stage1(
     BLOCK_DPE: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SLIDING_WINDOW_SIZE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     head_block = tl.program_id(1)
@@ -153,6 +154,12 @@ def _verify_mla_prefix_stage1(
                 other=0.0,
             ).to(K_Buffer.dtype.element_ty)
 
+        if SLIDING_WINDOW_SIZE > 0:
+            # extend_attention_fwd's rule on the pre-windowed prefix list: draft query
+            # l sees prefix key n iff seq_len + l <= n + SLIDING_WINDOW_SIZE
+            row_l = tl.reshape(offs_h[:, None] * 0 + offs_l[None, :], (R,))
+            window_start = cur_batch_seq_len + row_l - SLIDING_WINDOW_SIZE
+
         e_max = tl.zeros([R], dtype=tl.float32) - float("inf")
         e_sum = tl.zeros([R], dtype=tl.float32)
         acc = tl.zeros([R, BLOCK_DV], dtype=tl.float32)
@@ -180,6 +187,10 @@ def _verify_mla_prefix_stage1(
                 qk += tl.dot(q_pe, k_pe)
             qk *= sm_scale * k_scale
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
+            if SLIDING_WINDOW_SIZE > 0:
+                qk = tl.where(
+                    offs_n[None, :] >= window_start[:, None], qk, float("-inf")
+                )
 
             # MLA exposes its latent V through V_Buffer; ordinary shared-KV
             # attention has an independent V cache. Both use this same load.
@@ -192,8 +203,14 @@ def _verify_mla_prefix_stage1(
                 other=0.0,
             )
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
+            if SLIDING_WINDOW_SIZE > 0:
+                # a row whose keys so far are all outside the window stays at -inf
+                n_e_max_safe = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
+                re_scale = tl.exp(e_max - n_e_max_safe)
+                p = tl.exp(qk - n_e_max_safe[:, None])
+            else:
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
             acc += tl.dot(p.to(v.dtype), v)
             e_sum = e_sum * re_scale + tl.sum(p, 1)
@@ -208,9 +225,14 @@ def _verify_mla_prefix_stage1(
             + offs_l[None, :] * stride_ol,
             (R,),
         )
+        if SLIDING_WINDOW_SIZE > 0:
+            # a split with no key inside the window contributes nothing (lse -inf)
+            out = tl.where(e_sum[:, None] > 0, acc / e_sum[:, None], 0.0)
+        else:
+            out = acc / e_sum[:, None]
         tl.store(
             Att_Out + o_row[:, None] + offs_dv[None, :],
-            (acc / e_sum[:, None]).to(Att_Out.dtype.element_ty),
+            out.to(Att_Out.dtype.element_ty),
             mask=row_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
         )
         lse_row = tl.reshape(
@@ -377,6 +399,9 @@ def _verify_mla_combine_stage2(
 
 
 class VerifyMLA:
+    block_config = staticmethod(block_config)
+    prefix_num_stages = 1
+
     def __init__(
         self,
         max_bs,
@@ -448,6 +473,7 @@ class VerifyMLA:
         sm_scale,
         k_scale,
         v_scale,
+        sliding_window_size=-1,
     ):
         grid = (bs, self.n_head_blocks, num_splits)
         _verify_mla_prefix_stage1[grid](
@@ -488,8 +514,9 @@ class VerifyMLA:
             BLOCK_DPE=max(1, triton.next_power_of_2(self.pe_dim)),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
+            SLIDING_WINDOW_SIZE=sliding_window_size,
             num_warps=self.num_warps,
-            num_stages=1,
+            num_stages=self.prefix_num_stages,
             **_AMD_LAUNCH_KWARGS,
         )
 
@@ -561,6 +588,7 @@ class VerifyMLA:
         k_scale=1.0,
         v_scale=1.0,
         is_causal=True,
+        sliding_window_size=-1,
     ):
         if o_out is None:
             o_out = torch.empty(
@@ -583,6 +611,7 @@ class VerifyMLA:
             sm_scale,
             k_scale,
             v_scale,
+            sliding_window_size=sliding_window_size,
         )
         self._run_combine_kernel(
             bs,
@@ -602,11 +631,20 @@ class VerifyMLA:
 _VMLA_CACHE = {}
 
 
-def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device, kv_group_num=None):
-    key = (h_q, head_dim, v_head_dim, l_ext, str(device), kv_group_num)
+def _get_vmla(
+    max_bs,
+    h_q,
+    head_dim,
+    v_head_dim,
+    l_ext,
+    device,
+    kv_group_num=None,
+    vmla_cls=VerifyMLA,
+):
+    key = (h_q, head_dim, v_head_dim, l_ext, str(device), kv_group_num, vmla_cls)
     vk = _VMLA_CACHE.get(key)
     if vk is None:
-        block_h, block_n, num_warps = block_config(head_dim)
+        block_h, block_n, num_warps = vmla_cls.block_config(head_dim)
         if (
             kv_group_num is not None
             and kv_group_num < h_q  # i.e. h_kv > 1, so the offset is live
@@ -616,7 +654,7 @@ def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device, kv_group_num=Non
             # only admits power-of-two groups in that case, so this stays valid
             # for tl.arange(0, BLOCK_H).
             block_h = kv_group_num
-        vk = VerifyMLA(
+        vk = vmla_cls(
             max_bs,
             h_q,
             head_dim,
@@ -651,6 +689,7 @@ def can_handle(
     sinks=None,
     logit_cap=0.0,
     xai_temperature_len=-1,
+    allow_sliding_window=False,
 ):
     """Return True iff the grouped-head split-KV verify path can serve this
     exact problem with the same result as extend_attention_fwd. Conservative:
@@ -667,7 +706,9 @@ def can_handle(
     # No exotic features.
     if sinks is not None:
         return False
-    if sliding_window_size is not None and sliding_window_size > 0:
+    has_window = sliding_window_size is not None and sliding_window_size > 0
+    # the windowed combine serves the DSpark draft's non-causal block only
+    if has_window and (not allow_sliding_window or is_causal):
         return False
     if logit_cap and logit_cap > 0:
         return False
@@ -719,7 +760,15 @@ def can_handle(
     # any ragged/variable-extend batch -> falls back to the baseline.
     if q_extend.shape[0] != bs * mle:
         return False
+    # the window is applied to the prefix only; draft-draft pairs must all be inside it
+    if has_window and sliding_window_size < mle:
+        return False
     return True
+
+
+def _unit_stride_rows(x: torch.Tensor) -> torch.Tensor:
+    # the kernels index draft K/V rows and heads by stride, elements by 1
+    return x if x.stride(-1) == 1 else x.contiguous()
 
 
 def verify_shared_kv_fwd(
@@ -746,6 +795,7 @@ def verify_shared_kv_fwd(
     window_kv_offsets=None,
     xai_temperature_len=-1,
     max_bs=None,
+    allow_sliding_window=False,
 ):
     """
     Grouped-head drop-in for extend_attention_fwd on a topk==1 target-verify
@@ -770,6 +820,7 @@ def verify_shared_kv_fwd(
         sinks=sinks,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
+        allow_sliding_window=allow_sliding_window,
     ):
         return False
     if q_extend.shape[2] < v_extend.shape[2]:
@@ -798,13 +849,28 @@ def verify_shared_kv_fwd(
 
     if max_bs is None or max_bs < bs:
         max_bs = bs
+    windowed = sliding_window_size is not None and sliding_window_size > 0
+    if windowed:
+        # verify_mla_window subclasses VerifyMLA, so it imports this module
+        from sglang.kernels.ops.attention.verify_mla_window import WindowedVerifyMLA
+
+        vmla_cls = WindowedVerifyMLA
+    else:
+        vmla_cls = VerifyMLA
     vk = _get_vmla(
-        max_bs, h_q, head_dim, v_head_dim, l_ext, q_extend.device, kv_group_num
+        max_bs,
+        h_q,
+        head_dim,
+        v_head_dim,
+        l_ext,
+        q_extend.device,
+        kv_group_num,
+        vmla_cls,
     )
     vk(
         q_extend,
-        k_extend.contiguous(),
-        v_extend.contiguous(),
+        _unit_stride_rows(k_extend),
+        _unit_stride_rows(v_extend),
         k_buffer,
         v_buffer,
         qo_indptr,
@@ -815,5 +881,6 @@ def verify_shared_kv_fwd(
         k_scale=k_scale,
         v_scale=v_scale,
         is_causal=is_causal,
+        sliding_window_size=sliding_window_size if windowed else -1,
     )
     return True

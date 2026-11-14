@@ -6,8 +6,9 @@ ordered list of rules ``{"when": {...}, <launch_param>: <val>, ...}`` (first mat
 wins). Each op passes a portable default to :func:`resolve`, used whenever no
 rule matches (including when no file exists for the GPU).
 
-``<hardware_key>`` is the normalized device name on CUDA (``NVIDIA_GB300``).
-``when`` keys are ``<param>`` (equality) or ``<param>_{lt,le,ge,gt,eq}``.
+``<hardware_key>`` is the GCN arch on ROCm (``gfx950``, shared across MI350X/
+MI355X) and the normalized device name on CUDA (``NVIDIA_GB300``). ``when`` keys
+are ``<param>`` (equality) or ``<param>_{lt,le,ge,gt,eq}``.
 """
 
 from __future__ import annotations

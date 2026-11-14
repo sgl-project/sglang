@@ -167,7 +167,7 @@ curl -s http://localhost:${PORT}/v1/models
 - Test Command:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port ${PORT} \
@@ -251,7 +251,7 @@ Mean ITL (ms):                           13.17
 - Test Command:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port ${PORT} \

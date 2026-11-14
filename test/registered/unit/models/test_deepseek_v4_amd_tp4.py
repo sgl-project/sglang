@@ -175,7 +175,7 @@ def _replay_fused_and_unfused(group, run, check, *, residual, pre):
     "rows,verify", [(1, False), (8, True)], ids=["decode", "verify"]
 )
 def test_model_handoff_and_graph_replay(group, rows, verify):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.models.deepseek_v4_platform_stage import (
         forward_hc_pre_from_prev_fused_boundary,
     )
@@ -220,6 +220,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
         return x
 
     experts.quant_method = None
+    experts.supports_routed_deferred_finalize = False
     experts.moe_runner_config = SimpleNamespace(inplace=False)
     gate.rocm_router_max_tokens = -1  # the split-K router never serves the fake gate
     moe = DeepseekV2MoE.__new__(DeepseekV2MoE)
@@ -263,7 +264,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
 )
 def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
     from sglang.srt.layers.moe import MoeA2ABackend
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.models.deepseek_v4 import (
         DeepseekV4DecoderLayer,
         DeepseekV4PlatformDecoderLayer,
@@ -388,10 +389,7 @@ def _engram_table(rows):
         .flatten(1)
         .to(torch.bfloat16)
     )
-    with (
-        envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(False),
-        torch.device("cuda"),
-    ):
+    with torch.device("cuda"):
         # One hash column per rank, so TP4 takes the column-aligned split.
         bounds = tuple(rows * c // 4 for c in range(5))
         embed = EngramEmbedding(rows, 128, layer_id=1, column_bounds=bounds)

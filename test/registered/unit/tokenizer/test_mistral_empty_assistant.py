@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.utils.hf_transformers.mistral_utils import (
+from sglang.srt.hf_transformers.mistral_utils import (
     patch_mistral_common_tokenizer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci

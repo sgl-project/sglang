@@ -153,7 +153,7 @@ struct SetMlaKVConcatQKernel {
     auto S1_qo = SymbolicSize{"q_out_stride_1"};
     auto loc_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     D_qn.set_value(kQNopeDim);
     D_qr.set_value(kQRopeDim);
@@ -462,7 +462,7 @@ struct SetMlaKVConcatQFp8Kernel {
     auto S1_qo = SymbolicSize{"q_out_stride_1"};
     auto loc_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     D_nope.set_value(kFp8NopeDim);
     D_rope.set_value(kFp8RopeDim);

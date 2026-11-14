@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from sglang.srt.utils import sample_video_frames
+from sglang.srt.multimodal.media_io import sample_video_frames
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")

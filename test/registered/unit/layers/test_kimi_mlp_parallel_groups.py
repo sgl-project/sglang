@@ -167,6 +167,11 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                     parallel_scope(tp_group=tp, attn_tp_group=attn),
                                     patch.object(
                                         linear,
+                                        "is_allocation_symmetric",
+                                        return_value=True,
+                                    ),
+                                    patch.object(
+                                        linear,
                                         "use_symmetric_memory",
                                         return_value=nullcontext(),
                                     ) as allocation,
@@ -183,6 +188,11 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                         allocation.call_args.args[0],
                                         attn if auto_attn else tp,
                                     )
+                                    if not auto_attn:
+                                        self.assertEqual(
+                                            allocation.call_args.kwargs["disabled"],
+                                            layer.tp_group is None,
+                                        )
                                 else:
                                     allocation.assert_not_called()
 

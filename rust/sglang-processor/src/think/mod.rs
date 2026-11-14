@@ -45,16 +45,11 @@ pub(crate) enum ThinkConfig {
 
 #[cfg(feature = "openai")]
 impl ThinkConfig {
-    /// `_get_reasoning_from_request` for a template without a reasoning
-    /// config, by the detector's `reasoning_default`.
-    pub(crate) fn default_thinking(&self, kwargs: &Map<String, Value>) -> bool {
-        let default = match self {
+    /// The detector's `reasoning_default`.
+    pub(crate) fn reasoning_default(&self) -> ReasoningDefault {
+        match self {
             ThinkConfig::Tags(tags) => tags.reasoning_default,
             ThinkConfig::KimiK3 => ReasoningDefault::on_unless("thinking"),
-        };
-        match kwargs.get(default.kwarg) {
-            Some(Value::Bool(enabled)) => *enabled,
-            _ => default.on,
         }
     }
 
@@ -133,8 +128,18 @@ impl ReasoningDefault {
         Self { kwarg, on: true }
     }
 
+    #[cfg(feature = "openai")]
     pub(crate) const fn off_unless(kwarg: &'static str) -> Self {
         Self { kwarg, on: false }
+    }
+
+    /// `_get_reasoning_from_request` for a template without a reasoning config.
+    #[cfg(feature = "openai")]
+    pub(crate) fn enabled(&self, kwargs: &Map<String, Value>) -> bool {
+        match kwargs.get(self.kwarg) {
+            Some(Value::Bool(enabled)) => *enabled,
+            _ => self.on,
+        }
     }
 }
 

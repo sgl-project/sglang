@@ -325,6 +325,8 @@ class FusedPostExpertNormWeightedSumTRTLLM(BaseFusedOp):
             cluster_size=cluster_size,
             ar_world_size=0 if ar_workspace is None else ar_workspace.world_size,
             ar_multicast=ar_workspace is not None and ar_workspace.multicast,
+            ar_two_shot=ar_workspace is not None
+            and ar_workspace.uses_two_shot_push(num_tokens),
             ar_controller_count=ar_workspace.controller_count
             if ar_workspace is not None
             else 0,

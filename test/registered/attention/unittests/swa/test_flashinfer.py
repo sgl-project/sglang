@@ -4,8 +4,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (

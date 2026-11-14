@@ -47,7 +47,6 @@ class TestAttentionBCGOutputs(unittest.TestCase):
         graph = bcg.BreakableCUDAGraph()
         capture = SimpleNamespace(
             cuda_graph=graph,
-            _barrier_fn=None,
             _end_current_segment=lambda: None,
             _begin_new_segment=lambda: None,
         )
@@ -77,14 +76,14 @@ class TestAttentionBCGOutputs(unittest.TestCase):
     def test_local_attention_replays_into_captured_output(self):
         q = torch.zeros(1, 4, 2, 3)
         output = self._capture_and_replay(_attention(layer.LocalAttention), q, q, q)
-        self.assertTrue(torch.all(output == 2))
+        self.assertTrue(torch.all(output == 1))
 
     def test_ulysses_attention_replays_into_captured_tuple(self):
         q = torch.zeros(1, 4, 2, 3)
         replicated_q = torch.zeros(1, 2, 2, 3)
         attention = _attention(layer.UlyssesAttention)
         output, replicated_output = self._capture_and_replay(attention, q, q, q)
-        self.assertTrue(torch.all(output == 2))
+        self.assertTrue(torch.all(output == 1))
         self.assertIsNone(replicated_output)
 
         output, replicated_output = self._capture_and_replay(
@@ -98,8 +97,8 @@ class TestAttentionBCGOutputs(unittest.TestCase):
         )
         self.assertEqual(output.shape, q.shape)
         self.assertEqual(replicated_output.shape, replicated_q.shape)
-        self.assertTrue(torch.all(output == 4))
-        self.assertTrue(torch.all(replicated_output == 4))
+        self.assertTrue(torch.all(output == 2))
+        self.assertTrue(torch.all(replicated_output == 2))
 
 
 if __name__ == "__main__":
