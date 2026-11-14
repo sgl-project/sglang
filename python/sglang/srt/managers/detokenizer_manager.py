@@ -341,6 +341,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 for read, skip, space in zip(read_ids, skip_list, space_list)
             ]
 
+        stalled_commit_texts = self._decode_stalled_commits(
+            recv_obj, states, skip_list, space_list
+        )
+
         # Incremental decoding
         output_strs = []
         for i in range(bs):
@@ -357,10 +361,44 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_text=surr_texts[i],
                     finished_reason=finished_reason,
                     trim_matched_stop=self.trim_matched_stop,
+                    stalled_commit_text=stalled_commit_texts[i],
                 )
             )
 
         return output_strs
+
+    def _decode_stalled_commits(
+        self,
+        recv_obj: BatchTokenIDOutput,
+        states: List[Optional[DetokenizeState]],
+        skip_list: List[bool],
+        space_list: List[bool],
+    ) -> List[Optional[str]]:
+        """Decode the commit prefix of each streaming row whose tail has stalled."""
+        texts: List[Optional[str]] = [None] * len(states)
+        rows, ids_list = [], []
+        for i, s in enumerate(states):
+            if s is None or recv_obj.finished_reasons[i] is not None:
+                continue
+            if (ids := s.stalled_commit_ids()) is not None:
+                rows.append(i)
+                ids_list.append(ids)
+        if not rows:
+            return texts
+        skips = [skip_list[i] for i in rows]
+        spaces = [space_list[i] for i in rows]
+        if not self.disable_tokenizer_batch_decode:
+            decoded = self._grouped_batch_decode(ids_list, skips, spaces)
+        else:
+            decoded = [
+                self.tokenizer.decode(
+                    ids, skip_special_tokens=skip, spaces_between_special_tokens=space
+                )
+                for ids, skip, space in zip(ids_list, skips, spaces)
+            ]
+        for i, text in zip(rows, decoded):
+            texts[i] = text
+        return texts
 
     @staticmethod
     def _b64_encode_per_request(
