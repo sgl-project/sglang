@@ -17,9 +17,22 @@ logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import (
-        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
-    )
+
+    try:
+        from deep_gemm.utils.layout import (
+            get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+        )
+    except ImportError:
+        # Not every deep_gemm build ships the layout helpers (the T-HEAD SAIL
+        # build does not). Importing this module is on the `import sglang` path,
+        # so a missing helper would take down the whole package. Without the
+        # helper there is no layout transform to apply, so fall through to the
+        # pass-through below.
+        _get_mn_major_tma_aligned_tensor = None
+        logger.warning(
+            "deep_gemm.utils.layout is unavailable; "
+            "get_mn_major_tma_aligned_tensor falls back to a pass-through."
+        )
 
     def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
         """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
@@ -33,7 +46,11 @@ if ENABLE_JIT_DEEPGEMM:
         on host memory" during CUDA graph capture once the allocator reuses
         the block. Hand back ``sf`` itself in that case so ownership is
         preserved.
+
+        Builds that do not provide the helper are passed through unchanged.
         """
+        if _get_mn_major_tma_aligned_tensor is None:
+            return sf
         out = _get_mn_major_tma_aligned_tensor(sf)
         if out.data_ptr() == sf.data_ptr():
             assert out.shape == sf.shape and out.stride() == sf.stride()
@@ -293,22 +310,6 @@ def tf32_hc_prenorm_gemm(
     if x.shape[0] == 0:
         return
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
-
-
-def tf32_hc_prenorm_gemm_dual(
-    x: torch.Tensor,
-    fn: torch.Tensor,
-    fn2: torch.Tensor,
-    out: torch.Tensor,
-    out2: torch.Tensor,
-    sqrsum: torch.Tensor,
-    num_splits: Optional[int],
-):
-    if x.shape[0] == 0:
-        return
-    deep_gemm.tf32_hc_prenorm_gemm_dual(
-        x, fn, fn2, out, out2, sqrsum, num_splits=num_splits
-    )
 
 
 def update_deep_gemm_config(gpu_id: int):
