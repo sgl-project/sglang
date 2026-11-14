@@ -159,6 +159,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     override.install()
     case.addCleanup(override.restore)
     tm = TokenizerManager.__new__(TokenizerManager)
+    tm.tokenizer = None
     tm.server_args = MagicMock()
     tm._config_updates = []
     tm.server_args.enable_trace = False
