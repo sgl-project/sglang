@@ -155,7 +155,23 @@ def create_mm_data_row(
             prompt_str = f"<image>{text_prompt}"
 
     # Calculate total tokens (text + vision)
-    if type(processor).__name__ in ("KimiK25Processor", "KimiK3Processor"):
+    if type(processor).__name__ == "KimiK25Processor":
+        # K2.5's HF processor leaves one media placeholder per image in
+        # input_ids. Serving expands each placeholder to the resized image's
+        # token count; account for that expansion without changing the prompt
+        # sent to the server or allocating pixel tensors on the benchmark client.
+        vision_tokens = sum(
+            int(
+                processor.media_processor.media_tokens_calculator(
+                    {"type": "image", "image": image}
+                )
+            )
+            for image in images
+        )
+        prompt_len = (
+            len(processor.tokenizer.encode(prompt_str)) + vision_tokens - len(images)
+        )
+    elif type(processor).__name__ == "KimiK3Processor":
         medias = [{"type": "image", "image": img} for img in images]
         prompt_len = processor(
             text=prompt_str,
@@ -191,11 +207,17 @@ def create_mm_data_row(
             add_generation_prompt=True,
             tokenize=False,
         )
-        text_prompt_len = processor(
-            text=[text_only_prompt],
-            padding=False,
-            return_tensors="pt",
-        )["input_ids"].numel()
+        if type(processor).__name__ == "KimiK25Processor":
+            # This processor requires medias, even for text-only inputs.
+            # Use its tokenizer so chat-template tokens are not lost through
+            # the raw-text fallback below.
+            text_prompt_len = len(processor.tokenizer.encode(text_only_prompt))
+        else:
+            text_prompt_len = processor(
+                text=[text_only_prompt],
+                padding=False,
+                return_tensors="pt",
+            )["input_ids"].numel()
     except Exception:
         # Fallback: just tokenize the text prompt directly
         tokenizer_to_use = (
