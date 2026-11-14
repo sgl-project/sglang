@@ -5,17 +5,22 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.gemm import _prefer_torch_rowwise_fp8
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models import glm5_next
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 PREFIX = "model.layers.0.self_attn"
 QKV = ("q_proj", "k_proj", "v_proj")
 BFG = ("b_proj", "f_a_proj", "g_a_proj", "f_b_proj", "g_b_proj")
+KDA_FP8_INPUT_MODULES = ("qkv_proj", "f_a_proj", "g_a_proj")
+KDA_FP8_ALL_MODULES = ",".join(KDA_FP8_INPUT_MODULES + ("o_proj",))
 
 
 class MockQuantizedLinearMethod:
@@ -249,6 +254,217 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
                                     quant, PREFIX, packed, "fused_fg_b_proj"
                                 )
                             )
+
+
+def kda_fp8_modules(value, fp8_gemm=True, capability=(9, 0)):
+    with (
+        envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(value),
+        patch.object(glm5_next, "cutlass_fp8_supported", return_value=fp8_gemm),
+        patch.object(glm5_next, "get_device_capability", return_value=capability),
+    ):
+        return glm5_next._kda_fp8_modules()
+
+
+class TestGlm5NextKdaFp8Switch(CustomTestCase):
+    """SGLANG_OPT_GLM53_KDA_PTPC_MODULES parsing and wiring; the FP8 numerics run on
+    GPU in test/registered/kernels/ops/gemm/test_glm53_kda_fp8_projection.py."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(""))
+        override = get_context().override_server_args(
+            device="cpu", enable_lora=False, lora_paths=None
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.enterContext(
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                moe_tp_size=1,
+            )
+        )
+
+    def build(self, modules, quant_config=None):
+        with (
+            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(modules),
+            patch.object(glm5_next, "cutlass_fp8_supported", return_value=True),
+            patch.object(glm5_next, "get_device_capability", return_value=(9, 0)),
+        ):
+            return glm5_next.Glm5NextLinearAttention(
+                layer_idx=0,
+                hidden_size=16,
+                config=SimpleNamespace(
+                    linear_attn_config={
+                        "head_dim": 8,
+                        "num_heads": 4,
+                        "short_conv_kernel_size": 4,
+                    }
+                ),
+                quant_config=quant_config,
+                prefix=PREFIX,
+            )
+
+    def test_input_projections_switch_together(self):
+        # The fused input projection is one GEMM, so its parts cannot differ in dtype.
+        self.assertEqual(
+            kda_fp8_modules(KDA_FP8_ALL_MODULES),
+            set(KDA_FP8_INPUT_MODULES) | {"o_proj"},
+        )
+        self.assertEqual(kda_fp8_modules("o_proj"), {"o_proj"})
+        for partial in ("qkv_proj", "qkv_proj,f_a_proj", "g_a_proj,o_proj"):
+            with (
+                self.subTest(partial=partial),
+                self.assertRaisesRegex(ValueError, "together"),
+            ):
+                kda_fp8_modules(partial)
+
+    def test_switch_logs_once_that_it_is_experimental(self):
+        glm5_next._warn_kda_fp8_experimental.cache_clear()
+        with self.assertLogs(glm5_next.logger, "WARNING") as logs:
+            for _ in range(2):  # the check runs for every KDA layer
+                kda_fp8_modules("o_proj")
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("experimental", logs.output[0])
+
+    def test_rejects_unknown_module_and_gpus_other_than_hopper(self):
+        with self.assertRaisesRegex(ValueError, "Unknown"):
+            kda_fp8_modules("in_proj")
+        with self.assertRaisesRegex(ValueError, "Hopper"):
+            kda_fp8_modules("o_proj", fp8_gemm=False)
+        for capability in ((8, 9), (10, 0), (12, 0)):
+            with (
+                self.subTest(capability=capability),
+                self.assertRaisesRegex(ValueError, "Hopper"),
+            ):
+                kda_fp8_modules("o_proj", capability=capability)
+        with (
+            envs.SGLANG_FORCE_FP8_MARLIN.override(True),
+            self.assertRaisesRegex(ValueError, "SGLANG_FORCE_FP8_MARLIN"),
+        ):
+            kda_fp8_modules("o_proj")
+        self.assertEqual(kda_fp8_modules("", fp8_gemm=False), frozenset())
+
+    def test_switch_selects_the_fp8_method_per_projection(self):
+        for modules, in_fp8, o_fp8 in (
+            ("", False, False),
+            ("o_proj", False, True),
+            (",".join(KDA_FP8_INPUT_MODULES), True, False),
+            (KDA_FP8_ALL_MODULES, True, True),
+        ):
+            with self.subTest(modules=modules):
+                attention = self.build(modules)
+                for layer, fp8 in (
+                    (attention.fused_qkvbfg_a_proj, in_fp8),
+                    (attention.o_proj, o_fp8),
+                ):
+                    expected = (
+                        glm5_next._KdaFp8LinearMethod
+                        if fp8
+                        else UnquantizedLinearMethod
+                    )
+                    self.assertIs(type(layer.quant_method), expected)
+
+    def test_fp8_checkpoint_keeps_the_bf16_projections_for_the_switch(self):
+        # GLM-5.3-Flash's block-FP8 checkpoint lists the KDA projections as unquantized.
+        attention = self.build(
+            KDA_FP8_ALL_MODULES, MockFp8Config(QKV + BFG + ("o_proj",))
+        )
+        for layer in (attention.fused_qkvbfg_a_proj, attention.o_proj):
+            self.assertIs(type(layer.quant_method), glm5_next._KdaFp8LinearMethod)
+        with self.assertRaisesRegex(ValueError, "needs a BF16 o_proj"):
+            self.build("o_proj", MockFp8Config(QKV + BFG))
+
+    def test_unsupported_loads_and_runtime_modes_are_rejected(self):
+        # These load formats copy processed tensors into parameters built from the
+        # checkpoint; a transfer-engine seed serves its FP8 tensors to such peers.
+        cases = [
+            ({"load_format": fmt}, fmt)
+            for fmt in ("remote_instance", "sharded_state", "presharded", "remote")
+        ]
+        cases.append(
+            (
+                {"remote_instance_weight_loader_start_seed_via_transfer_engine": True},
+                "transfer-engine",
+            )
+        )
+        # Elastic EP reloads lost experts from disk and ignores the update's refusal.
+        cases.append(({"elastic_ep_backend": "mooncake"}, "elastic-ep-backend"))
+        # The FP8 path picks its kernel by token count.
+        cases.append(
+            ({"enable_deterministic_inference": True}, "deterministic-inference")
+        )
+        for args, error in cases:
+            with self.subTest(**args):
+                override = get_context().override_server_args(
+                    device="cpu", enable_lora=False, lora_paths=None, **args
+                )
+                override.install()
+                self.addCleanup(override.restore)
+                with self.assertRaisesRegex(ValueError, error):
+                    kda_fp8_modules("o_proj")
+                self.assertEqual(kda_fp8_modules(""), frozenset())
+
+    def test_unfused_input_projection_is_rejected(self):
+        # A quant config that quantizes the input projections turns the fusion off.
+        with self.assertRaisesRegex(ValueError, "fused"):
+            self.build(KDA_FP8_ALL_MODULES, MockFp8Config(("o_proj",)))
+
+    def test_lora_is_rejected(self):
+        override = get_context().override_server_args(enable_lora=True)
+        override.install()
+        self.addCleanup(override.restore)
+        with self.assertRaisesRegex(ValueError, "LoRA"):
+            kda_fp8_modules("o_proj")
+        self.assertEqual(kda_fp8_modules(""), frozenset())
+        # As in _can_fuse_proj, adapter paths alone count as LoRA.
+        with (
+            patch.object(
+                glm5_next,
+                "get_lora",
+                return_value=SimpleNamespace(enable_lora=False, lora_paths=["adapter"]),
+            ),
+            self.assertRaisesRegex(ValueError, "LoRA"),
+        ):
+            kda_fp8_modules("o_proj")
+
+    def test_fp8_scaled_mm_keeps_the_aot_kernel_below_8192_rows(self):
+        # _apply_dynamic_per_token calls the AOT kernel directly below 8192 rows, where
+        # fp8_scaled_mm never prefers torch._scaled_mm.
+        cuda = torch.device("cuda", 0)
+
+        def tensor(shape, stride, dtype):
+            # The predicate reads only metadata, so CUDA tensors are described, not allocated.
+            return SimpleNamespace(
+                shape=shape,
+                ndim=len(shape),
+                stride=lambda dim: stride[dim],
+                dtype=dtype,
+                device=cuda,
+                is_contiguous=lambda: stride[-1] == 1,
+                numel=lambda: shape[0] * shape[1],
+            )
+
+        def prefers_torch(m, n=24896, k=4096):
+            return _prefer_torch_rowwise_fp8(
+                tensor((m, k), (k, 1), torch.float8_e4m3fn),
+                tensor((k, n), (1, k), torch.float8_e4m3fn),
+                tensor((m, 1), (1, 1), torch.float32),
+                tensor((n, 1), (1, 1), torch.float32),
+                torch.bfloat16,
+                None,
+            )
+
+        self.assertTrue(prefers_torch(8192))
+        for n, k in ((24896, 4096), (6416, 4096), (3344, 4096), (4096, 8192)):
+            with self.subTest(n=n, k=k):
+                self.assertFalse(prefers_torch(8191, n, k))
 
 
 if __name__ == "__main__":
