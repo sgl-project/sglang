@@ -3,6 +3,8 @@ import io
 import logging
 import os
 import shlex
+import shutil
+import subprocess
 import time
 import warnings
 from typing import ClassVar, Optional
@@ -26,6 +28,9 @@ from sglang.test.test_utils import (
 from sglang.utils import wait_for_http_ready
 
 logger = logging.getLogger(__name__)
+
+# sgl-router fails a request that runs longer than this upstream timeout.
+SGL_ROUTER_REQUEST_TIMEOUT_SECS = 1800
 
 
 def configure_nixl_pd_backend(test_cls):
@@ -63,10 +68,17 @@ class PDDisaggregationServerBase(CustomTestCase):
     _prefill_stderr_buf: ClassVar[Optional[io.StringIO]] = None
     _decode_stdout_buf: ClassVar[Optional[io.StringIO]] = None
     _decode_stderr_buf: ClassVar[Optional[io.StringIO]] = None
+    lb_request_timeout_secs: ClassVar[int] = SGL_ROUTER_REQUEST_TIMEOUT_SECS
 
     @classmethod
     def setUpClass(cls):
         os.environ["MC_TCP_ENABLE_CONNECTION_POOL"] = "true"
+        # Mooncake binds its handshake RPC port at random from [15000, 17000]
+        # by default, which overlaps the fixed test ports below on some runners
+        # (base port 15000 on GPU 2), so it could grab prefill's HTTP port first.
+        # Keep it above both the test ports and the ephemeral range.
+        os.environ["MC_MIN_RPC_PORT"] = "61000"
+        os.environ["MC_MAX_RPC_PORT"] = "65000"
         os.environ["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = "1"
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
@@ -214,24 +226,13 @@ class PDDisaggregationServerBase(CustomTestCase):
 
     @classmethod
     def launch_lb(cls):
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang_router.launch_router",
-            "--pd-disaggregation",
-            "--mini-lb",  # FIXME: remove this
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-        print("Starting load balancer:", shlex.join(lb_command))
-        cls.process_lb = popen_with_error_check(lb_command)
-        cls.wait_server_ready(cls.lb_url + "/health", process=cls.process_lb)
+        cls.process_lb = popen_launch_sgl_router(
+            cls.model,
+            [cls.prefill_url, cls.decode_url],
+            host=cls.base_host,
+            port=cls.lb_port,
+            request_timeout_secs=cls.lb_request_timeout_secs,
+        )
 
     @classmethod
     def wait_server_ready(
@@ -248,6 +249,8 @@ class PDDisaggregationServerBase(CustomTestCase):
         if cls._fail_fast_stop is not None:
             cls._fail_fast_stop.set()
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
+        os.environ.pop("MC_MIN_RPC_PORT", None)
+        os.environ.pop("MC_MAX_RPC_PORT", None)
         os.environ.pop("SGLANG_ENABLE_RANK_CONSENSUS_CHECKER")
         if getattr(cls, "_mc_gid_index_set", False):
             os.environ.pop("MC_GID_INDEX", None)
@@ -283,6 +286,60 @@ class PDDisaggregationServerBase(CustomTestCase):
 
         # wait for 5 seconds
         time.sleep(5)
+
+
+def popen_launch_sgl_router(
+    model: str,
+    worker_urls: list[str],
+    *,
+    host: str,
+    port: str,
+    request_timeout_secs: int = SGL_ROUTER_REQUEST_TIMEOUT_SECS,
+) -> subprocess.Popen:
+    """Launch sgl-router in front of `worker_urls` and wait until it is ready.
+
+    The router reads each worker's PD role from its `/server_info`, so prefill
+    and decode URLs go in one list.
+    """
+    name = envs.SGLANG_TEST_PD_ROUTER_BINARY.get()
+    binary = shutil.which(name)
+    if binary is None:
+        raise FileNotFoundError(
+            f"sgl-router binary {name!r} not found: build it with "
+            "`cargo build --release --bin sgl-router` in sgl-router/, then put it "
+            "on PATH or set SGLANG_TEST_PD_ROUTER_BINARY to its path."
+        )
+    command = [
+        binary,
+        "--model-id",
+        model,
+        "--worker-urls",
+        *worker_urls,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        # Workers tokenize and render chat themselves, so the router needs no
+        # tokenizer for the model under test.
+        "--no-tokenizer",
+        "--request-timeout-secs",
+        str(request_timeout_secs),
+        "--stale-request-timeout-secs",
+        str(request_timeout_secs),
+        # Tests inject transfer failures on purpose; with one worker per role an
+        # open breaker would turn the requests after them into 503s.
+        "--disable-circuit-breaker",
+    ]
+    print("Starting sgl-router:", shlex.join(command))
+    process = popen_with_error_check(command)
+    # /health answers 200 as soon as the process listens; /readiness waits for
+    # the prefill and decode workers to be registered.
+    wait_for_http_ready(
+        url=f"http://{host}:{port}/readiness",
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        process=process,
+    )
+    return process
 
 
 def _get_available_ib_devices():

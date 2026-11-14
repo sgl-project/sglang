@@ -64,6 +64,8 @@ TARGET_WINDOW = object()
 _HOSTS = ("full", TARGET_WINDOW)
 _HOSTS_TRI = ("full", TARGET_WINDOW, "mamba")
 _DTYPE = torch.bfloat16
+# The default draft quant config of `_decide`: the one the host's dtype came from.
+_LIKE_HOST = object()
 _WINDOW = DraftKVGeometry(head_num=2, head_dim=64, v_head_dim=64)
 _STATE = DraftStateGeometry(
     conv_state_shapes=((2, 4), (2, 4)),
@@ -745,7 +747,12 @@ class TestFusedDraftDecision(CustomTestCase):
         resolved_window=128,
         draft_window=None,
         draft_cls=None,
+        draft_quant_config=_LIKE_HOST,
+        quant_config_reads=None,
     ):
+        """``draft_quant_config`` is the quant config the draft model keeps
+        once built; by default one declaring an FP8 KV cache exactly when the
+        host's dtype is FP8. ``quant_config_reads`` collects every read of it."""
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
         from sglang.srt.speculative import draft_worker_common
@@ -818,6 +825,19 @@ class TestFusedDraftDecision(CustomTestCase):
             speculative_draft_kv_cache_dtype=draft_kv_dtype,
             speculative_draft_attention_backend=draft_backend,
         )
+        if draft_quant_config is _LIKE_HOST:
+            draft_quant_config = (
+                SimpleNamespace(kv_cache_quant_algo="FP8")
+                if host_kv_dtype == torch.float8_e4m3fn
+                else None
+            )
+
+        def read_draft_quant_config(draft_model_config):
+            self.assertIs(draft_model_config, cfg.spec_aux_config.draft_model_config)
+            if quant_config_reads is not None:
+                quant_config_reads.append(draft_model_config)
+            return draft_quant_config
+
         with (
             published_topology(
                 tp_size=tp_size,
@@ -825,6 +845,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 attn_dp_size=attn_dp_size,
             ),
             patch.object(kvc, "get_memory", return_value=memory),
+            patch.object(kvc, "_draft_quant_config", read_draft_quant_config),
             patch.object(kvc, "_is_hip", is_hip),
             patch.object(
                 kvc,
@@ -979,41 +1000,51 @@ class TestFusedDraftDecision(CustomTestCase):
                     )
 
     def test_an_auto_draft_dtype_sizes_the_region_as_the_loaded_draft_resolves(self):
-        """BUG REGRESSION. An explicit draft KV dtype of `auto` sized the region
-        without the draft's quant config, in its compute dtype, while the
-        loaded draft, whose quant config declares an FP8 KV cache, resolved
-        FP8 and failed to bind. Until the draft loads, its `auto` takes the
-        host's dtype, as no flag does; an explicit dtype is its own."""
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
+        """BUG REGRESSION. The region is sized in the dtype the loaded draft
+        resolves: an `auto` reads the quant config the draft will keep, an
+        explicit dtype never does; a BF16 MTP head over an FP8-KV target was
+        sized FP8 and failed to bind."""
         from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
-        loaded_draft = SimpleNamespace(
-            quant_config=Fp8Config(
-                is_checkpoint_fp8_serialized=True, kv_cache_quant_algo="FP8"
-            )
-        )
-        for draft_kv_dtype in (None, "auto", "fp8_e4m3"):
-            with self.subTest(draft_kv_dtype=draft_kv_dtype):
+        fp8_kv = SimpleNamespace(kv_cache_quant_algo="FP8")
+        for flag, host, draft_flag, kept, region in (
+            # The draft keeps the checkpoint's FP8 KV declaration.
+            ("auto", torch.float8_e4m3fn, None, fp8_kv, torch.float8_e4m3fn),
+            # The draft keeps no quant config: an MTP head in BF16.
+            ("auto", torch.float8_e4m3fn, None, None, torch.bfloat16),
+            ("auto", torch.float8_e4m3fn, "auto", None, torch.bfloat16),
+            # The draft's `auto` replaces an explicit target dtype.
+            ("fp8_e4m3", torch.float8_e4m3fn, "auto", None, torch.bfloat16),
+            ("bf16", torch.bfloat16, "auto", fp8_kv, torch.float8_e4m3fn),
+            # Explicit dtypes never read the quant config.
+            ("fp8_e4m3", torch.float8_e4m3fn, None, None, torch.float8_e4m3fn),
+            ("auto", torch.float8_e4m3fn, "bf16", fp8_kv, torch.bfloat16),
+        ):
+            with self.subTest(flag=flag, draft_flag=draft_flag, kept=kept):
+                reads = []
                 decision = self._decide(
-                    draft_kv_dtype=draft_kv_dtype,
-                    host_kv_dtype=torch.float8_e4m3fn,
-                    kv_cache_dtype_flag="fp8_e4m3",
+                    kv_cache_dtype_flag=flag,
+                    host_kv_dtype=host,
+                    draft_kv_dtype=draft_flag,
+                    draft_quant_config=kept,
+                    quant_config_reads=reads,
                 )
                 self.assertIsNotNone(decision.placement, decision.declined)
                 # What the draft worker resolves once its model has loaded.
                 _, resolved = configure_kv_cache_dtype(
-                    server_args_kv_cache_dtype="fp8_e4m3",
-                    model=loaded_draft,
+                    server_args_kv_cache_dtype=flag,
+                    quant_config=kept,
                     model_dtype=_DTYPE,
                     is_draft_worker=True,
                     is_dflash=False,
                     speculative_draft_attention_backend=None,
-                    speculative_draft_kv_cache_dtype=draft_kv_dtype,
+                    speculative_draft_kv_cache_dtype=draft_flag,
                 )
-                self.assertEqual(resolved, torch.float8_e4m3fn)
+                self.assertEqual(resolved, region)
                 self.assertEqual(
-                    decision.placement.region("full").resolved_kv_dtype(), resolved
+                    decision.placement.region("full").resolved_kv_dtype(), region
                 )
+                self.assertEqual(len(reads), int((draft_flag or flag) == "auto"))
 
     def test_no_draft_backend_keeps_the_private_pool(self):
         """A fused draft reads its rows through the target's views and id

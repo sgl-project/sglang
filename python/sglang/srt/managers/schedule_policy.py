@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -196,6 +197,7 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        shortest_prefill_aging_factor: float = 0.0,
         bounded_lpm_enabled: bool = True,
     ):
         self._lpm_gate_next_check = 0.0
@@ -207,11 +209,25 @@ class SchedulePolicy:
         self._bounded_next_selected = False
         self._bounded_skipped: set[int] = set()
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
+        if not math.isfinite(shortest_prefill_aging_factor) or (
+            shortest_prefill_aging_factor < 0
+        ):
+            raise ValueError(
+                f"shortest_prefill_aging_factor must be finite and >= 0, got {shortest_prefill_aging_factor}"
+            )
+        if (
+            shortest_prefill_aging_factor
+            and self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        ):
+            raise ValueError(
+                "shortest_prefill_aging_factor requires schedule_policy=shortest-prefill-first"
+            )
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
 
@@ -321,8 +337,10 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-                SchedulePolicy._sort_by_shortest_prefill(
-                    waiting_queue, temporary_deprioritized
+                self._sort_by_shortest_prefill(
+                    waiting_queue,
+                    temporary_deprioritized,
+                    processed_tokens=processed_tokens,
                 )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
@@ -569,28 +587,59 @@ class SchedulePolicy:
                     )
         return temporary_deprioritized
 
-    @staticmethod
-    def _shortest_prefill_work(r: Req) -> int:
-        return max(
-            1,
-            len(r.origin_input_ids) + len(r.output_ids) - r.num_matched_prefix_tokens,
+    def poll_storage_prefetches(self, waiting_queue: Iterable[Req]) -> None:
+        """Observe finished storage prefetches before ranking. Completion is
+        otherwise observed only when admission reaches a request, which a
+        request still ranked by its unloaded prefix may never do."""
+        if (
+            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            or not self.tree_cache.can_poll_prefetch_progress()
+        ):
+            return
+        self.tree_cache.poll_prefetch_progress(
+            [req.cache_request_handle for req in waiting_queue]
         )
 
-    @staticmethod
+    def _shortest_prefill_work(self, r: Req) -> int:
+        cached = max(
+            r.num_matched_prefix_tokens,
+            self.tree_cache.staged_storage_prefix_end(r.cache_request_handle),
+        )
+        return max(1, len(r.origin_input_ids) + len(r.output_ids) - cached)
+
+    def _shortest_prefill_rank(self, r: Req, processed_tokens: int) -> float:
+        # Aging lowers the rank by the prefill work done while the request
+        # waited, bounding its wait to about work / factor processed tokens.
+        waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
+        return (
+            self._shortest_prefill_work(r)
+            - self.shortest_prefill_aging_factor * waited_tokens
+        )
+
     def _sort_by_shortest_prefill(
-        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+        self,
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        *,
+        processed_tokens: int,
     ) -> None:
         # Prioritize short uncached prefills while deferring duplicate prefixes.
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
-                SchedulePolicy._shortest_prefill_work(r),
+                self._shortest_prefill_rank(r, processed_tokens),
                 r.time_stats.wait_queue_entry_time,
             )
         )
 
     def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        *,
+        processed_tokens: int,
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
@@ -599,11 +648,16 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        chunked_waited = max(0, processed_tokens - chunked_req.arrival_processed_tokens)
+        chunked_rank = remaining - self.shortest_prefill_aging_factor * chunked_waited
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if (
+                self._shortest_prefill_rank(req, processed_tokens) >= chunked_rank
+                or reserved + charge > budget - page_size
+            ):
                 break
             reserved += charge
         if not reserved:
@@ -1019,6 +1073,7 @@ class PrefillAdder:
             extend_input_len=extend_input_len,
             total_tokens=total_tokens,
             state_slots=state_slots,
+            request_rows=self._request_rows_for_req(req),
             max_new_tokens=self._swa_new_tokens(req),
             input_tokens=len(req.full_untruncated_fill_ids),
             chunk_limit=chunk_limit,
@@ -1054,6 +1109,9 @@ class PrefillAdder:
         if include_host_hit:
             slots += req.mamba_host_hit_length
         return slots
+
+    def _request_rows_for_req(self, req: Req) -> int:
+        return self.memory_budget.request_rows(req)
 
     def _request_slot_reserve_for_req(
         self, req: Req, *, extend_input_len: Optional[int] = None
@@ -1122,6 +1180,7 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         state_slots: int = 0,
+        request_rows: int = 0,
         request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
         replay_len: int = 0,
@@ -1168,6 +1227,7 @@ class PrefillAdder:
             ),
             # Debit only working/tracking state that still awaits allocation.
             state_slots=state_slots,
+            request_rows=request_rows,
             chunk_limit=self.rem_chunk_tokens,
             is_chunked_continuation=is_chunked_continuation,
             unfinished_input_len=unfinished_input_len,
@@ -1336,6 +1396,7 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             replay_len=self._replay_len(req, prefix_len),
         )
         self._account_prefill_cache_admission(req, prefix_len)
@@ -1444,6 +1505,7 @@ class PrefillAdder:
             max_new_tokens,
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             reuses_kv=reuses_kv,
         )
 
@@ -1533,6 +1595,7 @@ class PrefillAdder:
         # slot reserve, which it does not see, is checked again.
         if request_slot_reserve and not self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             paged_input=(
                 self.ceil_paged_tokens(new_len)
                 + self.per_req_token_overhead
@@ -1563,6 +1626,7 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
             # Its window rows behind the chunk are held, as its shape check
@@ -1637,6 +1701,7 @@ class PrefillAdder:
                 return self._refused()
         fits = self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             paged_input=paged_input,
             extend_input_len=cand_extend_input_len,
             max_new_tokens=self._swa_new_tokens(req),
@@ -1690,6 +1755,7 @@ class PrefillAdder:
             max_new_tokens=self._swa_new_tokens(req),
             chunk_limit=chunk_limit,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             cached_tokens=req.prefix_len,
         ):
             return AddReqResult.NO_TOKEN
@@ -1738,6 +1804,7 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 state_slots=self._state_slots_for_req(req),
+                request_rows=self._request_rows_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
                 admitted_chunk_limit=chunk_limit,
                 cached_tokens=req.prefix_len,
@@ -1766,6 +1833,7 @@ class PrefillAdder:
                 0,
                 req.retracted_stain,
                 state_slots=self._state_slots_for_req(req),
+                request_rows=self._request_rows_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(
                     req, extend_input_len=trunc_len
                 ),
@@ -1894,6 +1962,7 @@ class PrefillAdder:
                         )
                     load_budget = dict(
                         state_slots=state_slots,
+                        request_rows=self._request_rows_for_req(req),
                         full_tokens=(
                             full_load_tokens
                             + admission.extend_len
@@ -2111,6 +2180,7 @@ class PrefillAdder:
                 max_new_tokens=0 if is_chunked else self._swa_new_tokens(req),
                 chunk_limit=chunk_limit,
                 state_slots=state_slots,
+                request_rows=self._request_rows_for_req(req),
                 window_host_hit_lengths=window_host_hit_lengths,
                 admitted_chunk_limit=chunk_tokens_limit,
                 cached_tokens=prefix_len,
@@ -2145,6 +2215,7 @@ class PrefillAdder:
             admission.max_new_tokens,
             req.retracted_stain,
             state_slots=state_slots,
+            request_rows=self._request_rows_for_req(req),
             request_slot_reserve=self._request_slot_reserve_for_req(
                 req, extend_input_len=admission.extend_len
             ),
