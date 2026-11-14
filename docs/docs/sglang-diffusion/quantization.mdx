@@ -356,6 +356,11 @@ is not available. Encoders, VAEs, and auxiliary components are independent:
 their repositories may still carry serialized quantized weights, which are
 restored when the selected component loader supports that format.
 
+On a single discrete CUDA GPU, if the original DiT checkpoint is larger than
+available GPU memory, the loader stages one layer at a time for online FP8 or
+MXFP8 conversion. The converted weights stay on the GPU for resident placement.
+Allow host RAM for the original checkpoint during startup.
+
 ### FP8 Online Quantization
 
 Apply FP8 quantization to a supported unquantized DiT checkpoint:
