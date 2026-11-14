@@ -1612,10 +1612,41 @@ EmbeddingInput = Union[
 ]
 
 
+class EmbeddingChatMessage(BaseModel):
+    # Embedding chat templates define their own roles (e.g. query, document),
+    # so the role is not restricted to the chat completion roles.
+    role: str
+    content: Union[str, List[ChatCompletionMessageContentPart], None] = None
+
+
+# One conversation per embedding: a single conversation, or a batch of them.
+EmbeddingMessages = Union[List[EmbeddingChatMessage], List[List[EmbeddingChatMessage]]]
+
+
+def _is_chat_conversation(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and all(
+            isinstance(item, dict) and isinstance(item.get("role"), str)
+            for item in value
+        )
+    )
+
+
+def _is_chat_conversation_batch(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and all(_is_chat_conversation(item) for item in value)
+    )
+
+
 class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
-    input: EmbeddingInput
+    # Exactly one of `input` and `messages` is set.
+    input: Optional[EmbeddingInput] = None
     model: str = DEFAULT_MODEL_NAME
     encoding_format: str = "float"
     dimensions: Optional[int] = None
@@ -1632,6 +1663,33 @@ class EmbeddingRequest(BaseModel):
     # Per-input embedding overrides (null entries skip that input).
     # Shape: [num_inputs][num_replacements][hidden_size]
     embed_overrides: Optional[List[Optional[List[List[float]]]]] = None
+
+    # Chat-style input, compatible with vLLM's embeddings API: the conversation
+    # is rendered with the model's chat template, keeping media in order.
+    messages: Optional[EmbeddingMessages] = None
+    # Applies to Jinja chat templates; a registered conversation template
+    # always ends with the assistant turn.
+    add_generation_prompt: bool = False
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _move_chat_input_to_messages(cls, data: Any) -> Any:
+        # vLLM also accepts conversations in `input`. Without this move they would
+        # validate as empty MultimodalEmbeddingInput items, dropping their content.
+        if not isinstance(data, dict) or data.get("messages") is not None:
+            return data
+        chat_input = data.get("input")
+        if _is_chat_conversation(chat_input) or _is_chat_conversation_batch(chat_input):
+            data = {k: v for k, v in data.items() if k != "input"}
+            data["messages"] = chat_input
+        return data
+
+    @model_validator(mode="after")
+    def _check_input_or_messages(self) -> EmbeddingRequest:
+        if (self.input is None) == (self.messages is None):
+            raise ValueError("pass exactly one of `input` and `messages`")
+        return self
 
 
 class EmbeddingObject(BaseModel):

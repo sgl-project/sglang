@@ -647,9 +647,12 @@ def generate_chat_conv(
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
+                # gme-qwen2-vl matches generate_embedding_convs, so `messages` and
+                # `input` embeddings get the same prompt.
                 image_token = (
                     conv.image_token + "\n"
-                    if conv.name not in ("qwen2-vl", "moss-vl", "unlimited-ocr")
+                    if conv.name
+                    not in ("qwen2-vl", "moss-vl", "unlimited-ocr", "gme-qwen2-vl")
                     else conv.image_token
                 )
                 add_token_as_needed: bool = (
