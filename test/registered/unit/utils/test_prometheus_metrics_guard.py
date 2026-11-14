@@ -1,6 +1,7 @@
 import asyncio
 import gzip
 import logging
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -255,3 +256,9 @@ def test_metrics_guard_logs_background_failure_after_timeout(caplog):
         )
 
     asyncio.run(run())
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
