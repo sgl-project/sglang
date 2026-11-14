@@ -1,13 +1,14 @@
 # Generates a PEP 503 simple index for sgl-flash-mla wheels under
 # sgl-whl/cu<version>/sgl-flash-mla/index.html. Mirrors update_deepgemm_whl_index.py
-# so consumers can `pip install sgl-flash-mla --extra-index-url https://...whl/cu130`.
+# so consumers can `pip install sgl-flash-mla --extra-index-url https://...whl/cu130`
+# (or .../whl/cu134).
 
 import argparse
 import hashlib
 import pathlib
 import re
 
-SUPPORTED_CUDA_VERSIONS = ["130"]
+SUPPORTED_CUDA_VERSIONS = ["130", "134"]
 
 
 def update_wheel_index(cuda_version, wheel_dir):

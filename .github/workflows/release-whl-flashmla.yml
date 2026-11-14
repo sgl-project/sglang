@@ -32,6 +32,9 @@ env:
   # The extensions use PyTorch's stable C++ ABI and would load against any 2.10+,
   # but a release is tested against one version.
   TORCH_VER: "2.14.1"
+  # The cu134 wheels (sglang's CUDA 13.4 image) are built against this torch from
+  # the cu134 channel. They go to the whl/cu134 index only; PyPI gets the cu130 ones.
+  TORCH_VER_CU134: "2.15.0"
 
 jobs:
   build:
@@ -42,6 +45,8 @@ jobs:
         # (cp310-abi3) and serves CPython 3.10+, so 3.12 only drives the build.
         python-version: ["3.12"]
         cuda-version: ["13.4"]
+        # PyTorch CUDA channel the wheel is built against and indexed under.
+        cu-tag: [cu130, cu134]
         arch: [x86_64, aarch64]
         include:
           - arch: x86_64
@@ -76,17 +81,22 @@ jobs:
           cat FlashMLA/flash_mla/VERSION
 
       - name: Build wheel
+        env:
+          TORCH_VER: ${{ matrix.cu-tag == 'cu134' && env.TORCH_VER_CU134 || env.TORCH_VER }}
         run: |
           chmod +x ./scripts/build_sgl_flash_mla.sh ./scripts/rename_sgl_flash_mla_whl.sh
-          ./scripts/build_sgl_flash_mla.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/FlashMLA" "${{ matrix.arch }}"
+          ./scripts/build_sgl_flash_mla.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/FlashMLA" "${{ matrix.arch }}" "${{ matrix.cu-tag }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: flashmla-wheel-${{ matrix.arch }}
+          name: flashmla-wheel-${{ matrix.cu-tag }}-${{ matrix.arch }}
           path: FlashMLA/dist/*.whl
 
+      # PyPI has one wheel per version and platform (no local version), so only
+      # the cu130 build goes there.
       - name: Upload PyPI artifacts
+        if: matrix.cu-tag == 'cu130'
         uses: actions/upload-artifact@v4
         with:
           name: flashmla-pypi-${{ matrix.arch }}
@@ -139,7 +149,7 @@ jobs:
         with:
           path: dist/
           merge-multiple: true
-          pattern: flashmla-wheel-${{ matrix.wheel_arch }}
+          pattern: flashmla-wheel-cu130-${{ matrix.wheel_arch }}
 
       - name: Install wheel and deps
         run: |
@@ -240,7 +250,9 @@ jobs:
           WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
 
       - name: Update wheel index
-        run: python3 scripts/update_flashmla_whl_index.py --cuda 130
+        run: |
+          python3 scripts/update_flashmla_whl_index.py --cuda 130
+          python3 scripts/update_flashmla_whl_index.py --cuda 134
 
       - name: Push wheel index
         run: |

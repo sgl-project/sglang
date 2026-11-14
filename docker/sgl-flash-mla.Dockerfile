@@ -10,6 +10,8 @@ ARG CUDA_VERSION=13.4
 ARG PYTHON_VERSION=3.12
 ARG PYTHON_TAG=cp312-cp312
 ARG TORCH_VER=2.14.1
+# PyTorch CUDA channel the build torch comes from (cu130 or cu134).
+ARG TORCH_CUDA_TAG=cu130
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
 ARG PYTORCH_MIRROR=download.pytorch.org
 
@@ -32,6 +34,6 @@ RUN set -eux; \
 # use no API newer than 13.0.
 RUN --mount=type=cache,id=sgl-flash-mla-pip,target=/root/.cache/pip \
     set -eux; \
-    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/cu130; \
+    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${TORCH_CUDA_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install --index-url ${PIP_DEFAULT_INDEX} \
         ninja setuptools wheel build numpy
