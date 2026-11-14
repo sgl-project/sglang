@@ -256,6 +256,12 @@ def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 
+def handle_attention_intel_amx(attn, forward_batch):
+    if forward_batch.forward_mode.is_decode_or_idle():
+        return _dispatch_mla_subtype(attn, forward_batch)
+    return AttnForwardMethod.MHA
+
+
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
@@ -269,3 +275,4 @@ AttentionBackendRegistry.register(
 )  # Deprecated alias; use "dsa"
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
+AttentionBackendRegistry.register("intel_amx", handle_attention_intel_amx)
