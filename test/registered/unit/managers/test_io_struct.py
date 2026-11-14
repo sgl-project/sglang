@@ -588,6 +588,16 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Check modalities
         self.assertEqual(req.modalities, [None, "image"])
 
+    def test_first_request_without_images(self):
+        """Per-request image lists are kept when the first request has no images."""
+        req = copy.deepcopy(self.base_req)
+        req.image_data = [None, ["image1.jpg", "image2.jpg"]]
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.image_data, [None, ["image1.jpg", "image2.jpg"]])
+        self.assertEqual(req.modalities, [None, "multi-images"])
+
     def test_oversized_n_rejected_before_fan_out(self):
         """An out-of-range n must be rejected before inputs are expanded n times."""
         with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(4096):
