@@ -507,6 +507,7 @@ class PrefillBootstrapQueue:
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
+            req_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank,
         )
         req.pending_bootstrap = True
 

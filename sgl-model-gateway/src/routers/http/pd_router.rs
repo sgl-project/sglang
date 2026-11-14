@@ -313,16 +313,16 @@ impl PDRouter {
         Ok(original)
     }
 
-    fn inject_prefill_dp_rank_for_decode<'a>(
-        decode_request: Cow<'a, Value>,
+    fn inject_prefill_dp_rank<'a>(
+        request: Cow<'a, Value>,
         prefill_worker: &dyn Worker,
     ) -> Result<Cow<'a, Value>, String> {
         let Some(prefill_dp_rank) = prefill_worker.dp_rank() else {
-            return Ok(decode_request);
+            return Ok(request);
         };
 
-        let mut decode_request = decode_request.into_owned();
-        let Some(obj) = decode_request.as_object_mut() else {
+        let mut request = request.into_owned();
+        let Some(obj) = request.as_object_mut() else {
             return Err(
                 "Failed to insert disagg_prefill_dp_rank because request body is not an object"
                     .to_string(),
@@ -333,7 +333,7 @@ impl PDRouter {
             Self::DISAGG_PREFILL_DP_RANK_KEY.to_string(),
             Value::from(prefill_dp_rank as u64),
         );
-        Ok(Cow::Owned(decode_request))
+        Ok(Cow::Owned(request))
     }
 
     async fn prepare_worker_request<'a>(
@@ -371,10 +371,12 @@ impl PDRouter {
         prefill: &dyn Worker,
         decode: &dyn Worker,
     ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
+        let prefill_json_request =
+            Self::inject_prefill_dp_rank(Cow::Borrowed(json_request), prefill)?;
         let prefill_request =
-            Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
+            Self::prepare_worker_request(route, prefill, prefill_json_request).await?;
         let decode_json_request =
-            Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
+            Self::inject_prefill_dp_rank(Cow::Borrowed(json_request), prefill)?;
         let decode_request =
             Self::prepare_worker_request(route, decode, decode_json_request).await?;
 
@@ -694,13 +696,13 @@ impl PDRouter {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let prepared_prefill = match Self::prepare_worker_request(
-            context.route,
-            prefill.as_ref(),
-            Cow::Borrowed(&json_request),
-        )
-        .await
-        {
+        let prepared_prefill = async {
+            let body =
+                Self::inject_prefill_dp_rank(Cow::Borrowed(&json_request), prefill.as_ref())?;
+            Self::prepare_worker_request(context.route, prefill.as_ref(), body).await
+        }
+        .await;
+        let prepared_prefill = match prepared_prefill {
             Ok(request) => request,
             Err(e) => {
                 error!("Failed to prepare PD worker requests: {}", e);
@@ -747,10 +749,8 @@ impl PDRouter {
             };
             let decode_guard = WorkerLoadGuard::new(decode.clone(), headers);
             let prepared_decode = async {
-                let body = Self::inject_prefill_dp_rank_for_decode(
-                    Cow::Borrowed(&json_request),
-                    prefill.as_ref(),
-                )?;
+                let body =
+                    Self::inject_prefill_dp_rank(Cow::Borrowed(&json_request), prefill.as_ref())?;
                 Self::prepare_worker_request(context.route, decode.as_ref(), body).await
             }
             .await
@@ -2032,7 +2032,7 @@ mod tests {
             "http://prefill:30000/v1/completions"
         );
         assert_eq!(prefill_request.body["data_parallel_rank"], 2);
-        assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
+        assert_eq!(prefill_request.body["disagg_prefill_dp_rank"], 2);
 
         assert_eq!(
             decode_request.endpoint_url,
