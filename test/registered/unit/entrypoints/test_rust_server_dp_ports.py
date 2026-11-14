@@ -117,6 +117,11 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         # launched path.
         ({"tokenizer_path": "/public"}, "tokenizer_path", "tokenizer"),
         ({"tokenizer_path": "/public"}, "public_tokenizer_path", "/public"),
+        # `--warmups` holds health until Python ran them (`rust_server.warmups`).
+        ({"warmups": "voice_chat"}, "custom_warmups_pending", True),
+        # Blank names run nothing, so nothing would release a hold.
+        ({"warmups": ""}, "custom_warmups_pending", False),
+        ({"warmups": " ,"}, "custom_warmups_pending", False),
     ],
     ids=[
         "native-grpc",
@@ -135,6 +140,9 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         "mm-limits-keep-order",
         "loaded-tokenizer",
         "public-tokenizer",
+        "custom-warmups",
+        "custom-warmups-empty",
+        "custom-warmups-blank",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):

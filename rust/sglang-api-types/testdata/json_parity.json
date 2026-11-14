@@ -401,6 +401,19 @@
       "canonical": "{\"error\":{\"message\":\"bad sampling\",\"code\":400},\"index\":1}"
     },
     {
+      "type": "GenerateStreamError",
+      "name": "streamed error item names its type and retryability",
+      "input": {
+        "error": {
+          "message": "bad sampling",
+          "type": "invalid_request_error",
+          "code": 400,
+          "retryable": false
+        }
+      },
+      "canonical": "{\"error\":{\"message\":\"bad sampling\",\"code\":400,\"type\":\"invalid_request_error\",\"retryable\":false}}"
+    },
+    {
       "type": "GetModelInfoResponse",
       "name": "absent optionals are emitted as null",
       "input": {

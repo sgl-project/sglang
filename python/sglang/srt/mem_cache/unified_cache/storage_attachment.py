@@ -67,6 +67,19 @@ class StorageAttachment:
         )
         if invalid is not None:
             return False, invalid
+        if (
+            hicache_write_policy == "write_back"
+            and cache.host_memory_mode == "buffer_only"
+        ):
+            # Startup resolves write_back to write_through in buffer_only mode:
+            # there is no host tier to write back to, so an eviction would only
+            # queue a backup it then drops.
+            return (
+                False,
+                "hicache_write_policy write_back is not supported with "
+                "--hicache-host-memory-mode buffer_only: host memory is only a "
+                "staging buffer. Use write_through.",
+            )
 
         controller = cache.cache_controller
         if controller is None:

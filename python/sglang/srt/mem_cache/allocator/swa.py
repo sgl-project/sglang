@@ -238,15 +238,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return self._req_to_token_pool.available_size() * self._swa_ring_cost
         return self.swa_attn_allocator.available_size()
 
-    # Slot-conservation views for the leak invariant. On the non-shared allocator
-    # the static budget IS physical (conserve == physical); the unified chain
-    # allocator keeps a static-cap view instead.
-    def _conserve_full_available_size(self):
-        return self.full_available_size()
-
-    def _conserve_swa_available_size(self):
-        return self.swa_available_size()
-
     @property
     def size(self):
         return min(self._size_full, self._size_swa)
