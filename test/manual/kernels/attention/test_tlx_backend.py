@@ -7,7 +7,7 @@ import torch
 
 from sglang.kernels.ops.attention.tlx.paged import unified_attention, unsupported_reason
 from sglang.srt.layers.attention.aiter_backend import ForwardMetadata
-from sglang.srt.layers.attention.tlx_backend import TlxAttnBackend
+from sglang.srt.layers.attention.tlx_backend import TLX_PHASES, TlxAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -55,6 +55,9 @@ class TestTlxBackend(CustomTestCase):
         backend._tlx_unsupported_reason = unsupported_reason
         backend._tlx_fallback_reasons = set()
         backend._tlx_dispatched = set()
+        # Every phase on uTLX, so the cases below exercise the kernels.
+        backend._tlx_phases = frozenset(TLX_PHASES)
+        backend._tlx_routed_phases = set()
         backend.use_mla = False
         backend.use_triton_unified_attention = True
         backend._use_unified_verify = True
@@ -239,6 +242,39 @@ class TestTlxBackend(CustomTestCase):
         backend._run_unified_attention(**args)
         torch.testing.assert_close(args["out"], expected)
         self.assertTrue(backend._tlx_fallback_reasons)
+
+    def test_phase_classification(self):
+        for max_seqlen_q, window, phase in (
+            (1, (-1, -1), "decode"),
+            (8, (2046, 0), "decode"),
+            (17, (-1, -1), "prefill_short"),
+            (1023, (-1, -1), "prefill_short"),
+            (1024, (-1, -1), "prefill_long"),
+            (4096, (2046, 0), "prefill_window"),
+        ):
+            with self.subTest(max_seqlen_q=max_seqlen_q, window=window):
+                self.assertEqual(
+                    TlxAttnBackend._phase(
+                        {"max_seqlen_q": max_seqlen_q, "window_size": window}
+                    ),
+                    phase,
+                )
+
+    def test_routed_phase_runs_aiter(self):
+        from aiter.ops.triton.attention.unified_attention import (
+            unified_attention as aiter_attention,
+        )
+
+        backend, _, _, args, _ = self.case((17, 129), (17, 2063))
+        backend._tlx_phases = frozenset({"decode"})
+        args["softcap"] = 0.0
+        args["q_descale"] = None
+        expected = torch.empty_like(args["out"])
+        aiter_attention(**(args | {"out": expected}))
+        backend._run_unified_attention(**args)
+        torch.testing.assert_close(args["out"], expected)
+        self.assertEqual(backend._tlx_routed_phases, {"prefill_short"})
+        self.assertFalse(backend._tlx_dispatched)
 
 
 if __name__ == "__main__":
