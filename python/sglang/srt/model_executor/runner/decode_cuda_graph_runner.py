@@ -168,6 +168,27 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def metadata_glue_off_reason(spec_algorithm, attn_backend) -> str:
+    """Why SGLANG_ENABLE_METADATA_GLUE_GRAPH must not glue this runner's per-replay
+    metadata prep ("" if it may). The glue graph replays only the prep's device ops,
+    so a value the prep computes on the host every replay would replay frozen at its
+    capture-time value (metadata_glue_graph.py)."""
+    if spec_algorithm.is_dflash_family():
+        return (
+            "DFlash-family speculative decoding (host-fed fast verify plans must "
+            "re-run on the host every replay)"
+        )
+    if attn_backend.needs_cpu_seq_lens:
+        # e.g. FlashInfer decode: fast_decode_plan plans from seq_lens_cpu and the
+        # KV index fill is sized by seq_lens_sum; glued replays would keep planning
+        # with the capture-time lengths.
+        return (
+            f"{type(attn_backend).__name__}, whose replay prep reads seq_lens_cpu / "
+            "seq_lens_sum on the host"
+        )
+    return ""
+
+
 def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
     if not spec_algorithm.supports_ragged_verify():
         return False
@@ -616,12 +637,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # host every replay), and capturing one freezes the capture-time
         # plan — drafts go stale and accept length collapses to ~1.
         enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
-        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+        why = enable_metadata_glue and metadata_glue_off_reason(
+            model_runner.spec_algorithm, self.attn_backend
+        )
+        if why:
             logger.warning(
-                "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
-                "DFlash-family speculative decoding (host-fed fast verify "
-                "plans must re-run on the host every replay); disabling the "
-                "metadata glue graph."
+                "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with %s; "
+                "disabling the metadata glue graph.",
+                why,
             )
             enable_metadata_glue = False
         self._metadata_glue = (
