@@ -6,6 +6,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.auto_round_mxfp8 import (
+    AutoRoundMXFP8Config,
+    is_auto_round_mx_fp,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -39,7 +43,9 @@ class AutoRoundConfig(QuantizationConfig):
         return SRTConfig.get_config_filenames()
 
     @classmethod
-    def from_config(cls, config: dict) -> "AutoRoundConfig":
+    def from_config(cls, config: dict) -> "AutoRoundConfig | AutoRoundMXFP8Config":
+        if is_auto_round_mx_fp(config):
+            return AutoRoundMXFP8Config.from_config(config)
         srt_config = SRTConfig.from_config(config)
         if "gptq" not in srt_config.packing_format:
             raise ValueError(
