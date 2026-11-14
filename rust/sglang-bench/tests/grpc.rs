@@ -156,6 +156,60 @@ impl SglangService for Mock {
         Err(Status::unimplemented("clear_hi_cache_storage"))
     }
 
+    async fn set_internal_state(
+        &self,
+        _: Request<api::SetInternalStateRequest>,
+    ) -> Result<Response<api::SetInternalStateResponse>, Status> {
+        Err(Status::unimplemented("set_internal_state"))
+    }
+    async fn start_profile(
+        &self,
+        _: Request<api::StartProfileRequest>,
+    ) -> Result<Response<api::ProfileResponse>, Status> {
+        Err(Status::unimplemented("start_profile"))
+    }
+    async fn stop_profile(
+        &self,
+        _: Request<api::StopProfileRequest>,
+    ) -> Result<Response<api::ProfileResponse>, Status> {
+        Err(Status::unimplemented("stop_profile"))
+    }
+    async fn start_expert_distribution_record(
+        &self,
+        _: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        Err(Status::unimplemented("start_expert_distribution_record"))
+    }
+    async fn stop_expert_distribution_record(
+        &self,
+        _: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        Err(Status::unimplemented("stop_expert_distribution_record"))
+    }
+    async fn dump_expert_distribution_record(
+        &self,
+        _: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        Err(Status::unimplemented("dump_expert_distribution_record"))
+    }
+    async fn slow_down(
+        &self,
+        _: Request<api::SlowDownRequest>,
+    ) -> Result<Response<api::SlowDownResponse>, Status> {
+        Err(Status::unimplemented("slow_down"))
+    }
+    async fn release_memory_occupation(
+        &self,
+        _: Request<api::ReleaseMemoryOccupationRequest>,
+    ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        Err(Status::unimplemented("release_memory_occupation"))
+    }
+    async fn resume_memory_occupation(
+        &self,
+        _: Request<api::ResumeMemoryOccupationRequest>,
+    ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        Err(Status::unimplemented("resume_memory_occupation"))
+    }
     async fn freeze_gc(
         &self,
         _: Request<api::FreezeGcRequest>,

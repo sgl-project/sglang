@@ -50,6 +50,26 @@ service SglangService {
   // ID is unaffected. Internal control/detokenization requests are not targeted.
   rpc Abort(AbortRequest) returns (AbortResponse);
 
+  // `/set_internal_state`: override numeric scheduler knobs on every DP rank;
+  // one `updated` flag per rank.
+  rpc SetInternalState(SetInternalStateRequest) returns (SetInternalStateResponse);
+
+  // `/start_profile` and `/stop_profile`: a profiler capture on every DP rank.
+  rpc StartProfile(StartProfileRequest) returns (ProfileResponse);
+  rpc StopProfile(StopProfileRequest) returns (ProfileResponse);
+
+  // `/{start,stop,dump}_expert_distribution_record`.
+  rpc StartExpertDistributionRecord(ExpertDistributionRecordRequest) returns (ExpertDistributionRecordResponse);
+  rpc StopExpertDistributionRecord(ExpertDistributionRecordRequest) returns (ExpertDistributionRecordResponse);
+  rpc DumpExpertDistributionRecord(ExpertDistributionRecordRequest) returns (ExpertDistributionRecordResponse);
+
+  // `/slow_down`: a per-forward sleep on every DP rank, for testing.
+  rpc SlowDown(SlowDownRequest) returns (SlowDownResponse);
+
+  // `/release_memory_occupation`, `/resume_memory_occupation`.
+  rpc ReleaseMemoryOccupation(ReleaseMemoryOccupationRequest) returns (MemoryOccupationResponse);
+  rpc ResumeMemoryOccupation(ResumeMemoryOccupationRequest) returns (MemoryOccupationResponse);
+
   // `/freeze_gc`, `/pause_generation`, `/continue_generation`,
   // `/pd_role_switch`, `/update_weight_version`.
   rpc FreezeGc(FreezeGcRequest) returns (FreezeGcResponse);
