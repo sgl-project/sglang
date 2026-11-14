@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
     CompressedTensorsLinearMethod,
@@ -159,6 +160,44 @@ class TestGetQuantMethodLmHead(CustomTestCase):
         config = _config(["Linear"])
         head = self._head()
         self.assertIsNone(config.get_quant_method(head, "lm_head"))
+
+
+class _LinearMethod:
+    def apply(self, layer, x, bias=None):
+        raise NotImplementedError
+
+
+def _method(name):
+    return type(name, (_LinearMethod,), {})()
+
+
+class TestShouldApplyLmHeadQuantMethod(CustomTestCase):
+    """The method owns its parameter layout; only the ModelOpt checks read `weight`."""
+
+    def setUp(self):
+        self.packed_head = torch.nn.Module()
+        self.packed_head.register_buffer(
+            "weight_packed", torch.zeros(4, 8, dtype=torch.int32)
+        )
+
+    def test_packed_head_is_applied(self):
+        method = _method("CompressedTensorsLinearMethod")
+        self.assertTrue(should_apply_lm_head_quant_method(self.packed_head, method))
+
+    def test_unquantized_method_is_not_applied(self):
+        method = _method("UnquantizedLinearMethod")
+        self.assertFalse(should_apply_lm_head_quant_method(self.packed_head, method))
+
+    def test_stale_modelopt_method_on_packed_head_is_not_applied(self):
+        for name in (
+            "ModelOptFp4LinearMethod",
+            "ModelOptNvFp4A16LinearMethod",
+            "ModelOptFp8LinearMethod",
+        ):
+            with self.subTest(method=name):
+                self.assertFalse(
+                    should_apply_lm_head_quant_method(self.packed_head, _method(name))
+                )
 
 
 if __name__ == "__main__":
