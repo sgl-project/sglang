@@ -96,12 +96,14 @@ _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
 # and run dense attention on the padded layout.
 _SP_PAD_MASK_DISABLED = envs.SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK
 
-# Dense backends the head-group pipeline runs against: each computes a head
-# independently, so a head group comes out as those heads do in the full call
-# (FlashAttention on Hopper, cuDNN SDPA on Blackwell).
+# Backends the head-group pipeline runs against: each computes a head
+# independently, so a head group comes out as those heads do in the full call.
+# Supported backends: FlashAttention (Hopper), cuDNN SDPA (Blackwell),
+# and SubBlock sparse attention.
 PIPELINED_ATTENTION_BACKENDS = (
     AttentionBackendEnum.FA,
     AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+    AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
 )
 
 
