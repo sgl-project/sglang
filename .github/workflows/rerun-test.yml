@@ -5,13 +5,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Dispatch mode: cuda | multimodal_gen | cpu"
+        description: "Dispatch mode: cuda | multimodal_gen | cpu | amd"
         required: true
         type: choice
         options:
           - cuda
           - multimodal_gen
           - cpu
+          - amd
       test_command:
         description: "Test command(s) to run, one per line (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
         required: true
@@ -460,8 +461,112 @@ jobs:
           fi
           echo "All $total test(s) passed in ${total_elapsed}s"
 
+  # Same container bring-up as pr-test-amd.yml, but runs each file directly.
+  rerun-test-amd:
+    name: rerun-test-amd (partition ${{ matrix.partition }})
+    needs: prepare-partitions
+    if: inputs.mode == 'amd'
+    strategy:
+      fail-fast: false
+      # AMD runners are shared with PR CI and far fewer than NV ones.
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
+    runs-on: ${{ inputs.runs_on }}
+    # Image pull, AOT kernel build and install run before the 60-min test step.
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          # Fork code (pr_head_sha set) runs these scripts, so it gets no
+          # Docker Hub login and pulls anonymously, as its PR runs do.
+          DOCKERHUB_AMD_USERNAME: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_AMD_USERNAME || '' }}
+          DOCKERHUB_AMD_TOKEN: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_AMD_TOKEN || '' }}
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
+          RUNS_ON: ${{ inputs.runs_on }}
+        run: |
+          # The container does not inherit the job env; pass what the tests read.
+          amd_extra_envs=(-e "SGLANG_JIT_KERNEL_RUN_FULL_TESTS=$SGLANG_JIT_KERNEL_RUN_FULL_TESTS")
+          # Same env as the 4-GPU jobs in pr-test-amd.yml and pr-test-amd-extra.yml.
+          if [[ "$RUNS_ON" == *-4gpu-* ]]; then
+            amd_extra_envs+=(-e NCCL_CUMEM_ENABLE=0 -e NCCL_NVLS_ENABLE=0 -e RCCL_MSCCL_ENABLE=0 -e SGLANG_USE_ROCM700A=1)
+          fi
+          cmds=()
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            cmds+=("$cmd")
+          done <<< "$TEST_COMMAND"
+          total=${#cmds[@]}
+          failed=()
+          suite_start=$SECONDS
+          for idx in "${!cmds[@]}"; do
+            i=$((idx + 1))
+            cmd="${cmds[$idx]}"
+            echo ""
+            echo "."
+            echo "Begin ($i/$total): python3 $cmd"
+            echo "."
+            file_start=$SECONDS
+            if ! bash scripts/ci/amd/amd_ci_exec.sh "${amd_extra_envs[@]}" \
+                -w /sglang-checkout/test python3 $cmd -f; then
+              failed+=("$cmd")
+            fi
+            elapsed=$(( SECONDS - file_start ))
+            echo "."
+            echo "End ($i/$total): elapsed=${elapsed}s"
+            echo "."
+            echo ""
+          done
+          total_elapsed=$(( SECONDS - suite_start ))
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
+            printf '  %s\n' "${failed[@]}"
+            {
+              echo "### Failed tests (partition ${{ matrix.partition }})"
+              printf -- '- `%s`\n' "${failed[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "All $total test(s) passed in ${total_elapsed}s"
+
   write-back-result:
-    needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu]
+    needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu, rerun-test-amd]
     if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
     runs-on: ubuntu-latest
     permissions:
@@ -485,7 +590,8 @@ jobs:
         run: |
           if [[ "${{ needs.rerun-test-cuda.result }}" == "success" \
              || "${{ needs.rerun-test-multimodal-gen.result }}" == "success" \
-             || "${{ needs.rerun-test-cpu.result }}" == "success" ]]; then
+             || "${{ needs.rerun-test-cpu.result }}" == "success" \
+             || "${{ needs.rerun-test-amd.result }}" == "success" ]]; then
             STATUS=success
           else
             STATUS=failure
