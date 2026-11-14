@@ -7,6 +7,7 @@ from typing import cast
 import torch
 
 from sglang.srt.layers.quantization.modelopt_quant import (
+    Fp4MoeRepack,
     ModelOptNvFp4FusedMoEMethod,
     _compute_gemm1_alphas,
 )
@@ -112,6 +113,7 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                     torch.empty(shape, dtype=dtype), requires_grad=False
                 ),
             )
+        layer._fp4_moe_repack = Fp4MoeRepack.CHECKPOINT
 
     # The base method's Marlin branch, and prepare_moe_nvfp4_layer_for_marlin
     # underneath it, address the experts by their pre-rename names.
@@ -143,6 +145,8 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         backend = getattr(self, "_moe_runner_backend", None)
         if backend is not None and backend.is_marlin():
             return self._process_weights_for_marlin(layer)
+        # The Muse [w1, w3] TRT-LLM layout has no restore.
+        layer._fp4_moe_repack = Fp4MoeRepack.NOT_RESTORABLE
         input_scale = layer.gate_up_proj_input_scale.max().float()
         output_scale = layer.down_proj_input_scale.max().float()
         if self.quant_config.use_per_token_activation:
@@ -171,7 +175,7 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 )
         self._align_fp4_moe_weights_for_flashinfer_trtllm(layer)
 
-    def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
+    def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> bool:
         if getattr(layer, "use_megamoe", False):
             from sglang.srt.layers.muse_spark.muse_spark_megamoe import (
                 build_nvfp4_megamoe_weights,
@@ -186,6 +190,7 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             )
 
             bind_megamoe_shared_weights(layer, "nvfp4xnvfp4")
+        return False  # the [w1, w3] reorder has no restore
 
 
 __all__ = [
