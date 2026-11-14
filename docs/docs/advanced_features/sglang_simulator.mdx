@@ -17,7 +17,8 @@ The simulator supports:
 - synthetic request rates, ShareGPT workloads, and timestamped Autobench traces;
 - OFFLINE logical-time simulation and BLOCKING wall-clock replay;
 - AISimulate, ML, and replay latency predictors;
-- SGLang prefix caching and [HiCache](/docs/advanced_features/hicache); and
+- SGLang prefix caching and [HiCache](/docs/advanced_features/hicache);
+- prefill-decode disaggregation across one or more prefill and decode instances with modelled KV transfer time, through the Python runner API; and
 - serving-compatible TTFT, TPOT, ITL, throughput, and cache-hit metrics.
 
 ## Install from the SGLang repository
@@ -87,4 +88,10 @@ The output directory contains:
 - `request.jsonl`: per-request timing and cache information; and
 - `iteration.jsonl`: scheduler batch composition and predicted iteration latency.
 
-Use a unique output directory for each run so metrics from separate experiments are not mixed. See the [SGLang Simulator source README](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator) for simulator configuration fields, predictor examples, and maintained tests.
+Use a unique output directory for each run so metrics from separate experiments are not mixed.
+
+## Simulate prefill-decode disaggregation
+
+`benchmark/simulator/pd_bench_runner.py` routes each request of a workload to a prefill and a decode instance, runs it on the prefill instances and then on the decode instances, models each request's KV transfer between the two passes, and reports client-visible TTFT and TPOT. No KV cache moves between the instances. The prefill instance still needs `mooncake-transfer-engine` installed because SGLang initialises the Mooncake engine at startup. The source README documents the runner, the `kv_transfer_config` fields, and the network profile file format.
+
+See the [SGLang Simulator source README](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator) for simulator configuration fields, predictor examples, and maintained tests.

@@ -104,6 +104,18 @@ class RequestStats:
     created_time: float = -1
     gen_token_latencies: list[float] = field(default_factory=list)
 
+    # Prefill EXTEND completions and the PD runner's transfer model output.
+    kv_prefill_chunks: list = field(default_factory=list)
+    kv_xfer_visible_s: Optional[float] = None
+    kv_xfer_n_waves: int = 0
+    kv_xfer_service_s: float = 0.0
+    kv_xfer_excursion_s: float = 0.0
+    kv_xfer_send_s: float = 0.0
+    kv_xfer_wave_tokens: list = field(default_factory=list)
+    decode_first_token_wait: float = 0.0
+    prefill_instance: int = 0
+    decode_instance: int = 0
+
     def is_complete(self) -> bool:
         return True
 

@@ -1,0 +1,33 @@
+{
+  "EXAMPLE_RDMA": {
+    "alpha_us": 100.0,
+    "bandwidth_gbps": 10.0,
+    "excursion": {
+      "later_wave_exc_scale": 0.1,
+      "bands": [
+        {
+          "max_bytes": 10000000,
+          "probability": 0.1,
+          "magnitude_s": {"0.001": 0.5, "0.005": 0.3, "0.02": 0.2}
+        },
+        {
+          "probability": 0.5,
+          "magnitude_s": {"0.002": 0.5, "0.01": 0.3, "0.05": 0.2}
+        }
+      ]
+    }
+  },
+  "EXAMPLE_TCP": {
+    "alpha_us": 1000.0,
+    "bandwidth_gbps": 2.0,
+    "excursion": {
+      "later_wave_exc_scale": 0.1,
+      "bands": [
+        {
+          "probability": 0.5,
+          "magnitude_s": {"0.005": 0.5, "0.02": 0.3, "0.1": 0.2}
+        }
+      ]
+    }
+  }
+}
