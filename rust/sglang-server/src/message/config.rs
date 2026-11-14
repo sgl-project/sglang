@@ -5,7 +5,7 @@
 //! pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] / [`RequestLogConfig`] /
-//! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
+//! [`Http2Config`] / [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
 //! [`MmFamily`] / [`MmResample`] are
 //! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
 //! / `_build_mm_spec`) constructs them directly by keyword and hands them to
@@ -146,6 +146,9 @@ pub struct ServerArgs {
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
+    /// `--enable-http2`: the HTTP listener also serves HTTP/2 over cleartext
+    /// (h2c) on the same port; `None` serves HTTP/1.1 only.
+    pub http2: Option<Http2Config>,
     /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
     /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
     pub grpc_port: Option<u16>,
@@ -293,6 +296,7 @@ impl ServerArgs {
         hicache_write_policy,
         host,
         port,
+        http2,
         grpc_port,
         grpc_response_timeout_secs,
         api_key,
@@ -358,6 +362,7 @@ impl ServerArgs {
         hicache_write_policy: Option<String>,
         host: String,
         port: u16,
+        http2: Option<Http2Config>,
         grpc_port: Option<u16>,
         grpc_response_timeout_secs: u64,
         api_key: Option<String>,
@@ -421,6 +426,7 @@ impl ServerArgs {
             hicache_write_policy,
             host,
             port,
+            http2,
             grpc_port,
             grpc_response_timeout_secs,
             api_keys: ApiKeys::new(api_key, admin_api_key),
@@ -492,6 +498,7 @@ impl Default for ServerArgs {
             hicache_write_policy: None,
             host: "127.0.0.1".into(),
             port: 30000,
+            http2: None,
             grpc_port: None,
             grpc_response_timeout_secs: DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
             api_keys: ApiKeys::default(),
@@ -633,6 +640,30 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
                 "deployment_info is not valid JSON: {e}"
             ))
         })
+    }
+}
+
+/// HTTP/2 settings, as Python's server (Granian) takes them with
+/// `--enable-http2`.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct Http2Config {
+    /// `--http2-max-concurrent-streams`: the streams one connection may open.
+    pub max_concurrent_streams: u32,
+    /// `--http2-initial-connection-window-size`: the connection-level receive
+    /// window, in bytes.
+    pub initial_connection_window_size: u32,
+}
+
+#[pyo3::pymethods]
+impl Http2Config {
+    #[new]
+    #[pyo3(signature = (*, max_concurrent_streams, initial_connection_window_size))]
+    fn py_new(max_concurrent_streams: u32, initial_connection_window_size: u32) -> Self {
+        Self {
+            max_concurrent_streams,
+            initial_connection_window_size,
+        }
     }
 }
 

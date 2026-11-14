@@ -150,6 +150,16 @@ def _build_server_args(
         hicache_write_policy=get_memory().hicache_write_policy,
         host=get_serving().host,
         port=get_serving().port,
+        http2=(
+            ext.Http2Config(
+                max_concurrent_streams=get_serving().http2_max_concurrent_streams,
+                initial_connection_window_size=(
+                    get_serving().http2_initial_connection_window_size
+                ),
+            )
+            if get_serving().enable_http2
+            else None
+        ),
         # The shared field is also populated for legacy SMG mode; only forward
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
@@ -485,9 +495,6 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             build_server_info(scheduler.server_args, scheduler_info)
         )
     )
-    # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
-    # router reads this key to pick its protocol.
-    info["enable_http2"] = False
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

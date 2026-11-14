@@ -5,6 +5,7 @@ import pickle
 import shutil
 import signal
 import socket
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -2876,6 +2877,28 @@ class TestSSLArgs(unittest.TestCase):
             self.assertIn("--enable-http-worker-reuseport", str(context.exception))
         self._validate_ssl(enable_http_worker_reuseport=True, tokenizer_worker_num=2)
 
+    def test_enable_http2_needs_granian_only_on_the_python_frontend(self):
+        # Real models run this validation; the Rust listener serves HTTP/2
+        # itself, so only the Python frontend needs Granian. Both frontends
+        # check the HTTP/2 settings.
+        with patch.dict(sys.modules, {"granian": None}):
+            for rust_server in (False, True):
+                with (
+                    self.subTest(rust_server=rust_server),
+                    envs.SGLANG_RUST_SERVER.override(rust_server),
+                ):
+                    if rust_server:
+                        self._validate_ssl(enable_http2=True)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "'granian' package"):
+                            self._validate_ssl(enable_http2=True)
+                    with self.assertRaisesRegex(
+                        ValueError, "--http2-max-concurrent-streams"
+                    ):
+                        self._validate_ssl(
+                            enable_http2=True, http2_max_concurrent_streams=0
+                        )
+
     @patch("os.path.isfile", return_value=True)
     def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):
         server_args = self._validate_ssl(
@@ -5738,7 +5761,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
             "--tokenizer-metrics-allowed-custom-labels",
             "tenant",
         ],
-        "enable_http2": ["--enable-http2"],
         "mm_preprocess_cache_size_mb": ["--mm-preprocess-cache-size-mb", "512"],
         "language_only": ["--language-only"],
         "checkpoint_engine_wait_weights_before_ready": [
@@ -5791,14 +5813,14 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "dummy",
                 "--mm-preprocess-cache-size-mb",
                 "512",
-                "--enable-http2",
+                "--return-output-ids",
             ]
         )
         self.assertEqual(
             validation_hook.rust_server_unsupported_args(
                 args, honored={"mm_preprocess_cache_size_mb"}
             ),
-            ["--enable-http2"],
+            ["--return-output-ids"],
         )
 
     def test_supported_and_default_valued_args_pass(self):
@@ -5818,6 +5840,9 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "--default-chat-template-kwargs",
                 '{"enable_thinking": false}',
                 "--enable-strict-thinking",
+                "--enable-http2",
+                "--http2-max-concurrent-streams",
+                "64",
                 "--api-key",
                 "sk-test",
                 "--admin-api-key",
