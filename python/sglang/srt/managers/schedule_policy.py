@@ -57,6 +57,7 @@ from sglang.srt.managers.schedule_batch import (
     split_cached_prefix_by_tier,
 )
 from sglang.srt.mem_cache.allocation import retire_window
+from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -67,6 +68,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
@@ -869,6 +871,22 @@ class PrefillAdder:
             )
             * ratio
         )
+
+    def _get_running_request_releasable_kv_len(self, req: Req) -> int:
+        # Only the fixed FULL-token budget has a one-to-one token credit.
+        # Other budgets retain their existing preemption estimate.
+        if (
+            type(self.memory_budget) is not PrefillBudget
+            or isinstance(
+                self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+            )
+            or is_cp_sharded_padded()
+            or self.kv_shard_size > 1
+            or req.session is not None
+            or not req.kv.holds_kv
+        ):
+            return 0
+        return max(0, req.kv.kv_allocated_len - req.kv.cache_protected_len)
 
     @property
     def rem_total_tokens(self):
@@ -2117,7 +2135,7 @@ class PrefillAdder:
                 preemptible_reqs.append(running_req)
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(
                     running_req
-                )
+                ) + self._get_running_request_releasable_kv_len(running_req)
                 if min_tokens_to_remove <= 0:
                     break
             else:
