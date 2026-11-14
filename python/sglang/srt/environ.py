@@ -2556,6 +2556,9 @@ class Envs:
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+    # MiB of earlier chat prompts the Rust server keeps to encode only what a new
+    # prompt appends to one; 0 disables. Gemma 4 style tokenizers only.
+    SGLANG_RUST_INCREMENTAL_ENCODE_CACHE_MB = EnvInt(0)
 
     # ===================================================================
     # Weight Cache Daemon

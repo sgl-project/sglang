@@ -1,7 +1,10 @@
 //! Tokenizer loading and encoding over Dynamo tokenizers.
 
+mod incremental;
+
 use crate::ProcessorError as Error;
 use crate::model_files::resolve_tokenizer_file;
+use incremental::IncrementalEncoder;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
 /// (read-only) across all pinned workers.
@@ -52,6 +55,8 @@ pub struct DynamoTokenizer {
     without_specials: dynamo_tokenizers::Tokenizer,
     with_specials: dynamo_tokenizers::Tokenizer,
     bos: Option<i32>,
+    /// Encodes `add_special_tokens = false` text when set; see [`Self::with_incremental_encode`].
+    incremental: Option<IncrementalEncoder>,
 }
 
 /// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
@@ -89,6 +94,7 @@ impl DynamoTokenizer {
             without_specials,
             with_specials,
             bos: None,
+            incremental: None,
         }
     }
 
@@ -101,6 +107,31 @@ impl DynamoTokenizer {
         );
         tokenizer.bos = configured_bos(&tokenizer.without_specials, path, revision);
         Ok(tokenizer)
+    }
+
+    /// Reuse the ids of earlier prompts that a new prompt extends, keeping up to
+    /// `budget_bytes` of prompts, when the tokenizer at `path` admits exact cuts
+    /// (`incremental::admission`); otherwise logs why and keeps whole encodes.
+    pub fn with_incremental_encode(
+        mut self,
+        path: &str,
+        revision: Option<&str>,
+        budget_bytes: usize,
+    ) -> Self {
+        let encoder = resolve_tokenizer_file(path, revision)
+            .filter(|file| file.ends_with(".json"))
+            .ok_or_else(|| "no tokenizer.json".to_string())
+            .and_then(|file| {
+                IncrementalEncoder::new(self.without_specials.clone(), &file, budget_bytes)
+            });
+        match encoder {
+            Ok(encoder) => {
+                tracing::info!(%path, budget_bytes, "incremental encode on");
+                self.incremental = Some(encoder);
+            }
+            Err(reason) => tracing::warn!(%path, %reason, "incremental encode not admitted"),
+        }
+        self
     }
 
     /// The handle that adds the tokenizer's specials, which decoding shares.
@@ -140,6 +171,10 @@ impl TextTokenizer for DynamoTokenizer {
     }
 
     fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, Error> {
+        if !add_special_tokens && let Some(incremental) = &self.incremental {
+            let ids = incremental.encode(text).map_err(Error::Tokenize)?;
+            return Ok(ids.into_iter().map(|id| id as i32).collect());
+        }
         let encoding = if add_special_tokens {
             &self.with_specials
         } else {
