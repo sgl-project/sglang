@@ -142,3 +142,11 @@ register_kernel(
         ),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.rstd_scale_add3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.rstd_scale_add3:rstd_scale_add3",
+    )
+)
