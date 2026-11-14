@@ -23,10 +23,10 @@ use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
 use crate::node::{
     NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
 };
-use crate::unified_lru_list::UnifiedLRUList;
 use crate::unified_lru_list::{
     EvictionStrategy, PriorityKey, TlruFloatConfig, get_eviction_strategy,
 };
+use crate::unified_lru_list::{JointLRU, UnifiedLRUList};
 
 // A 42-bit mask keeps digest multiplication by 1_000_003 within i64.
 const COEXIST_RECLAIM_DIGEST_MULTIPLIER: i64 = 1_000_003;
@@ -315,6 +315,8 @@ pub(crate) struct InsertWalkState<K: ChildKeyType> {
     result: Option<InsertResult>,
     /// Emitted actions awaiting the next barrier flush (or the final step).
     pub(crate) pending_actions: CacheActions,
+    /// The node the walk's last buffer-only backup ended on; later chains stop there.
+    backup_chain_tail: Option<NodeId>,
 }
 
 /// A new walk or the result of an empty or declined insert.
@@ -507,6 +509,20 @@ pub struct ComponentState {
     pub(crate) evict_device_pending_num_tokens: usize,
     /// Token budget for the current eviction walk.
     pub(crate) evict_device_request_cnt: usize,
+    /// The walk evicts this component alone from device leaves, never collapsing
+    /// a leaf with its Full value (a joint walk's SWA side).
+    pub(crate) evict_device_strip_only: bool,
+}
+
+/// (access tick, component index, rank, node); a min-heap pops the oldest first,
+/// and the rank breaks ties within a component.
+pub(crate) type JointEvictionEntry = (i64, usize, usize, NodeIdx_);
+
+/// One joint eviction walk over eligible Full leaves and SWA entries.
+pub(crate) struct JointEvictionWalk {
+    heap: BinaryHeap<Reverse<JointEvictionEntry>>,
+    /// A selected Full leaf's parent, re-admitted once it becomes a leaf.
+    last_full_parent: Option<NodeIdx_>,
 }
 
 /// Tree-construction parameters: the tree-consumed slice of the cache's init params.
@@ -546,6 +562,9 @@ pub struct CacheInitParams {
     /// Host-only mamba checkpoints never occupy a GPU slot. A host value then
     /// still counts as a device-prefix match so Full KV indices stay reachable.
     pub mamba_host_only_checkpoint: bool,
+    /// Keep SWA access ticks for joint Full/SWA eviction: the joint_lru policy on a
+    /// Full/SWA tree over the unified memory pool's two-ended allocator.
+    pub joint_lru: bool,
 }
 
 impl Default for CacheInitParams {
@@ -568,6 +587,7 @@ impl Default for CacheInitParams {
             mamba_cache_chunk_size: None,
             mamba_max_states_per_path: None,
             mamba_host_only_checkpoint: false,
+            joint_lru: false,
         }
     }
 }
@@ -658,6 +678,11 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) empty_device_indices: Tensor,
     /// The single in-flight resumable insert, if suspended at a barrier.
     ongoing_insert_walk_state: Option<InsertWalkState<K>>,
+    /// Device SWA access ticks, kept only under the joint_lru policy on the unified
+    /// memory pool's two-ended allocator (`CacheInitParams::joint_lru`).
+    pub(crate) joint_lru: Option<JointLRU>,
+    /// The running joint eviction walk, if any.
+    pub(crate) joint_walk: Option<JointEvictionWalk>,
 }
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
@@ -841,6 +866,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.evict_device_cursor = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
+        state.evict_device_strip_only = false;
     }
 
     /// Finish the component's device-eviction bookkeeping; panics if no walk
@@ -855,6 +881,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.evict_device_cursor = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
+        state.evict_device_strip_only = false;
     }
 
     /// Add newly evictable device tokens to the component's evictable size.
@@ -929,11 +956,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let eviction_policy = params.eviction_policy.to_lowercase();
         if !matches!(
             eviction_policy.as_str(),
-            "lru" | "lfu" | "fifo" | "mru" | "filo" | "priority" | "slru" | "tlru"
+            "lru" | "lfu" | "fifo" | "mru" | "filo" | "priority" | "slru" | "tlru" | "joint_lru"
         ) {
             return Err(format!(
                 "Unknown eviction policy: {eviction_policy}. Supported policies: \
-                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru'."
+                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru', 'joint_lru'."
             ));
         }
         Ok(())
@@ -1019,6 +1046,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
             ongoing_insert_walk_state: None,
+            joint_lru: params.joint_lru.then(JointLRU::default),
+            joint_walk: None,
         };
         for component in components {
             tree_core.register_component_(component);
@@ -1030,6 +1059,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// match result.
     pub fn reset(&mut self) {
         self.arena.reset();
+        if let Some(joint_lru) = &mut self.joint_lru {
+            *joint_lru = JointLRU::default();
+        }
         self.component_states = Default::default();
         self.evictable_device_leaves = NodeSet::new();
         self.evictable_host_leaves = NodeSet::new();
@@ -1041,6 +1073,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.full_evict_device_heap.clear();
         self.namespaced_event_hashes.clear();
         self.ongoing_insert_walk_state = None;
+        // Like the component walks above, a suspended joint walk ends here.
+        self.joint_walk = None;
     }
 
     /// Create a keyed, parented node not yet in its parent's child map;
@@ -1953,6 +1987,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 ..InsertResult::default()
             }),
             pending_actions: Vec::new(),
+            backup_chain_tail: None,
         })
     }
 
@@ -2077,11 +2112,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return;
         };
         let mut node_id = child_id;
+        // Under joint_lru an access to only the prefix keeps the suffix's recency.
+        let suffix_tick = self
+            .joint_lru
+            .is_some()
+            .then(|| self.arena.node(node_id).last_access_counter);
         self.touch_node_(node_id);
         let node = self.arena.node(node_id);
         let prefix_len = state.key.match_len(cursor, &node.key, self.page_size);
         if prefix_len < node.key.atom_len() {
             let (split_node_id, action) = self.split_node_(node_id, prefix_len);
+            if let Some(tick) = suffix_tick {
+                self.arena.node_mut(node_id).last_access_counter = tick;
+            }
             node_id = split_node_id;
             if let Some(action) = action {
                 state.pending_actions.push(Box::new(action));
@@ -2210,6 +2253,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         dup_start as i64,
                         swa_already_freed as i64,
                     )],
+                    tree_owned: false,
                 }));
             }
             if swa_already_freed < dup_len {
@@ -2236,8 +2280,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // Nodes this request already inserted were counted back then.
         let node_end = state.total_prefix_length + prefix_len;
         if node_end > state.inserted_len && self.inc_hit_count_and_check_(node_id) {
-            let backup = self
-                .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
+            let backup = self.insert_backup_action_(state, node_id);
             state.pending_actions.push(Box::new(backup));
         }
         state.node_id = node_id;
@@ -2373,8 +2416,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         if self.should_backup_after_insert_(state, target_node_id) {
-            let backup =
-                self.build_backup_kv_action_(self.arena.node(target_node_id), self.is_write_back);
+            let backup = self.insert_backup_action_(state, target_node_id);
             state.pending_actions.push(Box::new(backup));
         }
     }
@@ -2486,8 +2528,23 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             EvictLayer::Device,
             /* skip_existing = */ true,
         );
-        let tick = self.arena.get_and_bump_access_counter();
-        self.arena.node_mut(child_id).last_access_counter = tick;
+        // A split moves no data, so an SWA fragment keeps the suffix's access.
+        let swa_fragment =
+            self.joint_lru.is_some() && self.device_lru_list(SWA).in_list(Some(new_node_id));
+        if let Some(joint_lru) = &mut self.joint_lru
+            && swa_fragment
+        {
+            let tick = joint_lru
+                .swa_tick(child_id)
+                .expect("a device SWA entry has an access tick");
+            joint_lru.set_swa_tick(new_node_id, tick);
+        }
+        // Other policies count the suffix as just accessed; under joint_lru it
+        // keeps its Full recency too.
+        if self.joint_lru.is_none() {
+            let tick = self.arena.get_and_bump_access_counter();
+            self.arena.node_mut(child_id).last_access_counter = tick;
+        }
 
         self.update_evictable_leaf_sets_(new_node_id);
         self.update_evictable_leaf_sets_(child_id);
@@ -2846,7 +2903,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         {
             return result;
         }
-        if self.evictable_device_leaves.contains(node_idx)
+        if (self.evictable_device_leaves.contains(node_idx)
+            && !self.component_state(component_type).evict_device_strip_only)
             || (is_state && !node.has_device_value(FULL))
         {
             // Re-select through the ordinary walk if the victim's shape has
@@ -2886,6 +2944,103 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         self.component_by_type_(component_type)
             .evict_device_end(self);
+    }
+
+    /// Begin a joint Full/SWA eviction walk over one heap of eligible Full leaves
+    /// and SWA entries, ordered by their access ticks.
+    pub fn start_joint_eviction(&mut self) {
+        assert!(
+            self.joint_walk.is_none(),
+            "joint eviction already in progress"
+        );
+        assert!(
+            self.joint_lru.is_some(),
+            "joint eviction needs a joint_lru tree"
+        );
+        // SWA victims evict through the SWA walk without collapsing Full leaves.
+        self.evict_device_start(SWA, usize::MAX);
+        self.component_state_mut(SWA).evict_device_strip_only = true;
+        let mut heap = BinaryHeap::new();
+        for idx in self.evictable_device_leaves.iter() {
+            let rank = self.arena.node(idx).id;
+            heap.push(Reverse(self.joint_eviction_entry_(idx, FULL, rank)));
+        }
+        // Equal SWA ticks (a split's fragments) keep the SWA LRU order.
+        let mut cursor = self.device_lru_list(SWA).get_lru_no_lock(&self.arena);
+        let mut rank = 0;
+        while let Some(idx) = cursor {
+            heap.push(Reverse(self.joint_eviction_entry_(idx, SWA, rank)));
+            rank += 1;
+            cursor = self.device_lru_list(SWA).get_prev_no_lock(idx, &self.arena);
+        }
+        self.joint_walk = Some(JointEvictionWalk {
+            heap,
+            last_full_parent: None,
+        });
+    }
+
+    fn joint_eviction_entry_(
+        &self,
+        idx: NodeIdx_,
+        component_type: ComponentType,
+        rank: usize,
+    ) -> JointEvictionEntry {
+        let tick = if component_type == FULL {
+            self.arena.node(idx).last_access_counter
+        } else {
+            self.joint_lru
+                .as_ref()
+                .expect("joint eviction needs a joint_lru tree")
+                .swa_tick(idx)
+                .expect("a device SWA entry has an access tick")
+        };
+        (tick, component_type.idx(), rank, idx)
+    }
+
+    /// Pop the oldest still-eligible entry. An SWA victim becomes the SWA walk's
+    /// cursor; a Full victim is a device leaf for the caller to evict.
+    pub fn next_joint_eviction_victim(&mut self) -> Option<(ComponentType, NodeId)> {
+        let walk = self
+            .joint_walk
+            .as_mut()
+            .expect("joint eviction not started");
+        if let Some(parent) = walk.last_full_parent.take()
+            && self.evictable_device_leaves.contains(parent)
+        {
+            let rank = self.arena.node(parent).id;
+            let entry = self.joint_eviction_entry_(parent, FULL, rank);
+            self.joint_walk_mut_().heap.push(Reverse(entry));
+        }
+        loop {
+            let Reverse((_, component, _, idx)) = self.joint_walk_mut_().heap.pop()?;
+            if component == FULL.idx() {
+                if self.evictable_device_leaves.contains(idx) {
+                    let node = self.arena.node(idx);
+                    let (parent, node_id) = (node.try_parent(), node.id);
+                    self.joint_walk_mut_().last_full_parent = parent;
+                    return Some((FULL, node_id));
+                }
+            // A cascade or an earlier step may have removed this SWA entry.
+            } else if self.device_lru_list(SWA).in_list(Some(idx))
+                && self.arena.device_lock_ref(idx, SWA) == 0
+            {
+                self.component_state_mut(SWA).evict_device_cursor = Some(idx);
+                return Some((SWA, self.arena.node(idx).id));
+            }
+        }
+    }
+
+    fn joint_walk_mut_(&mut self) -> &mut JointEvictionWalk {
+        self.joint_walk
+            .as_mut()
+            .expect("joint eviction not started")
+    }
+
+    /// End the joint eviction walk and its SWA walk.
+    pub fn end_joint_eviction(&mut self) {
+        assert!(self.joint_walk.is_some(), "joint eviction not started");
+        self.evict_device_end(SWA);
+        self.joint_walk = None;
     }
 
     /// See `UnifiedTreeCoreInterface.mark_write_back_queued`.
@@ -3341,7 +3496,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         target: EvictLayer,
     ) {
         let is_leaf = match target {
-            EvictLayer::Device => self.evictable_device_leaves.contains(node_id),
+            EvictLayer::Device => {
+                self.evictable_device_leaves.contains(node_id)
+                    && !self
+                        .component_state(trigger_component_type)
+                        .evict_device_strip_only
+            }
             EvictLayer::Host => self.evictable_host_leaves.contains(node_id),
             EvictLayer::All => panic!("cascade_evict_: EvictLayer::All is not a single layer"),
         };
@@ -3455,6 +3615,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let node_handle = self.arena.node(node_id).id;
         // Arena slots are reused, so discard tracking before freeing the node.
         self.full_coexisting_host_nodes.discard(node_id);
+        if let Some(joint_lru) = &mut self.joint_lru {
+            joint_lru.clear_swa_tick(node_id);
+        }
         self.namespaced_event_hashes
             .remove(&self.arena.node(node_id).id);
         // The arena is the registry: freeing detaches by page key and recycles the slot.
@@ -3507,6 +3670,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let lru = self.device_lru_list_mut(component_type);
             if lru.in_list(Some(node_id)) {
                 lru.remove_node(node_id);
+            }
+            if component_type == SWA
+                && let Some(joint_lru) = &mut self.joint_lru
+            {
+                joint_lru.clear_swa_tick(node_id);
             }
         }
         if target.contains(EvictLayer::Host) {
@@ -4069,6 +4237,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 break;
             };
             node_id = child_id;
+            // Under joint_lru an access to only the prefix keeps the suffix's recency.
+            let suffix_tick = self
+                .joint_lru
+                .is_some()
+                .then(|| self.arena.node(node_id).last_access_counter);
             self.touch_node_(node_id);
             let matched_start = matched_length;
             let node = self.arena.node(node_id);
@@ -4078,6 +4251,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
             if prefix_len < node_key_len {
                 let (split_node_id, action) = self.split_node_(node_id, prefix_len);
+                if let Some(tick) = suffix_tick {
+                    self.arena.node_mut(node_id).last_access_counter = tick;
+                }
                 node_id = split_node_id;
                 if let Some(action) = action {
                     cache_actions.push(Box::new(action));
@@ -4605,28 +4781,48 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.build_backup_kv_action_(self.arena.node(node_id), false))
     }
 
+    /// The walk's write-through backup for a node; buffer-only chains stop where the
+    /// previous one ended.
+    fn insert_backup_action_(&self, state: &mut InsertWalkState<K>, node_id: NodeIdx_) -> BackupKV {
+        let node = self.arena.node(node_id);
+        if !self.is_host_memory_buffer_only {
+            return self.build_backup_kv_action_(node, /* write_back = */ false);
+        }
+        let stop_at = state.backup_chain_tail.replace(node.id);
+        self.build_backup_chain_(node, stop_at)
+    }
+
     /// Build the backup action for a node; write-through also chains its
     /// unbacked ancestors.
     pub fn build_backup_kv_action_(&self, node: &Node<K>, write_back: bool) -> BackupKV {
-        let mut chain = vec![node.id];
-        if !write_back {
-            let mut ancestor = node.try_parent();
-            while let Some(ancestor_idx) = ancestor {
-                let ancestor_node = self.arena.node(ancestor_idx);
-                if ancestor_node.is_root()
-                    || ancestor_node.backuped()
-                    || ancestor_node.external_cache_stored
-                    || (self.enable_external_cache_linker
-                        && ancestor_node.write_through_pending_id.is_some())
-                {
-                    break;
-                }
-                chain.push(ancestor_node.id);
-                ancestor = ancestor_node.try_parent();
-            }
-            // write_through: Ancestors first to preserve backup invariant
-            chain.reverse();
+        if write_back {
+            return BackupKV {
+                node_ids: vec![node.id],
+            };
         }
+        self.build_backup_chain_(node, /* stop_at = */ None)
+    }
+
+    /// The node and its unbacked ancestors below `stop_at`, ancestors first.
+    fn build_backup_chain_(&self, node: &Node<K>, stop_at: Option<NodeId>) -> BackupKV {
+        let mut chain = vec![node.id];
+        let mut ancestor = node.try_parent();
+        while let Some(ancestor_idx) = ancestor {
+            let ancestor_node = self.arena.node(ancestor_idx);
+            if Some(ancestor_node.id) == stop_at
+                || ancestor_node.is_root()
+                || ancestor_node.backuped()
+                || ancestor_node.external_cache_stored
+                || (self.enable_external_cache_linker
+                    && ancestor_node.write_through_pending_id.is_some())
+            {
+                break;
+            }
+            chain.push(ancestor_node.id);
+            ancestor = ancestor_node.try_parent();
+        }
+        // write_through: Ancestors first to preserve backup invariant
+        chain.reverse();
         BackupKV { node_ids: chain }
     }
 
@@ -5190,6 +5386,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             host_lru.remove_node(node_id);
         }
         self.device_lru_list_mut(component_type).insert_mru(node_id);
+        if component_type == SWA
+            && let Some(joint_lru) = &mut self.joint_lru
+        {
+            joint_lru.set_swa_tick(node_id, self.arena.get_and_bump_access_counter());
+        }
         // A value materialized under lock is protected; the last release
         // moves it to evictable.
         if self.arena.device_lock_ref(node_id, component_type) > 0 {

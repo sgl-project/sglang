@@ -332,6 +332,18 @@ jobs:
           overwrite: true
           if-no-files-found: warn
 
+  # The router the PD disaggregation tests in base-b-test-4-npu-a3 launch.
+  sgl-router-build-aarch64:
+    needs: [check-changes, pr-gate]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04-arm
+      artifact_name: sgl-router-aarch64
+    secrets: inherit
+
   base-b-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
@@ -367,7 +379,7 @@ jobs:
     secrets: inherit
 
   base-b-test-4-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage, sgl-router-build-aarch64]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -382,6 +394,8 @@ jobs:
       partitions: '{"size":2,"arr":[0, 1]}'
       only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_b_test_4_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
+      sgl_router: true
     secrets: inherit
 
   base-b-test-8-npu-a3:
@@ -1340,6 +1354,7 @@ jobs:
         base-b-test-4-npu-a3,
         base-b-test-8-npu-a3,
         base-b-test-16-npu-a3,
+        sgl-router-build-aarch64,
 
         multimodal-gen-test-1-npu-a3,
         multimodal-gen-test-4-npu-a3,
