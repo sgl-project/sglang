@@ -99,11 +99,12 @@ def dequantize_k_cache_v41_fp4(pages: torch.Tensor, page_size: int) -> torch.Ten
 # ---------------------------------------------------------------------------
 
 
-def ceil_pow2_scale(x: torch.Tensor) -> torch.Tensor:
-    """``2 ** ceil(log2(max(x, 1e-4)))`` as fp32, computed on the IEEE bits so
-    that it is exact at (and just above) powers of two."""
-    x = x.float()
-    scale = ceil_pow2(torch.clamp_min(x, 1e-4))
+def ceil_pow2_scale(amax: torch.Tensor) -> torch.Tensor:
+    """``2 ** ceil(log2(max(amax, 1e-4) / 448))`` as fp32, computed on the IEEE
+    bits so that it is exact at (and just above) powers of two. As in DeepSeek's
+    ``act_quant``, the 1e-4 floor applies to ``amax``, before the division."""
+    x = amax.float()
+    scale = ceil_pow2(torch.clamp_min(x, 1e-4) / E4M3_MAX)
     # ceil_pow2 works on the bits of a finite value; a NaN or inf amax passes
     # through (both become the ue8m0 NaN byte, but only the NaN one turns the
     # whole tile's payload into NaN).
@@ -115,11 +116,11 @@ def quantize_k_cache_v41(
 ) -> torch.Tensor:
     """``k`` ``[num_pages, page_size, 512]`` -> uint8 ``[num_pages, page_bytes]``
     pages of the V41 layout: 512 e4m3 per token, then 16 ue8m0 scales per token
-    (one per 32 values), ``scale = 2 ** ceil(log2(max(amax / 448, 1e-4)))``."""
+    (one per 32 values), ``scale = 2 ** ceil(log2(max(amax, 1e-4) / 448))``."""
     num_pages, page_size, d = k.shape
     assert d == 512
     x = k.float().view(num_pages, page_size, 16, 32)
-    scale = ceil_pow2_scale(x.abs().amax(dim=-1) / 448.0)
+    scale = ceil_pow2_scale(x.abs().amax(dim=-1))
     data = (x / scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view(torch.uint8)
     scale_u8 = scale.to(torch.float8_e8m0fnu).view(torch.uint8)
     raw = page_size * 528
