@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_stages,
 )
@@ -970,7 +971,12 @@ class Glm5NextDecoderLayer(nn.Module):
         # still launches separately, so this is two launches instead of three.
         assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
         num_tokens, hidden_size = hidden_states.shape
-        if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
+        # The fused boundary is used only up to a token count, so in batch-invariant
+        # mode a token's kernels would follow its batch size.
+        if (
+            num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS
+            or is_batch_invariant_mode_enabled()
+        ):
             return None
         hc_mult = self.config.hc_mult
         fused = apply_mhc_post_pre_boundary(

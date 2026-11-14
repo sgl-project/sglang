@@ -11,6 +11,7 @@ import triton.language as tl
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -26,6 +27,9 @@ _is_hip = is_hip()
 if _is_hip:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_mix_reduce_sinkhorn_vec,
+    )
+    from sglang.kernels.ops.layernorm.mhc_pre_batch_invariant import (
+        mhc_pre_batch_invariant,
     )
 
 logger = logging.getLogger(__name__)
@@ -1981,6 +1985,21 @@ def _mhc_pre_dispatch(
     n_splits_pre: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
+    if _is_hip and is_batch_invariant_mode_enabled():
+        # AITER's and the TileLang mhc_pre pick their split-K by token count.
+        post_mix, comb_mix, layer_input = mhc_pre_batch_invariant(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        return post_mix, comb_mix, layer_input, False
+
     if _use_aiter_mhc():
         result = _try_aiter_mhc_pre(
             residual=residual,
