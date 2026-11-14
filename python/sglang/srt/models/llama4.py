@@ -111,6 +111,7 @@ class Llama4MoE(nn.Module):
 
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
+            top_k=self.top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size_moe,
             layer_id=layer_id,
