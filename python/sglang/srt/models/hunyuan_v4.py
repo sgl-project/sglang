@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.layer_boundary import (
     IHCState,
@@ -24,6 +25,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
@@ -383,11 +385,11 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         if prefix.endswith(".0.self_attn"):
             logger.info("HYV4 MLA output gate backend: %s", self._gate_backend)
 
-    @staticmethod
-    def _sink_weight_loader(param, loaded_weight):
-        parallel = get_parallel()
-        heads = loaded_weight.shape[0] // parallel.attn_tp_size
-        start = parallel.attn_tp_rank * heads
+    def _sink_weight_loader(self, param, loaded_weight):
+        projection = unwrap_lora_layer(self.linear_gate)
+        tp_rank, tp_size = get_group_rank_size(projection.tp_group)
+        heads = loaded_weight.shape[0] // tp_size
+        start = tp_rank * heads
         param.data.copy_(loaded_weight[start : start + heads].float())
 
     @staticmethod
