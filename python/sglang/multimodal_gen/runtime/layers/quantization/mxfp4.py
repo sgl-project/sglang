@@ -150,6 +150,12 @@ class Mxfp4LinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config: Mxfp4Config):
+        if quant_config.is_checkpoint_mxfp4_serialized:
+            raise NotImplementedError(
+                "Mxfp4LinearMethod only supports online (post-load) MXFP4 "
+                "quantization of BF16/FP16 weights; loading a pre-quantized "
+                "MXFP4 checkpoint is not implemented."
+            )
         # Only supported on ROCm + GFX950
         if not is_gfx95_supported():
             platform = "unknown"
@@ -251,8 +257,8 @@ class Mxfp4LinearMethod(LinearMethodBase):
 
         # Handle 3D input tensors [batch, seq, hidden]
         original_shape = x.shape
-        if x.dim() == 3:
-            x = x.view(-1, x.shape[-1])
+        if x.dim() > 2:
+            x = x.reshape(-1, x.shape[-1])
 
         y = torch.ops.sglang.mxfp4_diffusion_quant_gemm(
             x, layer.weight, layer.weight_scale
