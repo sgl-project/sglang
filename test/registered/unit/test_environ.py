@@ -9,8 +9,14 @@ import warnings
 from contextlib import ExitStack
 from unittest.mock import patch
 
-from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
+from sglang.srt.environ import (
+    EnvField,
+    _DeprecatedEnv,
+    envs,
+    redirect_third_party_caches,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -192,6 +198,46 @@ class TestEnvField(unittest.TestCase):
                     child = self.env_fields[name]
                     with child.override(None):
                         self.assertIsNone(child.get())
+
+
+class TestHummingCacheRedirection(CustomTestCase):
+    def test_cache_and_tmp_follow_sglang_cache_dir(self):
+        """Humming artifacts must not escape the persisted SGLang cache tree."""
+        for base in ("/tmp/sglang-cache-test", "~/sglang-cache-test"):
+            with (
+                self.subTest(base=base),
+                patch.dict(os.environ, clear=True),
+                envs.SGLANG_CACHE_DIR.override(base),
+            ):
+                redirect_third_party_caches()
+                self.assertEqual(
+                    os.environ["HUMMING_CACHE_DIR"],
+                    os.path.expanduser(f"{base}/humming/cache"),
+                )
+                self.assertEqual(
+                    os.environ["HUMMING_TMP_DIR"],
+                    os.path.expanduser(f"{base}/humming/tmp"),
+                )
+
+    def test_explicit_overrides_are_preserved_independently(self):
+        defaults = {
+            "HUMMING_CACHE_DIR": "/tmp/sglang-cache-test/humming/cache",
+            "HUMMING_TMP_DIR": "/tmp/sglang-cache-test/humming/tmp",
+        }
+        for overrides in (
+            {"HUMMING_CACHE_DIR": "/custom/cache"},
+            {"HUMMING_TMP_DIR": "/custom/tmp"},
+            {"HUMMING_CACHE_DIR": "/custom/cache", "HUMMING_TMP_DIR": "/custom/tmp"},
+            {"HUMMING_CACHE_DIR": "", "HUMMING_TMP_DIR": ""},
+        ):
+            with (
+                self.subTest(overrides=overrides),
+                patch.dict(os.environ, overrides, clear=True),
+                envs.SGLANG_CACHE_DIR.override("/tmp/sglang-cache-test"),
+            ):
+                redirect_third_party_caches()
+                for name, expected in (defaults | overrides).items():
+                    self.assertEqual(os.environ[name], expected)
 
 
 class TestRenamedEnvAliases(unittest.TestCase):
