@@ -154,6 +154,14 @@ class UpdateWeightsFromDiskBase:
 
     def _offload_engine_and_resume_weights(self):
         self._post_json("/release_memory_occupation", {})
+        response = requests.post(
+            f"{self.base_url}/update_weights_from_disk",
+            json={"model_path": self.model},
+            timeout=self.update_timeout,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertFalse(response.json()["success"])
+        self.assertIn("resume_memory_occupation", response.json()["message"])
         self._post_json(
             "/resume_memory_occupation", {"tags": [GPU_MEMORY_TYPE_WEIGHTS]}
         )
