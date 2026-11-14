@@ -1102,6 +1102,9 @@ def chunk_kda_fwd(
     # round-trips, but cost register footprint per CTA. Wins at small grid
     # where launch overhead dominates; loses at large grid where the extra
     # register pressure spills. Gate both on the same grid heuristic.
+    # FUSE_DIAGONAL also needs a lower-bounded gate: it splits exp2(g_i - g_j)
+    # into two factors clamped to [2^-126, 2^126], which stop cancelling once
+    # a channel decays by more than 2^126 within a 16-token sub-chunk.
     # Total CTAs in inter_solve_fused = NT * B * H_per_rank. For varlen,
     # chunks don't cross sequence boundaries, so per-sequence ceil-divs sum to
     # more than cdiv(total_tokens, chunk_size); use chunk_indices.shape[0] which
@@ -1114,6 +1117,7 @@ def chunk_kda_fwd(
     _H_pr = q.shape[-2]
     _B = q.shape[0]
     _small_grid = _B * _NT_pr * _H_pr <= 256
+    safe_gate = lower_bound is not None
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -1124,8 +1128,8 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
-        safe_gate=lower_bound is not None,
-        fuse_diagonal=_small_grid,
+        safe_gate=safe_gate,
+        fuse_diagonal=_small_grid and safe_gate,
         fuse_recompute=_small_grid,
     )
 
