@@ -364,6 +364,7 @@ class SchedulerBatchResultProcessor:
         self.token_to_kv_pool_allocator.free_group_begin()
         # Each generation row's KV work, queued in row order for _flush_prefill.
         kv_ops: List[Callable[[], None]] = []
+        checkpoint_reqs: List[Req] = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -513,6 +514,7 @@ class SchedulerBatchResultProcessor:
                         kv_ops.append(
                             partial(checkpoint_kv_cache, req, self.tree_cache)
                         )
+                        checkpoint_reqs.append(req)
                         if get_memory().enable_hisparse:
                             kv_ops.append(
                                 partial(
@@ -626,12 +628,14 @@ class SchedulerBatchResultProcessor:
                     # being chunked reqs' prefill is not finished
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self._flush_prefill(
-            batch,
-            self._reqs_still_in_batch(batch, still_in_batch_rows),
-            kv_ops,
-            skip_stream_req,
-        )
+        # The state slots the queued checkpoints take, taken in one take.
+        with self.tree_cache.lease_checkpoint_state_slots(checkpoint_reqs):
+            self._flush_prefill(
+                batch,
+                self._reqs_still_in_batch(batch, still_in_batch_rows),
+                kv_ops,
+                skip_stream_req,
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         # None on decode->extend converted batches; they are decode work and

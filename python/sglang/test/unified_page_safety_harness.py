@@ -43,6 +43,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from sglang.kernels.ops.memory.virtual_slot import bind_inplace
 from sglang.srt.mem_cache.kv.alloc import band as band_module
 from sglang.srt.mem_cache.kv.alloc import signals as signals_module
 from sglang.srt.mem_cache.kv.alloc.band import Band
@@ -1046,6 +1047,7 @@ class Model:
     def install_arena_hooks(self) -> None:
         arena = self.arena
         real_move, real_zero = arena.move_units, arena.zero_units
+        real_bind_zero = arena.bind_zero_units
         dev = self.dev
         if not isinstance(dev, SimDevice):
             # Real streams: the copies run as issued; record the decisions.
@@ -1060,8 +1062,14 @@ class Model:
                 self.count("page_zeroes", int(units.numel()))
                 real_zero(name, units)
 
+            def bind_zero_units_cuda(name, virtual_units, v2p, p2v, **where):
+                dev.decisions.append(("zero", name, int(virtual_units.numel())))
+                self.count("page_zeroes", int(virtual_units.numel()))
+                return real_bind_zero(name, virtual_units, v2p, p2v, **where)
+
             arena.move_units = move_units_cuda
             arena.zero_units = zero_units_cuda
+            arena.bind_zero_units = bind_zero_units_cuda
             return
 
         def move_units(name, dst, src):
@@ -1112,8 +1120,23 @@ class Model:
                     effect,
                 )
 
+        def bind_zero_units(name, virtual_units, v2p, p2v, *, start=None, units=None):
+            # The ids bind at once, as `UnitIds.bind` does; the zeroing is the
+            # schedule-stream op `zero_units` models.
+            if units is None:
+                units = torch.arange(
+                    start,
+                    start + virtual_units.numel(),
+                    dtype=torch.int64,
+                    device=virtual_units.device,
+                )
+            bind_inplace(virtual_units, units, v2p, p2v)
+            zero_units(name, units)
+            return units
+
         arena.move_units = move_units
         arena.zero_units = zero_units
+        arena.bind_zero_units = bind_zero_units
 
     def _network_waiter(self, transfers) -> None:
         dev = self.dev

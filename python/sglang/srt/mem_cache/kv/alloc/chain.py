@@ -231,12 +231,20 @@ def take_new_pages(
             if owner.place_pages(new_virtual_pages, num_new_pages, consumer) is None:
                 return None
         else:
-            owner.ids.bind(new_virtual_pages, physical_pages)
-            owner._maybe_zero_pages(physical_pages)
+            owner._bind_pages(new_virtual_pages, physical_pages)
     # A rebind moves the capacity epoch; a step within its pages takes none.
     if num_new_pages > 0:
         owner.free_virtual_ids = owner.free_virtual_ids[num_new_pages:]
     return out_indices
+
+
+def _shared_copy(ids, bands: int):
+    """Ids that ``bands`` ledgers record, as ``(ids, copy)`` for each band's
+    `Band.set_inflight_forward`: one copy they share when several record a
+    tensor (a ledger never writes its ids), else the ids for a band to copy."""
+    if bands > 1 and isinstance(ids, torch.Tensor) and ids.numel() > 0:
+        return ids.clone(), False
+    return ids, True
 
 
 class ChainAllocator(BaseTokenToKVPoolAllocator):
@@ -258,6 +266,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     stage_capacity: Optional[StageCapacity] = None
     # Every stage's simulated snapshot, kept until the capacity epoch moves.
     _stage_memo: Tuple[Optional[int], Tuple[ChainSnapshot, ...]] = (None, ())
+    # The state sub-pool's band; None without recurrent state.
+    mamba_allocator: Optional[Band] = None
 
     # Base init writes `self.size`; the chain computes its capacity.
     @property
@@ -484,7 +494,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def _snapshot_key_now(self) -> int:
         """The chain's capacity epoch and, per band, its compaction mode, which
-        is not a capacity field."""
+        is not a capacity field. Every capacity read goes through here, so the
+        state slots an open free group holds back are freed first: the bands
+        share the arena, and a free outside a group would have given them back."""
+        self._settle_state_free_group()
         epoch = bits = 0
         for band in self.bands:
             epoch += band._capacity_epoch
@@ -697,6 +710,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def units_fit(self, demands: Dict[str, int]) -> bool:
         """Whether a take of these units (pages of a token sub-pool, slots of the
         state sub-pool) succeeds now by the take's own checks, on every PP stage."""
+        state = self.mamba_allocator
+        if state is not None and state.sub_pool_name in demands:
+            self._settle_state_free_group()
         return self._ask(
             "units_fit",
             lambda: _units_key(demands),
@@ -779,6 +795,26 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def state_slots_fit(self, count: int) -> bool:
         """Whether ``count`` state slots can be taken now."""
         return count <= 0 or self.units_fit({self.mamba_allocator.sub_pool_name: count})
+
+    def state_slots_fit_in_place(self, count: int) -> bool:
+        """Whether ``count`` state slots can be taken now without moving a page:
+        where the bands stand, around send-held bytes, so the take needs no
+        relief (compaction or relayout) and waits for no send. Under pipeline
+        stages, on every stage's snapshot, so all of them answer alike."""
+        if count <= 0:
+            return True
+        name = self.mamba_allocator.sub_pool_name
+        demands = {name: count}
+
+        def in_place(snapshot: ChainSnapshot) -> bool:
+            return (
+                count <= snapshot.band(name).free_virtual_pages
+                and plan_layout(snapshot, demands, NO_MOVE) is not None
+            )
+
+        if self.stage_capacity is None:
+            return in_place(self.held_snapshot())
+        return self._ask("state_in_place", lambda: _units_key(demands), in_place)
 
     def estimated_state_slots_available(self) -> int:
         """`estimated_units_available` of the state sub-pool: observers only."""
@@ -1500,6 +1536,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         request_rows: Optional[torch.Tensor] = None,
         token_writes_unknown: bool = False,
         state_writes_unknown: bool = False,
+        state_slots_owned: bool = False,
     ) -> None:
         """Hand the forward's metadata to every member; token bands translate the
         write set through their own v2p. The state band, written in place by
@@ -1507,22 +1544,38 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state slots the forward writes; a request band takes the batch's request
         rows, its virtual ids. ``token_writes_unknown`` /
         ``state_writes_unknown``: the token / state bands cannot read this
-        forward's write ids before it ends."""
+        forward's write ids before it ends. ``state_slots_owned``: the caller
+        hands ``state_slots_virtual`` over, so the state band keeps it as its
+        ledger's copy. Bands that record the same ids share one copy."""
         with record_function("ChainAllocator.set_inflight_forward"):
             requests = set(self.request_allocators.values())
+            token_bands = sum(
+                member is not self.mamba_allocator and member not in requests
+                for member in self.members
+            )
+            tokens, copy_tokens = _shared_copy(
+                None if token_writes_unknown else out_cache_loc_virtual, token_bands
+            )
+            rows, copy_rows = _shared_copy(request_rows, len(requests))
             for member in self.members:
                 if member in requests:
                     member.set_inflight_forward(
-                        forward_done, request_rows, writes_unknown=False
+                        forward_done, rows, writes_unknown=False, copy=copy_rows
                     )
                     continue
-                is_state = member is self.mamba_allocator
+                if member is self.mamba_allocator:
+                    member.set_inflight_forward(
+                        forward_done,
+                        state_slots_virtual,
+                        writes_unknown=state_writes_unknown,
+                        copy=not state_slots_owned,
+                    )
+                    continue
                 member.set_inflight_forward(
                     forward_done,
-                    state_slots_virtual if is_state else out_cache_loc_virtual,
-                    writes_unknown=(
-                        state_writes_unknown if is_state else token_writes_unknown
-                    ),
+                    tokens,
+                    writes_unknown=token_writes_unknown,
+                    copy=copy_tokens,
                 )
 
     def settle_pending_for_recovery(self, bands=None):
@@ -1617,8 +1670,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     )
                 continue
             assert bind.numel() == pages.numel()
-            window.ids.bind(bind, pages)
-            window._maybe_zero_pages(pages)
+            window._bind_pages(bind, pages)
         return out
 
     def _plan_and_take(
@@ -1635,6 +1687,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         demands = {name: n for name, n in demands.items() if n > 0}
         if not demands:
             return {}
+        # Before the operation: a take of any band sees the state slots an
+        # open free group holds back as free, as an immediate free would.
+        self._settle_state_free_group()
         with allocator_operation(self.members) as op:
             op.declare_takes(demands)
             with self._relief(demands) as plan:
@@ -2083,6 +2138,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state = self.mamba_allocator
         if need_size <= 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
+        self._settle_state_free_group()
         demands = {state.sub_pool_name: need_size}
         decided = self._decided_take(demands)
         if decided is False:
@@ -2105,8 +2161,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     f"{need_size} slots was refused"
                 )
         else:
-            state.ids.bind(slots, pages)
-            state._maybe_zero_pages(pages)
+            state._bind_pages(slots, pages)
         state.free_virtual_ids = state.free_virtual_ids[need_size:]
         return state._expand_pages_to_tokens(slots)
 
@@ -2135,8 +2190,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                         "refused"
                     )
             else:
-                band.ids.bind(rows, pages)
-                band._maybe_zero_pages(pages)
+                band._bind_pages(rows, pages)
         return True
 
     def free_request_rows(self, rows: torch.Tensor) -> None:
@@ -2282,6 +2336,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_reps_group = []
         self.full_page_reps_group = []
         self.full_free_group = []
+        # A retire batch's state slots go back in one free of the state band.
+        if self.mamba_allocator is not None:
+            self.mamba_allocator.free_group_begin()
 
     def free_group_end(self) -> None:
         pending, self.free_page_reps_group = self.free_page_reps_group, None
@@ -2292,6 +2349,18 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self.free_full(torch.cat(full_free_group))
         if pending or full_pending:
             self._release_page_reps(pending, full_pending)
+        if self.mamba_allocator is not None:
+            self.mamba_allocator.free_group_end()
+
+    def _settle_state_free_group(self) -> None:
+        """Free the state slots an open free group holds back, so a take or a
+        capacity read of any band inside the group sees them as a free outside
+        it would. A retire batch's frees with no take or read between them
+        still reach the state band as one free."""
+        state = self.mamba_allocator
+        if state is not None and state.free_group:
+            state.free_group_end()
+            state.free_group_begin()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
         """Fixed-shape counterpart of `free()` for a segment whose window pages

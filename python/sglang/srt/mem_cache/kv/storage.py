@@ -9,6 +9,7 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -138,6 +139,8 @@ class KVStorage:
         self._plan = plan
         self.sized = sized
         self._allocator = allocator
+        # State slots taken ahead for one batch's takes (`lease_state_slots`).
+        self._state_lease: Optional[torch.Tensor] = None
         self.start_layer = start_layer
         # The request table: rows, who holds each, and the ids they hold.
         self.requests = requests
@@ -638,8 +641,33 @@ class KVStorage:
     # -- the prefix tree's state effects: the tree decides, the storage executes --
 
     def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
-        """``count`` free state slots of ``sub_pool``; None when none are free."""
+        """``count`` free state slots of ``sub_pool``; None when none are free.
+        Inside `lease_state_slots`, served from the leased slots while they last."""
+        lease = self._state_lease
+        if lease is not None and count <= len(lease):
+            self._state_lease = lease[count:]
+            return lease[:count]
         return self._allocator.state_slots.alloc(count)
+
+    @contextmanager
+    def lease_state_slots(self, sub_pool: str, count: int):
+        """Take, in one take, the ``count`` slots of ``sub_pool`` that takes
+        of a slot each will ask inside this context, when all of them fit now
+        without moving a page; each take of the state band is a layout search
+        and a bind. The slots no take asked for go back on exit. Otherwise
+        nothing is leased and every take runs alone, with its relief or
+        eviction on a shortfall: the KV work queued before it, such as a
+        finished request's release, may first return the slots it needs."""
+        assert self._state_lease is None, "state slot leases do not nest"
+        slots = self._allocator.state_slots
+        if count > 1 and self._allocator.state_slots_fit_in_place(count):
+            self._state_lease = slots.alloc(count)
+        try:
+            yield
+        finally:
+            lease, self._state_lease = self._state_lease, None
+            if lease is not None and len(lease) > 0:
+                slots.free(lease)
 
     def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
         self._allocator.state_slots.free(slots)
@@ -1140,7 +1168,10 @@ class KVStorage:
         if self._allocator.mamba_allocator is not None and not state_writes_unknown:
             written = [self.requests.get_mamba_indices(req_pool_indices)]
             written += [slots for slots in state_slots if slots is not None]
-            state = torch.cat([slots.reshape(-1).to(torch.int64) for slots in written])
+            pieces = [slots.reshape(-1).to(torch.int64) for slots in written]
+            # The table gather is a fresh tensor, and so is a cat: the state
+            # band's ledger keeps it without a copy of its own.
+            state = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
         self._allocator.set_latest_forward_done_event(forward_done)
         self._allocator.set_inflight_forward(
             forward_done,
@@ -1149,6 +1180,7 @@ class KVStorage:
             request_rows=req_pool_indices.reshape(-1).to(torch.int64),
             token_writes_unknown=token_writes_unknown,
             state_writes_unknown=state_writes_unknown,
+            state_slots_owned=True,
         )
 
     def move_epoch(self) -> int:
