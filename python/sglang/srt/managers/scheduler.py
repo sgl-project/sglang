@@ -3826,6 +3826,19 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
+    def _requeue_preempted(self, preempted: List[Req]) -> None:
+        if preempted and self.metrics_reporter.enable_metrics:
+            # Preemption releases KV like a decode retraction; count it the same way.
+            self.metrics_reporter.metrics_collector.increment_retracted_reqs(
+                num_retracted_reqs=len(preempted),
+                num_retracted_input_tokens=sum(
+                    len(r.origin_input_ids) for r in preempted
+                ),
+                num_retracted_output_tokens=sum(len(r.output_ids) for r in preempted),
+            )
+        for req in preempted:
+            self._add_request_to_queue(req)
+
     def _add_request_to_queue(
         self,
         req: Req,
@@ -4757,6 +4770,27 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            # NO_TOKEN also follows an admission that spent the budget; only a
+            # request that was not admitted may preempt for KV and try again.
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if (
+                res == AddReqResult.NO_TOKEN
+                and not added
+                and self.enable_priority_preemption
+                and adder.preempt_to_schedule(req)
+            ):
+                # Preemption can evict tree nodes: drop what the first match
+                # staged and match the prefix again.
+                self._drop_unadmitted_match(req)
+                req.init_next_round_input(
+                    self.tree_cache, defer_cow_slot=defer_cow_slot
+                )
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                )
+                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -4770,7 +4804,6 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     self._drop_unadmitted_match(req)
                 if res == AddReqResult.UNSCHEDULABLE and not added:
@@ -4801,8 +4834,7 @@ class Scheduler(
         if len(can_run_list) == 0:
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+            self._requeue_preempted(adder.preempt_list)
             # Empty passes are the key signal for head-of-line blocking.
             self._maybe_log_schedule_decision(
                 can_run_list=can_run_list, running_batch=running_batch, adder=adder
@@ -4826,9 +4858,7 @@ class Scheduler(
             [req for req in admitted if req is not new_chunked_req],
             self.prefill_launched_reqs,
         )
-        if adder.preempt_list:
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+        self._requeue_preempted(adder.preempt_list)
 
         # After the re-queue, so #left-in-queue is what the next pass sees.
         self._maybe_log_schedule_decision(

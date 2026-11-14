@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +107,8 @@ class RequestRetirer:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
-        """Release a retracted request's memory uncheckpointed; return whether it can resume."""
+        """Release a retracted request's memory, checkpointed only under
+        --preempt-keep-kv; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.release_request(req)
 
@@ -125,9 +126,16 @@ class RequestRetirer:
             )
         else:
             resumable = req.resumable_by_rebootstrap
-        # TODO (csy): for preempted requests, we may want to insert into the tree
+        # A request that will resume keeps its KV as a cached prefix when asked to;
+        # a Mamba tree forks an unfinished request's state on insert, so never there.
+        keep_kv = (
+            offload_kv
+            and get_schedule().preempt_keep_kv
+            and not self.tree_cache.supports_mamba()
+        )
+        req.kv_kept_on_retract = keep_kv
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=keep_kv)
         return resumable
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
@@ -136,8 +144,10 @@ class RequestRetirer:
         _leave_owner_list(req)
         record_exit(req, "abort_retracted")
         self._detach(req)
-        # retract released the KV without a checkpoint.
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        # A checkpointed retract handed the KV to the cache, whose store settles
+        # the attempt, as in `release`; an uncheckpointed one settles it here.
+        if not req.kv_kept_on_retract:
+            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         self.beam_coordinator.retire_group(req)
         self.send_abort_output(
             make_abort_req(req, finished_reason=reason.to_json()), req

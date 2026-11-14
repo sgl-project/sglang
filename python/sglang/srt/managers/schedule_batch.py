@@ -664,6 +664,8 @@ class Req(ReqDllmMixin):
 
         # For retraction
         self.is_retracted = False
+        # Whether the last retraction checkpointed the KV into the tree.
+        self.kv_kept_on_retract = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
@@ -2988,7 +2990,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     idx, len(sorted_indices), request_retirer, offload_kv=False
                 )
                 continue
-            # release memory and don't insert into the tree because we need the space instantly
+            # Release the row now; the tree keeps its KV only with --preempt-keep-kv.
             if self.release_req(idx, len(sorted_indices), request_retirer):
                 retracted_reqs.append(req)
             else:
