@@ -20,6 +20,7 @@ _is_gfx95 = is_gfx95_supported()
 _is_sm90 = is_sm90_supported()
 _is_sm103 = is_cuda() and get_device_sm() == 103
 _is_sm107 = is_cuda() and get_device_sm() == 107
+_IS_HIP_TL = tl.constexpr(_is_hip)
 
 
 def _select_recurrent_launch_config(
@@ -57,6 +58,20 @@ def _select_recurrent_launch_config(
         # Kimi-K3 TP8 (12 heads) gets 48 CTAs at BV=32; tuned on MI355X at n=1 and n=4,
         # where BV=8 is 15.2 vs 19.9 us at n=1, T=8. One warp matches BV=32 bit for bit.
         return 8, 1
+    if (
+        _is_hip
+        and _is_gfx95
+        and is_kda
+        and target_verify
+        and 0 < n <= 16
+        and hv == 16
+        and k == 128
+        and v == 128
+    ):
+        # One wave per program; narrower V tiles widen the grid past the 64
+        # programs of BV=32 at TP4 small batch. Bit-identical across BV. Only
+        # measured at 16 heads per GPU (GLM-5.3-Flash TP4).
+        return (4 if n <= 2 else 8 if n <= 8 else 16), 1
     if (
         target_verify
         and not _is_hip
@@ -517,7 +532,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
             b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
-        elif IS_KDA and (V == 128 and BV == 4):
+        elif IS_KDA and (V == 128 and BV == 4) and not _IS_HIP_TL:
             # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
             b_h = tl.inline_asm_elementwise(
                 "add.rn.f32 $0, $1, $2;",
