@@ -104,6 +104,51 @@ all-reduce.
 - `--engram-config` applies to DeepSeek-V4.1 only; a DeepSeek-V4 checkpoint without Engram layers
   rejects it.
 
+## Mooncake MNNVL EGM storage
+
+`--engram-mnnvl-config` republishes each loaded Engram/PLE shard as an immutable byte table in
+Mooncake MNNVL EGM host memory and releases the native host backing. Models keep their hashing,
+masking, scales and collectives; only the row bytes move, so prefill, decode and CUDA graph
+capture are unchanged.
+
+It requires Mooncake built with MNNVL support (`MC_ENABLE_MNNVL=1`, VMM/FABRIC devices and an IMEX
+channel on the target host) and the native CPU offload path:
+
+- DeepSeek-V4.1: `--engram-config '{"placement": "cpu", "replication": "none"}'` and
+  `--startup-weight-load-mode serial`.
+- Qwen4-Exp PLE: `--ple-offload-embedding --ple-offload-backend pinned`, with serial loading.
+
+The adapter runs after weights are loaded and before kernel precompilation or graph capture. It
+migrates one layer at a time so the EGM arena coexists only with that layer's native table; every
+caller in a session must migrate and shut down in the same order, and each deployment uses a new
+`session_id`.
+
+```bash
+export MC_ENABLE_MNNVL=1
+sglang serve ... \
+  --engram-mnnvl-config '{
+    "namespace": "checkpoint-revision/layout-v1",
+    "master_addr": "http://master:8080/metadata",
+    "session_id": "deployment-001",
+    "shard_id": 0,
+    "num_shards": 2,
+    "num_callers": 4,
+    "max_lookup_rows": 1048576,
+    "max_egm_bytes_per_numa": 137438953472
+  }'
+```
+
+`caller_id` defaults to `distributed_rank % num_callers` and only matches node-aligned rank
+layouts; set it explicitly otherwise. Node 1 changes `shard_id` and, optionally, `host_id`.
+
+Limits: `pp_size` must be 1; `replication=none` and no `peer_read`; elastic EP membership changes,
+sentinel/asynchronous weight loading and PLE file offload are rejected; tables cannot be
+hot-updated, so a restart needs a new `session_id`.
+
+The startup log contains `Engram MNNVL enabled`. Compare outputs against the native/local
+deployment with `test/manual/engram/test_engram_sglang.py`; it does not start servers or inject
+adapters, and the actual EGM path must be confirmed from the deployment config and logs.
+
 ## Deprecated environment variables
 
 Earlier releases chose the placement with environment variables. They still work when

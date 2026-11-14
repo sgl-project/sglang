@@ -2101,6 +2101,11 @@ class Scheduler(
         destroy_global_experts_capturer()
         destroy_global_indexer_capturer()
 
+        if self.server_args.engram_mnnvl_config is not None:
+            from sglang.srt.mem_cache.engram.mnnvl import release
+
+            release(self)
+
         rank_consensus_checker.shutdown()
 
     def run_event_loop(self) -> None:

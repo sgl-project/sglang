@@ -1120,6 +1120,7 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
+        self._engram_row_source = None
         config = resolve_engram_config(len(column_bounds) - 1)
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
@@ -1310,6 +1311,8 @@ class EngramEmbedding(nn.Module):
 
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
+        if self._engram_row_source is not None:
+            return self._engram_row_source(indices)
         if self.rows == 0:
             return self.new_rows(indices).zero_()
         if self.host_table is None and not _cuda_kernels(indices):

@@ -306,6 +306,21 @@ class Memory(msgspec.Struct):
     ] = None
 
     # -------------------------------------------------------------------------
+    # Engram over Mooncake MNNVL EGM
+    # -------------------------------------------------------------------------
+    engram_mnnvl_config: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Serve native Engram/PLE table rows from Mooncake MNNVL EGM host "
+                "memory. A JSON object with namespace, master_addr, session_id, "
+                "shard_id, num_shards, num_callers, max_lookup_rows and "
+                "max_egm_bytes_per_numa; requires Mooncake with MNNVL support."
+            ),
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[

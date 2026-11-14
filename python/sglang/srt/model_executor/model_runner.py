@@ -1512,6 +1512,10 @@ class ModelRunner:
         self.startup_weight_load = None
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
+        if self.server_args.engram_mnnvl_config is not None:
+            from sglang.srt.mem_cache.engram.mnnvl import maybe_attach
+
+            maybe_attach(self)
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
     def _uses_cpu_graph_attention_backend(self) -> bool:
