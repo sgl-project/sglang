@@ -458,9 +458,13 @@ class MultiTokenizerRouter:
         self.startup_time = startup_time
 
     def dispatch_to_scheduler(self, obj: BaseReq) -> None:
-        asyncio.run_coroutine_threadsafe(
-            async_sock_send(self.send_to_scheduler, obj), self._loop
-        ).result()
+        try:
+            asyncio.run_coroutine_threadsafe(
+                async_sock_send(self.send_to_scheduler, obj, flags=zmq.NOBLOCK),
+                self._loop,
+            ).result()
+        except zmq.Again:
+            logger.warning(f"No scheduler is connected; dropped {type(obj).__name__}.")
 
     def _run_loop(self):
         self._loop.run_forever()

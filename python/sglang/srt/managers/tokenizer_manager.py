@@ -3739,18 +3739,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 break
 
-        if collect_scheduler_processes():
-            # Stop the watchdog: child exits are expected during shutdown, not crashes.
-            if self._subprocess_watchdog is not None:
-                self._subprocess_watchdog.stop()
+        # Stop the watchdog: child exits are expected during shutdown, not crashes.
+        if self._subprocess_watchdog is not None:
+            self._subprocess_watchdog.stop()
+        if self._subprocess_watchdog is not None or self.tokenizer_ipc_name is None:
             # Ask schedulers to release resources in userspace and exit (see
             # ShutdownReq), then wait for them before hard-killing the rest.
             self._dispatch_to_scheduler(ShutdownReq())
             wait_for_schedulers_to_exit()
         else:
             logger.info(
-                "Drained. The schedulers are not children of this process; "
-                "the process that launched them shuts them down."
+                "Drained. The process that launched the schedulers shuts them down."
             )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         if self._server_stop_hook is not None:
