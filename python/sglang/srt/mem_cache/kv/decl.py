@@ -305,6 +305,13 @@ def with_state_replay(
         raise ValueError(
             "KDA speculative ring needs a power-of-two length and room for two verify windows"
         )
+    if replay.speculative and not replay.is_kda:
+        min_len = max(16, speculative_num_draft_tokens or 0)
+        if length & (length - 1) or length < min_len:
+            raise ValueError(
+                "GDN speculative ring needs a power-of-two length of at least "
+                f"{min_len} (16 and the draft tokens), got {length}"
+            )
     dtype = geometry.conv_dtype if replay.speculative else geometry.temporal_dtype
     ring = [
         TensorPartDecl(

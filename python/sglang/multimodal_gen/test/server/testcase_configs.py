@@ -136,9 +136,11 @@ class ScenarioConfig:
     # Anonymous-host budget caps; None skips the check (older baselines).
     load_peak_host_anon_mb: float | None = None
     runtime_peak_host_anon_mb: float | None = None
+    # sampled process memory includes dependency/allocator overhead as well as weights
+    host_anon_tolerance: float | None = None
     # Per-case override for the wall-clock tolerances (e2e, denoise and stage
     # timings) when a case's runtime is dominated by shared-runner host I/O
-    # rather than by the code under test. Memory guards keep the profile
+    # rather than by the code under test. VRAM guards keep the profile
     # tolerance -- they are what such a case actually protects.
     timing_tolerance: float | None = None
 
@@ -163,6 +165,7 @@ class ScenarioConfig:
             runtime_peak_allocated_mb=optional_float("runtime_peak_allocated_mb"),
             load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
             runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
+            host_anon_tolerance=optional_float("host_anon_tolerance"),
             timing_tolerance=optional_float("timing_tolerance"),
         )
 
@@ -1091,7 +1094,6 @@ def get_default_sampling_params_for_server_args(
     return get_default_sampling_params_for_model_task(task_type)
 
 
-MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8"
 MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER = (
@@ -1101,7 +1103,6 @@ MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER = "lmsys/qwen-image-modelopt-fp8-sglang-tran
 MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
     "lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer"
 )
-MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL = "lmsys/qwen-image-2512-modelopt-nvfp4-sglang"
 MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"

@@ -1209,6 +1209,12 @@
                     ]
                   },
                   {
+                    "group": "Diffusion",
+                    "pages": [
+                      "docs/hardware-platforms/ascend-npus/diffusion/disaggregation"
+                    ]
+                  },
+                  {
                     "group": "Development",
                     "pages": [
                       "docs/hardware-platforms/ascend-npus/development/contribution_guide",

@@ -57,6 +57,7 @@ jobs:
               - "test/**/!(*.md)"
               - "python/sglang/kernels/aot/**/*.!(md|txt)"
               - ".github/workflows/pr-test-arm64.yml"
+              - ".github/workflows/release-docker-arm64.yml"
               - "docker/arm64.Dockerfile"
 
   pr-gate:

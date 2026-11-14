@@ -16,65 +16,41 @@
     },
     "runner_overrides": {
         "b200-cirrascale1-0123": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1574.32
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17742.04
             }
         },
         "b200-cirrascale1-4567": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1574.32
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17742.04
             }
         },
         "b200-cirrascale2": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1471.19
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17346.65
             }
         },
         "b200-cirrascale3-0123": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1470.24
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17894.49
             }
         },
         "b200-cirrascale3-4567": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1471.19
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17346.65
             }
         },
         "b200-cirrascale4-0123": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1470.24
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17894.49
             }
         },
         "b200-cirrascale4-4567": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1471.19
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17346.65
             }
         },
         "b200-di": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1334.16
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 16126.87
             }
@@ -114,39 +90,6 @@
         ]
     },
     "scenarios": {
-        "flux1_modelopt_nvfp4_t2i": {
-            "expected_load_ms": 38841.5,
-            "stages_ms": {
-                "InputValidationStage": 0.06,
-                "TextEncodingStage": 25.48,
-                "LatentPreparationStage": 0.23,
-                "TimestepPreparationStage": 2.09,
-                "DenoisingStage": 1097.5,
-                "DecodingStage": 15.42
-            },
-            "denoise_step_ms": {
-                "0": 100.7,
-                "1": 51.43,
-                "2": 92.65,
-                "3": 50.75,
-                "4": 91.21,
-                "5": 51.0,
-                "6": 51.14,
-                "7": 91.25,
-                "8": 50.41,
-                "9": 90.48,
-                "10": 50.42,
-                "11": 90.57
-            },
-            "expected_e2e_ms": 836.71,
-            "expected_avg_denoise_ms": 91.2,
-            "expected_median_denoise_ms": 90.58,
-            "estimated_full_test_time_s": 71.2,
-            "load_peak_vram_mb": 18297.16,
-            "runtime_peak_vram_mb": 23335.04,
-            "load_peak_allocated_mb": 18112.88,
-            "runtime_peak_allocated_mb": 19195.3
-        },
         "flux2_modelopt_nvfp4_t2i": {
             "expected_load_ms": 71333.99,
             "stages_ms": {

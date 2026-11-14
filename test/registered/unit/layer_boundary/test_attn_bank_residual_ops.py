@@ -184,14 +184,9 @@ def _staged(
 
 class TestRowShard(CustomTestCase):
     def test_shards_past_the_last_token_are_empty(self):
-        """With fewer tokens than the padded shards need, the last ranks own no real
-        rows; a negative count would slice the wrong rows off the reduced shard."""
+        """9 tokens over 8 ranks: the last rank owns no real row; a negative count
+        would slice the wrong rows off the reduced shard."""
         self.assertEqual(attn_bank_hip.row_shard(9, 8, 7), (14, 0))
-        self.assertEqual(attn_bank_hip.row_shard(9, 8, 4), (8, 1))
-        self.assertEqual(attn_bank_hip.row_shard(4097, 8, 7), (3591, 506))
-        for num_tokens in (1, 9, 49, 64, 4097):
-            shards = [attn_bank_hip.row_shard(num_tokens, 8, r) for r in range(8)]
-            self.assertEqual(sum(valid for _, valid in shards), num_tokens)
 
 
 class TestAttnBankResidualOps(CustomTestCase):

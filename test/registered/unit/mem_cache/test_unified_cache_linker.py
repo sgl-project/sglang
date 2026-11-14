@@ -213,7 +213,6 @@ class TestMooncakePrefetch(CustomTestCase):
         linker.layer_done_counter = LayerWiseLoadCounter(2)
         linker.gc_frozen = True
         linker.pending_loads, linker.broadcast_loads = {}, {}
-        linker.load_queued_at = {}
         linker.load_queue, linker.offload_queue, linker.offload_results = (
             Queue() for _ in range(3)
         )

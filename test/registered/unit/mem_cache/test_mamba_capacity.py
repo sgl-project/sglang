@@ -248,7 +248,6 @@ class TestMambaCapacity(unittest.TestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
         queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
-        queue.pending_reqs = []
         queue._num_published_destinations = 0
         queue.transfer_queue = SimpleNamespace(
             queue=decode_queue(ListKind.PD_RECEIVING)

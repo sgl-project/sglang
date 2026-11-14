@@ -51,6 +51,7 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
+from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
@@ -60,7 +61,7 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     prepare_kv_shard_forward,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_lens, is_mla_dcp_lse_base_on_e
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -88,6 +89,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,11 @@ def _multi_ctas_kv_counter_bytes(
     return flashinfer.utils.get_trtllm_gen_multi_ctas_kv_counter_bytes(
         batch_size, num_q_heads, sm_count
     )
+
+
+def trtllm_padded_heads(num_heads: int) -> int:
+    """Pad the unsupported 65-127 MLA query-head range for trtllm-gen."""
+    return 128 if 64 < num_heads < 128 else num_heads
 
 
 def make_persistent_multi_ctas_kv_counter_buffer(
@@ -318,8 +325,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
-        # Per-row window indices, built at the first sliding layer of a forward
-        # and reused by the next ones: (forward_batch, layer_id, indices, counts).
+        # (id(forward_batch), layer_id, indices, counts); a new forward restarts lower.
         self._window_index_cache = None
         self._window_counter_buffer = None
         self._window_row_indptr = None
@@ -339,18 +345,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             else None
         )
-        # Without DCP the window path drops the LSE and every row owns a key.
-        self._swa_need_lse = get_parallel().dcp_enabled or not (
-            envs.SGLANG_OPT_DFLASH_SWA_SKIP_LSE.get()
-        )
         if model_runner.sliding_window_size is not None and (
             model_runner.sliding_window_size >= 0
         ):
-            max_rows = model_runner.max_running_requests * max(
-                self.num_draft_tokens or 1, 1
-            )
+            # Padded graph batch, which can exceed max_running_requests.
+            max_rows = (self.q_indptr_decode.numel() - 1) * (self.num_draft_tokens or 1)
             self._window_counter_buffer = make_persistent_multi_ctas_kv_counter_buffer(
-                torch.device(self.device), 128, max_batch_size=max_rows
+                torch.device(self.device),
+                trtllm_padded_heads(self.num_decode_q_heads),
+                max_batch_size=max_rows,
             )
             self._window_row_indptr = torch.arange(
                 max_rows + 1, dtype=torch.int32, device=self.device
@@ -363,8 +366,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
-        # The DFLASH worker attaches the draft KV ring after the backends exist.
-        self._draft_runner = model_runner if self.is_draft_runner else None
+        self._draft_kv_ring = None
 
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
         # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
@@ -1478,35 +1480,38 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         return output.flatten(1), lse
 
+    def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
+        """Read a DFLASH draft's sliding-window keys from its per-request KV ring
+        instead of the request table."""
+        self._draft_kv_ring = ring
+
     def _window_sparse_indices(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """This rank's window indices / counts for every query row; built once
-        per forward and reused by the following sliding layers (one window)."""
         cache = self._window_index_cache
         if (
             cache is not None
-            and cache[0] is forward_batch
+            and cache[0] == id(forward_batch)
             and cache[1] == layer.layer_id - 1
         ):
-            self._window_index_cache = (forward_batch, layer.layer_id, *cache[2:])
+            self._window_index_cache = (cache[0], layer.layer_id, *cache[2:])
             return cache[2], cache[3]
         parallel = get_parallel()
-        ring = self._draft_runner.draft_kv_ring if self._draft_runner else None
+        ring = self._draft_kv_ring
         positions, window_left = self._window_key_positions(layer, forward_batch)
         indices, counts = mla_window_sparse_indices(
             req_to_token=self.req_to_token,
             req_pool_indices=forward_batch.req_pool_indices,
             positions=positions,
             window_left=window_left,
-            dcp_size=parallel.dcp_size if parallel.dcp_enabled else 1,
-            dcp_rank=parallel.dcp_rank if parallel.dcp_enabled else 0,
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
             page_size=self.page_size,
-            v2p=None if ring else self.runner_ids.full_v2p_table,
-            ring_rows_per_req=ring.rows_per_req if ring else 0,
-            min_pos=ring.min_pos if ring else None,
+            v2p=None if ring is not None else self.runner_ids.full_v2p_table,
+            ring_rows_per_req=ring.rows_per_req if ring is not None else 0,
+            min_pos=ring.min_pos if ring is not None else None,
         )
-        self._window_index_cache = (forward_batch, layer.layer_id, indices, counts)
+        self._window_index_cache = (id(forward_batch), layer.layer_id, indices, counts)
         return indices, counts
 
     def _window_key_positions(
@@ -1531,28 +1536,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         metadata: TRTLLMMLADecodeMetadata,
     ):
-        """A sliding-window layer of a dense ``[bs, q_len]`` query window:
-        each row (position p) attends [p - sliding_window_size, p] through
-        trtllm-gen sparse MLA over its own index list. Under DCP the lists hold
-        this rank's keys and the rank-local (out, lse) goes to the caller's
-        merge, like the dense DCP path."""
-        from sglang.srt.layers.attention.dsa.dsa_dcp import (
-            dcp_trtllm_sparse_attention,
-        )
-
+        """Row p attends [p - window, p]; under DCP returns the rank-local (out, lse)."""
         bs, q_len, heads, head_dim = q.shape
         rows = bs * q_len
+        assert rows < self._window_row_indptr.numel(), (
+            f"{rows} window rows exceed the {self._window_row_indptr.numel() - 1} "
+            "sized at init"
+        )
         if get_in_autotune_dummy_run():
-            # The autotune dummy discards attention, and its synthetic metadata
-            # overflows the trtllm-gen workspace for full-head windows (no DCP),
-            # as for the DCP decode.
+            # Autotune discards attention; its metadata overflows the workspace.
             out, lse = self._dummy_dcp_decode_for_autotune(
                 q.reshape(rows, heads, head_dim), layer
             )
             return (out, lse) if get_parallel().dcp_enabled else out
         indices, counts = self._window_sparse_indices(layer, forward_batch)
-        # trtllm-gen MLA has no 64 < heads < 128 variant (96-head draft under DCP8).
-        kernel_heads = 128 if 64 < heads < 128 else heads
+        kernel_heads = trtllm_padded_heads(heads)
         query = q.reshape(rows, 1, heads, head_dim)
         if kernel_heads != heads:
             padded = query.new_zeros((rows, 1, kernel_heads, head_dim))
@@ -1574,14 +1572,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             multi_ctas_kv_counter_buffer=self._window_counter_buffer,
-            need_lse=self._swa_need_lse,
         )
         out = out.view(rows, kernel_heads, -1)[:, :heads]
         if not get_parallel().dcp_enabled:
             return out.reshape(rows, -1)
         lse = lse[:, :heads]
-        if self.dcp_lse_base_on_e:
-            lse = lse * math.log(2.0)  # -inf rows (no owned key) stay -inf
+        # trtllm-gen returns a base-2 LSE; -inf rows (no owned key) stay -inf.
+        if is_mla_dcp_lse_base_on_e(self.decode_attention_backend_str):
+            lse = lse * math.log(2.0)
         return out.contiguous().flatten(1), lse.contiguous()
 
     def forward_extend(

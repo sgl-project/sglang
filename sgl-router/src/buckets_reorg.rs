@@ -154,6 +154,14 @@ pub struct BucketPick {
     pub decode: Option<Pick>,
 }
 
+/// Engines that can serve a request: the plain engines and no decoders, or
+/// the prefills that have a decode in their version group and the decoders.
+#[derive(Debug)]
+pub struct ReadyPools {
+    pub firsts: Vec<Arc<Worker>>,
+    pub decoders: Vec<Arc<Worker>>,
+}
+
 #[derive(Debug)]
 pub struct Bucket {
     pub id: String,
@@ -218,13 +226,26 @@ impl Bucket {
 
     /// Readiness uses this bucket's actual membership and pairing constraints.
     pub fn has_ready_workers(&self, workers: &WorkerRegistry, model: &ModelId) -> bool {
+        !self.ready_pools(workers, model).firsts.is_empty()
+    }
+
+    /// This bucket's live engines that can serve a request.
+    pub fn ready_pools(&self, workers: &WorkerRegistry, model: &ModelId) -> ReadyPools {
         match &self.groups {
-            BucketGroups::Plain(group) => !group.members(workers, model, Stage::Plain).is_empty(),
-            BucketGroups::Pd { prefill, decode } => !paired_prefills(
-                prefill.members(workers, model, Stage::Prefill),
-                &decode.members(workers, model, Stage::Decode),
-            )
-            .is_empty(),
+            BucketGroups::Plain(group) => ReadyPools {
+                firsts: group.members(workers, model, Stage::Plain),
+                decoders: Vec::new(),
+            },
+            BucketGroups::Pd { prefill, decode } => {
+                let decoders = decode.members(workers, model, Stage::Decode);
+                ReadyPools {
+                    firsts: paired_prefills(
+                        prefill.members(workers, model, Stage::Prefill),
+                        &decoders,
+                    ),
+                    decoders,
+                }
+            }
         }
     }
 

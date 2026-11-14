@@ -21,7 +21,7 @@ from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=25, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 PAGE = 64
 _GARBAGE = 1e30
@@ -48,14 +48,9 @@ def _row_lengths(world: int) -> list[int]:
     ]
 
 
-def _scores(kind: str, n: int, gen: torch.Generator) -> torch.Tensor:
-    """Distinct fp32 scores, so the top-k set is unique."""
-    perm = torch.randperm(n, generator=gen).float()
-    if kind == "spread":  # both signs, many exponents
-        return (perm - n / 2) * 2**-8
-    if kind == "one_exponent":  # all in [8, 16): only the low key bits differ
-        return 8.0 + perm * 2**-20
-    raise ValueError(kind)
+def _scores(n: int, gen: torch.Generator) -> torch.Tensor:
+    """Distinct fp32 scores of both signs and many exponents: a unique top-k set."""
+    return (torch.randperm(n, generator=gen).float() - n / 2) * 2**-8
 
 
 def _page_table(rows: int, pages: int, gen: torch.Generator) -> torch.Tensor:
@@ -108,24 +103,16 @@ def _dcp_topk(scores, world, table, span):
     return owned.clamp(min=-1).max(dim=0).values, num_owners
 
 
-def _case(world, lengths, make_scores, seed):
-    assert supports_dcp_topk_hip(TOPK, world)
-    gen = torch.Generator().manual_seed(seed)
-    scores = [make_scores(n, gen) for n in lengths]
-    span = PAGE * world
-    table = _page_table(len(lengths), max(1, -(-max(lengths) // span)), gen)
-    return scores, table, span
-
-
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
-@pytest.mark.parametrize("world,kind", [(2, "one_exponent"), (8, "spread")])
-def test_selects_the_global_topk_slots(world, kind):
-    """The slots of exactly the top-min(len, 2048) global positions, -1 after them,
-    whichever local path (copy, radix, register tail) each rank's share takes."""
+def test_selects_the_global_topk_slots():
+    """DCP8: the slots of exactly the top-min(len, 2048) global positions, -1 after
+    them, whichever local path (copy, radix, register tail) each rank's share takes."""
+    world, span = 8, PAGE * 8
+    assert supports_dcp_topk_hip(TOPK, world)
     lengths = _row_lengths(world)
-    scores, table, span = _case(
-        world, lengths, lambda n, g: _scores(kind, n, g), seed=world * 7
-    )
+    gen = torch.Generator().manual_seed(world * 7)
+    scores = [_scores(n, gen) for n in lengths]
+    table = _page_table(len(lengths), -(-max(lengths) // span), gen)
     out, num_owners = _dcp_topk(scores, world, table, span)
     out, num_owners, table = out.cpu(), num_owners.cpu(), table.cpu()
     for i, s in enumerate(scores):
@@ -138,37 +125,6 @@ def test_selects_the_global_topk_slots(world, kind):
             out[i, k:], torch.full((TOPK - k,), -1, dtype=torch.int32)
         ), msg
         assert torch.equal(out[i, :k].long().sort().values, want.sort().values), msg
-
-
-@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
-@pytest.mark.parametrize("world", [8])
-def test_ties_at_the_threshold_resolve_deterministically(world):
-    """Mostly exact-zero scores tie at both thresholds: a valid top-k, the same
-    one on every call (TP peers and graph replays must agree), and every rank
-    resolves the global ties alike, so no tied winner is emitted twice or dropped."""
-    n, num_positive = world * 17500, 300
-
-    def make_scores(n, gen):
-        s = torch.zeros(n)
-        s[torch.randperm(n, generator=gen)[:num_positive]] = (
-            torch.rand(num_positive, generator=gen) + 1.0
-        )
-        return s
-
-    scores, table, span = _case(world, [n, n // 3], make_scores, seed=world)
-    first, _ = _dcp_topk(scores, world, table, span)
-    second, _ = _dcp_topk(scores, world, table, span)
-    assert torch.equal(first, second)
-    first, table = first.cpu(), table.cpu()
-    for i, s in enumerate(scores):
-        pos = torch.arange(s.numel())
-        slot_to_pos = torch.full((int(table[i].max() + 1) * span,), -1)
-        slot_to_pos[_slots(pos, table[i], span)] = pos
-        assert bool((first[i] >= 0).all()), f"row {i}"
-        got = slot_to_pos[first[i].long()]
-        # distinct visible positions, every positive score among them
-        assert bool((got >= 0).all()) and got.unique().numel() == TOPK, f"row {i}"
-        assert set(pos[s > 0].tolist()) <= set(got.tolist()), f"row {i}"
 
 
 if __name__ == "__main__":

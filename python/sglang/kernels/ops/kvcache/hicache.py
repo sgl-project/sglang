@@ -226,7 +226,8 @@ def _default_unroll(element_size: int) -> int:
         unroll = 2
     else:
         unroll = 1  # fallback: no unroll
-    # ROCm's 16-64 B rounds tile rows such as the 656 B MLA row only with more items per copy group
+    # ROCm's 16-64 B rounds tile rows such as the 656 B MLA row only with more
+    # items per copy group.
     if _is_hip and not _tiles_across_lanes(element_size, unroll):
         unroll = next(
             (

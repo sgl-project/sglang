@@ -130,6 +130,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     identity: Optional[bytes] = None
     pad_values: Optional[Tuple[int, ...]] = None
     processor_fingerprint: Optional[str] = None
+    # Caller routing label (routing metadata only; never part of identity).
+    routing_label: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.hash is not None and not 0 <= self.hash <= _MM_HASH_MASK:
@@ -709,6 +711,10 @@ class MultimodalInputs:
 
         for item in mm_items:
             item.set_pad_value()
+
+        from sglang.srt.mem_cache.events import register_mm_routing_labels
+
+        register_mm_routing_labels(mm_items)
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in mm_items:

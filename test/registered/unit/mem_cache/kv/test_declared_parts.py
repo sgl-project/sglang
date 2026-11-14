@@ -1432,7 +1432,7 @@ class TestDeclaredParts(CustomTestCase):
                         decode=False,
                         speculative=True,
                         is_kda=mode == "kda_fold",
-                        cache_len=8,
+                        cache_len=16,
                         key_heads=1,
                     ),
                 )
@@ -1540,7 +1540,7 @@ class TestDeclaredParts(CustomTestCase):
                     check_dtype=False,
                 )
 
-    def test_replay_algorithm_guard_covers_unified_and_static_construction(self):
+    def test_gdn_replay_spec_declares_parts_for_every_algorithm(self):
         from sglang.srt.configs.qwen3_next import Qwen3NextConfig
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_exec, get_spec
@@ -1555,7 +1555,7 @@ class TestDeclaredParts(CustomTestCase):
         cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=4)
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
-        for algorithm in ("DFLASH", "DSPARK"):
+        for algorithm in ("DFLASH", "DSPARK", "EAGLE"):
             with (
                 self.subTest(algorithm=algorithm),
                 get_exec().mamba.override(enable_linear_replayssm_spec=True),
@@ -1563,20 +1563,7 @@ class TestDeclaredParts(CustomTestCase):
                     speculative_algorithm=algorithm, speculative_num_draft_tokens=4
                 ),
             ):
-                with self.assertRaisesRegex(ValueError, "requires a KDA"):
-                    cfg._kv_layer_decls()
-                with self.assertRaisesRegex(ValueError, "requires a KDA"):
-                    cfg._build_hybrid_req_pool(max_num_reqs=3, extra_max_context_len=4)
-                cfg.hybrid_kda_config = object()
-                cfg._validate_replay_spec_algorithm()
-                cfg.hybrid_kda_config = None
-        with (
-            get_exec().mamba.override(enable_linear_replayssm_spec=True),
-            get_spec().override(
-                speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
-            ),
-        ):
-            self.assertEqual(len(cfg._kv_layer_decls()), 2)
+                self.assertEqual(len(cfg._kv_layer_decls()), 2)
 
     def test_full_cap_is_enforced_on_live_allocations(self):
         storage, _, _ = _build()
@@ -1621,7 +1608,7 @@ class TestDeclaredParts(CustomTestCase):
                 decode=False,
                 speculative=True,
                 is_kda=False,
-                cache_len=8,
+                cache_len=16,
                 key_heads=1,
             ),
         )

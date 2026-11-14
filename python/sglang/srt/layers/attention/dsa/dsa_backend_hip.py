@@ -23,16 +23,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def validate_dcp_backend_hip(prefill_impl: str, decode_impl: str) -> None:
-    # ROCm merges top-k with its HIP kernels; only the triton backends localize
-    # slots and return the DCP partials.
-    if prefill_impl != "triton" or decode_impl != "triton":
-        raise ValueError(
-            "DSA with --dcp-size > 1 on ROCm needs --dsa-prefill-backend and "
-            f"--dsa-decode-backend triton; got {prefill_impl} and {decode_impl}."
-        )
-
-
 @functools.cache
 def _gfx950_decode_enabled() -> bool:
     return is_gfx95_supported() and envs.SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE.get()

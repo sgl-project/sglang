@@ -127,8 +127,6 @@ class InsertParams:
     # values belong to (stamped onto new tree nodes; None when sharding is
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
-    # Storage backup context: None keeps direct/manual inserts eligible.
-    is_request_end: Optional[bool] = None
 
     def get_evicted_seqlen(self, component_type: ComponentType) -> int:
         return self.component_evicted_seqlens.get(component_type, 0)

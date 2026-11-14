@@ -49,7 +49,14 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   default) sizes K after the model is loaded; see [Choosing K](#choosing-k).
 - **`--paged-experts-enable-disk`**: Let Paged Experts write to disk: keep each MoE layer's
   experts in the [expert cache](#the-expert-cache), so that later starts read them instead of
-  loading and repacking them. Off by default; requires `--enable-paged-experts`.
+  loading and repacking them, and serve the experts that do not fit host memory from there
+  (see [Disk tier](#disk-tier)). Off by default; requires `--enable-paged-experts`.
+- **`--paged-experts-host-memory-gb G`**: Pinned host memory, in GiB, for the experts of all MoE
+  layers. When every expert fits, nothing changes; otherwise the [disk tier](#disk-tier) holds the
+  rest, with `--paged-experts-enable-disk`, and without it the start fails. Unset, every expert is
+  pinned as before; with `--paged-experts-enable-disk`, the experts that do not fit what is
+  available at startup (within the container's memory limit) go to the disk tier, which then
+  keeps 10 GiB of that free. Requires `--enable-paged-experts`.
 
 ## Supported Configurations and Limitations
 
@@ -66,6 +73,7 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   | compressed-tensors W4A16/W8A16 | Marlin | |
   | compressed-tensors NVFP4 | Marlin | weight-only: nvfp4a16, or w4a4 before Blackwell |
   | MXFP4 (e.g. gpt-oss) | Marlin | pass `--moe-runner-backend marlin` |
+  | MXFP4 routed experts of an FP8 checkpoint (e.g. DeepSeek-V4) | Marlin | pass `--moe-runner-backend marlin` |
   | ModelOpt NVFP4 | Marlin | pass `--moe-runner-backend marlin`; runs W4A16 |
 
   Other quantization methods and MoE runners are rejected at startup.
@@ -81,8 +89,21 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   prefill graphs may use the `breakable` backend (the default on CUDA) or be disabled. Other
   combinations are rejected at startup.
 - **Host memory:** the host store holds all E experts of every MoE layer and is page-locked, so
-  the host must be able to pin that much memory. Under WSL2, pinned memory is capped at about
-  half of system RAM.
+  the host must be able to pin that much memory, or the disk tier holds the rest. Under WSL2,
+  pinned memory is capped at about half of system RAM: set `--paged-experts-host-memory-gb`
+  below that.
+- **Disk tier** ([below](#disk-tier); R is the experts per layer in host memory): x86-64 hosts
+  only for now. The first start writes every layer's file once, about the size of the expert
+  weights, and keeps 8 GiB of the disk free; the space is checked at startup. The checkpoint must
+  load through the safetensors loaders with mmap (see Startup; not a checkpoint that stacks all
+  experts in one tensor), or the start fails. With decode CUDA graphs on and R < E, a step waits
+  at a layer for the experts it reads from disk, and the scheduler thread waits for each decode
+  step (no overlap scheduling); a step that gives up waiting (after 2 s) is replayed. On hybrid
+  (mamba / linear-attention) models, the step's recurrent state is copied before it runs and
+  restored before a replay. Refused then, as they accumulate state a replay would count twice:
+  `--enable-linear-replayssm`, `--enable-linear-replayssm-spec`, `--enable-unified-memory`,
+  `--expert-distribution-recorder-mode` and `SGLANG_OPT_USE_ONLINE_COMPRESS`. With `auto`, K
+  grows at most to R.
 - **Startup:** with mapped safetensors (`--load-format auto`, `safetensors` or `mistral`, without
   `--weight-loader-disable-mmap`), loading makes no second copy of the experts: each expert is
   read from the checkpoint once, straight into the pinned host store. With other loaders, and
@@ -186,13 +207,17 @@ location once.
   served. Starts that alternate `--quantization` or `--moe-runner-backend` on the same
   checkpoint replace each other's layer files at every start. Check the space with
   `du -sh $SGLANG_CACHE_DIR/paged_experts`; to clear a model, delete its `<model>-*`
-  directory (the next start with the flag rebuilds it).
+  directory (the next start with the flag rebuilds it). A model loaded from a local folder gets
+  a directory named by a hash; the startup log names it. An SGLang, torch or kernel package
+  upgrade changes the key: the next start rebuilds every file once.
 - **Writes** run in the background with direct I/O and are published complete or not at all
   (a staging file, then a rename), so concurrent starts can share the directory; a start that
   is killed mid-write leaves a staging file that a later start removes. A write is skipped
   when it would leave less than 8 GiB free: on a nearly full disk, the layers written until
   then stay, and the warning says how much the next one needed. Reading or writing the cache
-  never fails a start; it only costs the time it would have saved.
+  never fails a start; it only costs the time it would have saved. On the
+  [disk tier](#disk-tier) the files are required instead: a first build that cannot write them
+  fails the start.
 - **Who can write the directory controls the served weights**: a start serves the cached
   experts outside the checked groups as they are on disk. Keep `$SGLANG_CACHE_DIR` private to
   the users who run the server, as for the other caches there.
@@ -205,6 +230,78 @@ location once.
 In a container, mount `$SGLANG_CACHE_DIR` (or a directory it points to) to keep the files
 across restarts; without a mount they are written into the container's own filesystem, which
 takes the disk space and loses them with the container.
+
+### Disk tier
+
+With `--paged-experts-enable-disk`, when the host budget cannot hold every expert of every layer,
+each layer keeps all E experts in its [expert cache](#the-expert-cache) file and R of them in
+pinned host rows; the K GPU slots are filled from the rows. The tier runs on x86-64 hosts for
+now: on others (e.g. Grace), such a model fails at startup. With `--paged-experts-host-memory-gb`
+and without `--paged-experts-enable-disk`, such a model fails at startup with the sizes and the
+flag. Layers routed by token id (DeepSeek-V4's hash layers) keep every expert in host memory when
+they take at most half the budget; the other layers split the rest evenly (over all hidden
+layers: a model with dense layers pins less than the budget).
+
+For example, DeepSeek-V4-Flash (137 GiB of experts) on a 16 GB GPU (RTX 5070 Ti) with 62 GB of
+RAM, as measured (about 14 tok/s decode; with the default `--mem-fraction-static` the weights
+leave no room for the KV cache on this card):
+
+```bash
+SGLANG_OPT_FP8_WO_A_GEMM=1 python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --enable-paged-experts --paged-experts-enable-disk --paged-experts-host-memory-gb 45 \
+  --moe-runner-backend marlin --mem-fraction-static 0.92 --max-running-requests 1 \
+  --context-length 4096 --json-model-override-args '{"max_position_embeddings":4096}' \
+  --chunked-prefill-size 4096 --swa-full-tokens-ratio 0.5 --cuda-graph-max-bs-decode 1 \
+  --cuda-graph-backend-prefill disabled --disable-radix-cache
+```
+
+`SGLANG_OPT_FP8_WO_A_GEMM=1` keeps DeepSeek-V4's `wo_a` in FP8 on SM120 (upstream option), the
+4096-token context limits the RoPE table and the KV cache, and one prefill chunk per prompt reads
+each expert from disk once.
+
+Set `--paged-experts-host-memory-gb` on a machine where the rest of the server needs more than
+10 GiB of host memory: pinned memory cannot be swapped out.
+
+DeepSeek-V4 on a small GPU needs `--max-running-requests`: without it, SGLang reserves the
+per-request state of DeepSeek-V4's compressed attention for its default of 256 requests (about
+2.5 GB for DeepSeek-V4-Flash) before Paged Experts sizes anything, which can leave no room for
+the sliding-window pool and fail the start. `--max-running-requests 1` reserves it for one.
+
+- **The first start writes the files once**, so a model larger than RAM never has to fit in
+  RAM: the experts' loads are replayed K at a time from the mapped checkpoint (see Startup)
+  straight into the file being built (a write through a mapping of the file, not direct I/O),
+  through the repack on the Marlin runner. The build keeps 8 GiB of the disk free: its space is
+  checked at startup, and again for each file. A failed build leaves no file behind. Later starts check the same experts as for a model that fits and do not
+  read the other experts from the checkpoint; nor do they read them from the file, except the
+  ones the slots and host rows start with.
+- **The host rows are inclusive:** moving an expert into a slot copies it from its host row,
+  which keeps it; the expert the slot held is dropped (the disk has it), so nothing is written
+  back. An expert only on disk is first read into the least recently used host row (whose
+  expert is dropped), with one read per expert, bypassing the page cache (`O_DIRECT`), and
+  several in flight.
+- **Captured decode** decides on the GPU as before and copies the experts that are in host rows
+  inside the graph. An expert only on disk is flagged: the layer's plan kernel writes the
+  layer's state to pinned host memory before the layer copies its host-row hits, a host thread
+  reads the flagged experts while those copies run, and the step waits at the layer until they
+  are in their slots, then runs on with the experts it routed to. The host thread is the one
+  that replays the graph, so it returns once the step ends: the overlap scheduler cannot prepare
+  the next batch during a decode step. A step that gives up waiting (after 2 s) runs on, and the
+  host copies the experts in after it and replays the step, with the recurrent state restored;
+  the log warns about such steps. A decode step only writes its own KV entries and outputs, so
+  replaying it gives the same result. ReplaySSM, `--enable-unified-memory`,
+  `--expert-distribution-recorder-mode` and DeepSeek-V4's `SGLANG_OPT_USE_ONLINE_COMPRESS`
+  accumulate state a replay would count twice: they are refused with decode CUDA graphs.
+- **Prefill reads from disk:** a prompt of a few thousand tokens routes to nearly every expert of
+  every layer, so its time to first token is that of reading most of the experts (DeepSeek-V4-Flash:
+  about 8.5 s for a 1.5k-token prompt on a PCIe 5.0 NVMe).
+- **Checkpoints:** the tier needs the experts' loads as views of mapped safetensors files, one
+  tensor per expert (`--load-format auto`, `safetensors` or `mistral`): checkpoints that stack all
+  experts in one tensor (gpt-oss) are refused.
+
+Expert packs (`--load-format expert_pack`) are a different SSD tier: prebuilt packs for
+specific models, read from SSD into a GPU cache. The disk tier needs no preparation; it serves
+checkpoints that load as mapped safetensors with one tensor per expert.
 
 ## Choosing K
 

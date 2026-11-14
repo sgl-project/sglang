@@ -106,6 +106,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
+            request_retirer=None,
             send_abort=None,
         )
         scheduler.token_to_kv_pool_allocator = None

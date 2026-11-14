@@ -8,6 +8,7 @@ from sglang.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
     _grouped_conv,
+    candidate_topk,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -84,15 +85,6 @@ def test_selector_rejects_a_quantized_target_lm_head():
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
 
 
-def _flashinfer_contract_topk(scores, k, sorted=False, deterministic=False):
-    """Stand-in for flashinfer.top_k pinning its call contract: contiguous
-    input (its CHECK_INPUT) and the explicit sorted/deterministic flags
-    _radix_topk relies on (the real kernel defaults both to False)."""
-    assert scores.is_contiguous()
-    assert sorted and deterministic
-    return torch.topk(scores, k, dim=-1)
-
-
 class _FakeQuantMethod:
     """Projects through a captured dense weight, asserting the packed-head
     call contract (packed dtype, no bias). The padded tail comes out as
@@ -115,13 +107,15 @@ class _FakeQuantMethod:
         return torch.stack([full, full], dim=-1)[..., 0]
 
 
+# A head that is not vocab-sharded keeps the local path under any TP.
+@pytest.mark.parametrize("draft_tp_size", [1, 2])
 def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
-    monkeypatch,
+    monkeypatch, draft_tp_size
 ):
     """Packed head weights must be projected through their quantization method,
     with the padded-vocab tail masked out of the top-k on contiguous logits:
-    flashinfer's radix top-k rejects non-contiguous input, so a plain crop view
-    would fail at capture on any padded vocab."""
+    flashinfer's radix top-k only reads dense rows, so a plain crop view would
+    be copied on any padded vocab."""
     torch.manual_seed(0)
     hidden = torch.randn(2, 4)
     dense_weight = torch.randn(6, 4)
@@ -132,6 +126,7 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
         weight=torch.empty(8, 2, dtype=torch.int8),
         quant_method=quant_method,
         org_vocab_size=6,
+        tp_size=1,
     )
     model = SimpleNamespace(
         lm_head=lm_head,
@@ -141,10 +136,7 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash.get_parallel",
-        lambda: SimpleNamespace(tp_group=SimpleNamespace(world_size=1)),
-    )
-    monkeypatch.setattr(
-        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
+        lambda: SimpleNamespace(tp_size=draft_tp_size),
     )
 
     candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
@@ -157,17 +149,12 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
     torch.testing.assert_close(unary_logits, expected_logits)
 
 
-@pytest.mark.parametrize("dp_lm_head", [False, True])
-def test_selector_gathers_global_candidates_across_vocab_shards(
-    monkeypatch, dp_lm_head
-):
+def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     """Pins the TP gather contract on the quantized path: the per-shard
     org-vocab restriction, the global id offset, and the fp32 cast before the
     all-gather -- a
     regression in any of them returns wrong global candidates only under TP,
-    which no single-rank test observes. A head sharded within attention TP
-    (--enable-dp-lm-head) gathers over that group: under DP attention the full
-    TP group would mix other DP ranks' rows."""
+    which no single-rank test observes."""
     torch.manual_seed(0)
     k = 4
     # bf16 like production: makes the fp32 upcast before the gather observable.
@@ -181,7 +168,7 @@ def test_selector_gathers_global_candidates_across_vocab_shards(
         weight=torch.empty(8, 2, dtype=torch.int8),
         quant_method=quant_method,
         shard_indices=SimpleNamespace(num_org_elements=6, org_vocab_start_index=6),
-        use_attn_tp_group=dp_lm_head,
+        tp_size=2,
     )
     model = SimpleNamespace(
         lm_head=lm_head,
@@ -201,20 +188,9 @@ def test_selector_gathers_global_candidates_across_vocab_shards(
             return torch.cat([rank0_vals.float(), x], dim=dim)
         return torch.cat([rank0_ids.long(), x], dim=dim)
 
-    def wrong_group_gather(x, dim):
-        raise AssertionError("gathered over the group the head is not sharded on")
-
-    shard_group = SimpleNamespace(world_size=2, all_gather=fake_all_gather)
-    other_group = SimpleNamespace(world_size=4, all_gather=wrong_group_gather)
+    lm_head.tp_group = SimpleNamespace(all_gather=fake_all_gather)
     monkeypatch.setattr(
-        "sglang.srt.models.dflash.get_parallel",
-        lambda: SimpleNamespace(
-            tp_group=other_group if dp_lm_head else shard_group,
-            attn_tp_group=shard_group if dp_lm_head else other_group,
-        ),
-    )
-    monkeypatch.setattr(
-        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
+        "sglang.srt.models.dflash.get_parallel", lambda: SimpleNamespace(tp_size=2)
     )
 
     candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
@@ -224,6 +200,76 @@ def test_selector_gathers_global_candidates_across_vocab_shards(
     )
     torch.testing.assert_close(candidate_ids, expected_ids)
     torch.testing.assert_close(unary_logits, expected_logits.float())
+
+
+def test_merged_candidates_gather_over_the_head_group(monkeypatch):
+    packed, gathered = torch.zeros(2, 8), torch.ones(2, 16)
+    ids, vals = torch.zeros(2, 4, dtype=torch.long), torch.zeros(2, 4)
+    lm_head = SimpleNamespace(
+        weight=torch.empty(6, 4, dtype=torch.bfloat16),
+        quant_method=None,
+        shard_indices=SimpleNamespace(num_org_elements=6, org_vocab_start_index=6),
+        tp_size=2,
+        tp_group=SimpleNamespace(
+            all_gather=lambda x, dim: gathered if x is packed else None
+        ),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel", lambda: SimpleNamespace(tp_size=2)
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash._project_candidate_logits",
+        lambda hidden, lm_head, num_org, use_quant_head: torch.zeros(2, num_org),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.topk_packed",
+        lambda logits, k, start: packed,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.merge_candidates",
+        lambda g, k, multiplier, softcap: (ids, vals) if g is gathered else None,
+        raising=False,
+    )
+
+    out = candidate_topk(
+        torch.randn(2, 4, dtype=torch.bfloat16),
+        lm_head,
+        4,
+        merged_unary_transform=(1.0, None),
+    )
+
+    assert out[0] is ids and out[1] is vals and out[2] is None
+
+
+def test_a_head_sharded_over_another_group_is_rejected(monkeypatch):
+    lm_head = SimpleNamespace(
+        weight=torch.empty(6, 4, dtype=torch.bfloat16), quant_method=None, tp_size=4
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel", lambda: SimpleNamespace(tp_size=2)
+    )
+    with pytest.raises(RuntimeError, match="--enable-dp-lm-head"):
+        candidate_topk(torch.randn(2, 4, dtype=torch.bfloat16), lm_head, 4)
+
+
+@pytest.mark.parametrize("head_tp_size", [1, 3])
+def test_fused_candidates_need_a_power_of_two_head_split(monkeypatch, head_tp_size):
+    calls = []
+
+    def fake_candidate_topk(hidden, lm_head, k, **kwargs):
+        calls.append(kwargs)
+        return torch.zeros(2, k, dtype=torch.long), torch.zeros(2, k), None
+
+    monkeypatch.setattr("sglang.srt.models.dflash.candidate_topk", fake_candidate_topk)
+    model = SimpleNamespace(
+        lm_head=SimpleNamespace(tp_size=head_tp_size),
+        candidate_selector=SimpleNamespace(top_k=4),
+        _transform_unary_logits=lambda logits: logits.float(),
+        merge_candidates_fused=True,
+    )
+    DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
+    assert calls == [{}]
 
 
 def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):

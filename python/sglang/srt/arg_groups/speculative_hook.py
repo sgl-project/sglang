@@ -5,7 +5,10 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
+from sglang.srt.arg_groups.choices import (
+    DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+)
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     dspark_dp_a2a_backends,
@@ -399,17 +402,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             parse_dflash_draft_config,
         )
 
-        model_override_args = json.loads(cfg.json_model_override_args)
         inferred_block_size = None
         try:
-            from sglang.srt.hf_transformers import get_config
-
-            draft_hf_config = get_config(
-                cfg.speculative_draft_model_path,
-                trust_remote_code=cfg.trust_remote_code,
-                revision=cfg.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
+            draft_hf_config = _load_draft_hf_config(cfg)
             inferred_block_size = parse_dflash_draft_config(
                 draft_hf_config=draft_hf_config
             ).resolve_block_size(default=None)
@@ -952,7 +947,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """
     from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
     from sglang.srt.speculative.draft_worker_common import (
-        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
         dflash_draft_reads_rows_by_position,
     )
 
@@ -966,8 +960,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 "DFLASH", backend
             )
         if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
-            # These serve only MLA layers: a draft verify window through the
-            # target's MLA decode kernels (DCP owner rows under DCP).
+            # trtllm_mla has no bidirectional mask: taken only when named.
+            if (
+                backend == "trtllm_mla"
+                and cfg.speculative_draft_attention_backend is None
+            ):
+                return False
             return is_dflash_mla_draft_config(_load_draft_hf_config(cfg))
         return backend in supported_draft_backends
 
@@ -1117,32 +1115,65 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
         )
 
 
+def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
+    from sglang.srt.speculative.dflash_utils import (
+        get_dflash_layer_types,
+        is_dflash_mla_draft_config,
+    )
+
+    cfg = resolving_view(server_args)
+    draft_backend = cfg.speculative_draft_attention_backend
+    if (
+        cfg.speculative_draft_window_size is None
+        or draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS
+    ):
+        return
+    draft_hf_config = _load_draft_hf_config(cfg)
+    if not is_dflash_mla_draft_config(draft_hf_config):
+        return
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if layer_types and "sliding_attention" in layer_types:
+        raise ValueError(
+            "--speculative-draft-window-size is not supported for an MLA draft "
+            f"with sliding-window layers on {draft_backend}: the backend applies "
+            "the draft's own window."
+        )
+
+
 def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
-    """Settle SGLANG_DFLASH_DRAFT_KV_RING once, before any worker starts, so
-    every process agrees, including PP stages that own no draft: they still
-    register the ring's PD state slots. Runs after the draft backend and the
-    compact window are final."""
+    """Runs after the draft backend is final, which it reads."""
     from sglang.srt.speculative.dflash_draft_ring import (
         draft_kv_ring_unsupported_reason,
     )
 
-    flag = envs.SGLANG_DFLASH_DRAFT_KV_RING
-    if not flag.get():
+    switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
+    if not switch.get():
+        logger.info("DFLASH draft KV ring: off, SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.")
         return
     cfg = resolving_view(server_args)
     reason = draft_kv_ring_unsupported_reason(
-        _load_draft_hf_config(cfg),
+        lambda: _load_draft_hf_config(cfg),
         draft_backend=cfg.speculative_draft_attention_backend,
-        draft_window_size=cfg.speculative_draft_window_size,
+        disaggregation_mode=cfg.disaggregation_mode,
+        disaggregation_transfer_backend=cfg.disaggregation_transfer_backend,
+        disaggregation_decode_host_receive_threshold=(
+            cfg.disaggregation_decode_host_receive_threshold
+        ),
+        enable_unified_memory=cfg.enable_unified_memory,
         dcp_size=cfg.dcp_size,
+        draft_window_size=cfg.speculative_draft_window_size,
     )
-    if reason is None:
-        logger.info("DFLASH draft KV ring: on.")
+    if reason is not None:
+        if switch.is_set():
+            raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
+        logger.info("DFLASH draft KV ring: off, %s.", reason)
         return
-    if flag.is_set():
-        raise ValueError(f"SGLANG_DFLASH_DRAFT_KV_RING=1, but {reason}.")
-    logger.info("DFLASH draft KV ring: off, %s.", reason)
-    flag.set(False)
+    logger.info("DFLASH draft KV ring: on.")
+    declare_resolution(
+        server_args,
+        "_resolve_dflash_draft_kv_ring",
+        speculative_dflash_draft_kv_ring=True,
+    )
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:

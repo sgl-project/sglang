@@ -10,20 +10,30 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::Response;
-use axum::routing::{get, post, MethodRouter};
+use axum::routing::{any, get, post, MethodRouter};
 use axum::Router;
 use std::sync::{Arc, OnceLock};
 use tower_http::catch_panic::CatchPanicLayer;
 
 /// Infra endpoints whose *successful* polls are logged at DEBUG rather than
 /// INFO. They are polled constantly — Prometheus scrapes `/metrics`, the kubelet
-/// hits `/healthz` + `/readyz` every few seconds — so logging every hit at INFO
-/// would bury real API traffic. A FAILING probe is the opposite: a pod dropping
-/// out of readiness is an incident signal, so it keeps the normal INFO line (see
-/// `access_log_and_record`). They are counted in both edge counters either way;
-/// filter them by `route` in PromQL.
+/// hits `/healthz` + `/readyz` (or their aliases `/health`, `/liveness`,
+/// `/readiness`, or the engine's `/health_generate`) every few seconds — so
+/// logging every hit at INFO would bury real API traffic. A FAILING probe is
+/// the opposite: a pod dropping out of readiness is an incident signal, so it
+/// keeps the normal INFO line (see `access_log_and_record`). They are counted
+/// in both edge counters either way; filter them by `route` in PromQL.
 fn is_infra_path(path: &str) -> bool {
-    matches!(path, "/healthz" | "/readyz" | "/metrics")
+    matches!(
+        path,
+        "/healthz"
+            | "/readyz"
+            | "/health"
+            | "/liveness"
+            | "/readiness"
+            | "/health_generate"
+            | "/metrics"
+    )
 }
 
 /// Collapse an HTTP method to a bounded allow-list for use as a metric label.
@@ -199,6 +209,11 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
+        // The same probes under the engine's `/health` and sgl-model-gateway's
+        // `/liveness` and `/readiness`.
+        .route("/health", get(crate::server::routes::health::healthz))
+        .route("/liveness", get(crate::server::routes::health::healthz))
+        .route("/readiness", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))
         .route(
             "/v1/models",
@@ -265,7 +280,33 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             crate::state::kv_events::bootstrap::SNAPSHOT_PATH,
             get(crate::server::routes::cache::kv_snapshot),
+        )
+        .route(
+            "/server_info",
+            get(crate::server::routes::worker_info::server_info),
+        )
+        .route(
+            "/model_info",
+            get(crate::server::routes::worker_info::model_info),
+        )
+        .route(
+            "/health_generate",
+            get(crate::server::routes::worker_info::health_generate),
+        )
+        // The `/get_` names are the engine's older aliases.
+        .route(
+            "/get_server_info",
+            get(crate::server::routes::worker_info::server_info),
+        )
+        .route(
+            "/get_model_info",
+            get(crate::server::routes::worker_info::model_info),
         );
+    let router = crate::server::routes::unsupported::UNSUPPORTED_PATHS
+        .iter()
+        .fold(router, |router, path| {
+            router.route(path, any(crate::server::routes::unsupported::unsupported))
+        });
     // A route that panics on purpose, so the panic-handling layers below are
     // exercised as `build_router` actually composes them. Without it the layers
     // could be deleted from this function and every test would still pass.
@@ -631,6 +672,26 @@ mod tests {
                 && logs.contains("status=503"),
             "a failing readiness probe must reach the INFO access log; captured:\n{logs}",
         );
+    }
+
+    /// The probe aliases answer exactly as the probes they alias: a stub
+    /// context is alive but never marked ready.
+    #[tokio::test]
+    async fn probe_aliases_answer_like_healthz_and_readyz() {
+        let ctx = Arc::new(AppContext::stub());
+        for (uri, want) in [
+            ("/health", StatusCode::OK),
+            ("/liveness", StatusCode::OK),
+            ("/readiness", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let res = build_router(Arc::clone(&ctx)).oneshot(req).await.unwrap();
+            assert_eq!(res.status(), want, "{uri}");
+        }
     }
 
     /// The `method` label must be bounded where it is USED, not merely where it

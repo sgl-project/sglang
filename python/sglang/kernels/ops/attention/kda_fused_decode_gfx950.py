@@ -2,8 +2,8 @@
 """HIP Kimi-K3 fused KDA decode for gfx950 (MI350X / MI355X).
 
 Same fail-closed interface as ``kda_fused_decode_aiter_hip``: it serves
-``SGLANG_ROCM_K3_KDA_FUSED_BACKEND=gfx950`` (the default on ROCm), and inputs it
-does not cover keep the unfused KDA decode. The kernel is
+``SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=gfx950`` (the default on ROCm), and inputs
+it does not cover keep the unfused KDA decode. The kernel is
 ``attention.kda_decode_gfx950`` (``KernelBackend.KDA``), implemented in
 ``sglang.kernels.kda_kernels.kda_decode_gfx950``.
 """
@@ -16,7 +16,7 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, print_warning_once
 
 _HEADS = 12
 _DIM = 128
@@ -24,14 +24,32 @@ _CHANNELS = 3 * _HEADS * _DIM
 
 
 def enabled() -> bool:
-    return envs.SGLANG_ROCM_K3_KDA_FUSED_BACKEND.get().lower() == "gfx950"
+    return envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "gfx950"
 
 
-def available(device: torch.device | None = None) -> bool:
+def _runs_here() -> bool:
     if not is_hip() or not enabled() or not torch.cuda.is_available():
         return False
     hip = current_arch().hip
     return hip is not None and hip.gcn_arch == "gfx950"
+
+
+def available(*, device: torch.device | None, state_dtype: torch.dtype) -> bool:
+    """Whether the kernel runs over a ``state_dtype`` pool on the local GPU arch.
+
+    ``device`` is unused (``current_arch()`` answers for the host);
+    it keeps the interface of ``kda_fused_decode_aiter_hip.available``.
+    """
+    if not _runs_here():
+        return False
+    if state_dtype != torch.float32:
+        print_warning_once(
+            "Kimi-K3 fused KDA decode not armed: the gfx950 kernel takes a "
+            f"torch.float32 recurrent state, the pool holds {state_dtype}; "
+            "decode runs the unfused chain"
+        )
+        return False
+    return True
 
 
 def warmup(**_: object) -> None:
@@ -51,7 +69,7 @@ def covered(
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> bool:
-    if not available(f_a.device) or f_a.ndim != 2:
+    if not _runs_here() or f_a.ndim != 2:
         return False
     batch = f_a.shape[0]
     return (
