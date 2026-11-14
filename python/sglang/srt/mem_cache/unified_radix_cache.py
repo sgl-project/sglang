@@ -128,6 +128,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
 )
 from sglang.srt.runtime_context import (
+    get_context,
     get_disagg,
     get_memory,
     get_model,
@@ -224,6 +225,7 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    logical_page_size: Optional[int] = None
 
     def __init__(
         self,
@@ -464,9 +466,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
-        if cache_linker.load_mode == "prefetch":
+        self.prefetch_stop_policy = cache_linker.prefetch_policy
+        if (
+            self.logical_page_size is not None
+            and get_context().is_config_namespace_published("memory")
+        ):
             memory = get_memory()
-            self.prefetch_stop_policy = cache_linker.prefetch_policy
             config = memory.unified_cache_external_linker_config
             (
                 _,
@@ -3008,7 +3013,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
-        if self.linker is not None and self.linker.load_mode == "prefetch":
+        if self.linker is not None:
             return self.linker.check_prefetch_progress(request)
         if self._is_pp_ticketed(request):
             return self._check_pp_prefetch_progress(request)

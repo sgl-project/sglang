@@ -275,8 +275,8 @@ class Memory(msgspec.Struct):
             help=(
                 "JSON configuration for the selected linker backend. Common "
                 "options include load_mode (layer_wise or prefetch) and "
-                "prefetch_policy (best_effort, wait_complete, or timeout). "
-                "Defaults are layer_wise and timeout. Built-in "
+                "prefetch_policy (best_effort, wait_complete, or timeout; "
+                "defaults to --hicache-storage-prefetch-policy). Built-in "
                 "backends accept storage options directly. The dynamic backend "
                 "requires linker (class name), linker_module_path (Python "
                 "module), and optional linker_extra_config (object). May be "

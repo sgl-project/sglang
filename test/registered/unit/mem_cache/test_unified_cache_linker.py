@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
     LayerWiseLoadCounter,
+    PrefetchStatus,
     TransferReady,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
@@ -95,7 +96,7 @@ class _FakeLinker(UnifiedCacheLinker):
         self.closed = False
         self.pools = {}
 
-    def lookup(self, rid, transfers):
+    def lookup(self, rid, transfers, prefetch=False):
         return list(self.restorable)
 
     def load(self, rid, transfers):
@@ -727,6 +728,261 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         cache.sanity_check()
 
 
+class TestLinkerStoreMemoryPrefetch(CustomTestCase):
+    def _fixture(
+        self, *, swa=False, mamba=False, is_eagle=False, policy="wait_complete"
+    ):
+        cfg = CacheConfig(
+            page_size=1 if mamba else 2,
+            is_eagle=is_eagle,
+            components=(ComponentType.FULL,)
+            + ((ComponentType.SWA,) if swa else ())
+            + ((ComponentType.MAMBA,) if mamba else ()),
+            sliding_window_size=2 if swa else None,
+            kv_size=32,
+            num_layers=2,
+            full_attention_layer_ids=(0,),
+        )
+        with patch.object(shared_cache_suite, "get_device", return_value="cpu"):
+            cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
+        backend = _FakeLinker()
+        if swa:
+            backend.pools[PoolName.SWA] = object()
+        if mamba:
+            backend.pools[PoolName.MAMBA] = object()
+        backend.load_mode = "layer_wise"
+        backend.prefetch_policy = policy
+        backend.status_by_rid = {}
+        backend.canceled_rids = []
+        backend.lookup_calls = []
+
+        def lookup(rid, transfers, prefetch=False):
+            backend.lookup_calls.append((rid, list(transfers), prefetch))
+            return list(backend.restorable)
+
+        backend.lookup = lookup
+        backend.prefetch_status = MagicMock(
+            side_effect=lambda rid: backend.status_by_rid.get(rid, PrefetchStatus.READY)
+        )
+        backend.cancel_prefetch = MagicMock(
+            side_effect=lambda rid: backend.canceled_rids.append(rid)
+        )
+        backend.restorable = list(range(1, 6 // cfg.page_size + 1))
+        with get_context().override_server_args(
+            hicache_storage_prefetch_policy=policy,
+            unified_cache_external_linker_config={
+                "load_mode": "layer_wise",
+                "prefetch_timeout_base": 1,
+                "prefetch_timeout_per_ki_token": 512,
+            },
+        ):
+            cache.init_cache_linker(backend)
+        self.addCleanup(cache.linker.close)
+        return cache, backend, self._request(is_eagle=is_eagle), allocator
+
+    def _request(self, rid="queued", start=1, attempt=0, is_eagle=False):
+        length = 8 if is_eagle else 7
+        req = Req(
+            rid=rid,
+            origin_input_text=None,
+            origin_input_ids=array("q", range(start, start + length)),
+            sampling_params=SamplingParams(max_new_tokens=1),
+        )
+        req.cache_request_handle = CacheRequestHandle(rid, attempt)
+        return req
+
+    def _enqueue(self, cache, req):
+        scheduler = SimpleNamespace(
+            enable_unified_cache_external_linker=True,
+            enable_hicache_storage=False,
+            enable_lmcache=False,
+            tree_cache=cache,
+        )
+        Scheduler._prefetch_kvcache(scheduler, req)
+
+    def test_enqueue_probes_once_with_prefetch_and_admits_same_tick_when_ready(self):
+        """DRAM-resident hits must neither duplicate lookup at enqueue nor delay admission."""
+        for is_eagle in (False, True):
+            with self.subTest(is_eagle=is_eagle):
+                cache, backend, req, allocator = self._fixture(
+                    swa=not is_eagle, mamba=not is_eagle, is_eagle=is_eagle
+                )
+                self._enqueue(cache, req)
+                assert len(backend.lookup_calls) == 1
+                _, enqueue_transfers, prefetch_flag = backend.lookup_calls[0]
+                assert prefetch_flag is True
+                assert not cache.linker.store_prefetches
+                assert not cache.linker.has_pending_prefetches()
+                assert cache.check_prefetch_progress(req.cache_request_handle)
+                if is_eagle:
+                    assert allocator.available_size() == 32
+                else:
+                    assert allocator.full_attn_allocator.available_size() == 32
+                    assert allocator.swa_attn_allocator.available_size() == 32
+                    assert allocator.state_slots.available_size() == 20
+                    assert not req.kv.holds_mamba
+                req.init_next_round_input(cache)
+                assert len(backend.lookup_calls) == 2
+                _, match_transfers, match_prefetch_flag = backend.lookup_calls[1]
+                assert match_prefetch_flag is False
+                assert [t.keys for t in enqueue_transfers] == [
+                    t.keys for t in match_transfers
+                ]
+                assert cache.linker.load_back(req)[0] == 6
+                assert len(backend.queued_loads) == 1
+                cache.sanity_check()
+
+    def test_legacy_two_arg_lookup_plugin_remains_compatible_on_enqueue(self):
+        """Out-of-tree linkers with 2-arg lookup(rid, transfers) must not fail on enqueue."""
+        calls = []
+
+        class _TwoArgPlugin(_FakeLinker):
+            def lookup(self, rid, transfers):
+                calls.append((rid, len(transfers)))
+                return [1, 2, 3]
+
+        cfg = CacheConfig(page_size=2, kv_size=32, num_layers=2)
+        with patch.object(shared_cache_suite, "get_device", return_value="cpu"):
+            cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
+        plugin = _TwoArgPlugin()
+        with get_context().override_server_args(
+            hicache_storage_prefetch_policy="wait_complete"
+        ):
+            cache.init_cache_linker(plugin)
+        self.addCleanup(cache.linker.close)
+        assert not cache.linker._lookup_accepts_prefetch
+        req = self._request()
+        self._enqueue(cache, req)
+        assert calls == [(req.rid, 1)]
+        assert cache.check_prefetch_progress(req.cache_request_handle)
+        assert allocator.available_size() == 32
+
+    def test_wait_complete_timeout_and_best_effort_consensus_transitions(self):
+        """Collective readiness and timeout voting run in check_hicache_events, not per-candidate polls."""
+        for policy, outcome in (
+            ("best_effort", "pending"),
+            ("wait_complete", "peer-pending"),
+            ("timeout", "local-expire"),
+            ("timeout", "peer-expire"),
+        ):
+            with self.subTest(policy=policy, outcome=outcome):
+                cache, backend, req, allocator = self._fixture(swa=True, policy=policy)
+                full_prefix = allocator.full_attn_allocator.alloc(2)
+                swa_prefix = allocator.swa_attn_allocator.alloc(2)
+                window = cache.window_sub_pool_of_slot(ComponentType.SWA)
+                cache.kv_storage().bind_window(window, full_prefix, swa_prefix)
+                anchor = cache.insert(
+                    InsertParams(
+                        key=RadixKey(req.origin_input_ids[:2]),
+                        value=full_prefix,
+                        inserted_len=2,
+                    )
+                ).last_device_node
+                backend.completed_offloads.append(True)
+                cache.check_hicache_events()
+                assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 0
+
+                # Partial 1-page hit out of 2 uncached tail pages: timeout_s = 1 + 1 * 1 = 2.0s.
+                backend.restorable = [1]
+                backend.status_by_rid[req.rid] = PrefetchStatus.PENDING
+                self._enqueue(cache, req)
+                handle = req.cache_request_handle
+                assert allocator.full_attn_allocator.available_size() == 30
+                assert allocator.swa_attn_allocator.available_size() == 30
+                assert cache.full_protected_size() == 0
+                assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 0
+
+                if policy == "best_effort":
+                    assert not cache.linker.store_prefetches
+                    assert req.rid in backend.canceled_rids
+                    assert cache.check_prefetch_progress(handle)
+                    continue
+
+                state = cache.linker.store_prefetches[handle]
+                assert state.timeout_s == 2.0 and state.wait_started is None
+                clock = SimpleNamespace(
+                    now=1000.0,
+                    peer_pending=outcome == "peer-pending",
+                    peer_expired=False,
+                    poll_collectives=0,
+                )
+
+                def reduce_events(verdicts, op, clock=clock):
+                    if verdicts.ndim == 2:
+                        if clock.peer_pending:
+                            verdicts[:, 0] = 0
+                        if clock.peer_expired:
+                            verdicts[:, 1] = 0
+
+                cache._all_reduce_attn_groups = reduce_events
+                with patch(
+                    "sglang.srt.mem_cache.unified_cache.unified_cache_linker.time",
+                    SimpleNamespace(perf_counter=lambda clock=clock: clock.now),
+                ):
+                    cache.check_hicache_events()
+                    # Forbid collectives inside check_prefetch_progress (#47620).
+                    cache._all_reduce_attn_groups = MagicMock(
+                        side_effect=AssertionError("poll must not run collectives")
+                    )
+                    assert not cache.check_prefetch_progress(handle)
+                    assert state.wait_started == 1000.0
+                    cache._all_reduce_attn_groups = reduce_events
+
+                    if policy == "wait_complete":
+                        clock.now = 1050.0
+                        backend.status_by_rid[req.rid] = PrefetchStatus.READY
+                        cache.check_hicache_events()
+                        # Local rank is READY, but peer rank is still PENDING.
+                        assert not cache.check_prefetch_progress(handle)
+                        clock.peer_pending = False
+                        cache.check_hicache_events()
+                        assert cache.check_prefetch_progress(handle)
+                    else:
+                        clock.now = 1001.0
+                        clock.peer_expired = outcome == "peer-expire"
+                        cache.check_hicache_events()
+                        assert cache.check_prefetch_progress(handle) is (
+                            outcome == "peer-expire"
+                        )
+                        if outcome == "local-expire":
+                            clock.now = 1002.1
+                            cache.check_hicache_events()
+                            assert cache.check_prefetch_progress(handle)
+
+                assert not cache.linker.store_prefetches
+                assert req.rid in backend.canceled_rids
+                cache._all_reduce_attn_groups = lambda value, op: None
+                req.init_next_round_input(cache)
+                assert req.prefix_len == 2 and req.host_hit_length == 2
+                assert cache.linker.load_back(req)[0] == 2
+                assert allocator.full_attn_allocator.available_size() == 28
+                cache.sanity_check()
+
+    def test_abort_requeue_and_reset_cleanup_pending_store_prefetch(self):
+        cache, backend, old, _ = self._fixture(policy="wait_complete")
+        backend.status_by_rid[old.rid] = PrefetchStatus.PENDING
+        self._enqueue(cache, old)
+        assert cache.linker.has_pending_prefetches()
+
+        # New attempt for the same rid cancels the older handle.
+        retried = self._request(rid=old.rid, attempt=1)
+        self._enqueue(cache, retried)
+        assert list(cache.linker.store_prefetches) == [retried.cache_request_handle]
+        assert cache.check_prefetch_progress(old.cache_request_handle)
+        assert not cache.check_prefetch_progress(retried.cache_request_handle)
+
+        other = self._request(rid="other", start=11)
+        backend.status_by_rid[other.rid] = PrefetchStatus.PENDING
+        self._enqueue(cache, other)
+        cache.linker.release_request(retried.cache_request_handle)
+        assert cache.check_prefetch_progress(retried.cache_request_handle)
+        assert cache.linker.has_pending_prefetches()
+
+        cache.reset()
+        assert not cache.linker.has_pending_prefetches()
+        assert other.rid in backend.canceled_rids
+
+
 def test_cache_linker_attachment_is_backend_independent():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.tree_core = SimpleNamespace(
@@ -817,7 +1073,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     def _clone_transfers(cls, transfers):
         return [cls._clone_transfer(transfer) for transfer in transfers]
 
-    def lookup(self, rid, transfers):
+    def lookup(self, rid, transfers, prefetch=False):
         transfers = self._clone_transfers(transfers)
         self.lookup_calls.append((rid, transfers))
         by_pool = {transfer.name: transfer for transfer in transfers}

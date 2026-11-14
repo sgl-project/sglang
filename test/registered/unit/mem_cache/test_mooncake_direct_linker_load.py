@@ -6,12 +6,23 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from unittest.mock import patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
+    PrefetchStatus,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -231,6 +242,193 @@ class TestGroupedLoad(CustomTestCase):
         last_get = max(t for kind, t in store.events if kind == "get")
         first_end = min(t for kind, t in store.events if kind == "end")
         self.assertGreater(first_end, last_get)
+
+
+class _FakeReplicaDesc:
+    def __init__(self, *, memory: bool, status: int = 3):
+        self._memory = memory
+        self.status = status
+
+    def is_memory_replica(self) -> bool:
+        return self._memory
+
+
+class TestMooncakeStoreMemoryPrefetch(CustomTestCase):
+    COMPLETE = 3
+    PROCESSING = 2
+    FAILED = 5
+
+    def _make_linker_with_storage(self, replicas_by_key, *, exist_options_cls=None):
+        import torch
+
+        calls = {"exist": [], "replicas": []}
+
+        class _StoreClient:
+            def batch_is_exist(self, keys, *args):
+                calls["exist"].append((list(keys), args))
+                return [1] * len(keys)
+
+            def batch_get_replica_desc(self, keys):
+                calls["replicas"].append(list(keys))
+                return {k: replicas_by_key[k] for k in keys if k in replicas_by_key}
+
+        storage = MooncakeStore.__new__(MooncakeStore)
+        storage.store = _StoreClient()
+        storage.config_prefix = "model"
+        storage.mla_suffix = "tp0_cp0_pp0"
+        storage.mha_suffix = "tp0_cp0_pp0"
+        storage._replica_complete_status = self.COMPLETE
+        storage._replica_terminal_statuses = (self.FAILED,)
+        if exist_options_cls is not None:
+            opts = exist_options_cls()
+            opts.prefetch_to_memory = True
+            storage._prefetch_exist_options = opts
+
+        kv_pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((8, 4), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=1,
+            rows_are_pages=False,
+        )
+        swa_pool = DevicePoolEntry(
+            name=PoolName.SWA,
+            indices_from_pool=PoolName.SWA,
+            device_pool=None,
+            components=[[torch.zeros((8, 4), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=1,
+            rows_are_pages=False,
+        )
+        pool_group = DevicePoolGroup([kv_pool, swa_pool], num_layers=1, page_size=1)
+        storage.mem_pool_host = pool_group
+        storage.registered_pools = pool_group.entry_map
+
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.load_mode = "layer_wise"
+        linker.pool_group = pool_group
+        linker.pools = pool_group.entry_map
+        linker.storage = storage
+        linker.pending_loads = {}
+        linker.pending_prefetches = {}
+        linker.broadcast_loads = {}
+        linker.stats = {"lookup": 0, "load": 0, "offload": 0}
+        return linker, calls
+
+    def test_lookup_prefetch_passes_exist_options_and_prunes_promoted_keys(self):
+        """Subsequent readiness polls must query only keys not yet in COMPLETE MEMORY."""
+
+        class _ExistOptions:
+            def __init__(self):
+                self.prefetch_to_memory = False
+
+        k0 = "model_p0_tp0_cp0_pp0_k"
+        k1 = "model_p1_tp0_cp0_pp0_k"
+        k2 = "model_p2_tp0_cp0_pp0_k"
+        s1 = "model_p1_tp0_cp0_pp0_swa"
+        s2 = "model_p2_tp0_cp0_pp0_swa"
+        replicas = {
+            k0: [_FakeReplicaDesc(memory=True, status=self.COMPLETE)],
+            k1: [
+                _FakeReplicaDesc(memory=False, status=self.COMPLETE),
+                _FakeReplicaDesc(memory=True, status=self.PROCESSING),
+            ],
+            k2: [_FakeReplicaDesc(memory=False, status=self.COMPLETE)],
+            s1: [_FakeReplicaDesc(memory=True, status=self.COMPLETE)],
+            s2: [_FakeReplicaDesc(memory=False, status=self.COMPLETE)],
+        }
+        linker, calls = self._make_linker_with_storage(
+            replicas, exist_options_cls=_ExistOptions
+        )
+        transfers = [
+            PoolTransfer(name=PoolName.KV, keys=["p0", "p1", "p2"]),
+            PoolTransfer(
+                name=PoolName.SWA,
+                keys=["p2"],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            ),
+        ]
+        # Restrict restorable boundary to 2 pages so p2 keys are not tracked,
+        # and trailing SWA window of 1 page selects only p1 (s1), not p0.
+        with patch.object(
+            linker.storage,
+            "batch_exists_v2",
+            wraps=linker.storage.batch_exists_v2,
+        ):
+            orig_exist = linker.storage._batch_exist
+            linker.storage._batch_exist = lambda keys, prefetch_to_memory=False: [
+                0 if key.startswith("model_p2_") else r
+                for key, r in zip(
+                    keys, orig_exist(keys, prefetch_to_memory=prefetch_to_memory)
+                )
+            ]
+            restorable = linker.lookup("r1", transfers, prefetch=True)
+
+        self.assertEqual(restorable, [1, 2])
+        self.assertEqual(len(calls["exist"]), 1)
+        _, exist_args = calls["exist"][0]
+        self.assertEqual(len(exist_args), 1)
+        self.assertTrue(exist_args[0].prefetch_to_memory)
+        # Tracked keys at 2-page boundary: KV [k0, k1] + trailing SWA [s1].
+        self.assertEqual(linker.pending_prefetches["r1"], [k0, k1, s1])
+
+        # Poll 1: k0 and s1 are COMPLETE MEMORY -> pruned; k1 is PROCESSING -> kept.
+        self.assertEqual(linker.prefetch_status("r1"), PrefetchStatus.PENDING)
+        self.assertEqual(calls["replicas"][-1], [k0, k1, s1])
+        self.assertEqual(linker.pending_prefetches["r1"], [k1])
+
+        # Poll 2: queries ONLY k1; once k1 becomes COMPLETE MEMORY, rid retires.
+        replicas[k1] = [_FakeReplicaDesc(memory=True, status=self.COMPLETE)]
+        self.assertEqual(linker.prefetch_status("r1"), PrefetchStatus.READY)
+        self.assertEqual(calls["replicas"][-1], [k1])
+        self.assertNotIn("r1", linker.pending_prefetches)
+
+        # Non-prefetch lookup does not pass ExistOptions or record pending_prefetches.
+        linker.lookup("r2", transfers, prefetch=False)
+        self.assertEqual(calls["exist"][-1][1], ())
+        self.assertNotIn("r2", linker.pending_prefetches)
+
+    def test_evicted_or_failed_replicas_do_not_block_and_lifecycle_cleans_up(self):
+        """Evicted or terminal-failed keys must report READY instead of stalling admission."""
+        k0 = "model_p0_tp0_cp0_pp0_k"
+        k1 = "model_p1_tp0_cp0_pp0_k"
+        replicas = {
+            k0: [],
+            k1: [_FakeReplicaDesc(memory=False, status=self.FAILED)],
+        }
+        linker, _ = self._make_linker_with_storage(replicas)
+        linker.storage.batch_exists_v2 = (
+            lambda keys, expanded, prefetch_to_memory=False: PoolTransferResult(
+                2, {PoolName.KV: 2}, [1, 2]
+            )
+        )
+        transfers = [
+            PoolTransfer(name=PoolName.KV, keys=["p0", "p1"]),
+            PoolTransfer(
+                name=PoolName.SWA, keys=["p1"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+            ),
+        ]
+        linker.lookup("missing", transfers, prefetch=True)
+        self.assertEqual(linker.prefetch_status("missing"), PrefetchStatus.READY)
+        self.assertEqual(linker.pending_prefetches, {})
+
+        # Active pending key is cleared by load(), cancel_prefetch(), and reset().
+        replicas[k0] = [_FakeReplicaDesc(memory=False, status=self.COMPLETE)]
+        linker.lookup("load-rid", transfers, prefetch=True)
+        self.assertEqual(linker.prefetch_status("load-rid"), PrefetchStatus.PENDING)
+        self.assertTrue(
+            linker.load(
+                "load-rid",
+                [PoolTransfer(name=PoolName.KV, keys=["p0"], device_indices=None)],
+            )
+        )
+        self.assertNotIn("load-rid", linker.pending_prefetches)
+
+        linker.lookup("cancel-rid", transfers, prefetch=True)
+        linker.cancel_prefetch("cancel-rid")
+        self.assertEqual(linker.prefetch_status("cancel-rid"), PrefetchStatus.READY)
 
 
 if __name__ == "__main__":

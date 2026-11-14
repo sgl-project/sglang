@@ -5970,7 +5970,7 @@ class Scheduler(
                 or self.deferred_responses.has_pending()
                 or (
                     self.enable_unified_cache_external_linker
-                    and self.tree_cache.linker.prefetches
+                    and self.tree_cache.linker.has_pending_prefetches()
                 )
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
@@ -6094,7 +6094,7 @@ class Scheduler(
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
             if self.enable_unified_cache_external_linker:
-                idle &= not self.tree_cache.linker.prefetches
+                idle &= not self.tree_cache.linker.has_pending_prefetches()
 
         return idle
 
