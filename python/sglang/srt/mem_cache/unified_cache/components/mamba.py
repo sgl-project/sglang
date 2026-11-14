@@ -1107,9 +1107,15 @@ class MambaComponent(TreeComponent):
                         self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                     )
                     src_slot = req.kv.mamba_ping_pong_track_buffer[keep_idx]
+                    empty = (
+                        req.kv.mamba_ping_pong_empty[keep_idx]
+                        if envs.SGLANG_OPT_MAMBA_CHECKPOINT_HOST_EMPTY_FLAG.get()
+                        else int(src_slot.reshape(-1)[0].item()) < 0
+                    )
                 else:
                     src_slot = req.kv.mamba_pool_idx
-                if int(src_slot.reshape(-1)[0].item()) < 0:
+                    empty = int(src_slot.reshape(-1)[0].item()) < 0
+                if empty:
                     return 0
                 self._stash_host_checkpoint_source(
                     insert_params, src_slot, is_finished=False

@@ -301,6 +301,9 @@ class Envs:
     SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Host-only Mamba checkpoint: read a running request's empty tracking slot from the
+    # host flag, not the device tensor. Opt-in.
+    SGLANG_OPT_MAMBA_CHECKPOINT_HOST_EMPTY_FLAG = EnvRuntimeBool(False)
     # EAGLE draft extend top-1 by the sampler's argmax (same token unless NaN).
     SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
