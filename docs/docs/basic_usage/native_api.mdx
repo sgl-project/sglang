@@ -259,7 +259,7 @@ Parameters:
 - `item_first`: Whether items come first in concatenation order (default: False)
 - `model`: Model name
 
-`query` and `items` also accept token ids, with `query` set to `[]` when each item is a complete prompt. `label_token_ids` can be one list per item. `temperature` divides the label logits before the softmax and needs `apply_softmax`, and `return_token_logprobs` adds `token_logprobs`, the full-vocabulary log-probabilities of the labels.
+`query` and `items` also accept token ids, with `query` set to `[]` when each item is a complete prompt. `label_token_ids` can be one list per item. `temperature` divides the label logits before the softmax and needs `apply_softmax`, and `return_token_logprobs` adds `token_logprobs`, the full-vocabulary log-probabilities of the labels, shaped like `scores`.
 
 The response contains `scores` - a list of probability lists, one per item, each in the order of `label_token_ids`.
 
