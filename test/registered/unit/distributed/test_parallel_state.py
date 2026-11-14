@@ -461,7 +461,8 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
-def test_dcp_disables_quick_allreduce_without_changing_tp_default():
+@pytest.mark.parametrize("combined_cp", [False, True])
+def test_dcp_groups_and_quick_allreduce_policy(combined_cp):
     world_size = 8
 
     with (
@@ -482,10 +483,12 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
         ),
     ):
         created_group_kwargs = {}
+        created_group_ranks = {}
 
         def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
             group_name = kwargs.get("group_name", "unknown")
             created_group_kwargs[group_name] = kwargs
+            created_group_ranks[group_name] = group_ranks
 
             mock_group = Mock()
             mock_group.device_group = Mock()
@@ -504,11 +507,23 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             mock_world.local_rank = 0
             mock_world_group.return_value = mock_world
 
-            publish_build_topology(tp_size=8, pp_size=1, dcp_size=8)
+            publish_build_topology(
+                tp_size=8,
+                pp_size=1,
+                attn_cp_size=2 if combined_cp else 1,
+                dcp_size=2,
+                enable_prefill_cp=combined_cp,
+                cp_strategy="zigzag" if combined_cp else None,
+            )
             parallel_state.initialize_model_parallel()
 
             assert created_group_kwargs["dcp"]["use_quick_allreduce"] is False
             assert "use_quick_allreduce" not in created_group_kwargs["tp"]
+            if combined_cp:
+                assert created_group_ranks["dcp"] == [[0, 4], [1, 5], [2, 6], [3, 7]]
+                assert created_group_ranks["dcp"] == created_group_ranks["attn_cp"]
+            else:
+                assert created_group_ranks["dcp"] == [[0, 1], [2, 3], [4, 5], [6, 7]]
 
             parallel_state.destroy_model_parallel()
 

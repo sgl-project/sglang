@@ -2259,10 +2259,10 @@ class DeepseekV2AttentionMLA(
             attn_type=attn_type,
             prefix=add_prefix("attn_mqa", prefix),
         )
-        # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if self.dcp_size > 1:
+            head_shards = 1 if get_parallel().dcp_over_attn_cp else self.dcp_size
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * self.dcp_size,
+                self.num_local_heads * head_shards,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,

@@ -256,7 +256,9 @@ class EagerRunner(BaseRunner):
 
         cp_active = is_cp_active(forward_batch)
         if cp_active:
-            prepare_cp_forward(forward_batch)
+            # The FFN boundary reduce-scatters each combined CP+DCP shard over attention TP.
+            attn_tp_size = self.attn_tp_size if get_parallel().dcp_over_attn_cp else 1
+            prepare_cp_forward(forward_batch, attn_tp_size=attn_tp_size)
 
         # Target verify can arrive with ``forward_metadata_ready`` set by an
         # upstream/speculative planning step.  That mark does not initialize
@@ -271,6 +273,7 @@ class EagerRunner(BaseRunner):
         ):
             if (
                 get_parallel().attn_dcp_size > 1
+                and not get_parallel().dcp_over_attn_cp
                 and hasattr(
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )

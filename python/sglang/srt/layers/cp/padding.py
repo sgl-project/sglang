@@ -14,6 +14,7 @@
 
 """Padding helpers shared by context-parallel strategies."""
 
+from math import lcm
 from typing import Any
 
 import torch
@@ -31,10 +32,10 @@ def get_cp_padding_align_size() -> int:
     return attn_cp_size
 
 
-def pad_logical_token_to_physical(metadata: Any) -> None:
+def pad_logical_token_to_physical(metadata: Any, *, attn_tp_size: int = 1) -> None:
     """Align each CP rank's physical token count for CP collectives."""
     logical_tokens = list(metadata.per_rank_actual_token)
-    align_size = get_cp_padding_align_size()
+    align_size = lcm(get_cp_padding_align_size(), attn_tp_size)
     physical_rank_len = (
         (max(logical_tokens) + align_size - 1) // align_size * align_size
     )

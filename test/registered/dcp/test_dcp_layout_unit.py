@@ -33,6 +33,7 @@ from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
+from sglang.srt.layers.dcp.prefill import DcpPrefillWorkspace
 from sglang.srt.layers.linear import QKVParallelLinear, ReplicatedParallelGroup
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -50,6 +51,44 @@ STARTS = [0, 1, 2, 5, 7, 13, 31]
 def _owner_count(length: int, n: int, rank: int, start: int) -> int:
     """Ground truth: # of absolute positions p in [start, start+length) with p % n == rank."""
     return sum(1 for p in range(start, start + length) if p % n == rank)
+
+
+class TestDcpPrefillWorkspace(CustomTestCase):
+    def test_gather_restores_chronological_prefix(self):
+        values = torch.arange(38, dtype=torch.bfloat16).view(19, 1, 2)
+        world_size = 3
+        workspace = DcpPrefillWorkspace(
+            context_len=len(values),
+            page_size=8,
+            dcp_size=world_size,
+            kv_dim=2,
+            dtype=values.dtype,
+            device="cpu",
+        )
+        for prefix_len in (1, 2, 17, 19):
+            shard_len = math.ceil(prefix_len / world_size)
+            shards = values.new_zeros((world_size, shard_len, 1, 2))
+            for rank in range(world_size):
+                expected_local = values[rank:prefix_len:world_size]
+                shards[rank, : len(expected_local)] = expected_local
+
+            for rank in range(world_size):
+                # Recycled physical rows need not be in sequence order.
+                local_values = values[rank:prefix_len:world_size]
+                rows = torch.arange(len(local_values) - 1, -1, -1)
+                cache = local_values.flip(0)
+
+                def all_gather(output, local):
+                    self.assertTrue(torch.equal(local, shards[rank]))
+                    output.copy_(shards.flatten(0, 1))
+
+                group = SimpleNamespace(
+                    world_size=world_size, all_gather_into_tensor=all_gather
+                )
+                workspace.gather_prefix(cache, rows, prefix_len, group)
+                self.assertTrue(
+                    torch.equal(workspace.kv[:prefix_len], values[:prefix_len])
+                )
 
 
 class TestFilterDcpLocalChunkKvIndices(CustomTestCase):

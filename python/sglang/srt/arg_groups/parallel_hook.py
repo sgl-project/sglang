@@ -11,9 +11,11 @@ from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
 from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
     model_config_of,
     resolved_view,
     resolving_view,
+    use_mla_backend,
 )
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
@@ -30,6 +32,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
+    dcp_over_attn_cp_of,
     derive_attn_tp_size,
     get_platform,
 )
@@ -263,8 +266,8 @@ def handle_decode_context_parallelism(server_args: Any):
             "--decode-context-parallel-size) must be >= 1, but got "
             f"dcp_size={cfg.dcp_size}."
         )
-    if cfg.dcp_size > 1 and cfg.enable_prefill_cp:
-        raise ValueError("--dcp-size > 1 does not support --enable-prefill-cp.")
+    if cfg.dcp_comm_backend == "ag_ar" and not dcp_over_attn_cp_of(cfg):
+        raise ValueError("--dcp-comm-backend ag_ar requires prefill CP and DCP.")
     if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "
@@ -288,6 +291,80 @@ def handle_decode_context_parallelism(server_args: Any):
                 "communication backend (it removes the head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
+
+
+def handle_combined_context_parallelism(server_args: Any):
+    cfg = resolving_view(server_args)
+    if not dcp_over_attn_cp_of(cfg):
+        return
+
+    platform = get_platform()
+    if not (
+        (platform.is_sm90 or platform.is_sm100)
+        and cfg.nnodes == cfg.pp_size == cfg.dp_size == cfg.attn_dp_size == 1
+        and cfg.attn_cp_size == cfg.dcp_size
+        and cfg.tp_size % cfg.dcp_size == 0
+    ):
+        raise ValueError(
+            "Combined prefill CP and DCP requires single-node SM90 or SM100, "
+            "PP1, DP1, and --dcp-size = --attn-cp-size dividing --tp-size."
+        )
+    prefill_backend = "fa4" if platform.is_sm100 else "fa3"
+    model_config = model_config_of(server_args)
+    model_arch = model_config.hf_config.architectures[0]
+    if (
+        model_arch not in ("DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM")
+        or cfg.model_impl not in ("auto", "sglang")
+        or not use_mla_backend(server_args)
+        or attention_backends_of(cfg) != (prefill_backend, "flashinfer")
+        or cfg.kv_cache_dtype not in ("bf16", "bfloat16")
+        or cfg.dcp_comm_backend != "ag_ar"
+    ):
+        raise ValueError(
+            "Combined prefill CP and DCP requires native DeepSeek dense MLA "
+            f"with --prefill-attention-backend {prefill_backend}, "
+            "--decode-attention-backend flashinfer, BF16 KV cache, and "
+            "--dcp-comm-backend ag_ar (the default for this combination)."
+        )
+    if prefill_backend == "fa4" and (
+        model_config.kv_lora_rank != 512 or model_config.qk_rope_head_dim != 64
+    ):
+        raise ValueError(
+            "Combined prefill CP and DCP with FA4 requires an MLA KV latent "
+            "dimension of 512 and RoPE head dimension of 64."
+        )
+
+    unsupported = {
+        "--cp-kv-layout": cfg.cp_kv_layout is not None,
+        "--enable-kv-cache-sharding": cfg.enable_kv_cache_sharding,
+        "--enable-cp-decode-attn-tp": cfg.enable_cp_decode_attn_tp,
+        "--enable-unified-memory": cfg.enable_unified_memory,
+        "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        "--enable-lmcache": cfg.enable_lmcache,
+        "--enable-hisparse": cfg.enable_hisparse,
+        "--enable-mixed-chunk": cfg.enable_mixed_chunk,
+        "--enable-two-batch-overlap": cfg.enable_two_batch_overlap,
+        "--enable-single-batch-overlap": cfg.enable_single_batch_overlap,
+        "--speculative-algorithm": cfg.speculative_algorithm is not None,
+        "--disaggregation-mode": cfg.disaggregation_mode != "null",
+        "--prefill-max-requests": cfg.prefill_max_requests not in (None, 1),
+        "--enable-torch-compile": cfg.enable_torch_compile,
+    }
+    if invalid := [name for name, enabled in unsupported.items() if enabled]:
+        raise ValueError(
+            f"Combined prefill CP and DCP is incompatible with {', '.join(invalid)}."
+        )
+
+    graph_config = with_phase(
+        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+    )
+    graph_config = with_phase(graph_config, Phase.DECODE, backend=Backend.DISABLED)
+    declare_resolution(
+        server_args,
+        "handle_combined_context_parallelism",
+        prefill_max_requests=1,
+        cuda_graph_config=graph_config,
+    )
 
 
 def handle_data_parallelism(server_args: Any):

@@ -91,6 +91,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
+from sglang.srt.layers.dcp.prefill import DcpPrefillWorkspace
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_gathered_buffer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
@@ -1013,6 +1014,21 @@ class ModelRunner:
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
+
+        parallel = get_parallel()
+        if parallel.dcp_over_attn_cp:
+            # Allocate before profiling the persistent KV pool so the workspace
+            # is charged to its memory budget. Prefill admission allows one request.
+            self.dcp_prefill_workspace = DcpPrefillWorkspace(
+                context_len=self.model_config.context_len,
+                page_size=self.page_size,
+                dcp_size=parallel.attn_dcp_size,
+                kv_dim=(
+                    self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim
+                ),
+                dtype=self.kv_cache_dtype,
+                device=self.device,
+            )
 
         self.init_kv_cache_configurator(draft_parallel_layout)
         expert_slots = None

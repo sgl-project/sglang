@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.environ import envs
@@ -78,6 +79,7 @@ if is_flashinfer_available():
 @dataclass
 class DecodeMetadata:
     decode_wrapper: BatchMLAPagedAttentionWrapper
+    local_kv_lens: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -463,7 +465,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 req_pool_indices=forward_batch.req_pool_indices,
                 plan=forward_batch.iteration_ids,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrapper)
+            local_kv_lens = None
+            if get_parallel().dcp_over_attn_cp:
+                bs = forward_batch.batch_size
+                local_kv_lens = self.kv_indptr[1 : bs + 1] - self.kv_indptr[:bs]
+            self.forward_metadata = DecodeMetadata(self.decode_wrapper, local_kv_lens)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -872,6 +878,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
         if isinstance(o, tuple):
             out, lse = o
+            if (local_kv_lens := self.forward_metadata.local_kv_lens) is not None:
+                fixup_zero_kv_rows(
+                    out,
+                    lse,
+                    local_kv_lens,
+                    self.q_indptr_decode[: local_kv_lens.numel() + 1],
+                    1,
+                )
             out = out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             return (out, lse)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -880,10 +894,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
+        parallel = get_parallel()
+        head_shards = 1 if parallel.dcp_over_attn_cp else parallel.attn_dcp_size
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads
-            // get_parallel().attn_tp_size
-            * get_parallel().attn_dcp_size
+            // parallel.attn_tp_size
+            * head_shards
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim

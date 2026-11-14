@@ -212,6 +212,10 @@ def attn_dcp_size_of(cfg: Any):
     return parallel_widths_of(cfg)["attn_dcp_size"]
 
 
+def dcp_over_attn_cp_of(cfg: Any) -> bool:
+    return cfg.enable_prefill_cp and cfg.dcp_size > 1
+
+
 def moe_ep_size_of(cfg: Any):
     """`moe_ep_size`, computed at publish. See `parallel_widths_of`."""
     return parallel_widths_of(cfg)["moe_ep_size"]
@@ -1606,9 +1610,12 @@ def _configure_context(
         placement["dp_rank"] = ranks.dp_rank
         placement["launch_world_rank"] = ranks.world_rank
         placement.update(_attention_ranks(parallel, placement["tp_rank"]))
-        # DCP groups are contiguous slices of a TP group.
         if parallel.dcp_enabled:
-            placement["dcp_rank"] = placement["tp_rank"] % parallel.dcp_size
+            placement["dcp_rank"] = (
+                placement["attn_cp_rank"]
+                if parallel.dcp_over_attn_cp
+                else placement["tp_rank"] % parallel.dcp_size
+            )
         placement["attn_dcp_rank"] = placement.get("dcp_rank", 0)
         parallel.override_permanently(**placement)
         _validate_parallel(parallel, "publish")

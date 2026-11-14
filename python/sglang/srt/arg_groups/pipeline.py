@@ -167,6 +167,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_prefill_only_disable_kv_cache_args,
     )
     from sglang.srt.arg_groups.parallel_hook import (
+        handle_combined_context_parallelism,
         handle_context_parallelism,
         handle_data_parallelism,
         handle_decode_context_parallelism,
@@ -385,6 +386,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_kv_cache_sharding, server_args)
 
     # Validate after all batch-size declarations are visible.
+    run_hook(handle_combined_context_parallelism, server_args)
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
 

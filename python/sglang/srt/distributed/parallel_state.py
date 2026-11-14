@@ -2710,16 +2710,39 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
-    # Build decode context-parallel groups inside each TP group only when DCP is enabled.
+    attn_dp_size = attention_data_parallel_size
+    attn_cp_size = attention_context_model_parallel_size
+    # Build the CP and attention TP groups at the same widths we publish.
+    derived_widths = derive_parallel_widths(
+        tp_size=tensor_model_parallel_size,
+        attn_cp_size=attn_cp_size,
+        attn_dp_size=attn_dp_size,
+        moe_ep_size=expert_model_parallel_size,
+        moe_dp_size=moe_data_model_parallel_size,
+        dcp_size=decode_context_parallel_size,
+        dcp_enabled=decode_context_parallel_size > 1,
+    )
+    attn_tp_size = derived_widths["attn_tp_size"]
+    attn_replica_size = attn_cp_size * attn_tp_size
+    attn_cp_group_ranks = [
+        tp_group[start + lane : start + attn_replica_size : attn_tp_size]
+        for tp_group in group_ranks
+        for start in range(0, len(tp_group), attn_replica_size)
+        for lane in range(attn_tp_size)
+    ]
+
+    # DCP reuses the CP axis in combined mode and slices TP otherwise.
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
     if decode_context_parallel_size > 1:
-        dcp_group_ranks = []
-        for tp_group in group_ranks:
-            for start in range(0, len(tp_group), decode_context_parallel_size):
-                dcp_group_ranks.append(
-                    tp_group[start : start + decode_context_parallel_size]
-                )
+        if parallel.dcp_over_attn_cp:
+            dcp_group_ranks = attn_cp_group_ranks
+        else:
+            dcp_group_ranks = [
+                tp_group[start : start + decode_context_parallel_size]
+                for tp_group in group_ranks
+                for start in range(0, len(tp_group), decode_context_parallel_size)
+            ]
         _DCP = init_model_parallel_group(
             dcp_group_ranks,
             get_world_group().local_rank,
@@ -2739,21 +2762,6 @@ def initialize_model_parallel(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
 
-    attn_dp_size = attention_data_parallel_size
-    attn_cp_size = attention_context_model_parallel_size
-    # The groups below are built at these numbers, and the same dict is stamped
-    # once they exist.
-    derived_widths = derive_parallel_widths(
-        tp_size=tensor_model_parallel_size,
-        attn_cp_size=attn_cp_size,
-        attn_dp_size=attn_dp_size,
-        moe_ep_size=expert_model_parallel_size,
-        moe_dp_size=moe_data_model_parallel_size,
-        dcp_size=decode_context_parallel_size,
-        dcp_enabled=_DCP is not None,
-    )
-    attn_tp_size = derived_widths["attn_tp_size"]
-
     global _ATTN_CP
     assert _ATTN_CP is None, (
         "attention context model parallel group is already initialized"
@@ -2761,24 +2769,8 @@ def initialize_model_parallel(
     if attn_cp_size == tensor_model_parallel_size:
         _ATTN_CP = _TP
     else:
-        group_ranks = []
-        for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for dp_idx in range(attn_dp_size):
-                for attn_tp_idx in range(attn_tp_size):
-                    st = (
-                        tp_group_idx * tensor_model_parallel_size
-                        + dp_idx * attn_tp_size * attn_cp_size
-                        + attn_tp_idx
-                    )
-                    en = (
-                        tp_group_idx * tensor_model_parallel_size
-                        + (dp_idx + 1) * attn_tp_size * attn_cp_size
-                        + attn_tp_idx
-                    )
-                    ranks = list(range(st, en, attn_tp_size))
-                    group_ranks.append(ranks)
         _ATTN_CP = init_model_parallel_group(
-            group_ranks,
+            attn_cp_group_ranks,
             get_world_group().local_rank,
             backend,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),

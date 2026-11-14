@@ -629,6 +629,24 @@ class TestCPZigzagStrategy(CustomTestCase):
                 )
             )
 
+    def test_combined_cp_padding_allows_equal_attention_tp_slices(self):
+        init_cp_strategy(enable_prefill_cp=True, cp_size=2, cp_strategy="zigzag")
+        batch = SimpleNamespace(
+            input_ids=torch.arange(13),
+            forward_mode=_ExtendMode(),
+            seq_lens_cpu=[13],
+            extend_seq_lens_cpu=[13],
+            attn_cp_metadata=None,
+        )
+        with get_parallel().override(
+            attn_cp_size=2, attn_cp_rank=0, enable_cp_tp_group_sharing=False
+        ):
+            prepare_cp_forward(batch, attn_tp_size=3)
+
+        metadata = batch.attn_cp_metadata
+        self.assertEqual(metadata.per_rank_logical_token, [7, 6])
+        self.assertEqual(metadata.per_rank_actual_token, [12, 12])
+
     def test_zigzag_materialize_full_kv_gathers_once_and_preserves_swa_location(self):
         key = torch.arange(6).view(3, 2)
         value = torch.arange(9).view(3, 3) + 10

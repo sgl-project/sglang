@@ -94,6 +94,8 @@ def cp_lse_ag_out_rs_mla(
     cp_group: GroupCoordinator,
     ctx: Optional[CPTritonContext] = None,
     is_lse_base_on_e: bool = False,
+    *,
+    replicated_heads: bool = False,
 ):
     """Merge DCP partial attention outputs with the LSE's actual log base.
 
@@ -103,6 +105,8 @@ def cp_lse_ag_out_rs_mla(
     FlashInfer MLA returns base-2 LSE, while FlashMLA returns natural-log LSE.
     The correction kernel must use the matching exp/log pair or it computes
     incorrect cross-rank softmax weights.
+
+    With replicated heads, return all corrected heads on every rank.
     """
     if cp_group.world_size == 1:
         return cp_attn_out
@@ -117,6 +121,14 @@ def cp_lse_ag_out_rs_mla(
         )
         cp_attn_lse = cp_attn_lse.to(torch.float32)
     lses = _ag_lse(cp_attn_lse, cp_group)
+    if replicated_heads:
+        # Triton loads the rank axis with a power-of-two arange.
+        ranks = cp_group.world_size
+        padding = (1 << (ranks - 1).bit_length()) - ranks
+        if padding:
+            lses = torch.nn.functional.pad(
+                lses, (0, 0, 0, 0, 0, padding), value=float("-inf")
+            )
     out, _ = correct_attn_out(
         cp_attn_out,
         lses,
@@ -125,7 +137,10 @@ def cp_lse_ag_out_rs_mla(
         new_output,
         is_lse_base_on_e=is_lse_base_on_e,
     )
-    out = cp_group.reduce_scatter_along_dim(out, dim=0)
+    if replicated_heads:
+        out = cp_group.all_reduce(out)
+    else:
+        out = cp_group.reduce_scatter_along_dim(out, dim=0)
     return out.to(cp_attn_out.dtype)
 
 

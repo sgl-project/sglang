@@ -1631,6 +1631,8 @@ def _dcp_comm_backend_default(view: Any) -> dict:
         return {}
     if view.dcp_size <= 1:
         return {"dcp_comm_backend": "ag_rs"}
+    if view.enable_prefill_cp:
+        return {"dcp_comm_backend": "ag_ar"}
     platform = get_platform()
     if is_fi_a2a_supported(
         dcp_size=view.dcp_size,
