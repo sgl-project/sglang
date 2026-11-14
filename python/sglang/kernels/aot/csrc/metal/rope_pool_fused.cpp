@@ -3,12 +3,15 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 
 #include "mlx/allocator.h"
 #include "mlx/array.h"
@@ -237,26 +240,18 @@ class RopePoolFused : public Primitive {
 };
 
 // Python entry: returns 4 arrays (q_rot, k_rot, k_pool_new, v_pool_new).
-nb::tuple rope_pool_fused_py(
-    nb::handle q_h,
-    nb::handle k_h,
-    nb::handle v_h,
-    nb::handle positions_h,
-    nb::handle slots_h,
-    nb::handle k_pool_h,
-    nb::handle v_pool_h,
+std::tuple<array, array, array, array> rope_pool_fused_py(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& positions,
+    const array& slots,
+    const array& k_pool,
+    const array& v_pool,
     int head_dim,
     int num_qo_heads,
     int num_kv_heads,
     float rope_base) {
-  auto& q = *nb::inst_ptr<array>(q_h);
-  auto& k = *nb::inst_ptr<array>(k_h);
-  auto& v = *nb::inst_ptr<array>(v_h);
-  auto& positions = *nb::inst_ptr<array>(positions_h);
-  auto& slots = *nb::inst_ptr<array>(slots_h);
-  auto& k_pool = *nb::inst_ptr<array>(k_pool_h);
-  auto& v_pool = *nb::inst_ptr<array>(v_pool_h);
-
   if (q.ndim() != 3 || k.ndim() != 3 || v.ndim() != 3) throw std::runtime_error("rope_pool_fused: q/k/v must be 3-D");
   if (positions.ndim() != 1 || slots.ndim() != 1)
     throw std::runtime_error("rope_pool_fused: positions/slots must be 1-D");
@@ -289,19 +284,7 @@ nb::tuple rope_pool_fused_py(
       primitive,
       {q, k, v, positions, slots, k_pool, v_pool});
 
-  // Cross-module nb cast doesn't work cleanly - explicitly construct.
-  nb::module_ mx_core = nb::module_::import_("mlx.core");
-  nb::object py_array_type = mx_core.attr("array");
-
-  nb::list result;
-  for (auto& a : outs) {
-    nb::object py_obj = py_array_type(0);
-    auto* dst = nb::inst_ptr<array>(py_obj);
-    new (dst) array(std::move(a));
-    nb::inst_mark_ready(py_obj);
-    result.append(py_obj);
-  }
-  return nb::tuple(result);
+  return {std::move(outs[0]), std::move(outs[1]), std::move(outs[2]), std::move(outs[3])};
 }
 
 }  // namespace
