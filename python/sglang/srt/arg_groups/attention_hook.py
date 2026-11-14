@@ -537,6 +537,38 @@ def handle_linear_attn_backend(server_args: Any):
                 cfg.mamba_ssm_dtype,
             )
 
+    if get_platform().is_npu:
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        model_config = model_config_of(server_args)
+        hf_config = getattr(model_config, "hf_config", None)
+        has_gdn = (
+            hf_config is not None
+            and hasattr(hf_config, "get_text_config")
+            and hybrid_gdn_config(model_config) is not None
+        )
+        if has_gdn and not is_npu_arch35():
+            effective_dtype = resolved_view(server_args).mamba_ssm_dtype
+            if effective_dtype is None:
+                logger.info(
+                    "Ascend NPU (non-arch35) detected with a GDN model; "
+                    "defaulting --mamba-ssm-dtype to bfloat16 (FP32 initial_state "
+                    "is only supported on Ascend950 / arch35)."
+                )
+                declare_resolution(
+                    server_args,
+                    "_handle_linear_attn_backend",
+                    mamba_ssm_dtype="bfloat16",
+                )
+            elif effective_dtype != "bfloat16":
+                raise ValueError(
+                    "GDN models on Ascend NPU (non-arch35, e.g. 910B) require "
+                    "--mamba-ssm-dtype bfloat16 (FP32 initial_state is only "
+                    "supported on Ascend950 / arch35), "
+                    f"got {effective_dtype!r}."
+                )
+
 
 def handle_multi_item_scoring(server_args: Any):
     """Setup and validate multi-item scoring constraints.
