@@ -154,6 +154,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
+        # Names of the layers that matched no target; a dict to dedupe in order.
+        self._untargeted_layers: Dict[Optional[str], None] = {}
 
     @property
     def kv_cache_quant_algo(self) -> Optional[str]:
@@ -1023,7 +1025,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
         ]
         # TODO: refactor this to use expert_mapping and check all layer numbers
-        all_scheme_dicts = [self.get_scheme_dict(layer, name) for name in unfused_names]
+        all_scheme_dicts = [
+            self.get_scheme_dict(layer, name, report_as=layer_name)
+            for name in unfused_names
+        ]
         scheme_dict = all_scheme_dicts[0] if all_scheme_dicts else None
 
         # multiple schemes found
@@ -1289,9 +1294,13 @@ class CompressedTensorsConfig(QuantizationConfig):
         layer: torch.nn.Module,
         layer_name: str | None = None,
         matched_target: str | None = None,
+        report_as: str | None = None,
     ) -> dict[str, QuantizationArgs | str | None] | None:
         """
         Extract the QuantizationArgs for a given layer.
+
+        ``report_as`` is the name an untargeted layer is logged and counted
+        under, for a caller that probes with per-projection names.
 
         A caller that already resolved the layer's target (e.g. via
         suffix-aware matching) passes it as ``matched_target`` to skip
@@ -1320,15 +1329,35 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
                 if matched_target is None:
-                    logger.warning_once(
-                        "Some layers match no compressed-tensors target and are "
-                        "not in `ignore`; loading them unquantized."
-                    )
+                    reported_name = report_as or layer_name
+                    if not self._untargeted_layers:
+                        logger.warning(
+                            "%s matches no compressed-tensors target and is not "
+                            "in `ignore`. Loading it and any other such layer "
+                            "unquantized. If the checkpoint stores them quantized, "
+                            "the model may be missing a `packed_modules_mapping` "
+                            "entry.",
+                            reported_name,
+                        )
+                    self._untargeted_layers[reported_name] = None
                     return None
 
             return self.target_scheme_map[matched_target]
 
         return None
+
+    def warn_untargeted_layers(self) -> None:
+        """Log how many layers fell back to unquantized, once the model is built.
+
+        A model that builds its layers from a copy of this config is not counted.
+        """
+        if not self._untargeted_layers:
+            return
+
+        logger.warning(
+            "Layers matching no compressed-tensors target and built unquantized: %d.",
+            len(self._untargeted_layers),
+        )
 
     def get_cache_scale(self, name: str) -> Optional[str]:
         """

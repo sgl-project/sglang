@@ -12,7 +12,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
-import logging
 import unittest
 from unittest import mock
 
@@ -455,16 +454,43 @@ class TestUntargetedLayers(CustomTestCase):
 
         self.assertIsNone(scheme)
 
-    def test_untargeted_layers_are_logged(self):
-        """warning_once is lru_cache-wrapped; clear it to stay order-independent."""
-        logging.Logger.warning_once.cache_clear()
-        self.addCleanup(logging.Logger.warning_once.cache_clear)
-
+    def test_first_untargeted_layer_is_named_once(self):
         config = _single_group_config(NVFP4_GROUP)
         with self.assertLogs(compressed_tensors.logger, level="WARNING") as captured:
             config.get_quant_method(_linear(), IN_PROJ_QKVZ)
+            config.get_quant_method(_linear(), MLP_LAYER)
 
-        self.assertIn("match no compressed-tensors target", "\n".join(captured.output))
+        named = [line for line in captured.output if "matches no" in line]
+        self.assertEqual(len(named), 1)
+        self.assertIn(IN_PROJ_QKVZ, named[0])
+
+    def test_untargeted_layers_are_counted_after_build(self):
+        config = _single_group_config(NVFP4_GROUP)
+        config.get_quant_method(_linear(), IN_PROJ_QKVZ)
+        config.get_quant_method(_linear(), IN_PROJ_QKVZ)
+        config.get_quant_method(_linear(), MLP_LAYER)
+
+        with self.assertLogs(compressed_tensors.logger, level="WARNING") as captured:
+            config.warn_untargeted_layers()
+
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("built unquantized: 2.", captured.output[0])
+
+    def test_untargeted_experts_count_as_one_layer(self):
+        config = _single_group_config(FP8_GROUP)
+        with self.assertLogs(compressed_tensors.logger, level="WARNING") as captured:
+            config.get_moe_scheme(torch.nn.Module(), layer_name=EXPERTS_LAYER)
+            config.warn_untargeted_layers()
+
+        self.assertIn(f"{EXPERTS_LAYER} matches no", captured.output[0])
+        self.assertIn("built unquantized: 1.", captured.output[-1])
+
+    def test_fully_targeted_model_logs_no_summary(self):
+        config = _single_group_config(NVFP4_GROUP)
+        config.get_moe_scheme(torch.nn.Module(), layer_name=EXPERTS_LAYER)
+
+        with self.assertNoLogs(compressed_tensors.logger, level="WARNING"):
+            config.warn_untargeted_layers()
 
     def test_fused_layer_matches_when_every_shard_matches(self):
         matched = find_matched_target(
