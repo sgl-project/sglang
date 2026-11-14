@@ -335,5 +335,17 @@ class PipelineExecutor(ABC):
         )
         try:
             yield
-        finally:
+        except BaseException:
+            # Do not mask a generation error/cancellation with profiling cleanup,
+            # or enter analysis collectives while another rank is unwinding.
+            try:
+                profiler.stop(
+                    export_trace=not current_platform.is_npu(), dump_rank=dump_rank
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to stop profiler while handling a request error"
+                )
+            raise
+        else:
             profiler.stop(dump_rank=dump_rank)

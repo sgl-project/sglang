@@ -6,12 +6,20 @@ from collections.abc import Iterator
 import torch
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_replica_group,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.srt.observability.profile_analysis_npu import (
+    NPUTraceHandler,
+    get_torch_npu,
+)
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if current_platform.is_npu():
-    import torch_npu
+    torch_npu = get_torch_npu()
 
     patches = [
         ["profiler.profile", torch_npu.profiler.profile],
@@ -80,6 +88,9 @@ class SGLDiffusionProfiler:
         except OSError:
             pass
 
+        self._npu_trace_handler = (
+            NPUTraceHandler(self.log_dir) if current_platform.is_npu() else None
+        )
         activities = [torch.profiler.ProfilerActivity.CPU]
         if torch.cuda.is_available() or (
             hasattr(torch, "musa") and torch.musa.is_available()
@@ -96,9 +107,9 @@ class SGLDiffusionProfiler:
             record_shapes=True,
             with_stack=True,
             on_trace_ready=(
-                None
-                if not current_platform.is_npu()
-                else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
+                self._npu_trace_handler.on_trace_ready
+                if self._npu_trace_handler is not None
+                else None
             ),
         )
         if self.full_profile:
@@ -158,24 +169,55 @@ class SGLDiffusionProfiler:
             return
         self.has_stopped = True
         logger.info("Stopping Profiler...")
-        if torch.cuda.is_available() or (
-            hasattr(torch, "musa") and torch.musa.is_available()
+        sync_npu_stop_errors = (
+            export_trace
+            and self._npu_trace_handler is not None
+            and self._npu_trace_handler.npu_auto_analysis_in_daemon
+        )
+        error = None
+        try:
+            if torch.cuda.is_available() or (
+                hasattr(torch, "musa") and torch.musa.is_available()
+            ):
+                torch.cuda.synchronize()
+            if current_platform.is_npu():
+                torch.npu.synchronize()
+            self.profiler.stop()
+        except Exception as exc:
+            if not sync_npu_stop_errors:
+                raise
+            error = f"rank {self.rank}: {exc}"
+            logger.error("NPU profiler stop failed: %s", error)
+        finally:
+            SGLDiffusionProfiler._instance = None
+
+        if sync_npu_stop_errors:
+            errors = [error]
+            if model_parallel_is_initialized():
+                group = get_replica_group()
+                if group.world_size > 1:
+                    # Coordinate capture-stop failures only. Background analysis
+                    # status is rank-local and never gates continued generation.
+                    errors = [None] * group.world_size
+                    torch.distributed.all_gather_object(
+                        errors, error, group=group.cpu_group
+                    )
+            if any(errors):
+                raise RuntimeError(
+                    "NPU profiler stop failed: " + "; ".join(e for e in errors if e)
+                )
+
+        if export_trace and (
+            self._npu_trace_handler is not None
+            or dump_rank is None
+            or dump_rank == self.rank
         ):
-            torch.cuda.synchronize()
-        if current_platform.is_npu():
-            torch.npu.synchronize()
-            export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
-        self.profiler.stop()
-
-        if export_trace:
-            if dump_rank is not None and dump_rank != self.rank:
-                pass
-            else:
-                self._export_trace()
-
-        SGLDiffusionProfiler._instance = None
+            self._export_trace()
 
     def _export_trace(self):
+        if self._npu_trace_handler is not None:
+            self._npu_trace_handler.export(self.profiler)
+            return
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
