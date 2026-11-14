@@ -175,6 +175,8 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # The last step id this rank holds (see DPStepCounter).
+    last_step_id: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -204,6 +206,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                self.last_step_id,
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +228,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                0,  # last_step_id
             ],
             device=device,
             dtype=dtype,
@@ -583,6 +587,23 @@ class DPShutdownVoteSent:
         self.value = False
 
 
+class DPStepCounter:
+    """Numbers the steps that every attention-DP rank launches together.
+
+    Each rank sends ``last``, the id of the last such step it launched, through
+    the MLP-sync gather. A gather that launches a step on every rank numbers
+    it one past the largest value gathered: every rank reads the same rows, so
+    all of them give the step the same id, and a rank whose count is behind
+    (a replacement process that rejoined its slot after a fault) catches up
+    at that step.
+    """
+
+    __slots__ = ("last",)
+
+    def __init__(self) -> None:
+        self.last = 0
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -596,6 +617,7 @@ def prepare_mlp_sync_batch_raw(
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
     drain_column: Optional[DPDrainColumn] = None,
+    step_counter: Optional[DPStepCounter] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -713,6 +735,7 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        last_step_id=step_counter.last if step_counter is not None else 0,
     )
 
     if num_dp_ranks == 1:
@@ -749,6 +772,25 @@ def prepare_mlp_sync_batch_raw(
         elif local_batch.forward_mode.is_prebuilt():
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
+
+    # Only a gather across attention-DP ranks numbers the step it launches.
+    # PP and the elastic WORLD gather stay unnumbered: whether their ranks
+    # always read the same rows is unverified.
+    dp_step_id = None
+    if (
+        need_idle_batch
+        and not skip_all_gather
+        and not use_world_group
+        and step_counter is not None
+        and parallel.attn_dp_size > 1
+        and parallel.pp_size == 1
+    ):
+        dp_step_id = int(mlp_sync_info.tp0_info_cpu[:, 13].max()) + 1
+        step_counter.last = dp_step_id
+    # On `local_batch`, as `recv_skipper_forward_mode` below. Rebound at every
+    # gather: a running batch object outlives its step.
+    if local_batch is not None:
+        local_batch.dp_step_id = dp_step_id
 
     if batch_to_gather is not None:
         _update_gather_batch(
@@ -818,6 +860,7 @@ class SchedulerDPAttnAdapter:
     shutdown_vote_sent: DPShutdownVoteSent = field(
         default_factory=DPShutdownVoteSent, init=False
     )
+    step_counter: DPStepCounter = field(default_factory=DPStepCounter, init=False)
 
     def shutdown_vote_pending(self) -> bool:
         """This rank honored a ShutdownReq that no MLP-sync gather has carried yet.
@@ -863,6 +906,7 @@ class SchedulerDPAttnAdapter:
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
             drain_column=drain_column,
+            step_counter=self.step_counter,
         )
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)

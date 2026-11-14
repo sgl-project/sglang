@@ -1997,6 +1997,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
     after_idle_gap: bool = False
+    # The step every attention-DP rank launches together (see DPStepCounter);
+    # None when no MLP-sync gather numbered this step.
+    dp_step_id: Optional[int] = None
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
@@ -3547,6 +3550,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
+            dp_step_id=self.dp_step_id,
             extend_num_tokens=self.extend_num_tokens,
         )
 

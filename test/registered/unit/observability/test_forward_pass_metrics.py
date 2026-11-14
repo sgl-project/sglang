@@ -14,6 +14,7 @@ from itertools import count
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import msgspec
 import prometheus_client
 import torch
 
@@ -35,9 +36,12 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
     FpmTiming,
+    QueuedRequestMetrics,
+    ScheduledRequestMetrics,
     TimingSegment,
     _FpmPublisherThread,
     decode,
+    encode,
     wrap_forward_with_fpm,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -490,6 +494,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             prefix_lens=[],
             prefill_stats=None,
             seq_lens_cpu=[],
+            dp_step_id=None,
         )
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)
@@ -549,6 +554,45 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertAlmostEqual(metric.wall_time, 0.023)
         self.assertEqual(metric.queued_requests.num_prefill_requests, 2)
         self.assertEqual(metric.queued_requests.sum_prefill_tokens, 384)
+
+    def test_iteration_id_is_the_step_id_of_the_processed_batch(self):
+        # The overlap loop processes step k from a copy, after step k+1's
+        # gather has renumbered the live running batch.
+        running = ScheduleBatch(reqs=[], forward_mode=ForwardMode.IDLE)
+        running.dp_step_id = 7
+        queued = running.copy()
+        running.dp_step_id = 8
+        self._emit_ready(queued)
+        self._emit_ready(self._make_batch())
+        self.assertEqual(
+            [m.iteration_id for m in self.scheduler._fpm_publisher.metrics], [7, None]
+        )
+
+    def test_iteration_id_does_not_break_consumers_of_the_previous_schema(self):
+        class PreviousSchema(msgspec.Struct, frozen=True):
+            version: int = 1
+            worker_id: str = ""
+            dp_rank: int = 0
+            counter_id: int = 0
+            wall_time: float = 0.0
+            scheduled_requests: ScheduledRequestMetrics = ScheduledRequestMetrics()
+            queued_requests: QueuedRequestMetrics = QueuedRequestMetrics()
+
+        current = ForwardPassMetrics(
+            worker_id="worker-7",
+            dp_rank=1,
+            counter_id=4,
+            wall_time=0.5,
+            scheduled_requests=ScheduledRequestMetrics(num_decode_requests=3),
+            queued_requests=QueuedRequestMetrics(num_prefill_requests=2),
+            iteration_id=9,
+        )
+        previous = msgspec.msgpack.decode(encode(current), type=PreviousSchema)
+        # Consumers match on the wire version; an added optional field keeps it.
+        self.assertEqual(previous.version, 1)
+        for field in PreviousSchema.__struct_fields__:
+            self.assertEqual(getattr(previous, field), getattr(current, field))
+        self.assertIsNone(decode(msgspec.msgpack.encode(previous)).iteration_id)
 
     def test_scheduler_state_controls_heartbeat_with_metrics_disabled(self):
         self.reporter.record_scheduler_active(event_ns=0)
@@ -843,7 +887,9 @@ class TestFpmPublisherIdleState(unittest.TestCase):
         publisher._dp_rank = 1
         publisher._pub = Mock()
         publisher._zmq = types.SimpleNamespace(Again=RuntimeError, NOBLOCK=1)
-        dummy = ForwardPassMetrics(worker_id="worker", dp_rank=1, wall_time=0.025)
+        dummy = ForwardPassMetrics(
+            worker_id="worker", dp_rank=1, wall_time=0.025, iteration_id=5
+        )
         actions = iter(["busy", dummy, "busy", "idle", "busy", "stop"])
 
         def next_item(**kwargs):
@@ -868,6 +914,8 @@ class TestFpmPublisherIdleState(unittest.TestCase):
         self.assertEqual(len(messages), 2)
         self.assertEqual([m.wall_time for m in messages], [0.025, 0.0])
         self.assertEqual([m.counter_id for m in messages], [0, 1])
+        # A heartbeat belongs to no step.
+        self.assertEqual([m.iteration_id for m in messages], [5, None])
         self.assertTrue(
             all(m.scheduled_requests.num_decode_requests == 0 for m in messages)
         )
