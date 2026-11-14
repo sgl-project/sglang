@@ -367,6 +367,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             tree_cache=env.cache,
             token_to_kv_pool=env.target_pool,
             draft_token_to_kv_pool=env.draft_pool,
+            draft_kv_ring=None,
             token_to_kv_pool_allocator=env.allocator,
             req_to_token_pool=env.req_to_token_pool,
             req_to_metadata_buffer_idx_allocator=ReqToMetadataIdxAllocator(2),

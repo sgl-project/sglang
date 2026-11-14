@@ -10,6 +10,7 @@ class _RopeCacheHost(torch.nn.Module):
     """The Z-Image DiT's RoPE caches on a module without weights."""
 
     _get_rope_cache = ZImageTransformer2DModel._get_rope_cache
+    _build_rope_cache = staticmethod(ZImageTransformer2DModel._build_rope_cache)
     _get_unified_freqs_cis = ZImageTransformer2DModel._get_unified_freqs_cis
     _pin_for_active_capture = ZImageTransformer2DModel._pin_for_active_capture
 
@@ -41,7 +42,7 @@ class TestZImageRopeCache(unittest.TestCase):
         host = _RopeCacheHost()
         host._get_rope_cache("unified", _table(0, 64))
         table = _table(1, 64)
-        cache, positions = host._get_rope_cache("unified", table)
+        cache, positions, _ = host._get_rope_cache("unified", table)
         self.assertTrue(torch.equal(cache, _expected_cache(table)))
         self.assertIsNone(positions)
 
@@ -60,7 +61,7 @@ class TestZImageRopeCache(unittest.TestCase):
         unified = host._get_unified_freqs_cis(x_freqs, cap_freqs)
         for got, image, caption in zip(unified, x_freqs, cap_freqs):
             self.assertTrue(torch.equal(got, torch.cat([image, caption])))
-        cache, _ = host._get_rope_cache("unified", unified)
+        cache, _, _ = host._get_rope_cache("unified", unified)
         self.assertTrue(torch.equal(cache, _expected_cache(unified)))
 
 

@@ -12,6 +12,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,6 +23,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 BASE = "sglang.srt.multimodal.processors.base_processor"
+PLACEMENT = "sglang.srt.multimodal.serving_preprocessing"
 
 
 class _Processor:
@@ -60,7 +64,7 @@ class TestFastImageProcessorDevice(CustomTestCase):
                 device_type=device_type,
             )
         )
-        with patch.multiple(BASE, platforms=platforms, **flags):
+        with patch.multiple(PLACEMENT, platforms=platforms, **flags):
             return processor._fast_image_processor_device(_Processor())
 
     def test_device_follows_the_instance_base_gpu_id(self):
@@ -94,7 +98,7 @@ class TestFastImageProcessorDevice(CustomTestCase):
             pass
 
         processor = _make(base_gpu_id=3)
-        with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
+        with patch.multiple(PLACEMENT, _is_cpu=False, _is_xpu=False, _is_npu=True):
             device = processor._fast_image_processor_device(Glm4vProcessor())
         self.assertIsNone(device)
 
@@ -123,7 +127,9 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
 
     def _processor(self, *, transport="cpu", precompute_hash=False):
         processor = _make(base_gpu_id=0)
-        processor.mm_feature_transport = transport
+        processor._feature_transport = MultimodalFeatureTransport(
+            transport, base_gpu_id=0, skip_mm_pool=True
+        )
         processor.precompute_hash_before_cpu_transfer = precompute_hash
         return processor
 
@@ -138,7 +144,10 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
         )
         for processor, device, expected in cases:
             with (
-                self.subTest(device=device, transport=processor.mm_feature_transport),
+                self.subTest(
+                    device=device,
+                    transport=processor._feature_transport.mm_feature_transport,
+                ),
                 patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
                 patch(f"{BASE}.torch.cuda.MemPool", return_value="pool") as mem_pool,
                 patch(f"{BASE}.torch.cuda.use_mem_pool", return_value=nullcontext()),
@@ -185,7 +194,7 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
 
         with (
             patch.multiple(
-                BASE,
+                PLACEMENT,
                 _is_cpu=False,
                 _is_xpu=False,
                 _is_npu=False,

@@ -22,7 +22,7 @@ use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -343,22 +343,21 @@ async fn dispatch<T: Transport>(
         stream_abort,
         decode_slot,
     );
+    // A logprob merge needs prefill's body, so it waits for prefill too.
+    let wait_for_prefill = ctx.config.proxy.stream_after_prefill || request.merges_input_logprobs;
     let dispatch = async {
         match prefill_task {
-            Some((task, prefill)) => {
-                let wait = ctx.config.proxy.stream_after_prefill;
-                forward_pd(task, prefill, response, wait).await
-            }
-            None => (response.await, None),
+            Some((task, prefill)) => forward_pd(task, prefill, response, wait_for_prefill).await,
+            None => (response.await, None, None),
         }
     };
     // A ready response wins if request expiration fires in the same poll.
-    let (result, blamed_prefill) = tokio::select! {
+    let (result, blamed_prefill, prefill_body) = tokio::select! {
         biased;
         dispatch = dispatch => dispatch,
         _ = expiration_token.cancelled() => {
             let model = metrics.model.clone();
-            (Err(ApiError::StaleRequestExpired { model }), None)
+            (Err(ApiError::StaleRequestExpired { model }), None, None)
         }
     };
     if matches!(dispatch_outcome::<T>(&result), RequestOutcome::Success) {
@@ -377,7 +376,7 @@ async fn dispatch<T: Transport>(
         (None, _) => vec![response_worker.id.clone()],
     };
     let result = match result {
-        Ok(response) => Ok(T::respond(request, response, metrics.streaming).await),
+        Ok(response) => Ok(T::respond(request, response, metrics.streaming, prefill_body).await),
         result => result,
     };
     let log_context =
@@ -444,10 +443,12 @@ trait Transport: Clone + Send + Sync + 'static {
     type Response: Send + 'static;
 
     fn status(response: &Self::Response) -> u16;
+    /// The client's response; `prefill_body` is a PD prefill's, when it completed first.
     fn respond(
         request: &mut PreparedRequest,
         response: Self::Response,
         streaming: bool,
+        prefill_body: Option<Bytes>,
     ) -> impl Future<Output = Self::Response> + Send;
 
     /// Send to the worker whose response the client receives.
@@ -473,7 +474,7 @@ trait Transport: Clone + Send + Sync + 'static {
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
-    ) -> impl Future<Output = PrefillFailure<Self::Response>> + Send;
+    ) -> impl Future<Output = PrefillOutcome<Self::Response>> + Send;
 }
 
 /// One worker's request: the HTTP body, and the same additions as typed fields.
@@ -515,9 +516,12 @@ impl Transport for Http {
         request: &mut PreparedRequest,
         response: Self::Response,
         streaming: bool,
+        prefill_body: Option<Bytes>,
     ) -> Self::Response {
         if request.responder.is_some() {
             super::openai::respond(&mut request.responder, response, streaming).await
+        } else if let Some(prefill_body) = prefill_body.filter(|_| request.merges_input_logprobs) {
+            merge_input_logprobs(&prefill_body, response).await
         } else {
             response
         }
@@ -563,7 +567,7 @@ impl Transport for Http {
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
-    ) -> PrefillFailure {
+    ) -> PrefillOutcome {
         let result = proxy
             .forward_json_to(
                 &worker.url,
@@ -575,8 +579,36 @@ impl Transport for Http {
                 None,
             )
             .await;
-        prefill_failure(result).await
+        prefill_outcome(result).await
     }
+}
+
+/// Decode's response with prefill's `meta_info.input_token_logprobs` before
+/// its own. A failure status, or a body without both lists, passes through;
+/// an unreadable decode body is a 502.
+async fn merge_input_logprobs(prefill_body: &[u8], response: Response<Body>) -> Response<Body> {
+    if !response.status().is_success() {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let Ok(decode_body) = axum::body::to_bytes(body, usize::MAX).await else {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::BAD_GATEWAY;
+        return response;
+    };
+    let body =
+        prepend_prefill_logprobs(prefill_body, &decode_body).map_or(decode_body, Bytes::from);
+    Response::from_parts(parts, Body::from(body))
+}
+
+fn prepend_prefill_logprobs(prefill_body: &[u8], decode_body: &[u8]) -> Option<Vec<u8>> {
+    const LOGPROBS: &str = "/meta_info/input_token_logprobs";
+    let prefill: serde_json::Value = serde_json::from_slice(prefill_body).ok()?;
+    let mut decode: serde_json::Value = serde_json::from_slice(decode_body).ok()?;
+    let prefill_logprobs = prefill.pointer(LOGPROBS)?.as_array()?;
+    let decode_logprobs = decode.pointer_mut(LOGPROBS)?.as_array_mut()?;
+    decode_logprobs.splice(0..0, prefill_logprobs.iter().cloned());
+    serde_json::to_vec(&decode).ok()
 }
 
 /// Reaches engines through the native RPC the client called.
@@ -594,6 +626,7 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         _request: &mut PreparedRequest,
         response: Self::Response,
         _streaming: bool,
+        _prefill_body: Option<Bytes>,
     ) -> Self::Response {
         response
     }
@@ -652,7 +685,7 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         worker: Arc<Worker>,
         _path: &'static str,
         leg: Leg,
-    ) -> PrefillFailure<Self::Response> {
+    ) -> PrefillOutcome<Self::Response> {
         let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
         let result = proxy
             .forward_grpc(
@@ -670,7 +703,7 @@ impl<R: EngineRpc> Transport for Grpc<R> {
                         .is_ok_and(|reply| !reply.is_error_event(&mut scanner))
                 });
                 if clean {
-                    return None;
+                    return PrefillOutcome::Completed(None);
                 }
                 response.status
             }
@@ -682,9 +715,9 @@ impl<R: EngineRpc> Transport for Grpc<R> {
             {
                 response.status
             }
-            result => return Some(result),
+            result => return PrefillOutcome::Failed(result),
         };
-        Some(Err(ApiError::PrefillFailed {
+        PrefillOutcome::Failed(Err(ApiError::PrefillFailed {
             status: Some(status),
         }))
     }
@@ -758,8 +791,14 @@ fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {
         .ok()
 }
 
-/// A prefill's client-visible failure; `None` means it succeeded.
-type PrefillFailure<R = Response<Body>> = Option<Result<R, ApiError>>;
+/// How a prefill ended.
+#[derive(Debug)]
+enum PrefillOutcome<R = Response<Body>> {
+    /// Succeeded, with its HTTP body.
+    Completed(Option<Bytes>),
+    /// Its client-visible failure.
+    Failed(Result<R, ApiError>),
+}
 
 /// Runs prefill to completion even if the client disconnects. A failure also
 /// aborts decode's stream until its first token, which proves KV transfer completed.
@@ -775,23 +814,25 @@ fn spawn_prefill_request<T: Transport>(
     bootstrap_room: u64,
     stream_abort: CancellationToken,
     slot: Option<DecodeSlot>,
-) -> tokio::task::JoinHandle<PrefillFailure<T::Response>> {
+) -> tokio::task::JoinHandle<PrefillOutcome<T::Response>> {
     let proxy = Arc::clone(&ctx.proxy);
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
         let _load_guards = load_guards;
-        let failure = transport
+        let prefill = transport
             .prefill(proxy, Arc::clone(&prefill_worker), path, leg)
             .await;
         if let Some(slot) = &slot {
             slot.release();
         }
+        let failure = match &prefill {
+            PrefillOutcome::Completed(_) => None,
+            PrefillOutcome::Failed(failure) => Some(failure),
+        };
         let prefill_url = &prefill_worker.url;
-        let outcome = failure
-            .as_ref()
-            .map_or(RequestOutcome::Success, dispatch_outcome::<T>);
+        let outcome = failure.map_or(RequestOutcome::Success, dispatch_outcome::<T>);
         registry.record_worker_request(prefill_url, &model, WorkerModeLabel::Prefill, outcome);
-        match &failure {
+        match failure {
             None => tracing::debug!(%prefill_url, bootstrap_room, "prefill side completed"),
             Some(Ok(response)) => tracing::debug!(
                 %prefill_url, bootstrap_room, status = T::status(response),
@@ -804,27 +845,29 @@ fn spawn_prefill_request<T: Transport>(
         if failure.is_some() {
             stream_abort.cancel();
         }
-        failure
+        prefill
     })
 }
 
 /// Client errors and backpressure pass through; only a prefill fault becomes
 /// `prefill_failed`.
-async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
+async fn prefill_outcome(result: Result<Response<Body>, ApiError>) -> PrefillOutcome {
     let status = match result {
         // A streaming prefill reports a late failure as a 200 carrying an SSE
         // error event; one with a 4xx code is the engine refusing the request.
         Ok(response) if response.status().is_success() => {
             let status = response.status();
             match axum::body::to_bytes(response.into_body(), usize::MAX).await {
-                Ok(body) if !sse::has_error_event(&body) => return None,
+                Ok(body) if !sse::has_error_event(&body) => {
+                    return PrefillOutcome::Completed(Some(body))
+                }
                 Ok(body) => match sse::client_error_event(&body) {
                     Some((status, error)) => {
                         let mut response = Response::new(Body::from(error));
                         *response.status_mut() = status;
                         let json = HeaderValue::from_static("application/json");
                         response.headers_mut().insert(CONTENT_TYPE, json);
-                        return Some(Ok(response));
+                        return PrefillOutcome::Failed(Ok(response));
                     }
                     None => status,
                 },
@@ -839,9 +882,9 @@ async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFai
         {
             response.status()
         }
-        result => return Some(result),
+        result => return PrefillOutcome::Failed(result),
     };
-    Some(Err(ApiError::PrefillFailed {
+    PrefillOutcome::Failed(Err(ApiError::PrefillFailed {
         status: Some(status),
     }))
 }
@@ -857,14 +900,15 @@ struct Blame {
 }
 
 /// Returns decode's response as soon as decode answers, or with
-/// `stream_after_prefill` once prefill also completes, unless prefill fails
+/// `wait_for_prefill` once prefill also completes, unless prefill fails
 /// first; then prefill's failure is returned along with the blamed prefill.
+/// Prefill's body comes along when prefill completed before the return.
 async fn forward_pd<R>(
-    mut task: tokio::task::JoinHandle<PrefillFailure<R>>,
+    mut task: tokio::task::JoinHandle<PrefillOutcome<R>>,
     prefill: Arc<Worker>,
     decode: impl Future<Output = Result<R, ApiError>>,
-    stream_after_prefill: bool,
-) -> (Result<R, ApiError>, Option<Blame>) {
+    wait_for_prefill: bool,
+) -> (Result<R, ApiError>, Option<Blame>, Option<Bytes>) {
     // Set on decode's first poll, which is where `forward_to_response_worker`
     // begins and the request reaches the worker. Read from the same task, so
     // `Relaxed` needs no ordering beyond what the select already gives.
@@ -884,18 +928,18 @@ async fn forward_pd<R>(
     loop {
         tokio::select! {
             biased;
-            failure = &mut task => return match failure {
-                Ok(None) => match held {
-                    Some(response) => (response, None),
-                    None => (decode.await, None),
+            outcome = &mut task => return match outcome {
+                Ok(PrefillOutcome::Completed(body)) => match held {
+                    Some(response) => (response, None, body),
+                    None => (decode.await, None, body),
                 },
-                Ok(Some(failure)) => (failure, blame(prefill)),
-                Err(_) => (Err(ApiError::PrefillFailed { status: None }), blame(prefill)),
+                Ok(PrefillOutcome::Failed(failure)) => (failure, blame(prefill), None),
+                Err(_) => (Err(ApiError::PrefillFailed { status: None }), blame(prefill), None),
             },
             // Dropping the handle leaves prefill running.
             response = &mut decode, if held.is_none() => {
-                if !stream_after_prefill {
-                    return (response, None);
+                if !wait_for_prefill {
+                    return (response, None, None);
                 }
                 held = Some(response);
             }
@@ -1124,12 +1168,14 @@ mod tests {
             let task = tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 finished.store(true, Ordering::SeqCst);
-                None
+                PrefillOutcome::Completed(Some(Bytes::from_static(b"p")))
             });
             let decode = async { Ok(Response::new(Body::empty())) };
-            let (response, blame) = forward_pd(task, Arc::clone(&prefill), decode, wait).await;
+            let (response, blame, body) =
+                forward_pd(task, Arc::clone(&prefill), decode, wait).await;
             assert!(response.is_ok() && blame.is_none());
             assert_eq!(done.load(Ordering::SeqCst), wait);
+            assert_eq!(body, wait.then(|| Bytes::from_static(b"p")));
         }
     }
 
@@ -1143,9 +1189,9 @@ mod tests {
         serde_json::from_slice(&bytes.await.unwrap()).unwrap()
     }
 
-    fn assert_prefill_failed(failure: PrefillFailure) {
-        match failure {
-            Some(Err(ApiError::PrefillFailed { status })) => {
+    fn assert_prefill_failed(outcome: PrefillOutcome) {
+        match outcome {
+            PrefillOutcome::Failed(Err(ApiError::PrefillFailed { status })) => {
                 assert_eq!(status, Some(StatusCode::OK));
             }
             other => panic!("expected prefill_failed, got {other:?}"),
@@ -1156,8 +1202,10 @@ mod tests {
     async fn in_band_client_error_passes_through() {
         // As sglang's OpenAI entrypoints stream a 4xx abort (`create_streaming_error_response`).
         let error = r#"{"error": {"object": "error", "message": "Invalid grammar", "type": "BAD_REQUEST", "param": null, "code": 400}}"#;
-        let failure = prefill_failure(sse(&[error, "[DONE]"])).await;
-        let response = failure.unwrap().unwrap();
+        let PrefillOutcome::Failed(Ok(response)) = prefill_outcome(sse(&[error, "[DONE]"])).await
+        else {
+            panic!("expected the engine's response");
+        };
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
         let expected: serde_json::Value = serde_json::from_str(error).unwrap();
@@ -1165,8 +1213,10 @@ mod tests {
 
         // As native `/generate` streams it (compact orjson): an abort finish reason with a status code.
         let native = r#"{"text":"","meta_info":{"finish_reason":{"type":"abort","message":"Invalid grammar","status_code":422}}}"#;
-        let failure = prefill_failure(sse(&[native, "[DONE]"])).await;
-        let response = failure.unwrap().unwrap();
+        let PrefillOutcome::Failed(Ok(response)) = prefill_outcome(sse(&[native, "[DONE]"])).await
+        else {
+            panic!("expected the engine's response");
+        };
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             body_json(response).await,
@@ -1177,9 +1227,9 @@ mod tests {
     #[tokio::test]
     async fn in_band_server_error_stays_prefill_failed() {
         let error = r#"{"error": {"object": "error", "message": "boom", "type": "INTERNAL_SERVER_ERROR", "param": null, "code": 500}}"#;
-        assert_prefill_failed(prefill_failure(sse(&[error, "[DONE]"])).await);
+        assert_prefill_failed(prefill_outcome(sse(&[error, "[DONE]"])).await);
         let native = r#"{"text":"","meta_info":{"finish_reason":{"type":"abort","message":"boom","status_code":503}}}"#;
-        assert_prefill_failed(prefill_failure(sse(&[native])).await);
+        assert_prefill_failed(prefill_outcome(sse(&[native])).await);
     }
 
     #[tokio::test]
@@ -1191,13 +1241,16 @@ mod tests {
             r#"{"error": {"message": "not a status", "code": 4000}}"#,
             r#"{"error": "bare string"}"#,
         ] {
-            assert_prefill_failed(prefill_failure(sse(&[event])).await);
+            assert_prefill_failed(prefill_outcome(sse(&[event])).await);
         }
     }
 
     #[tokio::test]
     async fn clean_prefill_stream_is_not_a_failure() {
         let chunk = r#"{"choices": [{"delta": {"content": "{\"error\": {\"code\": 400}}"}}]}"#;
-        assert!(prefill_failure(sse(&[chunk, "[DONE]"])).await.is_none());
+        assert!(matches!(
+            prefill_outcome(sse(&[chunk, "[DONE]"])).await,
+            PrefillOutcome::Completed(_)
+        ));
     }
 }
