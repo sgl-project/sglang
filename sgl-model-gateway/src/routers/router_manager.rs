@@ -25,6 +25,7 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
+        common::GenerationRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -605,6 +606,26 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router.route_responses(headers, body, selected_model).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to handle responses request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_responses_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &super::responses::ResponsesRequestBody,
+        model_id: Option<&str>,
+    ) -> Response {
+        let selected_model = model_id.or(body.get_model());
+        if let Some(router) = self.select_router_for_request(headers, selected_model) {
+            router
+                .route_responses_raw(headers, body, selected_model)
+                .await
         } else {
             (
                 StatusCode::NOT_FOUND,
