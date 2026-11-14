@@ -1234,6 +1234,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                # Compact verify ran the target on only verify_lens rows per request.
+                scored_lens=layout.verify_lens if run_compact else None,
             )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
