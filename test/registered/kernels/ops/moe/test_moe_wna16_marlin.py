@@ -1233,8 +1233,9 @@ def test_moe_wna16_marlin_inactive_output_ownership(has_inactive_prefix_count):
 @pytest.mark.parametrize("weight_first", [False, True])
 @pytest.mark.parametrize("fused_norm", [False, True])
 @pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128)])
+@pytest.mark.parametrize("rows", [4, 16])
 def test_muse_marlin_inactive_routes(
-    fused_norm, hidden, intermediate, weight_first, use_expert_map
+    fused_norm, hidden, intermediate, weight_first, use_expert_map, rows
 ):
     """Muse finalization excludes undefined inactive projection rows and weights."""
     from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
@@ -1244,7 +1245,7 @@ def test_muse_marlin_inactive_routes(
     )
 
     torch.manual_seed(67)
-    rows, local_experts, topk = 4, 2, 2
+    local_experts, topk = 2, 2
     dtype = torch.bfloat16
     layer = MuseSpark1xFp4Experts.__new__(MuseSpark1xFp4Experts)
     torch.nn.Module.__init__(layer)
@@ -1286,11 +1287,14 @@ def test_muse_marlin_inactive_routes(
     local_ids = torch.tensor(
         [[0, 1], [1, -1], [-1, 0], [-1, -1]], device="cuda", dtype=torch.int32
     )
+    ids = ids.repeat(rows // 4, 1)
+    local_ids = local_ids.repeat(rows // 4, 1)
     if not use_expert_map:
         ids = local_ids.clone()
     weights = torch.tensor(
         [[0.25, 0.75], [0.5, 0.5], [0.25, 0.75], [0.5, 0.5]], device="cuda"
     )
+    weights = weights.repeat(rows // 4, 1)
     weights[local_ids < 0] = float("nan")
     weights[-1, 0] = float("inf")
     input_weights = weights.clone()
@@ -1307,6 +1311,9 @@ def test_muse_marlin_inactive_routes(
     projection_buffers = []
 
     def record_projection_buffer(a, c, *args, **kwargs):
+        # At M=16, global fan-out selects 16 rows under EP, versus 32 at EP1.
+        expected_block_m = 8 if rows == 4 else (16 if use_expert_map else 32)
+        assert kwargs["moe_block_size"] == expected_block_m
         assert kwargs["is_ep"] is use_expert_map
         assert kwargs["has_inactive_prefix_count"] is (not use_expert_map)
         count = args[10]
