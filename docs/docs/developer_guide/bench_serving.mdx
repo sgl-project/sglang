@@ -397,7 +397,7 @@ python3 -m sglang.benchmark.serving \
 
 `zipf` mode samples each request's prefix group from the rank-based distribution `p(rank) = (1/rank**alpha) / sum_k(1/k**alpha)` with rank starting at 1, so group index 0 is the hottest. The total request count stays `num_groups * prompts_per_group` — identical to `uniform` mode — and only the per-request group assignment changes. `alpha` must be a finite float strictly greater than 0; larger values concentrate requests on lower-ranked (hotter) groups.
 
-The on-disk dataset cache at `~/.cache/sglang/benchmark/gen_shared_prefix_*.pkl` includes `group_distribution` and `zipf_alpha` in its key, so uniform-mode and zipf-mode runs (or two zipf runs with different alpha) never share a cache file. Uniform-mode filenames are unchanged from the legacy format, so existing caches remain valid.
+The on-disk dataset cache at `~/.cache/sglang/benchmark/gen_shared_prefix_*.pkl` is isolated by tokenizer name and vocabulary, `group_distribution`, and `zipf_alpha`.
 
 This flag controls prefix-popularity shape only. It does not by itself reproduce any production trace or guarantee an observed cache-hit rate for a given engine.
 
