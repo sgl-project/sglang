@@ -26,6 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
@@ -116,6 +117,16 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
+    @property
+    def requires_per_shape_decode_graph_warmup(self) -> bool:
+        # The score-only Triton kernel autotunes separately for each BS bucket.
+        return (
+            not self.is_npu
+            and not self.is_hip
+            and bool(self.disable_value_layer_ids)
+            and not (get_platform().is_sm90 and self.page_size % self.block_size_k == 0)
+        )
+
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
@@ -1910,6 +1921,13 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+
+    @property
+    def requires_per_shape_decode_graph_warmup(self) -> bool:
+        return (
+            self.dense.requires_per_shape_decode_graph_warmup
+            or self.sparse.requires_per_shape_decode_graph_warmup
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # delegate so the dense (FlashInfer) backend keeps its own eager init.

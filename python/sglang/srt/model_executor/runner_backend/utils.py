@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
@@ -35,7 +36,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_memory
+from sglang.srt.runtime_context import get_exec, get_flags, get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -44,6 +45,25 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _group_preparation_allowed(lora_manager, *, profile_enabled: bool) -> bool:
+    """Keep per-shape warmups for shape-dependent LoRA scratch."""
+    return (
+        current_platform.is_cuda()
+        and (
+            lora_manager is None
+            or (
+                lora_manager.lora_backend.lora_workspace is None
+                and not lora_manager.lora_backend.is_moe_lora
+            )
+        )
+        and not get_exec().graph.debug_cuda_graph
+        and not profile_enabled
+        and not get_flags().capture.enable_torch_compile
+        and not envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get()
+        and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
+    )
 
 
 def _needs_hicache_event_capture(model_runner: ModelRunner) -> bool:
@@ -127,10 +147,20 @@ def resolve_decode_backend(
     if full_backend_cls is None:
         full_backend_cls = FullCudaGraphBackend
 
-    return full_backend_cls(
+    backend = full_backend_cls(
         cuda_graph_runner,
         enable_memory_saver=enable_memory_saver,
     )
+    if (
+        full_backend_cls is FullCudaGraphBackend
+        and _group_preparation_allowed(
+            model_runner.lora_manager,
+            profile_enabled=cuda_graph_runner.enable_profile_cuda_graph,
+        )
+        and not cuda_graph_runner.attn_backend.requires_per_shape_decode_graph_warmup
+    ):
+        backend._group_preparation_enabled = True
+    return backend
 
 
 def resolve_prefill_backend(
@@ -153,7 +183,7 @@ def resolve_prefill_backend(
         )
 
     if backend_name == Backend.BREAKABLE:
-        return BreakableCudaGraphBackend(
+        backend = BreakableCudaGraphBackend(
             cuda_graph_runner,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             debug_eager=get_exec().graph.debug_cuda_graph,
@@ -161,6 +191,12 @@ def resolve_prefill_backend(
                 cuda_graph_runner.model_runner
             ),
         )
+        if _group_preparation_allowed(
+            model_runner.lora_manager,
+            profile_enabled=get_exec().graph.enable_profile_cuda_graph,
+        ):
+            backend._group_preparation_enabled = True
+        return backend
     if backend_name == Backend.FULL:
         return FullCudaGraphBackend(
             cuda_graph_runner,

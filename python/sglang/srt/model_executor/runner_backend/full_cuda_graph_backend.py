@@ -122,6 +122,8 @@ class FullCudaGraphBackend(BaseGraphBackend):
         self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._precarve = GraphPoolPrecarve()
+        self._group_preparation_enabled = False
+        self._prepared_groups = set()
         self._reuse_output_buffer = reuse_output_buffer
         self._output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
@@ -135,6 +137,8 @@ class FullCudaGraphBackend(BaseGraphBackend):
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
+        # Preparation is scoped to this capture session.
+        self._prepared_groups.clear()
         try:
             yield
         finally:
@@ -162,15 +166,26 @@ class FullCudaGraphBackend(BaseGraphBackend):
             else None
         )
 
-        # Two warmups so kernels are loaded and one-time setup is paid before capture.
+        # Keep synchronization and hook calls even when a group needs fewer forwards.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         warmup_output = None
+        # The first eager forward prepares lazy state; size 1 may specialize.
+        warmup_group = (
+            shape_key.variant_label,
+            shape_key.attention_variant,
+            shape_key.size == 1,
+        )
+        eager_forward_count = (
+            int(warmup_group not in self._prepared_groups)
+            if self._group_preparation_enabled
+            else 2
+        )
         for warmup_step in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
-                output = forward_fn()
-            if self._reuse_output_buffer and warmup_step == 1:
+                output = forward_fn() if warmup_step < eager_forward_count else None
+            if self._reuse_output_buffer and warmup_step == eager_forward_count - 1:
                 warmup_output = output
             del output
             if profiler is not None:
@@ -218,6 +233,9 @@ class FullCudaGraphBackend(BaseGraphBackend):
         if profiler is not None:
             profiler.step()
 
+        # Mark a group only after capture completes successfully.
+        if self._group_preparation_enabled:
+            self._prepared_groups.add(warmup_group)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
         # Captured kernels can read tensors owned only by the dummy batch.
