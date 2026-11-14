@@ -2,8 +2,9 @@
 """FP8 attention on SGLang's [S, H, 128] strided BF16 views.
 
 fp8_attention() quantizes Q/K/V per head with the fused Triton passes, runs the CuTe-DSL
-kernel and returns (output [S, H, 128] BF16, lse [H, S] FP32). The compiled kernel is
-cached per (sequence, heads, device); the E4M3, scale, output and LSE buffers come from
+kernel and returns (output [Sq, H, 128] BF16, lse [H, Sq] FP32). K/V may be longer or
+shorter than Q (cross-attention). The compiled kernel is cached per (query length, key
+length, heads, device); the E4M3, scale, output and LSE buffers come from
 the caching allocator on every call and belong to the caller, nothing is retained
 between calls.
 """
@@ -34,15 +35,21 @@ _KERNEL_CACHE: dict[tuple, object] = {}
 
 
 def validate_inputs(q, k, v, softmax_scale):
-    """Strided [S, H, 128] BF16 views on one CUDA device; returns the scale as float."""
+    """Strided [Sq, H, 128] Q and [Skv, H, 128] K/V BF16 views on one CUDA device.
+
+    Returns the scale as float.
+    """
     if (
         q.ndim != 3
         or q.shape[-1] != HEAD_DIM
-        or q.shape != k.shape
-        or q.shape != v.shape
+        or k.ndim != 3
+        or q.shape[1:] != k.shape[1:]
+        or k.shape != v.shape
     ):
-        raise ValueError("Q/K/V must have equal shape [sequence, heads, 128]")
-    if min(q.shape[:2]) < 1:
+        raise ValueError(
+            "Q must be [Sq, heads, 128] and K/V [Skv, heads, 128] with equal heads"
+        )
+    if min(q.shape[:2]) < 1 or k.shape[0] < 1:
         raise ValueError("Sequence and heads must be positive")
     for tensor in (q, k, v):
         if (
@@ -57,17 +64,17 @@ def validate_inputs(q, k, v, softmax_scale):
             )
         if tensor.data_ptr() % 16 or tensor.stride(0) % 8:
             raise ValueError("Token rows must be aligned to 16 bytes")
-        if tensor.stride() != q.stride():
-            raise ValueError("Q/K/V must share strides")
+    if v.stride() != k.stride():
+        raise ValueError("K and V must share strides")
     scale = HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
     if not math.isfinite(scale):
         raise ValueError("Softmax scale must be finite")
     return scale
 
 
-def kernel_key(q):
-    """Cache key: the kernel bakes the buffer shapes, which follow from (S, H)."""
-    return (q.shape[0], q.shape[1], q.device.index)
+def kernel_key(q, k):
+    """Cache key: the kernel bakes the buffer shapes, which follow from (Sq, Skv, H)."""
+    return (q.shape[0], k.shape[0], q.shape[1], q.device.index)
 
 
 class Workspace(msgspec.Struct, frozen=True, kw_only=True):
@@ -82,11 +89,12 @@ class Workspace(msgspec.Struct, frozen=True, kw_only=True):
     lse: torch.Tensor
 
 
-def _allocate_workspace(q):
+def _allocate_workspace(q, k):
     sequence = q.shape[0]
+    keys = k.shape[0]
     heads = q.shape[1]
     padded_queries = (sequence + QUERY_TILE - 1) // QUERY_TILE * QUERY_TILE
-    padded_keys = (sequence + KEY_TILE - 1) // KEY_TILE * KEY_TILE
+    padded_keys = (keys + KEY_TILE - 1) // KEY_TILE * KEY_TILE
     device = q.device
     return Workspace(
         q_fp8=torch.empty(
@@ -120,7 +128,7 @@ def _kernel_views(workspace):
 
 
 def fp8_attention(q, k, v, softmax_scale=None):
-    """Attention over strided [S, H, 128] BF16 views; returns (output [S, H, 128], lse [H, S])."""
+    """Attention of [Sq, H, 128] Q over [Skv, H, 128] K/V; returns (output [Sq, H, 128], lse [H, Sq])."""
     return _fp8_attention(q, k, v, softmax_scale, block_scaled_mma=True)
 
 
@@ -128,18 +136,19 @@ def _fp8_attention(q, k, v, softmax_scale, block_scaled_mma):
     # block_scaled_mma is not a user option: the output is bit-equal either way.
     scale = validate_inputs(q, k, v, softmax_scale)
     kernel_scale = cutlass.Float32(scale)
-    key = (*kernel_key(q), block_scaled_mma)
+    key = (*kernel_key(q, k), block_scaled_mma)
 
     with torch.cuda.device(q.device):
-        workspace = _allocate_workspace(q)
+        workspace = _allocate_workspace(q, k)
         views = _kernel_views(workspace)
         stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
 
         compiled = _KERNEL_CACHE.get(key)
         if compiled is None:
             logger.info(
-                "fp8_fa_sm120 attention: compiling for S=%d H=%d (once per shape)",
+                "fp8_fa_sm120 attention: compiling for Sq=%d Skv=%d H=%d (once per shape)",
                 q.shape[0],
+                k.shape[0],
                 q.shape[1],
             )
             compiled = cute.compile(
@@ -147,6 +156,7 @@ def _fp8_attention(q, k, v, softmax_scale, block_scaled_mma):
                 *views,
                 kernel_scale,
                 stream,
+                key_sequence=k.shape[0],
                 block_scaled_mma=block_scaled_mma,
             )
             _KERNEL_CACHE[key] = compiled
