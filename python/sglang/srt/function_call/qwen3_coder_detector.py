@@ -1,11 +1,7 @@
 import json
 import logging
-import math
 import re
 from typing import Any, List, Optional
-
-from jsonschema import Draft202012Validator
-from referencing import Registry
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -15,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import (
+    convert_string_union_value,
     get_schema_properties,
     infer_type_from_json_schema,
     safe_literal_eval,
@@ -102,13 +99,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
             return "string"
         return str(inferred_type).strip().lower()
 
-    @staticmethod
-    def _parse_finite_float(value: str) -> float:
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("Non-finite JSON number")
-        return number
-
     def _convert_param_value(
         self,
         param_value: str,
@@ -132,30 +122,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         param_type = self._get_param_type(param_config[param_name])
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
-            schema = param_config[param_name]
-            if (
-                isinstance(schema, dict)
-                and ("anyOf" in schema or "oneOf" in schema)
-                and param_value.lstrip().startswith(("{", "["))
-            ):
-                try:
-                    value = json.loads(
-                        param_value,
-                        parse_constant=self._parse_finite_float,
-                        parse_float=self._parse_finite_float,
-                    )
-                    if isinstance(value, (dict, list)) and Draft202012Validator(
-                        parameters if parameters is not None else schema,
-                        registry=Registry(),
-                    ).evolve(schema=schema).is_valid(value):
-                        return value
-                except Exception as exc:
-                    logger.debug(
-                        "Structured union conversion failed (%s); preserving the original string.",
-                        type(exc).__name__,
-                    )
-                    return param_value
-            return param_value
+            return convert_string_union_value(
+                value=param_value,
+                schema=param_config[param_name],
+                root_schema=parameters,
+            )
         elif (
             param_type.startswith("int")
             or param_type.startswith("uint")

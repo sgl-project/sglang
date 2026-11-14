@@ -403,6 +403,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     dict(parallel_group="replicated")
                     if (
                         get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_ascend_ops()
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_deepep_v2()
                         or get_moe_a2a_backend().is_flashinfer()
@@ -844,6 +845,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
