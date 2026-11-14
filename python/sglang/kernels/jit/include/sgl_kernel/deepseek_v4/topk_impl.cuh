@@ -1198,7 +1198,13 @@ struct TopKStreaming : TopKRadixBase<12> {
     if constexpr (kExact) {
       if (smem->count_eq > kMaxNumTie && (!zero_bin || smem->tie_nonzero != 0)) [[unlikely]] {
         // See the register path.
+#ifdef USE_ROCM
+        // The register path does this to keep its fast path small; here it is
+        // correctness: hipcc miscompiles it inlined into topk_split_select<PAGE_TABLE> on gfx950.
+        refine_ties_cold(problem, smem, v_lo, v_hi, smem->count_eq);
+#else
         refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
+#endif
       }
     }
     handle_staged_ties(problem, smem);

@@ -170,12 +170,14 @@ class _ScopedPhysicalTakes:
 
 class ChainRoles(msgspec.Struct, frozen=True, kw_only=True):
     """Sub-pool names by role: the virtual-id owner, the sliding window that
-    binds the owner's virtual pages, and the per-request state slots."""
+    binds the owner's virtual pages, the per-request state slots, and the
+    request sub-pools, whose units bind request rows."""
 
     owner: str
     window: Optional[str] = None
     state: Optional[str] = None
     windows: Tuple[str, ...] = ()
+    requests: Tuple[str, ...] = ()
 
 
 def _chain_order(bands: Sequence[Band]) -> Tuple[Band]:
@@ -247,10 +249,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     # State slots acquire allocates for a fresh request (its working slot and
     # initial tracking slots); the storage binds it from the state policy.
     fresh_request_state_slots = 1
-    # Bound at construction: the sizing plan, the request rows' memory, and
-    # (once the storage binds them) each window's retained tail by sub-pool.
+    # Bound at construction: the sizing plan, and (once the storage binds
+    # them) each window's retained tail by sub-pool.
     plan = None
-    request_memory = None
     retained_windows: Optional[Dict[str, int]] = None
     # Under pipeline parallelism, every stage's geometry, which every capacity
     # question is asked of (`install_stage_capacity`); None on a single stage.
@@ -286,6 +287,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_cap_tokens: Optional[int] = None,
         full_max_total_num_tokens: Optional[int] = None,
         swa_max_total_num_tokens: Optional[int] = None,
+        request_rows: Optional[int] = None,
     ):
         # Token bands share widened virtual pages. A replicated draft carries
         # every token inside its entries; target views select the rank's rows.
@@ -353,13 +355,27 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 lazy_compaction=lazy_compaction,
                 **band,
             )
-        # Role order: owner, window, state. Every fan-out walks this tuple.
+        # A request sub-pool's virtual ids are the request table's rows.
+        assert not roles.requests or request_rows, "request units bind table rows"
+        self.request_allocators: Dict[str, Band] = {
+            name: FloatBand(
+                sub_pool_name=name,
+                is_id_owner=False,
+                virtual_num_pages=request_rows,
+                page_size=1,
+                lazy_compaction=False,
+                **band,
+            )
+            for name in roles.requests
+        }
+        # Role order: owner, window, state, requests. Every fan-out walks this tuple.
         self.members: Tuple[Band, ...] = tuple(
             b
             for b in (
                 self.full_attn_allocator,
                 *self.window_allocators.values(),
                 self.mamba_allocator,
+                *self.request_allocators.values(),
             )
             if b is not None
         )
@@ -735,6 +751,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             # the token owner's.
             if b.name in self.window_pool_names():
                 id_room = owner_snap.num_virtual_pages - owner_snap.min_page
+            elif b.name in self.request_allocators:
+                # A request band mints no ids: each live unit binds one
+                # request table row, its id. Row 0 is the table's padding
+                # row; the band's own padding (`min_page`) is physical and
+                # bounds the units below.
+                id_room = b.num_virtual_pages - 1 - b.live
             else:
                 id_room = b.free_virtual_pages
             pages = min(pages, b.num_pages - b.min_page - b.live, id_room)
@@ -746,11 +768,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def estimated_units_available(self, sub_pool: str) -> int:
         """An estimate of what ``sub_pool`` alone could still take, in tokens (slots for
-        state), for observers; reading it inside a capacity decision is a violation."""
+        state, rows for a request sub-pool), for observers; reading it inside a
+        capacity decision is a violation."""
         observe_only_read("ChainAllocator.estimated_units_available")
         band = self.bands[self._band_positions[sub_pool]]
         pages = self._estimated_pages((sub_pool,))
-        return pages if band is self.mamba_allocator else pages * self.page_size
+        units = band is self.mamba_allocator or sub_pool in self.request_allocators
+        return pages if units else pages * self.page_size
 
     def state_slots_fit(self, count: int) -> bool:
         """Whether ``count`` state slots can be taken now."""
@@ -877,6 +901,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             demands[name] = -(-int(tokens) // page)
         if self.mamba_allocator is not None:
             demands[self.mamba_allocator.sub_pool_name] = int(demand.state_slots)
+        for name in self.request_allocators:
+            demands[name] = int(demand.request_rows)
         return demands
 
     def ensure_capacity(self, demand: KVDemand) -> bool:
@@ -909,6 +935,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 demand.full_tokens,
                 tuple(sorted(window_tokens.items())),
                 demand.state_slots,
+                demand.request_rows,
                 tuple(sorted(evictable.items())),
                 empty_pool,
             )
@@ -951,6 +978,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if state is not None:
             demands[state.sub_pool_name] = int(demand.state_slots)
             reclaim[state.sub_pool_name] = int(evictable.get(state.sub_pool_name, 0))
+        # Request units are never cached, so nothing evictable frees one.
+        for name in self.request_allocators:
+            demands[name] = int(demand.request_rows)
+            reclaim[name] = 0
         return demands, reclaim
 
     def _admits_on(
@@ -1025,6 +1056,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 demand.full_tokens + max(0, -full_budget_tokens),
                 windows,
                 demand.state_slots,
+                demand.request_rows,
             ),
             evictable=evictable,
         )
@@ -1038,7 +1070,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             "Unified memory reclamation insufficient: "
             f"needed=(full={demand.full_tokens}, "
             f"windows={dict(demand.window_tokens)}, "
-            f"state_slots={demand.state_slots})"
+            f"state_slots={demand.state_slots}, "
+            f"request_rows={demand.request_rows})"
         )
 
     def fits_after_frees(self, demands: Dict[str, int]) -> bool:
@@ -1100,8 +1133,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ``input_tokens`` can be admitted with in an empty pool, within
         ``token_capacity``; None when even the prompt cannot. Priced as
         `DemandPurpose.CEILING`: all of its decode, a fresh request's state
-        slots, window retirement (`demand.window_retirement`), and the smallest
-        chunk admission may cut its prompt to (`smallest_admissible_chunk`)."""
+        slots and request row, window retirement (`demand.window_retirement`),
+        and the smallest chunk admission may cut its prompt to
+        (`smallest_admissible_chunk`)."""
         page = self.page_size
         paged_input = -(-input_tokens // page) * page
         max_new_tokens = min(
@@ -1129,6 +1163,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     checkpoint_interval=checkpoint_interval,
                     decode_retire_lag=decode_retire_lag,
                     state_slots=state_slots,
+                    request_rows=int(bool(self.request_allocators)),
                 ).demand(),
                 empty_pool=True,
             )
@@ -1201,11 +1236,16 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             else config.unified_full_cap_tokens
             * (owner.page_size // owner.pool_page_size)
         )
+        requests = set(self.request_allocators.values())
         for band in self.members:
             band._set_capacity(
                 self.arena.num_entries(band.sub_pool_name),
+                # A request band's virtual ids are the request table's rows,
+                # which resizing keeps; a window binds the owner's.
                 virtual_num_pages=None
                 if band.is_id_owner
+                else band.ids.num_virtual_ids
+                if band in requests
                 else owner.ids.num_virtual_ids,
             )
         self._set_token_shares(
@@ -1226,6 +1266,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             else owner.max_slots - 1
         )
         for band in self.members:
+            if band in requests:
+                # Read through the views of the parts it holds, which span the
+                # whole arena: nothing to update.
+                continue
             view = self.views[band.sub_pool_name]
             view.size = band.max_slots - band.pool_page_size
             if band.sub_pool_name == self.roles.state:
@@ -1314,6 +1358,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 defer_reads=defer_reads,
             )
         return spaces
+
+    def request_id_spaces(self) -> Dict[str, IdSpace]:
+        """Each request sub-pool's id space: its units, named by request row."""
+        return {
+            name: band.ids.slot_space((name, id(self)))
+            for name, band in self.request_allocators.items()
+        }
 
     def state_id_spaces(self) -> Dict[str, IdSpace]:
         """The state band's id space: its slots."""
@@ -1443,17 +1494,25 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         out_cache_loc_virtual: Optional[torch.Tensor],
         state_slots_virtual: Optional[torch.Tensor] = None,
         *,
+        request_rows: Optional[torch.Tensor] = None,
         token_writes_unknown: bool = False,
         state_writes_unknown: bool = False,
     ) -> None:
         """Hand the forward's metadata to every member; token bands translate the
         write set through their own v2p. The state band, written in place by
         state kernels rather than through `out_cache_loc`, takes the virtual
-        state slots the forward writes. ``token_writes_unknown`` /
+        state slots the forward writes; a request band takes the batch's request
+        rows, its virtual ids. ``token_writes_unknown`` /
         ``state_writes_unknown``: the token / state bands cannot read this
         forward's write ids before it ends."""
         with record_function("ChainAllocator.set_inflight_forward"):
+            requests = set(self.request_allocators.values())
             for member in self.members:
+                if member in requests:
+                    member.set_inflight_forward(
+                        forward_done, request_rows, writes_unknown=False
+                    )
+                    continue
                 is_state = member is self.mamba_allocator
                 member.set_inflight_forward(
                     forward_done,
@@ -2004,6 +2063,40 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             state._maybe_zero_pages(pages)
         state.free_virtual_ids = state.free_virtual_ids[need_size:]
         return state._expand_pages_to_tokens(slots)
+
+    def alloc_request_rows(self, rows: torch.Tensor) -> bool:
+        """Bind a unit of every request sub-pool to each of request rows
+        ``rows`` (their virtual ids), laid out with the token pages; False when
+        they do not fit. The units are zeroed on hand-out (on this stream); a
+        freed unit is reused only after the forwards that touched it retire."""
+        if not self.request_allocators or rows.numel() == 0:
+            return True
+        count = int(rows.numel())
+        demands = {name: count for name in self.request_allocators}
+        decided = self._decided_take(demands)
+        if decided is False:
+            return False
+        physical = self._plan_and_take(demands, bind_at_frontier=True)
+        if physical is None:
+            self._refused_decided_take(decided, demands)
+            return False
+        for name, band in self.request_allocators.items():
+            pages = physical[name]
+            if pages is None:
+                if band.place_pages(rows, count) is None:
+                    raise RuntimeError(
+                        f"{name}: the planned frontier take of {count} units was "
+                        "refused"
+                    )
+            else:
+                band.ids.bind(rows, pages)
+                band._maybe_zero_pages(pages)
+        return True
+
+    def free_request_rows(self, rows: torch.Tensor) -> None:
+        """Release the request sub-pools' units of request rows ``rows``."""
+        for band in self.request_allocators.values():
+            band.free(rows)
 
     def is_slot_allocated(self, slot: int) -> bool:
         """Token-slot surface = the owner (which owns the virtual ids)."""
