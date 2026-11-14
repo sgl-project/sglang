@@ -303,6 +303,7 @@ def _request(**fields):
 
 class _WeightUpdaterManagerTestBase(CustomTestCase):
     def setUp(self):
+        self.enterContext(get_parallel().override(tp_rank=0, tp_size=1))
         patcher = patch("torch.distributed.barrier")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -420,6 +421,154 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
+
+
+class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
+    _routes = ("disk", "distributed", "tensor", "ipc")
+
+    def _case(
+        self,
+        route,
+        *,
+        local_error=False,
+        peer_receive_error=False,
+        peer_flush_error=False,
+        peer_exception=False,
+    ):
+        events = []
+        target, draft = _runner(), _runner()
+
+        def load(*args, **kwargs):
+            events.append("load")
+            if local_error:
+                raise ValueError("local loader failed")
+            return True, "ok"
+
+        for method in (
+            "update_weights_from_disk",
+            "load_weights_from_distributed",
+            "update_weights_from_tensor",
+            "update_weights_from_ipc",
+        ):
+            getattr(target.weight_updater, method).side_effect = load
+
+        manager = self._manager(target, draft)
+
+        def flush(**kwargs):
+            events.append("flush")
+            return True
+
+        manager.flush_cache = flush
+        failed = False
+
+        def gather(outputs, value, group):
+            nonlocal failed
+            events.append("agree")
+            error = None
+            if not failed:
+                if peer_receive_error or (peer_flush_error and "flush" in events):
+                    error = "TP rank 1: peer phase failed"
+                elif not peer_flush_error and "load" in events:
+                    error = "TP rank 1: peer loader failed"
+                failed = error is not None
+            outputs[:] = [value, (int(peer_exception and error is not None), error)]
+
+        with (
+            get_parallel().override(tp_rank=0, tp_size=2),
+            patch("torch.distributed.all_gather_object", side_effect=gather),
+        ):
+            output = getattr(manager, f"update_weights_from_{route}")(_request())
+        return output, manager, draft, events
+
+    def test_peer_load_failure_stops_all_runners_and_preserves_the_version(self):
+        """Rank 0 reported success and loaded the draft after a peer target failed."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                output, manager, draft, events = self._case(route)
+                self.assertFalse(output.success)
+                self.assertIn("TP rank 1", output.message)
+                self.assertEqual(self.recorded, [])
+                self.assertFalse(manager._session.loaded_weights)
+                self.assertEqual(events.count("flush"), 1)
+                self.assertLess(events.index("agree"), events.index("flush"))
+                for method in (
+                    "update_weights_from_disk",
+                    "load_weights_from_distributed",
+                    "update_weights_from_tensor",
+                    "update_weights_from_ipc",
+                ):
+                    self.assertEqual(
+                        getattr(draft.weight_updater, method).call_count, 0
+                    )
+
+    def test_local_exception_remains_fatal_after_reaching_agreement(self):
+        """Unexpected exceptions must not let a partially updated engine resume."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                with self.assertRaisesRegex(
+                    RuntimeError, "local loader failed.*TP rank 1"
+                ):
+                    self._case(route, local_error=True)
+                self.assertEqual(self.recorded, [])
+
+    def test_peer_exception_is_fatal_on_the_healthy_rank_too(self):
+        """Healthy ranks must not continue into draft loading after a peer raised."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                with self.assertRaisesRegex(RuntimeError, "TP rank 1"):
+                    self._case(route, peer_exception=True)
+                self.assertEqual(self.recorded, [])
+
+    def test_deserialization_exception_is_fatal_before_loading(self):
+        """Tensor intake exceptions must not become a resumable partial update."""
+        for tp_size in (1, 2):
+            with self.subTest(tp_size=tp_size):
+                target = _runner()
+                manager = self._manager(target)
+                manager.tp_worker.deserialize_own_rank = Mock(
+                    side_effect=ValueError("invalid tensor payload")
+                )
+                with (
+                    get_parallel().override(tp_rank=0, tp_size=tp_size),
+                    patch(
+                        "torch.distributed.all_gather_object",
+                        side_effect=lambda outputs, value, group: outputs.__setitem__(
+                            slice(None), [value, (1, "TP rank 1: peer intake failed")]
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        (ValueError, RuntimeError),
+                        "invalid tensor payload"
+                        + (".*TP rank 1" if tp_size > 1 else ""),
+                    ),
+                ):
+                    manager.update_weights_from_tensor(_request())
+                target.weight_updater.update_weights_from_tensor.assert_not_called()
+                self.assertEqual(self.recorded, [])
+
+    def test_receive_failure_on_a_peer_prevents_loading_any_runner(self):
+        """A healthy receiver must not start writing while a peer failed intake."""
+        for route in ("distributed", "tensor"):
+            with self.subTest(route=route):
+                self.recorded.clear()
+                output, _, _, events = self._case(route, peer_receive_error=True)
+                self.assertFalse(output.success)
+                self.assertNotIn("load", events)
+                self.assertNotIn("flush", events)
+                self.assertEqual(self.recorded, [])
+
+    def test_peer_flush_failure_is_reported_after_a_successful_load(self):
+        """New weights are recorded, but one rank refusing invalidation fails the RPC."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                output, manager, _, _ = self._case(route, peer_flush_error=True)
+                self.assertFalse(output.success)
+                self.assertIn("peer phase failed", output.message)
+                self.assertEqual(self.recorded, ["v2"])
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
