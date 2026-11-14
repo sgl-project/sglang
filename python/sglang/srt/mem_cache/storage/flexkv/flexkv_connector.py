@@ -256,6 +256,8 @@ class FlexKVConnector:
         token_ids: List[int],
         token_mask: torch.Tensor,
         handle: Optional[CacheRequestHandle] = None,
+        *,
+        namespace: Optional[List[str]],
     ) -> Tuple[int, int]:
         """Page-aligned prefix lookup against FlexKV.
 
@@ -267,6 +269,8 @@ class FlexKVConnector:
             under this key so a later ``retrieve_kv(handle, slots)`` call
             can resolve it. If not set, the held task is cancelled when
             hit > 0 and the caller didn't ask to track it.
+          namespace: seeds FlexKV's block hashes; must equal the one the
+            KV was stored under. None leaves the hashes unseeded.
 
         Returns:
           ``(fkv_task_id, hit_count)``. ``hit_count`` is page-aligned
@@ -280,7 +284,9 @@ class FlexKVConnector:
             tids_np = np.asarray(token_ids, dtype=np.int64)
             mask_np = self._as_numpy_mask(token_mask)
             try:
-                res = self.kv_manager.get_match(token_ids=tids_np, token_mask=mask_np)
+                res = self.kv_manager.get_match(
+                    token_ids=tids_np, token_mask=mask_np, namespace=namespace
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] get_match raised: %s", exc)
                 res = None
@@ -460,6 +466,8 @@ class FlexKVConnector:
         handle: CacheRequestHandle,
         token_ids: List[int],
         kv_indices: torch.Tensor,
+        *,
+        namespace: Optional[List[str]],
     ) -> int:
         """Schedule a write back from GPU into FlexKV.
 
@@ -494,7 +502,9 @@ class FlexKVConnector:
         fkv_task_id = -1
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
-                res = self.kv_manager.put_match(token_ids=token_ids_np, token_mask=None)
+                res = self.kv_manager.put_match(
+                    token_ids=token_ids_np, token_mask=None, namespace=namespace
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] put_match raised: %s", exc)
                 res = None
@@ -591,14 +601,21 @@ class FlexKVConnector:
     # Public API — prefetch
     # ------------------------------------------------------------------
 
-    def prefetch_async(self, handle: CacheRequestHandle, token_ids: List[int]) -> int:
+    def prefetch_async(
+        self,
+        handle: CacheRequestHandle,
+        token_ids: List[int],
+        *,
+        namespace: Optional[List[str]],
+    ) -> int:
         if not self._prefetch_enabled:
             return -1
         task_id = -1
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 task_id = self.kv_manager.prefetch_async(
-                    token_ids=np.asarray(token_ids, dtype=np.int64)
+                    token_ids=np.asarray(token_ids, dtype=np.int64),
+                    namespace=namespace,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[FlexKV] prefetch_async: %s", exc)
