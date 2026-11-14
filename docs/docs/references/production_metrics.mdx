@@ -11,6 +11,13 @@ An example of the monitoring dashboard is available in [examples/monitoring/graf
 
 `sglang:time_to_first_token_seconds` measures the time from request creation in the API server to the first token. For streaming requests it ends when the first output arrives after detokenization, which may contain no printable text. Non-streaming clients only see the final response, so for them it ends when the scheduler produced the first token.
 
+`sglang:time_to_first_answer_token_seconds` measures the time from request creation in the API server to the first streamed output that holds a token after the reasoning end marker. It uses the same labels and buckets as `sglang:time_to_first_token_seconds`. Details:
+
+- It is recorded only for streaming requests, and only when the server runs with `--reasoning-parser` and the parser has a token-based end marker. The boundary is the scheduler's reasoning token count, so a tool call or whitespace right after the marker counts as the answer.
+- The resolution is one streamed output. A streamed output normally holds about `--stream-interval` tokens, but it can hold more (for example with speculative decoding), so this is not an upper bound.
+- Requests that do not reason, never leave reasoning, or abort before their first answer add no sample. An abort after the first answer keeps its sample. Its count can therefore be lower than the count of `sglang:time_to_first_token_seconds`.
+- The Rust frontend does not record it.
+
 Here is an example of the metrics:
 
 ```text Output

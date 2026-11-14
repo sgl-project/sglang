@@ -298,6 +298,7 @@ class ReqState:
     # The latest stats the scheduler sent; see RequestOutputStats for when.
     request_stats: Optional[RequestOutputStats] = None
     ttft_observed: bool = False
+    ttfat_observed: bool = False
 
     dispatched: bool = False
     abort_sent: bool = False
@@ -3492,6 +3493,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # the baseline from the new count.
                 state.time_stats.set_last_time()
                 state.last_completion_tokens = completion_tokens
+
+        # Time to first answer token: the first streamed batch that holds a token
+        # past the reasoning end marker. The scheduler counts reasoning tokens up
+        # to that marker, and the count stays 0 when the parser has no token-based
+        # marker, so a positive count is what proves the boundary is tracked.
+        reasoning_tokens = getattr(recv_obj, "reasoning_tokens", None)
+        if (
+            reasoning_tokens
+            and reasoning_tokens[i] > 0
+            and getattr(state.obj, "stream", False)
+            and finish_type != "abort"
+            and state.ttft_observed
+            and not state.ttfat_observed
+            and completion_tokens > reasoning_tokens[i]
+        ):
+            state.ttfat_observed = True
+            self.metrics_collector.observe_time_to_first_answer_token(
+                labels,
+                time.perf_counter() - state.time_stats.created_time,
+                stream=True,
+            )
 
         if state.finished:
             spec_verify_ct = (

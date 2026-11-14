@@ -932,6 +932,8 @@ mod tests {
         "sglang:startup_cuda_graph_time_seconds",
         // Speculative verify counts are not on the output frames.
         "sglang:spec_verify_calls_total",
+        // The reasoning boundary is tracked by the Python tokenizer manager only.
+        "sglang:time_to_first_answer_token_seconds",
     ];
 
     fn fixture() -> Fixture {

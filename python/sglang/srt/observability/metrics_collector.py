@@ -2126,6 +2126,17 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_time_to_first_token,
         )
 
+        self.histogram_time_to_first_answer_token = Histogram(
+            name="sglang:time_to_first_answer_token_seconds",
+            documentation=(
+                "Histogram of time to first answer token in seconds: from request "
+                "creation to the first streamed output that holds a token after the "
+                "reasoning end marker."
+            ),
+            labelnames=[*labels.keys(), "is_streaming"],
+            buckets=bucket_time_to_first_token,
+        )
+
         self.histogram_inter_token_latency = Histogram(
             name="sglang:inter_token_latency_seconds",
             documentation="Histogram of inter-token latency in seconds.",
@@ -2234,6 +2245,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self, labels: Dict[str, str], value: float, *, stream: bool
     ):
         self.histogram_time_to_first_token.labels(
+            **labels, is_streaming="true" if stream else "false"
+        ).observe(value)
+
+    def observe_time_to_first_answer_token(
+        self, labels: Dict[str, str], value: float, *, stream: bool
+    ):
+        self.histogram_time_to_first_answer_token.labels(
             **labels, is_streaming="true" if stream else "false"
         ).observe(value)
 
