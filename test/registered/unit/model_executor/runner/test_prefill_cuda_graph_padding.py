@@ -27,10 +27,11 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.runtime_context import get_context, override_platform
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestPrefillCudaGraphPadding(CustomTestCase):
@@ -312,9 +313,8 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         self.assertIn("fixed metadata extent", "\n".join(logs.output))
 
     def test_requires_exact_gdn_prefill_bucket_policy(self):
-        """GDN prefill CUDA graphs allow padded replay by default only on SM100
-        quantized FP8/FP4 models; non-SM100 or unquantized GDN models require
-        exact bucket hits unless explicitly opted in or mixed-chunk is active."""
+        """Scheduling flags and checkpoint labels must not enable padded GDN
+        replay: an FP4/mixed checkpoint can retain BF16 projections."""
         gdn_leaf = GDNAttnBackend.__new__(GDNAttnBackend)
         hybrid_gdn = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
         hybrid_gdn.linear_attn_backend = gdn_leaf
@@ -323,25 +323,17 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         non_gdn = SimpleNamespace()
 
         cases = (
-            (hybrid_gdn, True, "modelopt", False, False, False),
-            (hybrid_gdn, True, "modelopt_fp4", False, False, False),
-            (hybrid_gdn, True, "modelopt_fp8", False, False, False),
-            (hybrid_gdn, True, "modelopt_mixed", False, False, False),
-            (hybrid_gdn, True, "fp8", False, False, False),
-            (gdn_leaf, True, "modelopt_fp4", False, False, False),
-            # Non-SM100 (e.g. SM120 / SM90) quantized GDN must require exact buckets.
-            (hybrid_gdn, False, "modelopt_mixed", False, False, True),
-            (hybrid_gdn, False, "modelopt_fp4", False, False, True),
-            (hybrid_gdn, False, "fp8", False, False, True),
-            # SM100 unquantized BF16 GDN must require exact buckets.
-            (hybrid_gdn, True, None, False, False, True),
-            (hybrid_gdn, True, "awq", False, False, True),
+            # The scheduling flag applies even when this batch has no decode rows.
+            (hybrid_gdn, False, "modelopt_fp4", False, True, True),
+            # Blackwell quantization labels do not describe each projection.
+            (hybrid_gdn, True, "modelopt_fp4", False, False, True),
+            (hybrid_gdn, True, "modelopt_mixed", False, True, True),
+            (gdn_leaf, False, None, False, False, True),
             # Non-GDN attention backends keep normal bucket padding.
             (non_gdn, False, None, False, False, False),
-            (hybrid_non_gdn, False, "modelopt_mixed", False, False, False),
-            # Explicit env opt-in or mixed-chunk prefill allows padded buckets.
-            (hybrid_gdn, False, "modelopt_mixed", True, False, False),
-            (hybrid_gdn, False, None, False, True, False),
+            (hybrid_non_gdn, True, "modelopt_mixed", False, True, False),
+            # Only an explicit numerical-risk opt-in disables the guard.
+            (hybrid_gdn, True, "modelopt_mixed", True, False, False),
         )
         for (
             attn_backend,
@@ -370,6 +362,18 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                 self.assertEqual(
                     _requires_exact_gdn_prefill_bucket(model_runner), expected
                 )
+                runner = self._make_runner()
+                runner.prefill_backend_name = Backend.BREAKABLE
+                runner.capture_num_tokens = [16, 20]
+                runner.max_num_tokens = 20
+                runner._requires_exact_prefill_bucket = (
+                    _requires_exact_gdn_prefill_bucket(model_runner)
+                )
+                # Ordinary prefill with no decode rows, even with mixed-chunk on.
+                self.assertEqual(
+                    runner.can_run_graph(self._make_forward_batch(17)), not expected
+                )
+                self.assertTrue(runner.can_run_graph(self._make_forward_batch(20)))
 
     def test_exact_prefill_bucket_guard_and_dp_vote_consensus(self):
         """When exact GDN prefill buckets are required, padded token counts run
