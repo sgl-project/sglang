@@ -116,6 +116,23 @@ class TestStepKernels(unittest.TestCase):
         self.assertGreater(json.loads(smaller)["metadata"]["evicted_for_bytes"], 0)
         self.assertEqual(len(json.loads(smaller)["traceEvents"]) % 2, 0)
 
+    def test_exact_utf8_byte_boundary_and_oversized_newest_forward(self):
+        events = []
+        for i in range(3):
+            k = kernel(i * 10 + 20, i + 1)
+            k["name"] = "算子" * (300 if i == 2 else 1)
+            events.extend([step(i * 10), launch(i * 10 + 2, i + 1), k])
+        a = attribute_step_kernels({"traceEvents": events})
+        full = render_recent_steps(a, max_bytes=10000)
+        self.assertEqual(full, render_recent_steps(a, max_bytes=len(full)))
+        clipped = json.loads(render_recent_steps(a, max_bytes=len(full) - 1))
+        self.assertEqual(clipped["metadata"]["retained_steps"], 2)
+        empty = json.loads(render_recent_steps(a, max_bytes=1000))
+        self.assertEqual(empty["metadata"]["evicted_for_bytes"], 3)
+        self.assertEqual(empty["traceEvents"], [])
+        with self.assertRaises(ValueError):
+            render_recent_steps(a, max_bytes=1)
+
     def test_retention_keeps_all_devices_of_one_forward(self):
         second_device = kernel(25, 2)
         second_device["args"]["device"] = 1

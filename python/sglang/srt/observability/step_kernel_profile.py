@@ -153,18 +153,19 @@ def render_recent_steps(
     )
     count_evicted = max(0, len(indices) - max_steps)
     indices = indices[-max_steps:]
-    byte_evicted = 0
-    while True:
-        steps = [s for i in indices for s in by_forward[i]]
-        origin = min((s["device_start_ns"] for s in steps), default=0)
-        events = []
+    # Keep a fixed time origin while testing successively longer suffixes.
+    origin = min(
+        (s["device_start_ns"] for i in indices for s in by_forward[i]), default=0
+    )
+
+    def events_for(steps):
         for step in steps:
             identity = {
                 "step_index": step["step_index"],
                 "source_pid": step["source_pid"],
                 "source_tid": step["source_tid"],
             }
-            events.append(
+            yield (
                 {
                     "ph": "X",
                     "cat": "step",
@@ -181,7 +182,7 @@ def render_recent_steps(
                 }
             )
             for k in step["kernels"]:
-                events.append(
+                yield (
                     {
                         "ph": "X",
                         "cat": "kernel",
@@ -193,6 +194,13 @@ def render_recent_steps(
                         "args": {**identity, "launch_correlation": k["correlation"]},
                     }
                 )
+
+    def encode(value):
+        return json.dumps(
+            value, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode()
+
+    def trailer(retained):
         metadata = {k: v for k, v in attribution.items() if k != "steps"}
         metadata.update(
             {
@@ -201,24 +209,44 @@ def render_recent_steps(
                 "collection_mode": "window",
                 "dropped_records": None,
                 "attribution": "unique_launch_correlation_and_enclosing_cpu_forward",
-                "retained_steps": len(indices),
+                "retained_steps": retained,
                 "evicted_for_count": count_evicted,
-                "evicted_for_bytes": byte_evicted,
+                "evicted_for_bytes": len(indices) - retained,
                 "completion_scope": "kernels_observed_at_profile_flush",
             }
         )
-        output = json.dumps(
-            {"displayTimeUnit": "ms", "traceEvents": events, "metadata": metadata},
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode()
-        if len(output) <= max_bytes:
-            return output
-        if not indices:
-            raise ValueError("max_bytes cannot hold step trace metadata")
-        indices = indices[1:]
-        byte_evicted += 1
+        return b'],"metadata":' + encode(metadata) + b"}"
+
+    prefix = b'{"displayTimeUnit":"ms","traceEvents":['
+    groups = []
+    size = len(prefix)
+    for index in reversed(indices):
+        tail = trailer(len(groups) + 1)
+        group = bytearray()
+        for event in events_for(by_forward[index]):
+            encoded = encode(event)
+            if (
+                size
+                + len(group)
+                + bool(group)
+                + len(encoded)
+                + bool(groups)
+                + len(tail)
+                > max_bytes
+            ):
+                break
+            if group:
+                group.extend(b",")
+            group.extend(encoded)
+        else:
+            size += len(group) + bool(groups)
+            groups.append(group)
+            continue
+        break
+    tail = trailer(len(groups))
+    if size + len(tail) > max_bytes:
+        raise ValueError("max_bytes cannot hold step trace metadata")
+    return prefix + b",".join(reversed(groups)) + tail
 
 
 def export_step_kernels(trace_path, payload, *, max_bytes: int) -> Path:

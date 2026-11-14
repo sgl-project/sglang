@@ -187,11 +187,12 @@ def export_kernel_summary(trace_path):
         if envs.SGLANG_PROFILE_STEP_KERNELS.get():
             from sglang.srt.observability.step_kernel_profile import export_step_kernels
 
-            export_step_kernels(
+            steps_path = export_step_kernels(
                 path,
                 payload,
                 max_bytes=envs.SGLANG_PROFILE_STEP_TRACE_MAX_BYTES.get(),
             )
+            logger.info("Forward kernel trace saved to %s", steps_path)
     except (OSError, EOFError, zlib.error, ValueError, ArithmeticError):
         logger.warning("Could not summarize profiler trace %s", path, exc_info=True)
     else:
@@ -203,8 +204,16 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace_path")
-    print(
-        json.dumps(
-            summarize_profile(read_profile(parser.parse_args().trace_path)), indent=2
-        )
+    parser.add_argument(
+        "--steps", action="store_true", help="also write a sibling .steps.json"
     )
+    parser.add_argument("--max-step-bytes", type=int, default=8 * 1024 * 1024)
+    options = parser.parse_args()
+    payload = read_profile(options.trace_path)
+    if options.steps:
+        from sglang.srt.observability.step_kernel_profile import export_step_kernels
+
+        export_step_kernels(
+            options.trace_path, payload, max_bytes=options.max_step_bytes
+        )
+    print(json.dumps(summarize_profile(payload), indent=2))
