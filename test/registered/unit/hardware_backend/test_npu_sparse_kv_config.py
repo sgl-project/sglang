@@ -41,26 +41,6 @@ def test_legacy_budget_requires_fused_mode(monkeypatch):
             )
 
 
-def test_fused_policy_rejects_invalid_model_topk(monkeypatch):
-    monkeypatch.setattr(config, "is_npu", lambda: True)
-    monkeypatch.setattr(config, "is_deepseek_dsa", lambda _: True)
-    monkeypatch.setattr(config, "attention_backends", lambda: ("ascend", "ascend"))
-    monkeypatch.setattr(
-        config, "get_schedule", lambda: SimpleNamespace(max_running_requests=4)
-    )
-    monkeypatch.setattr(
-        config, "get_disagg", lambda: SimpleNamespace(disaggregation_mode="null")
-    )
-    with (
-        envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
-        envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
-    ):
-        with pytest.raises(ValueError, match="index_topk=2048"):
-            config.is_sparsity_driven_kv_offload_enabled(
-                model_config=MODEL_CONFIG, use_mla_backend=True
-            )
-
-
 @pytest.mark.parametrize(
     "heads,width,expected_heads,valid",
     [
@@ -147,15 +127,12 @@ def test_draft_policy_is_private_to_fused_mode(monkeypatch, fused, draft):
     monkeypatch.setattr(
         config, "get_disagg", lambda: SimpleNamespace(disaggregation_mode="null")
     )
-    model = SimpleNamespace(**vars(MODEL_CONFIG))
-    model.hf_config = SimpleNamespace(**vars(MODEL_CONFIG.hf_config))
-    model.hf_config.index_topk = 2048 if fused else 512
     with (
         envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
         envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(fused),
     ):
         enabled = config.is_sparsity_driven_kv_offload_enabled(
-            model_config=model, use_mla_backend=True, is_draft_worker=draft
+            model_config=MODEL_CONFIG, use_mla_backend=True, is_draft_worker=draft
         )
     assert enabled is not (fused and draft)
 

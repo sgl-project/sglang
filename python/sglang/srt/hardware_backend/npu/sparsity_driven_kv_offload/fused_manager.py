@@ -104,7 +104,7 @@ class FusedSparseKVCacheManager:
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        sparse_context_len: int,
+        sparse_topk: int,
         paged_kv_cache: Optional[MLATokenToKVPool] = None,
         budget_plan=None,
     ) -> None:
@@ -116,7 +116,7 @@ class FusedSparseKVCacheManager:
         self.actual_request_rows = int(req_to_token_pool.req_to_token.shape[0])
         self.logical_max_context_len = int(req_to_token_pool.req_to_token.shape[1])
         self.req_to_token_pool = req_to_token_pool
-        self.sparse_context_len = int(sparse_context_len)
+        self.sparse_topk = int(sparse_topk)
         self.device = req_to_token_pool.device
         # EAGLE shares the target allocator's token IDs while owning a
         # separate draft KV pool. The allocator's pool is not the draft pool.
@@ -147,7 +147,7 @@ class FusedSparseKVCacheManager:
         self.device_cache_size = self.budget.cache_tokens
         logger.info(
             "Sparse KV per rank: K=%d C=%d, managed HBM=%.2f MiB, host KV=%.2f MiB, host_layout=paged_split",
-            self.sparse_context_len,
+            self.sparse_topk,
             self.device_cache_size,
             self.budget.managed_hbm_bytes / 1024**2,
             self.budget.host_kv_bytes / 1024**2,
@@ -313,7 +313,7 @@ class FusedSparseKVCacheManager:
             "Failed to allocate sparse KV buffer "
             f"{buffer_name}: req_capacity={self.size}, "
             f"max_context_len={self.max_context_len}, "
-            f"sparse_context_len={self.sparse_context_len}. "
+            f"sparse_topk={self.sparse_topk}. "
             "The sparse KV request capacity may be too large; set a smaller "
             "--max-running-requests for sparse KV offload."
         ) from exc
@@ -371,7 +371,7 @@ class FusedSparseKVCacheManager:
     ):
         batch = plan.request_safe_slots.numel()
         rows = batch * plan.query_width
-        ends = self.lim_adapter.copy_sfa_metadata(self, plan)
+        self.lim_adapter.copy_sfa_metadata(self, plan)
         padded_heads = self.fused_attn_out.shape[1]
         if query_nope.shape[1] < padded_heads:
             padding = padded_heads - query_nope.shape[1]
@@ -389,7 +389,7 @@ class FusedSparseKVCacheManager:
             query_nope.contiguous(),
             query_rope.contiguous(),
             cache,
-            ends,
+            self.planner_query_ends,
             self.planner_actual_seq_lengths_kv[:batch],
             self.planner_num_cache_tokens[:batch],
             plan.source_ids,

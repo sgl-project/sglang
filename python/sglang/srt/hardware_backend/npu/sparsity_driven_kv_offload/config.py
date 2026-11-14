@@ -108,8 +108,6 @@ def is_sparsity_driven_kv_offload_enabled(
     if get_disagg().disaggregation_mode == "prefill":
         # Prefill publishes native KV pages; fused offload belongs to decode.
         return False
-    if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
-        raise ValueError("Native LIM integration requires model index_topk=2048.")
     if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
         raise ValueError(
             "Native LIM integration currently requires PP=1 and DCP disabled."

@@ -134,7 +134,7 @@ class LIMDecodeAdapter:
             width,
         )
 
-    def copy_sfa_metadata(self, manager, plan):
+    def copy_sfa_metadata(self, manager, plan) -> None:
         batch = plan.request_safe_slots.numel()
         self._fused_copy_sfa_metadata(
             source_ids=plan.source_ids,
@@ -154,4 +154,4 @@ class LIMDecodeAdapter:
             seq_lens=plan.prefix_lens,
             host_block_table=self.block_table[:batch],
         )
-        return self.query_ends[plan.query_width - 1, :batch]
+        manager.planner_query_ends = self.query_ends[plan.query_width - 1, :batch]

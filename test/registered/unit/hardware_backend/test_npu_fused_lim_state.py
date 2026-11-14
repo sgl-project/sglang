@@ -212,7 +212,7 @@ class TestLIMState(CustomTestCase):
                 size=3,
                 batch_capacity=8,
                 max_query_width=width,
-                sparse_context_len=2048,
+                sparse_topk=2048,
                 max_context_len=32768,
                 layer_num=2,
                 device="cpu",
@@ -466,6 +466,14 @@ class TestLIMState(CustomTestCase):
         def native_copy_sfa(*tensors, **kwargs):
             self.assertEqual(tensors[2].shape[-1], 512)
             self.assertEqual(tensors[3].shape[-1], 64)
+            torch.testing.assert_close(
+                tensors[4],
+                torch.tensor([manager.max_query_width, rows], dtype=torch.int32),
+            )
+            self.assertEqual(
+                tensors[4].data_ptr(),
+                adapter.query_ends[manager.max_query_width - 1].data_ptr(),
+            )
             self.assertEqual(tensors[7].ndim, 2)
             self.assertEqual(tensors[8].ndim, 2)
             torch.testing.assert_close(tensors[7], source_values)

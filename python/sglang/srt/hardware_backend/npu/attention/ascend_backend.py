@@ -407,31 +407,30 @@ class AscendAttnBackend(AttentionBackend):
         self.use_fused_sparse_kv = (
             self.enable_sparsity_driven_kv_offload and use_fused_sparse_kv_offload()
         )
-        self.sparse_kv_manager = (
-            getattr(self.token_to_kv_pool, "sparse_kv_manager", None)
-            if self.use_fused_sparse_kv
-            else None
-        )
-        if self.enable_sparsity_driven_kv_offload and self.sparse_kv_manager is None:
+        if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 register_sparse_kv_manager,
             )
 
-            sparse_context_len = get_sparsity_driven_kv_offload_sparse_context_len(
+            sparse_topk = get_sparsity_driven_kv_offload_sparse_context_len(
                 model_config=model_runner.model_config
             )
             if self.use_fused_sparse_kv:
-                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
-                    FusedSparseKVCacheManager,
+                self.sparse_kv_manager = getattr(
+                    self.token_to_kv_pool, "sparse_kv_manager", None
                 )
+                if self.sparse_kv_manager is None:
+                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
+                        FusedSparseKVCacheManager,
+                    )
 
-                self.sparse_kv_manager = FusedSparseKVCacheManager(
-                    model_runner.req_to_token_pool,
-                    model_runner.token_to_kv_pool_allocator,
-                    sparse_context_len,
-                    paged_kv_cache=self.token_to_kv_pool,
-                )
-                self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
+                    self.sparse_kv_manager = FusedSparseKVCacheManager(
+                        model_runner.req_to_token_pool,
+                        model_runner.token_to_kv_pool_allocator,
+                        sparse_topk,
+                        paged_kv_cache=self.token_to_kv_pool,
+                    )
+                    self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
             else:
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                     SparseKVCacheManager,
@@ -440,13 +439,15 @@ class AscendAttnBackend(AttentionBackend):
                 self.sparse_kv_manager = SparseKVCacheManager(
                     model_runner.req_to_token_pool,
                     model_runner.token_to_kv_pool_allocator,
-                    sparse_context_len,
+                    sparse_topk,
                 )
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
                 "Sparsity-driven KV offload is enabled with manager %s.",
                 self.sparse_kv_manager,
             )
+        else:
+            self.sparse_kv_manager = None
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.use_fias_v2_bsnd = (
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
@@ -1862,6 +1863,7 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: torch.Tensor = None,
     ):
+
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
