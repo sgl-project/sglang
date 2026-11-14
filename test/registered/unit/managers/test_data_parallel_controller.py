@@ -273,6 +273,25 @@ class TestLocalKvEventSources(CustomTestCase):
         )
 
 
+class TestInitInfoReply(CustomTestCase):
+    @staticmethod
+    def _reply(*scheduler_infos):
+        controller = DataParallelController.__new__(DataParallelController)
+        controller._scheduler_init_info_lock = threading.Lock()
+        controller._scheduler_init_infos = []
+        controller._record_scheduler_init_infos(list(scheduler_infos))
+        return controller.get_init_info()
+
+    def test_router_l3_layout_is_forwarded_only_when_a_scheduler_reports_it(self):
+        """The reply holds only the keys the controller names, so it must name this one."""
+        info = {"max_total_num_tokens": 64, "max_req_input_len": 32}
+        reporting = {**info, "router_l3_layout": "layout-a"}
+        self.assertEqual(
+            self._reply(reporting, reporting)["router_l3_layout"], "layout-a"
+        )
+        self.assertNotIn("router_l3_layout", self._reply(info, info))
+
+
 class TestDPBudgetUpdateBudget(CustomTestCase):
     def test_maps_running_plus_waiting_to_total_requests(self):
         budget = DPBudget(num_dp_ranks=2)
