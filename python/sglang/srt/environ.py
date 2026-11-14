@@ -1984,6 +1984,16 @@ class Envs:
     SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
 
     # ===================================================================
+    # API keys (HTTP auth)
+    # ===================================================================
+    # SGLANG_API_KEY / SGLANG_ADMIN_API_KEY are the env fallbacks for the
+    # --api-key / --admin-api-key CLI flags. The CLI flag keeps precedence.
+    # Passing the secret via the environment keeps it out of the process
+    # command line, which is world-readable via /proc/<pid>/cmdline.
+    SGLANG_API_KEY = EnvStr(None)
+    SGLANG_ADMIN_API_KEY = EnvStr(None)
+
+    # ===================================================================
     # NUMA and CPU affinity
     # ===================================================================
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)

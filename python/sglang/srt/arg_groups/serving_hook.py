@@ -382,6 +382,21 @@ def handle_deprecated_args(server_args: Any):
             grpc_port=grpc_port_env,
         )
 
+    # --api-key / --admin-api-key fall back to SGLANG_API_KEY /
+    # SGLANG_ADMIN_API_KEY, so the secret never has to appear in the process
+    # command line (world-readable via /proc/<pid>/cmdline). The CLI flag
+    # keeps precedence; an empty env value counts as unset.
+    for attr, env in (
+        ("api_key", envs.SGLANG_API_KEY),
+        ("admin_api_key", envs.SGLANG_ADMIN_API_KEY),
+    ):
+        if getattr(cfg, attr) is None:
+            value = env.get()
+            if value:
+                declare_resolution(
+                    server_args, "_handle_deprecated_args", **{attr: value}
+                )
+
     # Legacy SMG defaults its port to --port + 10000. Derive/validate only
     # when gRPC is in use, so HTTP-only high ports don't fail validation.
     legacy_grpc = cfg.smg_grpc_mode or cfg.grpc_mode

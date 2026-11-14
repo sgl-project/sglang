@@ -4775,6 +4775,61 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 
+class TestApiKeyEnvFallback(CustomTestCase):
+    """--api-key / --admin-api-key fall back to SGLANG_API_KEY /
+    SGLANG_ADMIN_API_KEY when the flag is absent, so the secret never has
+    to appear in the process command line (world-readable via
+    /proc/<pid>/cmdline). The CLI flag keeps precedence.
+
+    The fallback lives in `serving_hook.handle_deprecated_args`, which
+    __post_init__ skips for dummy models, so these tests build a dummy
+    ServerArgs and invoke that handler directly (same pattern as
+    TestGrpcServerArgs).
+    """
+
+    @staticmethod
+    def _args(**kwargs):
+        return ServerArgs(model_path="dummy", **kwargs)
+
+    def test_env_api_key_used_when_flag_absent(self):
+        sa = self._args()
+        with envs.SGLANG_API_KEY.override("env-secret"):
+            handle_deprecated_args(sa)
+        self.assertEqual(resolution_result(sa, "api_key"), "env-secret")
+
+    def test_env_admin_api_key_used_when_flag_absent(self):
+        sa = self._args()
+        with envs.SGLANG_ADMIN_API_KEY.override("env-admin-secret"):
+            handle_deprecated_args(sa)
+        self.assertEqual(resolution_result(sa, "admin_api_key"), "env-admin-secret")
+
+    def test_cli_api_key_takes_precedence_over_env(self):
+        sa = self._args(api_key="cli-secret")
+        with envs.SGLANG_API_KEY.override("env-secret"):
+            handle_deprecated_args(sa)
+        self.assertEqual(resolution_result(sa, "api_key"), "cli-secret")
+
+    def test_cli_admin_api_key_takes_precedence_over_env(self):
+        sa = self._args(admin_api_key="cli-admin-secret")
+        with envs.SGLANG_ADMIN_API_KEY.override("env-admin-secret"):
+            handle_deprecated_args(sa)
+        self.assertEqual(resolution_result(sa, "admin_api_key"), "cli-admin-secret")
+
+    def test_empty_env_value_counts_as_unset(self):
+        sa = self._args()
+        with envs.SGLANG_API_KEY.override(""):
+            handle_deprecated_args(sa)
+        self.assertIsNone(resolution_result(sa, "api_key"))
+
+    def test_env_api_key_conflicts_with_grpc_port(self):
+        # The env-provided key must hit the same --grpc-port incompatibility
+        # check as a CLI-provided one.
+        sa = self._args(grpc_port=50051)
+        with envs.SGLANG_API_KEY.override("env-secret"):
+            with self.assertRaisesRegex(ValueError, "incompatible"):
+                handle_deprecated_args(sa)
+
+
 class TestTwoBatchOverlapBackend(CustomTestCase):
     """Non-EP DP two-batch-overlap backend requirement.
 
