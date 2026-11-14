@@ -662,6 +662,8 @@ fn built_request_keeps_its_media() {
                 url: "file:///v.mp4".into(),
                 hints: MediaHints {
                     fps: Some(2.0),
+                    max_frames: Some(16),
+                    max_tokens_per_frame: Some(64),
                     ..Default::default()
                 },
             }],
@@ -683,7 +685,9 @@ fn built_request_keeps_its_media() {
     );
     assert_eq!(
         body["video_data"],
-        serde_json::json!([{"url": "file:///v.mp4", "fps": 2.0}])
+        serde_json::json!([{
+            "url": "file:///v.mp4", "fps": 2.0, "max_frames": 16, "max_tokens_per_frame": 64,
+        }])
     );
     assert_eq!(body["audio_data"], Value::Null);
 }
