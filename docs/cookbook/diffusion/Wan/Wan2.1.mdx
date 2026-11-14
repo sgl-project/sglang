@@ -50,6 +50,21 @@ Current supported optimization options are listed in the [SGLang diffusion suppo
 - `--ring-degree {RING_DEGREE}`: Degree of ring attention-style SP in USP.
 - `--text-encoder-cpu-offload`, `--dit-cpu-offload`, `--vae-cpu-offload`: Use CPU offload to reduce peak GPU memory when needed.
 
+#### Optional UMT5 padding trim
+
+Set `SGLANG_DIFFUSION_WAN_TEXT_PADDING` before starting `sglang serve` or
+`sglang generate` to change the UMT5 encoder's padding:
+
+- `max` (default): pad to 512 tokens, preserving the existing inference path.
+- `longest`: pad to the longest prompt in the encoder batch.
+- `bucket`: use the longest prompt length rounded up to a multiple of 64.
+
+The DiT still receives 512-token, zero-padded embeddings with a matching mask.
+Shorter encoder inputs can reduce text-encoding work, but change BF16 rounding
+and can produce a different video for the same seed. Keep `max` for output
+comparisons with the default path; trimming is not a bit-exact optimization.
+It does not reduce the DiT's sequence length or denoising work.
+
 ### 3.3 24 GB NVIDIA GPUs
 
 The 14B DiTs do not fit on a 24 GB card in BF16 (the I2V-14B one is 30.5 GiB), so their weights have to stream from host memory layer by layer. On CUDA, `--performance-mode memory` streams the DiT, text encoder, image encoder and VAE:
@@ -83,21 +98,13 @@ For more API usage and request examples, please refer to:
 
 #### 4.1.1 Launch a server and then send requests
 
-```bash Command
-sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers --port 30000
-
-curl http://127.0.0.1:30000/v1/images/generations \
-  -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -d '{
-    "model": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
-    "prompt": "A cute baby sea otter",
-    "n": 1,
-    "size": "1024x1024",
-    "response_format": "b64_json"
-  }'
-```
+Use the Server and Request commands in the [command builder](#1-quick-start)
+for the selected checkpoint and T2V or I2V mode. The request submits an
+asynchronous job to `POST /v1/videos`; it does not return base64 image data.
+Poll `GET /v1/videos/{video_id}` until `status` is `completed`, then download
+`GET /v1/videos/{video_id}/content` to an MP4 file. If the job is `failed`,
+inspect its error instead. See [Video generation](/docs/sglang-diffusion/api/openai_api#video-generation)
+for polling and download examples.
 
 #### 4.1.2 Generate a video without launching a server
 
