@@ -80,6 +80,23 @@ class ToolResultBlock(BaseModel):
     content: Optional[Union[str, list["AnthropicContentBlock"]]] = None
     is_error: Optional[bool] = None
 
+    @field_validator("content")
+    @classmethod
+    def validate_nested_content(cls, content):
+        if isinstance(content, list):
+            for index, block in enumerate(content):
+                if block.type not in (
+                    "text",
+                    "image",
+                    "tool_reference",
+                    "search_result",
+                ):
+                    raise ValueError(
+                        f"Unsupported tool_result.content[{index}] type: {block.type!r}; "
+                        "expected text, image, tool_reference or search_result"
+                    )
+        return content
+
 
 class ToolReferenceBlock(BaseModel):
     """sglang extension: references a deferred-loaded tool by name."""
