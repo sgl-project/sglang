@@ -805,6 +805,31 @@ bandwidth — every fix here is a cost booked under another goal.
 **Cross-goal.** Context parallelism adds inter-device traffic, and an unchunked prefill keeps decode waiting wherever
 the two share a node — long-context settings are the most likely to shift [TPOT](#lower-decode-latency-tpot).
 
+### Shared-prefix workloads
+
+When requests share a large prefix — one system prompt across all traffic, or a `generated-shared-prefix`
+benchmark — the prefix cache is the first-order knob, ahead of everything in
+[Lower decode latency (TPOT)](#lower-decode-latency-tpot):
+
+1. Leave [`--disable-radix-cache`](#batching-graphs-and-memory) unset. The no-cache recipes (random-input
+   benchmark traffic, prefill-role nodes) set it because their requests truly share nothing; carrying the flag
+   over to shared-prefix traffic re-prefills the full prompt on every request. Nothing on the client side
+   reports the difference — the benchmark completes normally either way.
+2. On hybrid GDN / linear-attention models, prefix states do not enter the radix tree by default: add
+   `--mamba-radix-cache-strategy extra_buffer` and size `--max-mamba-cache-size` to the prefix states kept —
+   the [Qwen3.6-27B 64k-prefix90 recipe](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b)
+   is a validated example.
+3. Keep [`--chunked-prefill-size`](#batching-graphs-and-memory) bounded on mixed deployments. The cache makes
+   every prefill but the first per prefix short, but an unchunked cold pass still stalls all decode sharing
+   the device for the full prefix length.
+4. Verify reuse on the server, not from the dataset: the `#cached-token:` field of the `Prefill batch` log line
+   is the measured hit. A 90% prefix ratio describes the input, not what the server cached.
+
+**Cross-goal.** The bounded chunk trades prefill throughput and the extra mamba buffer trades memory headroom,
+both from the budgets of [TTFT](#lower-time-to-first-token-ttft) and
+[OOM](#resolve-out-of-memory-errors); on mixed traffic the first request per prefix still pays the full
+prefill, which is [Serve long contexts](#serve-long-contexts) read from the other side.
+
 ### From an observed symptom
 
 The goals above start from what you want; this table starts from what you see on a running deployment. Utilization
@@ -820,6 +845,7 @@ the row, not the section.
 | Ranks unevenly busy | [`--load-balance-method`](#parallelism), the [Parallelism](#parallelism) rows, prefix-cache distribution across DP ranks |
 | Communication dominates while operators run small | Parallel granularity: [`--tp-size`](#parallelism), [`--moe-dense-tp-size`](#parallelism), [`--enable-dp-lm-head`](#parallelism) — confirm with a profile first |
 | Long inputs run out of memory | The KV budget, temporary activation space, and graph capture range — see [Resolve out-of-memory errors](#resolve-out-of-memory-errors) |
+| Shared-prefix traffic re-prefills every request — TPOT at long-input level, `#cached-token: 0` in `Prefill batch` logs | The [Shared-prefix workloads](#shared-prefix-workloads) switches: [`--disable-radix-cache`](#batching-graphs-and-memory) set, or GDN prefix states uncached (`--mamba-radix-cache-strategy`) |
 | Throughput improved but TTFT worsened | Queueing and admission delay — the trade-off the change was expected to pay. Re-read the row of the knob you moved. |
 
 ### Tune a PD-disaggregated or multi-node deployment
