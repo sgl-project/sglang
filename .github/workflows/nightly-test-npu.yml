@@ -94,7 +94,17 @@ jobs:
             echo "job_filter=${{ inputs.job_filter }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a3 }}" ]; then
-            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              # TEMPORARY: the moving main-cann9.1.0-a3 tag built on 2026-11-13
+              # (commit 1b2870d33) ships an inconsistent sglang / KDA kernel
+              # pair ("_AscendKDAExtendKernel has no attribute
+              # wants_int64_query_start_loc") and crashes during the server
+              # startup warmup. Pin PR runs to the newest dated a3 image that
+              # predates that build; restore the main tag before merging.
+              echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-20261110" >> $GITHUB_OUTPUT
+            else
+              echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
+            fi
           else
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
