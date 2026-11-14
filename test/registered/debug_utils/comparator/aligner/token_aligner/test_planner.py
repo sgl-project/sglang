@@ -368,6 +368,15 @@ class TestMatchSequences:
         )
         assert matched == []
 
+    def test_prefix_tie_breaks_by_first_candidate_and_ignores_unrelated_first_tokens(self):
+        """Prefix matching ignores unrelated first tokens and preserves tie-break order."""
+        matched = _match_seqs(
+            x={0: (99, 1, 2), 1: (10, 20), 2: (10, 20), 3: (50, 60)},
+            y={0: (10, 20, 30)},
+        )
+        S = _int_to_seq_id
+        assert matched == [(S(1), S(0))]
+
 
 class TestComputeAlignmentPlanCrossFramework:
     """Tests for alignment plan across different frameworks and layouts."""
