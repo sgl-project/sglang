@@ -3199,3 +3199,18 @@ def test_layerwise_breakable_graph_preserves_copies_and_event_lifetimes():
         runner.reset()
         manager.release_all()
         manager.remove_forward_hooks()
+
+
+def test_mps_non_layer_weight_methods_noop_before_capture(monkeypatch):
+    class StreamingModule(LayerwiseOffloadableModuleMixin, torch.nn.Module):
+        mps_stream_non_layer_weights = True
+
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4)
+
+    module = StreamingModule()
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_mps", lambda: True)
+    module.materialize_mps_non_layer_weights("proj")
+    module.release_mps_non_layer_weights("proj")
+    module.restore_mps_cpu_non_layer_weights()

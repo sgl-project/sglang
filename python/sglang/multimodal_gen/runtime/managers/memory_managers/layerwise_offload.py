@@ -2962,8 +2962,17 @@ class LayerwiseOffloadableModuleMixin:
             name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes
         )
 
+    def _has_captured_mps_non_layer_weights(self) -> bool:
+        return hasattr(self, "_mps_cpu_non_layer_parameters") and hasattr(
+            self, "_mps_cpu_buffers"
+        )
+
     def materialize_mps_non_layer_weights(self, *prefixes: str) -> None:
-        if not current_platform.is_mps() or not self.mps_stream_non_layer_weights:
+        if (
+            not current_platform.is_mps()
+            or not self.mps_stream_non_layer_weights
+            or not self._has_captured_mps_non_layer_weights()
+        ):
             return
         selected_prefixes = tuple(prefixes)
         with torch.inference_mode(False), torch.no_grad():
@@ -2981,7 +2990,11 @@ class LayerwiseOffloadableModuleMixin:
                     )
 
     def release_mps_non_layer_weights(self, *prefixes: str) -> None:
-        if not current_platform.is_mps() or not self.mps_stream_non_layer_weights:
+        if (
+            not current_platform.is_mps()
+            or not self.mps_stream_non_layer_weights
+            or not self._has_captured_mps_non_layer_weights()
+        ):
             return
         selected_prefixes = tuple(prefixes)
         with torch.inference_mode(False), torch.no_grad():
@@ -3005,7 +3018,10 @@ class LayerwiseOffloadableModuleMixin:
         torch.mps.empty_cache()
 
     def restore_mps_cpu_non_layer_weights(self) -> None:
-        if not current_platform.is_mps():
+        if (
+            not current_platform.is_mps()
+            or not self._has_captured_mps_non_layer_weights()
+        ):
             return
         with torch.inference_mode(False), torch.no_grad():
             parameters = dict(self.named_parameters())
