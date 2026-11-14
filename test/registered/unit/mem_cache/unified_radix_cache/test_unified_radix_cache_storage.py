@@ -1893,6 +1893,14 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         self.assertEqual(cache2.buffer_pipeline.anchor_lock_cap_tokens, 0)
 
+        cache3, _alloc3, rtp3 = self._build_buffer_hicache_fixture(
+            storage_dir, fixture_headroom=False
+        )
+        self.assertEqual(
+            cache3.buffer_pipeline.anchor_lock_cap_tokens,
+            max(0, min(pool // 2, pool - rtp3.max_context_len)),
+        )
+
     @requires_hicache
     @requires(lambda cfg: cfg.has_swa, "SWA-specific admission accounting")
     def test_buffer_load_back_swa_window_charged_at_admission(self):
