@@ -15,6 +15,7 @@ from functools import lru_cache
 from typing import Protocol
 
 import msgspec
+
 from sglang_simulator.time_predictor.base import PredictorError
 
 STEP_ATTRIBUTE = "_sglang_simulator_dspark_step"
@@ -69,11 +70,36 @@ def _cached_canonical_budget(value, label):
     return _read_canonical_budget(value, label)
 
 
+@lru_cache(maxsize=4)
+def _cached_canonical_profile(value):
+    return _read_canonical_budget(value, "runtime_profile_json")
+
+
+@lru_cache(maxsize=256)
+def _cached_canonical_sampling(value):
+    return _read_canonical_budget(value, "sampling_params_json")
+
+
 def _canonical_budget(value, label):
-    # The bound limits retention only; larger or non-builtin inputs retain the
-    # original validation/error path without hashing user-defined objects.
-    if type(value) is str and type(label) is str and len(value) <= 1024 * 1024:
-        return _cached_canonical_budget(value, label)
+    # Run identities, request recipes and changing executions have independent
+    # lifetimes. A busy batch must not evict and reparse its immutable profile.
+    # Entry/character limits bound retained text to 10 Mi characters overall;
+    # larger or non-builtin inputs keep the original validation/error path.
+    if type(value) is str and type(label) is str:
+        if label == "runtime_profile_json":
+            return (
+                _cached_canonical_profile(value)
+                if len(value) <= 1024 * 1024
+                else _read_canonical_budget(value, label)
+            )
+        if label == "sampling_params_json":
+            return (
+                _cached_canonical_sampling(value)
+                if len(value) <= 16 * 1024
+                else _read_canonical_budget(value, label)
+            )
+        if len(value) <= 64 * 1024:
+            return _cached_canonical_budget(value, label)
     return _read_canonical_budget(value, label)
 
 
