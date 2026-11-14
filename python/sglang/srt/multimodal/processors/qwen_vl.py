@@ -17,6 +17,7 @@ from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.interns2_mobius import (
@@ -1066,6 +1067,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         self,
         input_text,
         artifacts: list[QwenVLImagePreprocessArtifact],
+        *,
+        add_special_tokens: Optional[bool] = None,
     ) -> Optional[MultimodalProcessorOutput]:
         """Compose prompt tokens and request-owned items from cached images.
 
@@ -1097,7 +1100,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                     offsets,
                     mrope_positions,
                     mrope_position_delta,
-                ) = self._cached_image_prompt_template(normalized_text, grid_key)
+                ) = self._cached_image_prompt_template(
+                    normalized_text, grid_key, add_special_tokens
+                )
             else:
                 (
                     input_ids_tuple,
@@ -1163,11 +1168,26 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         return normalized
 
     @lru_cache(maxsize=256)
-    def _cached_image_prompt_template(self, input_text: str, grid_key: tuple):
-        """Cache prompt expansion and M-RoPE by prompt and image-grid shape."""
-        return self._build_image_prompt_template(input_text, grid_key)
+    def _cached_image_prompt_template(
+        self,
+        input_text: str,
+        grid_key: tuple,
+        add_special_tokens: Optional[bool] = None,
+    ):
+        """Cache expansion and M-RoPE by prompt, grid, and tokenization policy."""
+        return self._build_image_prompt_template(
+            input_text, grid_key, add_special_tokens
+        )
 
-    def _build_image_prompt_template(self, input_text, grid_key: tuple):
+    def _build_image_prompt_template(
+        self, input_text, grid_key: tuple, add_special_tokens: Optional[bool] = None
+    ):
+        if isinstance(input_text, str) and add_special_tokens is not None:
+            # Preserve the request's template policy without changing the shared
+            # tokenizer. Alias normalization has already happened above.
+            input_text = self._tokenizer.encode(
+                input_text, add_special_tokens=add_special_tokens
+            )
         image_grid_thw = torch.tensor(grid_key, dtype=torch.long)
         input_ids_list, offsets, modalities = self.build_input_ids(
             input_text, img_grid_thw=image_grid_thw
@@ -1233,6 +1253,13 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         preprocess_time = time.perf_counter()
 
         processor_kwargs = {}
+        add_special_tokens = (
+            request_obj.embedding_add_special_tokens
+            if isinstance(request_obj, EmbeddingReqInput)
+            else None
+        )
+        if add_special_tokens is not None:
+            processor_kwargs["add_special_tokens"] = add_special_tokens
         processor_video_config = _get_processor_video_config(
             self.video_config, video_metadata
         )
@@ -1404,7 +1431,15 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         artifacts = await prepare_artifacts(
             image_data, content_hashes=getattr(request_obj, "mm_content_hashes", None)
         )
-        composed = self.compose_image_artifacts(input_text, artifacts)
+        composed = self.compose_image_artifacts(
+            input_text,
+            artifacts,
+            add_special_tokens=(
+                request_obj.embedding_add_special_tokens
+                if isinstance(request_obj, EmbeddingReqInput)
+                else None
+            ),
+        )
         if composed is not None:
             return composed
         return await self._process_mm_data_uncached(
