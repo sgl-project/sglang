@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import math
+import os
+import tempfile
 import unittest
+from types import SimpleNamespace
 
 from sglang.multimodal_gen.configs.models.dits.llada_image import (
     LLaDAImageArchConfig,
@@ -15,6 +19,18 @@ from sglang.multimodal_gen.configs.sample.llada_image import (
     LLaDAImageTurboSamplingParams,
 )
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentCheckpointUnsupportedError,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    RESIDENT,
+)
+from sglang.multimodal_gen.runtime.pipelines.llada_image import _check_fp8_transformer
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning import (
+    llada_image_text_encoder_quantization,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 
 
 class TestLLaDAImageConfig(unittest.TestCase):
@@ -63,6 +79,69 @@ class TestLLaDAImageConfig(unittest.TestCase):
             config.validate_output_size(1008, 1008, editing=True)
         with self.assertRaisesRegex(ValueError, "sequence positions"):
             config.validate_output_size(2048, 2048, editing=True)
+
+    def test_fp8_transformer_is_served_only_for_turbo(self):
+        """The FP8 Base DiT costs text rendering, so only Turbo serves FP8."""
+        pinned = []
+        with tempfile.TemporaryDirectory() as path:
+            with open(os.path.join(path, "config.json"), "w") as config_file:
+                json.dump({"quantization_config": {"quant_method": "fp8"}}, config_file)
+            for model_path, served in (
+                ("inclusionAI/LLaDA-Image-Turbo-FP8", True),
+                ("inclusionAI/LLaDA-Image-FP8", False),
+            ):
+                server_args = SimpleNamespace(
+                    model_path=model_path,
+                    backend=None,
+                    model_id=None,
+                    explicit_residency_mode=lambda name: None,
+                    residency_mode=lambda name: RESIDENT,
+                    require_component_resident=lambda name, feature_name: pinned.append(
+                        name
+                    ),
+                )
+                with self.subTest(model_path=model_path):
+                    if served:
+                        _check_fp8_transformer(server_args, path)
+                    else:
+                        with self.assertRaisesRegex(
+                            ComponentCheckpointUnsupportedError, "Turbo"
+                        ):
+                            _check_fp8_transformer(server_args, path)
+        self.assertEqual(pinned, ["transformer"])
+
+    def test_fp8_text_encoder_quantizes_only_routed_experts(self):
+        """BF16 encoder weights must never load into FP8 layers, which corrupts them."""
+        config = {
+            "first_k_dense_replace": 1,
+            "llada_fp8_experts": {
+                "enabled": True,
+                "format": "e4m3fn",
+                "weight_method": "symmetric_absmax_rtn",
+                "weight_granularity": "per_expert_2d_block",
+                "weight_block_size": [128, 128],
+                "activation_method": "dynamic_absmax_rtn",
+                "activation_granularity": "per_token",
+            },
+        }
+        fp8 = Fp8Config.from_config(llada_image_text_encoder_quantization(config))
+        self.assertTrue(fp8.is_checkpoint_fp8_serialized)
+        self.assertEqual(fp8.weight_block_size, [128, 128])
+        expected = {
+            "model.layers.1.mlp.experts": False,
+            "model.layers.10.mlp.experts": False,
+            "model.layers.1.attention.query_key_value": True,
+            "model.layers.1.attention.dense": True,
+            "model.layers.1.mlp.shared_experts.gate_up_proj": True,
+            "model.layers.1.mlp.shared_experts.down_proj": True,
+            "model.layers.0.mlp.gate_up_proj": True,
+            "model.layers.0.mlp.down_proj": True,
+        }
+        for prefix, skipped in expected.items():
+            with self.subTest(prefix=prefix):
+                self.assertIs(is_layer_skipped(prefix, fp8.ignored_layers), skipped)
+        del config["llada_fp8_experts"]
+        self.assertIsNone(llada_image_text_encoder_quantization(config))
 
 
 if __name__ == "__main__":
