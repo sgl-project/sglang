@@ -1195,6 +1195,12 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
+    # Cap the compile-time wave budget for hand-tuned ROCm absorb-BMM.
+    # A budget of four aborts compilation in the original gfx950 reproducer;
+    # two avoids that failure. Zero disables the cap for tuning.
+    SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU = EnvInt(2)
+    # Ignore the hand-tuned absorb-BMM config and let AITER choose its tuning.
+    SGLANG_ROCM_ABSORB_BMM_DISABLE_HAND_CONFIG = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
