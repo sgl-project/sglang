@@ -36,6 +36,35 @@ sglang generate \
 
 ## Advanced controls
 
+### FLUX.1 with true CFG
+
+When FLUX.1 evaluates separate positive and negative branches (true CFG),
+forecasts from early steps drift far from the real features, so Spectrum follows
+a bounded schedule up to a CFG weight of 2: real forwards for the first 40% of
+the steps and the last 2, and a real forward every other step in between. Above
+2, Spectrum is disabled for the request and every step runs a real forward. The
+log reports which one applies.
+
+On FLUX.1-dev at 1024x1024 (guidance 3.5, true CFG 1.5 and 2.0, 28 and 50
+steps, 15 prompts, 2 seeds, one B200), the bounded schedule ran about 72% of the
+DiT forwards and was 1.35x faster than the same requests without Spectrum.
+Against those requests the median PSNR was 28.2–31.6 dB and LPIPS stayed at or
+below 0.114, with or without CFG parallelism. The differences are changes in
+composition, texture or small details, sometimes a different but plausible
+element (for example, a paved surface instead of asphalt); no artifacts were
+visible.
+
+FLUX.1 also limits CFG gating to at most the final step. For example, requesting
+`cfg_gate_step=0.3` with 20 steps uses real negative-branch predictions for the
+first 19 steps. Residual refreshes use real positive and negative predictions
+and update both Spectrum histories. CFG-parallel requests still disable gating.
+
+Both remain approximations. Compare outputs against your uncached baseline and
+measure latency with diagnostics disabled. FLUX.1 without true CFG and the other
+supported models retain their existing Spectrum schedules.
+
+### Parameter reference
+
 Use `--enable-spectrum` explicitly. Providing any Spectrum override also
 enables it, but that implicit behavior is intended for scripts rather than new
 commands.
@@ -56,3 +85,35 @@ commands.
 These controls trade speed against output fidelity. Change one control at a
 time and retain a lossless baseline for comparison.
 </Warning>
+
+## Combining with CFG gating
+
+CFG gating (`--cfg-gate-step F`; `1.0`, the default, turns it off) is a
+separate lossy option. After fraction `F` of the steps it skips the
+unconditional forward and reuses the conditional-minus-unconditional difference
+frozen at that step, so the guidance term stops following the trajectory. Its
+error grows with the number of reused steps and with the guidance scale.
+
+With both enabled, every step before the gate runs real forwards on both
+branches, so the frozen difference never contains a Spectrum forecast. Spectrum
+therefore cannot skip those steps, and the combination is slower than Spectrum
+alone without being more accurate. On Wan, use Spectrum alone.
+
+Wan2.1-T2V-1.3B at its defaults (480x832, 81 frames, 50 steps, guidance 3.0),
+seed 42, two prompts, one B200, compared with the same request run without
+acceleration (latency from single runs, indicative only):
+
+| Setting | Mean frame PSNR | Mean LPIPS | Latency |
+| --- | --- | --- | --- |
+| None | — | — | 60 s |
+| `--enable-spectrum` | 26.8–27.6 dB | 0.08–0.10 | 19 s |
+| `--cfg-gate-step 0.3` | 30.1–31.2 dB | 0.02–0.03 | 39 s |
+| Both of the above | 28.5–30.3 dB | 0.05–0.06 | 25 s |
+| `--cfg-gate-step 0.7` | 40.2–42.1 dB | 0.003–0.005 | 51 s |
+| `--cfg-gate-step 0.9` | 46.1–47.1 dB | 0.001 | 57 s |
+
+At guidance 5.0 the accelerated settings lose another 1–7 dB.
+
+Wan therefore caps gating at the last 5 steps: an earlier gate is moved to step
+`num_steps - 5` with a warning, so at 50 steps `--cfg-gate-step 0.3` and `0.7`
+run as `0.9`. The 0.3 and 0.7 rows above were measured without the cap.
