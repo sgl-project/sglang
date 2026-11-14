@@ -49,6 +49,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             and not self.dsa_kv_cache_store_fp8
         ):
             return
+        # aiter's sparse prefill reads every column of the table, tail included.
+        if dsa_impl == "aiter" and phase == "prefill" and self.aiter_sparse_prefill:
+            return
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1

@@ -2,6 +2,7 @@
 two-source OPUS attention against an fp32 reference, and the -1 filled raw top-k buffers it reads."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -127,6 +128,49 @@ class TestOpusSparsePrefill(CustomTestCase):
         for heads in (32, 16):
             for two_sources in (True, False):
                 self._case(heads, two_sources, gen)
+
+    def test_dsa_kpool_table_without_sink(self):
+        """The DSA aiter prefill on a GLM-5.3-Flash kpool table (2,051 columns, -1 holes, an all -1
+        padding row), no sink, with q head-major as forward_extend passes it: 40 rows run TileLang,
+        300 rows run OPUS."""
+        from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
+            combined_to_csr,
+        )
+        from sglang.srt.layers.attention.dsa_backend import (
+            _AITER_SPARSE_PREFILL_MIN_ROW_HEADS,
+            DeepseekSparseAttnBackend,
+        )
+
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.kv_lora_rank = D
+        layer = SimpleNamespace(v_head_dim=D, scaling=SCALE)
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        width, n_kv = 2051, 3000
+        kv = (torch.randn(n_kv, D, generator=gen, device="cuda") * 0.5).to(
+            torch.bfloat16
+        )
+        for T in (40, 300):
+            for heads in (32, 16):
+                q = (torch.randn(heads, T, D, generator=gen, device="cuda") * 0.5).to(
+                    torch.bfloat16
+                )
+                q = q.transpose(0, 1)
+                table, _ = _padded_lists(T, width, n_kv, gen)
+                table[-1] = -1
+                out = backend._forward_aiter_sparse_prefill(
+                    q, kv.view(n_kv, 1, D), table, layer
+                )
+                lens = torch.full((T,), width, dtype=torch.int32, device="cuda")
+                csr = combined_to_csr(table, lens, 0, n_kv)
+                no_sink = torch.full((heads,), float("-inf"), device="cuda")
+                # the padding row has no keys and no softmax to compare against
+                ref = _attention_reference(q[:-1], [(kv, csr)], no_sink)
+                err = (
+                    out[:-1].float() - ref
+                ).abs().max().item() / ref.abs().max().item()
+                self.assertLess(err, TOL, (T, heads, err))
+                if T * heads >= _AITER_SPARSE_PREFILL_MIN_ROW_HEADS:
+                    self.assertTrue(bool((out[-1] == 0).all()), (T, heads))
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950")
