@@ -25,12 +25,10 @@ _MSGPACK_FAITHFUL_TYPES = frozenset(
     (
         type(None),
         bool,
-        int,
         float,
         str,
         bytes,
         torch.Tensor,
-        np.ndarray,
         array,
         msgspec.msgpack.Ext,
     )
@@ -153,6 +151,16 @@ def _is_msgpack_faithful(value: object) -> bool:
     value_type = type(value)
     if value_type in _MSGPACK_FAITHFUL_TYPES:
         return True
+    if value_type is int:
+        return -(1 << 63) <= value < (1 << 64)
+    if value_type is np.ndarray:
+        # The raw-buffer codec only records dtype.str, not fields or metadata.
+        return (
+            value.dtype.fields is None
+            and not value.dtype.hasobject
+            and value.dtype.metadata is None
+            and value.dtype.itemsize > 0
+        )
     if value_type is list:
         # The first check covers a flat list of leaves without a Python call each.
         return _MSGPACK_FAITHFUL_TYPES.issuperset(map(type, value)) or all(
