@@ -6,10 +6,12 @@ from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.auth import (
     AuthDecision,
     AuthLevel,
     add_api_key_middleware,
+    admin_auth_headers,
     auth_level,
     decide_request_auth,
 )
@@ -373,6 +375,21 @@ class TestApiKeyMiddleware(CustomTestCase):
             "/ws", headers={"Authorization": "Bearer user"}
         ):
             pass
+
+
+class TestAdminAuthHeaders(CustomTestCase):
+    def test_given_key_wins_over_env(self):
+        with envs.SGLANG_ADMIN_API_KEY.override("sk-env"):
+            self.assertEqual(
+                admin_auth_headers("sk-arg"), {"Authorization": "Bearer sk-arg"}
+            )
+            self.assertEqual(
+                admin_auth_headers(None), {"Authorization": "Bearer sk-env"}
+            )
+
+    def test_no_key_sends_no_header(self):
+        with envs.SGLANG_ADMIN_API_KEY.override(None):
+            self.assertEqual(admin_auth_headers(None), {})
 
 
 if __name__ == "__main__":

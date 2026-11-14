@@ -2,6 +2,8 @@
 
 # export SGLANG_TORCH_PROFILER_DIR=/data/sglang/
 export SGLANG_TORCH_PROFILER_DIR=/sgl-workspace/sglang/profile/
+# The server reads its admin key (required by /start_profile) from SGLANG_ADMIN_API_KEY:
+# export it before running this script.
 
 # Get the current timestamp
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -17,5 +19,4 @@ loadTracer.sh python3 -m sglang.launch_server \
     --quantization fp8 \
     --tp 8 \
     --port 30000 \
-    --admin-api-key "${ADMIN_API_KEY}" \
     --disable-radix-cache 2>&1 | tee "$LOGFILE"

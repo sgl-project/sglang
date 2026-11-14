@@ -830,8 +830,11 @@ def count_aligned_steps(
     )
 
 
-# Local copy: the torch-free fallback (fit) cannot import sglang.srt.
+# Local copy: the torch-free fallback (fit) cannot import sglang.srt at module level.
 def _admin_headers(admin_api_key: Optional[str]) -> dict:
+    from sglang.srt.environ import envs
+
+    admin_api_key = admin_api_key or envs.SGLANG_ADMIN_API_KEY.get()
     return {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
 
 
@@ -1409,7 +1412,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         "--admin-api-key",
         type=str,
         default=None,
-        help="The server's --admin-api-key, which --fracs needs to force a budget.",
+        help="The server's --admin-api-key, which --fracs needs to force a budget (default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--fracs",

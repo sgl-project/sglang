@@ -35,7 +35,7 @@ from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
-from sglang.srt.utils.auth import bearer_auth_headers
+from sglang.srt.utils.auth import admin_auth_headers
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
@@ -207,7 +207,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
         output = RequestFuncOutput()
         try:
             async with session.post(
-                url=api_url, headers=bearer_auth_headers(args.admin_api_key)
+                url=api_url, headers=admin_auth_headers(args.admin_api_key)
             ) as response:
                 if response.status == 200:
                     output.success = True
@@ -448,7 +448,7 @@ async def benchmark(
     # Flush cache
     if "sglang" in backend:
         requests.post(
-            base_url + "/flush_cache", headers=bearer_auth_headers(args.admin_api_key)
+            base_url + "/flush_cache", headers=admin_auth_headers(args.admin_api_key)
         )
 
     time.sleep(1.0)
@@ -976,7 +976,7 @@ if __name__ == "__main__":
         "--admin-api-key",
         type=str,
         default=None,
-        help="The server's --admin-api-key, which --profile requires.",
+        help="The server's --admin-api-key, which --profile requires (default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--lora-name",

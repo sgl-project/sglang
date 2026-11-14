@@ -1010,7 +1010,7 @@ def run_sglang_profiler(
 
     headers = {"Content-Type": "application/json"}
     # SGLang's /start_profile requires the server's --admin-api-key.
-    if admin_api_key := os.environ.get("ADMIN_API_KEY"):
+    if admin_api_key := os.environ.get("SGLANG_ADMIN_API_KEY"):
         headers["Authorization"] = f"Bearer {admin_api_key}"
     req = request.Request(
         url.rstrip("/") + "/start_profile",

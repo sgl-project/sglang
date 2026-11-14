@@ -85,14 +85,14 @@ Use `bench_serving` by default unless there are specific needs.
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 
 # start server; profiling needs an admin API key
-export ADMIN_API_KEY=<your-admin-api-key>
-python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --admin-api-key "${ADMIN_API_KEY}"
+export SGLANG_ADMIN_API_KEY=<your-admin-api-key>
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
 # send profiling request from client
-python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --admin-api-key "${ADMIN_API_KEY}"
+python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
 ```
 
-`--profile` calls the `/start_profile` and `/stop_profile` admin endpoints, so the server must be launched with `--admin-api-key` and `bench_serving` must be given the same key via `--admin-api-key`.
+`--profile` calls the `/start_profile` and `/stop_profile` admin endpoints, so the server must be launched with `SGLANG_ADMIN_API_KEY` set (or `--admin-api-key`) and `bench_serving` must be given the same key, which it reads from `SGLANG_ADMIN_API_KEY` (or `--admin-api-key`).
 
 For `bench_serving --profile`, the output directory is selected on the client side from `--profile-output-dir` or `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`), then sent in the `/start_profile` request.
 If you call `/start_profile` directly and do not provide `output_dir`, the server uses its own `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`).
@@ -112,21 +112,22 @@ When profiling in PD disaggregation mode, prefill and decode workers **must be p
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 
 # start prefill and decode servers (see PD disaggregation docs for setup)
-python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode prefill --admin-api-key "${ADMIN_API_KEY}"
-python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode decode --port 30001 --base-gpu-id 1 --admin-api-key "${ADMIN_API_KEY}"
+export SGLANG_ADMIN_API_KEY=<your-admin-api-key>
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode prefill
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode decode --port 30001 --base-gpu-id 1
 
 # start router
 python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 
 # send profiling request targeting prefill workers
-python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --admin-api-key "${ADMIN_API_KEY}" --pd-separated --profile-prefill-url http://127.0.0.1:30000
+python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000
 ```
 
 #### Profile Decode Workers
 
 ```bash Command
 # send profiling request targeting decode workers
-python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --admin-api-key "${ADMIN_API_KEY}" --pd-separated --profile-decode-url http://127.0.0.1:30001
+python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001
 ```
 
 #### Important Notes
@@ -135,10 +136,10 @@ python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1
 - Both options support multiple worker URLs for multi-instance setups:
   ```bash Command
   # Profile multiple prefill workers
-  python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --admin-api-key "${ADMIN_API_KEY}" --pd-separated --profile-prefill-url http://127.0.0.1:30000 http://127.0.0.1:30002
+  python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000 http://127.0.0.1:30002
 
   # Profile multiple decode workers
-  python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --admin-api-key "${ADMIN_API_KEY}" --pd-separated --profile-decode-url http://127.0.0.1:30001 http://127.0.0.1:30003
+  python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001 http://127.0.0.1:30003
   ```
 - Make sure `SGLANG_TORCH_PROFILER_DIR` is set on all worker nodes before starting the servers
 - For more details on setting up PD disaggregation, see [PD Disaggregation Guide](../advanced_features/pd_disaggregation)
@@ -167,20 +168,20 @@ python3 -m sglang.test.send_one
 
 # Terminal 2: Before the above request finishes, quickly launch the following command in a separate terminal.
 # It will generate a profile of the above request for several decoding batches.
-python3 -m sglang.profiler --admin-api-key "${ADMIN_API_KEY}"
+python3 -m sglang.profiler
 ```
 
 You can also combine the above operations into a single command
 
 ```text Output
-python3 -m sglang.test.send_one --profile --admin-api-key "${ADMIN_API_KEY}"
+python3 -m sglang.test.send_one --profile
 ```
 
 ### Profile a server with HTTP API endpoints
 
 SGLang provides HTTP API endpoints to control profiling on a running server. This allows you to start and stop profiling programmatically, which is useful for capturing specific workload patterns.
 
-`/start_profile` and `/stop_profile` are admin endpoints: the server must be launched with `--admin-api-key`, and each request must carry that key as `Authorization: Bearer <key>`. Without an admin key configured, the server answers HTTP 403 (`--api-key` does not unlock them). The examples below assume the key is exported as `ADMIN_API_KEY`.
+`/start_profile` and `/stop_profile` are admin endpoints: the server must be launched with `SGLANG_ADMIN_API_KEY` set (or `--admin-api-key`), and each request must carry that key as `Authorization: Bearer <key>`. Without an admin key configured, the server answers HTTP 403 (`--api-key` does not unlock them). The examples below assume the key is exported as `SGLANG_ADMIN_API_KEY`.
 
 #### Using `/start_profile` endpoint
 
@@ -191,7 +192,7 @@ The `/start_profile` endpoint starts profiling on the server. You can control wh
 ```bash Command
 # Start profiling immediately for 10 steps
 curl -X POST http://127.0.0.1:30000/start_profile \
-  -H "Authorization: Bearer ${ADMIN_API_KEY}" \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "num_steps": 10
@@ -214,7 +215,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 ```bash Command
 # Wait 5 steps (warmup), then profile for 10 steps
 curl -X POST http://127.0.0.1:30000/start_profile \
-  -H "Authorization: Bearer ${ADMIN_API_KEY}" \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "/tmp/profiles",
@@ -229,7 +230,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 ```bash Command
 # Start profiling without num_steps - must manually stop with /stop_profile
 curl -X POST http://127.0.0.1:30000/start_profile \
-  -H "Authorization: Bearer ${ADMIN_API_KEY}"
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 #### Detailed annotations
@@ -260,7 +261,7 @@ step[TARGET_VERIFY bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30]
 ```bash Command
 # Profile 10 steps with detailed annotations enabled
 curl -X POST http://127.0.0.1:30000/start_profile \
-  -H "Authorization: Bearer ${ADMIN_API_KEY}" \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "/tmp/profiles",
@@ -279,7 +280,7 @@ The `/stop_profile` endpoint stops an ongoing profiling session and saves the tr
 ```bash Command
 # Stop profiling and save traces
 curl -X POST http://127.0.0.1:30000/stop_profile \
-  -H "Authorization: Bearer ${ADMIN_API_KEY}"
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 This is only needed when you start profiling without specifying `num_steps`. If `num_steps` is specified, profiling will automatically stop after that many steps.
@@ -289,11 +290,12 @@ This is only needed when you start profiling without specifying `num_steps`. If 
 ```bash Command
 # Terminal 1: Start the server
 export SGLANG_TORCH_PROFILER_DIR=/tmp/profiles
-python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --admin-api-key "${ADMIN_API_KEY}"
+export SGLANG_ADMIN_API_KEY=<your-admin-api-key>
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
 # Terminal 2: Start continuous profiling
 curl -X POST http://127.0.0.1:30000/start_profile \
-  -H "Authorization: Bearer ${ADMIN_API_KEY}" \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "start_step": 3
@@ -304,7 +306,7 @@ python -m sglang.benchmark.serving --backend sglang --num-prompts 100
 
 # Terminal 2: Stop profiling when done
 curl -X POST http://127.0.0.1:30000/stop_profile \
-  -H "Authorization: Bearer ${ADMIN_API_KEY}"
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 ### Profiler Trace Merger for Distributed Traces
@@ -322,7 +324,7 @@ If there is no shared storage accessible across nodes, automatic merging of trac
 ```bash Command
 # Start profiling with automatic trace merging enabled
 curl -X POST <BASE_URL>/start_profile \
-  -H "Authorization: Bearer ${ADMIN_API_KEY}" \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "/tmp/profiles", # where to store profile traces
@@ -337,7 +339,6 @@ curl -X POST <BASE_URL>/start_profile \
 ```bash Command
 # Start profiling with merge enabled
 python -m sglang.profiler \
-  --admin-api-key "${ADMIN_API_KEY}" \
   --num-steps 10 \
   --cpu \
   --gpu \
@@ -405,7 +406,7 @@ client can generate a small trace file (&lt;100MB) by controlling number of prom
 For example, when profiling a server,
 
 ```bash Command
-python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile --admin-api-key "${ADMIN_API_KEY}"
+python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile
 ```
 
 This command sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for browser to open smoothly.
@@ -493,6 +494,7 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
 
    ```bash Command
    # Terminal 1: Start server with nsys and capture-range option
+   export SGLANG_ADMIN_API_KEY=<your-admin-api-key>
    nsys profile --trace-fork-before-exec=true \
      --cuda-graph-trace=node \
      --capture-range=cudaProfilerApi \
@@ -501,19 +503,18 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
      python -m sglang.launch_server \
        --model-path meta-llama/Llama-3.1-8B-Instruct \
        --enable-layerwise-nvtx-marker \
-       --disable-cuda-graph \
-       --admin-api-key "${ADMIN_API_KEY}"
+       --disable-cuda-graph
    ```
 
    Note: NVTX markers are not emitted for kernel launches captured by CUDA graphs. Use `--disable-cuda-graph` to ensure all layerwise NVTX markers are emitted in the trace.
 
-2. In another terminal, control profiling via `/start_profile` with `CUDA_PROFILER` activity. It is an admin endpoint, hence the `--admin-api-key` above and the bearer header below:
+2. In another terminal, control profiling via `/start_profile` with `CUDA_PROFILER` activity. It is an admin endpoint, hence the `SGLANG_ADMIN_API_KEY` above and the bearer header below:
 
    ```bash Command
    # Terminal 2: Wait for server to be ready, then start CUDA profiling
    # Wait 3 steps for warmup, then profile for 10 steps
    curl -X POST http://127.0.0.1:30000/start_profile \
-     -H "Authorization: Bearer ${ADMIN_API_KEY}" \
+     -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
      -H "Content-Type: application/json" \
      -d '{
        "start_step": 3,
@@ -534,7 +535,7 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
    ```bash Command
    # Terminal 2: Only needed if num_steps was not specified
    curl -X POST http://127.0.0.1:30000/stop_profile \
-     -H "Authorization: Bearer ${ADMIN_API_KEY}"
+     -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
    ```
 
 The `--capture-range=cudaProfilerApi` option tells Nsight Systems to only capture data between `cudaProfilerStart()` and `cudaProfilerStop()` calls (triggered by `/start_profile` and `/stop_profile`), reducing overhead and file size. The `start_step` parameter skips the first 3 steps to avoid capturing warmup overhead.

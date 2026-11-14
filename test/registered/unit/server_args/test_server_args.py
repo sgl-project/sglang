@@ -79,6 +79,7 @@ from sglang.srt.arg_groups.parallel_hook import (
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import (
+    handle_admin_api_key_env,
     handle_crash_dump_env,
     handle_deprecated_args,
     handle_load_balance_method,
@@ -1113,6 +1114,24 @@ class TestImageProcessorBackend(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "conflicts.*torchvision"):
             handle_deprecated_args(server_args)
+
+
+class TestAdminApiKeyEnv(CustomTestCase):
+    def test_env_fills_a_missing_flag(self):
+        server_args = ServerArgs(model_path="dummy")
+
+        with envs.SGLANG_ADMIN_API_KEY.override("sk-env"):
+            handle_admin_api_key_env(server_args)
+
+        self.assertEqual(resolution_result(server_args, "admin_api_key"), "sk-env")
+
+    def test_flag_wins_over_env(self):
+        server_args = ServerArgs(model_path="dummy", admin_api_key="sk-flag")
+
+        with envs.SGLANG_ADMIN_API_KEY.override("sk-env"):
+            handle_admin_api_key_env(server_args)
+
+        self.assertEqual(resolution_result(server_args, "admin_api_key"), "sk-flag")
 
 
 class TestTokenspeedMlaAlias(CustomTestCase):
@@ -4695,6 +4714,13 @@ class TestGrpcServerArgs(CustomTestCase):
     def test_native_grpc_rejects_http_auth(self):
         sa = self._args(grpc_port=40000, api_key="secret")
         with self.assertRaises(ValueError):
+            handle_deprecated_args(sa)
+
+    def test_native_grpc_rejects_admin_key_from_env(self):
+        sa = self._args(grpc_port=40000)
+        with envs.SGLANG_ADMIN_API_KEY.override("secret"):
+            handle_admin_api_key_env(sa)
+        with self.assertRaisesRegex(ValueError, "SGLANG_ADMIN_API_KEY"):
             handle_deprecated_args(sa)
 
     def test_invalid_grpc_worker_threads_rejected(self):

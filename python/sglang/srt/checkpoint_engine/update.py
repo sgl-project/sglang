@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 from safetensors import safe_open
 
-from sglang.srt.utils.auth import bearer_auth_headers
+from sglang.srt.utils.auth import admin_auth_headers
 
 try:
     from checkpoint_engine.ps import ParameterServer
@@ -134,7 +134,7 @@ def req_inference(
                         "weight_version": weight_version,
                     },
                     timeout=timeout,
-                    headers=bearer_auth_headers(admin_api_key),
+                    headers=admin_auth_headers(admin_api_key),
                 )
                 resp.raise_for_status()
 
@@ -267,7 +267,7 @@ def main():
         "--admin-api-key",
         type=str,
         default=None,
-        help="The server's --admin-api-key, which /update_weights_from_ipc requires.",
+        help="The server's --admin-api-key, which /update_weights_from_ipc requires (default: SGLANG_ADMIN_API_KEY).",
     )
     args = parser.parse_args()
 

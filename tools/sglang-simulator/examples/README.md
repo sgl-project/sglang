@@ -22,10 +22,10 @@ For maintained direct-run and serving examples, see
 Start a server with any example config:
 
 ```bash
+export SGLANG_ADMIN_API_KEY=<key>
 python3 -m sglang_simulator.simulation.sglang.launch_server \
   --model-path /path/to/model \
   --sim-config-path examples/sim_configs/aisimulate_sol.json \
-  --admin-api-key "${ADMIN_API_KEY}" \
   --port 30000
 ```
 
@@ -44,8 +44,7 @@ python3 benchmark/simulator/bench_serving.py \
   --dataset-path=examples/workloads/sharegpt-example.json \
   --sharegpt-output-len=4 \
   --num-prompts=3 \
-  --profile \
-  --admin-api-key="${ADMIN_API_KEY}"
+  --profile
 ```
 
 The timestamp trace uses the simulator-owned Autobench JSONL contract. Its

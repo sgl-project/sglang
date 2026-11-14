@@ -18,10 +18,10 @@ By default, SGLang does not log any request contents. You can log them by using 
 You can control the verbosity by using `--log-requests-level`.
 See [Logging](./server_arguments#logging) for more details.
 
-You can change verbosity at runtime. `/configure_logging` is an admin endpoint, so the server must be launched with `--admin-api-key` and the same key (exported as `ADMIN_API_KEY` below) passed to the tool:
+You can change verbosity at runtime. `/configure_logging` is an admin endpoint, so the server must be launched with `SGLANG_ADMIN_API_KEY` set (or `--admin-api-key`), and the tool reads the same key from `SGLANG_ADMIN_API_KEY`:
 
 ```bash Command
-python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --admin-api-key "${ADMIN_API_KEY}" --log-level=debug
+python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --log-level=debug
 ```
 
 ## Request Dump and Replay
@@ -30,7 +30,7 @@ You can dump all requests and replay them later for benchmarking or other purpos
 
 To start dumping, use the following command to send a request to a server:
 ```bash Command
-python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --admin-api-key "${ADMIN_API_KEY}" --dump-requests-folder /tmp/sglang_request_dump --dump-requests-threshold 100
+python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --dump-requests-folder /tmp/sglang_request_dump --dump-requests-threshold 100
 ```
 The server will dump the requests into a pickle file for every 100 requests.
 

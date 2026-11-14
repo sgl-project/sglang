@@ -111,7 +111,7 @@ class BenchArgs:
             "--admin-api-key",
             type=str,
             default=BenchArgs.admin_api_key,
-            help="The server's --admin-api-key, which --profile requires.",
+            help="The server's --admin-api-key, which --profile requires (default: SGLANG_ADMIN_API_KEY).",
         )
 
     @classmethod

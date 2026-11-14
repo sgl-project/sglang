@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 
+from sglang.srt.environ import envs
+
 # The Rust server answers with the same text (`ADMIN_KEY_MISSING`).
 ADMIN_API_KEY_MISSING_MESSAGE = (
     "This endpoint requires admin API key, but this server was started "
@@ -20,6 +22,11 @@ ADMIN_API_KEY_MISSING_MESSAGE = (
 def bearer_auth_headers(key: Optional[str]) -> dict:
     """`Authorization: Bearer <key>`, or no header when there is no key."""
     return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def admin_auth_headers(admin_api_key: Optional[str] = None) -> dict:
+    """Bearer headers for the admin endpoints: `admin_api_key`, else `SGLANG_ADMIN_API_KEY`."""
+    return bearer_auth_headers(admin_api_key or envs.SGLANG_ADMIN_API_KEY.get())
 
 
 @dataclass(frozen=True)

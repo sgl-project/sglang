@@ -11,7 +11,7 @@ from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
-from sglang.srt.utils.auth import bearer_auth_headers
+from sglang.srt.utils.auth import admin_auth_headers, bearer_auth_headers
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
@@ -83,13 +83,16 @@ class HttpServerEngineAdapter(EngineBase):
         url = f"{self.server_args.url()}/{endpoint}"
         cfg = resolving_view(self.server_args)
         # Every endpoint but /generate is an admin one, which takes the admin key when set.
-        key = (
-            cfg.api_key if endpoint == "generate" else cfg.admin_api_key or cfg.api_key
+        headers = (
+            bearer_auth_headers(cfg.api_key)
+            if endpoint == "generate"
+            else admin_auth_headers(cfg.admin_api_key)
+            or bearer_auth_headers(cfg.api_key)
         )
         response = requests.post(
             url,
             json=payload or {},
-            headers=bearer_auth_headers(key),
+            headers=headers,
             verify=ssl_verify_of(self.server_args),
         )
         response.raise_for_status()

@@ -928,7 +928,7 @@ async def server_info():
 
 
 # example usage:
-# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -H "Authorization: Bearer $ADMIN_API_KEY" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
+# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 @auth_level(AuthLevel.ADMIN_FORCE)
 async def set_internal_state(
@@ -1149,7 +1149,7 @@ async def clear_hicache_storage_backend():
 # example usage:
 # curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
 #  -H 'Content-Type: application/json' \
-#  -H "Authorization: Bearer $ADMIN_API_KEY" \
+#  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
 #   -d '{
 #     "hicache_storage_backend": "file",
 #     "hicache_storage_backend_extra_config_json": "{}",

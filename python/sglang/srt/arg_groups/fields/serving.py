@@ -163,7 +163,7 @@ class Serving(msgspec.Struct):
     ] = None
     admin_api_key: A[
         Optional[str],
-        "Set admin API key for management endpoints. Sensitive ones (e.g. weight updates, LoRA loading, profiling, /hicache/storage-backend) are refused unless it is set. When set, admin endpoints require this key and do NOT accept --api-key.",
+        "Set admin API key for management endpoints. Sensitive ones (e.g. weight updates, LoRA loading, profiling, /hicache/storage-backend) are refused unless it is set. When set, admin endpoints require this key and do NOT accept --api-key. Defaults to SGLANG_ADMIN_API_KEY, which the bundled clients (sglang.profiler, bench_serving, send_one) also read.",
     ] = None
     served_model_name: A[
         Optional[str],

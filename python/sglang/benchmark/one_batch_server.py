@@ -44,7 +44,7 @@ from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell
-from sglang.srt.utils.auth import bearer_auth_headers
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.test.nightly_bench_utils import save_results_as_pydantic_models
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
@@ -554,7 +554,7 @@ def _flush_cache_with_retry(
     url: str, endpoint: str, max_retries: int = 3, admin_api_key: Optional[str] = None
 ):
     """Post to a cache flush endpoint with retries on failure."""
-    headers = bearer_auth_headers(admin_api_key)
+    headers = admin_auth_headers(admin_api_key)
     for attempt in range(max_retries):
         try:
             response = requests.post(

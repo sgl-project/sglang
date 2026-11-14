@@ -33,7 +33,7 @@ from eval_utils import (
 )
 from tqdm import tqdm
 
-from sglang.srt.utils.auth import bearer_auth_headers
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
@@ -59,7 +59,7 @@ async def async_request_profile(
         output = RequestFuncOutput()
         try:
             async with session.post(
-                url=api_url, headers=bearer_auth_headers(admin_api_key)
+                url=api_url, headers=admin_auth_headers(admin_api_key)
             ) as response:
                 if response.status == 200:
                     output.success = True

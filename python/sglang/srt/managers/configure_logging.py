@@ -25,6 +25,8 @@ import argparse
 
 import requests
 
+from sglang.srt.environ import envs
+
 
 def _parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -39,8 +41,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--admin-api-key",
         type=str,
-        default=None,
-        help="The server's --admin-api-key, which /configure_logging requires.",
+        default=envs.SGLANG_ADMIN_API_KEY.get(),
+        help="The server's --admin-api-key, which /configure_logging requires "
+        "(default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--log-requests", action=argparse.BooleanOptionalAction, default=None

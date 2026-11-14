@@ -15,6 +15,8 @@ from typing import List, Optional
 
 import requests
 
+from sglang.srt.environ import envs
+
 PROFILER_DIR = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
 
 
@@ -31,6 +33,7 @@ def run_profile(
 ) -> str:
     if output_dir is None:
         output_dir = PROFILER_DIR
+    admin_api_key = admin_api_key or envs.SGLANG_ADMIN_API_KEY.get()
 
     output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(time.time())
     output_dir.mkdir(exist_ok=True, parents=True)
@@ -144,7 +147,7 @@ if __name__ == "__main__":
         "--admin-api-key",
         type=str,
         default=None,
-        help="The server's --admin-api-key, which /start_profile requires.",
+        help="The server's --admin-api-key, which /start_profile requires (default: SGLANG_ADMIN_API_KEY).",
     )
 
     args = parser.parse_args()

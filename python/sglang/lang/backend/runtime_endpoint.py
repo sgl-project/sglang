@@ -22,6 +22,7 @@ from sglang.lang.ir import (
     REGEX_STR,
     SglSamplingParams,
 )
+from sglang.srt.environ import envs
 from sglang.utils import http_request
 
 
@@ -39,7 +40,7 @@ class RuntimeEndpoint(BaseBackend):
 
         self.base_url = base_url
         self.api_key = api_key
-        self.admin_api_key = admin_api_key
+        self.admin_api_key = admin_api_key or envs.SGLANG_ADMIN_API_KEY.get()
         self.verify = verify
 
         res = http_request(

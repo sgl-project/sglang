@@ -149,21 +149,22 @@ export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
 export SIMULATOR_OUTPUT_DIR=/tmp/sglang-simulator-serving-001
 test ! -e "$SIMULATOR_OUTPUT_DIR"
 export SGLANG_SIMULATOR_OUTPUT_DIR="$SIMULATOR_OUTPUT_DIR"
+export SGLANG_ADMIN_API_KEY=<key>
 
 python3 -m sglang_simulator.simulation.sglang.launch_server \
   --model-path /absolute/path/to/model \
   --sim-config-path /absolute/path/to/simulator.json \
-  --admin-api-key "${ADMIN_API_KEY}" \
   --port 30000
 ```
 
-In the benchmark terminal, export the same output directory before sending
+In the benchmark terminal, export the same output directory and admin key before sending
 timestamped traffic with the simulator-aware benchmark adapter:
 
 ```bash
 cd /path/to/sglang
 export SIMULATOR_OUTPUT_DIR=/tmp/sglang-simulator-serving-001
 export SGLANG_SIMULATOR_OUTPUT_DIR="$SIMULATOR_OUTPUT_DIR"
+export SGLANG_ADMIN_API_KEY=<key>
 
 python3 benchmark/simulator/bench_serving.py \
   --simulator-mode offline \
@@ -175,7 +176,6 @@ python3 benchmark/simulator/bench_serving.py \
   --use-trace-timestamps \
   --num-prompts 100 \
   --profile \
-  --admin-api-key "${ADMIN_API_KEY}" \
   --output-file "$SIMULATOR_OUTPUT_DIR/benchmark.json"
 ```
 

@@ -22,7 +22,7 @@ This philosophy empowers innovation by providing SGLang as flexible tools, not r
 The following sections cover these aspects in detail.
 
 <Note>
-The memory release/resume, weight update and pause/resume endpoints below (`/release_memory_occupation`, `/resume_memory_occupation`, `/update_weights_from_*`, `/begin_weight_update`, `/end_weight_update`, `/init_weights_update_group`, `/destroy_weights_update_group`, `/update_weight_version`, `/pause_generation`, `/continue_generation`) are admin endpoints. Launch the server with `--admin-api-key <key>` and send `Authorization: Bearer <key>` with each call; without an admin key configured, the server answers HTTP 403 (`--api-key` does not unlock them).
+The memory release/resume, weight update and pause/resume endpoints below (`/release_memory_occupation`, `/resume_memory_occupation`, `/update_weights_from_*`, `/begin_weight_update`, `/end_weight_update`, `/init_weights_update_group`, `/destroy_weights_update_group`, `/update_weight_version`, `/pause_generation`, `/continue_generation`) are admin endpoints. Launch the server with `SGLANG_ADMIN_API_KEY=<key>` set (or pass `--admin-api-key <key>`) and send `Authorization: Bearer <key>` with each call; without an admin key configured, the server answers HTTP 403 (`--api-key` does not unlock them).
 </Note>
 
 ## Fine-Grained Engine Sleep and Wake Up

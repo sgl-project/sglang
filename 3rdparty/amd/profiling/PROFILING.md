@@ -324,6 +324,8 @@ server.sh
 
 # export SGLANG_TORCH_PROFILER_DIR=/data/sglang/
 export SGLANG_TORCH_PROFILER_DIR=/sgl-workspace/sglang/profile/
+# The server reads its admin key (required by /start_profile) from SGLANG_ADMIN_API_KEY:
+# export it before running this script.
 
 # Get the current timestamp
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -339,13 +341,12 @@ loadTracer.sh python3 -m sglang.launch_server \
     --quantization fp8 \
     --tp 8 \
     --port 30000 \
-    --admin-api-key "${ADMIN_API_KEY}" \
     --disable-radix-cache 2>&1 | tee "$LOGFILE"
 ```
 6. Open another terminal for the same docker container, and run the rpd enabled ./client.sh after you see "The server is fired up and is ready to roll!" message from server side terminal.
 
 #### Common Notes 3
-- Use curl http://localhost:30000/start_profile & curl http://localhost:30000/stop_profile, each with `-H "Authorization: Bearer ${ADMIN_API_KEY}"` (the server's `--admin-api-key`), to control the start and end of profiling. Check sglang/python/sglang/srt/managers/scheduler.py for more details.
+- Use curl http://localhost:30000/start_profile & curl http://localhost:30000/stop_profile, each with `-H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"` (the server's admin key, set through `SGLANG_ADMIN_API_KEY` or `--admin-api-key`), to control the start and end of profiling. Check sglang/python/sglang/srt/managers/scheduler.py for more details.
 - Please don't use RPD profiler together with PyTorch profiler to avoid interference.
 - The rocmProfileData/tools/rpd2tracing.py file is used to generate json file from RPD file.
 
@@ -355,7 +356,7 @@ client.sh
 #!/bin/bash
 
 # Start profiling via API
-curl http://localhost:30000/start_profile -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_API_KEY}"
+curl http://localhost:30000/start_profile -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 
 # Benchmark serving using sglang with random dataset and tokenizer
 # Define the log file with a timestamp
@@ -374,7 +375,7 @@ python3 -m sglang.benchmark.serving \
     --output-file online.jsonl 2>&1 | tee "$LOGFILE"
 
 # Stop profiling via API
-curl http://localhost:30000/stop_profile -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_API_KEY}"
+curl http://localhost:30000/stop_profile -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 
 # Convert tracing file to csv & json
 sqlite3 trace.rpd ".mode csv" ".header on" ".output trace.csv" "select * from top;" ".output stdout"

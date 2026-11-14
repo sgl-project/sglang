@@ -96,7 +96,7 @@ class EvalArgs:
             "--admin-api-key",
             type=str,
             default=EvalArgs.admin_api_key,
-            help="The server's --admin-api-key, which --profile requires.",
+            help="The server's --admin-api-key, which --profile requires (default: SGLANG_ADMIN_API_KEY).",
         )
         parser.add_argument(
             "--concurrency",

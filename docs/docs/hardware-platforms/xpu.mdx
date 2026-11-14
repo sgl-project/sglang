@@ -367,21 +367,21 @@ TMS_PLATFORM=xpu uv pip install --no-build-isolation \
 **Use it** by launching with `--enable-memory-saver` (the XPU backend is
 selected automatically); optionally add `--enable-weights-cpu-backup` to keep
 weights in host RAM across a release. The release/resume endpoints are admin
-endpoints, so the server also needs `--admin-api-key` and the calls must carry
-that key (exported as `ADMIN_API_KEY` below):
+endpoints, so the server also needs `SGLANG_ADMIN_API_KEY` (or `--admin-api-key`)
+and the calls must carry that key (exported as `SGLANG_ADMIN_API_KEY` below):
 
 ```bash
+export SGLANG_ADMIN_API_KEY=<key>
 python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B \
-    --trust-remote-code --device xpu --enable-memory-saver \
-    --admin-api-key "${ADMIN_API_KEY}"
+    --trust-remote-code --device xpu --enable-memory-saver
 ```
 
 ```bash
 # Release GPU memory while idle, then reclaim it (server must be idle).
 curl -X POST http://127.0.0.1:30000/release_memory_occupation \
-    -H "Authorization: Bearer ${ADMIN_API_KEY}"
+    -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 curl -X POST http://127.0.0.1:30000/resume_memory_occupation \
-    -H "Authorization: Bearer ${ADMIN_API_KEY}"
+    -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 The Python engine API (`engine.release_memory_occupation(tags=...)` /

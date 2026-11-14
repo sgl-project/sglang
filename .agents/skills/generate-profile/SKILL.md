@@ -18,7 +18,8 @@ This skill launches an SGLang server, validates it with a quick accuracy test, g
 ### Step 1: Launch the server
 
 ```bash
-CUDA_VISIBLE_DEVICES=<gpu_id> sglang serve --model-path <model> --port <port> --admin-api-key <admin_key> &
+export SGLANG_ADMIN_API_KEY=<admin_key>
+CUDA_VISIBLE_DEVICES=<gpu_id> sglang serve --model-path <model> --port <port> &
 ```
 
 - Default model: `Qwen/Qwen3-8B` (good balance of speed and quality)
@@ -57,7 +58,7 @@ sgl-eval run gsm8k --base-url http://127.0.0.1:<port>/v1 --num-examples 20
 ### Step 4: Generate the profile
 
 ```bash
-python3 -m sglang.test.send_one --profile --admin-api-key <admin_key>
+python3 -m sglang.test.send_one --profile
 ```
 
 This command:
@@ -100,7 +101,8 @@ Return the profile directory path (e.g., `/tmp/1773999986.4769795`) and list its
 ```bash
 # 1. Launch server
 source cleanup/bin/activate
-CUDA_VISIBLE_DEVICES=1 sglang serve --model-path Qwen/Qwen3-8B --port 30000 --admin-api-key sk-admin &
+export SGLANG_ADMIN_API_KEY=sk-admin
+CUDA_VISIBLE_DEVICES=1 sglang serve --model-path Qwen/Qwen3-8B --port 30000 &
 
 # 2. Wait for ready
 for i in $(seq 1 120); do
@@ -113,7 +115,7 @@ sgl-eval run gsm8k --base-url http://127.0.0.1:30000/v1 --num-examples 20
 # Expected: score > 80%
 
 # 4. Profile
-python3 -m sglang.test.send_one --profile --admin-api-key sk-admin
+python3 -m sglang.test.send_one --profile
 # Output: "Dump profiling traces to /tmp/1773999986.4769795"
 
 # 5. Cleanup

@@ -206,8 +206,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--admin-api-key",
         type=str,
-        default=None,
-        help="The server's --admin-api-key, which /update_weights_from_ipc requires.",
+        default=os.getenv("SGLANG_ADMIN_API_KEY"),
+        help="The server's --admin-api-key, which /update_weights_from_ipc requires "
+        "(default: SGLANG_ADMIN_API_KEY).",
     )
     args = parser.parse_args()
     rank = int(os.getenv("RANK"))
