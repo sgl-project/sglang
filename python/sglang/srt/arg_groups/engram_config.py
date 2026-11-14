@@ -14,7 +14,8 @@ class EngramPlacement:
 class EngramReplication:
     NONE = "none"
     PER_NODE = "per_node"
-    ALL = (NONE, PER_NODE)
+    GROUP_SHARDS = "group_shards"
+    ALL = (NONE, PER_NODE, GROUP_SHARDS)
 
 
 class EngramLookup:
@@ -54,6 +55,13 @@ class EngramConfig:
                 f"--engram-config: invalid {', '.join(invalid)}; choices: {choices}"
             )
         config = cls(**raw)
+        if config.replication == EngramReplication.GROUP_SHARDS:
+            if config.lookup not in (EngramLookup.AUTO, EngramLookup.PEER_READ):
+                raise ValueError(
+                    "--engram-config: replication 'group_shards' reads the shards "
+                    "in place; lookup must be 'auto' or 'peer_read'."
+                )
+            return dataclasses.replace(config, lookup=EngramLookup.PEER_READ)
         if (
             config.lookup == EngramLookup.PEER_READ
             and config.placement != EngramPlacement.GPU
