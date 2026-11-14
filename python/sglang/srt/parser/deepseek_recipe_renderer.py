@@ -7,6 +7,8 @@ import copy
 import functools
 import json
 import logging
+import re
+import uuid
 from types import ModuleType
 from typing import Any, Optional, Union
 
@@ -105,6 +107,117 @@ def _error_message(body: Any) -> str:
         return str(body)
 
 
+def _take_message_tools(
+    messages: list[dict[str, Any]], tool_choice: Any
+) -> tuple[
+    list[dict[str, Any]], list[tuple[str, str, list[dict[str, Any]]]], list[int]
+]:
+    """Brackets each declaring message with marker system messages, which conversion
+    keeps even when it drops an empty declaring message. The last list holds the
+    request index of each rewritten message."""
+    token = uuid.uuid4().hex
+    rewritten, declarations, origins = [], [], []
+    for index, message in enumerate(messages):
+        tools = message.get("tools") or []
+        message = {key: value for key, value in message.items() if key != "tools"}
+        if tool_choice == "none" or message["role"] != "system":
+            tools = []
+        elif isinstance(tool_choice, dict):
+            name = tool_choice["function"]["name"]
+            tools = [tool for tool in tools if tool["function"]["name"] == name]
+        if not tools:
+            rewritten.append(message)
+            origins.append(index)
+            continue
+        opening = f"<sglang message tools {token} {index}>"
+        closing = f"</sglang message tools {token} {index}>"
+        rewritten += [
+            {"role": "system", "content": opening},
+            message,
+            {"role": "system", "content": closing},
+        ]
+        origins += [index] * 3
+        declarations.append((opening, closing, tools))
+    return rewritten, declarations, origins
+
+
+def _declare_message_tools(
+    conversation: Any,
+    declarations: list[tuple[str, str, list[dict[str, Any]]]],
+    encoding: Any,
+) -> Any:
+    """Deferred tools render only where a system message declares them; the opening
+    tools block keeps the call format even when every tool is deferred."""
+    recipe = load_deepseek_recipe()
+    declared = {
+        tool["function"]["name"] for _, _, tools in declarations for tool in tools
+    }
+    tools = [
+        (
+            recipe.ToolDefinition(
+                name=tool.name,
+                description=tool.description,
+                parameters=tool.parameters,
+                strict=tool.strict,
+                defer_loading=True,
+            )
+            if tool.name in declared
+            else tool
+        )
+        for tool in conversation.tools
+    ]
+    by_name = {tool.name: tool for tool in tools}
+
+    def special_ranges(message):
+        alone = recipe.Conversation([message], thinking_mode=False)
+        return encoding.render_conversation(alone).special_ranges
+
+    messages = list(conversation.messages)
+    for opening, closing, declaration in declarations:
+        bracket = [
+            index
+            for index, message in enumerate(messages)
+            if message.role == "system" and message.content in (opening, closing)
+        ]
+        if len(bracket) != 2:
+            raise ValueError("deepseek-recipe dropped a message that declares tools")
+        start, end = bracket
+        # Conversion drops a declaring message whose content is empty.
+        message = messages[start + 1] if end > start + 1 else recipe.SystemMessage("")
+        # The constructor takes the token's first spellings as the image
+        # placeholders, so one spelled as text ahead of an image would take its place.
+        if message.image_sources and special_ranges(message) != special_ranges(
+            recipe.SystemMessage(
+                message.content,
+                image_sources=message.image_sources,
+                image_token=IMAGE_TOKEN,
+            )
+        ):
+            raise ValueError(
+                f"a message that declares tools cannot spell {IMAGE_TOKEN} as text "
+                "before one of its images"
+            )
+        messages[start : end + 1] = [
+            recipe.SystemMessage(
+                message.content,
+                image_sources=message.image_sources,
+                tools=[by_name[tool["function"]["name"]] for tool in declaration],
+                image_token=IMAGE_TOKEN,
+            )
+        ]
+    response_format = conversation.response_format
+    return recipe.Conversation(
+        messages,
+        thinking_mode=conversation.thinking_mode,
+        tools=tools,
+        tool_choice=conversation.tool_choice,
+        reasoning_effort=conversation.reasoning_effort,
+        response_format="json_object" if response_format == "json_object" else "text",
+        response_schema=conversation.response_schema,
+        response_regex=conversation.response_regex,
+    )
+
+
 class DeepSeekRecipe:
     """`tokenizer` is the checkpoint's `tokenizers.Tokenizer`; recipe encodes prompts
     with its own copy of it, and the SGLang extensions splice ids from the original."""
@@ -184,11 +297,37 @@ class DeepSeekRecipe:
         normalized["model"] = self.model
         if effort_budget is not None:
             normalized["reasoning_effort"] = BUDGET_TIER
+        normalized["messages"], declarations, origins = _take_message_tools(
+            normalized["messages"], tool_choice=body.get("tool_choice")
+        )
+        if declarations:
+            if self.model == MODEL_NAMES["dsv4"]:
+                raise ValueError(
+                    "DeepSeek-V4 cannot render tools declared in messages; declare "
+                    "them in the request's tools"
+                )
+            # Conversion validates and normalizes the declared tools; recipe requires
+            # the type that SGLang defaults and the wire dump omits.
+            normalized["tools"] = normalized.get("tools", []) + [
+                {"type": "function", **tool}
+                for _, _, tools in declarations
+                for tool in tools
+            ]
         try:
             converted = recipe.ChatCompletionRequest(normalized).convert(self._options)
         except recipe.ConversionError as error:
-            raise ValueError(_error_message(error.body)) from error
-        return converted.conversation
+            # Recipe locates an error by the index of the rewritten message.
+            message = _error_message(error.body)
+            located = re.match(r"\.messages\[(\d+)\]", message)
+            if located and int(located[1]) < len(origins):
+                index = origins[int(located[1])]
+                message = f".messages[{index}]{message[located.end() :]}"
+            raise ValueError(message) from error
+        if not declarations:
+            return converted.conversation
+        return _declare_message_tools(
+            converted.conversation, declarations, self._encoding
+        )
 
     def encode_conversation(
         self, conversation: Any, *, effort_budget: Optional[int] = None

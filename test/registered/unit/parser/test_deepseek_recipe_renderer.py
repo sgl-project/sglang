@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from sglang.srt.parser import deepseek_recipe_renderer as renderer
@@ -250,6 +251,94 @@ class TestDeepSeekRecipe(CustomTestCase):
                     prefix_ids[-2:], self._ids("<｜Assistant｜>", think_token)
                 )
                 self.assertEqual(full_ids[: len(prefix_ids) - 2], prefix_ids[:-2])
+
+    def test_v4_rejects_tools_declared_in_messages(self):
+        """V4's encoding has no place for message-declared tools and would drop them."""
+        tool = {"type": "function", "function": {"name": "f"}}
+        with self.assertRaisesRegex(ValueError, "tools declared in messages"):
+            renderer.DeepSeekRecipe("dsv4", self.tokenizer).encode(
+                {
+                    "messages": [
+                        {"role": "system", "content": "", "tools": [tool]},
+                        {"role": "user", "content": "x"},
+                    ],
+                    "thinking": False,
+                    "tool_choice": "auto",
+                }
+            )
+
+    def test_conversion_errors_locate_the_request_message(self):
+        """An error names the message's index in the request, whatever number of
+        earlier messages declare tools."""
+        tools = [{"function": {"name": "f"}}]
+        bad = [{"type": "image_url", "image_url": {"url": "ftp://example.com/a.png"}}]
+        hi = {"role": "user", "content": "hi"}
+        failing = {"role": "user", "content": bad}
+        for index, messages in (
+            (1, [{"role": "system", "content": "s", "tools": tools}, failing]),
+            (1, [hi, failing]),
+            (
+                3,
+                [
+                    {"role": "system", "content": "s", "tools": tools},
+                    hi,
+                    {
+                        "role": "developer",
+                        "content": "",
+                        "tools": [{"function": {"name": "g"}}],
+                    },
+                    failing,
+                ],
+            ),
+            (1, [hi, {"role": "system", "content": bad, "tools": tools}, hi]),
+        ):
+            with self.subTest(index=index, count=len(messages)):
+                with self.assertRaisesRegex(
+                    ValueError, rf"^\.messages\[{index}\]: Unsupported image_url"
+                ):
+                    self.deepseek_recipe.encode(
+                        {"messages": messages, "thinking": False, "tool_choice": "auto"}
+                    )
+
+    def test_unlocatable_conversion_error_keeps_its_text(self):
+        """An error naming an index the request does not hold stays a ValueError
+        with recipe's own text."""
+        from unittest import mock
+
+        recipe = renderer.load_deepseek_recipe()
+        tools = [{"function": {"name": "f"}}]
+        hi = {"role": "user", "content": "hi"}
+        declaring = {"role": "system", "content": "s", "tools": tools}
+        other = {
+            "role": "developer",
+            "content": "",
+            "tools": [{"function": {"name": "g"}}],
+        }
+        for messages, rewritten in (
+            ([], 0),
+            ([hi], 1),
+            ([declaring, hi], 4),
+            ([declaring, hi, other, hi], 8),
+        ):
+            for index in (rewritten, 999999):
+                text = f".messages[{index}]: boundary; keep .messages[0]"
+                error = recipe.ConversionError()
+                error.body = json.dumps({"error": {"message": text}})
+                request = mock.Mock()
+                request.convert.side_effect = error
+                with self.subTest(count=len(messages), index=index):
+                    with mock.patch.object(
+                        recipe, "ChatCompletionRequest", return_value=request
+                    ):
+                        with self.assertRaises(ValueError) as raised:
+                            self.deepseek_recipe.convert(
+                                {
+                                    "messages": messages,
+                                    "thinking": False,
+                                    "tool_choice": "auto",
+                                }
+                            )
+                    self.assertEqual(str(raised.exception), text)
 
     def test_api_validation_surfaces_as_value_error(self):
         with self.assertRaises(ValueError):
