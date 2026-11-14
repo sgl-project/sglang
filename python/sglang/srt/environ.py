@@ -79,11 +79,7 @@ class EnvField:
         try:
             return self.parse(value)
         except ValueError as e:
-            default = self._resolve_default()
-            warnings.warn(
-                f'Invalid value for {self.name}: {e}, using default "{default}"'
-            )
-            return default
+            raise ValueError(f"Invalid value for {self.name}: {e}") from e
 
     def is_set(self):
         return self.name in os.environ

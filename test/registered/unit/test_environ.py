@@ -142,12 +142,51 @@ class TestEnvField(unittest.TestCase):
             if envs.SGLANG_TEST_RETRACT or (1 == 1):
                 pass
 
-    def test_invalid_value_warns_and_returns_default(self):
-        os.environ["SGLANG_TEST_RETRACT"] = "not-a-bool"
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
-        self.assertIn("Invalid value", str(caught[0].message))
+    def test_invalid_value_raises_with_variable_name(self):
+        for field, value in (
+            (envs.SGLANG_TEST_RETRACT, "not-a-bool"),
+            (envs.SGLANG_PORT, "not-a-port"),
+            (envs.SGLANG_WARMUP_TIMEOUT, "not-a-float"),
+            (envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG, "{invalid-json"),
+        ):
+            with self.subTest(name=field.name), field.override(value):
+                with self.assertRaisesRegex(
+                    ValueError, f"Invalid value for {field.name}:"
+                ):
+                    field.get()
+
+    def test_invalid_value_does_not_resolve_callable_default(self):
+        field = envs.SGLANG_TEST_RETRACT
+        with (
+            field.override("not-a-bool"),
+            patch.object(field, "default", return_value=False) as default,
+        ):
+            with self.assertRaisesRegex(ValueError, field.name):
+                field.get()
+            default.assert_not_called()
+
+    def test_valid_values_and_unset_defaults(self):
+        for field, value, expected, default in (
+            (envs.SGLANG_TEST_RETRACT, "yes", True, False),
+            (envs.SGLANG_PORT, "30000", 30000, None),
+            (envs.SGLANG_WARMUP_TIMEOUT, "1.5", 1.5, -1),
+            (envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG, '{"bits": 4}', {"bits": 4}, None),
+        ):
+            with self.subTest(name=field.name), field.override(value):
+                self.assertEqual(field.get(), expected)
+                field.clear()
+                self.assertEqual(field.get(), default)
+
+    def test_invalid_value_fails_in_subprocess(self):
+        command = [
+            sys.executable,
+            "-c",
+            "from sglang.srt.environ import envs; envs.SGLANG_PORT.get()",
+        ]
+        with envs.SGLANG_PORT.override("not-a-port"):
+            result = subprocess.run(command, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ValueError: Invalid value for SGLANG_PORT:", result.stderr)
 
     def test_mega_runtime_defaults_and_registry_scope(self):
         with ExitStack() as stack:
@@ -226,6 +265,14 @@ class TestRenamedEnvAliases(unittest.TestCase):
                 _, value, deprecations = self._read(new, {old: "1", new: "0"})
                 self.assertIs(value, False)
                 self.assertEqual(deprecations, [])
+
+    def test_invalid_former_name_raises_with_canonical_name(self):
+        new, old = next(iter(RENAMED_NV_MEGA_RUNTIME_CHILDREN.items()))
+        with patch.dict(os.environ, {old: "not-a-bool"}):
+            os.environ.pop(new, None)
+            with self.assertWarnsRegex(FutureWarning, old):
+                with self.assertRaisesRegex(ValueError, f"Invalid value for {new}:"):
+                    vars(type(envs))[new].get()
 
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):
