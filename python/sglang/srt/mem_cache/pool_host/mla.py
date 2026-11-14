@@ -95,27 +95,6 @@ class MLAHostAllocation(msgspec.Struct, frozen=True, kw_only=True):
     packed_fp8: bool = False
 
 
-def _split_v_dtype(info: MLABufferInfo) -> torch.dtype:
-    # Packed DSA has no device V payload; keep its existing host allocation.
-    v = info.buffers.v
-    return info.dtype if info.packed_fp8 or v is None else v.dtype
-
-
-def _split_row_bytes(info: MLABufferInfo, layer_num: int) -> list[int]:
-    native = info.buffers
-    k_width = native.k_width if info.packed_fp8 else info.kv_lora_rank
-    widths = [
-        layer_num * k_width * info.dtype.itemsize,
-        layer_num * info.qk_rope_head_dim * _split_v_dtype(info).itemsize,
-    ]
-    index_layers = len(native.index_layer_indices)
-    if native.index_k is not None:
-        widths.append(index_layers * native.index_width * info.dtype.itemsize)
-    if native.index_scales is not None:
-        widths.append(index_layers * native.index_scales.element_size())
-    return widths
-
-
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     """Host mirror built by the assembler or HiSparse from captured MLA buffers.
 
@@ -228,19 +207,28 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if isinstance(buffer_info.buffers, MLASplitBuffers):
                 self._native_buffers = buffer_info.buffers
                 self._native_infos = infos
-                if layout == "page_first_kv_split":
-                    self._split_row_bytes = _split_row_bytes(
-                        buffer_info, self.layer_num
+                native = self._native_buffers
+                self._v_dtype = self.dtype
+                if (
+                    layout == "page_first_kv_split"
+                    and self.dtype == torch.float8_e4m3fn
+                    and not self.dsa_kv_cache_store_fp8
+                    and native.v is not None
+                    and native.v.dtype == torch.bfloat16
+                ):
+                    # ModelSlim MLA stores FP8 latent and BF16 RoPE separately.
+                    self._v_dtype = native.v.dtype
+                    self._size_per_token = self.layer_num * (
+                        self.kv_lora_rank * self.dtype.itemsize
+                        + self.qk_rope_head_dim * self._v_dtype.itemsize
                     )
-                    self._v_dtype = _split_v_dtype(buffer_info)
-                    if (
-                        self.dtype == torch.float8_e4m3fn
-                        and self._v_dtype == torch.bfloat16
-                    ):
-                        self._size_per_token = sum(self._split_row_bytes)
-                    else:
-                        # Keep the existing capacity policy for ordinary and packed DSA KV.
-                        self._size_per_token += sum(self._split_row_bytes[2:])
+                index_layers = len(native.index_layer_indices)
+                if layout == "page_first_kv_split" and native.index_k is not None:
+                    self._size_per_token += (
+                        native.index_width * self.dtype.itemsize * index_layers
+                    )
+                    if native.index_scales is not None:
+                        self._size_per_token += 4 * index_layers
                 self.device_kv_buffers = ()
                 self.device_data_ptrs = None
             else:
@@ -355,7 +343,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_mapping_lengths(self) -> list[int]:
         if self.layout != "page_first_kv_split" or self._native_buffers is None:
             return super().get_mapping_lengths()
-        return [self.size * width for width in self._split_row_bytes]
+        native = self._native_buffers
+        k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
+        per_row_widths = [
+            self.layer_num * k_width * self.dtype.itemsize,
+            self.layer_num * self.qk_rope_head_dim * self._v_dtype.itemsize,
+        ]
+        index_layers = len(native.index_layer_indices)
+        if native.index_k is not None:
+            per_row_widths.append(
+                index_layers * native.index_width * self.dtype.itemsize
+            )
+        if native.index_scales is not None:
+            # FP32 scale mirror
+            per_row_widths.append(index_layers * 4)
+        rows = self.page_num * self.page_size
+        return [rows * width for width in per_row_widths]
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
@@ -419,7 +422,28 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # AIV sparse-copy IO path and usable by the legacy memcpy2d
                 # path unchanged.  Size the GB-aligned reserve with the
                 # combined bytes of all buffers allocated below.
-                total_bytes = self.size * sum(self._split_row_bytes)
+                total_bytes = (
+                    self.page_num
+                    * self.page_size
+                    * self.layer_num
+                    * (
+                        k_width * self.dtype.itemsize
+                        + self.qk_rope_head_dim * self._v_dtype.itemsize
+                    )
+                )
+                if native.index_k is not None:
+                    total_bytes += (
+                        self.page_num
+                        * self.page_size
+                        * num_indexer_layers
+                        * native.index_width
+                        * self.dtype.itemsize
+                    )
+                if native.index_scales is not None:
+                    # FP32 scale mirror
+                    total_bytes += (
+                        self.page_num * self.page_size * num_indexer_layers * 4
+                    )
                 ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
                 alloc_func = alloc_with_memfabric
             self.k_buffer = alloc_func(
