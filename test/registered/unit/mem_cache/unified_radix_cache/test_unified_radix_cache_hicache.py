@@ -773,6 +773,52 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
         self.assertEqual(result.host_hit_length, node_key_length(cache, leaf))
 
+    @requires_full_mamba_ps1
+    def test_hicache_mamba_host_eviction_keeps_path_tails(self):
+        """Host Mamba eviction drops a pass-through checkpoint before an older
+        path tail, so both paths keep their full host hit."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        # An older path with a single state, then a path with one state per page.
+        tail_seq = self._make_seq(1, 2)
+        tail = self._insert(
+            cache, allocator, req_to_token_pool, tail_seq
+        ).last_device_node
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        chain_seq = self._match_tokens_for_chain(cache, chain)
+
+        # Back up both paths and drop them from the device, older path first,
+        # so every state is host-only and the older tail is least recent.
+        self._backup_node(cache, tail)
+        self._backup_node(cache, chain[-1])
+        for seq in (tail_seq, chain_seq):
+            cache.evict(EvictParams(num_tokens=len(seq)))
+        for node in (tail, *chain):
+            self.assertTrue(cache.tree_core.is_full_device_evicted(node))
+            self.assertIsNotNone(node_host_value(cache, node, ComponentType.MAMBA))
+        for seq in (tail_seq, chain_seq):
+            self.assertEqual(match_prefix(cache, seq).host_hit_length, len(seq))
+
+        self.assertEqual(cache.evict_host(1, ComponentType.MAMBA), 1)
+
+        # Both paths keep their full host hit: a middle checkpoint went, and
+        # the older tail and the chain's tail stayed.
+        for seq in (tail_seq, chain_seq):
+            result = match_prefix(cache, seq)
+            self.assertEqual(result.device_prefix_len, 0)
+            self.assertEqual(result.host_hit_length, len(seq))
+        self.assertIsNotNone(node_host_value(cache, tail, ComponentType.MAMBA))
+        self.assertIsNotNone(node_host_value(cache, chain[-1], ComponentType.MAMBA))
+        self.assertEqual(
+            sum(
+                node_host_value(cache, node, ComponentType.MAMBA) is None
+                for node in chain[:-1]
+            ),
+            1,
+        )
+        cache.sanity_check()
+
     @requires_full_swa_ps1
     def test_hicache_swa_host_best_match_keeps_device_anchor(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
