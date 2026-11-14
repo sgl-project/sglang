@@ -44,6 +44,46 @@ class Llama32Detector(BaseFormatDetector):
             pass
         return text
 
+    def _convert_python_dict_syntax(self, buffer: str) -> str:
+        """Convert Python-dict single-quote syntax to JSON for streaming.
+
+        Only segments *outside* double-quoted JSON string literals are
+        converted, so single quotes that legitimately appear inside a JSON
+        string value (e.g. ``{"text": "tip: 'x'"}``) are left untouched.
+        Rewriting them used to corrupt the tool-call arguments because the
+        ``: '...'`` substitution matched inside the value.
+        """
+
+        def _convert(segment: str) -> str:
+            segment = re.sub(r"'([^']*)':", r'"\1":', segment)
+            segment = re.sub(r":\s*'([^']*)'", r': "\1"', segment)
+            return segment
+
+        out: List[str] = []
+        segment_start = 0
+        in_string = False
+        escaped = False
+        for i, ch in enumerate(buffer):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                    # Copy the closed string literal verbatim.
+                    out.append(buffer[segment_start : i + 1])
+                    segment_start = i + 1
+            elif ch == '"':
+                # Flush the preceding (convertible) out-of-string segment.
+                out.append(_convert(buffer[segment_start:i]))
+                in_string = True
+                segment_start = i
+        tail = buffer[segment_start:]
+        # An unterminated string at the buffer tail (mid-stream) stays verbatim.
+        out.append(tail if in_string else _convert(tail))
+        return "".join(out)
+
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Llama 3.2 format tool call."""
         # depending on the prompt format the Llama model may or may not
@@ -118,11 +158,11 @@ class Llama32Detector(BaseFormatDetector):
         """Override to handle Python dict format in streaming."""
         # First try with converted Python dict
         self._buffer += new_text
-        converted_buffer = self._buffer
 
-        # Convert Python dict syntax to JSON
-        converted_buffer = re.sub(r"'([^']*)':", r'"\1":', converted_buffer)
-        converted_buffer = re.sub(r":\s*'([^']*)'", r': "\1"', converted_buffer)
+        # Convert Python dict syntax to JSON. Conversion is skipped inside JSON
+        # string literals so single quotes within an argument value are not
+        # rewritten (which would corrupt the streamed arguments).
+        converted_buffer = self._convert_python_dict_syntax(self._buffer)
 
         # Temporarily replace buffer for parsing
         original_buffer = self._buffer
