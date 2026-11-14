@@ -612,6 +612,13 @@ def handle_deterministic_inference(server_args: Any):
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
 
     if cfg.enable_deterministic_inference:
+        # The raw flag distinguishes an explicit request from model-selected fusion.
+        if server_args.enable_aiter_allreduce_fusion:
+            raise ValueError(
+                "--enable-aiter-allreduce-fusion is not supported with deterministic "
+                "inference, including --rl-on-policy-target. Remove "
+                "--enable-aiter-allreduce-fusion."
+            )
         if cfg.enable_aiter_allreduce_fusion:
             logger.warning(
                 "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
