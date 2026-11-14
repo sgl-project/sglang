@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 # A changed upstream implementation must be reviewed, never best-effort patched.
-SOURCE_SHA256 = "cb72e0aaa79da2a4a37112046903fbb48f15e16a6715012e9639f47a372be63d"
+SOURCE_SHA256 = "7b1afaa4d2d6e092f6fc169406e70a3130fab232fe30c9d7b84c78289265bfb0"
 
 
 def bind_with_globals(instance, name, overrides):
@@ -157,16 +157,17 @@ def install(pipeline):
 
     model._embed = types.MethodType(embedding, model)
     for block in model.blocks:
-        bind_with_globals(
-            block,
-            "forward",
-            {
-                "_modulate_gate": comfy_gate,
-                "MINIMAX_H3_NORM_MODULATE": types.SimpleNamespace(
-                    is_enabled=lambda _: False
-                ),
-            },
-        )
+        for method in ("forward", "_fuses_gate_norm2"):
+            bind_with_globals(
+                block,
+                method,
+                {
+                    "_modulate_gate": comfy_gate,
+                    "MINIMAX_H3_NORM_MODULATE": types.SimpleNamespace(
+                        is_enabled=lambda _: False
+                    ),
+                },
+            )
         bind_with_globals(
             block.attn, "_attend", {"fused_inplace_qknorm_rope": comfy_rope}
         )
