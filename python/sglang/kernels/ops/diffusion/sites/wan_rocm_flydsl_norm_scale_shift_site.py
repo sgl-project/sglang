@@ -20,15 +20,15 @@ def _static_reject_reason(site: nn.Module) -> str | None:
 
     if not _use_rocm_flydsl:
         return "disabled by SGLANG_USE_ROCM_FLYDSL"
-    # The existing kernels use a fixed epsilon, despite exposing an eps argument.
-    if site.eps != 1e-6:
-        return "FlyDSL requires epsilon 1e-6"
     try:
-        from sglang.kernels.ops.diffusion import FLYDSL_NORM_MIN_ALIGNED_DIM
+        from sglang.kernels.ops.diffusion import flydsl_norm_supports
     except ImportError:
         return "FlyDSL unavailable"
-    if WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(site) % FLYDSL_NORM_MIN_ALIGNED_DIM:
-        return "unaligned hidden size"
+    # The kernels pick a block per hidden size, so the dim they accept is the
+    # one whose tile divides it rather than a single alignment.
+    hidden_size = WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(site)
+    if not flydsl_norm_supports(hidden_size):
+        return "no FlyDSL norm kernel for this hidden size"
     return None
 
 
