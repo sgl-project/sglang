@@ -616,6 +616,19 @@ def _asm_context_prefill_gather_indices(
     return tok_idx, cu_k
 
 
+# mha_batch_prefill over-reads 128 page ids past the last token (see
+# AiterIndicesUpdaterPrefill); 256 keeps that tile inside the buffer.
+_MHA_PREFILL_KV_INDEX_PAD = 256
+
+
+def _pad_mha_prefill_kv_indices(kv_indices: torch.Tensor) -> torch.Tensor:
+    """Repeat a live page id into the tail the CK prefill kernel over-reads."""
+    if kv_indices.numel() == 0:
+        return kv_indices
+    pad = kv_indices[:1].expand(_MHA_PREFILL_KV_INDEX_PAD)
+    return torch.cat([kv_indices, pad])
+
+
 def _unified_extend_q(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
     """q as unified_attention's (tokens, heads, head_dim) input, without a copy when possible.
 
@@ -877,6 +890,18 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+        # Draft-extend only (prefill/target verify keep their kernels). Read the
+        # eagle topk from the spec config: the registry builds this backend with the
+        # default topk=1, so self.topk is 1 even when the server runs topk > 1.
+        # topk > 1 stays on the CK path.
+        draft_extend_topk = get_spec().speculative_eagle_topk
+        self._use_unified_draft_extend = (
+            not self.use_mla
+            and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
+            and (draft_extend_topk is None or int(draft_extend_topk) <= 1)
+        )
+        if self._use_unified_draft_extend:
+            logger.info("Aiter draft extend uses unified_attention (topk<=1).")
 
         # Muse Spark TP8 shapes on gfx950: head_dim 64, GQA 8, SWA KV pool, unified
         # Triton attention. Extend and target verify take the Muse fast paths below
@@ -3001,6 +3026,14 @@ class AiterAttnBackend(AttentionBackend):
                         plan=forward_batch.iteration_ids,
                     )
                 )
+                # CK fallback: publish this step's short qo_indptr into the
+                # shared buffer (prompt extend left it at the prompt length),
+                # set max_kv_len, and pad the page ids the kernel over-reads.
+                kv_indices = _pad_mha_prefill_kv_indices(kv_indices)
+                n_qo = qo_indptr.shape[0]
+                self.qo_indptr[:n_qo].copy_(qo_indptr)
+                qo_indptr = self.qo_indptr[:n_qo]
+                max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
                     kv_indices,
@@ -5113,16 +5146,14 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-            # draft_extend (EAGLE-v2 KV catch-up) is decode-shaped: short Q
-            # (accepted tokens) against long paged KV, GQA. The default
-            # mha_batch_prefill_func FMHA has no split-KV, so at short Q it is
-            # occupancy-starved (~0.2% HBM BW, ~400x over the memory floor).
-            # Route it through unified_attention (GQA-packed + split-KV), exactly
-            # like target_verify, so it runs near the memory floor.
+            # draft_extend (EAGLE-v2 KV catch-up): short Q, long paged KV. Route
+            # it to the #30105 unified_attention path. Gating on
+            # _use_unified_draft_extend (not _use_unified_verify) lets the
+            # default aiter backend take it; topk>1 and the kill switch fall
+            # through to the padded CK path below.
             if (
-                self._use_unified_verify
-                and forward_batch.forward_mode.is_draft_extend_v2()
-                and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
+                forward_batch.forward_mode.is_draft_extend_v2()
+                and self._use_unified_draft_extend
             ):
                 bs = forward_batch.batch_size
                 if layer.qk_head_dim != layer.v_head_dim:
