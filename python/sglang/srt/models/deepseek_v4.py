@@ -581,7 +581,17 @@ def _apply_wo_a_bf16_matmul(
         and _is_cuda
         and is_target_verify
         and o.shape[0] > 0
-        and get_platform().is_blackwell
+        and (
+            get_platform().is_blackwell
+            or (
+                get_platform().is_sm90
+                and 1 <= o.shape[0] <= 48
+                and o.shape[1:] == (8, 4096)
+                and wo_a.shape == (8, 1024, 4096)
+                and o.stride(1) == 4096
+                and o.stride(0) >= 32768
+            )
+        )
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
         and wo_a.is_contiguous()
