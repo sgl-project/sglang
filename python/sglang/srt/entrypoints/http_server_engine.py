@@ -153,11 +153,20 @@ class HttpServerEngineAdapter(EngineBase):
 
         return self._make_request("generate", payload)
 
-    def release_memory_occupation(self):
-        return self._make_request("release_memory_occupation")
+    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+        return self._make_request("release_memory_occupation", {"tags": tags})
 
-    def resume_memory_occupation(self):
-        return self._make_request("resume_memory_occupation")
+    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+        return self._make_request("resume_memory_occupation", {"tags": tags})
+
+    def pause_generation(self, mode: str = "abort"):
+        """Pause generation: ``mode`` is "abort", "retract" or "in_place"."""
+        return self._make_request("pause_generation", {"mode": mode})
+
+    def continue_generation(self, torch_empty_cache: bool = True):
+        return self._make_request(
+            "continue_generation", {"torch_empty_cache": torch_empty_cache}
+        )
 
     def flush_cache(self):
         return self._make_request("flush_cache")
