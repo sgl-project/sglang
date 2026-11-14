@@ -20,8 +20,11 @@ use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefin
 use sglang_processor::dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
+    ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType,
     ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop, TopLogprobs,
 };
@@ -402,18 +405,60 @@ async fn chat_completions(
 /// The chat's images for the multimodal pipeline, in the order Python's
 /// `process_content_for_template_format` collects them, or why the request is
 /// refused: only a multimodal model takes media, and only images so far.
-fn chat_images<T: serde::Serialize>(
-    messages: &T,
+fn needs_media_scan(messages: &[ChatCompletionRequestMessage]) -> bool {
+    messages.iter().any(|message| match message {
+        ChatCompletionRequestMessage::Developer(_)
+        | ChatCompletionRequestMessage::Assistant(_)
+        | ChatCompletionRequestMessage::Function(_) => false,
+        // System tools can carry arbitrary JSON keys inspected by the existing scan.
+        ChatCompletionRequestMessage::System(message) => message.tools.is_some(),
+        ChatCompletionRequestMessage::User(message) => match &message.content {
+            ChatCompletionRequestUserMessageContent::Text(_) => false,
+            ChatCompletionRequestUserMessageContent::Array(parts) => {
+                parts.iter().any(|part| match part {
+                    ChatCompletionRequestUserMessageContentPart::Text(_) => false,
+                    ChatCompletionRequestUserMessageContentPart::ImageUrl(_)
+                    | ChatCompletionRequestUserMessageContentPart::VideoUrl(_)
+                    | ChatCompletionRequestUserMessageContentPart::AudioUrl(_)
+                    | ChatCompletionRequestUserMessageContentPart::InputAudio(_) => true,
+                })
+            }
+        },
+        ChatCompletionRequestMessage::Tool(message) => match &message.content {
+            ChatCompletionRequestToolMessageContent::Text(_) => false,
+            ChatCompletionRequestToolMessageContent::Array(parts) => {
+                parts.iter().any(|part| match part {
+                    ChatCompletionRequestToolMessageContentPart::Text(_) => false,
+                    ChatCompletionRequestToolMessageContentPart::ImageUrl(_)
+                    | ChatCompletionRequestToolMessageContentPart::VideoUrl(_)
+                    | ChatCompletionRequestToolMessageContentPart::AudioUrl(_) => true,
+                })
+            }
+        },
+    })
+}
+
+fn chat_images(
+    messages: &[ChatCompletionRequestMessage],
     is_multimodal: bool,
 ) -> Result<Vec<MmItem>, String> {
-    let messages = serde_json::to_value(messages).unwrap_or_default();
-    if !contains_media(&messages) {
+    if !needs_media_scan(messages) {
         return Ok(Vec::new());
     }
-    if !is_multimodal || contains_non_image_media(&messages) {
+    chat_images_from_value(
+        &serde_json::to_value(messages).unwrap_or_default(),
+        is_multimodal,
+    )
+}
+
+fn chat_images_from_value(messages: &Value, is_multimodal: bool) -> Result<Vec<MmItem>, String> {
+    if !contains_media(messages) {
+        return Ok(Vec::new());
+    }
+    if !is_multimodal || contains_non_image_media(messages) {
         return Err("image, audio, video, and file message content is not supported".into());
     }
-    let images = sglang_processor::extract_images(&messages)?;
+    let images = sglang_processor::extract_images(messages)?;
     Ok(images.into_iter().map(MmItem::Source).collect())
 }
 
@@ -1186,14 +1231,16 @@ mod tests {
         post_json, with_cached_tokens,
     };
     use super::{
-        OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
-        chat_sampling_params, merge_template_stops, unary_chat,
+        OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_images_from_value,
+        chat_logprobs, chat_sampling_params, merge_template_stops, needs_media_scan, unary_chat,
     };
     use crate::message::config::{DefaultSamplingParams, ServerArgs};
     use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
     use axum::http::StatusCode;
     use futures::StreamExt;
-    use sglang_processor::dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
+    use sglang_processor::dynamo_protocols::types::{
+        ChatCompletionRequestMessage, CreateChatCompletionRequest, Stop,
+    };
     use sglang_processor::dynamo_tokenizers::Tokenizer;
     use sglang_processor::openai::ChatModel;
     use sglang_processor::{DeepSeekOutputOptions, ReasoningOptions};
@@ -1206,6 +1253,110 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn chat_images_typed_scan_preserves_existing_media_behavior() {
+        let fixtures = [
+            (
+                serde_json::json!([
+                    {"role": "developer", "content": "image_url is text"},
+                    {"role": "system", "content": [{"type": "text", "text": "video_url"}]},
+                    {"role": "user", "content": "input_audio is text"},
+                    {"role": "assistant", "content": "audio_url is text", "audio": {"id": "prior-audio"}},
+                    {"role": "tool", "tool_call_id": "call-1", "content": [{"type": "text", "text": "file is text"}]},
+                    {"role": "function", "name": "legacy", "content": "image_url is text"}
+                ]),
+                false,
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": [
+                    {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": [
+                    {"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "tool", "tool_call_id": "call-2", "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/tool.png"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "tool", "tool_call_id": "call-3", "content": [
+                    {"type": "video_url", "video_url": {"url": "https://example.com/tool.mp4"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "tool", "tool_call_id": "call-4", "content": [
+                    {"type": "audio_url", "audio_url": {"url": "https://example.com/tool.wav"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": [
+                    {"type": "image_url", "image_url": null, "uuid": "cached"}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "system", "tools": [
+                    {"name": "inspect", "parameters": {"properties": {"file": {"type": "string"}}}}
+                ]}]),
+                true,
+            ),
+        ];
+
+        for (wire, needs_scan) in fixtures {
+            let messages: Vec<ChatCompletionRequestMessage> =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(needs_media_scan(&messages), needs_scan, "{wire}");
+            let serialized = serde_json::to_value(&messages).unwrap();
+            for is_multimodal in [false, true] {
+                let sources = |result: Result<Vec<crate::message::multimodal::MmItem>, String>| {
+                    result.map(|items| {
+                        items
+                            .into_iter()
+                            .map(|item| item.source().unwrap().to_owned())
+                            .collect::<Vec<_>>()
+                    })
+                };
+                assert_eq!(
+                    sources(chat_images(&messages, is_multimodal)),
+                    sources(chat_images_from_value(&serialized, is_multimodal)),
+                    "{wire}, is_multimodal={is_multimodal}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_content_remains_rejected_by_request_schema() {
+        let wire = serde_json::json!([{"role": "user", "content": [{
+            "type": "file",
+            "file": {"file_id": "file-1"}
+        }]}]);
+        assert!(serde_json::from_value::<Vec<ChatCompletionRequestMessage>>(wire).is_err());
+    }
+
     /// Images ride along in Python's order; other media, or any media for a
     /// text-only model, is refused.
     #[test]
@@ -1216,23 +1367,23 @@ mod tests {
             {"role": "user", "content": "plain"},
             {"role": "user", "content": [image("b")]},
         ]);
-        let urls: Vec<String> = chat_images(&messages, true)
+        let urls: Vec<String> = chat_images_from_value(&messages, true)
             .unwrap()
             .into_iter()
             .map(|item| item.source().unwrap().to_owned())
             .collect();
         assert_eq!(urls, ["a", "b"]);
-        assert!(chat_images(&messages, false).is_err());
+        assert!(chat_images_from_value(&messages, false).is_err());
         let video = serde_json::json!([{"role": "user", "content": [
             {"type": "video_url", "video_url": {"url": "v"}}
         ]}]);
-        assert!(chat_images(&video, true).is_err());
+        assert!(chat_images_from_value(&video, true).is_err());
         let text = serde_json::json!([{"role": "user", "content": "plain"}]);
-        assert!(chat_images(&text, false).unwrap().is_empty());
+        assert!(chat_images_from_value(&text, false).unwrap().is_empty());
         let no_url = serde_json::json!([{"role": "user", "content": [
             {"type": "image_url", "image_url": null, "uuid": "cached"}
         ]}]);
-        assert!(chat_images(&no_url, true).is_err());
+        assert!(chat_images_from_value(&no_url, true).is_err());
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
