@@ -2422,11 +2422,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
-        self._apply_cache_actions(
-            self.tree_core.commit_load_back(
-                node_id, device_indices, kv_xfer, comp_xfers
-            )
-        )
+        self._commit_load_back(node_id, device_indices, kv_xfer, comp_xfers)
         self.name_loaded_window_rows_by_owner(aux_xfers)
 
         receipt = _OngoingLoadBack(
@@ -2446,6 +2442,19 @@ class UnifiedRadixCache(BasePrefixCache):
             self.ongoing_load_back[node_id] = receipt
 
         return True
+
+    def _commit_load_back(
+        self,
+        node_id: NodeId,
+        device_indices: torch.Tensor,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> None:
+        self._apply_cache_actions(
+            self.tree_core.commit_load_back(
+                node_id, device_indices, kv_xfer, comp_xfers
+            )
+        )
 
     def name_loaded_window_rows_by_owner(self, transfers) -> None:
         """A queued host load reserved window rows and the tree has bound them
@@ -2897,14 +2906,37 @@ class UnifiedRadixCache(BasePrefixCache):
                 PPPrefetchDecision.TICKETED if decision else PPPrefetchDecision.SKIPPED
             )
 
-    def _check_pp_prefetch_progress(self, request: CacheRequestHandle) -> bool:
-        req_id = request.rid
-        ready = self.pp_rank == 0 and self.cache_controller.is_pp_prefetch_ready(req_id)
-        ready_tensor = torch.tensor(int(ready), dtype=torch.int, device="cpu")
-        self._all_reduce(ready_tensor, torch.distributed.ReduceOp.MAX)
-        if ready_tensor.item() == 0:
-            return False
+    def _is_pp_ticketed(self, request: CacheRequestHandle) -> bool:
+        return (
+            self.cache_controller is not None
+            and self.cache_controller.pp_prefetch_decisions.get(request.rid)
+            is PPPrefetchDecision.TICKETED
+        )
 
+    def _pp_prefetch_ready(self, requests: list[CacheRequestHandle]) -> list[bool]:
+        # PP0 decides; one exchange carries every verdict along the pipeline.
+        ready = torch.tensor(
+            [
+                int(
+                    self.pp_rank == 0
+                    and self.cache_controller.is_pp_prefetch_ready(request.rid)
+                )
+                for request in requests
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce(ready, torch.distributed.ReduceOp.MAX)
+        return [bool(flag) for flag in ready.tolist()]
+
+    def _check_pp_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if not self._pp_prefetch_ready([request])[0]:
+            return False
+        self._finish_pp_prefetch(request)
+        return True
+
+    def _finish_pp_prefetch(self, request: CacheRequestHandle) -> None:
+        req_id = request.rid
         state = self.cache_controller.take_ready_pp_prefetch(req_id)
         if state is None:
             raise RuntimeError(
@@ -2914,7 +2946,7 @@ class UnifiedRadixCache(BasePrefixCache):
         operation = state.operation
         if operation.host_indices is None or operation.completed_tokens == 0:
             self.prefetch_loaded_tokens_by_reqid[request] = 0
-            return True
+            return
 
         ticket = state.ticket
         prefetch_key = ticket.prefetch_key
@@ -2943,7 +2975,19 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.host_indices[operation.completed_tokens :]
         )
         self._handle_prefetch_result(operation)
-        return True
+
+    @rank_consensus(same_params=True)
+    def poll_prefetch_progress(self, requests: list[CacheRequestHandle]) -> None:
+        # Finishing a ticket clears its decision, so classify before the exchange.
+        tickets, others = [], []
+        for request in requests:
+            (tickets if self._is_pp_ticketed(request) else others).append(request)
+        if tickets:
+            for request, ready in zip(tickets, self._pp_prefetch_ready(tickets)):
+                if ready:
+                    self._finish_pp_prefetch(request)
+        for request in others:
+            self.check_prefetch_progress(request)
 
     def waiting_storage_span(
         self, request: CacheRequestHandle
@@ -2966,11 +3010,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if self.linker is not None and self.linker.load_mode == "prefetch":
             return self.linker.check_prefetch_progress(request)
-        if (
-            self.cache_controller is not None
-            and self.cache_controller.pp_prefetch_decisions.get(request.rid)
-            is PPPrefetchDecision.TICKETED
-        ):
+        if self._is_pp_ticketed(request):
             return self._check_pp_prefetch_progress(request)
 
         if request not in self.ongoing_prefetch:
@@ -3341,6 +3381,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_tokens_by_reqid.pop(request, 0),
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None),
         )
+
+    def staged_storage_prefix_end(self, request: CacheRequestHandle) -> int:
+        if self.buffer_pipeline is None:
+            return 0
+        return self.buffer_pipeline.staged_prefix_end(request)
+
+    def can_poll_prefetch_progress(self) -> bool:
+        # The other stop policies end the prefetch when progress is checked.
+        return self.enable_storage and self.prefetch_stop_policy == "wait_complete"
 
     @rank_consensus(same_params=True)
     def _abandon_attempt(self, request: CacheRequestHandle) -> None:
