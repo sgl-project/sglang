@@ -3,7 +3,10 @@ import importlib
 import logging
 import math
 import threading
-from typing import Tuple
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator, Tuple
 
 import torch
 import triton
@@ -836,6 +839,63 @@ def get_mhc_pre_token_count_representatives(
     return tuple(sorted(reps.values()))
 
 
+@functools.lru_cache(maxsize=1)
+def _warn_prewarm_lock_fallback():
+    logger.warning(
+        "MHC prewarm locking unavailable or timed out; continuing without sharding"
+    )
+
+
+@contextmanager
+def _claim_prewarm_bucket(
+    tag: str, *, wait: bool, timeout: float = 300.0
+) -> Iterator[bool]:
+    # False means a peer owns the bucket. Infrastructure failures yield True
+    # so this rank replays normally, without relying on another rank's cache.
+    lock_file = None
+    locked = False
+    own = True
+    try:
+        try:
+            import fcntl
+
+            from tilelang.env import env as tilelang_env
+
+            lock_dir = Path(tilelang_env.TILELANG_CACHE_DIR) / "prewarm_locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_file = open(lock_dir / f"{tag}.lock", "a")
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if not wait:
+                        own = False
+                        break
+                    # A live but stuck owner must not indefinitely delay startup.
+                    if time.monotonic() >= deadline:
+                        _warn_prewarm_lock_fallback()
+                        break
+                    time.sleep(0.1)
+        except (ImportError, OSError):
+            _warn_prewarm_lock_fallback()
+        # Keep replay exceptions outside the lock error handler.
+        yield own
+    finally:
+        if locked:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except OSError:
+                _warn_prewarm_lock_fallback()
+        if lock_file is not None:
+            try:
+                lock_file.close()
+            except OSError:
+                _warn_prewarm_lock_fallback()
+
+
 def prewarm_mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -855,6 +915,8 @@ def prewarm_mhc_pre(
     prenorm with the call's real weights. The compiled kernels are written to
     the TileLang/DeepGEMM on-disk JIT cache, so this cost is paid only on a cold
     cache; later server runs hit the cache. Driven once per process from load_weights.
+    Ranks sharing the cache dir split the buckets between them, then replay each
+    other's as cache hits, so every rank still ends up holding every kernel.
     """
     from sglang.srt.runtime_context import get_schedule
 
@@ -868,24 +930,55 @@ def prewarm_mhc_pre(
         max_num_tokens, hc_mult * hidden_size
     )
 
-    logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+    logger.info("MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+
+    def replay(num_tokens: int) -> None:
+        mhc_pre(
+            residual.new_zeros(num_tokens, hc_mult, hidden_size),
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            n_splits_pre,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            # Ranks replay buckets in different orders, so their allocations
+            # must not touch the symmetric pool.
+            symmetric_output=False,
+        )
+
+    props = torch.cuda.get_device_properties(residual.device)
+    arch = (
+        props.gcnArchName.split(":")[0]
+        if torch.version.hip
+        else f"sm{props.major}{props.minor}"
+    )
+    shard_key = f"mhc_pre_{arch}_h{hc_mult}x{hidden_size}_s{n_splits}_{n_splits_pre}"
+    taken_by_peers: list[int] = []
     with torch.inference_mode():
         for num_tokens in buckets:
-            mhc_pre(
-                residual.new_zeros(num_tokens, hc_mult, hidden_size),
-                fn,
-                hc_scale,
-                hc_base,
-                rms_eps,
-                hc_pre_eps,
-                hc_sinkhorn_eps,
-                hc_post_mult_value,
-                sinkhorn_repeat,
-                n_splits,
-                n_splits_pre,
-                norm_weight=norm_weight,
-                norm_eps=norm_eps,
-            )
+            with _claim_prewarm_bucket(f"{shard_key}_m{num_tokens}", wait=False) as own:
+                if own:
+                    replay(num_tokens)
+                else:
+                    taken_by_peers.append(num_tokens)
+        for num_tokens in taken_by_peers:
+            # Replay outside the lock to avoid serializing cache-hit loads.
+            # After owner death or a timeout, peers may compile concurrently;
+            # TileLang's cache remains responsible for artifact correctness.
+            with _claim_prewarm_bucket(f"{shard_key}_m{num_tokens}", wait=True):
+                pass
+            replay(num_tokens)
+    logger.info(
+        "MHC prenorm prewarm: claimed %d buckets, %d held by peers",
+        len(buckets) - len(taken_by_peers),
+        len(taken_by_peers),
+    )
 
 
 @tilelang.jit(
@@ -1080,9 +1173,12 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
     eps_outside_sqrt: bool = False,
+    symmetric_output: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``eps_outside_sqrt`` normalizes by ``1 / (sqrt(mean_sq) + eps)`` instead of
-    ``rsqrt(mean_sq + eps)``; set it to the formula the checkpoint was trained with."""
+    ``rsqrt(mean_sq + eps)``; set it to the formula the checkpoint was trained with.
+    ``symmetric_output=False`` keeps ``layer_input`` out of the symmetric memory
+    pool, whose growth is a collective call every TP rank must make in step."""
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -1117,7 +1213,8 @@ def mhc_pre(
     # output back into this buffer, so a symmetric input yields a symmetric
     # all-reduce input.
     with use_symmetric_memory(
-        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        get_parallel().tp_group,
+        disabled=not symmetric_output or not is_allocation_symmetric(),
     ):
         layer_input = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
