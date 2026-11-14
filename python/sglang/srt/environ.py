@@ -1566,6 +1566,13 @@ class Envs:
     # sections, the SASS is unchanged; like the flag above, it gets its own
     # cache entry.
     SGLANG_JIT_ENABLE_LINEINFO = EnvBool(False)
+    # In-kernel event tracing (sgl_kernel/debug/trace.cuh), debugging only:
+    # "iket" builds every JIT module with NVIDIA IKET placeholders (4-byte
+    # records, 30 event names per translation unit), "iket-extended" with
+    # 8-byte records; "naive" records %clock cycles into a buffer owned by
+    # sglang.kernels.jit.debug.trace, "naive-debug" also detects overwritten
+    # records. Like the flags above, it gets its own cache entry.
+    SGLANG_JIT_DEBUG_TRACE = EnvStr(None)
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)

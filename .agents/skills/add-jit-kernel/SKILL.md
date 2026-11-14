@@ -306,6 +306,11 @@ LaunchKernel(num_blocks, kBlockSize, device.unwrap())(kernel, params);
 
 - `device::dot_product_vec(a, b, acc)` — accumulates `sum a[i] * b[i]` over two `AlignedVector`s of `bf16x2_t` (or bf16 x fp32) into an fp32 `acc`, in element order, one rounding per product. Small-GEMM and GEMV kernels share it, so they agree bitwise where their ranges overlap. Reuse it rather than writing another dot-product loop.
 
+### `debug/trace.cuh` — In-kernel event tracing (debugging only)
+
+- Per-warp ranges and marks (`SGL_TRACE_DECLARE_*` at namespace scope, `SGL_TRACE_SCOPE` / `MARK` / ... in device code), recorded by `sglang.kernels.jit.debug.trace.capture()`. Every macro is empty unless `SGLANG_JIT_DEBUG_TRACE` is set: `iket` (NVIDIA IKET, `%globaltimer` ns, Hopper or newer) or `naive` (`%clock` cycles, any architecture; `naive-debug` checks its usage rules). Never commit instrumented kernels.
+- Usage, rules and costs of both backends: [performance-cuda.md](performance-cuda.md), "In-kernel tracing".
+
 ---
 
 ## Step 0 (optional): Generate a `.clangd` config for better IDE support
