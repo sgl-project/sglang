@@ -553,6 +553,7 @@ class MMEncoder:
             get_mm().media_url_max_file_size_mb,
             get_mm().media_url_timeout,
             get_mm().allow_local_media_files,
+            allowed_local_media_paths=get_mm().allowed_local_media_paths,
         )
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"

@@ -273,6 +273,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
             media_url_timeout=get_mm().media_url_timeout,
             allow_local_media_files=get_mm().allow_local_media_files,
+            allowed_local_media_paths=get_mm().allowed_local_media_paths,
         )
         MultimodalProcessorMixin._initialize_processor(
             self, hf_config, _processor, processor_config=processor_config

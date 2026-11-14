@@ -91,6 +91,17 @@ class Mm(msgspec.Struct):
         "exact hostnames. Redirect destinations are checked against the same "
         "allowlist. When unset, remote media from any domain is allowed.",
     ] = msgspec.field(default_factory=list)
+    allowed_local_media_paths: A[
+        Optional[List[str]],
+        Arg(
+            help=(
+                "Restrict client-supplied local media files and file:// URIs to these "
+                "allowed directories or files. When unset and allowed_media_domains is set, "
+                "local media access is disabled. Paths are resolved to their canonical real paths."
+            ),
+            nargs="*",
+        ),
+    ] = None
     media_url_max_file_size_mb: A[
         int,
         "Maximum size in MiB for one client-supplied remote media download. "

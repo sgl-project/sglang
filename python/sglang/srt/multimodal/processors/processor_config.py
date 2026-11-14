@@ -15,5 +15,6 @@ class MultimodalProcessorConfig(msgspec.Struct, frozen=True, kw_only=True):
     media_url_max_file_size_mb: int = 64
     media_url_timeout: Optional[float] = None
     allow_local_media_files: bool = True
+    allowed_local_media_paths: Optional[list[str]] = None
     # Keep preprocessed features on the GPU; serving sets it for GPU transports.
     keep_mm_features_on_device: bool = False
