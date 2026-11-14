@@ -36,6 +36,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample_graph,
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
+from sglang.kernels.ops.speculative.fly import FlyGreedyPrepass
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import (
@@ -61,6 +62,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
+from sglang.srt.speculative.fly_config import FlyConfig
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -151,6 +153,7 @@ class TargetVerifyExecutor:
         simulated_correct_len: Optional[torch.Tensor] = None,
         block_verification: bool = False,
         rejection_noise: Optional[RejectionNoise] = None,
+        fly: Optional[FlyConfig] = None,
     ) -> None:
         self.target_worker = target_worker
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
@@ -166,6 +169,7 @@ class TargetVerifyExecutor:
         self._block_verification = block_verification
         # Block-wise rejection draws (blockwise_rejection.py); None keeps the classic kernel.
         self._rejection_noise = rejection_noise
+        self._fly = fly
         self._simulated_correct_len = simulated_correct_len
         # SGLANG_SIMULATE_ACC_LEN: every TP rank draws the same correct length and
         # bonus seed from the server seed, whatever else reads the process RNG.
@@ -212,6 +216,7 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
+            fly=self._fly,
         )
         greedy_bonus = simulate_bonus_sampling_info is None and (
             sampling_info is None or sampling_info.is_all_greedy
@@ -604,8 +609,10 @@ class DsparkVerifyEpilogue:
         accept_tail_max_bs: int = 0,
         deferred_draft_kv: Optional[DeferredDraftKVStore] = None,
         post_fold: bool = False,
+        fly: Optional[FlyConfig] = None,
     ) -> None:
         self.max_bs = int(max_bs)
+        self.fly = fly
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
@@ -854,6 +861,13 @@ class DsparkVerifyEpilogue:
         bs = candidates.shape[0]
         # Under simulate_fold the tail does not read the argmax; it still runs as served.
         target_predict = sampling_argmax(logits).view(-1)
+        if self.fly is not None:
+            target_predict = FlyGreedyPrepass.execute(
+                candidates=candidates,
+                target_predict=target_predict,
+                target_logits=logits,
+                fly=self.fly,
+            )
         bonus_parts = None
         if self.simulate_fold:
             bonus_parts = (
@@ -1050,6 +1064,7 @@ class DsparkVerifyEpilogue:
             target_logits=logits,
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
+            fly=self.fly,
         )
         if self.simulate_fold:
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
@@ -1318,6 +1333,7 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     block_verification: bool = False,
     rejection_noise: Optional[RejectionNoise] = None,
+    fly: Optional[FlyConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -1328,6 +1344,7 @@ def accept_draft_tokens(
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            fly=fly,
         )
     if _accepts_on_shards(draft_block, sampling_info, block_verification):
         # Block-wise rejection scans the whole draft vocab. This kernel is the
@@ -1344,6 +1361,7 @@ def accept_draft_tokens(
             key=draft_block.noise.key,
             offset=draft_block.noise.offset,
             verify_lens=cutoff_verify_lens,
+            fly=fly,
         )
     elif _blockwise_rejection_applies(
         sampling_info=sampling_info,
@@ -1375,6 +1393,7 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
+            fly=fly,
         )
     if not sampling_info.is_any_greedy:
         return sampled
@@ -1383,6 +1402,7 @@ def accept_draft_tokens(
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        fly=fly,
     )
     sampling_len, sampling_bonus, sampling_trim = sampled
     selected = SelectMixedAccept.execute(

@@ -78,6 +78,7 @@ def _epilogue_for_accept(*, fused, bs, stride, history):
     epi.folds_engram_commit = False
     epi.static_io = {}
     epi._post_fold = False
+    epi.fly = None
     # No fused-norm pool: the epilogue returns right after the engram commit.
     epi.commit_ctx = SimpleNamespace(
         resolve_engram_hasher=lambda: SimpleNamespace(history=history),

@@ -182,6 +182,19 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             f"(--speculative-algorithm {cfg.speculative_algorithm})"
         )
 
+    if cfg.speculative_use_fly and cfg.speculative_algorithm != "DSPARK":
+        raise ValueError(
+            "--speculative-use-fly only supports --speculative-algorithm DSPARK, got "
+            f"{cfg.speculative_algorithm!r}."
+        )
+    if cfg.speculative_use_fly and not get_platform().is_hip:
+        raise ValueError("--speculative-use-fly is only supported on ROCm.")
+    if cfg.speculative_use_fly and cfg.speculative_use_block_verification:
+        raise ValueError(
+            "--speculative-use-fly does not support "
+            "--speculative-use-block-verification."
+        )
+
     if cfg.speculative_use_block_verification:
         if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
             raise ValueError(
@@ -869,6 +882,26 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         raise ValueError(
             "DSpark speculative_num_draft_tokens must be >= 2 (= gamma + 1), "
             f"got {cfg.speculative_num_draft_tokens}."
+        )
+    if cfg.speculative_use_fly:
+        from sglang.srt.speculative.fly_config import resolve_fly_config
+
+        fly = resolve_fly_config(
+            gamma=int(cfg.speculative_num_draft_tokens) - 1,
+            window_size=cfg.speculative_fly_window_size,
+            entropy_threshold=cfg.speculative_fly_entropy_threshold,
+            entropy_top_k=cfg.speculative_fly_entropy_top_k,
+        )
+        if cfg.speculative_fly_window_size is None:
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                speculative_fly_window_size=fly.window_size,
+            )
+        logger.warning(
+            "FLy verification is lossy: it does not preserve the target "
+            "distribution and may degrade model outputs (%s).",
+            fly,
         )
 
     if cfg.max_running_requests is None:
