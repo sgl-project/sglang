@@ -806,6 +806,9 @@ def exchange_posix_fds(
     server = socket.socket(socket.AF_UNIX, sock_kind)
     server.settimeout(_FD_SEND_TIMEOUT_S)
     received_fds = {}
+    fd_lock = threading.Lock()
+    exchange_failed = False
+    fds_transferred = False
     errors = []
 
     def recv_loop():
@@ -820,10 +823,15 @@ def exchange_posix_fds(
                             break
                         src_rank, base_idx, fd = packet
                         key = (src_rank, base_idx)
-                        if key in received_fds:
-                            os.close(fd)
-                            raise RuntimeError(f"duplicate fd for {key}")
-                        received_fds[key] = fd
+                        with fd_lock:
+                            # The caller may have timed out while recvmsg was blocked.
+                            if exchange_failed:
+                                os.close(fd)
+                                return
+                            if key in received_fds:
+                                os.close(fd)
+                                raise RuntimeError(f"duplicate fd for {key}")
+                            received_fds[key] = fd
         except BaseException as e:
             errors.append(e)
 
@@ -861,14 +869,19 @@ def exchange_posix_fds(
         missing = expected.difference(received_fds)
         extra = set(received_fds).difference(expected)
         if missing or extra:
-            for fd in received_fds.values():
-                os.close(fd)
             raise RuntimeError(
                 "POSIX fd exchange mismatch: "
                 f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
             )
+        fds_transferred = True
         return received_fds
     finally:
+        if not fds_transferred:
+            with fd_lock:
+                exchange_failed = True
+                while received_fds:
+                    _, fd = received_fds.popitem()
+                    os.close(fd)
         server.close()
         try:
             os.unlink(sock_path)
