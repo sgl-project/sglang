@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -128,6 +129,7 @@ def _accept_sampling_core(
         and not block_verification
         and not _is_npu
         and target_logits.is_cuda
+        and not _deterministic_inference()
     ):
         # the vocabulary split over CTAs (one CTA a request walks 202k twice otherwise:
         # ~340 us a step at any batch size); the softmax is folded in
@@ -334,13 +336,23 @@ except ImportError:
     _flashinfer_softmax = None
 
 
+def _deterministic_inference() -> bool:
+    # Standalone kernel calls can run before the server publishes its config.
+    return (
+        get_context().is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+    )
+
+
 # Not sampling.softmax: the FlashInfer and Triton paths are not bitwise torch.softmax(x / t).
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
-        if _flashinfer_softmax is not None:
+        # FlashInfer selects its launch from the row count, so a request's bits can
+        # change with its batch.
+        if _flashinfer_softmax is not None and not _deterministic_inference():
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
@@ -539,7 +551,8 @@ def softmax_temp_triton(
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
     if num_rows == 0:
         return out
-    if not is_hip():
+    # The ROCm split count depends on the batch size and changes the reduction order.
+    if not is_hip() or _deterministic_inference():
         _softmax_temp_kernel[(num_rows,)](
             logits,
             temperatures,
