@@ -69,6 +69,22 @@ def cuda_lib_dir(home: str) -> str:
     return os.path.join(home, "lib64")
 
 
+def cudart_link_flags(home: str) -> List[str]:
+    """Flags that link libcudart from a CUDA root.
+
+    The pip wheels ship only the versioned ``libcudart.so.<N>``, so ``-lcudart``
+    cannot resolve; name the versioned file explicitly in that case.
+    """
+    lib_dir = cuda_lib_dir(home)
+    flags = [f"-L{lib_dir}"]
+    if os.path.exists(os.path.join(lib_dir, "libcudart.so")):
+        return flags + ["-lcudart"]
+    versioned = sorted(glob.glob(os.path.join(glob.escape(lib_dir), "libcudart.so.*")))
+    if versioned:
+        return flags + [f"-l:{os.path.basename(versioned[-1])}"]
+    return flags + ["-lcudart"]
+
+
 @cache_once
 def cuda_stubs_dir() -> str:
     """Directory holding the driver stub libraries (`libcuda.so`).
@@ -78,7 +94,7 @@ def cuda_stubs_dir() -> str:
     the stub ships with the toolkit, so this path -- not a plain `-lcuda` -- is
     what makes the link resolve.
     """
-    return os.path.join(cuda_home(), "lib64", "stubs")
+    return os.path.join(cuda_lib_dir(cuda_home()), "stubs")
 
 
 @cache_once
@@ -254,7 +270,7 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         ]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
-    return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
+    return flags + cudart_link_flags(cuda_home())
 
 
 def compilers() -> Tuple[str, str]:

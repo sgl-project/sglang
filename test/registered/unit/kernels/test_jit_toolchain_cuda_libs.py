@@ -31,3 +31,26 @@ def test_lib64_preferred_when_both_have_cudart(tmp_path):
 
 def test_empty_root_falls_back_to_lib64(tmp_path):
     assert toolchain.cuda_lib_dir(str(tmp_path)) == str(tmp_path / "lib64")
+
+
+def test_system_toolkit_flags_unchanged(tmp_path):
+    _touch(tmp_path / "lib64" / "libcudart.so")
+    assert toolchain.cudart_link_flags(str(tmp_path)) == [
+        f"-L{tmp_path / 'lib64'}",
+        "-lcudart",
+    ]
+
+
+def test_pip_wheel_links_versioned_file(tmp_path):
+    _touch(tmp_path / "lib" / "libcudart.so.13")
+    assert toolchain.cudart_link_flags(str(tmp_path)) == [
+        f"-L{tmp_path / 'lib'}",
+        "-l:libcudart.so.13",
+    ]
+
+
+def test_missing_cudart_keeps_old_flags(tmp_path):
+    assert toolchain.cudart_link_flags(str(tmp_path)) == [
+        f"-L{tmp_path / 'lib64'}",
+        "-lcudart",
+    ]
