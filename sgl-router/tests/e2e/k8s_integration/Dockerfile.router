@@ -15,12 +15,6 @@ FROM rust:1.92-bookworm AS source
 # `channel = "1.92"`.
 ENV RUSTUP_TOOLCHAIN=1.92.0
 
-# libssl-dev + pkg-config ship with rust:1.92-bookworm already; protoc does not,
-# and the Indexer's build script needs it to compile the KV-indexer protos.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /build
 
 # Copy the sgl-router crate and its sglang-processor path dependency (context is the repo root)

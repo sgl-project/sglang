@@ -135,9 +135,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install protoc
-        run: sudo bash scripts/ci/utils/install_protoc.sh
-
       # sccache install is best-effort: the GitHub release CDN intermittently
       # returns 5xx and the action's built-in retry is shallow. If it fails,
       # we unset RUSTC_WRAPPER below and proceed without compile caching —
@@ -209,14 +206,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install protoc
-        run: sudo bash scripts/ci/utils/install_protoc.sh
-
-      - name: Install OS deps (libssl, pkg-config)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
 
       # sccache install is best-effort: the GitHub release CDN intermittently
       # returns 5xx and the action's built-in retry is shallow. If it fails,
