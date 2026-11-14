@@ -25,6 +25,7 @@ import msgspec
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.pp_relay import PPRelay
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -353,7 +354,13 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.work_list: list[torch.distributed.Work] = []
+        self.pp_relay = PPRelay(
+            group=params.pp_cache_group,
+            pp_rank=params.pp_rank,
+            pp_size=params.pp_size,
+            tag=P2PTag.HICACHE_PP_SYNC,
+            window=params.pp_size + params.pp_async_batch_depth,
+        )
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -414,18 +421,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
-    def _drain_async_work(self):
-        """
-        Block until all outstanding async sends are consumed, then clear.
-
-        Called at the start of each event round, so work_list holds the sends
-        accumulated since the last round. This bounds it and applies
-        backpressure when a downstream PP rank lags. Scheduler thread only.
-        """
-        for work in self.work_list:
-            work.wait()
-        self.work_list.clear()
-
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
         """
         Synchronize data across all TP and PP ranks.
@@ -440,27 +435,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._pp_sync(data)
 
     def _pp_sync(self, data: torch.Tensor) -> None:
-        """
-        Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
-        """
-        if self.pp_size <= 1 or self.pp_group is None:
-            return
-        if self.pp_rank > 0:
-            torch.distributed.recv(
-                data,
-                group_src=self.pp_rank - 1,
-                group=self.pp_group,
-                tag=P2PTag.HICACHE_PP_SYNC,
-            )
-        if self.pp_rank + 1 < self.pp_size:
-            copy_of_data = data.clone()
-            send_work = torch.distributed.isend(
-                copy_of_data,
-                group_dst=self.pp_rank + 1,
-                group=self.pp_group,
-                tag=P2PTag.HICACHE_PP_SYNC,
-            )
-            self.work_list.append(send_work)
+        self.pp_relay.relay_tensor(data)
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
@@ -4431,8 +4406,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if self.enable_storage:
             self._raise_if_storage_workers_died()
-        # Reap the previous round's PP-sync sends before issuing new ones.
-        self._drain_async_work()
+        self.pp_relay.open_round()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()

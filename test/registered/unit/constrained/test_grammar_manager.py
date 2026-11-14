@@ -35,7 +35,6 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
     ReasonerGrammarObject,
 )
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
-from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -814,96 +813,59 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertIn("timed out", req.set_finish_with_abort.call_args[0][0])
 
 
-class _FakePPSendWork:
-    def __init__(self):
-        self.waited = False
-        self.work = self
+class _RecordingRelay:
+    def __init__(self, *, active, recv=None):
+        self.active = active
+        self.recv = recv
+        self.calls = []
 
-    def wait(self):
-        self.waited = True
+    def open_round(self):
+        self.calls.append("open_round")
 
-
-class _FakePPGroup:
-    def __init__(self, recv_data=None):
-        self.recv_data = recv_data
-        self.recv_calls = []
-        self.send_calls = []
-
-    def recv_object(self, *, src, tag):
-        self.recv_calls.append((src, tag))
-        return self.recv_data
-
-    def send_object(self, data, *, dst, async_send, tag):
-        self.send_calls.append((data, dst, async_send, tag))
-        return [_FakePPSendWork()]
+    def relay_object(self, obj):
+        self.calls.append(("relay_object", obj))
+        return obj if self.recv is None else self.recv
 
 
 class TestGrammarManagerPPSync(unittest.TestCase):
+    """The grammar ready/failed decision travels down the PP relay: one round opened
+    per call, PP0's tuple relayed as is, a received tuple adopted verbatim."""
+
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
 
-    """Test PP synchronization of grammar ready/failed indexes."""
-
-    def _make_mgr_for_pp(self, pp_rank, pp_size, pp_group):
+    def _make_mgr(self, relay):
         scheduler = _make_scheduler()
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        # Override ranks after the server-args override rebuilds the config bags.
-        enter_scope(self, get_parallel().override(pp_size=pp_size, pp_rank=pp_rank))
-        scheduler.pp_group = pp_group
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
+        mgr.pp_relay = relay
         return mgr
 
-    def test_pp0_sends_ready_failed_without_recv(self):
-        pp_group = _FakePPGroup()
-        mgr = self._make_mgr_for_pp(pp_rank=0, pp_size=3, pp_group=pp_group)
+    def test_pp0_relays_its_decision_once_per_round(self):
+        relay = _RecordingRelay(active=True)
+        mgr = self._make_mgr(relay)
 
         data = mgr._pp_sync_ready_failed({1}, {3})
 
         self.assertEqual(data, ({1}, {3}))
-        self.assertEqual(pp_group.recv_calls, [])
-        self.assertEqual(
-            pp_group.send_calls,
-            [(({1}, {3}), 1, True, P2PTag.GRAMMAR_PP_SYNC)],
-        )
+        self.assertEqual(relay.calls, ["open_round", ("relay_object", ({1}, {3}))])
 
-    def test_middle_pp_rank_receives_and_forwards_pp0_result(self):
-        pp0_data = ({1, 2}, {4})
-        pp_group = _FakePPGroup(recv_data=pp0_data)
-        mgr = self._make_mgr_for_pp(pp_rank=1, pp_size=3, pp_group=pp_group)
+    def test_later_rank_adopts_pp0_decision(self):
+        relay = _RecordingRelay(active=True, recv=({1, 2}, {4}))
+        mgr = self._make_mgr(relay)
 
-        data = mgr._pp_sync_ready_failed(set(), set())
+        self.assertEqual(mgr._pp_sync_ready_failed(set(), set()), ({1, 2}, {4}))
 
-        self.assertEqual(data, pp0_data)
-        self.assertEqual(pp_group.recv_calls, [(0, P2PTag.GRAMMAR_PP_SYNC)])
-        self.assertEqual(
-            pp_group.send_calls,
-            [(pp0_data, 2, True, P2PTag.GRAMMAR_PP_SYNC)],
-        )
+    def test_inactive_relay_keeps_local_decision(self):
+        relay = _RecordingRelay(active=False)
+        mgr = self._make_mgr(relay)
 
-    def test_last_pp_rank_receives_without_forwarding(self):
-        pp0_data = ({0}, {2})
-        pp_group = _FakePPGroup(recv_data=pp0_data)
-        mgr = self._make_mgr_for_pp(pp_rank=2, pp_size=3, pp_group=pp_group)
-
-        data = mgr._pp_sync_ready_failed(set(), set())
-
-        self.assertEqual(data, pp0_data)
-        self.assertEqual(pp_group.recv_calls, [(1, P2PTag.GRAMMAR_PP_SYNC)])
-        self.assertEqual(pp_group.send_calls, [])
-
-    def test_pp_sync_drains_previous_async_send_work(self):
-        pp_group = _FakePPGroup()
-        mgr = self._make_mgr_for_pp(pp_rank=0, pp_size=2, pp_group=pp_group)
-        work = _FakePPSendWork()
-        mgr.grammar_pp_sync_work_list = [work]
-
-        mgr._pp_sync_ready_failed({1}, set())
-
-        self.assertTrue(work.waited)
+        self.assertEqual(mgr._pp_sync_ready_failed({5}, set()), ({5}, set()))
+        self.assertEqual(relay.calls, [])
 
 
 class TestStrictReasoningPaths(unittest.TestCase):

@@ -9,17 +9,19 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.distributed.pp_relay import PPRelay
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
     _StoragePrefetchWait,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class TestUnifiedPPSyncBatching(unittest.TestCase):
+class TestUnifiedPPSyncBatching(CustomTestCase):
     def _make_cache(self, pp_rank, write_ready, load_ready):
         cache = object.__new__(UnifiedRadixCache)
         cache.tree_core = SimpleNamespace(
@@ -28,6 +30,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         )
         cache.pp_rank = pp_rank
         cache.pp_size = 2
+        cache.pp_relay = PPRelay(group=None, pp_rank=pp_rank, pp_size=2, tag=0, window=1)
         cache.host_memory_mode = "cache"
         # The per-tick deadline vote runs under storage; no live prefetch
         # means it issues no collective, which the asserts below pin.
@@ -37,7 +40,6 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
         cache.linker = None
-        cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
         cache.writing_check = MagicMock()
         cache.loading_check = MagicMock()
