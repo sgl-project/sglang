@@ -154,6 +154,7 @@ mod tests {
                 },
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
 
@@ -233,6 +234,7 @@ mod tests {
                 })],
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
 
@@ -272,6 +274,7 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         (handle, intake_rx)

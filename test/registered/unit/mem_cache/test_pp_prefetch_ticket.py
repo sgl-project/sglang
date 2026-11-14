@@ -756,6 +756,47 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertTrue(key.is_bigram)
         self.assertFalse(c.is_pp_prefetch_ready("hit"))
 
+    def test_poll_exchanges_readiness_once_for_all_tickets(self):
+        c, cache = self.c, self.cache
+        tickets = [CacheRequestHandle(f"t{i}", 0) for i in range(6)]
+        local = CacheRequestHandle("local", 0)
+        for handle in tickets:
+            c.pp_prefetch_decisions[handle.rid] = PPPrefetchDecision.TICKETED
+        # Finishing a ticket clears its decision, as take_ready_pp_prefetch does.
+        cache._finish_pp_prefetch = Mock(
+            side_effect=lambda handle: c.pp_prefetch_decisions.pop(handle.rid)
+        )
+        cache.check_prefetch_progress = Mock()
+        queue = [tickets[0], local, *tickets[1:]]
+
+        cache.pp_rank = 0
+        with patch.object(
+            c, "is_pp_prefetch_ready", side_effect={"t2", "t4"}.__contains__
+        ):
+            cache.poll_prefetch_progress(queue)
+        cache._all_reduce.assert_called_once()
+        ready, op = cache._all_reduce.call_args.args
+        self.assertEqual(
+            (ready.tolist(), op), ([0, 0, 1, 0, 1, 0], torch.distributed.ReduceOp.MAX)
+        )
+        self.assertEqual(
+            [call.args[0] for call in cache._finish_pp_prefetch.call_args_list],
+            [tickets[2], tickets[4]],
+        )
+        # Only the unticketed request takes the local path; finished tickets do not.
+        cache.check_prefetch_progress.assert_called_once_with(local)
+
+        # A downstream stage follows PP0's verdict from the same single exchange.
+        cache.pp_rank = 1
+        cache._all_reduce.reset_mock()
+        cache._finish_pp_prefetch.reset_mock()
+        cache._all_reduce.side_effect = lambda tensor, _: tensor.__setitem__(3, 1)
+        for handle in (tickets[2], tickets[4]):
+            c.pp_prefetch_decisions[handle.rid] = PPPrefetchDecision.TICKETED
+        cache.poll_prefetch_progress(queue)
+        cache._all_reduce.assert_called_once()
+        cache._finish_pp_prefetch.assert_called_once_with(tickets[3])
+
     def test_allocation_error_preserves_ack_sequence_and_next_ticket(self):
         c = self.c
         self.submit(

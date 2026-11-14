@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
+from sglang.srt.utils.device import async_h2d_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -1142,7 +1143,7 @@ class HiCacheController:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
-                host_indices = host_indices.to(self.device, non_blocking=True)
+                host_indices = async_h2d_tensor(host_indices, device=self.device)
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
@@ -1517,10 +1518,16 @@ class HiCacheController:
         return False
 
     def alloc_prefetch_host_buffers(
-        self, operation: StorageOperation, need_size: int
+        self,
+        operation: StorageOperation,
+        need_size: int,
+        *,
+        start_owner: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Allocate the host bounce for a storage hit."""
-        return self.mem_pool_host.alloc(need_size)
+        if start_owner is None:
+            return self.mem_pool_host.alloc(need_size)
+        return self.mem_pool_host.alloc(need_size, start_owner=start_owner)
 
     def can_fit_prefetch_host_buffers(
         self, operation: StorageOperation, need_size: int
