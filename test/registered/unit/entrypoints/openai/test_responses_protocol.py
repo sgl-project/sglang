@@ -5,6 +5,7 @@ from utils import make_serving  # noqa: F401 — bootstrap import
 
 from sglang.srt.entrypoints.openai.protocol import (
     PromptTokensDetails,
+    ResponsesLifecycleEvent,
     ResponsesRequest,
     ResponsesResponse,
     UsageInfo,
@@ -173,8 +174,9 @@ class ResponsesSamplingParamsTestCase(CustomTestCase):
             model="x", input="hi", store=False, max_output_tokens=100
         )
         params = request.to_sampling_params(default_max_tokens=None)
-        # 100 minus the 2-token BOS/EOS headroom.
-        self.assertEqual(params["max_new_tokens"], 98)
+        # An explicit max_output_tokens is passed through verbatim; the 2-token
+        # BOS/EOS headroom only applies to the server-derived default budget.
+        self.assertEqual(params["max_new_tokens"], 100)
 
     def test_default_budget_still_caps_when_provided(self):
         # Backwards compatible: an explicit default budget still applies.
@@ -360,27 +362,20 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         self.assertNotIn("prompt_tokens", usage)
         self.assertNotIn("completion_tokens", usage)
 
-    def test_only_sdk_known_efforts_echoed_so_streaming_event_validates(self):
-        import openai.types.responses as ort
-
+    def test_effort_echoed_verbatim_and_accepted_by_lifecycle_stream_events(self):
         # OpenAI's Reasoning.effort literal is narrower than our tier list:
-        # "none" is a request-side extension and xhigh/max postdate it. Echoing
-        # one of those raises a ValidationError in the typed event below, which
-        # the stream generator builds before its try block -- the connection
-        # then dies without a single SSE byte.
+        # "none" is a request-side extension and xhigh/max postdate it. The
+        # streaming wire uses ResponsesLifecycleEvent, which wraps our own
+        # ResponsesResponse schema rather than the SDK's narrow one, so every
+        # tier echoes verbatim without breaking event validation.
         for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
             resp = _in_progress_response(
                 ResponsesRequest(
                     model="x", input="hi", store=False, reasoning={"effort": effort}
                 )
             )
-            expected = (
-                effort if effort in ("minimal", "low", "medium", "high") else None
-            )
-            self.assertEqual(resp.reasoning["effort"], expected, effort)
-            ort.ResponseCreatedEvent(
-                type="response.created", sequence_number=0, response=resp.model_dump()
-            )
+            self.assertEqual(resp.reasoning["effort"], effort, effort)
+            ResponsesLifecycleEvent(type="response.created", response=resp)
 
 
 class InputItemStringIdTestCase(CustomTestCase):
