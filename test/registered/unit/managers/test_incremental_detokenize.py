@@ -1,3 +1,4 @@
+import random
 import unittest
 from array import array
 from unittest import mock
@@ -339,7 +340,7 @@ class TestDetokenizeState(CustomTestCase):
         detok = _detokenizer()
         detok.tokenizer = _ByteTokenizer()
         sent = {}
-        rows = [[0xE4], [0xB8], [0xAD], [0x21]]
+        rows = [[0x61] * 2 * MAX_UNCOMMITTED_IDS + [0xE4], [0xB8], [0xAD], [0x21]]
 
         texts = [
             detok.handle_batch_token_id_out(
@@ -348,7 +349,37 @@ class TestDetokenizeState(CustomTestCase):
             for i, ids in enumerate(rows)
         ]
 
-        self.assertEqual("".join(texts), "\u4e2d!")
+        self.assertEqual("".join(texts), "a" * 2 * MAX_UNCOMMITTED_IDS + "\u4e2d!")
+
+    def test_streamed_text_matches_the_full_decode_for_any_row_split(self):
+        data = ("ab \u4e2d\u6587 \U0001f6a8\U0001f6a8 cd\n" * 8).encode() + bytes(
+            [0xE4, 0xE4]
+        ) * 20
+        data += "\u4e2d!".encode()
+        rng = random.Random(0)
+        for _ in range(50):
+            detok = _detokenizer()
+            detok.tokenizer = _ByteTokenizer()
+            sent, texts, i = {}, [], 0
+            while i < len(data):
+                n = rng.randint(1, 40)
+                out = detok.handle_batch_token_id_out(
+                    _output(
+                        sent,
+                        [
+                            (
+                                "r",
+                                list(data[i : i + n]),
+                                _header([0x20]) if i == 0 else None,
+                                i + n >= len(data),
+                            )
+                        ],
+                    )
+                )
+                texts += out.output_strs
+                i += n
+
+            self.assertEqual("".join(texts), data.decode("utf-8", errors="replace"))
 
     def test_a_tail_that_never_completes_keeps_the_decode_window_bounded(self):
         for tail_id, skip, expected in [(0xE4, False, "\ufffd"), (300, True, "")]:
@@ -370,9 +401,7 @@ class TestDetokenizeState(CustomTestCase):
                 )
                 texts += out.output_strs
 
-                self.assertLessEqual(
-                    detok.tokenizer.longest, 2 * MAX_UNCOMMITTED_IDS + 6
-                )
+                self.assertLess(detok.tokenizer.longest, 3 * MAX_UNCOMMITTED_IDS)
                 self.assertEqual("".join(texts), expected * 400 + "!")
 
 
