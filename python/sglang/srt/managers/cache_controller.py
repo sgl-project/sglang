@@ -1518,10 +1518,16 @@ class HiCacheController:
         return False
 
     def alloc_prefetch_host_buffers(
-        self, operation: StorageOperation, need_size: int
+        self,
+        operation: StorageOperation,
+        need_size: int,
+        *,
+        start_owner: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Allocate the host bounce for a storage hit."""
-        return self.mem_pool_host.alloc(need_size)
+        if start_owner is None:
+            return self.mem_pool_host.alloc(need_size)
+        return self.mem_pool_host.alloc(need_size, start_owner=start_owner)
 
     def can_fit_prefetch_host_buffers(
         self, operation: StorageOperation, need_size: int
