@@ -171,7 +171,7 @@ def grouped_gemm_nt_bf16_contig(
 
 
 def get_contiguous_layout_alignment(expected_m: int, num_groups: int) -> int:
-    alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    alignment = compile_utils.get_m_alignment_for_contiguous_layout()
     if isinstance(alignment, tuple):
         alignment = alignment[0]
 
@@ -293,22 +293,6 @@ def tf32_hc_prenorm_gemm(
     if x.shape[0] == 0:
         return
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
-
-
-def tf32_hc_prenorm_gemm_dual(
-    x: torch.Tensor,
-    fn: torch.Tensor,
-    fn2: torch.Tensor,
-    out: torch.Tensor,
-    out2: torch.Tensor,
-    sqrsum: torch.Tensor,
-    num_splits: Optional[int],
-):
-    if x.shape[0] == 0:
-        return
-    deep_gemm.tf32_hc_prenorm_gemm_dual(
-        x, fn, fn2, out, out2, sqrsum, num_splits=num_splits
-    )
 
 
 def update_deep_gemm_config(gpu_id: int):

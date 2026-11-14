@@ -43,6 +43,29 @@ _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
 _ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
 _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
+
+
+def get_m_alignment_for_contiguous_layout() -> int:
+    """Alignment of the ``M`` dimension for contiguous-layout grouped GEMMs.
+
+    DeepGEMM exposes this as ``get_mk_alignment_for_contiguous_layout``. Builds
+    that only ship the M-only variant -- the T-HEAD SAIL build is one -- still
+    describe a valid alignment through ``get_m_alignment_for_contiguous_layout``,
+    so prefer the full helper and fall back to the narrower one instead of
+    raising ``AttributeError`` during precompilation.
+    """
+    getter = getattr(deep_gemm, "get_mk_alignment_for_contiguous_layout", None)
+    if getter is not None:
+        return getter()
+    getter = getattr(deep_gemm, "get_m_alignment_for_contiguous_layout", None)
+    if getter is not None:
+        return getter()
+    raise RuntimeError(
+        "deep_gemm exposes neither get_mk_alignment_for_contiguous_layout nor "
+        "get_m_alignment_for_contiguous_layout; cannot determine the M alignment."
+    )
+
+
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
 
@@ -205,10 +228,10 @@ def _compile_deep_gemm_one_type_all(
     saved_context = disable_symmetric_memory_context()
     try:
         if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+            m_alignment = get_m_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
-            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+            m_alignment = get_m_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
@@ -550,7 +573,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-    from sglang.srt.layers.dp_attention import require_mlp_sync
+    from sglang.srt.utils.common import require_mlp_sync
 
     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
     block_m = 64
