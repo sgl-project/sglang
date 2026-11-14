@@ -2574,8 +2574,13 @@ class MQALayer(MqaAttentionBase):
                 )
                 kv = None
             elif in_replay_tail_graph():
-                assert not fuse_q_rope
-                bcg_tail_kv_store(self, x_linear, positions, qkv_a)
+                bcg_tail_kv_store(
+                    self,
+                    x_linear,
+                    positions,
+                    qkv_a,
+                    q if fuse_q_rope else None,
+                )
                 kv = None
             else:
                 self._compute_kv_to_cache(

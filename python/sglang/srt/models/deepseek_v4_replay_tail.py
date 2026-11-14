@@ -12,6 +12,7 @@ rank's rows from the pre-forward exchange.
 from __future__ import annotations
 
 import copy
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
@@ -61,15 +62,16 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     enter_late_layer_dp,
     exit_late_layer_dp,
 )
-from sglang.srt.models.deepseek_v4_mhc import HcState
+from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
 from sglang.srt.runtime_context import get_flags, get_parallel
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _in_replay_tail = False
+logger = logging.getLogger(__name__)
 
 
 def in_replay_tail_graph() -> bool:
@@ -101,18 +103,23 @@ def scattered_dp_counts(num_tokens: int, num_rows: int) -> Tuple[int, List[int]]
     return max(tokens), rows
 
 
-def _tail_kv_store(attention, x, positions, qkv_a) -> None:
+def _tail_kv_store(attention, x, positions, qkv_a, q_rope) -> None:
     # The SWA store writes the step's live tail slots, so a tail graph breaks here.
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
+        live_rows,
+    )
+
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     num_rows = forward_batch.global_num_token_non_padded_cpu
     if num_rows == 0:
         return
     attention._compute_kv_to_cache(
-        x[:num_rows],
+        live_rows(x, num_rows),
         positions[:num_rows],
         forward_batch,
         get_attn_backend(),
         qkv_a=None if qkv_a is None else qkv_a[:num_rows],
+        q_rope=None if q_rope is None else q_rope[:num_rows],
     )
 
 
@@ -123,12 +130,18 @@ def _flatten_state(state: HcState):
     """The state's row tensors, whether ``pre`` is among them, and the inverse.
     The normed input and mix stats are dropped (the first tail layer rebuilds
     them), so every step keys the same graphs."""
-    assert isinstance(state.streams, torch.Tensor), "tail graphs are CUDA only"
+    streams = state.streams
+    pending = isinstance(streams, HcPending)
+    assert pending or isinstance(streams, torch.Tensor), type(streams)
     has_pre = state.pre is not None
-    leaves = [state.streams, state.pre] if has_pre else [state.streams]
+    leaves = list(streams) if pending else [streams]
+    if has_pre:
+        leaves.append(state.pre)
 
     def rebuild(tensors: List[torch.Tensor]) -> HcState:
-        return HcState(tensors[0], tensors[1] if has_pre else None)
+        num_streams = len(streams) if pending else 1
+        rebuilt = HcPending(*tensors[:num_streams]) if pending else tensors[0]
+        return HcState(rebuilt, tensors[num_streams] if has_pre else None)
 
     return leaves, has_pre, rebuild
 
@@ -148,6 +161,7 @@ class DecoderReplayTail:
         self.runner = RowBucketGraphRunner(
             row_step=row_step, max_rows=max_rows, label="Decoder tail graph"
         )
+        self._hip_break_logged = False
         self._static_ids_global: dict[torch.dtype, torch.Tensor] = {}
         # Older, smaller sets stay alive for the graphs that write and read them.
         self._bridge_buffers: dict[tuple, List[List[Optional[torch.Tensor]]]] = {}
@@ -155,9 +169,14 @@ class DecoderReplayTail:
     @classmethod
     def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
         max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
+        hip_graph = (
+            is_hip()
+            and envs.SGLANG_OPT_HIP_PREFILL_GRAPH_EXACT_TAIL.get()
+            and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+        )
         if not (
             model.tail_writes_source_kv
-            and is_cuda()
+            and (is_cuda() or hip_graph)
             and max_rows > 0
             # Borrowed graph-pool storage forbids capturing mid-serving.
             and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
@@ -165,12 +184,21 @@ class DecoderReplayTail:
             return None
         from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
 
-        return cls(
+        tail = cls(
             model=model,
             layer_ids=range(model.late_layer_start, model.end_layer),
             row_step=SWA_WINDOW,
             max_rows=max_rows,
         )
+        if hip_graph:
+            logger.info(
+                "Enabled HIP breakable prefill exact decoder SWA tail: threshold=%d "
+                "tokens, row buckets=%d..%d.",
+                envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS.get(),
+                tail.runner.row_step,
+                max_rows,
+            )
+        return tail
 
     @staticmethod
     def _can_capture_moe_bound(forward_batch: ForwardBatch) -> bool:
@@ -593,6 +621,15 @@ class DecoderReplayTail:
         capture_dspark: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
         """The graphs' body; mirrors the model loop past the tail switch."""
+        if is_hip():
+            return self._layer_stack_hip(
+                state,
+                positions=positions,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                forward_batch=forward_batch,
+                capture_dspark=capture_dspark,
+            )
         model = self._model
         aux: List[torch.Tensor] = []
         residual_batch.start(forward_batch)
@@ -633,6 +670,57 @@ class DecoderReplayTail:
             )
         finally:
             residual_batch.clear(forward_batch)
+        state = state.materialized(model.layers[self._layer_ids[-1]].hc_cfg)
+        return state.residual, state.pre, aux
+
+    def _layer_stack_hip(
+        self,
+        state: HcState,
+        *,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        forward_batch: ForwardBatch,
+        capture_dspark: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
+        from sglang.srt.models.deepseek_v4_platform_stage import (
+            forward_layer_fused_boundary,
+        )
+
+        model = self._model
+        aux: List[torch.Tensor] = []
+        for i in self._layer_ids:
+            layer = model.layers[i]
+            assert layer.engram is None
+            if capture_dspark and i in model.dspark_layers_to_capture:
+                from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
+                aux.append(mhc_stream_mean(state.residual))
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                if layer.hc_boundary_fused:
+                    state = forward_layer_fused_boundary(
+                        model,
+                        i,
+                        state,
+                        positions=positions,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_ids_global=input_ids_global,
+                        capture_dspark=capture_dspark,
+                    )
+                else:
+                    state = layer.forward_hc_pre_from_prev(
+                        positions=positions,
+                        state=state,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_ids_global=input_ids_global,
+                    )
         state = state.materialized(model.layers[self._layer_ids[-1]].hc_cfg)
         return state.residual, state.pre, aux
 
@@ -710,6 +798,19 @@ def _tail_layers_in_prefill_graph(
             return tail.rows(t[:num_tokens])
 
         num_rows = tail.positions.shape[0]
+        if (
+            is_hip()
+            and backend.prefill_graph_replay_batch is not None
+            and not get_flags().dp.capturing_prefill_graph
+            and not tail_layers._hip_break_logged
+        ):
+            logger.info(
+                "HIP prefill graph exact decoder tail active: %d live rows from "
+                "%d prompt rows.",
+                num_rows,
+                num_tokens,
+            )
+            tail_layers._hip_break_logged = True
         dp_rows = None
         if dp:
             # Exchanged before the forward, except on the dummy batches the prefill

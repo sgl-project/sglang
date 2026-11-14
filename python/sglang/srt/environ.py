@@ -2016,6 +2016,10 @@ class Envs:
     # Prefill-graph shapes of at least this many tokens run the tail from the tail
     # graphs in a break (measured crossover 1536-2048 tokens on GB300 TP4).
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS = EnvInt(2048)
+    # ROCm breakable prefill graphs keep the decoder SWA tail as on CUDA: captured as
+    # the tail block below the threshold above, and at or above it run in a break over
+    # each request's exact tail rows from the tail graphs. Off: they keep no tail.
+    SGLANG_OPT_HIP_PREFILL_GRAPH_EXACT_TAIL = EnvBool(False)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches), "v41_new" (the same bytes interleaved per token, for
