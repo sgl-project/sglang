@@ -44,15 +44,6 @@ from sglang.srt.multimodal.modality import Modality
 
 logger = logging.getLogger(__name__)
 
-SIGLIP_NAME = "siglip-so400m-patch14-448"
-VISION_ENCODER_TO_PROCESSING_CONFIG = {
-    "siglip-so400m-patch14-448": {
-        "vit_image_size": 448,
-        "vit_patch_size": 14,
-        "token_compression_factor": 2,
-    },
-}
-
 
 class Phi4MMImageEncoder(nn.Module):
     """Image embedding."""

@@ -170,6 +170,75 @@ def test_lru_budget_and_oversized_outputs():
 
 
 @torch.no_grad()
+def test_partial_edit_of_request_with_more_than_128_entries_reuses_the_rest():
+    """Editing a few of a request's 148 small entries (tiled VAE references) must
+    recompute only those; a 128-entry LRU evicted all of them between requests."""
+    cache = ConditioningCache(1 << 20)
+    model = Encoder().eval()
+    tiles = [torch.full((4,), float(value)) for value in range(148)]
+    edited = list(tiles)
+    for index in (3, 70, 140):  # a local edit touches a few tiles
+        edited[index] = tiles[index] + 1000
+    with cache.scope():
+        for x in tiles:
+            model(x)
+        for x in edited:
+            model(x)
+    assert (model.calls, cache.hits, cache.evictions) == (151, 145, 0)
+
+
+@torch.no_grad()
+def test_group_tier_keeps_a_stage_with_more_than_128_private_entries():
+    """A grouped stage must reuse every private snapshot within the entry limit;
+    a fixed 128-entry group tier dropped the rest of a large tiled reference."""
+    cache = ConditioningCache(0)  # cross-request tier off, so only group hits count
+    model = Encoder().eval()
+    tiles = [torch.full((4,), float(value)) for value in range(148)]
+    with cache.scope(), cache.group_scope():
+        for _ in range(2):
+            for x in tiles:
+                model(x)
+    assert (model.calls, cache.group_hits) == (148, 148)
+
+
+@torch.no_grad()
+def test_entry_limit_evicts_lru_and_keeps_preferred_entries():
+    model = Encoder().eval()
+
+    def encode(value, *, preferred=False):
+        with prefer_conditioning_cache() if preferred else nullcontext():
+            model(torch.full((4,), float(value)))
+
+    lru = ConditioningCache(1 << 20, max_entries=2)
+    with lru.scope():
+        encode(1)
+        encode(2)
+        encode(1)  # hit: 2 becomes least recent
+        encode(3)  # evicts 2, not 1
+        encode(1)
+        assert lru.hits == 2
+        encode(2)
+        assert lru.hits == 2
+
+    protected = ConditioningCache(1 << 20, max_entries=2)
+    with protected.scope():
+        encode(10, preferred=True)
+        encode(11)
+        encode(12)  # a normal store evicts 11, never the older preferred 10
+        encode(10, preferred=True)
+        encode(12)
+        assert protected.hits == 2
+
+    full = ConditioningCache(1 << 20, max_entries=1)
+    with full.scope():
+        encode(20, preferred=True)
+        encode(21)  # only a preferred entry could make room: bypass
+        assert full.stats()["entries"] == 1 and full.bypasses == 1
+        encode(22, preferred=True)  # a preferred store may evict it
+        assert full.stats()["entries"] == 1 and full.evictions == 1
+
+
+@torch.no_grad()
 def test_device_hot_promotion_shares_budget_and_eviction_with_host_entries():
     cache = ConditioningCache(32)
     model = Encoder().eval()

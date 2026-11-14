@@ -1,0 +1,46 @@
+{
+  "invalid_argument": {
+    "message": "bad sampling",
+    "unary": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "bad sampling"
+        }
+      }
+    },
+    "stream": {
+      "status": 200,
+      "frame": {
+        "error": {
+          "message": "bad sampling",
+          "type": "invalid_request_error",
+          "code": 400,
+          "retryable": false
+        }
+      }
+    }
+  },
+  "status_503": {
+    "message": "the encoder returned no embeddings",
+    "unary": {
+      "status": 503,
+      "body": {
+        "error": {
+          "message": "the encoder returned no embeddings"
+        }
+      }
+    },
+    "stream": {
+      "status": 200,
+      "frame": {
+        "error": {
+          "message": "the encoder returned no embeddings",
+          "type": "invalid_request_error",
+          "code": 503,
+          "retryable": false
+        }
+      }
+    }
+  }
+}

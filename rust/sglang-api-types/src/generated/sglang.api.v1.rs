@@ -167,13 +167,19 @@ pub struct OptionalInt64List {
 }
 /// The native error body: `{"error": {"message", "code"}}` (Python
 /// `http_server.generate_request` parity). Transports frame it themselves
-/// (unary status + body, SSE error frame, gRPC status detail).
+/// (unary status + body, SSE error frame, gRPC status detail). A streamed
+/// error also carries `type` and `retryable`, as Python's `stream_results()`
+/// frame does; a unary body leaves them unset.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorBody {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
     #[prost(uint32, tag = "2")]
     pub code: u32,
+    #[prost(string, optional, tag = "3")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "4")]
+    pub retryable: ::core::option::Option<bool>,
 }
 /// Python's `matched` key, `Union\[str, int, List[int]\]`: the three wire shapes
 /// are disjoint, so shape alone picks the arm (untagged).

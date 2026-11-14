@@ -1898,8 +1898,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         prefix: str,
         use_adaln_cache: bool = False,
+        layer_index: int = 0,
     ) -> None:
         super().__init__()
+        self.layer_index = layer_index
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         MINIMAX_H3_NORM_MODULATE.mark(self)
@@ -1937,6 +1939,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
+        block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1945,6 +1948,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
+        if adaln_params is None and block_adaln_params is not None:
+            # Cache-DiT forwards the same kwargs to every wrapped block.
+            # Select by the original layer index, not the outer stack index.
+            adaln_params = block_adaln_params[self.layer_index]
         if adaln_params is None:
             if self.adaln_proj is None:
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")
@@ -2642,6 +2649,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     quant_config,
                     prefix=f"blocks.{index}",
                     use_adaln_cache=self._adaln_precomputed,
+                    layer_index=index,
                 )
                 for index in range(arch.num_layers)
             ]
@@ -3389,7 +3397,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             # (Ulysses) and/or ring-rotates KV across ring ranks; everything
             # else, including the final layer, is row-local. Only the narrow
             # video/audio logits are gathered after the final layer.
-            for index, block in enumerate(self.blocks):
+            for block in self.blocks:
                 hidden = block(
                     hidden,
                     adaln_input=adaln_input,
@@ -3401,11 +3409,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
                     ulysses_active=ulysses_ws > 1,
                     ring_active=ring_ws > 1,
-                    adaln_params=(
-                        None
-                        if block_adaln_params is None
-                        else block_adaln_params[index]
-                    ),
+                    block_adaln_params=block_adaln_params,
                 )
             if spectrum_on:
                 self._h3_spectrum_record_targets(
