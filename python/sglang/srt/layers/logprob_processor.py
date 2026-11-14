@@ -431,7 +431,16 @@ def compute_spec_logprobs(
         1, accepted_token_ids.long().view(-1, 1)
     ).view(bs, max_accept)
 
-    if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
+    top_k = batch.top_logprobs_nums[0] if batch.top_logprobs_nums else 0
+    if top_k > 0 and all(x == top_k for x in batch.top_logprobs_nums):
+        # Every row asks for the same k: one [bs * max_accept, k] pair, so the
+        # result is copied to the host and converted to lists once per step
+        # instead of once per row.
+        (
+            logits_output.next_token_top_logprobs_val,
+            logits_output.next_token_top_logprobs_idx,
+        ) = gathered_logprobs.topk(top_k, dim=-1)
+    elif batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
         top_logprobs_nums_expanded = [
             num for num in batch.top_logprobs_nums for _ in range(max_accept)
         ]
