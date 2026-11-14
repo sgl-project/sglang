@@ -322,6 +322,9 @@ class DSAIndexerPoolHost(HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "load on a dummy (non-src DSA) host pool"
         )
+        if host_indices.numel() == 0:
+            # The kvcacheio launchers divide by zero on an empty index list.
+            return
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = (
             self._draft_host_layer(layer_id)
@@ -390,6 +393,8 @@ class DSAIndexerPoolHost(HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "backup on a dummy (non-src DSA) host pool"
         )
+        if host_indices.numel() == 0:
+            return
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = (
             self._draft_host_layer(layer_id)
@@ -440,6 +445,8 @@ class DSAIndexerPoolHost(HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "backup on a dummy (non-src DSA) host pool"
         )
+        if host_indices.numel() == 0:
+            return
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
