@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_quant_load_spec,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
+    MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -477,12 +480,19 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             init_params["adaln_weight_files"] = safetensors_list
             init_params["adaln_plan_width"] = (
                 component_server_args.minimax_h3_adaln_plan_width
+                if component_server_args.minimax_h3_adaln_plan_width is not None
+                else MINIMAX_H3_ADALN_MAX_PLAN_WIDTH
             )
             init_params["adaln_max_plans"] = (
                 envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS
             )
             init_params["adaln_host_cache_bytes"] = int(
-                component_server_args.minimax_h3_adaln_host_cache_gb * 1e9
+                (
+                    component_server_args.minimax_h3_adaln_host_cache_gb
+                    if component_server_args.minimax_h3_adaln_host_cache_gb is not None
+                    else 8.0
+                )
+                * 1e9
             )
             init_params["adaln_precision"] = (
                 "fp32" if envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32 else "match"
@@ -501,6 +511,16 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             )
 
         local_torch_device = get_local_torch_device()
+        layerwise_postprocess_device = None
+        if (
+            component_starts_on_cpu
+            and not use_fsdp
+            and local_torch_device.type == "cuda"
+            and runtime_quant_config is not None
+            and runtime_quant_config.get_name() in ("fp8", "mxfp8")
+            and not runtime_quant_config.is_checkpoint_fp8_serialized
+        ):
+            layerwise_postprocess_device = local_torch_device
         checkpoint_load_device = (
             torch.device("cpu")
             if cpu_offload_flag
@@ -515,6 +535,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                     )
                     or quant_spec.is_convrot_int8
                     or quant_spec.is_serialized_kitchen_w4a8
+                    or layerwise_postprocess_device is not None
                 ),
             )
         )
@@ -529,6 +550,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             checkpoint_load_device=checkpoint_load_device,
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
             component_starts_on_cpu=component_starts_on_cpu,
+            layerwise_postprocess_device=layerwise_postprocess_device,
             load_full_state_dict_on_device=direct_gpu_weight_loading,
             mps_layerwise_cpu_staging=bool(
                 cpu_offload_flag and current_platform.is_mps()

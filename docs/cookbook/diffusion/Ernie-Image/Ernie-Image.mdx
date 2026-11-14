@@ -7,7 +7,7 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["image", "text-to-image", "standard + Turbo", "single GPU"]} />
+<DiffusionModelTags tags={["image", "text-to-image", "standard + Turbo", "Ulysses SP"]} />
 
 import { Deployment } from '/src/snippets/_deployment.jsx';
 import { config } from '/src/snippets/configs/baidu/ernie-image.jsx';
@@ -26,7 +26,7 @@ Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installa
 
 [ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) is Baidu's text-to-image family with separate standard and Turbo checkpoints. The standard model is the quality-oriented path; Turbo is the lower-latency choice, and both load through SGLang's native `ErnieImagePipeline`.
 
-This integration currently targets text-only image generation rather than image editing or reference conditioning. Choose it for a straightforward single-GPU T2I deployment; use a dedicated editing model when preserving source-image structure is part of the task.
+This integration targets text-only image generation. You can use a single GPU or Ulysses sequence parallelism; use a dedicated editing model when preserving source-image structure is part of the task.
 
 | Model | Hugging Face model ID | Notes |
 | --- | --- | --- |
@@ -98,7 +98,9 @@ with open("ernie_image.png", "wb") as f:
 - ERNIE-Image is a text-to-image pipeline; do not pass `--image-path`.
 - `--performance-mode auto` keeps conservative defaults while preserving explicit user flags.
 - If the checkpoint includes a PE component, SGLang loads it automatically with the native Ministral3 runtime. Use `--layerwise-offload-components pe` when the local PE decoder needs to trade latency for lower GPU memory usage.
-- Treat FSDP, SP/Ulysses/Ring, and TP as explicit benchmark knobs. Measure the target resolution, step count, and GPU type before making them production defaults.
+- On NVIDIA CUDA, use `--num-gpus 2 --tp-size 1 --ulysses-degree 2 --encoder-parallel replicate` to shard the DiT image tokens across two GPUs while retaining the full text on each rank. Both checkpoints use this path. Measure your target resolution: communication can make smaller images slower.
+- Ulysses sharding requires an evenly divisible image-token count and unmasked text conditioning. Uneven image-token counts, padded caption batches with a mask, and ring configurations retain dense DiT execution on each rank. Ring does not accelerate this model.
+- FSDP, TP, caching, and breakable CUDA graphs need separate validation; the Ulysses path does not establish compatibility with these features.
 
 ## 6. Run in ComfyUI
 

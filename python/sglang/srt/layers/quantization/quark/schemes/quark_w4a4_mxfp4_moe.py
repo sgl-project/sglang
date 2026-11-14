@@ -111,14 +111,37 @@ else:
 
 OCP_MX_BLOCK_SIZE = 32
 
-# gfx1151 (Strix Halo) has neither FP4 hardware nor an AITER FP4 MoE kernel, so
-# the AITER path cannot run there: its scales are laid out for gfx950 and its
-# kernels produce garbage. Run the MoE as W4A16 instead: keep the packed MXFP4
-# weights and upcast them inside triton_kernels' matmul, with bf16 activations.
-_use_triton_w4a16 = (
-    _is_hip and "gfx1151" in torch.cuda.get_device_properties(0).gcnArchName
-)
+# Consumer RDNA (gfx11 and gfx120, e.g. gfx1100 / gfx1151 Strix Halo / gfx1201)
+# has neither FP4 hardware nor an AITER FP4 MoE kernel, so the AITER path cannot
+# run there: its scales are laid out for gfx950 and its kernels produce garbage.
+# Run the MoE as W4A16 instead: keep the packed MXFP4 weights and upcast them
+# inside triton_kernels' matmul, with bf16 activations.
+_arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] if _is_hip else ""
+# gfx120, not gfx12: gfx1250 (MI455) also starts with gfx12 and must stay on AITER.
+_is_consumer_rdna = _arch.startswith(("gfx11", "gfx120"))
+_use_triton_w4a16 = _is_consumer_rdna
 _TRITON_W4A16_NUM_WARPS = 8
+
+
+def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+    """Convert packed MXFP4 weights and their scales to the triton_kernels matmul
+    layouts. triton_kernels comes from the ROCm image, not the sglang-kernel wheel."""
+    from triton_kernels.numerics import InFlexData
+    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+    from triton_kernels.tensor_details import layout
+
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=-2, num_warps=num_warps
+    )
+    # transpose the tensor so that the quantization axis is on dim1
+    quant_tensor = quant_tensor.transpose(-2, -1)
+    scale = scale.transpose(-2, -1)
+    quant_tensor = convert_layout(
+        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout
+    )
+    scale = convert_layout(wrap_torch_tensor(scale), scale_layout)
+    return quant_tensor, InFlexData(), scale
 
 
 class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
@@ -968,6 +991,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         if _use_triton_w4a16:
             self._process_weights_triton_w4a16(layer)
             return
+        if not _use_aiter and getattr(layer, "_gluon_moe_backend", None) is None:
+            raise RuntimeError(
+                "Quark MXFP4 MoE weight post-processing requires aiter on this "
+                "device (set SGLANG_USE_AITER=1 and install aiter). Consumer RDNA "
+                "(gfx11 / gfx120) uses the W4A16 triton path."
+            )
         if not getattr(self, "_owns_moe_weight_layout", False):
             raise RuntimeError(
                 "Quark MXFP4 weight preshuffling requires a backend that owns "
@@ -1159,8 +1188,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
     def _process_weights_triton_w4a16(self, layer: torch.nn.Module) -> None:
         from triton_kernels.matmul import FlexCtx, PrecisionConfig
 
-        from sglang.srt.layers.quantization.mxfp4 import _swizzle_mxfp4
-
         assert (
             self.is_checkpoint_mxfp4_serialized and self.dequantization_config is None
         ), "The W4A16 triton path only supports serialized MXFP4 checkpoints."
@@ -1185,7 +1212,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 f"The W4A16 triton path does not support SwiGLU variants: {unsupported}"
             )
         logger.info_once(
-            "Quark MXFP4 MoE on gfx1151: no FP4 hardware, running the W4A4 MXFP4 "
+            "Quark MXFP4 MoE on consumer RDNA: no FP4 hardware, running the W4A4 MXFP4 "
             "checkpoint as W4A16 (bf16 activations, MXFP4 weights upcast in "
             "triton_kernels)."
         )

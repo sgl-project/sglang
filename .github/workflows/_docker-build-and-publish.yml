@@ -21,6 +21,11 @@ on:
         required: false
         type: string
         default: ""
+      mega_use_release_pin:
+        description: "Read docker/mega-release-ref.txt from checkout_ref instead of Mega main"
+        required: false
+        type: boolean
+        default: false
       tag_config:
         description: 'JSON array of {"cuda":"cu130","tags":["tag1","tag2"]}. Tags support {version} substitution.'
         required: true
@@ -37,7 +42,55 @@ on:
         default: "lmsysorg/sglang"
 
 jobs:
+  resolve-sources:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mega_commit: ${{ steps.resolve.outputs.commit }}
+      sglang_commit: ${{ steps.sglang.outputs.commit }}
+    steps:
+      - name: Resolve SGLang source for both architectures
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
+
+      - name: Record SGLang revision
+        id: sglang
+        run: |
+          COMMIT="$(git rev-parse HEAD)"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "SGLang: $COMMIT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve Mega revision for both architectures
+        id: resolve
+        env:
+          USE_RELEASE_PIN: ${{ inputs.mega_use_release_pin }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_RELEASE_PIN" = "true" ]; then
+            PIN_FILE=docker/mega-release-ref.txt
+            if [ ! -f "$PIN_FILE" ]; then
+              echo "::error::Missing $PIN_FILE in the selected release tag; refusing to use Mega main."
+              exit 1
+            fi
+            MEGA_COMMIT="$(cat "$PIN_FILE")"
+            SOURCE="release pin"
+          else
+            MEGA_COMMIT="$(git ls-remote --exit-code https://github.com/sgl-project/sgl-nvidia-mega.git refs/heads/main | cut -f1)"
+            SOURCE="main"
+          fi
+          if [[ ! "$MEGA_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Mega $SOURCE must resolve to a full 40-character commit SHA."
+            exit 1
+          fi
+          echo "commit=$MEGA_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Mega $SOURCE: $MEGA_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+
   build-x86:
+    needs: resolve-sources
     if: github.repository == 'sgl-project/sglang'
     environment: ${{ inputs.use_environment || null }}
     runs-on: x64-docker-build-node
@@ -57,7 +110,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.checkout_ref || github.ref }}
+          ref: ${{ needs.resolve-sources.outputs.sglang_commit }}
 
       - name: Compute Docker build metadata args
         run: |
@@ -119,6 +172,7 @@ jobs:
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
+            --build-arg SGL_NVIDIA_MEGA_REF=${{ needs.resolve-sources.outputs.mega_commit }} \
             --metadata-file /tmp/metadata-cu130.json \
             --no-cache \
             .
@@ -128,6 +182,7 @@ jobs:
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
   build-arm64:
+    needs: resolve-sources
     if: github.repository == 'sgl-project/sglang'
     environment: ${{ inputs.use_environment || null }}
     runs-on: arm-docker-build-node
@@ -147,7 +202,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.checkout_ref || github.ref }}
+          ref: ${{ needs.resolve-sources.outputs.sglang_commit }}
 
       - name: Compute Docker build metadata args
         run: |
@@ -198,6 +253,7 @@ jobs:
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
+            --build-arg SGL_NVIDIA_MEGA_REF=${{ needs.resolve-sources.outputs.mega_commit }} \
             --metadata-file /tmp/metadata-cu130.json \
             --no-cache \
             .

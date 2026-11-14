@@ -18,10 +18,11 @@ PushPlaneObj::PushPlaneObj(
     uint32_t rank,
     uint32_t world_size,
     std::vector<TensorView> workspaces,  // world_size * [2 * world_size][slot_bytes]
-    TensorView counter,                  // [num_blocks]
-    intptr_t mc_workspace_ptr)
+    TensorView counter,                  // [1] int64: one EpochCounter
+    intptr_t mc_workspace_ptr,
+    uint32_t default_blocks)
     : BasePlane(rank, world_size),  //
-      num_blocks(),
+      default_blocks(),
       slot_bytes(),
       counter(),
       workspaces{},
@@ -30,7 +31,6 @@ PushPlaneObj::PushPlaneObj(
   // Shared symbolic sizes and device enforce consistency across ranks; the
   // matchers also require contiguity (no strides given) and uint8 dtype.
   auto N = SymbolicSize{"slot_bytes"};
-  auto M = SymbolicSize{"num_blocks"};
   auto device_sym = SymbolicDevice{};
   device_sym.set_options<kDLGPU>();
   for (uint32_t i = 0; i < world_size; ++i) {
@@ -39,16 +39,18 @@ PushPlaneObj::PushPlaneObj(
         .with_device(device_sym)
         .verify(workspaces[i]);
   }
-  TensorMatcher({M, static_cast<int64_t>(sizeof(Counter))})  //
-      .with_dtype<uint8_t>()
+  static_assert(sizeof(EpochCounter) == sizeof(int64_t));
+  TensorMatcher({1})  //
+      .with_dtype<int64_t>()
       .with_device(device_sym)
       .verify(counter);
-  CHECK_HOST(N.unwrap() > 0 && M.unwrap() > 0) << "A push plane needs a non-empty workspace and counter";
+  CHECK_HOST(N.unwrap() > 0) << "A push plane needs a non-empty workspace";
+  CHECK_HOST(default_blocks > 0) << "A push plane needs a positive default launch width";
 
   // only set the value safely after the symbolic size has been verified
-  this->num_blocks = static_cast<uint32_t>(M.unwrap());
+  this->default_blocks = default_blocks;
   this->slot_bytes = N.unwrap();
-  this->counter = static_cast<Counter*>(counter.data_ptr());
+  this->counter = static_cast<EpochCounter*>(counter.data_ptr());
   for (uint32_t i = 0; i < world_size; ++i) {
     this->workspaces[i] = static_cast<uint8_t*>(workspaces[i].data_ptr());
   }
@@ -59,11 +61,13 @@ PullPlaneObj::PullPlaneObj(
     uint32_t rank,
     uint32_t world_size,
     std::vector<TensorView> workspaces,  // world_size * [num_bytes]
-    std::vector<TensorView> semaphores,  // world_size * [num_blocks]
+    std::vector<TensorView> semaphores,  // world_size * [capacity]
     intptr_t mc_workspace_ptr,
-    intptr_t mc_semaphore_ptr)
+    intptr_t mc_semaphore_ptr,
+    uint32_t default_blocks)
     : BasePlane(rank, world_size),  //
-      num_blocks(),
+      capacity(),
+      default_blocks(),
       num_bytes(),
       semaphores{},
       workspaces{},
@@ -74,7 +78,7 @@ PullPlaneObj::PullPlaneObj(
   // Either half may be empty (a 0-element tensor); the halves a caller does
   // own still have to agree on size and device across ranks.
   auto N = SymbolicSize{"num_bytes"};
-  auto M = SymbolicSize{"num_blocks"};
+  auto M = SymbolicSize{"capacity"};
   auto device_sym = SymbolicDevice{};
   device_sym.set_options<kDLGPU>();
   for (uint32_t i = 0; i < world_size; ++i) {
@@ -90,7 +94,8 @@ PullPlaneObj::PullPlaneObj(
   CHECK_HOST(N.unwrap() > 0 || M.unwrap() > 0) << "A pull plane with neither workspaces nor semaphores is useless";
 
   // only set the value safely after the symbolic size has been verified
-  this->num_blocks = static_cast<uint32_t>(M.unwrap());
+  this->capacity = static_cast<uint32_t>(M.unwrap());
+  this->default_blocks = std::min(default_blocks, this->capacity);
   this->num_bytes = N.unwrap();
   for (uint32_t i = 0; i < world_size; ++i) {
     this->semaphores[i] = static_cast<Semaphore*>(semaphores[i].data_ptr());
@@ -120,17 +125,18 @@ inline void register_communicator() {
   using Tensors = std::vector<TensorView>;
 
   refl::ObjectDef<dist::PushPlaneObj>()
-      .def(refl::init<uint32_t, uint32_t, Tensors, TensorView, intptr_t>(), "__init__")
+      .def(refl::init<uint32_t, uint32_t, Tensors, TensorView, intptr_t, uint32_t>(), "__init__")
       .def_ro("rank", &dist::PushPlaneObj::rank)
       .def_ro("world_size", &dist::PushPlaneObj::world_size)
-      .def_ro("num_blocks", &dist::PushPlaneObj::num_blocks)
+      .def_ro("default_blocks", &dist::PushPlaneObj::default_blocks)
       .def_ro("slot_bytes", &dist::PushPlaneObj::slot_bytes);
 
   refl::ObjectDef<dist::PullPlaneObj>()
-      .def(refl::init<uint32_t, uint32_t, Tensors, Tensors, intptr_t, intptr_t>(), "__init__")
+      .def(refl::init<uint32_t, uint32_t, Tensors, Tensors, intptr_t, intptr_t, uint32_t>(), "__init__")
       .def_ro("rank", &dist::PullPlaneObj::rank)
       .def_ro("world_size", &dist::PullPlaneObj::world_size)
-      .def_ro("num_blocks", &dist::PullPlaneObj::num_blocks)
+      .def_ro("capacity", &dist::PullPlaneObj::capacity)
+      .def_ro("default_blocks", &dist::PullPlaneObj::default_blocks)
       .def_ro("num_bytes", &dist::PullPlaneObj::num_bytes);
 
   refl::ObjectDef<dist::CommunicatorObj>()

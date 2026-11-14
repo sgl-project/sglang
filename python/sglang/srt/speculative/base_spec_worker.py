@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.model_config import uses_compressed_kv_attention
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -128,7 +128,6 @@ class EagleDraftWorkerBase(ABC):
             f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
         )
         num_steps = self.speculative_num_steps
-        sa = self.server_args
         decode_max_bs = (
             get_exec().graph.cuda_graph_config.decode.max_bs
             if get_exec().graph.cuda_graph_config is not None

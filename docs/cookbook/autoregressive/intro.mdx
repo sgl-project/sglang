@@ -34,7 +34,7 @@ metatags:
   <Card
     title="Thinking Machines"
     mode="card"
-    href="/cookbook/autoregressive/ThinkingMachines/Inkling"
+    href="/cookbook/autoregressive/ThinkingMachines/Inkling-2-Small"
     img="/cards/logos/thinkingmachines.png"
   />
   <Card

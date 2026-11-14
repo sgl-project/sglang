@@ -19,7 +19,12 @@ from .gptq_scheme import GPTQLinearSchemeBase
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig
 
-__all__ = ["GPTQLinearScheme", "GPTQAscendLinearScheme", "GPTQXPULinearScheme"]
+__all__ = [
+    "GPTQLinearScheme",
+    "GPTQAscendLinearScheme",
+    "GPTQXPULinearScheme",
+    "GPTQTritonLinearScheme",
+]
 
 
 class GPTQLinearScheme(GPTQLinearSchemeBase):
@@ -177,3 +182,12 @@ class GPTQXPULinearScheme(GPTQLinearScheme):
         )
 
         return GPTQXPULinearKernel(quant_config)
+
+
+class GPTQTritonLinearScheme(GPTQLinearScheme):
+    def _init_kernel(self, quant_config: GPTQConfig):
+        from sglang.srt.hardware_backend.gpu.quantization.gptq_triton_kernels import (
+            GPTQTritonLinearKernel,
+        )
+
+        return GPTQTritonLinearKernel(quant_config)

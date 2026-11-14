@@ -125,8 +125,6 @@ def get_non_pad_index(
 
 
 class VideoSparseAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128]

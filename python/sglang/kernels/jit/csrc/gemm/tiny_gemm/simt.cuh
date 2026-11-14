@@ -91,7 +91,7 @@ __global__ __launch_bounds__(Trait::kBlockSize, 1) void tiny_simt_kernel(const T
   for (uint32_t m = 0; m < M_TILE; ++m) {
 #pragma unroll
     for (uint32_t u = 0; u < kUnroll; ++u) {
-      xv[m][u].load(tiny_gemm::assume_global(x_tile + m * params.stride_x), lane + u * kLanes);
+      xv[m][u].load(assume_global(x_tile + m * params.stride_x), lane + u * kLanes);
     }
   }
 

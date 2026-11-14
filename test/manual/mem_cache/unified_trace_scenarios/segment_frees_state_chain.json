@@ -1,4 +1,4 @@
-{"name": "segment_frees_state_chain", "chain": "mamba", "page_size": 16, "lazy": false, "ops": [
+{"name": "segment_frees_state_chain", "chain": "mamba", "page_size": 16, "ops": [
   {"op": "extend", "req": 0, "n": 83},
   {"op": "extend", "req": 1, "n": 83},
   {"op": "extend", "req": 2, "n": 83},

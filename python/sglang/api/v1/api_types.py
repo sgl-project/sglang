@@ -116,6 +116,8 @@ class ErrorBody(msgspec.Struct, kw_only=True, frozen=True):
 
     message: str = ""
     code: int = 0
+    type: Optional[str] = None
+    retryable: Optional[bool] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "ErrorBody":
@@ -740,6 +742,8 @@ class GetModelInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     load_format: Optional[str] = None
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    model_type: Optional[str] = None
+    architectures: List[str] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetModelInfoResponse":
@@ -779,6 +783,9 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     incremental_streaming_output: bool = False
     disaggregation_mode: str = ""
     deployment_info: Optional[DeploymentInfo] = None
+    allow_auto_truncate: bool = False
+    skip_tokenizer_init: bool = False
+    num_reserved_tokens: int = 0
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -1152,6 +1159,10 @@ def decode_ErrorBody(value: Any) -> ErrorBody:
             kw["message"] = _expect_str(x, expected="a string")
         elif key == "code":
             kw["code"] = _expect_uint(x, expected="u32")
+        elif key == "type":
+            kw["type"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "retryable":
+            kw["retryable"] = None if x is None else _expect_bool(x, expected="a boolean")
     return ErrorBody(**kw)
 
 
@@ -1159,6 +1170,10 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["message"] = v.message
     d["code"] = v.code
+    if v.type is not None:
+        d["type"] = v.type
+    if v.retryable is not None:
+        d["retryable"] = v.retryable
     return d
 
 
@@ -2396,6 +2411,10 @@ def decode_GetModelInfoResponse(value: Any) -> GetModelInfoResponse:
             kw["reasoning_parser"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "tool_call_parser":
             kw["tool_call_parser"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "model_type":
+            kw["model_type"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "architectures":
+            kw["architectures"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
     return GetModelInfoResponse(**kw)
 
 
@@ -2410,6 +2429,9 @@ def encode_GetModelInfoResponse(v: GetModelInfoResponse) -> Dict[str, Any]:
     d["load_format"] = v.load_format
     d["reasoning_parser"] = v.reasoning_parser
     d["tool_call_parser"] = v.tool_call_parser
+    d["model_type"] = v.model_type
+    if v.architectures:
+        d["architectures"] = list(v.architectures)
     return d
 
 
@@ -2451,6 +2473,12 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["disaggregation_mode"] = _expect_str(x, expected="a string")
         elif key == "deployment_info":
             kw["deployment_info"] = None if x is None else decode_DeploymentInfo(x)
+        elif key == "allow_auto_truncate":
+            kw["allow_auto_truncate"] = _expect_bool(x, expected="a boolean")
+        elif key == "skip_tokenizer_init":
+            kw["skip_tokenizer_init"] = _expect_bool(x, expected="a boolean")
+        elif key == "num_reserved_tokens":
+            kw["num_reserved_tokens"] = _expect_uint(x, expected="u64")
     return GetServerInfoResponse(**kw)
 
 
@@ -2471,6 +2499,9 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["disaggregation_mode"] = v.disaggregation_mode
     if v.deployment_info is not None:
         d["deployment_info"] = encode_DeploymentInfo(v.deployment_info)
+    d["allow_auto_truncate"] = v.allow_auto_truncate
+    d["skip_tokenizer_init"] = v.skip_tokenizer_init
+    d["num_reserved_tokens"] = v.num_reserved_tokens
     return d
 
 

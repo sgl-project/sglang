@@ -22,6 +22,7 @@ from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import (
+    get_memory,
     get_serving,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
         HostAuxiliaryOutput,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.observability.forward_pass_metrics import (
         FpmTiming,
@@ -65,7 +67,13 @@ def allocate_distinct_stream(device_module, avoid_streams):
 
 
 def is_war_barrier_enabled() -> bool:
-    return is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    # On by default on CUDA. Unified memory frees ids and rewrites request rows on the
+    # schedule stream at once, so it needs the barrier on every device.
+    return (
+        is_cuda()
+        or get_memory().enable_unified_memory
+        or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    )
 
 
 @dataclasses.dataclass
@@ -95,7 +103,12 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # The unified pool's record of this forward; processing the result retires
+    # it, so page moves stop treating its pages as in flight.
+    unified_forward_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms
@@ -260,23 +273,6 @@ class GenerationBatchResult:
             self.logits_output.auxiliary_device_output = None
             self.forward_auxiliary_output = None
 
-    @classmethod
-    def from_pp_proxy(
-        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
-    ):
-        # TODO(lsyin): refactor PP and avoid using dict
-        proxy_dict = next_pp_outputs.tensors
-        return cls(
-            logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
-            next_token_ids=next_pp_outputs["next_token_ids"],
-            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
-            extend_logprob_start_len_per_req=proxy_dict.get(
-                "extend_logprob_start_len_per_req", None
-            ),
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
-
 
 def validate_input_length(
     req: Req, max_req_input_len: int, allow_auto_truncate: bool
@@ -301,9 +297,16 @@ def validate_input_length(
             req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
             return None
         else:
+            # OpenAI-compatible clients (e.g. LiteLLM) recognize a context
+            # overflow by OpenAI's "This model's maximum context length is"
+            # sentence; without it this is a generic 400 to them.
+            # Both sentences quote the largest accepted prompt.
+            max_prompt_len = max_req_input_len - 1
             error_msg = (
                 f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
+                f"the maximum allowed length ({max_prompt_len} tokens). "
+                f"This model's maximum context length is {max_prompt_len} "
+                f"tokens on this server. "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
             return error_msg
@@ -413,13 +416,18 @@ class EmbeddingBatchResult:
             only when the batch contained ``return_pooled_hidden_states=True``
             requests.  Tensor (uniform shapes) or list of tensors (MIS).
         copy_done: CUDA event recorded after the async CPU copy completes.
+        unified_forward_done: The unified pool's record of an overlapped
+            forward; processing the result retires it.
     """
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    unified_forward_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
     fpm_timing: Optional[FpmTiming] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):

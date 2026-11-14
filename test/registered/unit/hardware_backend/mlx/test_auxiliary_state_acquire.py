@@ -14,6 +14,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.kv.requests import RowResets
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
@@ -65,6 +66,17 @@ class TestMlxAuxiliaryStateAcquire(CustomTestCase):
         self.assertEqual(
             int(self.table.get_auxiliary_state_indices(rows)[0]), int(held)
         )
+
+    def test_row_reset_without_replayssm_cursors(self):
+        """Resetting a handed-out row succeeds on the MLX state pool, which has
+        no ReplaySSM cursors."""
+        state = self.table.state
+        row_resets = RowResets(
+            lambda rows: state.reset_request_rows(rows, device="cpu")
+        )
+        rows = acquire_rows(self.table, state, [_req()], row_resets=row_resets)
+        self.assertEqual(len(rows), 1)
+        row_resets.apply()
 
 
 if __name__ == "__main__":

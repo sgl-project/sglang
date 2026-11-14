@@ -215,12 +215,6 @@ class LoRAManager:
             ) or check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
         return True
 
-    @property
-    def prefill_cuda_graph_max_bs(self) -> Optional[int]:
-        """Request-count cap for prefill-graph LoRA batches; None until
-        init_prefill_cuda_graph_batch_info() ran."""
-        return self.lora_backend.prefill_cuda_graph_max_bs
-
     def can_use_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         """Whether this batch can use the static prefill-graph LoRA metadata;
         shared by prepare_lora_batch and can_run_graph so they stay consistent."""
