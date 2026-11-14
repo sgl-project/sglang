@@ -2,17 +2,22 @@ import logging
 import os
 import re
 import signal
-import socket
 import subprocess
 import threading
 import time
 from functools import wraps
 from types import SimpleNamespace
-from typing import Iterable, Union
+from typing import Iterable, Optional, Union
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import (
+    check_port_availability,
+    get_k8s_api,
+    get_meta_service_process,
+    query_configmap,
+)
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 
@@ -159,40 +164,6 @@ def get_host_ip():
     return host_ip
 
 
-def get_k8s_api():
-    from kubernetes import client, config
-
-    kube_config = os.environ.get("KUBECONFIG")
-    config.load_kube_config(kube_config)
-    return client.CoreV1Api()
-
-
-# Query ConfigMap from Kubernetes
-def query_configmap(name, namespace):
-    """Query ConfigMap from Kubernetes.
-
-    Args:
-        name (str): ConfigMap name.
-        namespace (str): Kubernetes namespace.
-
-    Returns:
-        V1ConfigMap: ConfigMap object, or None if failed.
-    """
-    from kubernetes.client.rest import ApiException
-
-    k8s_api = get_k8s_api()
-    try:
-        configmap = k8s_api.read_namespaced_config_map(name, namespace)
-        logger.info(f"Successfully queried ConfigMap {name} in namespace {namespace}")
-        return configmap
-    except ApiException as e:
-        logger.error(f"Failed to query ConfigMap {name} in namespace {namespace}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error querying ConfigMap: {e}")
-        return None
-
-
 def upsert_configmap_field_strict(
     name: str,
     namespace: str,
@@ -299,43 +270,6 @@ def set_environment_variables(env_vars):
         os.environ[key] = value
 
     return env_vars
-
-
-def check_port_availability(host, port, timeout=3):
-    """Check if the port is available.
-
-    Args:
-        host (str): Host IP address.
-        port (int): Port number.
-        timeout (int): Connection timeout in seconds.
-
-    Returns:
-        bool: True if port is available, False otherwise.
-    """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            result = sock.connect_ex((host, int(port)))
-            if result == 0:
-                return True
-            else:
-                return False
-
-    except socket.timeout:
-        logger.error(f"Port check timeout for {host}:{port} after {timeout}s")
-        return False
-    except socket.gaierror as e:
-        logger.error(f"Port check address resolution error for {host}:{port}: {e}")
-        return False
-    except socket.error as e:
-        logger.error(f"Port check socket error for {host}:{port}: {e}")
-        return False
-    except ValueError as e:
-        logger.error(f"Port check invalid value for {host}:{port}: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Port check unexpected error for {host}:{port}: {e}")
-        return False
 
 
 def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15):
@@ -484,6 +418,11 @@ def launch_pd_mix_node(model_config):
 
     host_ip = get_host_ip()
     logger.info(f"Starting node, {host_ip=} {other_args=}")
+
+    # The npu_memcache MetaService was already started (and the L3 backend
+    # extra config built with the same node IP) when the test built its args
+    # via build_hicache_storage_extra_config.
+
     try:
         process = popen_launch_server(
             model_config["model_path"],
@@ -496,6 +435,9 @@ def launch_pd_mix_node(model_config):
     except Exception as e:
         raise RuntimeError(f"Failed to start node on {host_ip}: {e}")
 
+    # Expose the MetaService process (None when this node does not host it)
+    # so callers can stop it during tearDown.
+    process.meta_service_process = get_meta_service_process()
     return process
 
 
@@ -672,6 +614,10 @@ def launch_pd_separation_node(model_config):
     # if "--model-type" not in service_args:
     #     other_args.extend(["--model-type", "llm"])
 
+    # The npu_memcache MetaService was already started (and the L3 backend
+    # extra config built with the same node IP) when the test built its args
+    # via build_hicache_storage_extra_config.
+
     other_args.extend(service_args)
 
     try:
@@ -684,6 +630,9 @@ def launch_pd_separation_node(model_config):
     except Exception as e:
         raise RuntimeError(f"Failed to start {role} node on {host_ip}: {e}")
 
+    # Expose the MetaService process (None when this pod does not host it) so
+    # callers can stop it during tearDown.
+    process.meta_service_process = get_meta_service_process()
     return process
 
 

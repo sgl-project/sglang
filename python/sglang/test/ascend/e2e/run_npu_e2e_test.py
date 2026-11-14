@@ -32,6 +32,11 @@ rbac_api = client.RbacAuthorizationV1Api()
 
 LOCAL_TIMEOUT = 12600
 
+# Number of trailing lines dumped per pod into the runner output when a
+# case fails; None dumps the complete pod log. The full logs also stay on
+# the shared PVC.
+POD_LOG_TAIL_LINES = None
+
 script_path = os.path.dirname(os.path.abspath(__file__))
 
 KUBE_JOB_SINGLE = "single"
@@ -500,6 +505,41 @@ def monitor_pod_logs(
                 process.kill()
 
 
+def print_pod_logs(kube_job_prefix_name, namespace, tail_lines=POD_LOG_TAIL_LINES):
+    """Dump every job pod's log into the runner output.
+
+    Container logs disappear with the pod/job, and the archived copies live
+    on the shared PVC. Printing them here makes failures (e.g. a prefill
+    node that never became healthy) visible directly in the CI log.
+    ``tail_lines=None`` prints the complete log.
+    """
+    try:
+        pods = core_api.list_namespaced_pod(namespace=namespace)
+    except ApiException as e:
+        logger.error(f"Failed to list pods for log dump: {e}")
+        return
+
+    for pod in pods.items:
+        pod_name = pod.metadata.name
+        if kube_job_prefix_name not in pod_name:
+            continue
+
+        label = "full" if tail_lines is None else f"last {tail_lines} lines"
+        print(f"===== pod log ({label}): {pod_name} =====")
+        try:
+            log_request = {"name": pod_name, "namespace": namespace}
+            if tail_lines is not None:
+                log_request["tail_lines"] = tail_lines
+            pod_log = core_api.read_namespaced_pod_log(**log_request)
+        except ApiException as e:
+            logger.error(f"Failed to read log of pod {pod_name}: {e}")
+            print(f"===== end of pod log: {pod_name} (unavailable) =====")
+            continue
+
+        print(pod_log if pod_log else "(empty)")
+        print(f"===== end of pod log: {pod_name} =====")
+
+
 def generate_metrics_json(metrics_data_file, test_case, status):
     """Collect [METRIC] lines from the log and write metrics.json.
 
@@ -625,6 +665,7 @@ def run_npu_e2e_test_case(
     }
     kube_yaml_file = kube_yaml_file_dict.get(kube_job_type)
 
+    monitor_success = False
     try:
         logger.info(
             f"Apply k8s yaml... KUBE_NAME_SPACE:{kube_name_space}, KUBE_CONFIG_MAP:{kube_config_map}, "
@@ -737,7 +778,6 @@ def run_npu_e2e_test_case(
         else:
             logger.info("Pod not ready, maybe not enough resource")
 
-        monitor_success = False
         try:
             monitor_pod_logs(
                 kube_job_type, final_kube_job_name, kube_name_space, LOCAL_TIMEOUT
@@ -757,6 +797,10 @@ def run_npu_e2e_test_case(
         if os.path.exists(kube_yaml_file):
             # Don't delete pod when trouble_shotting is enabled
             if not trouble_shotting:
+                if not monitor_success:
+                    # Surface each pod's tail in the CI output, since the
+                    # job (and its logs) is deleted right below.
+                    print_pod_logs(final_kube_job_name, kube_name_space)
                 delete_pod(yaml_file=kube_yaml_file, namespace=kube_name_space)
                 os.remove(kube_yaml_file)
             else:

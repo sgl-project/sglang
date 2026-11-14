@@ -1,0 +1,5 @@
+{
+    "meta_service_url": "tcp://127.0.0.1:5007",
+    "config_store_url": "tcp://127.0.0.1:6007",
+    "metrics_url": "http://127.0.0.1:8007"
+}

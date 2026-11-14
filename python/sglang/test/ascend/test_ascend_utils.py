@@ -5,10 +5,14 @@ Keep the weight-path constants sorted by variable name within each section.
 
 import asyncio
 import copy
+import json
 import logging
 import os
 import random
+import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -18,7 +22,6 @@ import requests
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
-from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -28,8 +31,23 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
+logger = logging.getLogger(__name__)
+
 STDERR_FILENAME = "/tmp/stderr.txt"
 STDOUT_FILENAME = "/tmp/stdout.txt"
+
+# npu_memcache L3 backend MetaService ports.
+META_SERVICE_PORT = 5007
+CONFIG_STORE_PORT = 6007
+META_METRICS_PORT = 8007
+
+# npu_memcache L3 backend MetaService readiness.
+META_SERVICE_READY_TIMEOUT = 300
+META_SERVICE_READY_POLL_INTERVAL = 5
+
+# Timeout for resolving the cluster-wide MetaService host from the harness
+# ConfigMap ({pod_name: pod_ip}, written by run_npu_e2e_test.py).
+META_SERVICE_MASTER_TIMEOUT = 300
 
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
@@ -750,6 +768,12 @@ def run_mmlu_test(
     chunked_prefill_size=32,
 ):
     def workload_func(base_url, model):
+        # Imported lazily: in image mode the CI harness overlays only
+        # sglang/test/ascend onto the image, and images built before
+        # sglang.test.sgl_eval_utils existed must still be able to import the
+        # rest of this module (mmlu is the only user of the eval helper).
+        from sglang.test.sgl_eval_utils import run_sgl_eval
+
         # Run the eval
         args = SimpleNamespace(
             base_url=base_url,
@@ -880,3 +904,187 @@ def write_github_step_summary_once(summary: str):
         return
     write_github_step_summary_once.has_written = True
     write_github_step_summary(summary)
+
+
+def check_port_availability(host, port, timeout=3):
+    """Check if the port is available.
+
+    Args:
+        host (str): Host IP address.
+        port (int): Port number.
+        timeout (int): Connection timeout in seconds.
+
+    Returns:
+        bool: True if port is available, False otherwise.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, int(port)))
+            if result == 0:
+                return True
+            else:
+                return False
+
+    except socket.timeout:
+        logger.error(f"Port check timeout for {host}:{port} after {timeout}s")
+        return False
+    except socket.gaierror as e:
+        logger.error(f"Port check address resolution error for {host}:{port}: {e}")
+        return False
+    except socket.error as e:
+        logger.error(f"Port check socket error for {host}:{port}: {e}")
+        return False
+    except ValueError as e:
+        logger.error(f"Port check invalid value for {host}:{port}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Port check unexpected error for {host}:{port}: {e}")
+        return False
+
+
+_meta_service_process = None
+
+
+def get_meta_service_process():
+    """Return the MetaService process started for L3 on this pod, if any."""
+    return _meta_service_process
+
+
+def get_k8s_api():
+    from kubernetes import client, config
+
+    config.load_kube_config(os.environ.get("KUBECONFIG"))
+    return client.CoreV1Api()
+
+
+def query_configmap(name, namespace):
+    """Query ConfigMap from Kubernetes.
+
+    Returns the V1ConfigMap object, or None if failed.
+    """
+    from kubernetes.client.rest import ApiException
+
+    try:
+        configmap = get_k8s_api().read_namespaced_config_map(name, namespace)
+        logger.info(f"Successfully queried ConfigMap {name} in namespace {namespace}")
+        return configmap
+    except ApiException as e:
+        logger.error(f"Failed to query ConfigMap {name} in namespace {namespace}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error querying ConfigMap: {e}")
+        return None
+
+
+def get_meta_service_host():
+    """Return the node IP that hosts the single cluster-wide MetaService.
+
+    The harness writes every pod's IP into the ConfigMap; the first pod of the
+    job (``prefill-0`` for PD separation, ``sglang-node-0`` for PD mix) hosts
+    the service. Falls back to the local POD_IP when the ConfigMap is not
+    available (e.g. a run outside the multi-node harness).
+    """
+    local_ip = os.getenv("POD_IP", "127.0.0.1")
+    namespace = os.getenv("NAMESPACE")
+    configmap_name = os.getenv("KUBE_CONFIG_MAP")
+    if not (namespace and configmap_name):
+        return local_ip
+
+    deadline = time.time() + META_SERVICE_MASTER_TIMEOUT
+    while time.time() < deadline:
+        configmap = query_configmap(configmap_name, namespace)
+        if configmap and configmap.data:
+            for pod_name, pod_ip in configmap.data.items():
+                if pod_name.endswith("prefill-0") or pod_name.endswith(
+                    "sglang-node-0"
+                ):
+                    return pod_ip
+        logger.info("Waiting for the MetaService master pod in the ConfigMap ...")
+        time.sleep(META_SERVICE_READY_POLL_INTERVAL)
+
+    logger.warning(
+        f"No master pod found in ConfigMap {configmap_name} after "
+        f"{META_SERVICE_MASTER_TIMEOUT}s, falling back to local POD_IP {local_ip}"
+    )
+    return local_ip
+
+
+def build_hicache_storage_extra_config(
+    world_size: int, protocol: str, dram_size: str
+):
+    """Start the cluster-wide npu_memcache MetaService and return the L3
+    backend config for ``--hicache-storage-backend-extra-config``.
+
+    The service is hosted on the first pod of the job (``get_meta_service_host``)
+    and every pod's endpoints point at that node IP. It is started only once
+    per process, and only on the pod that owns the host IP.
+    """
+    global _meta_service_process
+    host = get_meta_service_host()
+    if _meta_service_process is None and host == os.getenv("POD_IP", "127.0.0.1"):
+        _meta_service_process = start_meta_service(host)
+    return json.dumps(
+        {
+            "meta_service_url": f"tcp://{host}:{META_SERVICE_PORT}",
+            "config_store_url": f"tcp://{host}:{CONFIG_STORE_PORT}",
+            "log_level": "info",
+            "world_size": world_size,
+            "protocol": protocol,
+            "dram_size": dram_size,
+        }
+    )
+
+
+def start_meta_service(host_ip):
+    """Start the npu_memcache MetaService before the model server.
+
+    The L3 npu_memcache backend connects to the Ascend MemCache MetaService
+    at startup, so it must already be listening. ``host_ip`` is the node IP
+    shared by all pods, which is also what the L3 backend extra config
+    targets.
+
+    Returns the MetaService process.
+    """
+    meta_service_config = {
+        "meta_service_url": f"tcp://{host_ip}:{META_SERVICE_PORT}",
+        "config_store_url": f"tcp://{host_ip}:{CONFIG_STORE_PORT}",
+        "metrics_url": f"http://{host_ip}:{META_METRICS_PORT}",
+    }
+
+    # Materialize the config on the pod-local temp dir so runtime ports
+    # (chosen by the test case) are not baked into a checked-in file.
+    config_path = os.path.join(
+        tempfile.gettempdir(), "npu_memcache_metaservice_config.json"
+    )
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(meta_service_config, f, indent=4)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "sglang.srt.mem_cache.storage.npu_memcache.start_meta_service",
+        "--config_path",
+        config_path,
+    ]
+    logger.info(f"Starting npu_memcache MetaService: {' '.join(cmd)}")
+    process = subprocess.Popen(cmd, start_new_session=True)
+
+    start_time = time.time()
+    while time.time() - start_time < META_SERVICE_READY_TIMEOUT:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"npu_memcache MetaService exited with code "
+                f"{process.returncode} before it was ready"
+            )
+        if check_port_availability(host_ip, META_SERVICE_PORT):
+            logger.info(
+                f"npu_memcache MetaService is ready at {host_ip}:{META_SERVICE_PORT}"
+            )
+            return process
+        time.sleep(META_SERVICE_READY_POLL_INTERVAL)
+
+    raise RuntimeError(
+        f"Timed out after {META_SERVICE_READY_TIMEOUT}s waiting for "
+        f"npu_memcache MetaService at {host_ip}:{META_SERVICE_PORT}"
+    )
