@@ -451,7 +451,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             return prefix_len;
         }
 
-        let swa_evicted_seqlen = params.swa_evicted_seqlen;
+        // Never recover below the request's protected prefix: its incoming ids are the node's own.
+        let swa_evicted_seqlen = params.swa_evicted_seqlen.max(params.prev_prefix_len);
         // A locked tombstone is legal (segment locks count every node); the
         // full-value swap below is safe because full lock_ref >= swa
         // lock_ref, so a locked-SWA node always takes the Recover branch.
