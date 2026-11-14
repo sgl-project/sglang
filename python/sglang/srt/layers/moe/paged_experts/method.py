@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.paged_experts.formats import (
     FORMATS,
     ExpertFormat,
     PostLoad,
+    UnquantizedFormat,
     expert_params,
     format_for,
 )
@@ -489,9 +490,23 @@ def check_paged_experts_compat(layer, expert_format) -> None:
 
     problems = []
     parallel = get_parallel()
-    for name in ("tp_size", "ep_size", "pp_size", "dp_size"):
+    for name in ("ep_size", "pp_size", "dp_size"):
         if getattr(parallel, name) > 1:
-            problems.append(f"--{name.replace('_', '-')} must be 1 (single GPU only)")
+            problems.append(f"--{name.replace('_', '-')} must be 1 with paged experts")
+    if parallel.tp_size > 1:
+        if get_exec().moe.paged_experts_enable_disk:
+            problems.append(
+                "--paged-experts-enable-disk requires --tp-size 1 "
+                "(cached expert shards are not rank-specific)"
+            )
+        if expert_format is not None and (
+            not isinstance(expert_format, UnquantizedFormat)
+            or layer.params_dtype != torch.bfloat16
+        ):
+            problems.append(
+                "TP > 1 is supported only for unquantized BF16 experts "
+                "using the triton runner"
+            )
     if get_exec().moe.enable_eplb:
         problems.append("--enable-eplb is not supported")
     if get_spec().speculative_algorithm:

@@ -77,9 +77,13 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   | ModelOpt NVFP4 | Marlin | pass `--moe-runner-backend marlin`; runs W4A16 |
 
   Other quantization methods and MoE runners are rejected at startup.
-- **Single GPU:** tensor, expert, pipeline and data parallelism, EPLB, fused shared experts
-  (use `--disable-shared-experts-fusion`) and `--enable-fused-moe-sum-all-reduce` are rejected
-  at startup.
+- **Tensor parallelism:** supported for unquantized BF16 experts with the triton runner. Each
+  TP rank holds its native expert shards in pinned host memory and its own K-slot GPU table;
+  ordinary TP1 usage keeps supporting the other formats above. Expert, pipeline and data
+  parallelism, EPLB, fused shared experts (use `--disable-shared-experts-fusion`) and
+  `--enable-fused-moe-sum-all-reduce` are rejected at startup. TP ranks use one shared K under
+  `auto`, chosen from their minimum free memory and shard size so CUDA graph capture and replay
+  stay aligned. The disk tier requires TP1: its cache does not distinguish TP ranks' shards.
 - **Speculative decoding** is rejected at startup.
 - **Load formats:** `--load-format auto` (the default), `safetensors`, `pt`, `npcache`,
   `mistral`, `fastsafetensors`, `instanttensor` and `runai_streamer`. The others are rejected

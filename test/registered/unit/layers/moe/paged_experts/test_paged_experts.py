@@ -1172,12 +1172,22 @@ class TestFormats(CustomTestCase):
 
 class TestCompat(CustomTestCase):
     def _check(
-        self, num_resident=K, speculative_algorithm=None, load_format="auto", **flags
+        self,
+        num_resident=K,
+        speculative_algorithm=None,
+        load_format="auto",
+        tp_size=1,
+        params_dtype=torch.bfloat16,
+        enable_disk=False,
+        expert_format=None,
+        parallel_sizes=None,
+        **flags,
     ):
         method = "sglang.srt.layers.moe.paged_experts.method."
         moe = SimpleNamespace(
             enable_eplb=False,
             paged_experts_num_resident=num_resident,
+            paged_experts_enable_disk=enable_disk,
             enable_fused_moe_sum_all_reduce=False,
         )
         features = SimpleNamespace(
@@ -1187,14 +1197,14 @@ class TestCompat(CustomTestCase):
             enable_nvidia_megakernel=flags.get("enable_nvidia_megakernel", False)
         )
         lora = SimpleNamespace(enable_lora=flags.get("enable_lora", False))
-        layer = SimpleNamespace(top_k=TOP_K, num_fused_shared_experts=0)
+        layer = SimpleNamespace(
+            top_k=TOP_K, num_fused_shared_experts=0, params_dtype=params_dtype
+        )
+        parallel = SimpleNamespace(tp_size=tp_size, ep_size=1, pp_size=1, dp_size=1)
+        for name, size in (parallel_sizes or {}).items():
+            setattr(parallel, name, size)
         with (
-            patch(
-                method + "get_parallel",
-                return_value=SimpleNamespace(
-                    tp_size=1, ep_size=1, pp_size=1, dp_size=1
-                ),
-            ),
+            patch(method + "get_parallel", return_value=parallel),
             patch(
                 method + "get_exec",
                 return_value=SimpleNamespace(moe=moe, features=features, kernel=kernel),
@@ -1212,10 +1222,34 @@ class TestCompat(CustomTestCase):
             ),
             patch(method + "check_cuda_graph_backend", return_value=True),
         ):
-            check_paged_experts_compat(layer=layer, expert_format=object())
+            check_paged_experts_compat(
+                layer=layer, expert_format=expert_format or UnquantizedFormat()
+            )
 
     def test_accepts_a_supported_config(self):
         self._check()
+
+    def test_tp_supports_only_bf16_in_memory(self):
+        """TP must keep rank-specific shard bytes out of the rank-unaware disk cache and must
+        not silently enable quantized or FP16 layouts tested only at TP1."""
+        self._check(tp_size=2)
+        for name, kwargs in {
+            "disk cache": {"enable_disk": True},
+            "fp16": {"params_dtype": torch.float16},
+            "quantized": {"expert_format": formats.Fp8BlockFormat()},
+        }.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(RuntimeError, "--tp-size|unquantized BF16"):
+                    self._check(tp_size=2, **kwargs)
+        self._check(params_dtype=torch.float16)
+
+    def test_tp_keeps_other_parallel_modes_rejected(self):
+        for name in ("ep_size", "pp_size", "dp_size"):
+            with self.subTest(name):
+                with self.assertRaisesRegex(
+                    RuntimeError, f"--{name.replace('_', '-')}"
+                ):
+                    self._check(tp_size=2, parallel_sizes={name: 2})
 
     def test_only_loaders_that_fill_through_load_weights_are_accepted(self):
         """The loaders that fill the experts through model.load_weights and then run the
@@ -1381,6 +1415,60 @@ class TestSizing(CustomTestCase):
         # The small layer stops at E; the rest goes to the big one alone.
         self.assertEqual(grow([2, 2], [8, 32], [100, 100], 3000), [8, 26])
         self.assertEqual(grow([2, 2], [32, 32], [100, 100], 199), [2, 2])
+
+    def test_tp_budget_uses_the_minimum_free_memory(self):
+        """When only one rank can fit another slot per layer, both ranks must stop growing.
+        Otherwise they can capture different decode graphs containing TP collectives."""
+        tp_group = SimpleNamespace(world_size=2, cpu_group=object())
+        kvc = SimpleNamespace(
+            device="cuda",
+            gpu_id=0,
+            model_config=SimpleNamespace(is_multimodal=False),
+        )
+
+        def free_memory(*, device, gpu_id, distributed, cpu_group):
+            self.assertEqual(device, "cuda")
+            self.assertIs(cpu_group, tp_group.cpu_group)
+            return min(9, 6) if distributed else (9, 6)[gpu_id]
+
+        with (
+            self._patched(mem_fraction_static=0.75),
+            patch(
+                self._SIZING + "get_mm",
+                return_value=SimpleNamespace(mm_feature_transport=None),
+            ),
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+            patch(
+                "sglang.srt.utils.device.get_available_gpu_memory",
+                side_effect=free_memory,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.mm_runtime_reservation_gb",
+                return_value=0,
+            ),
+        ):
+            budgets = []
+            for rank in range(2):
+                kvc.gpu_id = rank
+                budgets.append(sizing.static_budget_bytes(kvc, pre_model_load_memory=0))
+
+        self.assertEqual(budgets, [6 * sizing._GIB] * 2)
+        for budget in budgets:
+            self.assertEqual(
+                sizing.ExpertSlotSizing._grow(
+                    [TOP_K, TOP_K],
+                    [E, E],
+                    [sizing._GIB, sizing._GIB],
+                    budget,
+                ),
+                [5, 5],
+            )
+        self.assertEqual(
+            sizing.ExpertSlotSizing._grow(
+                [TOP_K, TOP_K], [E, E], [sizing._GIB, sizing._GIB], 9 * sizing._GIB
+            ),
+            [6, 6],
+        )
 
     def _sized(
         self,
