@@ -587,6 +587,14 @@ Every error uses the Anthropic error envelope; 5xx messages are replaced with a
 generic one, and a failed stream still closes its open block and ends with
 `message_stop`.
 
+A `system` turn inside `messages`, as Claude Code sends, stays in place only
+when every worker of the model reports `supports_inline_system` in
+`/server_info`: its chat template renders a system message after the first.
+Otherwise its text joins the leading system message, where the engine's own
+`/v1/messages` puts it, and the turns either side of it stay apart. An engine
+that predates the field counts as not supporting it, and a request that ends
+with a system turn is never a prefill.
+
 `/v1/messages/count_tokens` is answered by the router from the model's chat
 template, without calling an engine. Image tokens are not counted, and a model
 without a chat template answers 500 rather than a raw-text estimate.

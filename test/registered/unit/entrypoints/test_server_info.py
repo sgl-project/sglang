@@ -112,12 +112,13 @@ def _call_server_info_with(
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
     scheduler_info: dict | None = None,
+    supports_inline_system: bool = False,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
     Bypasses the FastAPI HTTP layer (no TestClient): the handler is an
-    `async def` that reads module-level `_global_state`, so wiring a
-    `SimpleNamespace` stub via `set_global_state` and awaiting the
+    `async def` that reads module-level `_global_state` and the request's
+    chat handler, so wiring `SimpleNamespace` stubs for both and awaiting the
     coroutine directly is enough to exercise the handler logic without
     booting a model server.
 
@@ -147,7 +148,11 @@ def _call_server_info_with(
         published = True
         tokenizer_manager.record_config_updates("test", **config_updates)
     try:
-        return asyncio.run(http_server.server_info())
+        chat = SimpleNamespace(supports_inline_system=supports_inline_system)
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(openai_serving_chat=chat))
+        )
+        return asyncio.run(http_server.server_info(request))
     finally:
         # Restore so a later test in the same process isn't surprised.
         http_server._global_state = prior_state
@@ -207,7 +212,13 @@ class TestServerInfoTransportParity(CustomTestCase):
                 # Every transport below reports the same fields.
                 for name in secrets:
                     self.assertEqual(http_info[name], "<redacted>")
-                for field in ("startup_time", "internal_states", "version", "frontend"):
+                for field in (
+                    "startup_time",
+                    "internal_states",
+                    "version",
+                    "frontend",
+                    "supports_inline_system",
+                ):
                     self.assertIn(field, http_info)
                     http_info.pop(field)
 
@@ -841,6 +852,15 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         self.assertIn("internal_states", info)
         self.assertIn("version", info)
         self.assertEqual(info["frontend"], "python")
+
+    def test_supports_inline_system_is_what_messages_acts_on(self):
+        # sgl-router's /v1/messages keeps an inline system turn in place on this
+        # value; a constant would send one to a template that rejects it.
+        for value in (True, False):
+            info = _call_server_info_with(
+                ServerArgs(model_path="dummy"), supports_inline_system=value
+            )
+            self.assertIs(info["supports_inline_system"], value)
 
     def test_kv_events_config_raw_field_still_surfaced(self):
         # The new structured `kv_events` block sits alongside the

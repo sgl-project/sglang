@@ -14,6 +14,7 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use bytes::Bytes;
 
+use crate::discovery::ModelId;
 use crate::off_worker;
 use crate::protocol::anthropic::{
     self, response::chat_to_message, stream::MessagesStream, EchoContext,
@@ -38,8 +39,9 @@ pub(crate) async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
+    let inline_system = model_supports_inline_system(&ctx);
     let prepared = off_worker::run_for_body(body.len(), || {
-        let converted = parse(&body, false)?;
+        let converted = parse(&body, false, inline_system)?;
         let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
         Ok::<_, ApiError>((converted, chat_body))
     });
@@ -59,10 +61,12 @@ pub(crate) async fn count_tokens(
     State(ctx): State<Arc<AppContext>>,
     body: Bytes,
 ) -> Response<Body> {
-    let mut converted = match off_worker::run_for_body(body.len(), || parse(&body, true)) {
-        Ok(c) => c,
-        Err(e) => return adapt(e.into_response(), None).await,
-    };
+    let inline_system = model_supports_inline_system(&ctx);
+    let mut converted =
+        match off_worker::run_for_body(body.len(), || parse(&body, true, inline_system)) {
+            Ok(c) => c,
+            Err(e) => return adapt(e.into_response(), None).await,
+        };
     let model = ctx.config.model.id.as_str();
     if let Err(e) = served_tokenizer(&ctx) {
         return adapt(e.into_response(), None).await;
@@ -87,10 +91,23 @@ pub(crate) async fn count_tokens(
     }
 }
 
-fn parse(body: &Bytes, count_only: bool) -> Result<anthropic::Converted, ApiError> {
+fn parse(
+    body: &Bytes,
+    count_only: bool,
+    inline_system: bool,
+) -> Result<anthropic::Converted, ApiError> {
     let req: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
-    anthropic::to_chat(req, count_only).map_err(ApiError::BadRequest)
+    anthropic::to_chat(req, count_only, inline_system).map_err(ApiError::BadRequest)
+}
+
+/// Whether every worker of the served model renders a system message after
+/// the first; a worker that does not report it counts as no.
+fn model_supports_inline_system(ctx: &AppContext) -> bool {
+    let workers = ctx
+        .registry
+        .workers_for(&ModelId(ctx.config.model.id.clone()));
+    !workers.is_empty() && workers.iter().all(|w| w.supports_inline_system())
 }
 
 /// `echo` is `Some((echo, streaming))`, `None` on the error paths.
