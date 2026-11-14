@@ -5,10 +5,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import _topk_unfused
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -799,6 +801,32 @@ def topk_from_pooled_history_logits(
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
 
+    if _deterministic_inference():
+        # The fused radix-select kernels resolve ties at the selection threshold
+        # and write the selected groups in atomicAdd order, so the same logits can
+        # select different groups, in a different order, from run to run.
+        result = _kpool_topk_unfused(
+            logits=logits,
+            group_lengths=group_lengths,
+            kpool=kpool,
+            topk=topk,
+            group_topk=group_topk,
+            page_table=page_table if page_table_row_index is None else None,
+            page_table_row_index=None,
+            topk_offsets=topk_offsets,
+            seq_lens=seq_lens,
+            row_starts=row_starts,
+            out_rows=None,
+            deterministic=True,
+        )
+        if page_table_row_index is not None:
+            # Map positions through each row's page-table row, as the fused path
+            # does, without gathering whole page-table rows.
+            positions = result.clamp(min=0, max=page_table.shape[1] - 1).long()
+            mapped = page_table[page_table_row_index.long().unsqueeze(1), positions]
+            result = torch.where(result >= 0, mapped.to(torch.int32), result)
+        return _pad_rows(result, out_rows)
+
     v2_result = _try_kpool_topk_v2(
         logits=logits,
         group_lengths=group_lengths,
@@ -854,6 +882,58 @@ def topk_from_pooled_history_logits(
     )
 
 
+def _pad_rows(result: torch.Tensor, out_rows: int | None) -> torch.Tensor:
+    if out_rows is None or out_rows == result.shape[0]:
+        return result
+    padded = torch.full(
+        (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
+    )
+    padded[: result.shape[0]] = result
+    return padded
+
+
+def _deterministic_inference() -> bool:
+    # Kernel tests and tools run without a server's published configuration.
+    return (
+        get_context().is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+    )
+
+
+def _tie_free_topk(x: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Top k of each row, equal scores to the lower column: the selection depends
+    only on the row (torch.topk's own tie-break follows the tensor shape). Both
+    branches select the same columns; each is the faster one for its width."""
+    if x.shape[-1] <= 4096:
+        values, indices = torch.sort(x, dim=-1, descending=True, stable=True)
+        return values[:, :k], indices[:, :k]
+    # Order-preserving int32 view of the fp32 scores, with the column in the low
+    # 32 bits: every key is distinct.
+    bits = x.contiguous().view(torch.int32)
+    key = torch.where(bits >= 0, bits, bits ^ 0x7FFFFFFF).to(torch.int64)
+    cols = torch.arange(x.shape[-1], device=x.device, dtype=torch.int64)
+    key = (key << 32) | (0xFFFFFFFF - cols)
+    top = torch.topk(key, k, dim=-1).indices
+    return x.gather(-1, top), top
+
+
+def _deterministic_group_topk(
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    group_topk: int,
+    row_starts: torch.Tensor | None,
+) -> torch.Tensor:
+    """The top groups of each row, ties to the lower index, in ascending order
+    and unused slots (-1) last: the same logits always give the same groups in
+    the same order, whatever rows share the call."""
+    selected = _topk_unfused(
+        logits, group_lengths, group_topk, row_starts=row_starts, topk_op=_tie_free_topk
+    )
+    last = torch.iinfo(selected.dtype).max
+    selected, _ = torch.sort(selected.masked_fill(selected < 0, last), dim=-1)
+    return selected.masked_fill(selected == last, -1)
+
+
 def _kpool_topk_unfused(
     *,
     logits: torch.Tensor,
@@ -867,19 +947,25 @@ def _kpool_topk_unfused(
     seq_lens: torch.Tensor | None,
     row_starts: torch.Tensor | None,
     out_rows: int | None,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     assert page_table_row_index is None, (
         "page_table_row_index requires the fused fast_kpool group_topk path"
     )
 
-    from sgl_kernel import fast_topk_v2
+    if deterministic:
+        selected_groups = _deterministic_group_topk(
+            logits, group_lengths, group_topk, row_starts
+        )
+    else:
+        from sgl_kernel import fast_topk_v2
 
-    selected_groups = fast_topk_v2(
-        logits,
-        group_lengths.to(torch.int32),
-        group_topk,
-        row_starts=row_starts,
-    )
+        selected_groups = fast_topk_v2(
+            logits,
+            group_lengths.to(torch.int32),
+            group_topk,
+            row_starts=row_starts,
+        )
 
     rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
     max_valid_groups = min(logits.shape[1], group_topk)
