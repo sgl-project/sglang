@@ -909,6 +909,8 @@ class TestAllocationIntegration(CustomTestCase):
             status=KVPoll.Success,
             targets=[("decode", 2)],
             failure_reason=None,
+            # The worker uncounts the chunk only after this call returns.
+            counts_self=True,
         )
 
     def test_abort_after_worker_success_does_not_fail_decode(self):
@@ -1015,6 +1017,24 @@ class TestAllocationIntegration(CustomTestCase):
                 )
             with self.subTest("decode room is Failed"):
                 self.assertEqual(decode.request_status.get(1), KVPoll.Failed)
+
+    def test_abort_before_last_chunk_is_uncounted_keeps_success(self):
+        mgr = self.manager("prefill", 1)
+        mgr.defer_decode_allocation = False
+        mgr.deferred_bootstrap = None
+        mgr._staging_outstanding = defaultdict(int)
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            sender = MooncakeKVSender(mgr, "prefill:8998", 1)
+            mgr.update_status(1, KVPoll.WaitingForInput)
+            # transfer_worker counts the chunk at dequeue and uncounts it only
+            # after conclude_transfer returns.
+            mgr._staging_outstanding[1] += 1
+            self.conclude_like_worker(mgr)
+            sender.abort()
+            mgr._staging_outstanding[1] -= 1
+            self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
 
 
 if __name__ == "__main__":

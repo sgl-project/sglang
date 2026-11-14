@@ -3103,6 +3103,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         if status == KVPoll.Success
                                         else f"Failed to send aux data of {req.room}"
                                     ),
+                                    # Uncounted below, after the loop.
+                                    counts_self=True,
                                 )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
