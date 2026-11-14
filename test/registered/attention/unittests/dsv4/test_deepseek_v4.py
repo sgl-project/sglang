@@ -648,6 +648,64 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
+    def _make_v41_trtllm_metadata(self, base: int):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            SWA_WINDOW,
+            DSV4AttnMetadata,
+        )
+
+        rows = 3
+        metadata = DSV4AttnMetadata(
+            page_size=256,
+            page_table=torch.zeros((rows, 2), dtype=torch.int32),
+            raw_out_loc=torch.arange(rows, dtype=torch.int32),
+            cuda_int32_kwargs={"dtype": torch.int32},
+            seq_lens_casual=torch.tensor([5, 900, 4000], dtype=torch.int32) + base,
+            positions_casual=torch.zeros(rows, dtype=torch.int32),
+            swa_page_indices=torch.zeros((rows, SWA_WINDOW), dtype=torch.int32),
+            swa_topk_lengths=torch.full((rows,), SWA_WINDOW, dtype=torch.int32),
+            index_topk=512,
+            present_ratios=(1, 2, 128),
+            low_ratios=(1, 2),
+        )
+        for ratio in (1, 2):
+            metadata.set_sparse_topk(
+                ratio,
+                page_indices=torch.zeros((rows, 512), dtype=torch.int32),
+                topk_lengths=torch.full((rows,), 512, dtype=torch.int32),
+            )
+        metadata.c4_sparse_topk_lengths = metadata.c4_sparse_page_indices = None
+        metadata.c128_page_indices = torch.zeros((rows, 64), dtype=torch.int32)
+        metadata.c128_topk_lengths_clamp1 = torch.ones(rows, dtype=torch.int32)
+        for ratio in (0, 1, 2, 4, 128):
+            setattr(metadata, f"c{ratio}_flashmla_metadata", object())
+        metadata.init_trtllm_sparse_buffers()
+        return metadata
+
+    def test_trtllm_indexed_lens_are_per_ratio_metadata(self):
+        """trtllm-gen reads its lengths before its PDL wait, so each indexed
+        ratio's lengths are written with the metadata, one row per ratio."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+        metadata = self._make_v41_trtllm_metadata(0)
+        self.assertEqual(metadata.trtllm_indexed_ratios, (1, 2))
+        self.assertEqual(tuple(metadata.trtllm_c4_lens.shape), (2, 3))
+        # min(top-k, seq_len // ratio), as init_trtllm_sparse_buffers clamps it.
+        for ratio, expected in ((1, [5, 512, 512]), (2, [2, 450, 512])):
+            self.assertEqual(
+                metadata.trtllm_indexed_lens(ratio).tolist(),
+                [SWA_WINDOW + n for n in expected],
+            )
+        with self.assertRaises(ValueError):
+            metadata.trtllm_indexed_lens(4)
+
+        # Replay copies the rows into the captured storage.
+        captured = metadata.trtllm_c4_lens
+        replay = self._make_v41_trtllm_metadata(1)
+        metadata.refresh_for_breakable_cuda_graph_replay_(replay)
+        self.assertIs(metadata.trtllm_c4_lens, captured)
+        self.assertTrue(torch.equal(captured, replay.trtllm_c4_lens))
+
     def test_backend_replay_keeps_captured_metadata_active(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
@@ -714,6 +772,66 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 replay_metadata.core_attn_metadata.seq_lens_casual,
             )
         )
+
+    def test_trtllm_launch_never_reads_lengths_packed_right_before_it(self):
+        """Decode packs only the table and reads the ratio's metadata row; eager
+        prefill packs lengths, so its launch runs without PDL."""
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        metadata = self._make_v41_trtllm_metadata(0)
+        rows = metadata.seq_lens_casual.shape[0]
+        backend = object.__new__(trtllm.DeepseekV4TrtllmAttnBackend)
+        backend.cuda_int32_kwargs = {"dtype": torch.int32}
+        backend.trtllm_workspace_buffer = torch.empty(0)
+        backend._trtllm_kv_cache_views = lambda *_: (torch.empty(0), torch.empty(0))
+        backend._get_trtllm_bmm_scales = lambda _: (1.0, 1.0)
+        backend._move_to_device = torch.tensor
+        backend.forward_metadata = SimpleNamespace(
+            core_attn_metadata=metadata, late_layer_tail=None
+        )
+        launches, packs = [], []
+
+        def fake_launch(**kwargs):
+            launches.append(kwargs)
+            return torch.zeros(kwargs["query"].shape[0], 1, 64, 512)
+
+        def fake_pack(indices, lengths, table, total_lengths):
+            packs.append((lengths, total_lengths))
+
+        kwargs = dict(
+            q=torch.zeros(rows, 64, 512),
+            layer=SimpleNamespace(layer_id=0),
+            compress_ratio=2,
+            attn_sink=torch.zeros(64),
+            swa_page_indices=metadata.swa_page_indices,
+            extra_indices=metadata.sparse_page_indices(2),
+            extra_topk_lengths=metadata.sparse_topk_lengths(2),
+        )
+        with (
+            mock.patch.object(
+                trtllm,
+                "trtllm_batch_decode_sparse_mla_dsv4",
+                fake_launch,
+                create=True,
+            ),
+            mock.patch.object(trtllm, "pack_sparse_tail", fake_pack),
+            mock.patch.object(trtllm, "_check_trtllm_query_rows", lambda _: None),
+            mock.patch.object(trtllm, "_get_trtllm_kv_counter_buffer", lambda *_: None),
+        ):
+            backend._forward_trtllm_decode(core_attn_metadata=metadata, **kwargs)
+            self.assertEqual(packs.pop(), (None, None))
+            decode = launches.pop()
+            self.assertNotIn("enable_pdl", decode)
+            self.assertTrue(
+                torch.equal(decode["sparse_topk_lens"], metadata.trtllm_indexed_lens(2))
+            )
+
+            forward_batch = SimpleNamespace(
+                extend_seq_lens_cpu=[rows], seq_lens=torch.tensor([rows])
+            )
+            backend._forward_trtllm_prefill(forward_batch=forward_batch, **kwargs)
+            self.assertIsNotNone(packs.pop()[1])
+            self.assertIs(launches.pop()["enable_pdl"], False)
 
     def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
         from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm

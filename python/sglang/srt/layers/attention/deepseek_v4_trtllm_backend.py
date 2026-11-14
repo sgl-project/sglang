@@ -308,7 +308,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sparse_topk_lens = core_attn_metadata.trtllm_c128_lens
         else:
             sparse_indices = core_attn_metadata.trtllm_c4_indices
-            sparse_topk_lens = core_attn_metadata.trtllm_c4_lens
+            sparse_topk_lens = core_attn_metadata.trtllm_indexed_lens(compress_ratio)
         assert sparse_indices is not None and sparse_topk_lens is not None, (
             "trtllm decode requires metadata built with "
             "init_trtllm_sparse_buffers (decode-mode DSV4AttnMetadata)"
@@ -326,9 +326,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             assert SWA_WINDOW + width == sparse_indices.shape[1], (
                 f"{width=} {sparse_indices.shape=}"
             )
-            pack_sparse_tail(
-                extra_indices, extra_topk_lengths, sparse_indices, sparse_topk_lens
-            )
+            # Table only: the lengths came with the metadata (trtllm_indexed_lens).
+            pack_sparse_tail(extra_indices, None, sparse_indices, None)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
             layer.layer_id, compress_ratio
@@ -438,10 +437,15 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         swa_indices = _tile_padded_pf(-1, swa_page_indices[:sum_q], width=SWA_WINDOW)
         assert swa_indices.shape == (sum_q, SWA_WINDOW), f"{swa_indices.shape=}"
+        # trtllm-gen reads the lengths before its griddepcontrol.wait, where a PDL
+        # launch need not see its predecessor's stores: when this call wrote
+        # them, launch without PDL.
+        wrote_lengths = False
         if extra_indices is None:
             sparse_indices = swa_indices
             if core.trtllm_prefill_swa_lens is None:
                 core.trtllm_prefill_swa_lens = _tile_padded_pf(SWA_WINDOW)
+                wrote_lengths = True
             sparse_topk_lens = core.trtllm_prefill_swa_lens
         elif compress_ratio == 128:
             if core.trtllm_prefill_c128 is None:
@@ -454,6 +458,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 pack_sparse_tail(
                     extra_indices[:sum_q], extra_topk_lengths[:sum_q], table, lens
                 )
+                wrote_lengths = True
                 core.trtllm_prefill_c128 = (table, lens)
             sparse_indices, sparse_topk_lens = core.trtllm_prefill_c128
         else:
@@ -478,6 +483,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 sparse_indices,
                 sparse_topk_lens,
             )
+            wrote_lengths = True
 
         # Retain a unit-scale cast for callers without fused FP8 Q preparation.
         q_fp8 = q[:sum_q].to(torch.float8_e4m3fn)
@@ -520,6 +526,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             multi_ctas_kv_counter_buffer=_get_trtllm_kv_counter_buffer(
                 num_heads, q.device
             ),
+            **({"enable_pdl": False} if wrote_lengths else {}),
         )
         return out_padded if out_padded is not None else out
 
