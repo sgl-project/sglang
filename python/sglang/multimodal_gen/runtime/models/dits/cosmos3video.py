@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoC
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
     get_sp_group,
     get_sp_world_size,
     get_tp_world_size,
@@ -64,9 +65,12 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 logger = init_logger(__name__)
 
@@ -79,6 +83,7 @@ def _can_enable_t1_fused_qk_norm_rope(
     *,
     is_blackwell: bool,
     is_hopper: bool,
+    is_sm121: bool,
     hidden_act: str,
     tp_size: int,
     sp_size: int,
@@ -89,6 +94,11 @@ def _can_enable_t1_fused_qk_norm_rope(
         return False
     if is_blackwell:
         return True
+    if is_sm121:
+        shape = (hidden_act, hidden_size)
+        return (
+            tp_size == 1 and sp_size == 1 and shape in (("relu2", 2048), ("silu", 4096))
+        )
     if not is_hopper or sp_size != 1:
         return False
     if tp_size == 1:
@@ -776,6 +786,7 @@ class Cosmos3CrossAttention(nn.Module):
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
         supported_attention_backends: set | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -807,6 +818,7 @@ class Cosmos3CrossAttention(nn.Module):
             num_kv_heads=self.local_num_key_value_heads,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
             prefix=add_prefix("attn", prefix),
             is_cross_attention=True,
         )
@@ -1777,6 +1789,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=current_platform.is_blackwell(),
             is_hopper=current_platform.is_hopper(),
+            is_sm121=(
+                current_platform.is_cuda()
+                and current_platform.get_device_capability() == (12, 1)
+            ),
             hidden_act=self.hidden_act,
             hidden_size=self.hidden_size,
             tp_size=get_tp_world_size(),
@@ -2004,8 +2020,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             yield from _try_emit(linear_target)
 
     def post_load_weights(self, target_dtype: torch.dtype = torch.bfloat16) -> None:
-        """Cast non-quantized parameters to their preferred dtypes and rebuild
-        meta-device buffers.
+        """Cast non-quantized parameters to their preferred dtypes,
+        and rebuild the RoPE buffer.
 
         Time-embedder stays in float32 for numerical stability; embeddings and
         the VAE/LLM bridge linears go to ``target_dtype``. Quantized modules
@@ -2013,22 +2029,34 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         on them would cast their FP8 weights back to BF16/FP32 and break the
         quant kernels.
 
-        Also re-materializes the RoPE ``inv_freq`` buffer, which can land on
-        the meta device when the model is constructed under a meta context.
+        Also rebuilds the RoPE ``inv_freq`` buffer from powers computed on
+        ``get_local_torch_device()``, and places it on the DiT's device.
         """
         # Get the actual device from a loaded parameter
         device = next(self.parameters()).device
 
-        # Recompute RoPE inv_freq buffer on the correct device
-        # This is needed because model is created in meta device context
+        # Compute RoPE on the runtime device so offload preserves resident values
         rotary_emb = self.language_model.rotary_emb
-        if rotary_emb.inv_freq.is_meta:
-            dim = rotary_emb.head_dim
-            inv_freq = 1.0 / (
-                self.rope_theta
-                ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        dim = rotary_emb.head_dim
+        runtime_device = get_local_torch_device()
+        if current_platform.is_cuda() and dim & (dim - 1) == 0:
+            # CUDA logspace matches pow for power-of-two dims without its cold load.
+            # CPU and CUDA reciprocals round identically for these FP32 powers.
+            powers = torch.logspace(
+                start=0,
+                end=(dim - 2) / dim,
+                steps=dim // 2,
+                base=self.rope_theta,
+                dtype=torch.float32,
+                device=runtime_device,
             )
-            rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+            inv_freq = powers.to(device).reciprocal()
+        else:
+            exponents = torch.arange(
+                start=0, end=dim, step=2, dtype=torch.float32, device=runtime_device
+            )
+            inv_freq = (1.0 / (self.rope_theta ** (exponents / dim))).to(device)
+        rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Collect all quantized submodules so we can skip them during
         # dtype casts.  Calling .to(dtype) on a quantized layer would

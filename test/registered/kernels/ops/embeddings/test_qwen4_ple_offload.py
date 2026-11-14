@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
@@ -17,10 +18,9 @@ from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPLELayer,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.srt.utils import set_weight_attrs
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_xpu_ci(est_time=45, suite="stage-b-test-1-gpu-xpu")
 
 _accelerator = torch.accelerator.current_accelerator()
@@ -244,17 +244,17 @@ def test_qwen4_ple_offload_avoids_device_table(single_rank_runtime_context):
 
 
 def _file_backend_supported() -> bool:
-    from sglang.srt.models.qwen4_exp_ple_table import device_uses_host_page_tables
+    from sglang.srt.models.qwen4_exp_ple_table import device_reads_pageable_memory
 
     return (
         torch.cuda.is_available()
-        and device_uses_host_page_tables(torch.cuda.current_device()) is True
+        and device_reads_pageable_memory(torch.cuda.current_device()) is True
     )
 
 
 @pytest.mark.skipif(
     not _file_backend_supported(),
-    reason="the file backend needs pageable host memory reachable through host page tables",
+    reason="the file backend needs a device that reads pageable host memory",
 )
 @pytest.mark.parametrize("embedding_dim", [7, 160])
 def test_qwen4_ple_file_backend_matches_pinned(embedding_dim):
@@ -286,7 +286,7 @@ def test_qwen4_ple_file_backend_matches_pinned(embedding_dim):
 
 @pytest.mark.skipif(
     not _file_backend_supported(),
-    reason="the file backend needs pageable host memory reachable through host page tables",
+    reason="the file backend needs a device that reads pageable host memory",
 )
 def test_qwen4_ple_file_backend_fp8_table():
     embedding_dim = 160
@@ -313,6 +313,130 @@ def test_qwen4_ple_file_backend_fp8_table():
             .reshape(1, 3, embedding_dim)
         )
         torch.testing.assert_close(filed(ids), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not _file_backend_supported(),
+    reason="the file backend needs a device that reads pageable host memory",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_qwen4_ple_file_backend_gathers_prefill_rows_on_the_host(monkeypatch, dtype):
+    """A prefill-sized gather (>= PLE_FILE_PREFETCH_MIN_ROWS ids) from the file-backed
+    table reads its rows on the host and gives the kernel's bytes: repeated ids, both
+    shard edges, ids outside the shard (zero rows) and a shard none of the ids fall in.
+    Control: a decode-sized gather stays in the kernel (no host staging). The GPU is taken
+    as one that faults pageable pages through the driver (HMM), whatever this one does.
+    Every staged gather first advises its rows' pages (WILLNEED), and the kernel takes
+    the advice."""
+    monkeypatch.setattr(
+        qwen4_exp_module, "device_faults_pageable_pages", lambda device_index=0: True
+    )
+    embedding_dim = 160
+    staged = []
+    stage = Qwen4ExpPinnedHostEmbedding._stage_rows
+    monkeypatch.setattr(
+        Qwen4ExpPinnedHostEmbedding,
+        "_stage_rows",
+        lambda self, *a: staged.append(a[0].numel()) or stage(self, *a),
+    )
+    advised = []
+    advise = qwen4_exp_module.advise_rows_willneed
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "advise_rows_willneed",
+        lambda fd, rows, row_bytes: (
+            advised.append((rows.tolist(), advise(fd, rows, row_bytes)))
+            or advised[-1][1]
+        ),
+    )
+    with tempfile.TemporaryDirectory() as table_dir:
+        filed = Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(
+                embedding_dim=embedding_dim,
+                dtype=dtype,
+                vocab_start=4,
+                vocab_end=8,
+                org_vocab_size=8,
+                tp_size=2,
+            ),
+            backend="file",
+            table_dir=table_dir,
+        )
+        full = torch.randn(8, embedding_dim, dtype=torch.float32, device="cuda").to(
+            dtype
+        )
+        _load_rows(filed, full, pinned=False)  # the loader keeps this rank's rows 4-7
+        expected_row = full.to(torch.bfloat16)
+
+        def gather(ids):
+            # A sharded table: the output is preallocated (as the model does), since
+            # allocating one goes through the TP group, which this test has none of.
+            out = torch.empty(
+                (*ids.shape, embedding_dim), dtype=torch.bfloat16, device="cuda"
+            )
+            return filed.gather(ids, out=out)
+
+        def expected(ids):
+            inside = (ids >= 4) & (ids < 8)
+            rows = expected_row.index_select(0, ids.clamp(0, 7).flatten())
+            return (rows * inside.flatten()[:, None]).reshape(*ids.shape, -1)
+
+        big = torch.randint(-2, 12, (4096,), device="cuda")
+        big[:4] = torch.tensor([4, 7, 3, 8], device="cuda")
+        torch.testing.assert_close(gather(big), expected(big), rtol=0, atol=0)
+        assert staged == [4096]
+        in_shard = big[(big >= 4) & (big < 8)].unique().cpu() - 4
+        assert advised == [(in_shard.tolist(), 1)]  # rows 0-3 share page 0
+        outside = torch.full((2048,), 2, device="cuda")
+        torch.testing.assert_close(
+            gather(outside),
+            torch.zeros(2048, embedding_dim, dtype=torch.bfloat16, device="cuda"),
+            rtol=0,
+            atol=0,
+        )
+        assert staged == [4096, 2048]
+        assert advised[1:] == [([0], 1)]  # the row the kernel reads before zeroing
+        small = torch.tensor([[4, 7, 3]], device="cuda")
+        torch.testing.assert_close(gather(small), expected(small), rtol=0, atol=0)
+        assert staged == [4096, 2048]  # decode-sized: the kernel reads the table
+        assert len(advised) == 2
+
+
+@pytest.mark.skipif(
+    not _file_backend_supported(),
+    reason="the file backend needs a device that reads pageable host memory",
+)
+def test_qwen4_ple_file_backend_keeps_gathers_in_kernel_with_host_page_tables(
+    monkeypatch,
+):
+    """Control for the host gather: a GPU that reads pageable memory through the host's
+    page tables (GB10) does not fault page by page, so a prefill-sized gather stays in
+    the kernel, with the same bytes."""
+    monkeypatch.setattr(
+        qwen4_exp_module, "device_faults_pageable_pages", lambda device_index=0: False
+    )
+    staged = []
+    stage = Qwen4ExpPinnedHostEmbedding._stage_rows
+    monkeypatch.setattr(
+        Qwen4ExpPinnedHostEmbedding,
+        "_stage_rows",
+        lambda self, *a: staged.append(a[0].numel()) or stage(self, *a),
+    )
+    embedding_dim = 160
+    with tempfile.TemporaryDirectory() as table_dir:
+        filed = Qwen4ExpPinnedHostEmbedding(
+            _make_source_embedding(embedding_dim=embedding_dim, dtype=torch.bfloat16),
+            backend="file",
+            table_dir=table_dir,
+        )
+        rows = filed.weight.shape[0]
+        full = torch.randn(rows, embedding_dim, device="cuda").to(torch.bfloat16)
+        _load_rows(filed, full, pinned=False)
+        big = torch.randint(0, rows, (4096,), device="cuda")
+        torch.testing.assert_close(
+            filed.gather(big), full.index_select(0, big), rtol=0, atol=0
+        )
+        assert staged == []
 
 
 if __name__ == "__main__":

@@ -5,12 +5,18 @@ import queue
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import msgspec
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
+from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo,
+    MooncakeKVManager,
+    MooncakeKVSender,
+)
 from sglang.srt.disaggregation.mooncake.kvserve import ACK, KVServeAdapter
 from sglang.srt.disaggregation.mooncake.kvserve_pipeline import (
     EncodedTransferPipeline,
@@ -18,6 +24,17 @@ from sglang.srt.disaggregation.mooncake.kvserve_pipeline import (
     SourceRoomGate,
 )
 from sglang.srt.disaggregation.mooncake.kvserve_transport import ReceiveCredits
+from sglang.srt.disaggregation.prefill import (
+    SchedulerDisaggregationPrefillMixin,
+    _send_done,
+)
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -120,6 +137,165 @@ class TestAdapterProtocol(unittest.TestCase):
         self.assertFalse(sender._kvserve_source_gate.acquire())
         sender._kvserve_source_gate.release()
         self.assertEqual(sender._poll_with_status(fail_after_enqueue), KVPoll.Failed)
+
+    def test_registration_preserves_native_dcp_and_optional_codec_fields(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.get_session_id = lambda: "session"
+        manager.local_ip, manager.rank_port = "127.0.0.1", 1234
+        manager.attn_tp_size, manager.dcp_size, manager.dcp_rank = 1, 1, 0
+        manager.enable_staging = False
+        manager.exchange_aux_item_lens = False
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[4096],
+            aux_data_ptrs=[8192],
+            state_data_ptrs=[],
+            state_item_lens=[],
+            state_dim_per_tensor=[],
+            state_layer_ids=[],
+            kv_layer_ids=[0],
+            engine_rank=0,
+            kv_item_lens=[64],
+            draft_rows_dcp_collapsed=True,
+        )
+        for profile in (None, {"version": 3, "profile": "default"}):
+            with self.subTest(profile=profile):
+                manager.kvserve = (
+                    None
+                    if profile is None
+                    else SimpleNamespace(registration=lambda: profile)
+                )
+                msg = manager.build_receiver_registration_message()
+                self.assertEqual(msg[21], b"1")
+                parsed = KVArgsRegisterInfo.from_zmq(msg)
+                self.assertTrue(parsed.dst_draft_rows_dcp_collapsed)
+                self.assertEqual(parsed.kvserve, profile)
+                legacy = KVArgsRegisterInfo.from_zmq(msg[:21])
+                self.assertFalse(legacy.dst_draft_rows_dcp_collapsed)
+                self.assertIsNone(legacy.kvserve)
+
+    def test_enqueue_records_native_send_and_owns_source_until_done(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.request_status = {7: KVPoll.Transferring}
+        manager.transfer_infos = {7: {"127.0.0.1:1234": object()}}
+        manager.transfer_queues = [queue.Queue()]
+        manager.kvserve_enabled = True
+        manager._send_records = None
+        gate = SourceRoomGate()
+        manager.add_transfer_request(7, [3], slice(0, 1), False, source_gate=gate)
+        chunk = manager.transfer_queues[0].get_nowait()
+        self.assertEqual(manager.send_counts(7), (1, 0))
+        self.assertIs(chunk.send_record, manager.send_record(7))
+        self.assertFalse(gate.close_and_is_idle())
+        chunk._kvserve_source_gate.release()
+        self.assertTrue(gate.close_and_is_idle())
+        manager.note_send_finished(7, chunk.send_record)
+        self.assertEqual(manager.send_counts(7), (1, 1))
+
+
+class TestRequestOwnership(unittest.TestCase):
+    def test_failed_send_does_not_allow_page_move_before_codec_drains(self):
+        gate = SourceRoomGate()
+        self.assertTrue(gate.acquire())
+        sender = SimpleNamespace(
+            bootstrap_room=7,
+            kv_mgr=SimpleNamespace(
+                kvserve_enabled=True, request_status={7: KVPoll.Failed}
+            ),
+            is_source_release_safe=gate.close_and_is_idle,
+        )
+        self.assertFalse(_send_done((sender, 0)))
+        gate.release()
+        self.assertTrue(_send_done((sender, 0)))
+
+    def test_waiting_abort_sends_output_once_and_releases_after_drain(self):
+        class Request:
+            rid = "pending"
+            owner_list = None
+            pending_bootstrap = False
+            finished_reason = None
+            metadata_buffer_index = -1
+            return_logprob = False
+            time_stats = SimpleNamespace(set_completion_time=Mock())
+
+            def finish_outside_step(self, reason):
+                self.finished_reason = reason
+
+        req = Request()
+        gate = SourceRoomGate()
+        self.assertTrue(gate.acquire())
+        req.disagg_kv_sender = SimpleNamespace(
+            kv_mgr=SimpleNamespace(kvserve_enabled=True),
+            abort=Mock(),
+            clear=Mock(),
+            is_source_release_safe=gate.close_and_is_idle,
+        )
+        scheduler = SchedulerDisaggregationPrefillMixin()
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+        scheduler.req_to_metadata_buffer_idx_allocator = Mock()
+        scheduler.scheduler_stage_metrics = None
+        scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
+        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.request_retirer = RequestRetirer(
+            tree_cache=Mock(),
+            beam_coordinator=Mock(),
+            hisparse_coordinator=None,
+            uocr_runtime=None,
+            send_abort_output=Mock(),
+            stream_output=Mock(),
+        )
+        scheduler.request_retirer.release = Mock(
+            side_effect=lambda item, **_: item.owner_list._leave([item])
+        )
+        scheduler.handle_inflight_transfer_failure = Mock(
+            side_effect=lambda item: scheduler.request_retirer.release(
+                item, checkpoint=False
+            )
+        )
+        move([req], scheduler.waiting_queue)
+        abort = SimpleNamespace(
+            matches=lambda rid: rid == req.rid, finished_reason=None
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.make_abort_req",
+            return_value=object(),
+        ):
+            Scheduler._abort_waiting(scheduler, abort)
+        scheduler.request_retirer.send_abort_output.assert_called_once()
+        scheduler.request_retirer.release.assert_not_called()
+        req.disagg_kv_sender.clear.assert_not_called()
+        self.assertFalse(scheduler.waiting_queue)
+        self.assertTrue(req._kvserve_abort_output_sent)
+        self.assertIs(req.owner_list, scheduler.disagg_prefill_transfer_queue)
+
+        gate.release()
+        self.assertTrue(req.disagg_kv_sender.is_source_release_safe())
+        with patch(
+            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+            return_value=[KVPoll.Failed],
+        ):
+            scheduler.process_disagg_prefill_transfer_queue()
+        scheduler.request_retirer.release.assert_called_once_with(req, checkpoint=False)
+        scheduler.output_streamer.stream_output.assert_called_once_with([], False, None)
+        self.assertIsNone(req.owner_list)
+
+    def test_page_move_and_release_wait_for_local_restore(self):
+        transfer = object.__new__(DecodeTransferQueue)
+        transfer.scheduler = SimpleNamespace(request_retirer=Mock())
+        receiver = SimpleNamespace(
+            is_local_restore_release_safe=Mock(return_value=False),
+            poll=Mock(return_value=KVPoll.Success),
+        )
+        req = SimpleNamespace(kv_receiver=receiver)
+        self.assertFalse(transfer._receive_done(req))
+        with self.assertRaisesRegex(RuntimeError, "unsettled local restore"):
+            transfer._do_release(req, 0)
+        transfer.scheduler.request_retirer.release.assert_not_called()
+        receiver.is_local_restore_release_safe.return_value = True
+        transfer.enable_staging = False
+        self.assertTrue(transfer._receive_done(req))
 
 
 class TestTransferBuffers(unittest.TestCase):

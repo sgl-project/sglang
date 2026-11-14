@@ -26,6 +26,8 @@ def _convert_weights(weights: WeightIterator, dit_config: Any) -> WeightIterator
     for name, tensor in weights:
         if name.endswith(".comfy_quant"):
             continue  # read by _quant_markers
+        if name.endswith(".comfy_attention.config"):
+            continue  # per-layer attention kernel hint; the worker picks its own kernel
         match = _GATE_UP_RE.match(name)
         if match is None:
             yield name, tensor

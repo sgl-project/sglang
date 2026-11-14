@@ -4,6 +4,7 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
@@ -29,13 +30,13 @@ def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
 
 @cache_once
 def _load_fa3_kernels():
-    # By default, we use the implementation from sgl-kernel,
+    # By default, we use the implementation from the sgl-fa3 wheel,
     # which is expected to be more stable and compatible
     if envs.SGLANG_USE_SGL_FA3_KERNEL.get():
         logger.debug(
-            f"SGLANG_USE_SGL_FA3_KERNEL=True, use sgl-kernel implementation for FlashAttention v3 "
+            f"SGLANG_USE_SGL_FA3_KERNEL=True, use the sgl-fa3 implementation for FlashAttention v3"
         )
-        return _load_fa3_kernel_from_sgl()
+        return _load_fa3_kernel_from_sgl_fa3()
 
     # Otherwise, we try to load the kernels from the kernels community cache directory or kernels community repo
     lockfile_path = os.path.join(
@@ -60,16 +61,16 @@ def _load_fa3_kernels():
     except Exception as e:
         # When the kernels from the repo or the cache directory cannot be loaded
         # we catch the exception and log a warning, and then fallback to the implementation
-        # from sgl-kernel, which is expected to be less efficient but more compatible.
+        # from the sgl-fa3 wheel, which is expected to be less efficient but more compatible.
         logger.warning(
-            f"Rollback to implementation from sgl-kernel since loading FlashAttention v3 "
+            f"Rollback to implementation from sgl-fa3 since loading FlashAttention v3 "
             f"kernels from {SGL_FA3_KERNEL_REPO} with lockfile {lockfile_path} failed: {e}"
         )
-        return _load_fa3_kernel_from_sgl()
+        return _load_fa3_kernel_from_sgl_fa3()
 
 
-def _load_fa3_kernel_from_sgl():
-    from sgl_kernel.flash_attn import (
+def _load_fa3_kernel_from_sgl_fa3():
+    from sgl_fa3 import (
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
@@ -81,20 +82,21 @@ def _load_fa3_kernel_from_sgl():
 
 
 @cache_once
-def _is_fa3_supported(device=None) -> bool:
+def _is_fa3_supported() -> bool:
     #  There some fa3 FYI
     #  FA3 can fail without a enough shared memory for a some shapes, such as higher
     #  hidden_dim or some special cases.
     #  Right now, fa3 is supported for sm80/sm87 and sm86/sm89. The main different
     #  Between sm80/sm87 and sm86/sm89 is the shared memory size. you can follow the link below for more information
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
-    #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
+    #  The sgl-fa3 wheel ships sm80/sm86/sm90a kernels (x86_64 only).
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    major, minor = get_device_capability()
     if is_musa():
+        major, _ = get_device_capability()
         return major >= 3
     if torch.version.cuda is not None and torch.version.cuda >= "12.3":
-        return major == 9 or major == 8
+        arch = current_arch()
+        return arch.is_sm(9) or arch.is_sm(8)
     return False
 
 

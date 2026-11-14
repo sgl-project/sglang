@@ -16,7 +16,7 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils.device import get_device
 from sglang.srt.utils.network import get_free_port, get_zmq_socket_on_host
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,

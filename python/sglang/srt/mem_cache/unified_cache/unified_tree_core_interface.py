@@ -173,16 +173,21 @@ def uses_joint_lru(
     params: CacheInitParams, component_types: Sequence[ComponentType]
 ) -> bool:
     """Whether a tree built from ``params`` with ``component_types`` keeps the
-    joint Full/SWA LRU. The joint_lru policy takes effect only on an enabled
-    Full/SWA tree over the two-ended unified allocator, whose allocation-time
-    eviction walks that order; elsewhere it evicts each component as lru."""
+    joint LRU of its token and window entries. The joint_lru policy takes
+    effect only on an enabled tree with exactly one window slot and no state
+    slot, over the two-ended unified allocator (a token end and a window end),
+    whose allocation-time eviction then walks that order too; elsewhere,
+    several windows included, it evicts each component as lru."""
     from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+    from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 
     allocator = params.token_to_kv_pool_allocator
+    families = [slot.family for slot in params.tree_slots or ()]
     return (
         params.eviction_policy.lower() == JOINT_LRU_EVICTION_POLICY
         and not params.disable
-        and ComponentType.SWA in component_types
+        and families.count(TREE_WINDOW) == 1
+        and TREE_STATE not in families
         # The chain of two token ends: an owner and a window, no state slots.
         and isinstance(allocator, ChainAllocator)
         and allocator.has_window_pool
@@ -513,13 +518,7 @@ class UnifiedTreeCoreInterface(ABC):
     def full_protected_size(self) -> int: ...
 
     @abstractmethod
-    def swa_evictable_size(self) -> int: ...
-
-    @abstractmethod
     def mamba_evictable_size(self) -> int: ...
-
-    @abstractmethod
-    def swa_protected_size(self) -> int: ...
 
     @abstractmethod
     def mamba_protected_size(self) -> int: ...

@@ -14,7 +14,6 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
     ComfyUIModelAdapter,
     PackedForward,
     get_adapter_class,
-    registered_model_types,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
@@ -30,9 +29,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
 def test_registered_comfyui_model_types() -> None:
-    types = registered_model_types()
-    assert "flux" in types
-    assert "lumina2" in types
     assert get_adapter_class("lumina2") is ZImageAdapter
     assert get_adapter_class("flux") is FluxAdapter
     assert get_adapter_class("lumina2").pipeline_class_name == "ZImagePipeline"

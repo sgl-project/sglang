@@ -486,6 +486,11 @@ def linear_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
+def linear_attn_tp_rank() -> int:
+    """This rank's index in ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_rank")
+
+
 def draft_attn_parallel_group() -> str:
     """The group an attention-owning draft uses, resolved in the target scope.
 
@@ -717,6 +722,8 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        # Physical token rows in TP rank order for the current Ascend MoE call.
+        "ascend_allgather_row_sizes": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -1236,9 +1243,7 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
-        from sglang.srt.arg_groups.overrides import (
-            declare_resolution,
-        )
+        from sglang.srt.arg_groups.overrides import declare_resolution
 
         server_args = ServerArgs(model_path="dummy")
         server_args.resolve_once()
@@ -1841,6 +1846,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
     "is_mps": "is_mps",
+    "is_mlu": "is_mlu",
     "is_sail": "is_sail",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
@@ -1848,6 +1854,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_sm110": "is_sm110_supported",
     "is_sm120": "is_sm120_supported",
     "is_blackwell": "is_blackwell_supported",
+    "is_gfx95": "is_gfx95_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
     "has_amx": "cpu_has_amx_support",
     "has_flashinfer": "is_flashinfer_available",
@@ -1863,7 +1870,7 @@ _PLATFORM_VALUES: Dict[str, str] = {
 class PlatformContext:
     """The machine's own facts, with one place to override them.
 
-    Every name maps to a probe in `utils.common`; the probes are
+    Every name maps to a probe in `utils.device`; the probes are
     `lru_cache`-d, so reading through here costs a call and a dict lookup
     (~26 ns) rather than a device query.
     """
@@ -1880,12 +1887,12 @@ class PlatformContext:
             raise AttributeError(
                 f"unknown platform fact {name!r}; known: {', '.join(known)}"
             )
-        overrides = object.__getattribute__(self, "_overrides")
+        overrides = self._overrides
         if name in overrides:
             return overrides[name]
-        from sglang.srt.utils import common as _common
+        from sglang.srt.utils import device as _device
 
-        return getattr(_common, probe)()
+        return getattr(_device, probe)()
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(

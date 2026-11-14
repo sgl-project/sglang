@@ -27,6 +27,11 @@ from sglang.srt.lora.moe.runner import (
 )
 from sglang.srt.lora.utils import Phase, architecture_for_capability
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.moe_lora import (
+    cutedsl_ready,
+    make_token_lora_mapping,
+    standalone_output_allocation,
+)
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # SM100 runs its own plan rows (per-row B and split-K in decode) and base GEMMs.
@@ -42,19 +47,8 @@ def _bind_test_menu(runner, plan, launch_config):
     runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
 
 
-def _cutedsl_ready() -> bool:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
-        return False
-    try:
-        import cuda.bindings.driver  # noqa: F401
-        import cutlass  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
 pytestmark = pytest.mark.skipif(
-    not _cutedsl_ready(), reason="the numerical oracle runs the CuTeDSL providers"
+    not cutedsl_ready(), reason="the numerical oracle runs the CuTeDSL providers"
 )
 
 _EXPERTS = 2
@@ -163,23 +157,6 @@ def _make_cpu_tensors(
     return tensors
 
 
-def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
-    if traffic == "active":
-        return torch.zeros(num_tokens, dtype=torch.int32)
-    if traffic == "mixed":
-        # Batch preparation normalizes every inactive resident assignment
-        # to -1 before any MoE layer consumes the mapping.
-        pattern = torch.tensor([0, -1, -1, 0, -1, -1], dtype=torch.int32)
-        return pattern.repeat((num_tokens + pattern.numel() - 1) // pattern.numel())[
-            :num_tokens
-        ].contiguous()
-    if traffic == "base_only":
-        # Config choice and graph shape stay fixed while every token follows
-        # the base sentinel; one topology serves every batch.
-        return torch.full((num_tokens,), -1, dtype=torch.int32)
-    raise AssertionError(f"unknown traffic pattern {traffic}")
-
-
 def _fp8_blocks(weight: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """[128, 128]-block FP8 checkpoint: (codes, FP32 scales, dequantized FP32)."""
     experts, rows, cols = weight.shape
@@ -276,18 +253,6 @@ def _reference(
     return boundary(output * _ROUTED_SCALING)
 
 
-def _standalone_output_allocation(
-    runner: MoeLoraRunner,
-    *,
-    num_tokens: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """Match eager output geometry without requiring a serving TP group."""
-
-    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
-
-
 @pytest.mark.parametrize(
     ("mode", "num_tokens", "hidden_size", "intermediate_size", "physical_rank"),
     (
@@ -312,9 +277,7 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
     if capability[0] not in (9, 10):  # the table mapper itself never raises
         pytest.skip(f"MoE LoRA does not support SM{capability[0]}{capability[1]}")
 
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
+    monkeypatch.setattr(MoeLoraRunner, "_allocate_output", standalone_output_allocation)
 
     cpu = _make_cpu_tensors(
         num_tokens,
@@ -366,7 +329,7 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
     )
     references: dict[str, torch.Tensor] = {}
     for traffic in ("active", "mixed", "base_only"):
-        cpu_slots = _token_lora_mapping(traffic, num_tokens)
+        cpu_slots = make_token_lora_mapping(traffic, num_tokens)
         references[traffic] = _reference(cpu, cpu_slots, plan=reference_plan)
         batch = MoeLoraBatch(
             gate_up_lora_a=gpu["gate_up_lora_a"],
@@ -391,7 +354,7 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
     assert (references["active"] - references["base_only"]).abs().max().item() > 0.02
 
     token_lora_mapping = batch.token_lora_mapping
-    token_lora_mapping.copy_(_token_lora_mapping("active", num_tokens).to(device))
+    token_lora_mapping.copy_(make_token_lora_mapping("active", num_tokens).to(device))
     batch.use_cuda_graph = True
 
     # The workspace keys scratch by stream: warm up on the capture stream.
@@ -412,7 +375,9 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
     torch.cuda.synchronize(device)
     torch.testing.assert_close(
         output.detach().float().cpu(),
-        _reference(cpu, _token_lora_mapping("active", num_tokens), plan=reference_plan),
+        _reference(
+            cpu, make_token_lora_mapping("active", num_tokens), plan=reference_plan
+        ),
         atol=0.018,
         rtol=0.06,
         msg=f"{choice.name}: active replay",
@@ -425,7 +390,7 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
     torch.testing.assert_close(
         output.detach().float().cpu(),
         _reference(
-            cpu, _token_lora_mapping("base_only", num_tokens), plan=reference_plan
+            cpu, make_token_lora_mapping("base_only", num_tokens), plan=reference_plan
         ),
         atol=0.018,
         rtol=0.06,
@@ -436,13 +401,15 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
     cpu["hidden_states"] = (cpu["hidden_states"].float() * 1.5).to(torch.bfloat16)
     gpu["topk_ids"].copy_(cpu["topk_ids"])
     gpu["hidden_states"].copy_(cpu["hidden_states"])
-    token_lora_mapping.copy_(_token_lora_mapping("mixed", num_tokens).to(device))
+    token_lora_mapping.copy_(make_token_lora_mapping("mixed", num_tokens).to(device))
     graph.replay()
     torch.cuda.synchronize(device)
     assert output.data_ptr() == output_ptr
     torch.testing.assert_close(
         output.detach().float().cpu(),
-        _reference(cpu, _token_lora_mapping("mixed", num_tokens), plan=reference_plan),
+        _reference(
+            cpu, make_token_lora_mapping("mixed", num_tokens), plan=reference_plan
+        ),
         atol=0.018,
         rtol=0.06,
         msg=f"{choice.name}: mutated-routing replay",
@@ -486,9 +453,7 @@ def test_fp8_base_pipeline_matches_reference_under_graph_replay(
     capability = torch.cuda.get_device_capability(device)
     if capability[0] not in (9, 10):
         pytest.skip(f"MoE LoRA does not support SM{capability[0]}{capability[1]}")
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
+    monkeypatch.setattr(MoeLoraRunner, "_allocate_output", standalone_output_allocation)
 
     num_tokens = 6
     cpu = _make_cpu_tensors(num_tokens, experts=_FP8_EXPERTS)

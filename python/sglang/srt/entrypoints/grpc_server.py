@@ -186,8 +186,8 @@ async def serve_grpc(server_args, model_info=None):
     # at fork time.
     if cfg.enable_metrics:
         try:
+            from sglang.srt.entrypoints.server_utils import set_prometheus_multiproc_dir
             from sglang.srt.observability.func_timer import enable_func_timer
-            from sglang.srt.utils import set_prometheus_multiproc_dir
 
             set_prometheus_multiproc_dir()
             enable_func_timer()

@@ -191,61 +191,22 @@ fn cache_actions_to_py(py: Python<'_>, actions: CacheActions) -> PyResult<Py<PyL
 }
 
 /// The python PoolName string for a pool.
-fn pool_name_str(name: PoolName) -> &'static str {
+fn pool_name_str(name: &PoolName) -> &str {
     match name {
         PoolName::Kv => "kv",
         PoolName::Mamba => "mamba",
         PoolName::Swa => "swa",
-        PoolName::AuxiliarySwa => "auxiliary_swa",
-        PoolName::Indexer => "indexer",
-        PoolName::DeepseekV4C4 => "deepseek_v4_c4",
-        PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
-        PoolName::DeepseekV4C4IndexerScale => "deepseek_v4_c4_indexer_scale",
-        PoolName::DeepseekV4C128 => "deepseek_v4_c128",
-        PoolName::DeepseekV4C1 => "deepseek_v4_c1",
-        PoolName::DeepseekV4C1Indexer => "deepseek_v4_c1_indexer",
-        PoolName::DeepseekV4C1IndexerScale => "deepseek_v4_c1_indexer_scale",
-        PoolName::DeepseekV4C2 => "deepseek_v4_c2",
-        PoolName::DeepseekV4C2Indexer => "deepseek_v4_c2_indexer",
-        PoolName::DeepseekV4C2IndexerScale => "deepseek_v4_c2_indexer_scale",
-        PoolName::DeepseekV4C4Rope => "deepseek_v4_c4_rope",
-        PoolName::DeepseekV4C128Rope => "deepseek_v4_c128_rope",
-        PoolName::DeepseekV4C4State => "deepseek_v4_c4_state",
-        PoolName::DeepseekV4C4IndexerState => "deepseek_v4_c4_indexer_state",
-        PoolName::DeepseekV4C128State => "deepseek_v4_c128_state",
-        PoolName::Draft => "draft",
-        PoolName::DraftIndexer => "draft_indexer",
-        PoolName::DraftSwa => "draft_swa",
+        PoolName::Other(name) => name,
     }
 }
 
 /// Map a python PoolName string onto the Rust enum.
-fn parse_pool_name(name: &str) -> PyResult<PoolName> {
+fn parse_pool_name(name: &str) -> PoolName {
     match name {
-        "kv" => Ok(PoolName::Kv),
-        "mamba" => Ok(PoolName::Mamba),
-        "swa" => Ok(PoolName::Swa),
-        "auxiliary_swa" => Ok(PoolName::AuxiliarySwa),
-        "indexer" => Ok(PoolName::Indexer),
-        "deepseek_v4_c4" => Ok(PoolName::DeepseekV4C4),
-        "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
-        "deepseek_v4_c4_indexer_scale" => Ok(PoolName::DeepseekV4C4IndexerScale),
-        "deepseek_v4_c128" => Ok(PoolName::DeepseekV4C128),
-        "deepseek_v4_c1" => Ok(PoolName::DeepseekV4C1),
-        "deepseek_v4_c1_indexer" => Ok(PoolName::DeepseekV4C1Indexer),
-        "deepseek_v4_c1_indexer_scale" => Ok(PoolName::DeepseekV4C1IndexerScale),
-        "deepseek_v4_c2" => Ok(PoolName::DeepseekV4C2),
-        "deepseek_v4_c2_indexer" => Ok(PoolName::DeepseekV4C2Indexer),
-        "deepseek_v4_c2_indexer_scale" => Ok(PoolName::DeepseekV4C2IndexerScale),
-        "deepseek_v4_c4_rope" => Ok(PoolName::DeepseekV4C4Rope),
-        "deepseek_v4_c128_rope" => Ok(PoolName::DeepseekV4C128Rope),
-        "deepseek_v4_c4_state" => Ok(PoolName::DeepseekV4C4State),
-        "deepseek_v4_c4_indexer_state" => Ok(PoolName::DeepseekV4C4IndexerState),
-        "deepseek_v4_c128_state" => Ok(PoolName::DeepseekV4C128State),
-        "draft" => Ok(PoolName::Draft),
-        "draft_indexer" => Ok(PoolName::DraftIndexer),
-        "draft_swa" => Ok(PoolName::DraftSwa),
-        other => Err(PyValueError::new_err(format!("unknown pool name: {other}"))),
+        "kv" => PoolName::Kv,
+        "mamba" => PoolName::Mamba,
+        "swa" => PoolName::Swa,
+        other => PoolName::Other(other.into()),
     }
 }
 
@@ -319,7 +280,7 @@ fn parse_hit_policy(hit_policy: &str) -> PyResult<PoolHitPolicy> {
 /// Convert a pool transfer into its boundary tuple.
 fn transfer_to_py(py: Python<'_>, transfer: PoolTransfer) -> PyResult<Py<PyAny>> {
     (
-        pool_name_str(transfer.name),
+        pool_name_str(&transfer.name),
         transfer.host_indices.map(PyTensor),
         transfer.device_indices.map(PyTensor),
         transfer.nodes_to_load,
@@ -333,7 +294,7 @@ fn transfer_to_py(py: Python<'_>, transfer: PoolTransfer) -> PyResult<Py<PyAny>>
 fn transfer_from_args(args: TransferArgs) -> PyResult<PoolTransfer> {
     let (name, host_indices, device_indices, nodes_to_load, keys, hit_policy) = args;
     Ok(PoolTransfer {
-        name: parse_pool_name(&name)?,
+        name: parse_pool_name(&name),
         host_indices: host_indices.map(|t| t.0),
         device_indices: device_indices.map(|t| t.0),
         keys,
@@ -447,6 +408,7 @@ pub struct TreeCoreInitParamsBinding {
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
     pub mamba_host_only_checkpoint: bool,
+    pub joint_lru: bool,
 }
 
 impl TreeCoreInitParamsBinding {
@@ -471,6 +433,7 @@ impl TreeCoreInitParamsBinding {
             mamba_cache_chunk_size: self.mamba_cache_chunk_size,
             mamba_max_states_per_path: self.mamba_max_states_per_path,
             mamba_host_only_checkpoint: self.mamba_host_only_checkpoint,
+            joint_lru: self.joint_lru,
         })
     }
 }
@@ -478,7 +441,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, joint_lru = false))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -496,6 +459,7 @@ impl TreeCoreInitParamsBinding {
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
         mamba_host_only_checkpoint: bool,
+        joint_lru: bool,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
@@ -514,6 +478,7 @@ impl TreeCoreInitParamsBinding {
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
             mamba_host_only_checkpoint,
+            joint_lru,
         }
     }
 }
@@ -1936,17 +1901,16 @@ macro_rules! tree_core_methods {
                             ..InsertResult::default()
                         },
                     );
-                let pool_storage_result = pool_storage_result
-                    .map(|(kv_hit_pages, extra_pool_hit_pages)| {
-                        Ok::<_, PyErr>(PoolTransferResult {
+                let pool_storage_result =
+                    pool_storage_result.map(|(kv_hit_pages, extra_pool_hit_pages)| {
+                        PoolTransferResult {
                             kv_hit_pages,
                             extra_pool_hit_pages: extra_pool_hit_pages
                                 .into_iter()
-                                .map(|(name, pages)| Ok((parse_pool_name(&name)?, pages)))
-                                .collect::<PyResult<HashMap<_, _>>>()?,
-                        })
-                    })
-                    .transpose()?;
+                                .map(|(name, pages)| (parse_pool_name(&name), pages))
+                                .collect(),
+                        }
+                    });
                 let (cache_actions, mamba_exist) = py
                     .detach(move || {
                         let mut cache_actions = Vec::new();
@@ -4012,8 +3976,59 @@ macro_rules! tree_core_binding {
     };
 }
 
-tree_core_binding! {
-    core = UnifiedTreeCore;
+// Only UnifiedTreeCore has the joint Full/SWA eviction walk.
+impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<UnifiedTreeCore<K>> {
+    fn start_joint_eviction(&self, py: Python<'_>) {
+        py.detach(|| self.core().start_joint_eviction());
+    }
+
+    fn next_joint_eviction_victim(&self, py: Python<'_>) -> Option<(u8, NodeId)> {
+        py.detach(|| self.core().next_joint_eviction_victim())
+            .map(|(ct, node_id)| (ct as u8, node_id))
+    }
+
+    fn end_joint_eviction(&self, py: Python<'_>) {
+        py.detach(|| self.core().end_joint_eviction());
+    }
+}
+
+// Stamps the UnifiedTreeCore pyclasses, each with the joint-eviction forwarders.
+macro_rules! unified_tree_core_bindings {
+    ($($(#[$doc:meta])* $name:ident, $key:ty;)+) => {
+        tree_core_binding! {
+            core = UnifiedTreeCore;
+            $(
+            $(#[$doc])*
+            $name,
+            $key,
+            {
+                fn start_joint_eviction(&self, py: Python<'_>) -> PyResult<()> {
+                    catch_native_panic(|| {
+                        self.inner.start_joint_eviction(py);
+                        Ok(())
+                    })
+                }
+
+                fn next_joint_eviction_victim(
+                    &self,
+                    py: Python<'_>,
+                ) -> PyResult<Option<(u8, NodeId)>> {
+                    catch_native_panic(|| Ok(self.inner.next_joint_eviction_victim(py)))
+                }
+
+                fn end_joint_eviction(&self, py: Python<'_>) -> PyResult<()> {
+                    catch_native_panic(|| {
+                        self.inner.end_joint_eviction(py);
+                        Ok(())
+                    })
+                }
+            };
+            )+
+        }
+    };
+}
+
+unified_tree_core_bindings! {
     /// The UnifiedTreeCore Python adapter over single-token (unigram) child keys.
     RustUnifiedTreeCoreBinding,
     Vec<i64>;

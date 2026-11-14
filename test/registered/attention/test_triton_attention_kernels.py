@@ -978,12 +978,7 @@ class TestTritonAttention(CustomTestCase):
             backend.cuda_graph_uneven_batch = torch.zeros(
                 1, dtype=torch.int32, device=device
             )
-            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (
-                None,
-                None,
-                None,
-                lens,
-            )
+            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (None, lens)
 
             seq_lens = torch.zeros(bs, dtype=torch.int32, device=device)
             kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)

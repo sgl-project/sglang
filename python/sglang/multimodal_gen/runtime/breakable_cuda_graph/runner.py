@@ -31,7 +31,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any, ClassVar
 
 import torch
@@ -221,6 +221,7 @@ class _CaptureEntry:
     static_leaves: list[torch.Tensor]
     output: Any
     num_segments: int
+    offload_keepalive: list[Any] = field(default_factory=list)
 
 
 class _CaptureRejected(RuntimeError):
@@ -496,6 +497,7 @@ class BaseBreakableCudaGraphRunner:
         entry.static_kwargs.clear()
         entry.static_leaves.clear()
         entry.output = None
+        entry.offload_keepalive.clear()
 
     def reset(self, *, disabled_reason: str | None = None) -> None:
         for entry in self.entries.values():
@@ -568,13 +570,20 @@ class BaseBreakableCudaGraphRunner:
         self._capture_stream.synchronize()
         self.device_module.synchronize()
 
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+            capture_layerwise_offload,
+        )
+
         graph = BreakableCUDAGraph()
-        with self._tp_graph_capture():
-            with enable_breakable_cuda_graph():
-                with BreakableCUDAGraphCapture(
-                    cuda_graph=graph, pool=self._pool, stream=self._capture_stream
-                ):
-                    output = self.transformer(**static_kwargs)
+        with capture_layerwise_offload(
+            self.transformer, self._capture_stream
+        ) as offload_keepalive:
+            with self._tp_graph_capture():
+                with enable_breakable_cuda_graph():
+                    with BreakableCUDAGraphCapture(
+                        cuda_graph=graph, pool=self._pool, stream=self._capture_stream
+                    ):
+                        output = self.transformer(**static_kwargs)
         self.device_module.synchronize()
 
         logger.info(
@@ -590,6 +599,7 @@ class BaseBreakableCudaGraphRunner:
             static_leaves=static_leaves,
             output=output,
             num_segments=len(graph._segments),
+            offload_keepalive=offload_keepalive,
         )
         limit_reason = self._capture_limit_reason(entry)
         if limit_reason is not None:

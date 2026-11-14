@@ -62,6 +62,9 @@ def _make_grounding_image() -> str:
 
 class TestLlavaServer(ImageOpenAITestMixin):
     model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
+    # llava's CPU preprocessing times out after REQUEST_TIMEOUT (default 10 s);
+    # the server's startup warmup image overruns that on some 1-gpu-large CI runners.
+    extra_env = {"REQUEST_TIMEOUT": "60"}
 
 
 class TestLfm2VlServer(ImageOpenAITestMixin):

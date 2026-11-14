@@ -17,6 +17,7 @@ import platform
 import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
@@ -126,7 +127,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         )
         _use_real_launch_hook(scheduler)
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.ingest_requests.side_effect = recv_side_effect
@@ -277,7 +278,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         scheduler = MagicMock()
         scheduler.forward_ct = 0
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         recv_requests = MagicMock(side_effect=recv_side_effect)
@@ -324,7 +325,8 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         # event_loop_normal/event_loop_overlap, or shutdown during a pause
         # spins forever.
         scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
-        scheduler._engine_paused = True
+        scheduler.pause_state = PauseState()
+        scheduler.pause_state.pause()
 
         with patch(
             "sglang.srt.hardware_backend.mlx.scheduler_mixin.mx.synchronize"
@@ -360,12 +362,14 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         scheduler.forward_ct = 0
         scheduler._sched_idled = False
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler.enable_overlap = False
         scheduler.enable_overlap_mlx = True
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.chunked_req = None
         scheduler.decode_offload_manager = None
+        scheduler.hisparse_coordinator = None
+        scheduler.dllm_config = None
         scheduler.last_batch = None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
@@ -381,6 +385,9 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         scheduler.pause_generation.side_effect = Scheduler.pause_generation.__get__(
             scheduler
         )
+        scheduler._retract_batches.side_effect = Scheduler._retract_batches.__get__(
+            scheduler
+        )
 
         req = MagicMock()
         req.rid = "r1"
@@ -390,6 +397,9 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         batch.return_logprob = False
         batch.forward_mode.is_extend.return_value = False
         batch.copy.side_effect = lambda: MagicMock(reqs=list(batch.reqs))
+        batch.filter_batch.side_effect = lambda keep_indices: setattr(
+            batch, "reqs", [batch.reqs[i] for i in keep_indices]
+        )
         scheduler.running_batch = batch
 
         def get_next_batch_to_run(running_batch, last_batch):
@@ -440,6 +450,10 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         with (
             patch("sglang.srt.managers.scheduler.retract_all", fake_retract_all),
             patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=MagicMock(pp_size=1),
+            ),
+            patch(
                 "sglang.srt.hardware_backend.mlx.scheduler_mixin.resolve_forward_inputs"
             ),
             self.assertRaises(_StopLoop),
@@ -453,7 +467,7 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
 
     @staticmethod
     def _resume(scheduler):
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
 
     def test_retract_pause_processes_inflight_job_before_retract(self):
         # Iteration 1 launches a decode job.  Iteration 2 pauses with retract

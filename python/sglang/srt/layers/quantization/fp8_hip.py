@@ -1,8 +1,8 @@
 """gfx950 dense routes of Fp8LinearMethod for 32x32-block fp8 checkpoints served as
 MXFP8 (block_fp8_as_mxfp8): the Triton dot_scaled kernel, the native scaled-MFMA
-kernels on a lane-ordered weight, or aiter's MXFP8 GEMM on the plain one. With
-SGLANG_OPT_HIP_FLYDSL_MXFP8 the aiter route hands its large-M (prefill) calls to the FlyDSL
-kernel of mxfp8_flydsl_gfx95 on the same weight. The fused gfx950 producers hand these
+kernels on a lane-ordered weight, or aiter's MXFP8 GEMM on the plain one. The aiter route
+hands its large-M (prefill) calls to the FlyDSL kernel of mxfp8_flydsl_gfx95 on the same
+weight when FlyDSL is installed. The fused gfx950 producers hand these
 routes their operand as an Fp8GridActivation (bf16 already on the fp8 grid) or an
 Mxfp8Activation."""
 
@@ -27,7 +27,6 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     dequant_mxfp8_to_bf16,
     mxfp8_operand,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.utils import copy_or_rebind_param
 
 logger = logging.getLogger(__name__)
@@ -158,20 +157,19 @@ def _flydsl_mxfp8_module():
     try:
         from sglang.kernels.ops.gemm import mxfp8_flydsl_gfx95
     except ImportError as e:
-        logger.warning("SGLANG_OPT_HIP_FLYDSL_MXFP8 ignored, FlyDSL unavailable: %s", e)
+        logger.info("FlyDSL unavailable, MXFP8 prefill GEMMs stay on aiter: %s", e)
         return None
     return mxfp8_flydsl_gfx95
 
 
 def _prepare_flydsl_mxfp8(layer: torch.nn.Module) -> None:
     """
-    Weight scales in mxfp8_flydsl_gfx95's layout when SGLANG_OPT_HIP_FLYDSL_MXFP8 is set
-    and the kernel takes this weight; weight_scale_mx_flydsl stays None otherwise.
+    Weight scales in mxfp8_flydsl_gfx95's layout when the kernel takes this weight;
+    weight_scale_mx_flydsl stays None otherwise.
     """
     n, k = layer.weight.shape
     if (
-        not envs.SGLANG_OPT_HIP_FLYDSL_MXFP8.get()
-        or k % 128
+        k % 128
         or n % 8
         or not layer.weight.is_contiguous()
         or _flydsl_mxfp8_module() is None

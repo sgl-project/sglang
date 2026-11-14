@@ -31,11 +31,12 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
 )
 from sglang.srt.utils import BumpAllocator
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 HIDDEN, HEADS, KV_LORA, NOPE, ROPE, VDIM, THETA, EPS = 16, 2, 8, 8, 8, 6, 1e4, 1e-6
 Q_LORA = 16
@@ -284,9 +285,7 @@ class TestDFlashMLA(CustomTestCase):
                 post_load_weights(model)
                 assert_absorbed(attn)
 
-    def test_sliding_layers_require_triton(self):
-        """Only triton applies an MLA layer's sliding window; the other MLA
-        backends would silently attend over the full context."""
+    def test_sliding_layers_require_a_window_backend(self):
         config = Qwen3Config(
             **_export_fields(),
             layer_types=["sliding_attention"],
@@ -297,9 +296,33 @@ class TestDFlashMLA(CustomTestCase):
         with patch(resolve, return_value="flashinfer"):
             with self.assertRaisesRegex(ValueError, "require .* triton"):
                 DFlashMLAAttention(config, layer_id=0)
-        with patch(resolve, return_value="triton"):
-            attn = DFlashMLAAttention(config, layer_id=0)
-        self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
+        for backend in ("triton", "trtllm_mla", "cutedsl_mla"):
+            with self.subTest(backend=backend), patch(resolve, return_value=backend):
+                attn = DFlashMLAAttention(config, layer_id=0)
+                self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
+        # DSPARK's worker runs cutedsl_mla / trtllm_mla drafts on flashinfer.
+        with (
+            patch(
+                resolve,
+                side_effect=lambda algo_label=None: (
+                    "cutedsl_mla" if algo_label == "DFLASH" else "flashinfer"
+                ),
+            ),
+            patch(
+                "sglang.srt.models.dflash.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "require .* triton"):
+                DFlashMLAAttention(config, layer_id=0)
+        config.is_causal = False
+        with patch(resolve, return_value="cutedsl_mla"):
+            with self.assertRaisesRegex(ValueError, "causally"):
+                DFlashMLAAttention(config, layer_id=0)
+        config.layer_types = ["full_attention"]
+        with patch(resolve, return_value="trtllm_mla"):
+            with self.assertRaisesRegex(ValueError, "causally"):
+                DFlashMLAAttention(config, layer_id=0)
 
     def test_matches_specforge_reference(self):
         """Context-KV materialization and the block forward reproduce SpecForge's

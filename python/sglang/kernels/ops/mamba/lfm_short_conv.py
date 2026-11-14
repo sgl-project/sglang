@@ -7,15 +7,11 @@ materialization points while operating directly on the three projection views.
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
-
-_DISABLE_LFM_FUSED_CONV = os.getenv("SGLANG_DISABLE_LFM_FUSED_CONV", "0") == "1"
 
 
 @triton.jit
@@ -239,8 +235,7 @@ def can_use_fused_lfm_short_conv(
 ) -> bool:
     """Return whether the exact LFM2 BF16 width-3 contract is satisfied."""
     return (
-        not _DISABLE_LFM_FUSED_CONV
-        and b.is_cuda
+        b.is_cuda
         and torch.version.hip is None
         and current_arch().is_sm(9, 0)
         and c.is_cuda

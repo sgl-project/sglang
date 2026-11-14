@@ -19,15 +19,13 @@ import ctypes
 import logging
 import os
 import subprocess
-import tempfile
 
 import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.hipcc import (
     HipKernel,
-    check_hip,
-    hip_lib,
+    build_gfx950_module,
     hip_version,
     hipcc_path,
 )
@@ -46,7 +44,6 @@ MAX_TOK_DISPATCH_FP8 = {256: 20, 128: 48}  # crossover vs aiter's per_128x128 as
 _kernels: dict = {}
 _available = None
 _disabled_reason = None
-_build_dir = None
 _ws: dict = {}
 logger = logging.getLogger(__name__)
 
@@ -128,38 +125,15 @@ def _disable(reason):
 def _get_kernels(inter: int, pre: str):
     kk = _kernels.get((pre, inter))
     if kk is None:
-        global _build_dir
-        if _build_dir is None:
-            _build_dir = tempfile.mkdtemp(prefix="sglang_smallm_moe_")
-            co = os.path.join(_build_dir, "smallm_moe.co")
+        if "_mod" not in _kernels:
             try:
-                subprocess.run(
-                    [
-                        hipcc_path(),
-                        "--genco",
-                        "--offload-arch=gfx950",
-                        "-O3",
-                        "-o",
-                        co,
-                        _SRC,
-                    ],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
+                _kernels["_mod"] = build_gfx950_module(_SRC, "sglang_smallm_moe_")
             except (OSError, subprocess.CalledProcessError) as e:
                 detail = getattr(e, "stderr", None) or str(e)
                 _disable(f"hipcc failed: {detail.strip()[-400:]}")
-            mod = ctypes.c_void_p()
-            try:
-                check_hip(
-                    hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()),
-                    "hipModuleLoad",
-                )
             except RuntimeError as e:
                 _disable(str(e))
-            _kernels["_mod"] = mod
-            logger.info("smallm_moe: gfx950 small-M MoE kernels active (built %s)", co)
+            logger.info("smallm_moe: gfx950 small-M MoE kernels active")
         mod = _kernels["_mod"]
         try:
             kk = {

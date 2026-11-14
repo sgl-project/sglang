@@ -26,17 +26,18 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import math
 from typing import Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from sglang.kernels.ops.lora.moe.cutedsl.kernel_sm90_bf16 import (
+    GroupedGemmKernelSm90Bf16,
+)
 from sglang.kernels.ops.lora.moe.cutedsl.scheduler import (
     MoESchedulerParams,
     create_moe_tile_scheduler,
@@ -44,7 +45,7 @@ from sglang.kernels.ops.lora.moe.cutedsl.scheduler import (
 )
 
 
-class GroupedGemmKernelSm90Fp8:
+class GroupedGemmKernelSm90Fp8(GroupedGemmKernelSm90Bf16):
     """Hopper FP8 GEMM with software FP32 scale promotion per 128-K tile.
 
     swap_ab puts weights on M, giving one weight scale per tile and one
@@ -65,114 +66,22 @@ class GroupedGemmKernelSm90Fp8:
         contiguous_segments: bool = False,
         single_k_pipeline: bool = False,
     ):
-        if use_2cta_instrs:
-            raise ValueError("2-CTA MMA is a tcgen05 feature; SM90 has none")
         if not swap_ab:
             raise ValueError("the FP8 grouped GEMM implements swap_ab only")
         if mma_inst_tile_k != 4:
             # 4 x k32 FP8 WGMMA steps = one 128-element scale group per tile.
             raise ValueError("FP8 promotion pins mma_inst_tile_k to 4")
-        self.acc_dtype = acc_dtype
+        super().__init__(
+            acc_dtype,
+            use_2cta_instrs,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            mma_inst_tile_k=mma_inst_tile_k,
+            persistent_clusters=persistent_clusters,
+            swap_ab=swap_ab,
+            contiguous_segments=contiguous_segments,
+        )
         self.single_k_pipeline = single_k_pipeline
-        self.cluster_shape_mn = cluster_shape_mn
-        self.mma_inst_tile_k = mma_inst_tile_k
-        self.persistent_clusters = persistent_clusters
-        self.swap_ab = swap_ab
-        self.contiguous_segments = contiguous_segments
-        if contiguous_segments and cluster_shape_mn != (1, 1):
-            raise ValueError("contiguous_segments requires a (1, 1) cluster")
-
-        # The K extent here is a placeholder. _setup_attributes computes it.
-        self.tile_shape_mnk = (*mma_tiler_mn, 1)
-        # Upstream uses a second math warp group only for large tiles.
-        self.atom_layout_mnk = (
-            (2, 1, 1)
-            if self.tile_shape_mnk[0] > 64 and self.tile_shape_mnk[1] > 128
-            else (1, 1, 1)
-        )
-
-        self.occupancy = 1
-        self.num_dma_warp_groups = 1
-        self.num_mma_warp_groups = math.prod(self.atom_layout_mnk)
-        self.num_threads_per_warp_group = 128
-        self.threads_per_cta = (
-            self.num_dma_warp_groups + self.num_mma_warp_groups
-        ) * self.num_threads_per_warp_group
-        self.load_warp_id = 0
-        self.epi_store_warp_id = self.num_dma_warp_groups * 4
-        self.load_register_requirement = 40
-        self.mma_register_requirement = 232
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
-        self.num_mma_threads = (
-            self.num_mma_warp_groups * self.num_threads_per_warp_group
-        )
-        self.epilog_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=1, num_threads=self.num_mma_threads
-        )
-        self.buffer_align_bytes = 1024
-
-        self.tiled_mma = None
-        self.ab_stage = None
-        self.epi_stage = None
-        self.a_smem_layout_staged = None
-        self.b_smem_layout_staged = None
-        self.epi_smem_layout_staged = None
-        self.epi_tile = None
-        self.shared_storage = None
-
-    def _setup_attributes(self):
-        self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
-            self.a_dtype,
-            self.b_dtype,
-            self.a_layout.sm90_mma_major_mode(),
-            self.b_layout.sm90_mma_major_mode(),
-            self.acc_dtype,
-            self.atom_layout_mnk,
-            tiler_mn=(64, self.tile_shape_mnk[1]),
-        )
-        mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
-        self.tile_shape_mnk = (
-            self.tile_shape_mnk[0],
-            self.tile_shape_mnk[1],
-            mma_inst_shape_k * self.mma_inst_tile_k,
-        )
-
-        self.cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))
-        self.num_mcast_ctas_a = self.cluster_shape_mn[1]
-        self.num_mcast_ctas_b = self.cluster_shape_mn[0]
-        self.is_a_mcast = self.num_mcast_ctas_a > 1
-        self.is_b_mcast = self.num_mcast_ctas_b > 1
-
-        is_cooperative = self.atom_layout_mnk == (2, 1, 1)
-        self.epi_tile = (
-            min(128 if is_cooperative else 64, self.tile_shape_mnk[0]),
-            min(32, self.tile_shape_mnk[1]),
-        )
-        self.ab_stage, self.epi_stage = self._compute_stages(
-            self.tile_shape_mnk,
-            self.a_dtype,
-            self.b_dtype,
-            self.epi_tile,
-            self.c_dtype,
-            self.smem_capacity,
-            self.occupancy,
-        )
-        (
-            self.a_smem_layout_staged,
-            self.b_smem_layout_staged,
-            self.epi_smem_layout_staged,
-        ) = self._make_smem_layouts(
-            self.tile_shape_mnk,
-            self.epi_tile,
-            self.a_dtype,
-            self.a_layout,
-            self.b_dtype,
-            self.b_layout,
-            self.ab_stage,
-            self.c_dtype,
-            self.c_layout,
-            self.epi_stage,
-        )
 
     @cute.jit
     def __call__(
@@ -895,150 +804,8 @@ class GroupedGemmKernelSm90Fp8:
 
             tma_store_pipeline.producer_tail()
 
-    # The host helpers below come from the upstream Hopper persistent example.
-
-    @staticmethod
-    def _compute_stages(
-        tile_shape_mnk,
-        a_dtype,
-        b_dtype,
-        epi_tile,
-        c_dtype,
-        smem_capacity,
-        occupancy,
-    ):
-        a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
-        b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
-        ab_bytes_per_stage = (
-            cute.size(a_shape) * a_dtype.width // 8
-            + cute.size(b_shape) * b_dtype.width // 8
-        )
-        c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
-        epi_stage = 4
-        epi_bytes = c_bytes_per_stage * epi_stage
-        mbar_helpers_bytes = 1024
-        ab_stage = (
-            smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes)
-        ) // ab_bytes_per_stage
-        return ab_stage, epi_stage
-
-    @staticmethod
-    def _make_smem_layouts(
-        tile_shape_mnk,
-        epi_tile,
-        a_dtype,
-        a_layout,
-        b_dtype,
-        b_layout,
-        ab_stage,
-        c_dtype,
-        c_layout,
-        epi_stage,
-    ):
-        a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
-        a_is_k_major = (
-            a_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
-        )
-        b_is_k_major = (
-            b_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
-        )
-        a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
-        a_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(a_layout, a_dtype, a_major_mode_size),
-            a_dtype,
-        )
-        a_smem_layout_staged = cute.tile_to_shape(
-            a_smem_layout_atom,
-            cute.append(a_smem_shape, ab_stage),
-            order=(0, 1, 2) if a_is_k_major else (1, 0, 2),
-        )
-
-        b_smem_shape = cute.slice_(tile_shape_mnk, (0, None, None))
-        b_major_mode_size = tile_shape_mnk[2 if b_is_k_major else 1]
-        b_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(b_layout, b_dtype, b_major_mode_size),
-            b_dtype,
-        )
-        b_smem_layout_staged = cute.tile_to_shape(
-            b_smem_layout_atom,
-            cute.append(b_smem_shape, ab_stage),
-            order=(0, 1, 2) if b_is_k_major else (1, 0, 2),
-        )
-
-        c_smem_shape = epi_tile
-        c_major_mode_size = epi_tile[1] if c_layout.is_n_major_c() else epi_tile[0]
-        c_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(c_layout, c_dtype, c_major_mode_size),
-            c_dtype,
-        )
-        epi_smem_layout_staged = cute.tile_to_shape(
-            c_smem_layout_atom,
-            cute.append(c_smem_shape, epi_stage),
-            order=(1, 0, 2) if c_layout.is_m_major_c() else (0, 1, 2),
-        )
-        return a_smem_layout_staged, b_smem_layout_staged, epi_smem_layout_staged
-
-    @staticmethod
-    def _make_tma_store_atoms_and_tensors(tensor_c, epi_smem_layout_staged, epi_tile):
-        epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
-        return cute.nvgpu.cpasync.make_tiled_tma_atom(
-            cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
-            tensor_c,
-            epi_smem_layout,
-            epi_tile,
-        )
-
-    @staticmethod
-    def _make_tma_atoms_and_tensors(tensor, smem_layout_staged, smem_tile, mcast_dim):
-        op = (
-            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
-            if mcast_dim == 1
-            else cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp()
-        )
-        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
-        return cute.nvgpu.cpasync.make_tiled_tma_atom(
-            op, tensor, smem_layout, smem_tile, num_multicast=mcast_dim
-        )
-
     def check_supported_dtypes(self, a_dtype, b_dtype, c_dtype):
         if a_dtype is not cutlass.Float8E4M3FN or b_dtype is not cutlass.Float8E4M3FN:
             raise TypeError(f"the FP8 grouped GEMM takes e4m3 A/B; got {a_dtype}")
         if c_dtype is not cutlass.BFloat16:
             raise TypeError(f"C must be BF16; got {c_dtype}")
-
-    def check_mma_tiler_and_cluster_shape(self):
-        if self.tile_shape_mnk[0] not in (64, 128):
-            raise ValueError("SM90 CTA tile M must be 64/128")
-        if self.tile_shape_mnk[1] not in (8, 16, 32, 64, 128, 256):
-            raise ValueError(
-                "this port validates CTA tile N in {8, 16, 32, 64, 128, "
-                "256}; WGMMA itself accepts 8..256 step 8 -- extend the "
-                "validated set before requesting other widths"
-            )
-        if math.prod(self.cluster_shape_mn) > 4:
-            raise ValueError("SM90 cluster size must be <= 4")
-        for extent in self.cluster_shape_mn:
-            if extent <= 0 or extent & (extent - 1):
-                raise ValueError(
-                    "cluster extents must be positive powers of two; got "
-                    f"{self.cluster_shape_mn}"
-                )
-
-    def check_tensor_alignment(self, problem_shape, a_major, b_major, c_major):
-        if a_major != "k" or b_major != "k":
-            raise ValueError("SM90 port requires K-major A and B")
-        m, n, k, _length = problem_shape
-        for extent, name in ((m, "M"), (n, "N"), (k, "K")):
-            if extent % 8:
-                raise ValueError(f"{name}={extent} breaks 16-byte TMA alignment")
-
-    def can_implement(
-        self, problem_shape, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
-    ) -> bool:
-        try:
-            self.check_supported_dtypes(a_dtype, b_dtype, c_dtype)
-            self.check_mma_tiler_and_cluster_shape()
-            self.check_tensor_alignment(problem_shape, a_major, b_major, c_major)
-        except (TypeError, ValueError):
-            return False
-        return True

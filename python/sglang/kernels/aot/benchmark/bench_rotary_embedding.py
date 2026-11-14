@@ -11,10 +11,10 @@ from sgl_kernel.testing.rotary_embedding import (
     create_inputs,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.bench_utils import bench_kineto
-from sglang.utils import is_in_ci
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 # CI environment uses simplified parameters
 if IS_CI:

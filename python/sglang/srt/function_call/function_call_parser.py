@@ -22,6 +22,7 @@ from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.dots_detector import DotsToolDetector
+from sglang.srt.function_call.ernie55_detector import Ernie5_5Detector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
@@ -32,6 +33,7 @@ from sglang.srt.function_call.glm4_moe_detector import (
 )
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.granite_toolcall_detector import GraniteToolCallDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
@@ -85,11 +87,13 @@ class FunctionCallParser:
         "deepseekv4": DeepSeekV4Detector,
         "deepseekv41": DeepSeekV41Detector,
         "dots": DotsToolDetector,
+        "ernie55": Ernie5_5Detector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
         "flint": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
+        "granite_toolcall_parser": GraniteToolCallDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,

@@ -43,6 +43,7 @@ def test_sidecar_restores_cache_and_request_slots(active_request, sidecar_first)
     controller.device = "cpu"
     controller.is_kv_sharded = False
     controller.mem_pool_device_allocator = SimpleNamespace()
+    controller.kv_storage = None
     controller.load_queue = []
     controller.mem_pool_host = SimpleNamespace(
         anchor_entry=SimpleNamespace(

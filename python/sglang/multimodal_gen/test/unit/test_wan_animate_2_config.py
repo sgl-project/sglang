@@ -36,10 +36,6 @@ from sglang.multimodal_gen.configs.sample.wan import (
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
@@ -110,9 +106,6 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_VIDEO_STEPS,
     build_warmup_reqs,
     lighten_warmup_req,
-)
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
 )
 
 # Wan_Animate_2_14B_Config
@@ -386,11 +379,11 @@ class _RotatedQuantConfig:
         return UnquantizedLinearMethod()
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_block_refuses_a_checkpoint_with_offline_qk_rotation(monkeypatch):
     # The parent block registers q_rot / k_rot and applies them in its own attention
     # path; forward_ref / forward_gen never do, so loading would be silently wrong.
     monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", "true")
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"), pytest.raises(ValueError, match="offline Q/K rotation"):
         WanAnimate2TransformerBlock(
             64,
@@ -487,6 +480,7 @@ def _checkpoint_keys() -> list[str]:
     return keys
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_every_checkpoint_key_maps_onto_a_distinct_dit_parameter():
     """The DiT loads with the shared Wan rules plus the Wan-Animate-2 extras; a rule that
     stops matching leaves a tensor unmapped (skipped with a warning) or lands two tensors on
@@ -499,18 +493,9 @@ def test_every_checkpoint_key_maps_onto_a_distinct_dit_parameter():
     assert unmapped == []
     assert len(set(mapped.values())) == len(keys)
 
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         model = WanAnimate2Transformer3DModel(WanAnimate2Config(), hf_config={})
     assert set(mapped.values()) == set(model.state_dict())
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    # The DiT's parallel linear layers need the TP group even on a meta device.
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def test_official_checkpoint_config_names_update_the_arch_config():

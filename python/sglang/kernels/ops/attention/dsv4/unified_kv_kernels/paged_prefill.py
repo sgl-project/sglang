@@ -49,7 +49,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils.common import is_gfx95_supported, is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx95_supported, is_gfx1250_supported
 
 # OPUS gfx950 paged-prefill kernel is preferred when importable; otherwise fall
 # back to the Triton implementation below.

@@ -94,6 +94,8 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     prepare_for_draft,
     prepare_for_draft_extend,
@@ -118,8 +120,8 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import (
-    fast_topk,
+from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.device import (
     get_available_gpu_memory,
     is_cpu,
     is_cuda,
@@ -127,8 +129,8 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
     is_xpu,
-    log_info_on_rank0,
 )
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -835,13 +837,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     break
 
                 forward_batch.input_ids = input_ids
-                # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
-                # argument must be contiguous.
-                if (
-                    self.draft_runner.model_config.hf_config.architectures[0]
-                    == "Qwen3MoeForCausalLMMTP"
-                ):
-                    out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
 
@@ -1323,6 +1318,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # harnesses construct workers without __init__.
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
     _simulated_acc_len_rng: Optional[torch.Generator] = None
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
 
     @property
     def draft_parallel_layout(self):
@@ -1415,6 +1411,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         super().init_attention_backends()
+        # Resolve once before any eager or captured post-verify path runs.
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=self.topk == 1
+        )
         # not in __init__, which the standalone and frozen-KV workers do not run
         if (
             self._draft_worker is not None
@@ -1439,36 +1439,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self._post_verify_graphs = EaglePostVerifyGraphs(
             target_worker=self.target_worker,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
-            with (
-                draft_tp_context(self._draft_worker.parallel_layout),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
-                self.adaptive_controller.register(
-                    SpecRuntimeState(
-                        speculative_num_steps=self.speculative_num_steps,
-                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self._draft_worker.draft_attn_backend,
-                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
-                        target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
-                        draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
-                    )
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    draft_attn_backend=self._draft_worker.draft_attn_backend,
+                    cuda_graph_runner=self._draft_worker.cuda_graph_runner,
+                    target_attn_backend=self._target_worker.model_runner.attn_backend,
+                    target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
+                    draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
+                    cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                 )
-                self.adaptive_controller.init_states(
-                    cuda_graph_bs=(
-                        None
-                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
-                    ),
-                )
+            )
+            self.adaptive_controller.init_states(
+                cuda_graph_bs=(
+                    None
+                    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                    else get_exec().graph.cuda_graph_bs_decode
+                ),
+            )
 
     def forward_batch_generation(
         self,
@@ -1852,8 +1848,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
         ):
-            self._draft_worker.init_attention_backend()
-            self._draft_worker._capture_cuda_graphs()
+            # Draft overrides must end before target resources are constructed.
+            with (
+                draft_tp_context(self._draft_worker.parallel_layout),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                self._draft_worker.init_attention_backend()
+                self._draft_worker._capture_cuda_graphs()
 
             # Build target attention backend and CUDA graph runner
             target_model_runner = self._target_worker.model_runner
@@ -2043,6 +2045,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         max_top_k = compact_verify_max_top_k(batch)
         return run_eagle_verify(
             batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             pp_proxy_tensors=pp_proxy_tensors,
             target_worker=self.target_worker,
             req_to_token_pool=self.req_to_token_pool,

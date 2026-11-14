@@ -5,7 +5,16 @@ from __future__ import annotations
 
 import enum
 import importlib
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 import msgspec
 import torch
@@ -81,7 +90,7 @@ class Numerics(msgspec.Struct, frozen=True):
 
 
 class BuildContext(msgspec.Struct, frozen=True):
-    widths: tuple[int, ...]  # step rows to build, ascending
+    widths: tuple[int, ...]  # decode step rows to build, ascending
     tokens_per_request: int
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
@@ -89,9 +98,15 @@ class BuildContext(msgspec.Struct, frozen=True):
 
 
 class Step(msgspec.Struct, frozen=True):
-    """A covered step, decided from host state alike on every rank."""
+    """A covered step, decided from host state alike on every rank.
 
-    mode: str  # "decode", "target_verify" or "prefill"
+    mode is one of:
+      "decode"        – autoregressive single-token decode; runs in a CUDA graph.
+      "target_verify" – speculative-decoding target verify; runs in a CUDA graph.
+      "prefill"       – context prefill; runs eagerly (never captured in a graph).
+    """
+
+    mode: str
     rows: int
     # the running forward's ForwardView, set by SGLang before forward runs the step
     view: Any = None
@@ -417,11 +432,13 @@ class BuiltMegakernel(Protocol):
         self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
     ) -> Optional[Step]:
         """The step to run, or None for the model's own forward; host-only, so a
-        captured graph replays the decision made at capture."""
+        captured graph replays the decision made at capture.  A "prefill" step
+        is always eager and is never replayed from a captured graph."""
 
     def forward(self, step: Step, original: Callable, *args: Any, **kwargs: Any) -> Any:
         """Run step in place of original (the model's bound forward), taking and
-        returning what it does; capturable in a CUDA graph."""
+        returning what it does; capturable in a CUDA graph for decode and
+        target_verify steps (prefill runs eagerly)."""
 
 
 # The optional entries of a built megakernel, beyond draft_sampler the EAGLE ones
@@ -434,6 +451,103 @@ ENTRIES = (
 # The graph runners a built object's graph_variants may key: the target's verify
 # graphs, the EAGLE draft graphs and the EAGLE draft-extend graphs
 GRAPH_VARIANT_RUNNERS = ("target_verify", "draft_loop", "draft_extend")
+
+
+@runtime_checkable
+class SupportsDraftAux(Protocol):
+    """A DFlash draft spec that writes the target's context into the draft KV cache.
+
+    draft_aux issues collectives: every TP rank calls it in program order.
+    """
+
+    draft_aux_rows: tuple[int, ...]
+
+    def draft_aux(self, **kwargs: Any) -> None: ...
+
+
+@runtime_checkable
+class SupportsDraftSelectorHead(Protocol):
+    """A DFlash selector draft spec whose forward also proposes the draft block.
+
+    attach_draft_head runs once on every TP rank, before any draft forward or capture.
+    """
+
+    draft_head_requests: tuple[int, ...]
+    draft_head_sampling: bool
+
+    def attach_draft_head(self, **kwargs: Any) -> tuple: ...
+
+    def stage_draft_head_sampling(self, **kwargs: Any) -> None: ...
+
+
+@runtime_checkable
+class SupportsDraftEmbed(Protocol):
+    """A DFlash draft spec that embeds the draft block from its token ids itself.
+
+    attach_draft_embed runs once on every TP rank, before any draft forward or capture.
+    """
+
+    draft_embed_requests: tuple[int, ...]
+
+    def attach_draft_embed(self, **kwargs: Any) -> None: ...
+
+
+@runtime_checkable
+class SupportsKdaCommit(Protocol):
+    """A target spec that commits the KDA state after a chain verify in one launch.
+
+    kda_commit returns False, launching nothing, when off; SGLang then commits itself.
+    """
+
+    def kda_commit(self, **kwargs: Any) -> bool: ...
+
+
+@runtime_checkable
+class SupportsDraftAccept(Protocol):
+    """A DFlash draft spec that runs the greedy verify accept itself.
+
+    draft_accept issues a collective: every TP rank calls it in program order.
+    """
+
+    draft_accept_requests: tuple[int, ...]
+
+    def attach_draft_accept(self, **kwargs: Any) -> None: ...
+
+    def draft_accept(self, **kwargs: Any) -> None: ...
+
+
+@runtime_checkable
+class SupportsRank0Broadcast(Protocol):
+    """A target spec that broadcasts rank 0's DFLASH sampled-accept result on device.
+
+    rank0_broadcast overwrites its args in place, or returns False when off; it is a
+    collective, so every rank calls it in the same order.
+    """
+
+    def rank0_broadcast(self, accept_len: Any, bonus: Any) -> bool: ...
+
+
+@runtime_checkable
+class SupportsSampledAccept(Protocol):
+    """A target spec that runs the DFLASH sampled accept on vocab-sharded verify logits.
+
+    sampled_accept returns rank 0's decision on every rank; these are collectives, so
+    every rank calls them in the same order.
+    """
+
+    def prepare_sampled_accept(
+        self,
+        *,
+        vocab_size: int,
+        softcap: Any,
+        shard_width: int,
+        seed: int,
+        topk: int = 16,
+    ) -> bool: ...
+
+    def sampled_accept_fits(self, requests: int, logits: Any = None) -> bool: ...
+
+    def sampled_accept(self, **kwargs: Any) -> Any: ...
 
 
 class MegakernelSpec(msgspec.Struct, frozen=True):
@@ -460,6 +574,10 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     model_disable_reasons: Optional[Callable[[torch.nn.Module, Any], list[str]]] = None
     # (cfg, hf_config), before load: the checks requires cannot state
     config_disable_reasons: Optional[Callable[[Any, Any], list[str]]] = None
+    # Optional tensor entry: (weights view, deadline seconds), for a multi-token verify
+    tensor_verify_binding_kind: int = 0
+    tensor_verify_build: Optional[Callable[[Any, float], BuiltMegakernel]] = None
+    # Pool preparation after allocation and before any forward or graph capture.
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
 
 

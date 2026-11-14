@@ -358,6 +358,23 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         pen.apply(logits)
         self.assertTrue(torch.isneginf(logits[0, 6]))
 
+    def test_ignores_stop_ids_outside_vocab(self):
+        """Stop ids outside the vocab never match and must not break the batch."""
+        _, pen = self._setup(
+            [
+                (3, {-1, 0, 5, VOCAB_SIZE - 1, VOCAB_SIZE, VOCAB_SIZE + 7, 2**63}, 2),
+                # No min_new_tokens of its own; shares the batch with one that has it.
+                (0, {VOCAB_SIZE + 1}, 2),
+            ]
+        )
+        logits = torch.zeros(2, VOCAB_SIZE)
+        pen.apply(logits)
+        blocked = torch.isneginf(logits)
+        self.assertEqual(
+            blocked[0].nonzero().flatten().tolist(), [0, 2, 5, VOCAB_SIZE - 1]
+        )
+        self.assertFalse(blocked[1].any())
+
     def test_filter_keeps_subset(self):
         """Test that filter keeps the second request (min_tokens=5) and drops the first."""
         orch, pen = self._setup([(3, None, 2), (5, None, 2)])

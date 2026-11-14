@@ -16,6 +16,7 @@ from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
+from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.flint import FlintConfig
@@ -103,6 +104,7 @@ __all__ = [
     "BailingMM2Config",
     "BailingMoeV3VLConfig",
     "BeamConfig",
+    "Ernie5_5_MoeConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
     "Cohere2MoeConfig",

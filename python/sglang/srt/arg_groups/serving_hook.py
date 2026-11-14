@@ -14,15 +14,14 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.sampling.watermarking.config import load_watermark_config
-from sglang.srt.utils.common import (
-    configure_media_url_security,
+from sglang.srt.utils.device import (
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
 )
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +100,16 @@ def handle_ssl_validation(server_args: Any):
                 "1024 and 2147483647."
             )
 
-        try:
-            import granian  # noqa: F401
-        except ImportError:
-            raise ValueError(
-                "--enable-http2 requires the 'granian' package. "
-                'Install it with: pip install "sglang[http2]"'
-            )
+        # The Rust listener serves HTTP/2 itself; only the Python frontend
+        # runs on Granian.
+        if not envs.SGLANG_RUST_SERVER.get():
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
 
         if cfg.enable_ssl_refresh:
             raise ValueError(
@@ -207,6 +209,8 @@ def handle_media_url_security(server_args: Any):
         allowed_media_domains=configure_media_url_security(
             cfg.allowed_media_domains,
             cfg.media_url_max_file_size_mb,
+            cfg.media_url_timeout,
+            cfg.allow_local_media_files,
         ),
     )
 
@@ -243,7 +247,7 @@ def handle_grammar_backend(server_args: Any):
 
 def handle_debug_utils(server_args: Any):
     cfg = resolving_view(server_args)
-    if is_in_ci() and cfg.soft_watchdog_timeout is None:
+    if envs.SGLANG_IS_IN_CI.get() and cfg.soft_watchdog_timeout is None:
         logger.info("Set soft_watchdog_timeout since in CI")
         declare_resolution(
             server_args, "_handle_debug_utils", soft_watchdog_timeout=300
@@ -298,7 +302,7 @@ def handle_deprecated_args(server_args: Any):
         enable_flashinfer_allreduce_fusion=False,
     )
     # Deprecated attention-backend aliases.
-    aliases = {"compressed": "dsv4", "tokenspeed_mla": "cutedsl_mla"}
+    aliases = {"tokenspeed_mla": "cutedsl_mla"}
     renamed = {}
     for attr in (
         "attention_backend",
@@ -330,6 +334,22 @@ def handle_deprecated_args(server_args: Any):
             and cfg.speculative_attention_mode == "prefill"
         ):
             renamed["speculative_attention_mode"] = "decode"
+    if renamed:
+        declare_resolution(server_args, "_handle_deprecated_args", **renamed)
+
+    # Deprecated MoE A2A backend alias.
+    renamed = {}
+    for attr, value in (
+        ("moe_a2a_backend", cfg.moe_a2a_backend),
+        ("speculative_moe_a2a_backend", cfg.speculative_moe_a2a_backend),
+    ):
+        if value == "flashinfer":
+            logger.warning(
+                "--%s=flashinfer is deprecated; use 'flashinfer_nvlink_one_sided' "
+                "instead.",
+                attr.replace("_", "-"),
+            )
+            renamed[attr] = "flashinfer_nvlink_one_sided"
     if renamed:
         declare_resolution(server_args, "_handle_deprecated_args", **renamed)
 
@@ -435,9 +455,6 @@ def handle_environment_variables(server_args: Any):
     envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if cfg.enable_torch_compile else "0")
     if cfg.mamba_ssm_dtype is not None:
         envs.SGLANG_MAMBA_SSM_DTYPE.set(cfg.mamba_ssm_dtype)
-    envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
-        "1" if cfg.disable_outlines_disk_cache else "0"
-    )
     envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
         "1" if cfg.enable_deterministic_inference else "0"
     )
@@ -453,7 +470,6 @@ def handle_environment_variables(server_args: Any):
                 server_args, "_handle_environment_variables", debug_cuda_graph=False
             )
         else:
-            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
             logger.warning(
                 "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                 "All operations will run eagerly through the graph capture/replay path."
@@ -464,6 +480,10 @@ def handle_environment_variables(server_args: Any):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
+        )
+    if cfg.enable_fp4_indexer and not get_platform().is_sm100:
+        raise ValueError(
+            "--enable-fp4-indexer requires SM100 GPUs with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
     # run it, mirroring the forward scale split: the default sm100 UE8M0

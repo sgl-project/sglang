@@ -222,7 +222,7 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 #  NPUW4A8MXFP4MoEMethod
 # ---------------------------------------------------------------------------
 class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
-    """ModelSlim W4A8 MoE with packed MXFP4 weights and MXFP8 activations."""
+    """Shared W4A8 MXFP kernels for online and ModelSlim MoE weights."""
 
     # Dispatch wire format required by the W4A8 MXFP GMMs: low-latency
     # dispatch quantizes activations to MXFP8 (E8M0 block scales); normal
@@ -233,7 +233,12 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         "low_latency_dispatcher_output_dtype": "mxfp8",
     }
 
-    def __init__(self, dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT):
+    def __init__(
+        self,
+        dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT,
+        *,
+        weight_prefix: Optional[str] = None,
+    ):
         super().__init__(quant_config=None)
         self.dynamic_quant_kwargs = dynamic_quant_kwargs
         # Fused gmm1 (matmul + swiglu + requant in one aclnn kernel). The v2 op
@@ -241,8 +246,8 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         # (llm/probe_mxfp4_gmm_swiglu_quant.py: same numerics as the unfused
         # chain modulo the output fp8 requant, which the unfused chain also
         # applies before gmm2).
-        self.use_fused_gmm1 = True
-        self.fused_matmul = GroupedMatmulSwigluQuant()
+        self.use_fused_gmm1 = weight_prefix != "w2"
+        self.fused_matmul = GroupedMatmulSwigluQuant() if self.use_fused_gmm1 else None
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
             quant_dtype=torch.float8_e4m3fn
         )
@@ -253,11 +258,35 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight = getattr(layer, f"{weight_prefix}_weight")
+        if weight.dtype in (torch.float16, torch.bfloat16):
+            fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+            if fp4_dtype is None:
+                raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+            source = weight.data
+            if not source.is_npu:
+                source = source.to(f"npu:{torch.npu.current_device()}")
+            packed, block_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                source,
+                dst_type=fp4_dtype,
+                round_mode="rint",
+                scale_alg=2,
+                dst_type_max=7.25,
+            )
+            del source
+            # Normalize online [E, N, K/64, 2] scales to the checkpoint layout.
+            if block_scale.dim() == 4:
+                block_scale = block_scale.flatten(-2)
+            weight = Parameter(packed, requires_grad=False)
+            layer.register_parameter(f"{weight_prefix}_weight", weight)
+            layer.register_parameter(
+                f"{weight_prefix}_weight_scale",
+                Parameter(block_scale, requires_grad=False),
+            )
+
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
         weight.data, weight_scale.data = prepare_w4a8_mxfp_weight(
             weight.data, weight_scale.data
         )
-
         if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(dict(self.DISPATCHER_QUANT_CONFIG))
 

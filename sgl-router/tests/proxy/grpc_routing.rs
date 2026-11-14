@@ -21,8 +21,8 @@ use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::state::kv_events::KvEventIndex;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{DecodeGate, EngineProfile, WireProtocol, WorkerRegistry};
-use sglang_api_types::runtime::v1 as proto;
-use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
+use sglang_runtime_v1_types as proto;
+use sglang_runtime_v1_types::sglang_service_client::SglangServiceClient;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -725,15 +725,15 @@ async fn errors_arrive_as_grpc_status() {
     ]))
     .await;
 
-    let unknown_model = json!({"model": "nope", "messages": []}).to_string();
+    let no_model = json!({"messages": []}).to_string();
     let status = client
-        .chat_complete(openai(unknown_model.into()))
+        .chat_complete(openai(no_model.into()))
         .await
         .unwrap_err();
-    assert_eq!(status.code(), Code::NotFound);
+    assert_eq!(status.code(), Code::InvalidArgument);
     assert_eq!(
         status.metadata().get("x-router-error-code").unwrap(),
-        "model_not_found"
+        "bad_request"
     );
 
     // Round robin reaches both workers: the engine fails mid-stream, the other has no gRPC port.

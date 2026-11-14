@@ -335,7 +335,6 @@ DSV4_ENV=(
   -e SGLANG_USE_ROCM700A=$ROCM700A
   -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
   -e SGLANG_OPT_FP8_WO_A_GEMM=false -e SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-  -e SGLANG_OPT_USE_TOPK_V2=false -e SGLANG_OPT_USE_AITER_INDEXER=true
   -e SGLANG_OPT_USE_TILELANG_INDEXER=false -e SGLANG_OPT_USE_TILELANG_MHC_PRE=false
   -e SGLANG_OPT_USE_TILELANG_MHC_POST=false -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
@@ -397,7 +396,7 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
 -e MORI_RDMA_SL=3 -e MORI_RDMA_TC=104 -e MORI_IO_SL=3 -e MORI_IO_TC=104 -e MORI_IO_TC_DISABLE=0 \
 -e SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD=4096 \
 -e SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600 -e SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600 \
--e SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=32 -e SGLANG_EAGER_INPUT_NO_COPY=true \
+-e SGLANG_EAGER_INPUT_NO_COPY=true \
 -e MORI_BOOTSTRAP_TIMEOUT=300"
     # The overlap plan stream is a wide-EP perf knob, but it makes
     # EAGLEWorkerV2.verify call attn_backend.update_verify_buffers_to_fill_after_draft,
@@ -718,7 +717,11 @@ for f in README.md LICENSE; do
 done
 
 python3 -m pip uninstall -y sglang || true
-python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
+# Install with runtime_base (the torch-free deps) instead of --no-deps: the
+# image can predate a dependency the checkout imports (blake3 from #47120
+# failed every 11-05 job on image 20261104). pip's default only-if-needed
+# strategy leaves already-satisfied packages, including torch/aiter, alone.
+python3 -m pip install --no-build-isolation -e "$RUNTIME_CHECKOUT/python[runtime_base]"
 
 export RUNTIME_CHECKOUT
 export PYTHONPATH="$RUNTIME_CHECKOUT/python:${PYTHONPATH:-}"

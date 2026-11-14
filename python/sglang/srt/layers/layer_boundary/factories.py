@@ -139,6 +139,7 @@ def _resolve_ffn(
     update=PLAIN_ADD,
     dense_tp_size=None,
     output_complete=False,
+    output_on_cp_shards=False,
     terminal_accepts_update=False,
 ):
     parallel = get_parallel()
@@ -240,8 +241,23 @@ def _resolve_ffn(
         rows = Layout.sharded_over(
             *((TokenAxis.ATTN_CP,) if on_cp_shards else ()), axis_sizes=axes
         )
+    # A complete output of rows gathered over attention CP that the compute
+    # already leaves on this rank's CP rows: the residual's.
+    on_residual_cp_shards = (
+        output_on_cp_shards
+        and complete
+        and variant is BatchVariant.CONTEXT_PARALLEL
+        and not on_rank_rows
+        and not on_attention_rows
+        and TokenAxis.ATTN_CP in attention.sharded
+        and TokenAxis.ATTN_CP not in rows.sharded
+    )
     produced = (
-        OutputContract(rows, update=update, transform=output_transform)
+        OutputContract(
+            attention if on_residual_cp_shards else rows,
+            update=update,
+            transform=output_transform,
+        )
         if complete
         else OutputContract(
             rows,
@@ -301,6 +317,12 @@ class StageDeclaration:
         output_complete: Whether the FFN's compute completes its own output
             sum, so the exit owes none. For an FFN whose output sum is fused
             with a reduction its computation needs anyway.
+        output_on_cp_shards: Whether, on a CP extend whose FFN input is
+            gathered over attention CP, the compute returns only this rank's
+            CP rows, every one valid, with the sum complete (how is its own
+            choice). The output then lands on the residual's rows with no
+            take-back. Requires a complete sparse output; every other path
+            keeps the gathered-rows output.
         sum_impl: Optional implementation of the declared output sum using
             the model's custom collective. Its batch predicate, when supplied,
             preserves eligibility for carrying that sum to the consumer.
@@ -341,6 +363,7 @@ class StageDeclaration:
     exit_rows: Optional[ExitRows] = None
     writes_at_handoff: bool = False
     output_complete: bool = False
+    output_on_cp_shards: bool = False
     attn_tp_gather: Optional[Callable] = None
     sum_impl: Optional[SumImplementation] = None
     row_transport: Optional[RowTransport] = None
@@ -356,6 +379,18 @@ class StageDeclaration:
                 raise TypeError("stage sources must be declarations")
         _check_update(self.update)
         _check_read(self.read)
+        if self.output_on_cp_shards and not (
+            self.kind is StageKind.FFN
+            and self.sparse
+            and self.output_complete
+            and self.sum_impl is None
+            and self.row_transport is None
+            and self.output_transform is None
+        ):
+            raise ValueError(
+                "output_on_cp_shards needs a sparse FFN whose compute completes "
+                "its output, with no custom sum, transport or output transform"
+            )
 
 
 # The members every ResidualUpdate and ResidualReadout must set: the binding
@@ -502,6 +537,7 @@ def declare_ffn(
     dense_tp_size=None,
     exit_rows=None,
     output_complete=False,
+    output_on_cp_shards=False,
     sum_impl=None,
     row_transport=None,
 ):
@@ -520,6 +556,8 @@ def declare_ffn(
             the adjacent FFN kinds and TBO configuration.
         output_complete: Whether the compute completes its own output sum,
             fused with a reduction it needs anyway; the exit then owes none.
+        output_on_cp_shards: Whether the compute returns only this rank's CP
+            rows of a CP extend's gathered input (see StageDeclaration).
         sum_impl: Model-specific implementation and deferral eligibility of
             the output sum. Cannot be combined with output_complete.
 
@@ -536,6 +574,7 @@ def declare_ffn(
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
+        output_on_cp_shards=output_on_cp_shards,
         sum_impl=sum_impl,
         row_transport=row_transport,
     )
@@ -675,6 +714,7 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             update=stage.update,
             dense_tp_size=stage.dense_tp_size,
             output_complete=stage.output_complete,
+            output_on_cp_shards=stage.output_on_cp_shards,
             terminal_accepts_update=stage.terminal
             and takes_pending_update(final_read, stage.update),
         )

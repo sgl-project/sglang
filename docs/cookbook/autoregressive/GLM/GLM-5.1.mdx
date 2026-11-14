@@ -170,11 +170,10 @@ The following ROCm commands are additional options for AMD GPUs and do not repla
 
 #### MXFP4 (MI355X / gfx950)
 
-On MI355X (gfx950), set `SGLANG_DSA_TRITON_PREFILL=1` to enable a faster Triton attention kernel for the prefill phase (opt-in, off by default). Keep `--dsa-prefill-backend tilelang` as shown. The EAGLE speculative-decoding flags below are optional but recommended on gfx950.
+On MI355X (gfx950), keep `--dsa-prefill-backend tilelang` as shown. The EAGLE speculative-decoding flags below are optional but recommended on gfx950.
 
 ```shell Command
-# SGLANG_DSA_TRITON_PREFILL=1 is optional; it enables a faster Triton prefill kernel on gfx950
-SGLANG_DSA_TRITON_PREFILL=1 sglang serve \
+sglang serve \
   --model-path amd/GLM-5.1-MXFP4 \
   --tp 4 \
   --trust-remote-code \

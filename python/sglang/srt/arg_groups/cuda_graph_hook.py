@@ -175,7 +175,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
-        is_deepseek_v4,
+        uses_compressed_kv_attention,
         uses_kda_attention,
     )
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -194,9 +194,9 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         # c4 indexer scratch is pinned in the capture pool and OOMs. The
         # supported CP path captures a smaller rank-local body.
         (
-            "DeepSeek-V4 (heavy capture-pool memory pressure)",
+            "compressed-KV attention (DeepSeek-V4, ERNIE 5.5 Flash)",
             lambda: (
-                is_deepseek_v4(model_config_of(server_args).hf_config)
+                uses_compressed_kv_attention(model_config_of(server_args).hf_config)
                 and not supports_prefill_cp_bcg(server_args)
             ),
         ),
@@ -223,7 +223,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             "unvalidated a2a backend",
             lambda: (
                 resolved_view(server_args).moe_a2a_backend
-                not in ("none", "deepep", "megamoe", "flashinfer")
+                not in ("none", "deepep", "megamoe", "flashinfer_nvlink_one_sided")
             ),
         ),
         # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.

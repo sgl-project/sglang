@@ -54,7 +54,7 @@ def get_tokenizer(
         and pretrained_model_name_or_path != ""
     )
     if pretrained_model_name_or_path.endswith((".json", ".model", ".gguf")):
-        from sglang.srt.utils.hf_transformers import get_tokenizer
+        from sglang.srt.hf_transformers import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
 
@@ -75,7 +75,7 @@ def get_processor(
         and pretrained_model_name_or_path != ""
     )
 
-    from sglang.srt.utils.hf_transformers import get_processor as _srt_get_processor
+    from sglang.srt.hf_transformers import get_processor as _srt_get_processor
 
     if not pretrained_model_name_or_path.endswith(
         (".json", ".model")

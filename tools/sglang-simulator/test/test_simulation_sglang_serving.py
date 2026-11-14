@@ -14,9 +14,10 @@ ASSETS = Path(__file__).parent / "assets"
 SGLANG_ROOT = Path(__file__).parents[3]
 BENCH_SERVING = SGLANG_ROOT / "benchmark" / "simulator" / "bench_serving.py"
 EXAMPLES = Path(__file__).parent.parent / "examples"
+
 SIM_CONFIGS = {
-    "aic_sol": EXAMPLES / "sim_configs" / "aic_sol.json",
-    "aic_silicon": EXAMPLES / "sim_configs" / "aic_silicon.json",
+    "aisimulate_sol": EXAMPLES / "sim_configs" / "aisimulate_sol.json",
+    "aisimulate_silicon": EXAMPLES / "sim_configs" / "aisimulate_silicon.json",
     "ml": EXAMPLES / "sim_configs" / "ml.json",
     "replay": EXAMPLES / "sim_configs" / "replay.json",
 }

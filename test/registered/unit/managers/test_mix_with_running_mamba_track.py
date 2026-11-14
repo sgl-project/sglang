@@ -287,7 +287,7 @@ class TestLazyFinishBeforeBoundary(unittest.TestCase):
             _maybe_collect_indexer_topk=lambda req: None,
             _maybe_collect_customized_info=lambda i, req, out, n: None,
             request_retirer=SimpleNamespace(
-                release_finished=lambda req, checkpoint: released.append(checkpoint)
+                release=lambda req, checkpoint: released.append(checkpoint)
             ),
         )
         with (

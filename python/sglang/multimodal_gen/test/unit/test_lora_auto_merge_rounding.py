@@ -118,3 +118,30 @@ def test_auto_decision_logs_only_new_lossy_configurations(rank, norms, caplog):
     messages = [r.message for r in caplog.records if "stays unmerged" in r.message]
     expected = 2 if rank == 0 and norms == (0.81, 1.0) else 0
     assert len(messages) == expected
+
+
+def test_a_chain_of_adapters_is_measured_together() -> None:
+    """auto measures every adapter attached to a layer, so a chain of updates
+    below a BF16 ulp (Turbo plus a light style LoRA) stays unmerged."""
+    base, a, b = _inputs(1e-5)
+    layer = _layer(base, a, b, strength=1.0)
+    _, a2, b2 = _inputs(1e-5, seed=1)
+    layer.set_lora_weights(a2, b2, strength=0.7, merge_weights=False)
+    assert len(layer.lora_weights_list) == 2
+    lost_sq, delta_sq = layer.merge_rounding_norms(max_rows=10**6)
+    exact = base.float() + b @ a + 0.7 * (b2 @ a2)
+    torch.testing.assert_close(
+        torch.tensor(delta_sq), (exact - base.float()).square().sum(), rtol=1e-4, atol=0
+    )
+    assert merge_rounding_loss({"l": layer}) > AUTO_MERGE_MAX_ROUNDING_LOSS
+
+    calls = []
+    stub = SimpleNamespace(
+        auto_merge_rounding_loss={},
+        loaded_adapter_alphas={},
+        _apply_lora_to_layers=lambda *args, **kwargs: calls.append(args),
+    )
+    assert LoRAPipeline._auto_merge_rounds_away(
+        stub, "transformer", {"l": layer}, ["turbo", "style"], ["t", "s"], 0, [1.0, 0.7]
+    )
+    assert calls and calls[0][1] == ["turbo", "style"]

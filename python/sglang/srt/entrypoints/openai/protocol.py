@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import unicodedata
@@ -31,6 +32,7 @@ from typing import (
     Optional,
     Protocol,
     Tuple,
+    Type,
     TypeAlias,
     Union,
     get_args,
@@ -64,6 +66,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    SerializationInfo,
     StrictBool,
     field_serializer,
     field_validator,
@@ -77,11 +80,43 @@ try:
 except:
     StructuralTag = Any
 
-from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
 
+# OpenAI's limit on n; SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ still applies after it.
+OPENAI_MAX_N = 128
+
 DEFAULT_MODEL_NAME = "default"
+
+
+def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
+    """Convert a JSON schema to a string.
+    Parameters
+    ----------
+    json_schema
+        The JSON schema.
+    Returns
+    -------
+    str
+        The JSON schema converted to a string.
+    Raises
+    ------
+    ValueError
+        If the schema is not a dictionary, a string or a Pydantic class.
+    """
+    if isinstance(json_schema, dict):
+        schema_str = json.dumps(json_schema)
+    elif isinstance(json_schema, str):
+        schema_str = json_schema
+    elif issubclass(json_schema, BaseModel):
+        schema_str = json.dumps(json_schema.model_json_schema())
+    else:
+        raise ValueError(
+            f"Cannot parse schema {json_schema}. The schema must be either "
+            + "a Pydantic class, a dictionary or a string that contains the JSON "
+            + "schema specification"
+        )
+    return schema_str
 
 
 class ModelCard(BaseModel):
@@ -232,6 +267,9 @@ class UsageInfo(BaseModel):
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
+    # Kimi-K3 extension, ignored elsewhere: attach
+    # choices[].internal_content[].token_ids to every increment frame.
+    include_internal_content: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -376,7 +414,7 @@ class CompletionRequest(PDRoutingFields):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
     max_tokens: int = 16
-    n: int = 1
+    n: int = Field(default=1, ge=1, le=OPENAI_MAX_N)
     presence_penalty: float = 0.0
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
@@ -643,6 +681,11 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     image_url: ChatCompletionMessageContentImageURL
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
+    @field_validator("image_url", mode="before")
+    @classmethod
+    def _accept_bare_url(cls, value: Any) -> Any:
+        return {"url": value} if isinstance(value, str) else value
+
 
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
@@ -730,11 +773,33 @@ RerankContentPart = Union[
 RerankContent = Union[str, List[RerankContentPart]]
 
 
+# Request messages reuse ToolCall and reach chat templates through model_dump(),
+# so stream chunks drop null delta keys only under this context.
+STREAM_DELTA_CONTEXT = {"stream_delta": True}
+
+
+def _is_stream_delta(info: SerializationInfo) -> bool:
+    return bool(info.context and info.context.get("stream_delta"))
+
+
 class FunctionResponse(BaseModel):
     """Function response."""
 
     name: Optional[str] = None
     arguments: Optional[str | Dict[str, Any]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler, info: SerializationInfo):
+        # Continuation chunks must not carry a name key, not even null; the
+        # arguments key must always be present.
+        data = handler(self)
+        if not _is_stream_delta(info):
+            return data
+        if data.get("name") is None:
+            data.pop("name", None)
+        if data.get("arguments") is None:
+            data["arguments"] = ""
+        return data
 
 
 class ToolCall(BaseModel):
@@ -744,6 +809,20 @@ class ToolCall(BaseModel):
     index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler, info: SerializationInfo):
+        # Continuation chunks (id is None) may only carry index +
+        # function.arguments; id/type must not appear, not even null.
+        data = handler(self)
+        if not _is_stream_delta(info):
+            return data
+        if data.get("id") is None:
+            data.pop("id", None)
+            data.pop("type", None)
+        if data.get("index") is None:
+            data.pop("index", None)
+        return data
 
 
 _GenericMessageRole = Literal[
@@ -765,6 +844,18 @@ class ChatCompletionMessageGenericParam(BaseModel):
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def validate_assistant_tool_call_names(self):
+        # FunctionResponse.name is optional for streaming deltas,
+        # but request history must name each call so the chat template can render it.
+        if self.role != "assistant" or not self.tool_calls:
+            return self
+        for index, tool_call in enumerate(self.tool_calls):
+            name = tool_call.function.name
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"tool_calls[{index}]: 'function.name' is required")
+        return self
 
     @field_validator("role", mode="before")
     @classmethod
@@ -855,6 +946,14 @@ class Tool(BaseModel):
             self.function.defer_loading = self.defer_loading
         return self
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # Chat templates render this dict; do not inject a field the client left out.
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
+
 
 # Tool is defined after the message params that reference it, so the forward
 # reference has to be resolved explicitly.
@@ -895,6 +994,21 @@ ReasoningEffortType = Optional[
 ]
 
 
+def _parse_effort(effort: Any, field: str) -> Union[str, float]:
+    if isinstance(effort, str) and effort in get_args(ReasoningEffortTier):
+        return effort
+    if isinstance(effort, (int, float)) and not isinstance(effort, bool):
+        return float(effort)
+    if isinstance(effort, str):
+        # Keep parity with the top-level reasoning_effort field, whose
+        # lax union coerces numeric strings; range checks then apply.
+        try:
+            return float(effort)
+        except ValueError as exc:
+            raise ValueError(f"invalid {field}: {effort!r}") from exc
+    raise ValueError(f"invalid {field}: {effort!r}")
+
+
 def _message_tools_indices(messages: Any) -> List[int]:
     if not isinstance(messages, list):
         return []
@@ -932,27 +1046,32 @@ class ChatCompletionRequest(PDRoutingFields):
         description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
     )
     frequency_penalty: float = 0.0
+    # NOTE: OpenAI limits (temperature <= 2, top_logprobs <= 20, logit_bias in
+    # [-100, 100], top_logprobs requires logprobs) are deliberately not enforced:
+    # SGLang applies these values correctly and existing clients rely on that.
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
-    top_logprobs: Optional[int] = None
+    top_logprobs: Optional[int] = Field(default=None, ge=0)
     max_tokens: Optional[int] = Field(
         default=None,
+        ge=0,
         deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
         description="The maximum number of tokens that can be generated in the chat completion. ",
     )
     max_completion_tokens: Optional[int] = Field(
         default=None,
+        ge=0,
         description="The maximum number of completion tokens for a chat completion request, "
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
     )
-    n: int = 1
+    n: int = Field(default=1, ge=1, le=OPENAI_MAX_N)
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = None
+    temperature: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
@@ -1002,8 +1121,10 @@ class ChatCompletionRequest(PDRoutingFields):
     )
     thinking: Optional[Any] = Field(
         default=None,
-        description="Thinking config such as {'type': 'adaptive'}; read only by "
-        "models whose chat template defines a thinking mode, ignored otherwise.",
+        description="Thinking config such as {'type': 'adaptive'}. 'type' "
+        "(enabled, disabled, adaptive) sets the thinking toggle and 'effort' takes "
+        "precedence over reasoning_effort; templates that define a thinking mode "
+        "also read the dict itself.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -1120,6 +1241,14 @@ class ChatCompletionRequest(PDRoutingFields):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
 
+    @field_validator("max_tokens", "max_completion_tokens", mode="before")
+    @classmethod
+    def validate_output_limit_type(cls, value, info):
+        # Lax int parsing would read a boolean as a 0- or 1-token limit.
+        if isinstance(value, bool):
+            raise ValueError(f"{info.field_name} must not be a boolean")
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
@@ -1130,28 +1259,8 @@ class ChatCompletionRequest(PDRoutingFields):
             effort = r.get("effort")
             if effort is None:
                 effort = r.get("reasoning_effort")
-            if isinstance(effort, str) and effort in {
-                "none",
-                "minimal",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "ultra",
-                "max",
-            }:
-                values["reasoning_effort"] = effort
-            elif isinstance(effort, (int, float)) and not isinstance(effort, bool):
-                values["reasoning_effort"] = float(effort)
-            elif isinstance(effort, str):
-                # Keep parity with the top-level reasoning_effort field, whose
-                # lax union coerces numeric strings; range checks then apply.
-                try:
-                    values["reasoning_effort"] = float(effort)
-                except ValueError as exc:
-                    raise ValueError(f"invalid reasoning effort: {effort!r}") from exc
-            elif effort is not None:
-                raise ValueError(f"invalid reasoning effort: {effort!r}")
+            if effort is not None:
+                values["reasoning_effort"] = _parse_effort(effort, "reasoning effort")
 
             enabled = (
                 r.get("enabled")
@@ -1163,9 +1272,25 @@ class ChatCompletionRequest(PDRoutingFields):
             if enabled:
                 thinking = True
 
+        # thinking.effort outranks reasoning.effort and reasoning_effort;
+        # chat_template_kwargs still wins, since renderers only fill unset keys.
+        thinking_type = None
+        thinking_config = values.get("thinking")
+        if isinstance(thinking_config, dict):
+            thinking_effort = thinking_config.get("effort")
+            if thinking_effort is not None:
+                values["reasoning_effort"] = _parse_effort(
+                    thinking_effort, "thinking effort"
+                )
+            thinking_type = thinking_config.get("type")
+
         effort = values.get("reasoning_effort")
         if effort is not None:
             thinking = effort != "none"
+        if thinking_type is not None:
+            thinking = thinking_type != "disabled"
+        elif isinstance(thinking_config, dict) and thinking is None:
+            thinking = True
 
         if thinking is not None:
             ctk = values.get("chat_template_kwargs")
@@ -1211,6 +1336,15 @@ class ChatCompletionRequest(PDRoutingFields):
 
         return values
 
+    @property
+    def effective_max_tokens(self) -> Optional[int]:
+        """Prefer max_completion_tokens when set, including an explicit zero."""
+        return (
+            self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens
+        )
+
     def to_sampling_params(
         self,
         stop: List[str],
@@ -1240,7 +1374,7 @@ class ChatCompletionRequest(PDRoutingFields):
 
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
+            "max_new_tokens": self.effective_max_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -1356,7 +1490,13 @@ class ChatCompletionResponseChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            "server_interrupted",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
@@ -1405,8 +1545,12 @@ class DeltaMessage(BaseModel):
     hidden_states: Optional[object] = None
 
     @model_serializer(mode="wrap")
-    def _serialize(self, handler):
+    def _serialize(self, handler, info: SerializationInfo):
         data = handler(self)
+        # Without the context, null keys stay: OpenAI SDK clients read
+        # reasoning_content as an attribute.
+        if _is_stream_delta(info):
+            return {k: v for k, v in data.items() if v is not None}
         if self.hidden_states is None:
             data.pop("hidden_states", None)
         return data
@@ -1418,14 +1562,23 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            "server_interrupted",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    internal_content: Optional[List[Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.internal_content is None:
+            data.pop("internal_content", None)
         if self.delta.tool_calls is None:
             data["delta"].pop("tool_calls", None)
         return data
@@ -1550,6 +1703,8 @@ class ScoringRequest(BaseModel):
     return_token_logprobs: bool = False
     item_first: bool = False
     return_pooled_hidden_states: bool = False
+    # Base request id; expanded to `<rid>_<i>` per item (`i` zero-padded).
+    rid: Optional[str] = None
 
     # Setwise readout: when set, the readout is taken AT every occurrence of this
     # token in each `query + item` sequence instead of the last token, and `scores`

@@ -194,6 +194,7 @@ class TestHybridTransfer(unittest.TestCase):
         manager.enable_staging = False
         manager.enable_deferred_decode_kv_release = True
         manager.kvserve_enabled = True
+        manager._send_records = None
         manager.kv_args = types.SimpleNamespace(
             state_types=[StateType.MAMBA], kv_data_ptrs=[1]
         )
@@ -265,6 +266,7 @@ class TestHybridTransfer(unittest.TestCase):
             staging_counted=False,
             wait_event=None,
             indices_event=None,
+            send_record=None,
             _kvserve_source_gate=gate,
         )
         work = queue.Queue()

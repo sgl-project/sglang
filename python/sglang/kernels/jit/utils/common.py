@@ -19,11 +19,11 @@ def should_run_full_tests() -> bool:
 
 
 def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
-    from sglang.utils import is_in_ci
+    from sglang.srt.environ import envs
 
     if should_run_full_tests():
         return full_range
-    return ci_range if is_in_ci() else full_range
+    return ci_range if envs.SGLANG_IS_IN_CI.get() else full_range
 
 
 _NO_GUARD = contextlib.nullcontext()
