@@ -49,9 +49,11 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import tqdm
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
@@ -371,6 +373,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ) == 4 or getattr(prefill_attn_backend, "fa3_upgrades_to_fa4", False)
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
+        # Quantized hybrid-GDN models on SM100/SM103 must replay exact buckets.
+        # Padded breakable replay gives non-repeatable, wrong prompt logprobs for
+        # short prompts (issue #49295). Padding is still used elsewhere.
+        model_config = model_runner.model_config
+        self._exact_bucket_gdn_replay = (
+            is_cuda()
+            and hybrid_gdn_config(model_config) is not None
+            and current_arch().is_sm(10)
+            and (
+                self.quant_config is not None
+                or getattr(model_config, "quantization", None) is not None
+            )
+        )
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.is_dsv41_model = (
             model_runner.model_config.hf_config.model_type == "deepseek_v41"
@@ -1521,6 +1536,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+            return False
+        if self._exact_bucket_gdn_replay and padded_num_tokens != num_tokens:
             return False
         return True
 
