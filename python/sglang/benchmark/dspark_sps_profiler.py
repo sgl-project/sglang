@@ -654,7 +654,7 @@ def run_one_round(
             admin_api_key=context.admin_api_key,
         )
 
-    flush_cache(base_url=context.base_url)
+    flush_cache(base_url=context.base_url, admin_api_key=context.admin_api_key)
     watermarks = [
         max((row.forward_ct for row in rows), default=-1)
         for rows in fetch_rank_rows(base_url=context.base_url)
@@ -678,7 +678,7 @@ def run_one_round(
         min_steady_seconds=settings.min_steady_seconds,
         timeout_seconds=settings.round_timeout_seconds,
     )
-    abort_all_requests(base_url=context.base_url)
+    abort_all_requests(base_url=context.base_url, admin_api_key=context.admin_api_key)
     load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
     if load_thread.is_alive():
         logger.warning(
@@ -830,18 +830,28 @@ def count_aligned_steps(
     )
 
 
-def abort_all_requests(*, base_url: str) -> None:
+# Local copy: the torch-free fallback (fit) cannot import sglang.srt.
+def _admin_headers(admin_api_key: Optional[str]) -> dict:
+    return {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
+
+
+def abort_all_requests(*, base_url: str, admin_api_key: Optional[str] = None) -> None:
     response = requests.post(
         base_url + "/abort_request",
         json={"abort_all": True},
+        headers=_admin_headers(admin_api_key),
         timeout=DEFAULT_TIMEOUT,
     )
     response.raise_for_status()
 
 
-def flush_cache(*, base_url: str) -> None:
+def flush_cache(*, base_url: str, admin_api_key: Optional[str] = None) -> None:
     try:
-        requests.post(base_url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
+        requests.post(
+            base_url + "/flush_cache",
+            headers=_admin_headers(admin_api_key),
+            timeout=DEFAULT_TIMEOUT,
+        )
     except Exception:
         logger.warning("POST /flush_cache failed; continuing.", exc_info=True)
 
@@ -852,7 +862,7 @@ def set_forced_budget_frac(
     response = requests.post(
         base_url + "/set_internal_state",
         json={"server_args": {"dspark_force_budget_frac": frac}},
-        headers={"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {},
+        headers=_admin_headers(admin_api_key),
         timeout=DEFAULT_TIMEOUT,
     )
     response.raise_for_status()

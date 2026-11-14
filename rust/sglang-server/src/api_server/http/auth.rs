@@ -93,7 +93,6 @@ fn decide(method: &Method, path: &str, authorization: Option<&str>, keys: &ApiKe
         return Decision::Allowed;
     }
     let required = if ADMIN_FORCE_PATHS.contains(&path) {
-        // The admin key alone, and no access at all without one.
         match keys.admin_api_key.as_deref() {
             Some(key) => Some(key),
             None => return Decision::AdminKeyMissing,

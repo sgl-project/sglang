@@ -63,7 +63,7 @@ class RuntimeEndpoint(BaseBackend):
     def flush_cache(self):
         res = http_request(
             self.base_url + "/flush_cache",
-            api_key=self.api_key,
+            api_key=self.admin_api_key or self.api_key,
             verify=self.verify,
             method="POST",
         )

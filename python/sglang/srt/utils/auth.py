@@ -17,6 +17,11 @@ ADMIN_API_KEY_MISSING_MESSAGE = (
 )
 
 
+def bearer_auth_headers(key: Optional[str]) -> dict:
+    """`Authorization: Bearer <key>`, or no header when there is no key."""
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 @dataclass(frozen=True)
 class AuthDecision:
     allowed: bool

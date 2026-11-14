@@ -10,14 +10,14 @@ from typing import List
 import requests
 
 from sglang.srt.runtime_context import get_serving
+from sglang.srt.utils.auth import bearer_auth_headers
 
 logger = logging.getLogger(__name__)
 
 
 def _seed_admin_headers() -> dict:
     # The seed instance's weight-send endpoints take its admin key; a deployment shares one.
-    admin_api_key = get_serving().admin_api_key
-    return {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
+    return bearer_auth_headers(get_serving().admin_api_key)
 
 
 class RemoteInstanceWeightLoaderBackend(str, enum.Enum):

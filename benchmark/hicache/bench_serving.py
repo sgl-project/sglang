@@ -35,6 +35,7 @@ from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
+from sglang.srt.utils.auth import bearer_auth_headers
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
@@ -205,11 +206,9 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         output = RequestFuncOutput()
         try:
-            admin_api_key = getattr(args, "admin_api_key", None)
-            headers = (
-                {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
-            )
-            async with session.post(url=api_url, headers=headers) as response:
+            async with session.post(
+                url=api_url, headers=bearer_auth_headers(args.admin_api_key)
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -448,7 +447,9 @@ async def benchmark(
 
     # Flush cache
     if "sglang" in backend:
-        requests.post(base_url + "/flush_cache")
+        requests.post(
+            base_url + "/flush_cache", headers=bearer_auth_headers(args.admin_api_key)
+        )
 
     time.sleep(1.0)
 

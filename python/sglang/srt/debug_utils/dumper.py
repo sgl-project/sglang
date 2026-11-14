@@ -250,8 +250,8 @@ class _Dumper:
     1. `python ...`
     2. sglang mode:  `curl -X POST http://localhost:30000/dumper/configure -H "Authorization: Bearer $ADMIN_API_KEY" -d '{"enable": true}'`
        standalone:   `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true}'`
-    3. `curl -X POST http://localhost:30000/dumper/configure -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
-    4. `curl -X POST http://localhost:30000/dumper/reset`
+    3. `curl -X POST http://localhost:30000/dumper/configure -H "Authorization: Bearer $ADMIN_API_KEY" -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
+    4. `curl -X POST http://localhost:30000/dumper/reset -H "Authorization: Bearer $ADMIN_API_KEY"`
 
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """

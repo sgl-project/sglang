@@ -334,7 +334,11 @@ async def send_profile_request(
         print(f"Error sending {profile_text} request: {e}")
 
 
-async def call_freeze_gc_http(session: aiohttp.ClientSession, http_url: str) -> None:
+async def call_freeze_gc_http(
+    session: aiohttp.ClientSession,
+    http_url: str,
+    admin_api_key: Optional[str] = None,
+) -> None:
     """
     Call the /freeze_gc HTTP endpoint.
 
@@ -351,7 +355,12 @@ async def call_freeze_gc_http(session: aiohttp.ClientSession, http_url: str) -> 
 
         print(f"Calling freeze_gc endpoint: {freeze_gc_url}")
 
-        async with session.post(freeze_gc_url) as resp:
+        async with session.post(
+            freeze_gc_url,
+            headers={"Authorization": f"Bearer {admin_api_key}"}
+            if admin_api_key
+            else {},
+        ) as resp:
             if resp.status == 200:
                 print("freeze_gc called successfully")
             else:
@@ -422,7 +431,7 @@ async def perform_global_warmup_and_freeze(
     async with aiohttp.ClientSession() as session:
         await send_warmup_requests(session, http_url, build_warmup_request_func)
         if config.freeze_gc:
-            await call_freeze_gc_http(session, http_url)
+            await call_freeze_gc_http(session, http_url, config.admin_api_key)
         print(
             f"HTTP warmup{' and GC freeze' if config.freeze_gc else ''} completed successfully."
         )

@@ -16,8 +16,8 @@ curl -H "Authorization: Bearer <token>" ...
 Rules:
 
 - normal protected endpoints require `api_key`
-- admin endpoints require `admin_api_key`
-- some HiCache endpoints fail if `admin_api_key` is not configured at all
+- admin endpoints require `admin_api_key` when it is configured
+- sensitive admin endpoints (`AuthLevel.ADMIN_FORCE` in `http_server.py`, e.g. weight updates, LoRA loading, memory release, profiling, `/set_internal_state`, `/hicache/storage-backend`, pause/continue generation) answer 403 when `admin_api_key` is not configured at all
 - `/health` and metrics-style health checks are usually still exposed
 
 ## Core Endpoints

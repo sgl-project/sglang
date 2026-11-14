@@ -33,6 +33,7 @@ from eval_utils import (
 )
 from tqdm import tqdm
 
+from sglang.srt.utils.auth import bearer_auth_headers
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
@@ -57,10 +58,9 @@ async def async_request_profile(
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         output = RequestFuncOutput()
         try:
-            headers = (
-                {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
-            )
-            async with session.post(url=api_url, headers=headers) as response:
+            async with session.post(
+                url=api_url, headers=bearer_auth_headers(admin_api_key)
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:

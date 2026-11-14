@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import re
 import shutil
 import sys
@@ -1007,10 +1008,14 @@ def run_sglang_profiler(
             framework="sglang",
         )
 
+    headers = {"Content-Type": "application/json"}
+    # SGLang's /start_profile requires the server's --admin-api-key.
+    if admin_api_key := os.environ.get("ADMIN_API_KEY"):
+        headers["Authorization"] = f"Bearer {admin_api_key}"
     req = request.Request(
         url.rstrip("/") + "/start_profile",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     with request.urlopen(req, timeout=300.0):
         pass

@@ -345,7 +345,7 @@ loadTracer.sh python3 -m sglang.launch_server \
 6. Open another terminal for the same docker container, and run the rpd enabled ./client.sh after you see "The server is fired up and is ready to roll!" message from server side terminal.
 
 #### Common Notes 3
-- Use curl http://localhost:30000/start_profile & curl http://localhost:30000/stop_profile to control the start and end of profiling. Check sglang/python/sglang/srt/managers/scheduler.py for more details.
+- Use curl http://localhost:30000/start_profile & curl http://localhost:30000/stop_profile, each with `-H "Authorization: Bearer ${ADMIN_API_KEY}"` (the server's `--admin-api-key`), to control the start and end of profiling. Check sglang/python/sglang/srt/managers/scheduler.py for more details.
 - Please don't use RPD profiler together with PyTorch profiler to avoid interference.
 - The rocmProfileData/tools/rpd2tracing.py file is used to generate json file from RPD file.
 

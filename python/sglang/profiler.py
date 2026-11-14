@@ -62,9 +62,10 @@ def run_profile(
     if start_step is not None:
         json_data["start_step"] = str(start_step)
 
-    headers = {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
     response = requests.post(
-        url=url + "/start_profile", json=json_data, headers=headers
+        url=url + "/start_profile",
+        json=json_data,
+        headers={"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {},
     )
     response.raise_for_status()
 

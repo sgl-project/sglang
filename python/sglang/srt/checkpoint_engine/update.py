@@ -27,6 +27,8 @@ import torch
 import torch.distributed as dist
 from safetensors import safe_open
 
+from sglang.srt.utils.auth import bearer_auth_headers
+
 try:
     from checkpoint_engine.ps import ParameterServer
     from loguru import logger
@@ -132,11 +134,7 @@ def req_inference(
                         "weight_version": weight_version,
                     },
                     timeout=timeout,
-                    headers=(
-                        {"Authorization": f"Bearer {admin_api_key}"}
-                        if admin_api_key
-                        else None
-                    ),
+                    headers=bearer_auth_headers(admin_api_key),
                 )
                 resp.raise_for_status()
 

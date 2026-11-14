@@ -80,10 +80,13 @@ def _build_payload(args: argparse.Namespace) -> dict:
 
 if __name__ == "__main__":
     args = _parse_args()
-    headers = (
-        {"Authorization": f"Bearer {args.admin_api_key}"} if args.admin_api_key else {}
-    )
     response = requests.post(
-        args.url + "/configure_logging", json=_build_payload(args), headers=headers
+        args.url + "/configure_logging",
+        json=_build_payload(args),
+        headers=(
+            {"Authorization": f"Bearer {args.admin_api_key}"}
+            if args.admin_api_key
+            else {}
+        ),
     )
     assert response.status_code == 200

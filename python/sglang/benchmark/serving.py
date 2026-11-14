@@ -55,6 +55,7 @@ from sglang.benchmark.utils import (
     set_ulimit,
 )
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.utils.auth import bearer_auth_headers
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
@@ -915,10 +916,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 body["start_step"] = str(args.profile_start_step)
             if hasattr(args, "profile_steps") and args.profile_steps is not None:
                 body["num_steps"] = str(args.profile_steps)
-            admin_api_key = getattr(args, "admin_api_key", None)
-            headers = (
-                {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
-            )
+            headers = bearer_auth_headers(getattr(args, "admin_api_key", None))
             async with session.post(
                 url=api_url, json=body, headers=headers
             ) as response:
@@ -1031,11 +1029,7 @@ def flush_server_cache(
     elif backend.startswith("sglang"):
         response = requests.post(
             base_url + "/flush_cache",
-            headers=(
-                {"Authorization": f"Bearer {admin_api_key}"}
-                if admin_api_key
-                else get_auth_headers()
-            ),
+            headers=bearer_auth_headers(admin_api_key) or get_auth_headers(),
             params={"timeout": flush_cache_timeout},
         )
     else:
