@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     cached_vae_encode,
     invalidate_conditioning_caches,
     prefer_conditioning_cache,
+    prefetch_vae_tile_digests,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
@@ -65,6 +66,31 @@ class VisionLanguageEncoder(Encoder):
     def forward(self, text, pixels):
         self.calls += 1
         return self.image_features(pixels) + text
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_prefetched_tile_digests_match_per_tile_keys_and_only_their_views():
+    cache = ConditioningCache(64 * 1024 * 1024)
+    vae = VAE().eval()
+    x = torch.rand(1, 3, 512, 512, device="cuda")
+
+    def tiles(image):
+        return [
+            image[..., i : i + 256, j : j + 256] for i in (0, 256) for j in (0, 256)
+        ]
+
+    with cache.scope():
+        for tile in tiles(x):
+            vae.encode(tile)
+        same = x.clone()
+        with prefetch_vae_tile_digests(vae, tiles(same)):
+            for tile in tiles(same):
+                vae.encode(tile)
+            assert vae.calls == 4  # prefetched keys equal the per-tile keys
+            # A view at another offset of the same storage is not a prefetched tile.
+            vae.encode(same[..., 128:384, 128:384])
+            assert vae.calls == 5
 
 
 @torch.no_grad()
