@@ -358,3 +358,116 @@ python -m sglang.benchmark.serving \
     --request-rate inf \
     --seed 1
 ```
+
+### DeepSeek-V4-Flash Native FP8 4P on 950PR/DT IN128K OUT1K PREFIX90 50ms
+
+Model: DeepSeek-V4-Flash-0731
+
+Hardware: Ascend 950PR/DT, 4 cards
+
+Deploy Mode: Single-node mixed
+
+Quantization: Native FP8
+
+Dataset: 128K input + 1K output, 90% prefix cache hit
+
+The following configuration was validated with SGLang `0.5.21+npu` and CANN `25.7.rc1.10` on four Ascend 950PR devices. The model uses `--tp-size 4` and the `dsv4` attention backend.
+
+#### Model Deployment
+
+```bash
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731
+PYTHON_BIN=python3
+
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+
+export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/:${ASCEND_CUSTOM_OPP_PATH:-}
+export DEEPEP_HCCL_BUFFSIZE=1600
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+export LD_LIBRARY_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH:-}
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=160
+export SGLANG_DSPARK_A5_EXTRA_OPS_SO=/usr/local/Ascend/extra-ops/vllm_ascend_C.cpython-312-x86_64-linux-gnu.so
+export SGLANG_DSPARK_FAST_KERNEL=0
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_WAR_BARRIER=1
+export SGLANG_FORCE_COARSE_WAR_BARRIER=1
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+export SGLANG_OPT_FP8_WO_A_GEMM=False
+export SGLANG_OPT_FUSE_WQA_WKV=0
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
+export SGLANG_OPT_USE_TILELANG_MHC_POST=False
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+$PYTHON_BIN -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --page-size 128 \
+  --tp-size 4 \
+  --trust-remote-code \
+  --device npu \
+  --attention-backend dsv4 \
+  --watchdog-timeout 9000 \
+  --host 127.0.0.1 \
+  --port 6688 \
+  --mem-fraction-static 0.72 \
+  --max-running-requests 64 \
+  --chunked-prefill-size 65536 \
+  --max-prefill-tokens 65536 \
+  --cuda-graph-bs-decode 1 2 4 8 16 \
+  --enable-dp-lm-head \
+  --enable-dp-attention \
+  --dp-size 4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-attention-backend ascend \
+  --speculative-num-draft-tokens 6 \
+  --speculative-dspark-block-size 5
+```
+
+Keep radix cache enabled for this shared-prefix workload. Do not add `--disable-radix-cache`.
+
+#### GSM8K Accuracy
+
+```bash
+sgl-eval run gsm8k \
+  --model "$MODEL_PATH" \
+  --base-url http://127.0.0.1:6688/v1 \
+  --num-examples 1319 \
+  --max-tokens 2048
+```
+
+Measured accuracy was `96.9674%` with zero invalid and zero truncated responses.
+
+#### Benchmark
+
+```bash
+python -m sglang.benchmark.serving \
+  --dataset-name generated-shared-prefix \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 6688 \
+  --gsp-num-groups 1 \
+  --gsp-prompts-per-group 20 \
+  --gsp-system-prompt-len 115200 \
+  --gsp-question-len 12800 \
+  --gsp-output-len 1000 \
+  --max-concurrency 16 \
+  --num-prompts 20 \
+  --request-rate inf \
+  --seed 1
+```
+
+Measured results were Mean TPOT `18.42 ms`, P95 TPOT `40.78 ms`, P99 TPOT `48.36 ms`, and output throughput `222.41 tok/s`.
+
+For a stricter TPOT target, keep the deployment unchanged and run the same workload with `--max-concurrency 8`. The measured Mean TPOT was `11.56 ms`, P95 TPOT was `18.15 ms`, P99 TPOT was `20.81 ms`, and output throughput was `378.32 tok/s`.
