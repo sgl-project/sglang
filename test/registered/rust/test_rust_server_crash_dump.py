@@ -105,6 +105,7 @@ def _server_args(ext, port: int):
         metrics=None,
         request_log=ext.RequestLogConfig(**request_log_settings(1, GenerateReqInput)),
         crash_dump=True,
+        crash_dump_max_bytes=0,
         server_added_custom_params=[],
     )
 

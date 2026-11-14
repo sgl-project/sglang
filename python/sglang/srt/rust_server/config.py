@@ -266,6 +266,7 @@ def _build_server_args(
             else None
         ),
         crash_dump=bool(get_observability().crash_dump_folder),
+        crash_dump_max_bytes=envs.SGLANG_CRASH_DUMP_MAX_BYTES.get(),
         server_added_custom_params=list(server_added_custom_params),
     )
 

@@ -135,9 +135,12 @@ impl RequestLog {
         };
         Ok(Some(Arc::new(Self {
             logger,
-            recorder: args
-                .crash_dump
-                .then(|| CrashRecorder::omitting(args.server_added_custom_params.clone())),
+            recorder: args.crash_dump.then(|| {
+                CrashRecorder::omitting(
+                    args.server_added_custom_params.clone(),
+                    args.crash_dump_max_bytes,
+                )
+            }),
             server_added_custom_params: args.server_added_custom_params.clone(),
             default_priority: args.default_priority_value,
             weight_version: args.weight_version.as_deref().map(Arc::from),
@@ -163,7 +166,7 @@ impl RequestLog {
             logger: config.map(|config| {
                 RequestLogger::new(config, LogSink::Memory(Mutex::default())).expect("valid config")
             }),
-            recorder: crash_dump.then(|| CrashRecorder::omitting(omitted.clone())),
+            recorder: crash_dump.then(|| CrashRecorder::omitting(omitted.clone(), 0)),
             server_added_custom_params: omitted,
             default_priority: None,
             weight_version: Some(Arc::from("default")),
@@ -1982,12 +1985,47 @@ struct CrashRecorder {
     next_id: AtomicU64,
     /// Server-added `custom_params` keys, left out of the bodies it writes.
     omit_custom_params: Vec<String>,
+    /// Bytes the finished window may hold, outputs plus each body once; 0 keeps
+    /// the whole five minutes, as Python does.
+    max_finished_bytes: usize,
 }
 
 #[derive(Default)]
 struct RecorderState {
     finished: VecDeque<FinishedRequest>,
     in_flight: HashMap<u64, InFlightRequest>,
+    /// Finished records per body id: a batch's items share one body, which the
+    /// byte budget counts once.
+    finished_body_refs: HashMap<u64, usize>,
+    finished_bytes: usize,
+}
+
+impl RecorderState {
+    fn push_finished(&mut self, record: FinishedRequest) {
+        let body = &record.request.body;
+        let refs = self.finished_body_refs.entry(body.id).or_insert(0);
+        if *refs == 0 {
+            self.finished_bytes += body.json.bytes.len();
+        }
+        *refs += 1;
+        self.finished_bytes += record.out.len();
+        self.finished.push_back(record);
+    }
+
+    /// Remove the oldest finished record; the caller drops it after unlocking.
+    fn pop_finished(&mut self) -> Option<FinishedRequest> {
+        let record = self.finished.pop_front()?;
+        self.finished_bytes -= record.out.len();
+        let body = &record.request.body;
+        if let Some(refs) = self.finished_body_refs.get_mut(&body.id) {
+            *refs -= 1;
+            if *refs == 0 {
+                self.finished_body_refs.remove(&body.id);
+                self.finished_bytes -= body.json.bytes.len();
+            }
+        }
+        Some(record)
+    }
 }
 
 /// The JSON object Python rebuilds requests from: a native body, shared by
@@ -2045,9 +2083,10 @@ struct InFlightRequest {
 }
 
 impl CrashRecorder {
-    fn omitting(omit_custom_params: Vec<String>) -> Self {
+    fn omitting(omit_custom_params: Vec<String>, max_finished_bytes: usize) -> Self {
         Self {
             omit_custom_params,
+            max_finished_bytes,
             ..Self::default()
         }
     }
@@ -2082,30 +2121,40 @@ impl CrashRecorder {
     }
 
     /// Move a finished request to the window, evicting what finished five
-    /// minutes before it (Python `record_request_for_crash_dump`).
+    /// minutes before it (Python `record_request_for_crash_dump`) and, past
+    /// `max_finished_bytes`, the oldest. Evicted records are freed unlocked.
     fn finish(&self, id: u64, log_metrics: bool, out: &Map<String, Value>, now: f64) {
         let out = log_metrics
             .then(|| Bytes::from(serde_json::to_vec(out).expect("a JSON map serializes")));
-        let mut state = lock(&self.state);
-        let Some(entry) = state.in_flight.remove(&id) else {
-            return;
+        let mut evicted = Vec::new();
+        let output = {
+            let mut state = lock(&self.state);
+            let Some(InFlightRequest {
+                request,
+                created_time,
+                output,
+            }) = state.in_flight.remove(&id)
+            else {
+                return;
+            };
+            if let Some(out) = out {
+                state.push_finished(FinishedRequest {
+                    request,
+                    out,
+                    created_time,
+                    finished_time: now,
+                });
+                while state.finished.front().is_some_and(|oldest| {
+                    now - oldest.finished_time >= CRASH_DUMP_WINDOW_SECS
+                        || (self.max_finished_bytes > 0
+                            && state.finished_bytes > self.max_finished_bytes)
+                }) {
+                    evicted.extend(state.pop_finished());
+                }
+            }
+            output
         };
-        let Some(out) = out else {
-            return;
-        };
-        state.finished.push_back(FinishedRequest {
-            request: entry.request,
-            out,
-            created_time: entry.created_time,
-            finished_time: now,
-        });
-        while state
-            .finished
-            .front()
-            .is_some_and(|oldest| now - oldest.finished_time >= CRASH_DUMP_WINDOW_SECS)
-        {
-            state.finished.pop_front();
-        }
+        drop((output, evicted));
     }
 
     /// `{"bodies": {id: body}, "finished": [record], "unfinished": [record]}`,
@@ -2113,8 +2162,8 @@ impl CrashRecorder {
     /// "finished_time"}` and each body written once, however many items of a
     /// batch name it.
     fn snapshot(&self, now: f64) -> Vec<u8> {
-        // Capture under the lock (reference counts and the partial outputs),
-        // write outside it.
+        // Take reference counts under the lock; partial outputs and JSON are
+        // built outside it, so register and finish never wait on the copy.
         let (finished, unfinished) = {
             let state = lock(&self.state);
             let finished: Vec<(DumpRequest, Bytes, f64, f64)> = state
@@ -2129,19 +2178,17 @@ impl CrashRecorder {
                     )
                 })
                 .collect();
-            let unfinished: Vec<(DumpRequest, Map<String, Value>, f64)> = state
+            let unfinished: Vec<(DumpRequest, Arc<Mutex<CoreOutput>>, f64)> = state
                 .in_flight
                 .values()
-                .map(|e| {
-                    (
-                        e.request.clone(),
-                        partial_out(&lock(&e.output)),
-                        e.created_time,
-                    )
-                })
+                .map(|e| (e.request.clone(), e.output.clone(), e.created_time))
                 .collect();
             (finished, unfinished)
         };
+        let unfinished: Vec<(DumpRequest, Map<String, Value>, f64)> = unfinished
+            .into_iter()
+            .map(|(request, output, created)| (request, partial_out(&lock(&output)), created))
+            .collect();
         let mut bodies = std::collections::BTreeMap::new();
         let mut buf = Vec::new();
         buf.extend_from_slice(b"\"finished\":[");
