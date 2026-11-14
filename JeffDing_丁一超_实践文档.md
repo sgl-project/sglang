@@ -363,8 +363,33 @@ sgl-eval run gsm8k \
 2. 
 3. 
 
-### 改进建议
+## 五、环境变量汇总
 
-1. 暂无
-2. 
-3. 
+| 分类 | 变量 | 值 | 作用 |
+|------|------|-----|------|
+| **算子/库路径** | `ASCEND_CUSTOM_OPP_PATH` | `/usr/local/Ascend/extra-ops/vendors/custom_transformer/` | 自定义算子搜索路径 |
+| | `LD_LIBRARY_PATH` | 追加 `op_api/lib` | 算子动态库路径 |
+| | `SGLANG_DSPARK_A5_EXTRA_OPS_SO` | `vllm_ascend_C.cpython-312-x86_64-linux-gnu.so` | DSPARK A5 扩展算子库 |
+| **DeepEP 通信** | `DEEPEP_HCCL_BUFFSIZE` | `1600` | HCCL 通信缓冲区（MB） |
+| | `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ` | `1` | 启用长序列 combine 优化 |
+| | `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS` | `2048` | 每轮 dispatch token 数 |
+| | `DEEPEP_NORMAL_LONG_SEQ_ROUND` | `16` | 长序列分片轮次 |
+| | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `32` | 单 rank dispatch 上限 |
+| **精度/量化** | `FORCE_DRAFT_MODEL_NON_QUANT` | `1` | 草稿模型不量化 |
+| | `INF_NAN_MODE_FORCE_DISABLE` | `1` | 关闭 Inf/NaN 检测开销 |
+| | `SGLANG_OPT_DEEPGEMM_HC_PRENORM` | `False` | 关闭 HC 预归一化 |
+| | `SGLANG_OPT_FP8_WO_A_GEMM` | `False` | 关闭 FP8 WO GEMM |
+| **显存/性能** | `PYTORCH_NPU_ALLOC_CONF` | `expandable_segments:True` | 可扩展显存段，减碎片 |
+| | `SGLANG_NPU_USE_MULTI_STREAM` | `1` | NPU 多流并行 |
+| | `SGLANG_ENABLE_OVERLAP_PLAN_STREAM` | `1` | plan 流重叠隐藏调度耗时 |
+| | `STREAMS_PER_DEVICE` | `32` | 每设备流数 |
+| | `SGLANG_SET_CPU_AFFINITY` | `1` | CPU 亲和性绑定 |
+| **投机解码** | `SGLANG_ENABLE_SPEC_V2` | `1` | 投机解码 V2 |
+| | `SGLANG_DSPARK_FAST_KERNEL` | `0` | 关闭 DSPARK 快内核 |
+| **算子开关** | `SGLANG_OPT_BF16_FP32_GEMM_ALGO` | `torch` | GEMM 走 torch 实现 |
+| | `SGLANG_OPT_FUSE_WQA_WKV` | `0` | 关闭 WQA/WKV 融合 |
+| | `SGLANG_OPT_USE_FUSED_HASH_TOPK` | `False` | 关闭 Hash-TopK 融合 |
+| | `SGLANG_OPT_USE_OVERLAP_STORE_CACHE` | `False` | 关闭 store cache 重叠 |
+| | `SGLANG_OPT_USE_TILELANG_MHC_PRE/POST` | `False` | 关闭 TileLang MHC 前后处理 |
+| **同步机制** | `SGLANG_ENABLE_WAR_BARRIER` | `1` | 启用 warp barrier |
+| | `SGLANG_FORCE_COARSE_WAR_BARRIER` | `1` | 强制粗粒度 barrier |
