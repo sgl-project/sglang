@@ -1914,7 +1914,7 @@ class V1RerankReqInput(BaseModel):
     @classmethod
     def validate_top_n(cls, v):
         if v is not None and v < 1:
-            raise ValueError("Value error, parameter top_n should be larger than 0.")
+            raise ValueError("parameter top_n should be larger than 0.")
         return v
 
     def is_multimodal(self) -> bool:

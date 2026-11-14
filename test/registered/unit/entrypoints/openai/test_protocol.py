@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     ToolCall,
     UsageInfo,
+    V1RerankReqInput,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -921,6 +922,13 @@ class TestValidationEdgeCases(CustomTestCase):
         """Test negative token limits"""
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
+
+    def test_rerank_top_n_error_has_single_prefix(self):
+        """pydantic prepends "Value error, " itself; the validator must not repeat it."""
+        with self.assertRaises(ValidationError) as ctx:
+            V1RerankReqInput(query="q", documents=["d"], top_n=0)
+
+        self.assertEqual(ctx.exception.errors()[0]["msg"].count("Value error"), 1)
 
 
 class TestAssistantToolCallNames(unittest.TestCase):
