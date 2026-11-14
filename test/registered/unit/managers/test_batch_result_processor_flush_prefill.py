@@ -1,6 +1,8 @@
 """SchedulerBatchResultProcessor._flush_prefill: a generation prefill's per-request
 KV calls are queued and run in order, before free_group_end and the send. A subclass
-that sends first gets the same KV calls, in the same order and one free group."""
+that sends first gets the same KV calls, in the same order and one free group.
+A decode step sends first and then releases its finished requests, in the same free
+group."""
 
 import unittest
 from array import array
@@ -15,6 +17,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskStatus,
 )
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -74,9 +77,16 @@ def _batch():
     )
 
 
-def _run(cls, *, hisparse=False):
-    """One prefill result through ``cls``; returns the log of KV calls, free group
-    and send."""
+def _decode_req(rid, max_new_tokens, to_finish=None):
+    req = _req(rid, max_new_tokens)
+    req.output_ids = [7]
+    req.to_finish = to_finish
+    return req
+
+
+def _run(cls, *, hisparse=False, decode_reqs=None, auxiliary=False):
+    """One prefill result (or a decode step over ``decode_reqs``) through ``cls``;
+    returns the log of KV calls, free group, auxiliary output and send."""
     log = []
     allocator = Mock()
     allocator.free_group_begin.side_effect = lambda: log.append("free_group_begin")
@@ -107,16 +117,26 @@ def _run(cls, *, hisparse=False):
         ),
         output_streamer=streamer,
         still_in_batch=lambda req: True,
+        beam_coordinator=Mock(),
+        metrics_reporter=Mock(num_generated_tokens=0, forward_ct_decode=0),
     )
-    batch = _batch()
+    if decode_reqs is None:
+        batch = _batch()
+        statuses = [SamplingMaskStatus.OVERFLOW] * len(batch.reqs)
+    else:
+        batch = ScheduleBatch(
+            reqs=decode_reqs, spec_algorithm=SpeculativeAlgorithm.NONE
+        )
+        statuses = None
     result = GenerationBatchResult(
         logits_output=LogitsProcessorOutput(
-            next_token_logits=None,
-            next_token_sampling_mask_status=[SamplingMaskStatus.OVERFLOW]
-            * len(batch.reqs),
+            next_token_logits=None, next_token_sampling_mask_status=statuses
         ),
         next_token_ids=torch.tensor([7 + i for i in range(len(batch.reqs))]),
     )
+    if auxiliary:
+        result.auxiliary_host_output = Mock()
+        result.auxiliary_host_output.consume.side_effect = lambda *_: log.append("aux")
     memory = SimpleNamespace(enable_hisparse=hisparse)
     with (
         published_topology(),
@@ -131,8 +151,12 @@ def _run(cls, *, hisparse=False):
             lambda req, tree: log.append(("checkpoint", req.rid)),
         ),
         patch(f"{BRP}.get_memory", lambda: memory),
+        patch.object(cls, "_mamba_prefix_cache_update"),
     ):
-        cls(**kwargs).process_batch_result_prefill(batch, result)
+        if decode_reqs is None:
+            cls(**kwargs).process_batch_result_prefill(batch, result)
+        else:
+            cls(**kwargs).process_batch_result_decode(batch, result)
     return log
 
 
@@ -168,6 +192,33 @@ class TestFlushPrefill(CustomTestCase):
             _run(_StreamFirst, hisparse=True),
             ["free_group_begin", SEND, *kv_calls, "free_group_end"],
         )
+
+    def test_decode_sends_before_the_finished_release(self):
+        """The final output does not wait for the prefix-cache insert, which still
+        runs in the step's free group, before the scheduler's next iteration."""
+        reqs = [_decode_req("r0", 2), _decode_req("r1", 8)]
+        self.assertEqual(
+            _run(SchedulerBatchResultProcessor, decode_reqs=reqs),
+            ["free_group_begin", SEND, ("release", "r0", True), "free_group_end"],
+        )
+
+    def test_decode_keeps_release_first_where_the_send_depends_on_it(self):
+        # A requested finish (here an abort) leaves finished_len for the send to
+        # fill, and the release reads it; a consumer of auxiliary output may
+        # defer_response only a released request.
+        for to_finish, auxiliary in ((FINISH_ABORT(), False), (None, True)):
+            with self.subTest(auxiliary=auxiliary):
+                log = _run(
+                    SchedulerBatchResultProcessor,
+                    decode_reqs=[_decode_req("r0", 2, to_finish)],
+                    auxiliary=auxiliary,
+                )
+                self.assertEqual(
+                    log,
+                    ["free_group_begin", ("release", "r0", True)]
+                    + ["aux"] * auxiliary
+                    + [SEND, "free_group_end"],
+                )
 
 
 if __name__ == "__main__":

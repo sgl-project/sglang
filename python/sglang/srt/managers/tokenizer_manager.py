@@ -87,6 +87,7 @@ from sglang.srt.layers.joint_schema_head import (
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.deferred_input_release import DeferredInputRelease
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import (
     PositionalEmbeds,
@@ -509,6 +510,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     tokenized_generate_req_type = TokenizedGenerateReqInput
     batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
     canary_info_hook: Optional[CanaryInfoTokenizerManagerHook] = None
+    deferred_input_release: Optional[DeferredInputRelease] = None
 
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
@@ -628,6 +630,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init request dispatcher
         self.init_request_dispatcher()
+        self.init_deferred_input_release()
 
         # Init the CUDA IPC transport for GPU-resident embedding overrides
         self.init_positional_embeds_transport()
@@ -934,6 +937,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
         self._dispatch_to_scheduler(reg)
 
+    def init_deferred_input_release(self):
+        self.deferred_input_release = DeferredInputRelease()
+
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -1018,8 +1024,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
+                    if (deferred := self.deferred_input_release) is not None:
+                        deferred.release()
                     async for response in self._wait_one_response(obj, request):
                         yield response
+                    if deferred is not None:
+                        deferred.hold(obj.input_ids)
                 else:
                     async for response in self._handle_batch_request(
                         obj, request, request_states

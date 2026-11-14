@@ -12,6 +12,7 @@ Covers:
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
   - _handle_batch_output takes non-streaming first_token_time from the scheduler
+  - A finished request's prompt ids are freed after the next dispatch or idle
 """
 
 import asyncio
@@ -31,6 +32,9 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
+from sglang.srt.managers.deferred_input_release import (  # noqa: E402
+    DeferredInputRelease,
+)
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
@@ -2006,6 +2010,45 @@ class TestChatStreamDisconnect(CustomTestCase):
             self.assertFalse(live.abort_sent)
 
         asyncio.run(drive())
+
+
+class TestDeferredInputRelease(CustomTestCase):
+    def test_prompt_ids_are_freed_after_the_next_dispatch(self):
+        """A finished request's prompt ids outlive its stream (freeing a long
+        list delays the stream's end) and go once the next request is sent."""
+        tm = _make_tm_for_generate(self)
+        tm.init_deferred_input_release()
+        tm._tokenize_one_request = AsyncMock(return_value=SimpleNamespace())
+        tm._send_one_request = AsyncMock()
+        held = []  # held lists when each request waits, and after its stream
+
+        async def wait_one_response(obj, request=None):
+            held.append(len(tm.deferred_input_release))
+            yield {"text": "a"}
+
+        tm._wait_one_response = wait_one_response
+
+        async def drive():
+            for rid in ("first", "second"):
+                obj = _make_generate_obj(rid, is_single=True)
+                obj.input_ids, obj.return_prompt_token_ids = [1, 2], False
+                async for _ in tm.generate_request(obj):
+                    pass
+                held.append(len(tm.deferred_input_release))
+
+        asyncio.run(drive())
+        self.assertEqual(held, [0, 1, 0, 1])
+
+    def test_idle_timer_frees_after_a_release_rearms_it(self):
+        async def drive():
+            holder = DeferredInputRelease(idle_delay_s=0.01)
+            holder.hold([1])
+            holder.release()
+            holder.hold([2])
+            await asyncio.sleep(0.05)
+            return len(holder)
+
+        self.assertEqual(asyncio.run(drive()), 0)
 
 
 if __name__ == "__main__":
