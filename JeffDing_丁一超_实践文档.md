@@ -178,8 +178,26 @@ Max ITL (ms):                            27724.73
 ```bash
 sgl-eval run gsm8k \
  --model /workspace/shared_assets/OssSGLangMeetup/model/DeepSeek-V4-Flash-0731 \
- --base-url http://localhost:6688/v1 \
+ --base-url http://127.0.0.1:6688/v1 \
  --num-examples 10 --max-tokens 2048
+```
+测试结果：
+```
+Run directory: /root/.sgl_eval/sgl_eval_gsm8k_20261114-132022
+gsm8k: 100%|█████████████████████████████████████████████████████████████████████████████████| 10/10 [00:09<00:00,  1.10it/s, acc=100.00%, truncated=0/10 (0.00%)]
+== gsm8k ==
+10 examples (single-shot)  |  9.1s  |  111 tok/s  |  1K tokens
+
+* score                =  100.00%
+  stop_rate            =  100.00%
+  truncated_rate       =  0.00%
+  error_rate           =  0.00%
+  avg_input_tokens     =  86.7 tokens
+  avg_output_tokens    =  101.1 tokens
+  avg_thinking_tokens  =  0.0 tokens
+
+Metrics: /root/.sgl_eval/sgl_eval_gsm8k_20261114-132022/metrics.json
+Predictions: /root/.sgl_eval/sgl_eval_gsm8k_20261114-132022  (1 jsonl file(s))
 ```
 
 ### TPOT=20ms场景
@@ -340,6 +358,25 @@ sgl-eval run gsm8k \
  --model /workspace/shared_assets/OssSGLangMeetup/model/DeepSeek-V4-Flash-0731 \
  --base-url http://localhost:6688/v1 \
  --num-examples 10 --max-tokens 2048
+```
+
+测试结果：
+```
+Run directory: /root/.sgl_eval/sgl_eval_gsm8k_20261114-132308
+gsm8k: 100%|█████████████████████████████████████████████████████████████████████████████████| 10/10 [00:20<00:00,  2.04s/it, acc=100.00%, truncated=0/10 (0.00%)]
+== gsm8k ==
+10 examples (single-shot)  |  20.4s  |  50 tok/s  |  1K tokens
+
+* score                =  100.00%
+  stop_rate            =  100.00%
+  truncated_rate       =  0.00%
+  error_rate           =  0.00%
+  avg_input_tokens     =  86.7 tokens
+  avg_output_tokens    =  102.0 tokens
+  avg_thinking_tokens  =  0.0 tokens
+
+Metrics: /root/.sgl_eval/sgl_eval_gsm8k_20261114-132308/metrics.json
+Predictions: /root/.sgl_eval/sgl_eval_gsm8k_20261114-132308  (1 jsonl file(s))
 ```
 
 ---
