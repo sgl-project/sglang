@@ -15,7 +15,7 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
 from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -77,6 +77,79 @@ def test_wo_a_partial_quant_matches_quantize():
             q.view(torch.uint8), eq.view(torch.uint8), rtol=0, atol=0
         )
         torch.testing.assert_close(s, es, rtol=0, atol=0)
+
+
+def _mode_flags(mode):
+    flags = dict(is_decode=False, is_target_verify=False, is_prefill=False)
+    flags[mode] = True
+    return flags
+
+
+def _strided_bmm_cases(groups):
+    cases = [("is_target_verify", rows) for rows in (9, 64, 100, 128, 384)]
+    cases += [("is_prefill", rows) for rows in (4096, 8192, 16384, 65536)]
+    if groups != 2:
+        # 4 and 8 groups also take prefill below 4096 rows; 2 groups keep that floor
+        # and run 1-8 rows through the gemv and small-batch kernels instead
+        cases += [("is_prefill", rows) for rows in (1, 128, 2048, 4095)]
+        cases += [("is_decode", 1)]
+        cases += [("is_target_verify", rows) for rows in range(1, 9)]
+    for mode, rows in cases:
+        # attention may hand over a head slice of a padded buffer
+        for padded_heads in (groups * 8, 128):
+            yield mode, rows, padded_heads
+
+
+@pytest.mark.parametrize("groups", [2, 4, 8])
+def test_wo_a_strided_bmm_matches_einsum(groups):
+    """The strided bmm returns the einsum's values in the token-major layout wo_b reads."""
+    from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
+
+    torch.manual_seed(0)
+    wo_a = torch.randn(groups, 1024, 4096, device=DEVICE, dtype=torch.bfloat16) * 0.02
+    for mode, rows, padded_heads in _strided_bmm_cases(groups):
+        x = torch.randn(rows, padded_heads, 512, device=DEVICE, dtype=torch.bfloat16)[
+            :, : groups * 8
+        ].view(rows, groups, 4096)
+        out = _apply_wo_a_bf16_matmul(x, wo_a, fast_path=True, **_mode_flags(mode))
+        case = (groups, mode, rows, padded_heads)
+        assert out.is_contiguous(), case
+        assert torch.equal(out, torch.einsum("tgd,grd->tgr", x, wo_a)), case
+
+
+@pytest.mark.parametrize("groups", [2, 4, 8])
+def test_wo_a_strided_bmm_graph_replay_matches_einsum(groups):
+    """Replays of a captured call stay token-major and equal to the einsum on new inputs."""
+    from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
+
+    torch.manual_seed(0)
+    wo_a = torch.randn(groups, 1024, 4096, device=DEVICE, dtype=torch.bfloat16)
+    for mode, rows, padded_heads in _strided_bmm_cases(groups):
+        buf = torch.randn(rows, padded_heads, 512, device=DEVICE, dtype=torch.bfloat16)
+        x = buf[:, : groups * 8].view(rows, groups, 4096)
+        flags = _mode_flags(mode)
+        _apply_wo_a_bf16_matmul(x, wo_a, fast_path=True, **flags)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = _apply_wo_a_bf16_matmul(x, wo_a, fast_path=True, **flags)
+        case = (groups, mode, rows, padded_heads)
+        for _ in range(3):
+            buf.normal_()
+            wo_a.normal_(std=0.02)
+            graph.replay()
+            assert out.is_contiguous(), case
+            assert torch.equal(out, torch.einsum("tgd,grd->tgr", x, wo_a)), case
+
+
+@pytest.mark.parametrize("groups, rows", [(2, 4095)])
+def test_wo_a_strided_bmm_gate_rejects_unmeasured_prefill(groups, rows):
+    """Prefill shapes outside the measured gate keep the einsum's group-major layout."""
+    from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
+
+    wo_a = torch.randn(groups, 1024, 4096, device=DEVICE, dtype=torch.bfloat16)
+    x = torch.randn(rows, groups, 4096, device=DEVICE, dtype=torch.bfloat16)
+    out = _apply_wo_a_bf16_matmul(x, wo_a, fast_path=True, **_mode_flags("is_prefill"))
+    assert not out.is_contiguous()
 
 
 if __name__ == "__main__":
