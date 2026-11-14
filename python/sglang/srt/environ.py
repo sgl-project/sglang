@@ -938,6 +938,9 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Prefill GPU scratch, per transfer thread, into which a decode rank's heads of
+    # the page-row KV and the draft KV next to it are gathered before the transfer
+    SGLANG_DISAGG_GATHER_SCRATCH_MB = EnvInt(512)
     SGLANG_ENABLE_NIXL_KV_PACKING = EnvBool(False)
     SGLANG_NIXL_KV_PACK_BUFFER_SIZE_MB = EnvInt(64)
     # Queue incoming KV scatters between forwards; disabled by default.

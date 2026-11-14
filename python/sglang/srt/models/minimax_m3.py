@@ -1952,6 +1952,12 @@ class MiniMaxM3Model(nn.Module):
             )
 
         aux_hidden_states = AuxHiddenStateList()
+        # Earlier PP stages' DSpark captures, concatenated in layer order.
+        if (
+            not self.pp_group.is_first_rank
+            and "dspark_hidden_states" in pp_proxy_tensors.tensors
+        ):
+            aux_hidden_states.capture(pp_proxy_tensors["dspark_hidden_states"])
         if forward_batch.can_run_tbo:
             hidden_states = model_forward_stages(
                 layers=self.layers,
@@ -1983,7 +1989,12 @@ class MiniMaxM3Model(nn.Module):
                     )
 
         if not self.pp_group.is_last_rank:
-            return residual_batch.to_pp(hidden_states, forward_batch)
+            proxy = residual_batch.to_pp(hidden_states, forward_batch)
+            if aux_hidden_states:
+                proxy.tensors["dspark_hidden_states"] = torch.cat(
+                    aux_hidden_states, dim=-1
+                )
+            return proxy
         hidden_states = residual_batch.final_norm(
             hidden_states,
             forward_batch,

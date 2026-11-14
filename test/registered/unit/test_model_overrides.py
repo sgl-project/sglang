@@ -3791,6 +3791,58 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(ov["attention_backend"], "fa4")
             self.assertEqual(ov["page_size"], 128)
 
+    def test_m31_nvfp4_pp_only_for_dspark_pd_prefill(self):
+        """PP prefill relays the DSpark captures across stages, so DSPARK may run
+        PP on a PD prefill server; colocated serving and PD decode keep PP=1."""
+        from sglang.srt.arg_groups.model_overrides import minimax_m3_hip
+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
+            _minimax_m3_overrides,
+        )
+
+        hf = SimpleNamespace(
+            architectures=["MiniMaxM3SparseForConditionalGeneration"],
+            quantization_config={
+                "quant_method": "mxfp8",
+                "moe_quant_algo": "NVFP4",
+                "moe_quant_format": "nvfp4-pack-quantized",
+            },
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                quantization=None,
+                _quantization_explicitly_unset=False,
+                speculative_algorithm="DSPARK",
+                speculative_draft_kv_cache_dtype=None,
+                speculative_draft_attention_backend=None,
+                speculative_draft_model_quantization=None,
+                page_size=None,
+                tp_size=1,
+                pp_size=4,
+                disaggregation_mode="prefill",
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        rocm = dict(is_cuda=False, is_hip=True, is_blackwell=False, is_gfx95=True)
+        with (
+            override_platform(**rocm),
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            envs.SGLANG_SPEC_TP_SYNC.override("rng"),
+            patch.object(
+                minimax_m3_hip, "nvfp4_overrides", side_effect=lambda cfg, ov: ov
+            ),
+        ):
+            self.assertEqual(
+                _minimax_m3_overrides(_args(), hf)["quantization"], "minimax_m3_nvfp4"
+            )
+            for mode in ("null", "decode"):
+                with (
+                    self.subTest(mode=mode),
+                    self.assertRaisesRegex(ValueError, "PP=1"),
+                ):
+                    _minimax_m3_overrides(_args(disaggregation_mode=mode), hf)
+
     def test_page_constraint_passes_at_callable_level(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (

@@ -69,8 +69,9 @@ class DSparkMiniMaxAttention(MiniMaxM3Attention):
         return k_by_head.view_as(k)
 
     def apply_k_rope(self, positions: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        # Use a minimal dummy query (1 head) to avoid doing full-Q work.
-        dummy_q = k.new_empty((k.shape[0], self.head_dim))
+        # A dummy query as wide as k skips the full-Q work; the rope kernel needs its head
+        # count to be a multiple of k's, which a 1-head query is not past 1 KV head per rank.
+        dummy_q = torch.empty_like(k)
         _, k = self.rotary_emb(positions, dummy_q, k)
         return k
 

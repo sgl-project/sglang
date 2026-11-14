@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -136,6 +136,12 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    # Head-major page-row KV (MiniMax-M3.1 NVFP4): KV heads per rank ->
+    # ([(byte offset, bytes per head)] per row component, row bytes). None for
+    # token-major pools.
+    kv_page_row_head_layout: Optional[
+        Callable[[int], Tuple[List[Tuple[int, int]], int]]
+    ] = None
 
 
 class KVPoll:
@@ -180,6 +186,11 @@ class BaseKVManager(ABC):
     # Opt-in per backend: set True once the prefill acks a drained abort
     # (ABORT_ACK carrying the sender rank). Without it a hold only ends on timeout.
     supports_deferred_decode_kv_release: bool = False
+
+    # Opt-in per backend: set True once its sender head-slices MiniMax sparse KV
+    # (token-major FP8 and NVFP4 page rows) and broadcasts or elects the
+    # replicated index-K state across different attention TP sizes.
+    supports_minimax_heterogeneous_tp: bool = False
 
     def teardown(self) -> None:
         raise NotImplementedError(

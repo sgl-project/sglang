@@ -1560,6 +1560,20 @@ def build_staging_slot_metadata(
         inner = draft_kv_pool.layer_router.wrapped_view()
         if inner is not None:
             draft_kv_pool = inner
+    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+    # NVFP4 page rows are head-major per component, which the staging gather cannot
+    # slice by heads; they keep the direct page-row path.
+    if isinstance(kv_pool, MiniMaxSparseKVPool) and not isinstance(
+        kv_pool, MiniMaxM3Nvfp4KVPool
+    ):
+        return _minimax_staging_slot_metadata(
+            kv_layer_ids=kv_layer_ids,
+            num_draft_entries=num_draft_entries,
+            kv_pool=kv_pool,
+            draft_kv_pool=draft_kv_pool,
+        )
     if not isinstance(kv_pool, MHAKVView):
         return None
 
@@ -1580,6 +1594,51 @@ def build_staging_slot_metadata(
         k_ids += ids[num_target : num_target + draft_half]
         v_ids += ids[num_target + draft_half :]
     return k_buffers, v_buffers, k_ids + v_ids
+
+
+def _minimax_staging_slot_metadata(
+    *, kv_layer_ids, num_draft_entries: int, kv_pool, draft_kv_pool
+):
+    """Stage the kv_data_ptrs entries of a token-major MiniMax pool: the sparse
+    layers' K/V, then a DSpark draft's; index-K and dense-layer K/V ride the
+    state channel."""
+    from sglang.srt.mem_cache.kv.memory.views import MHAKVView
+
+    if kv_pool._enable_hisparse:  # the KV lands in the host pool, not these buffers
+        return None
+    # Storage-dtype views (uint8 for FP8), as an MHA pool's k_buffer / v_buffer.
+    layers = sorted(kv_pool.sparse_layer_id_mapping)
+    k_buffers = [kv_pool.get_key_buffer(i).view(kv_pool.store_dtype) for i in layers]
+    v_buffers = [kv_pool.get_value_buffer(i).view(kv_pool.store_dtype) for i in layers]
+    ids = list(kv_layer_ids or [])
+    if not num_draft_entries:
+        return k_buffers, v_buffers, ids
+    # The gather and scatter size every slot by the first buffer's heads, head
+    # dim and element size, so the draft must match the target on all three.
+    if not (
+        isinstance(draft_kv_pool, MHAKVView)
+        and all(
+            buffer.shape[1:] == k_buffers[0].shape[1:]
+            and buffer.element_size() == k_buffers[0].element_size()
+            for buffer in list(draft_kv_pool.k_buffer) + list(draft_kv_pool.v_buffer)
+        )
+    ):
+        raise RuntimeError(
+            "SGLANG_DISAGG_STAGING_BUFFER cannot stage this draft KV with the "
+            f"MiniMax KV ({k_buffers[0].dtype}, {tuple(k_buffers[0].shape[1:])} per "
+            "token); unset it or give the draft the target's KV cache dtype."
+        )
+    # [K target, V target, K draft, V draft] in kv_data_ptrs; all K, then all V here.
+    half = (len(ids) - num_draft_entries) // 2
+    draft_half = num_draft_entries // 2
+    return (
+        k_buffers + list(draft_kv_pool.k_buffer),
+        v_buffers + list(draft_kv_pool.v_buffer),
+        ids[:half]
+        + ids[2 * half : 2 * half + draft_half]
+        + ids[half : 2 * half]
+        + ids[2 * half + draft_half :],
+    )
 
 
 def append_state_component(
@@ -1798,6 +1857,64 @@ def get_kv_transfer_buf_infos(storage: KVStorage | StaticKVStorage):
     """The KV entries a PD peer registers: the storage's owner region."""
     region = storage.regions(storage.owner)
     return list(region.ptrs), list(region.lens), list(region.item_lens)
+
+
+def get_kv_page_row_head_layout(pool):
+    """KVArgs.kv_page_row_head_layout of a pool whose KV entries are head-major
+    page rows, else None."""
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+    if isinstance(pool, MiniMaxM3Nvfp4KVPool):
+        return pool.page_row_head_layout
+    return None
+
+
+def build_page_row_head_slice_blocks(
+    *,
+    src_ptr: int,
+    dst_ptr: int,
+    src_row_bytes: int,
+    dst_row_bytes: int,
+    src_pages: np.ndarray,
+    dst_pages: np.ndarray,
+    src_segments: Sequence[Tuple[int, int]],
+    dst_segments: Sequence[Tuple[int, int]],
+    src_head_start: int,
+    dst_head_start: int,
+    num_heads: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(src addrs, dst addrs, lengths) moving heads [src_head_start, +num_heads) of
+    every page row in src_pages to heads [dst_head_start, +num_heads) of the paired
+    dst_pages row: one copy per (page, component)."""
+    if len(src_segments) != len(dst_segments) or any(
+        src_per_head != dst_per_head
+        for (_, src_per_head), (_, dst_per_head) in zip(src_segments, dst_segments)
+    ):
+        raise ValueError(
+            f"page-row components differ: src={src_segments} dst={dst_segments}"
+        )
+    if len(src_pages) != len(dst_pages):
+        raise ValueError(
+            f"page counts differ: src={len(src_pages)} dst={len(dst_pages)}"
+        )
+    src_offsets = np.array(
+        [offset + src_head_start * per_head for offset, per_head in src_segments],
+        dtype=np.int64,
+    )
+    dst_offsets = np.array(
+        [offset + dst_head_start * per_head for offset, per_head in dst_segments],
+        dtype=np.int64,
+    )
+    lengths = np.array(
+        [num_heads * per_head for _, per_head in src_segments], dtype=np.int64
+    )
+    src_rows = src_ptr + np.asarray(src_pages, dtype=np.int64)[:, None] * src_row_bytes
+    dst_rows = dst_ptr + np.asarray(dst_pages, dtype=np.int64)[:, None] * dst_row_bytes
+    return (
+        (src_rows + src_offsets).reshape(-1),
+        (dst_rows + dst_offsets).reshape(-1),
+        np.broadcast_to(lengths, (len(src_pages), len(lengths))).reshape(-1),
+    )
 
 
 def _wire_state_type(state_type) -> Enum:

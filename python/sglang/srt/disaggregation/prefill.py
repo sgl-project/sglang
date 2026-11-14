@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
+    get_kv_page_row_head_layout,
     get_kv_transfer_buf_infos,
     get_pd_kv_layout,
     get_qsa_pending_state_indices,
@@ -435,6 +436,9 @@ class PrefillBootstrapQueue:
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
             storage=storage,
         )
+        kv_args.kv_page_row_head_layout = get_kv_page_row_head_layout(
+            self.token_to_kv_pool
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -470,6 +474,19 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
             **kv_manager_kwargs,
         )
+        if kv_args.kv_page_row_head_layout is not None:
+            from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+            # Page-row KV (and the draft KV next to it) is head-sliced with a GPU gather.
+            if isinstance(kv_manager, MooncakeKVManager):
+                kv_manager.set_gather_kv_tensors(
+                    row_tensors=self.token_to_kv_pool.get_sparse_kv_tensors(),
+                    draft_tensors=(
+                        draft_kv_pool._pd_registerable_tensors()
+                        if draft_kv_pool is not None
+                        else []
+                    ),
+                )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()

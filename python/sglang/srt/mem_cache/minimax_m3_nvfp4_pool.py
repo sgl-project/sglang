@@ -74,6 +74,23 @@ def msa_v1_page_row_bytes(
     )
 
 
+def main_page_row_head_layout(
+    head_num: int, head_dim: int, page_size: int
+) -> tuple[list[tuple[int, int]], int]:
+    """``[(byte offset, bytes per head)]`` of each component of a main page row,
+    and the row width, for a rank holding ``head_num`` KV heads.
+
+    Each component is head-major, so a run of heads is one contiguous byte range
+    per component: PD moves a head slice of a layer-page as one copy per component.
+    """
+    components = _main_page_components(head_num, head_dim, page_size)
+    offsets, row_bytes = _page_row_layout(components)
+    return [
+        (offset, math.prod(shape) // head_num)
+        for (_, shape), offset in zip(components, offsets)
+    ], row_bytes
+
+
 def _allocate_page_rows(pool: KVCache, components, num_pages: int, device: str):
     """One ``[layers, pages, row_bytes]`` slab and per-layer component views.
 
@@ -752,11 +769,23 @@ class MiniMaxM3Nvfp4KVPool(MiniMaxSparseKVPool):
     def get_sparse_kv_buf_infos(self):
         return self.main_pool.get_contiguous_buf_infos()
 
+    def get_sparse_kv_tensors(self):
+        """The [pages, row_bytes] page rows behind get_sparse_kv_buf_infos."""
+        return list(self.main_pool.rows)
+
+    def page_row_head_layout(self, head_num: int) -> tuple[list[tuple[int, int]], int]:
+        """main_page_row_head_layout of this pool's rows for a rank with head_num heads."""
+        return main_page_row_head_layout(
+            head_num, self.main_pool.head_dim, self.main_pool.page_size
+        )
+
     def get_kv_layer_ids(self):
         # One main page row per layer has no K/V halves; peers pair rows by id.
         return list(range(self.main_pool.start_layer, self.main_pool.end_layer))
 
     def get_index_k_state_buf_infos(self):
+        if self.index_k_pool is None:  # a PP stage without sparse layers
+            return [], [], []
         return self.index_k_pool.get_contiguous_buf_infos()
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):

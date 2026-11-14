@@ -73,8 +73,15 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
                 raise ValueError(
                     f"M3.1 NVFP4 {algorithm} requires SGLANG_RAGGED_VERIFY_MODE=static"
                 )
-            if cfg.pp_size != 1:
-                raise ValueError(f"M3.1 NVFP4 {algorithm} requires PP=1")
+            # A PD prefill server runs DSpark under PP: every stage relays its
+            # captures downstream and the last stage hosts the draft.
+            if cfg.pp_size != 1 and not (
+                algorithm == "DSPARK" and cfg.disaggregation_mode == "prefill"
+            ):
+                raise ValueError(
+                    f"M3.1 NVFP4 {algorithm} requires PP=1, except DSPARK on a "
+                    "PD prefill server"
+                )
             if algorithm == "DFLASH" and cfg.disaggregation_mode != "null":
                 raise ValueError(
                     "M3.1 NVFP4 DFLASH currently requires colocated serving"
