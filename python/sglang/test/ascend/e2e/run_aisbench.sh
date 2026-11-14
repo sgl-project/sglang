@@ -25,7 +25,7 @@ show_usage() {
     echo "  --repeat_rate       Repeat rate for prefix cache test (default: 0)"
     echo "  --dp                Data parallelism for prefix cache test (default: 2)"
     echo "  --seed              Dataset random seed for prefix cache test (optional)"
-    echo "  --warmup-passes     Discarded prefix-cache passes before the measured one (default: 0)"
+    echo "  --warmup-requests   Native aisbench warmup requests before measurement (default: 0)"
     echo "  --generation-kwargs Custom generation kwargs dict string (overrides defaults based on mode)"
     echo "                      Example: 'dict(temperature=0.5, top_k=10, top_p=0.95, seed=None, repetition_penalty=1.03)'"
     echo ""
@@ -54,7 +54,7 @@ REQUEST_RATE=0
 REPEAT_RATE=0
 DP=1
 SEED=""
-WARMUP_PASSES=0
+WARMUP_REQUESTS=0
 
 GENERATION_KWARGS=""
 
@@ -136,8 +136,8 @@ while [[ $# -gt 0 ]]; do
             SEED="$2"
             shift 2
             ;;
-        --warmup-passes)
-            WARMUP_PASSES="$2"
+        --warmup-requests)
+            WARMUP_REQUESTS="$2"
             shift 2
             ;;
         -h|--help)
@@ -586,6 +586,13 @@ EOF
             # stdin (absent in CI) and aborts. Patch the disposable copy.
             sed -i "s/from_pretrained(tokenizer_path)/from_pretrained(tokenizer_path, trust_remote_code=True)/" "${DEST_COPY_DIR}"/*.py
 
+            # The toolkit pins --num-warmups 0 in its aisbench perf command.
+            # Raise it to the requested count so aisbench's native warmup
+            # absorbs the first long-context decode after a fresh server start.
+            if [ "${WARMUP_REQUESTS:-0}" -gt 0 ]; then
+                sed -i "s/--num-warmups 0/--num-warmups ${WARMUP_REQUESTS}/" "${DEST_COPY_DIR}/aisbench_test.py"
+            fi
+
             echo "===== [Mode] Prefix Cache Test (Hit Rate: $REPEAT_RATE) ====="
             echo "Use dataset: ${DATASET_NAME}, dataset_file: ${dataset_file}"
             echo "Input tokens: ${INPUT_LEN} | Output tokens: ${OUTPUT_LEN} | Batch size: ${BATCH_SIZE} | Prompts num: ${NUM_PROMPTS}"
@@ -608,19 +615,7 @@ EOF
             echo "Executing: ${PREFIX_TEST_CMD}"
 
             source ${PYTHON_ENV_FOR_AISBENCH}/bin/activate
-            # The first prefix-cache pass after a fresh server start can stall
-            # for ~1 min on the initial long-context decode, so optionally run
-            # discarded warmup passes and keep only the last (measured) one.
-            # aisbench_test.py truncates aisbench.log at the start of each run,
-            # and the metric parser below reads the last summarizer table.
-            for pass in $(seq 1 $((WARMUP_PASSES + 1))); do
-                if [ "$pass" -le "$WARMUP_PASSES" ]; then
-                    echo "===== Prefix warmup pass ${pass} / ${WARMUP_PASSES} (discarded) ====="
-                else
-                    echo "===== Prefix measured pass ====="
-                fi
-                eval "${PREFIX_TEST_CMD}"
-            done
+            eval "${PREFIX_TEST_CMD}"
             exit 0
         else
             echo "===== [Mode] Standard AISBench Performance Test ====="

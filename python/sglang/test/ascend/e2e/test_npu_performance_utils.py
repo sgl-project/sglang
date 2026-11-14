@@ -663,7 +663,7 @@ def run_aisbench(
     dp=None,
     generation_kwargs=None,
     seed=None,
-    warmup_passes=0,
+    warmup_requests=None,
 ):
 
     if dataset_type == "sharegpt":
@@ -769,8 +769,8 @@ def run_aisbench(
         cmd += f" --dp {dp}"
     if seed is not None:
         cmd += f" --seed {seed}"
-    if warmup_passes:
-        cmd += f" --warmup-passes {warmup_passes}"
+    if warmup_requests:
+        cmd += f" --warmup-requests {warmup_requests}"
     if generation_kwargs:
         cmd += f" --generation-kwargs '{generation_kwargs}'"
 
@@ -1189,7 +1189,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     image_resolution = None
     image_count = None
     warmup_requests = None
-    warmup_passes = None
     seed = None
     temperature = None
     top_p = None
@@ -1385,7 +1384,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
                 seed=self.seed,
-                warmup_passes=self.warmup_passes,
+                warmup_requests=self.warmup_requests,
             )
             assert_metrics(self, metrics)
 
@@ -1442,7 +1441,6 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     image_resolution = None
     image_count = None
     warmup_requests = None
-    warmup_passes = None
     seed = None
     temperature = None
     top_p = None
@@ -1536,7 +1534,7 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
                 seed=self.seed,
-                warmup_passes=self.warmup_passes,
+                warmup_requests=self.warmup_requests,
             )
             assert_metrics(self, metrics)
 
@@ -1593,7 +1591,6 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     image_resolution = None
     image_count = None
     warmup_requests = None
-    warmup_passes = None
     seed = None
     temperature = None
     top_p = None
@@ -1709,7 +1706,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
                 seed=self.seed,
-                warmup_passes=self.warmup_passes,
+                warmup_requests=self.warmup_requests,
             )
             assert_metrics(self, metrics)
 
