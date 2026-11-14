@@ -197,7 +197,7 @@ Generate a 1024×1024 image and upscale to 4096×4096:
 sglang generate \
   --model-path black-forest-labs/FLUX.2-dev \
   --prompt "A cat sitting on a windowsill" \
-  --output-size 1024x1024 \
+  --height 1024 --width 1024 \
   --enable-upscaling \
   --save-output
 ```

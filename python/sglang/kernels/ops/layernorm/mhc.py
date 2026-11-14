@@ -2143,7 +2143,7 @@ def npu_hc_pre(
     hc_eps: float,
     forward_batch=None,
 ) -> tuple:
-    """NPU-accelerated hc_pre via the custom_ops kernel.
+    """NPU-accelerated hc_pre via the fused pre+sinkhorn op.
 
     Returns (y, post, comb, norm_fused).  norm_fused is always False
     because npu_hc_pre does not fold input_layernorm — the caller must
@@ -2168,25 +2168,12 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    # Note the return order: (y, post, comb) — y is the (T, hidden)
-    # mixed activation, post / comb are the hc_post inputs. The
-    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
-    # cast back to the input dtype before the downstream
-    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
-    y, post, comb = torch.ops.custom.npu_hc_pre(
-        x,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        hc_mult=hc_mult,
-        hc_sinkhorn_iters=hc_sinkhorn_iters,
-        norm_eps=rms_norm_eps,
-        hc_eps=hc_eps,
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
+
+    y, post, comb = mhc_pre_dpskv4(
+        x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps
     )
-    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
-    # not fold input_layernorm. Return norm_fused=False so the caller
-    # applies the layernorm itself, matching the deepgemm/torch paths.
-    return y.to(dtype), post, comb, False
+    return y, post, comb, False
 
 
 @triton.jit
@@ -2690,14 +2677,18 @@ def hc_mix_stats_sinkhorn_bf16x3(
     rms_eps: float,
     hc_eps: float,
     hc_mult: int = 4,
+    decode_grid: bool = False,
 ):
     m, k = x.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
-    block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+    if decode_grid:
+        slices, block_m = 64, 64
+    else:
+        slices = _HC_MIX_COMPENSATED_SLICES
+        block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
     assert x.is_contiguous() and x.dtype == torch.bfloat16
-    assert hopper_medium or 4096 <= m <= 65536
+    assert decode_grid or hopper_medium or 4096 <= m <= 65536
     assert k % (slices * _HC_MIX_BF16X3_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(

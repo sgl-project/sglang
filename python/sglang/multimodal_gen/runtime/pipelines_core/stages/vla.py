@@ -602,6 +602,8 @@ class VLAActionPostprocessStage(PipelineStage):
             "actions": actions_out,
         }
         payload["parameters"] = {"num_inference_steps": batch.num_inference_steps}
+        if "extras" in state:
+            payload["extras"] = state["extras"]
         if options.get("return_timing", True):
             timings = dict(vla_timings(batch))
             timings["postprocess_ms"] = (time.perf_counter() - start) * 1000

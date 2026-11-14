@@ -16,7 +16,7 @@ Multi-step denoising amplifies a per-step rounding difference into visible quali
 
 **Same math, different rounding — request-gated at `lossless`.** These keep the reference function and the precision of every operand and accumulator; only the place or the order of the rounding moves, so the result is within rounding error of the reference rather than equal to it. They are mounted for `quality="lossless"` (the default) and `quality="high"` requests, at batch boundaries, all-or-nothing per transformer. `quality="exact"` runs the unmodified reference chain instead.
 
-**Approximate — request-gated at `high`.** A fusion that quantizes, lowers an operand or accumulator precision, or sits upstream of a quantizer or threshold is no longer a rounding difference, so it needs model-level quality evaluation and is mounted only for `quality="high"`. Today that is the FLUX.2 NVFP4 FC1+SwiGLU+quant path (it quantizes FC2's input before the reference BF16 intermediate exists), Ideogram's BF16-native gate RMSNorm (the reference keeps the norm statistics in fp32), SANA-Video's BF16-input linear attention (the reference promotes those inputs to FP32), and SANA-Video 2.0's BF16-input softmax attention in its anchor layers (the reference promotes Q/K/V to FP32, which also forces the FP32 memory-efficient SDPA kernel).
+**Approximate — request-gated at `high`.** A fusion that quantizes, lowers an operand or accumulator precision, or sits upstream of a quantizer or threshold is no longer a rounding difference, so it needs model-level quality evaluation and is mounted only for `quality="high"`. Today that is the FLUX.2 NVFP4 FC1+SwiGLU+quant path (it quantizes FC2's input before the reference BF16 intermediate exists), Ideogram's BF16-native gate RMSNorm (the reference keeps the norm statistics in fp32), SANA-Video's BF16-input linear attention (the reference promotes those inputs to FP32), SANA-Video 2.0's BF16-input softmax attention in its anchor layers (the reference promotes Q/K/V to FP32, which also forces the FP32 memory-efficient SDPA kernel), and Wan's ROCm FlyDSL norm + scale/shift (the reference keeps the gate/modulation operands and residuals in FP32).
 
 **Model/checkpoint-native.** Generic close-contract kernels, sparse operators, and FP8/NVFP4 producers can be part of a model implementation or a separately selected deployment path. They are documented in the inventory, but `quality` does not select or undo those choices.
 
@@ -75,14 +75,13 @@ The `quality` field in a **video response** body is unrelated. It is Sora-compat
 
 `quality` participates in the dynamic-batch signature, so mixed-quality traffic is batched separately and the transition happens safely at a batch boundary. Mounting is all-or-nothing: if any marked site on a transformer fails its static guards, no site on that transformer is fused.
 
-<Warning>
-Do not combine request-gated DiT fusions with `--enable-breakable-cuda-graph`.
-BCG warmup captures the lossless module branches before an `lossless` or
-`high` request mounts its DiT fusions, so replay would bypass the requested
-kernels. SGLang rejects this combination for models with eligible DiT quality
-sites. Models whose request-gated path changes only VAE decode remain allowed
-because BCG captures the DiT only.
-</Warning>
+<Note>
+Under `--enable-breakable-cuda-graph`, warmup captures graphs only at the
+warmup request's quality level (the default `lossless` unless
+`--warmup-sampling-params` sets `quality`). Requests at another `quality` level run eagerly
+with their own fusion set, so they work but get no CUDA-graph speedup. BCG
+captures only the DiT, so VAE-only request-gated paths are unaffected.
+</Note>
 
 These fusion families mount under both `quality="lossless"` and
 `quality="high"`:
@@ -92,23 +91,30 @@ These fusion families mount under both `quality="lossless"` and
 | Linear + tanh-GELU | Bias-add and GELU into the GEMM epilogue (cublasLt), removing the `[tokens, 4*dim]` intermediate round trip |
 | Wan NVFP4 linear + GELU | Bias-add and GELU fused into Wan's NVFP4 FFN projection output |
 | Qwen-Image added-QKV | Added Q/K/V projections fused into joint-buffer production |
-| Qwen-Image 2.1 BF16 image MLP | One gate/up GEMM and packed SiLU-mul on SM120 for resident, unquantized TP1 projections and batch-one target sequences of 1024 or 4096 tokens. GEMM width can change rounding. Conditioning prefixes, `exact`/`lossless`, LoRA wrappers and `torch.compile` keep separate projections |
 | LayerNorm + modulate | `layer_norm(x, weight=(1 + scale), bias=shift)` in place of affine-free LN plus a separate modulate |
 | LTX-2 RMSNorm + modulate | `rms_norm(x) * (1 + scale) + shift` in one launch |
-| Gate RMSNorm (BF16-native) | `RMSNorm + tanh + mul + add` in one pass |
 | HunyuanVideo strided QK RMSNorm | Per-head QK RMSNorm over the packed QKV layout |
 | LingBot Video fused RMSNorm | Replaces the handwritten cast, square, mean, rsqrt, and multiply chain with existing Triton RMSNorm kernels |
 | LingBot Video per-token gated residual + RMSNorm modulate | Folds `residual + gate * update` (per-token `[B, S, 1]` gate) and the `rmsnorm(x) * (1 + scale) + shift` adaLN chain (strided `[B, S, 6D]` chunk views) into single kernels |
-| SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
-| SANA-Video 2.0 BF16-input softmax attention | Hands the anchor layers' BF16-valued Q/K/V to SDPA without the FP32 upcast, so flash attention is eligible; QK^T, softmax and PV still accumulate in FP32, and only the probabilities round to BF16 before the PV GEMM |
 | Dynamic LoRA delta | An unmerged adapter's scaled update accumulated onto the base output by its second GEMM (`addmm`, one rounding), and a row-parallel layer's bias added in the base GEMM's epilogue, instead of materializing the `[tokens, out]` delta and scaling and adding it in separate passes |
 | FLUX-family VAE fast paths | Channels-last decode, GroupNorm(+SiLU), upsample, and attention replacements for FLUX.2 and AutoencoderKL-based FLUX.1, Z-Image, and SD3 pipelines |
 | Wan VAE RMSNorm + SiLU | Replaces the channel-first RMSNorm/SiLU chain while keeping the decode in `channels_last_3d` |
 | MiniMax-H3 VAE decoder fast path | Per-head fp32 RMSNorm, rounded to the activation dtype, and NeoX RoPE in one launch over the strided Q/K views of the ViT decoder's QKV buffer; cuDNN SDPA for the block's attention; up to `vae_config.decoder_tile_batch` spatial tiles and `vae_config.window_batch` temporal windows per decoder forward. On SM100+ the temporal blend write and output de-normalization run as bit-exact kernels at every quality level |
 
+These fusion families mount only under `quality="high"`:
+
+| Fusion | What it folds |
+| --- | --- |
+| FLUX.2 NVFP4 FC1 + SwiGLU + quant | FC1 GEMM, SwiGLU and NVFP4 quantization of FC2's input in one pass; quantizes before the reference BF16 intermediate exists |
+| Qwen-Image 2.1 BF16 image MLP | One gate/up GEMM and packed SiLU-mul on SM120 for resident, unquantized TP1 projections and batch-one target sequences of 1024 or 4096 tokens. GEMM width can change rounding. Conditioning prefixes, `exact`/`lossless`, LoRA wrappers and `torch.compile` keep separate projections |
+| Gate RMSNorm (BF16-native) | `RMSNorm + tanh + mul + add` in one pass |
+| SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
+| SANA-Video 2.0 BF16-input softmax attention | Hands the anchor layers' BF16-valued Q/K/V to SDPA without the FP32 upcast, so flash attention is eligible; QK^T, softmax and PV still accumulate in FP32, and only the probabilities round to BF16 before the PV GEMM |
+| Wan ROCm FlyDSL norm + scale/shift | FlyDSL (residual +) norm + scale/shift for Wan on ROCm with `SGLANG_USE_ROCM_FLYDSL`; converts the FP32 gate/modulation operands and residuals to BF16. Below `high`, these layers run the native path |
+
 ## Kernel inventory
 
-46 operators are registered in the kernel registry across 52 implementations (some operators carry several backends). Backends are named by provenance, not device: `KDA` identifies Kernel Design Agents implementations, `JIT` compiles under nvcc *and* hipcc, `TRITON` identifies Triton sources, `CUTE_DSL` needs CUTLASS, `FLYDSL` is ROCm gfx950 only, and `AOT` comes from the `sgl_kernel` wheel. Per-operator capability metadata determines which devices can load each implementation.
+Operators are registered in the kernel registry under `diffusion.*`, and some carry several backend implementations (query the live list as shown in [Inspecting what is registered](#inspecting-what-is-registered)). Backends are named by provenance, not device: `KDA` identifies Kernel Design Agents implementations, `JIT` compiles under nvcc *and* hipcc, `TRITON` identifies Triton sources, `CUTE_DSL` needs CUTLASS, `FLYDSL` is ROCm gfx950 only, and `AOT` comes from the `sgl_kernel` wheel. Per-operator capability metadata determines which devices can load each implementation.
 
 ### Normalization
 
@@ -134,6 +140,7 @@ These fusion families mount under both `quality="lossless"` and
 | --- | --- | --- | --- |
 | `modulate_scale_shift` | JIT CUDA | bit-exact | `x * (1 + scale) + shift` |
 | `residual_gate_add` | KDA (JIT CUDA) | bit-exact | `residual + gate * update` |
+| `residual_gate_fp32` | Triton | bit-exact against the verified native `addcmul` dispatch | Joy Image Edit large BF16 residual updates on SM103; keeps the product in FP32 until the final cast |
 | `try_fused_scaled_residual_bf16` | Triton | bit-exact against the verified native dispatch | LingBot World causal BF16 residual with an FP32 per-frame gate; skips the unused normalized output before camera conditioning |
 | `timestep_embedding` | JIT CUDA | close | sinusoidal timestep embedding |
 | `temb_table_slices` | Triton | bit-exact | see note below |
@@ -144,6 +151,11 @@ affine row per token. The causal normalization and residual paths verify each
 new signature outside CUDA graph capture and fall back to their native chains
 on mismatch or unsupported layouts. These paths preserve `lossless` arithmetic;
 kernel replay support does not enable BCG for a model configuration that disables it.
+
+Joy uses `residual_gate_fp32` for contiguous BF16 residual updates with at least
+16,777,216 elements on SM103. Each new shape and gate-stride signature is
+verified against `torch.addcmul`. Small text updates, other layouts and
+architectures, gradient-enabled calls, and compilation retain the native path.
 
 <Tip>
 `temb_table_slices` is worth knowing about. The eager `(scale_shift_table + temb.float()).chunk(6, dim=2)` materializes roughly 8 GB of fp32 at 704p/121f *and* hands six **strided** slices downstream, whose `.contiguous()` calls then copy each one again. The fused kernel produces the six slices in one pass, each naturally contiguous, so the downstream copies become no-ops.
@@ -162,6 +174,7 @@ kernel replay support does not enable BCG for a model configuration that disable
 | `helios_qk_rope` | JIT CUDA | bit-exact | paired in-place Helios Q/K RoPE with transposed frequency layout |
 | `ltx2_qknorm_split_rope` | KDA (JIT CUDA) | close (validated on B200) | LTX-2 QK-norm + split RoPE |
 | `ltx25_decoder_rope` | JIT CUDA | bit-exact | paired LTX-2.5 decoder 3D RoPE from cached compact axis tables |
+| `fused_nomas_qk_norm_mrope` | Triton | bit-exact against the compiled parameter graph, verified per signature | Nomas PixelUMM VAE BF16 Q/K normalization and 64/32/32-axis RoPE on SM100+, retaining ATen mean squares and the compiled fallback |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact | QKV pack and RoPE in one pass |
 
 The Klein strided path preserves the BF16 rounding between RMSNorm and RoPE,
@@ -216,10 +229,11 @@ unsupported layouts, gradient-bearing inputs, and unverified signatures
 during graph capture use the native path. This does not enable model-level
 BCG support.
 
-For large Hopper BF16 image Q/K with 32 heads of width 128, Joy also uses
-the existing out-of-place QK-Norm + RoPE kernel to read the packed projection
-directly. This removes two input copies while retaining the original CUDA
-arithmetic and contiguous outputs. Each new signature is checked bitwise;
+On SM90 and SM103, Joy uses the existing out-of-place QK-Norm + RoPE
+kernel for packed BF16 image Q/K tensors with 32 heads of width 128 and
+at least 16,777,216 elements. It reads the packed projection directly,
+removing two input copies while retaining the original CUDA arithmetic
+and contiguous outputs. Each new signature is checked bitwise;
 inputs remain intact if the operation fails. Other shapes and platforms,
 compilation, unverified capture, and `SGLANG_ENABLE_FUSED_QKNORM_ROPE=0`
 retain the original helper.
@@ -245,7 +259,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Qwen-Image | linear+GELU, select-0/1 LN modulation, added-QKV fusion, QK RMSNorm+RoPE+joint QKV writes, residual norm/modulate+NVFP4 producer |
 | GLM-Image | LN+modulate, per-head qk LN, residual-gate add, linear+GELU |
 | ERNIE-Image | RMSNorm+scale/shift, residual-gated variant, rotate-half RoPE, residual-gate add |
-| Joy Image Edit | Bitwise image/text QKV concatenation; strided image QK-Norm + RoPE on Hopper |
+| Joy Image Edit | Bitwise image/text QKV concatenation; strided image QK-Norm + RoPE on Hopper; FP32-intermediate BF16 image residual updates on SM103 |
 | Z-Image | BF16-native RMSNorm scale / tanh-residual, per-head QK RMSNorm |
 | Ideogram 4 | gate RMSNorm, SwiGLU, rotate-half RoPE, modulate, residual-gate add |
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
@@ -253,7 +267,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | HunyuanVideo / Helios | QKV+RoPE pack, strided QK RMSNorm, linear+GELU; Helios also has paired in-place Q/K RoPE |
 | LingBot Video MoE | Default-on group-limited top-k expert selection; fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=lossless` or `quality=high` |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
-| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; GLUMB bias+SiLU / bias+GLU in eager and BCG; LN+modulate and residual-gate add during BCG; BF16-input linear attention at `quality=lossless` or `quality=high` |
+| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; GLUMB bias+SiLU / bias+GLU in eager and BCG; LN+modulate and residual-gate add during BCG; BF16-input linear attention at `quality=high` |
 | SANA-Video 2.0 | BF16-input softmax attention in the anchor layers at `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
 | Wan / LongLive 2 VAE | temb table slices (Wan); VAE cat+pad and DupUp3D add; lossless FP32 normalization post-ops; full `channels_last_3d` RMSNorm+SiLU at `quality=lossless` or `quality=high` |

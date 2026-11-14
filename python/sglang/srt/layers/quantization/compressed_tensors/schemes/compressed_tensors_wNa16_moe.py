@@ -157,6 +157,18 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             num_groups_w2 = num_groups_w13 = 1
             self.group_size = -1
         else:
+            if (
+                not load_full_w2
+                and intermediate_size_per_partition % self.group_size != 0
+            ):
+                # Each rank narrows whole scale groups, so a shard that starts
+                # or ends mid-group would pair its K range with the wrong scales.
+                raise ValueError(
+                    "Compressed-tensors WNA16 MoE needs the per-rank intermediate "
+                    f"size ({intermediate_size_per_partition}) to be divisible by "
+                    f"group_size ({self.group_size}). Use a tensor parallel size "
+                    "that keeps whole groups per rank, or enable expert parallelism."
+                )
             num_groups_w2 = w2_scales_size // self.group_size
             num_groups_w13 = hidden_size // self.group_size
 

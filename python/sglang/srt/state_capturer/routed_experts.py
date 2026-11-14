@@ -26,7 +26,11 @@ from sglang.srt.runtime_context import (
     get_schedule,
     is_scheduler_io_rank,
 )
-from sglang.srt.state_capturer.base import BaseTopkCapturer
+from sglang.srt.state_capturer.base import BaseTopkCapturer, TopkCaptureOutput
+from sglang.srt.utils.device import async_d2h
+
+# Key of the routed-expert rows in the tensor dicts pipeline stages exchange.
+PP_ROUTED_EXPERTS_KEY = "routed_experts"
 
 
 def _is_scattered_a2a_backend() -> bool:
@@ -44,7 +48,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     experts; the host cache and user-facing return drop them via the
     [:topk_size] truncation.
 
-    Only the rank that sends outputs keeps a host cache.
+    Only the rank that sends outputs keeps a host cache. Under pipeline
+    parallelism each stage appends its layers' rows to the relayed ones; the
+    first stage stores the full rows once the last stage sends them back.
     """
 
     @staticmethod
@@ -54,6 +60,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         model_config: ModelConfig,
         num_tokens: int,
         max_running_requests: int,
+        stage_start_layer: int,
+        stage_end_layer: int,
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
         if not get_exec().features.enable_return_routed_experts:
@@ -66,6 +74,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             num_tokens=num_tokens,
             max_running_requests=max_running_requests,
             num_fused_shared_experts=num_fused_shared_experts,
+            stage_start_layer=stage_start_layer,
+            stage_end_layer=stage_end_layer,
             device=device,
         )
 
@@ -75,9 +85,16 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         num_tokens: int,
         max_running_requests: int,
         num_fused_shared_experts: int,
+        stage_start_layer: int,
+        stage_end_layer: int,
         device: str,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
+        # Global ids [start, end) of this pipeline stage's layers; the whole
+        # model without PP.
+        self.stage_start_layer = stage_start_layer
+        self.stage_end_layer = stage_end_layer
+        self.is_pipelined = get_parallel().pp_size > 1
         topk_size = model_config.hf_text_config.num_experts_per_tok
         num_layers = model_config.hf_text_config.num_hidden_layers
 
@@ -100,8 +117,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
             # Other ranks compute the same ids (or join the gather below) and
-            # send nothing, so they keep no rows.
-            allocate_caches=is_scheduler_io_rank(),
+            # send nothing, so they keep no rows. Under PP every rank sends its
+            # slice of the rows to the next stage, so all keep a device cache.
+            allocate_host_cache=is_scheduler_io_rank(),
+            allocate_device_cache=is_scheduler_io_rank() or self.is_pipelined,
         )
 
         # Rebuild the full token batch before routed-expert readback.
@@ -155,6 +174,21 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             topk_indices[source : source + end - start]
         )
 
+    def on_forward_end(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: Optional[int],
+        no_copy_to_cpu: bool = False,
+    ) -> Optional[TopkCaptureOutput]:
+        # Under PP the rows ride to the next stage instead of the host cache.
+        return super().on_forward_end(
+            forward_batch=forward_batch,
+            can_run_graph=can_run_graph,
+            cuda_graph_batch=cuda_graph_batch,
+            no_copy_to_cpu=no_copy_to_cpu or self.is_pipelined,
+        )
+
     def _get_local_slice(
         self,
         forward_batch: ForwardBatch,
@@ -171,8 +205,60 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         else:
             local_start_pos, local_end_pos = 0, forward_batch.out_cache_loc.shape[0]
         return self.device_cache.buffer[
-            local_start_pos:local_end_pos, :, : self.topk_size
+            local_start_pos:local_end_pos,
+            self.stage_start_layer : self.stage_end_layer,
+            : self.topk_size,
         ]
+
+
+def merge_pipeline_stage_rows(
+    *,
+    relayed: Optional[torch.Tensor],
+    local: torch.Tensor,
+    stage_start_layer: int,
+) -> torch.Tensor:
+    """Rows are [num_tokens, layers, topk]; relayed covers the stages before
+    this one, local this stage's own layers."""
+    if relayed is None:
+        assert stage_start_layer == 0, "no routed experts from the previous stage"
+        return local
+    assert relayed.shape[1] == stage_start_layer, (
+        f"relayed {relayed.shape[1]} layers, stage starts at {stage_start_layer}"
+    )
+    return torch.cat((relayed, local), dim=1)
+
+
+def merge_relayed_routed_experts(
+    *,
+    output: Optional[TopkCaptureOutput],
+    relayed: Optional[torch.Tensor],
+) -> Optional[TopkCaptureOutput]:
+    if output is None:
+        return None
+    output.topk = merge_pipeline_stage_rows(
+        relayed=relayed,
+        local=output.topk,
+        stage_start_layer=get_global_experts_capturer().stage_start_layer,
+    )
+    return output
+
+
+def returned_routed_experts_output(
+    *,
+    rows: Optional[torch.Tensor],
+    slots: Optional[torch.Tensor],
+) -> Optional[TopkCaptureOutput]:
+    """Rows the last pipeline stage sent back, at the KV slots the first stage
+    recorded at launch; only the rank with the host cache records slots."""
+    if slots is None:
+        return None
+    output = TopkCaptureOutput(
+        out_cache_loc=slots,
+        topk=rows,
+        host_cache=get_global_experts_capturer().host_cache,
+    )
+    output.map_device_tensors(async_d2h)
+    return output
 
 
 def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:

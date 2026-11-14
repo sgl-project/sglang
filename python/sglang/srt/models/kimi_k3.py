@@ -210,6 +210,13 @@ def _uses_modelopt_fp8_pb_wo(
     return resolver is not None and resolver(prefix) == "FP8_PB_WO"
 
 
+def _uses_modelopt_mxfp8(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    resolver = getattr(quant_config, "_resolve_quant_algo", None)
+    return resolver is not None and resolver(prefix) == "MXFP8"
+
+
 def _uses_split_gguf_kv_b(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
@@ -227,13 +234,18 @@ def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
 
 
 def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
-    """Return a dense weight with serialized block-FP8 scales applied."""
+    """Return a dense weight with serialized block-FP8 or MXFP8 scales applied."""
     weight = module.weight.data
     if not hasattr(module, "weight_scale_inv"):
         return weight
+    scale = module.weight_scale_inv.data
+    if scale.dtype == torch.uint8:
+        # MXFP8 UE8M0 exponents, still in checkpoint layout: the model's
+        # post-load runs before process_weights_after_loading reorders them.
+        scale = torch.exp2(scale.to(torch.float32) - 127.0)
     return block_quant_dequant(
         weight,
-        module.weight_scale_inv,
+        scale,
         module.quant_method.weight_block_size,
         module.params_dtype,
     )
@@ -501,6 +513,7 @@ def _uses_ep_a2a() -> bool:
         _a2a_backend.is_megamoe()
         or _a2a_backend.is_flashinfer_megamoe()
         or _a2a_backend.is_deepep()
+        or _a2a_backend.is_ascend_ops()
         or _a2a_backend.is_mooncake()
         or _a2a_backend.is_ascend_fuseep()
         or _a2a_backend.is_mori()
@@ -1818,6 +1831,9 @@ class KimiK3DeltaAttention(nn.Module):
         self._bfa_uses_block_fp8 = self.use_full_rank_gate and _uses_modelopt_fp8_pb_wo(
             quant_config, f"{prefix}.b_proj"
         )
+        self._bfa_uses_mxfp8 = self.use_full_rank_gate and _uses_modelopt_mxfp8(
+            quant_config, f"{prefix}.b_proj"
+        )
 
         # The full-rank [q, k, v, g] merged projection is explicitly sharded
         # using attention-TP placement, so it also supports DP attention.
@@ -2102,7 +2118,7 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_f_b_w = self.f_b_proj.weight
             return
         mods = [self.f_a_proj, self.b_proj]
-        if self._bfa_uses_block_fp8:
+        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
             weights = [_get_k3_dense_weight(mod) for mod in mods]
             sizes = [weight.shape[0] for weight in weights]
             pad = (-sum(sizes)) % 8
@@ -2188,9 +2204,9 @@ class KimiK3DeltaAttention(nn.Module):
             return False
         if not (self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel):
             return False
-        # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
+        # Block-FP8 / MXFP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
-        if self._bfa_uses_block_fp8:
+        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
             return False
         ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
@@ -3457,11 +3473,16 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import register_tgv_m_ranges
+        if not (_is_hip or _is_npu):
+            # The CuTe DSL GEMM module imports cuda.bindings and cutlass at
+            # module level; neither ships on ROCm or Ascend NPU.
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                register_tgv_m_ranges,
+            )
 
-        register_tgv_m_ranges(_K3_TGV_M_RANGES)
-        if get_platform().device_sm == 103:
-            register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
+            register_tgv_m_ranges(_K3_TGV_M_RANGES)
+            if get_platform().device_sm == 103:
+                register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
@@ -3793,8 +3814,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
-                    if name.endswith(".b_proj.weight_scale_inv"):
-                        # All TP ranks share K3's single beta output-scale block.
+                    if (
+                        name.endswith(".b_proj.weight_scale_inv")
+                        and param.data.shape == loaded_weight.shape
+                    ):
+                        # FP8_PB_WO: all TP ranks share K3's single beta
+                        # output-scale block. MXFP8 per-row scales shard below.
                         param.data.copy_(loaded_weight)
                     else:
                         weight_loader = getattr(

@@ -200,6 +200,7 @@ jobs:
       partitions: '{"size":2,"arr":[0,1]}'
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
+      sgl_router: true
     secrets: inherit
 
   nightly-8-npu-a3:
