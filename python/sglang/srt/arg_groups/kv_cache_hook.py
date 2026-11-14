@@ -43,6 +43,16 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
             )
         return
 
+    if cfg.attention_backend == "dsa":
+        # DSA NVFP4 is the 352 B/token prims_ts row; prims_ts reads it in
+        # prefill too, so there is no prefill dequantization workspace.
+        if requested_dtype != "auto":
+            raise ValueError(
+                "--prefill-kv-cache-dequant-dtype does not apply to DSA NVFP4 KV: "
+                "prims_ts reads the packed cache in both phases."
+            )
+        return
+
     if requested_dtype == "auto":
         explicit_backend = cfg.prefill_attention_backend or cfg.attention_backend
         if explicit_backend in _NVFP4_PREFILL_DEQUANT_DTYPE:
@@ -298,6 +308,9 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                         "flashinfer",
                         "trtllm_mla",
                     ]
+                    if cfg.kv_cache_dtype == "nvfp4":
+                        # DSA's own resolver admits only prims_ts over NVFP4.
+                        KV4_ATTENTION_MLA_BACKEND_CHOICES.append("dsa")
                     assert attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES, (
                         f"KV4 MLA expects attention_backend to be one of "
                         f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {attention_backend}"

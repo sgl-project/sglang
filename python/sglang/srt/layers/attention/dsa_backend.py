@@ -90,8 +90,10 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolWritePlan,
 )
 from sglang.srt.layers.attention.dsa.prims_ts import (
+    PRIMS_TS_TOPK,
     PrimsTSSparseMLA,
     check_prims_ts_sparse_mla_support,
+    make_prims_ts_causal_indices,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
@@ -712,6 +714,8 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+    # prims_ts over the 352 B/token NVFP4 pool (set in __init__ from the pool)
+    is_dsa_prims_nvfp4: bool = False
 
     def _call_flash_mla_sparse_fwd_small_heads(self, *args):
         from sglang.kernels.ops.attention.flash_mla_interface import (
@@ -762,6 +766,7 @@ class DeepseekSparseAttnBackend(
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
+        self.is_dsa_prims_nvfp4 = model_runner.token_to_kv_pool.dsa_kv_cache_store_nvfp4
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         # Every model's PAGED extend takes the packed v2 top-k for an unsharded
         # batch; this flag also sends prefill-CP shards to it (DSATopKBackend).
@@ -815,8 +820,10 @@ class DeepseekSparseAttnBackend(
         # Dense MHA expands prefix KV outside the DSA metadata path. Keep
         # sharded prefill on the sparse kernels with explicit scratch addresses.
         self.supports_mha_one_shot: bool = (
-            self.attn_dcp_size == 1 or self.dsa_shards_index_k
-        ) and self._kv_shard_pool is None
+            (self.attn_dcp_size == 1 or self.dsa_shards_index_k)
+            and self._kv_shard_pool is None
+            and not self.is_dsa_prims_nvfp4
+        )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         if (
@@ -835,12 +842,17 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.flashmla_kv_num_q_heads = _flashmla_kv_padded_heads(self.num_q_heads)
-        # prims_ts: the trtllm route with Prims-TS as the kernel
+        # prims_ts: with FP8 KV, the trtllm route with Prims-TS as the kernel;
+        # with the 352 B NVFP4 pool, its own route (_forward_prims_ts_nvfp4).
         self._prims_ts: Optional[PrimsTSSparseMLA] = None
         if "prims_ts" in (self.dsa_prefill_impl, self.dsa_decode_impl):
-            if model_runner.kv_cache_dtype != torch.float8_e4m3fn:
+            if self.is_dsa_prims_nvfp4:
+                prims_ts_kv_format = "nvfp4.fp8rope"
+            elif model_runner.kv_cache_dtype == torch.float8_e4m3fn:
+                prims_ts_kv_format = "native"
+            else:
                 raise ValueError(
-                    "--dsa-*-backend prims_ts needs --kv-cache-dtype fp8_e4m3."
+                    "--dsa-*-backend prims_ts needs --kv-cache-dtype fp8_e4m3 or nvfp4."
                 )
             _validate_prims_ts_dcp(
                 dcp_size=get_parallel().attn_dcp_size,
@@ -851,8 +863,11 @@ class DeepseekSparseAttnBackend(
                 num_heads=self.num_q_heads,
                 kv_lora_rank=self.kv_lora_rank,
                 qk_rope_head_dim=self.qk_rope_head_dim,
+                kv_cache_format=prims_ts_kv_format,
             )
-            self._prims_ts = PrimsTSSparseMLA(torch.device(self.device))
+            self._prims_ts = PrimsTSSparseMLA(
+                torch.device(self.device), prims_ts_kv_format
+            )
         self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
             self.local_num_q_heads
         )
@@ -962,6 +977,43 @@ class DeepseekSparseAttnBackend(
             self.qk_rope_head_dim,
             self.dsa_prefill_impl,
         )
+
+        # prims_ts NVFP4: per-forward live row count, graph-stable lengths
+        # buffers (rows -> [lengths, live rows written]), and the causal
+        # indices of a prefill without top-k, shared by all its layers.
+        self._prims_ts_live_rows = 0
+        self._prims_ts_lengths: dict[int, list] = {}
+        self._prims_ts_graph_rows: set[int] = set()
+        self._prims_ts_causal = None
+        if self.is_dsa_prims_nvfp4:
+            # Triton codec; imported only for the NVFP4 route.
+            from sglang.srt.layers.attention.dsa.prims_k_cache import (
+                cast_prims_query_into,
+            )
+
+            self._cast_prims_ts_query = cast_prims_query_into
+            if (
+                self.dsa_index_topk != PRIMS_TS_TOPK
+                or self.physical_page_size != 64
+                or self.dsa_index_kpool != 1
+                or self.attn_dcp_size != 1
+                or model_runner.is_draft_worker
+                or model_runner.model_config.dtype != torch.bfloat16
+                or self.speculative_num_draft_tokens
+                or self.hisparse_coordinator is not None
+                or (self.dsa_prefill_impl, self.dsa_decode_impl)
+                != ("prims_ts", "prims_ts")
+            ):
+                raise ValueError(
+                    "prims_ts with NVFP4 KV requires prims_ts for prefill and decode, "
+                    "BF16 weights, top-k 2048, page size 64, no k-pool, DCP, "
+                    "speculative decoding or HiSparse"
+                )
+            logger.warning(
+                "prims_ts with 352 B/token NVFP4 KV: FP8 Q/MMA/P, model quality "
+                "not yet validated; adapter=prims-ts-nvfp4"
+            )
+
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
         _validate_flashmla_sparse_q8_backend(
             prefill_impl=self.dsa_prefill_impl,
@@ -1056,8 +1108,10 @@ class DeepseekSparseAttnBackend(
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode).
         # These come from flashinfer, which is CUDA-only, so the SM major alone
         # cannot gate them: ROCm gfx1250 also reports compute capability (12, 5).
-        elif _is_cuda and (
-            self.device_sm_major == 10 or self.dsa_decode_impl == "trtllm"
+        elif (
+            _is_cuda
+            and not self.is_dsa_prims_nvfp4
+            and (self.device_sm_major == 10 or self.dsa_decode_impl == "trtllm")
         ):
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
@@ -1446,6 +1500,14 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self.is_dsa_prims_nvfp4:
+            rows = forward_batch.batch_size
+            actual_mode = getattr(forward_batch, "actual_forward_mode", None)
+            active_rows = rows - getattr(forward_batch, "num_padding", 0)
+            if (actual_mode or forward_batch.forward_mode).is_idle():
+                active_rows = 0
+            self._prims_ts_live_rows = active_rows
+            self._prims_ts_nvfp4_lengths(rows, active_rows, for_graph=True)
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1828,6 +1890,18 @@ class DeepseekSparseAttnBackend(
         )
         self.forward_metadata = metadata
         self.init_kernel_metadata(forward_batch)
+        if self.is_dsa_prims_nvfp4:
+            rows = forward_batch.input_ids.shape[0]
+            self._prims_ts_live_rows = (
+                0
+                if forward_batch.forward_mode.is_idle()
+                else (
+                    batch_size
+                    if forward_batch.forward_mode.is_decode_or_idle()
+                    else sum(extend_seq_lens_cpu)
+                )
+            )
+            self._prims_ts_nvfp4_lengths(rows, self._prims_ts_live_rows)
 
     def _cal_indexer_k_start_end(
         self,
@@ -2601,7 +2675,11 @@ class DeepseekSparseAttnBackend(
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
 
-        if uses_raw_fp8_dsa_kv_layout(dsa_impl) and not self.use_mha:
+        if (
+            uses_raw_fp8_dsa_kv_layout(dsa_impl)
+            and not self.is_dsa_prims_nvfp4
+            and not self.use_mha
+        ):
             return self._forward_trtllm(
                 q,
                 k,
@@ -2672,6 +2750,28 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
+        if self.is_dsa_prims_nvfp4 and topk_indices is None:
+            if topk_transform_method != TopkTransformMethod.PAGED:
+                raise NotImplementedError("prims_ts NVFP4 prefill needs PAGED top-k")
+            # Identical for every layer of this forward: build it once.
+            rows = q_nope.shape[0]
+            cached = self._prims_ts_causal
+            if (
+                cached is None
+                or cached[0] is not metadata
+                or cached[1].shape[0] != rows
+            ):
+                cached = (
+                    metadata,
+                    make_prims_ts_causal_indices(
+                        metadata.page_table_1,
+                        metadata.token_to_batch_idx,
+                        metadata.dsa_seqlens_expanded,
+                        rows,
+                    ),
+                )
+                self._prims_ts_causal = cached
+            return self._forward_prims_ts_nvfp4(q_nope, q_rope, layer, cached[1])
         # q8 is only wired on the RAGGED route; PAGED would run the bf16 kernel.
         if (
             dsa_impl == "flashmla_sparse_q8"
@@ -2739,6 +2839,11 @@ class DeepseekSparseAttnBackend(
                     page_table_1
                 ).to(torch.int32)
 
+        if self.is_dsa_prims_nvfp4:
+            # PAGED top-k: page_table_1 already holds physical slots (-1 holes).
+            if topk_transform_method != TopkTransformMethod.PAGED:
+                raise NotImplementedError("prims_ts NVFP4 prefill needs PAGED top-k")
+            return self._forward_prims_ts_nvfp4(q_nope, q_rope, layer, page_table_1)
         if dsa_impl == "tilelang":
             if q_rope is not None:
                 # Cat-skip, as in forward_decode: q_rope=None means the caller
@@ -2986,7 +3091,7 @@ class DeepseekSparseAttnBackend(
                 f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
             )
 
-        if uses_raw_fp8_dsa_kv_layout(dsa_impl):
+        if uses_raw_fp8_dsa_kv_layout(dsa_impl) and not self.is_dsa_prims_nvfp4:
             return self._forward_trtllm(
                 q,
                 k,
@@ -3055,6 +3160,8 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        if self.is_dsa_prims_nvfp4:
+            return self._forward_prims_ts_nvfp4(q_nope, q_rope, layer, page_table_1)
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -3167,6 +3274,74 @@ class DeepseekSparseAttnBackend(
 
         else:
             assert False, f"Unsupported {dsa_impl = }"
+
+    def _prims_ts_nvfp4_lengths(
+        self, rows: int, live: int, *, for_graph: bool = False
+    ) -> torch.Tensor:
+        """Top-k lengths for the NVFP4 route: 2048 for live rows, 0 for padding.
+
+        Live rows use the full width because the indexer pads its selection
+        with -1 holes, which the kernel masks; a zero length disables a padding
+        row, whose stale indices are never read. Written only when the live row
+        count changes, outside graph capture, so layers launch nothing for it.
+        Graph shapes keep their buffer address; only the latest eager shape is
+        kept besides them.
+        """
+        if not 0 <= live <= rows:
+            raise ValueError(f"invalid prims_ts live row count {live} of {rows}")
+        entry = self._prims_ts_lengths.get(rows)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if entry is None:
+            if capturing:
+                raise RuntimeError(
+                    f"prims_ts has no lengths for {rows} rows; set them before capture"
+                )
+            for old in list(self._prims_ts_lengths):
+                if old not in self._prims_ts_graph_rows:
+                    del self._prims_ts_lengths[old]
+            entry = [torch.empty(rows, dtype=torch.int32, device=self.device), -1]
+            self._prims_ts_lengths[rows] = entry
+        if for_graph:
+            self._prims_ts_graph_rows.add(rows)
+        if entry[1] != live:
+            if capturing:
+                raise RuntimeError("prims_ts lengths must not change during capture")
+            entry[0].fill_(PRIMS_TS_TOPK)
+            if live < rows:
+                entry[0][live:].fill_(0)
+            entry[1] = live
+        return entry[0]
+
+    def _forward_prims_ts_nvfp4(self, q_nope, q_rope, layer, indices):
+        """prims_ts over the 352 B NVFP4 pool; indices hold physical slots."""
+        if layer.v_head_dim != 512 or layer.head_dim != 576:
+            raise ValueError("prims_ts needs absorbed MLA 512+64, never unabsorbed MHA")
+        rows = q_nope.shape[0]
+        if rows == 0:
+            return q_nope.new_empty((0, layer.tp_q_head_num, 512))
+        # Eager DP padding can widen Q after init_forward_metadata; that shape
+        # gets its own lengths. Captured forwards only read the buffer, which
+        # the out-of-graph replay hook keeps current.
+        lengths = self._prims_ts_nvfp4_lengths(rows, self._prims_ts_live_rows)
+        q8 = torch.empty(
+            (rows, layer.tp_q_head_num, 576),
+            dtype=torch.float8_e4m3fn,
+            device=q_nope.device,
+        )
+        self._cast_prims_ts_query(
+            q_nope.view(rows, layer.tp_q_head_num, 512),
+            q_rope.view(rows, layer.tp_q_head_num, 64),
+            q8,
+        )
+        out, _ = self._prims_ts.forward(
+            q=q8,
+            kv_cache=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            indices=indices,
+            lengths=lengths,
+            sm_scale=layer.scaling,
+            kv_scale=1.0,
+        )
+        return out
 
     def _forward_fa3(
         self,
@@ -3777,6 +3952,8 @@ class DeepseekSparseAttnBackend(
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # dcp_partial: DCP decode, q gathered from the group attends over this
         # rank's KV shard; returns (o, lse) for the merge instead of o.
+        if self.is_dsa_prims_nvfp4:
+            raise RuntimeError("prims352 must never enter the FlashMLA consumer")
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
 
@@ -4774,6 +4951,11 @@ class DeepseekSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
+        if self.is_dsa_prims_nvfp4:
+            # Model dispatch reads use_mha: force absorbed MLA for ALL prefills,
+            # including no-prefix short prompts. Never bypass 352 quantization.
+            self.use_mha = False
+            return
         # Hoisted in __init__ (import cost is per-call otherwise).
         is_in_breakable_cuda_graph = self._is_in_breakable_cuda_graph
         is_in_tc_piecewise_cuda_graph = self._is_in_tc_piecewise_cuda_graph

@@ -1,7 +1,8 @@
-"""prims_ts DSA backend: FlashInfer Prims-TS sparse MLA over raw FP8 MLA rows (E4M3
-q, natural-log LSE). Under sharded DCP each rank attends over its owned top-k rows
-(compacted, lengths = owned count); the partials merge to the single-rank result,
-and the DCP combine must merge them base e."""
+"""prims_ts DSA backend: FlashInfer Prims-TS sparse MLA over raw FP8 MLA rows and
+over 352 B/token NVFP4 rows (E4M3 q, natural-log LSE). Under sharded DCP each rank
+attends over its owned top-k rows (compacted, lengths = owned count); the partials
+merge to the single-rank result, and the DCP combine must merge them base e. The
+NVFP4 rows are checked against FP32 attention over the values the loader expands."""
 
 from __future__ import annotations
 
@@ -34,6 +35,21 @@ def _sm100() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 
+def _require_prims_ts(case, heads: int = 96, kv_cache_format: str = "native"):
+    if not _sm100():
+        case.skipTest("Prims-TS sparse MLA needs SM100/SM103/SM107")
+    try:
+        check_prims_ts_sparse_mla_support(
+            device=torch.device("cuda"),
+            num_heads=heads,
+            kv_lora_rank=KV_LORA,
+            qk_rope_head_dim=ROPE,
+            kv_cache_format=kv_cache_format,
+        )
+    except ValueError as exc:
+        case.skipTest(str(exc))
+
+
 def _localize(slots: torch.Tensor, dcp: int, rank: int):
     out = torch.empty_like(slots)
     lens = torch.empty(slots.shape[0], dtype=torch.int32, device=slots.device)
@@ -44,24 +60,11 @@ def _localize(slots: torch.Tensor, dcp: int, rank: int):
 
 
 class TestShardedDcpPrimsTs(CustomTestCase):
-    def _require_prims_ts(self):
-        if not _sm100():
-            self.skipTest("Prims-TS sparse MLA needs SM100/SM103/SM107")
-        try:
-            check_prims_ts_sparse_mla_support(
-                device=torch.device("cuda"),
-                num_heads=96,
-                kv_lora_rank=KV_LORA,
-                qk_rope_head_dim=ROPE,
-            )
-        except ValueError as exc:
-            self.skipTest(str(exc))
-
     def _check_dcp8_partials_merge_to_full(self, rows: int):
         """Per-rank Prims-TS partials (natural-log LSE; a rank owning none of a
         row's keys returns zero output and -inf LSE) merge by exp weights, the base
         TestPrimsTsDcpLseBase pins for the combine, to the single-rank result."""
-        self._require_prims_ts()
+        _require_prims_ts(self)
         dcp, heads, ctx = 8, 96, 16384
         gen = torch.Generator(device="cuda").manual_seed(3)
         kv = (torch.randn(ctx, DIM, generator=gen, device="cuda") * 0.5).to(FP8)
@@ -130,6 +133,80 @@ class TestShardedDcpPrimsTs(CustomTestCase):
     def test_packed_rows_dcp8_partials_merge_to_full(self):
         # Past the exact-plan limit: power-of-two packed capacity with qo_indptr.
         self._check_dcp8_partials_merge_to_full(rows=_EXACT_PLAN_MAX_ROWS + 1)
+
+
+class TestPrimsTsNvfp4(CustomTestCase):
+    def _check_nvfp4_matches_reference(self, rows: int):
+        """The same check over the 352 B/token NVFP4 cache that the prims_ts NVFP4
+        route writes, against FP32 attention over the values its loader expands
+        (E2M1 x block scale rounded to E4M3, E4M3 RoPE). Rows past their count are
+        disabled with a zero length, as DP padding rows are."""
+        from sglang.srt.layers.attention.dsa.prims_k_cache import (
+            cast_prims_query_into,
+            dequantize_prims_k_cache_paged,
+            quantize_prims_k_cache_into,
+        )
+
+        heads, ctx = 64, 16384
+        _require_prims_ts(self, heads, "nvfp4.fp8rope")
+        gen = torch.Generator(device="cuda").manual_seed(5)
+        kv = torch.zeros((ctx, 1, 352), dtype=torch.uint8, device="cuda")
+        quantize_prims_k_cache_into(
+            torch.randn(ctx, KV_LORA, generator=gen, device="cuda").bfloat16(),
+            torch.randn(ctx, ROPE, generator=gen, device="cuda").bfloat16(),
+            kv,
+            torch.arange(ctx, device="cuda"),
+        )
+        q8 = torch.empty(rows, heads, DIM, dtype=FP8, device="cuda")
+        cast_prims_query_into(
+            torch.randn(rows, heads, KV_LORA, generator=gen, device="cuda").bfloat16(),
+            torch.randn(rows, heads, ROPE, generator=gen, device="cuda").bfloat16(),
+            q8,
+        )
+        live = rows - 1
+        slots = torch.full((rows, TOPK), -1, dtype=torch.int32, device="cuda")
+        for r in range(rows):
+            pick = torch.randperm(ctx, generator=gen, device="cuda")[:TOPK]
+            # interior -1 holes, as the indexer leaves past a short context
+            holes = torch.rand(TOPK, generator=gen, device="cuda") < 0.25
+            slots[r] = torch.where(holes, -1, pick.to(torch.int32))
+        lengths = torch.full((rows,), TOPK, dtype=torch.int32, device="cuda")
+        lengths[live:] = 0
+
+        runner = PrimsTSSparseMLA(torch.device("cuda"), "nvfp4.fp8rope")
+        out, lse = runner.forward(
+            q=q8,
+            kv_cache=kv,
+            indices=slots,
+            lengths=lengths,
+            sm_scale=SM_SCALE,
+            kv_scale=1.0,
+        )
+        packed = rows > _EXACT_PLAN_MAX_ROWS
+        self.assertEqual({key[3] for key in runner._plans}, {packed})
+
+        qf = q8.float()
+        ref = torch.empty((live, heads, KV_LORA), dtype=torch.float32, device="cuda")
+        ref_lse = torch.empty((live, heads), dtype=torch.float32, device="cuda")
+        for r in range(live):
+            valid = slots[r][slots[r] >= 0]
+            k = dequantize_prims_k_cache_paged(kv, valid, torch.float32)[:, 0]
+            s = (qf[r] @ k.T) * SM_SCALE
+            ref_lse[r] = torch.logsumexp(s, dim=-1)
+            ref[r] = torch.softmax(s, dim=-1) @ k[:, :KV_LORA]
+
+        got = out[:live].float()
+        self.assertLess(((got - ref).norm() / ref.norm()).item(), 0.03)
+        torch.testing.assert_close(lse[:live], ref_lse, atol=2e-2, rtol=2e-3)
+        # The zero-length row reads none of its indices.
+        self.assertTrue(torch.all(out[live:] == 0))
+        self.assertTrue(torch.all(torch.isneginf(lse[live:])))
+
+    def test_nvfp4_exact_plan_matches_reference(self):
+        self._check_nvfp4_matches_reference(rows=8)
+
+    def test_nvfp4_packed_plan_matches_reference(self):
+        self._check_nvfp4_matches_reference(rows=_EXACT_PLAN_MAX_ROWS + 1)
 
 
 class TestPrimsTsDcpLseBase(CustomTestCase):

@@ -2416,6 +2416,13 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = dsa_pool_class
+        if is_float4_e2m1fn_x2(self.kv_cache_dtype) and (
+            PoolCls is not dsa_pool_class or self.loc_space_scale > 1
+        ):
+            raise ValueError(
+                "DSA NVFP4 KV needs the plain DSA pool: no KV sharding, HiSparse, "
+                "CP layer split or DCP"
+            )
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
@@ -3711,6 +3718,28 @@ def calculate_mla_kv_cache_dim(
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
         return kv_cache_dim
+
+    if is_float4_e2m1fn_x2(kv_cache_dtype):
+        # The only DSA NVFP4 layout is the 352 B/token Prims-TS row
+        # (nvfp4.fp8rope), read by prims_ts in both phases.
+        from sglang.srt.layers.attention.dsa.prims_k_cache import (
+            PRIMS_NVFP4_BYTES_PER_TOKEN,
+        )
+
+        backends = (
+            get_exec().kernel.dsa_prefill_backend,
+            get_exec().kernel.dsa_decode_backend,
+        )
+        if (kv_lora_rank, qk_rope_head_dim) != (512, 64) or backends != (
+            "prims_ts",
+            "prims_ts",
+        ):
+            raise ValueError(
+                "DSA --kv-cache-dtype nvfp4 needs 512+64 MLA and prims_ts for "
+                f"prefill and decode; got {kv_lora_rank=}, {qk_rope_head_dim=}, "
+                f"backends {backends}"
+            )
+        return PRIMS_NVFP4_BYTES_PER_TOKEN
 
     # TRTLLM and Prims-TS use the raw MLA KV layout. In disaggregated serving
     # only the backend for the local role determines the local pool layout; the

@@ -489,7 +489,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * kv_size
             )
             cell_size = per_layer_bytes * effective_num_layers
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
+            # DSA NVFP4 rows are packed bytes with in-row block scales.
+            if is_float4_e2m1fn_x2(kv_cache_dtype) and not is_deepseek_dsa(
+                model_config.hf_config
+            ):
                 # kv_scale_buffer
                 scale_block_size = 16
                 cell_size = (cell_size // 2) + (
