@@ -7,9 +7,15 @@ import unittest
 import requests
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.platforms import current_platform
+from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.weight_cache.protocol import get_ready_path, get_socket_path
+from sglang.srt.weight_cache.protocol import (
+    compute_config_digest,
+    get_ready_path,
+    get_socket_path,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
@@ -46,9 +52,20 @@ PROMPTS = [
 ]
 
 
-def _gpu_uuids(tp_size: int) -> list:
-    # Single-node, default base_gpu_id/gpu_id_step: rank i runs on physical GPU i.
-    return [current_platform.get_device_uuid(i) for i in range(tp_size)]
+def _daemon_paths(model: str, tp_size: int, daemon_args=()) -> list:
+    """(ready, socket) path pairs the standalone daemon launcher will use."""
+    server_args = prepare_server_args(
+        ["--model-path", model, "--tp-size", str(tp_size), *daemon_args]
+    )
+    server_args.resolve_once()
+    cfg = resolving_view(server_args)
+    paths = []
+    for i in range(tp_size):
+        # Single-node, default base_gpu_id/gpu_id_step: rank i runs on physical GPU i.
+        uuid = current_platform.get_device_uuid(i)
+        digest = compute_config_digest(cfg, tp_rank=i, pp_rank=0)
+        paths.append((get_ready_path(uuid, digest), get_socket_path(uuid, digest)))
+    return paths
 
 
 @unittest.skipIf(
@@ -67,13 +84,12 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
         cls.model = cls.model_override or DEFAULT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 2
-        cls.gpu_uuids = _gpu_uuids(cls.tp_size)
+        cls.daemon_paths = _daemon_paths(cls.model, cls.tp_size, cls.daemon_args)
 
         # Clean up stale ready/socket files from previous runs
-        for device_uuid in cls.gpu_uuids:
-            for path in (get_ready_path(device_uuid), get_socket_path(device_uuid)):
-                if os.path.exists(path):
-                    os.unlink(path)
+        for path in [p for paths in cls.daemon_paths for p in paths]:
+            if os.path.exists(path):
+                os.unlink(path)
 
         # Step 1: Launch weight cache daemons (blocks until all ranks are ready,
         # then monitors child processes)
@@ -93,14 +109,12 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
         # Step 2: Wait for all daemon ready files
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         start = time.time()
-        for device_uuid in cls.gpu_uuids:
-            ready_path = get_ready_path(device_uuid)
+        for ready_path, _ in cls.daemon_paths:
             while not os.path.exists(ready_path):
                 if time.time() - start > timeout:
                     kill_process_tree(cls.daemon_process.pid)
                     raise TimeoutError(
-                        f"Weight cache daemon for GPU {device_uuid} not ready "
-                        f"within {timeout}s"
+                        f"Weight cache daemon {ready_path} not ready within {timeout}s"
                     )
                 if cls.daemon_process.poll() is not None:
                     raise RuntimeError(
@@ -144,13 +158,12 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                     os.unlink(path)
                 except OSError:
                     pass
-        for device_uuid in getattr(cls, "gpu_uuids", ()):
-            for path in (get_ready_path(device_uuid), get_socket_path(device_uuid)):
-                if os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+        for path in [p for ps in getattr(cls, "daemon_paths", ()) for p in ps]:
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def test_generate(self):
         for prompt in PROMPTS:
@@ -227,13 +240,12 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
         cls.model = DEFAULT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 1
-        cls.gpu_uuids = _gpu_uuids(cls.tp_size)
+        cls.daemon_paths = _daemon_paths(cls.model, cls.tp_size)
 
         # Clean up stale ready/socket files from previous runs.
-        for device_uuid in cls.gpu_uuids:
-            for path in (get_ready_path(device_uuid), get_socket_path(device_uuid)):
-                if os.path.exists(path):
-                    os.unlink(path)
+        for path in [p for paths in cls.daemon_paths for p in paths]:
+            if os.path.exists(path):
+                os.unlink(path)
 
         # Step 1: Launch the weight cache daemon (blocks until the rank is
         # ready, then monitors the child process).
@@ -252,14 +264,12 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
         # Step 2: Wait for the daemon ready file.
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         start = time.time()
-        for device_uuid in cls.gpu_uuids:
-            ready_path = get_ready_path(device_uuid)
+        for ready_path, _ in cls.daemon_paths:
             while not os.path.exists(ready_path):
                 if time.time() - start > timeout:
                     kill_process_tree(cls.daemon_process.pid)
                     raise TimeoutError(
-                        f"Weight cache daemon for GPU {device_uuid} not ready "
-                        f"within {timeout}s"
+                        f"Weight cache daemon {ready_path} not ready within {timeout}s"
                     )
                 if cls.daemon_process.poll() is not None:
                     raise RuntimeError(
@@ -302,13 +312,12 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                     os.unlink(path)
                 except OSError:
                     pass
-        for device_uuid in getattr(cls, "gpu_uuids", ()):
-            for path in (get_ready_path(device_uuid), get_socket_path(device_uuid)):
-                if os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+        for path in [p for ps in getattr(cls, "daemon_paths", ()) for p in ps]:
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def test_generate(self):
         resp = requests.post(
