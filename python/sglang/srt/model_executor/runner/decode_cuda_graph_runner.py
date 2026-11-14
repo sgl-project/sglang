@@ -1389,30 +1389,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             for variant_label in lora_variants:
                 with capture_lora_variant(variant_label):
                     for attention_variant in attention_variants:
-                        _set_capture_attention_variant(attention_variant)
-                        for logits_variant in self.logits_graph_variants:
-                            self._set_profile_trace_tag(
-                                bs,
-                                variant_label,
-                                attention_variant,
-                                logits_variant,
-                            )
-                            with (
-                                capture_logits_variant(logits_variant),
-                                self.backend.prepare_capture_forward(
-                                    self.model_runner.model,
-                                    enable_compile=bs in self.compile_bs,
-                                    num_tokens=bs * self.captured_req_width,
-                                    tp_group=get_parallel().tp_group,
-                                ) as forward,
-                            ):
-                                self.capture_one_shape(
+                        with _attention_variant_during_prep(attention_variant):
+                            for logits_variant in self.logits_graph_variants:
+                                self._set_profile_trace_tag(
                                     bs,
-                                    forward,
                                     variant_label,
                                     attention_variant,
+                                    logits_variant,
                                 )
-        _set_capture_attention_variant(None)
+                                with (
+                                    capture_logits_variant(logits_variant),
+                                    self.backend.prepare_capture_forward(
+                                        self.model_runner.model,
+                                        enable_compile=bs in self.compile_bs,
+                                        num_tokens=bs * self.captured_req_width,
+                                        tp_group=get_parallel().tp_group,
+                                    ) as forward,
+                                ):
+                                    self.capture_one_shape(
+                                        bs,
+                                        forward,
+                                        variant_label,
+                                        attention_variant,
+                                    )
 
     def capture_one_shape(
         self,
