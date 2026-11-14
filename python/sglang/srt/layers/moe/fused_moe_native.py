@@ -6,7 +6,7 @@ It is based on https://github.com/pytorch-labs/gpt-fast/blob/32971d3129541c5bfb4
 import torch
 from torch.nn import functional as F
 
-from sglang.srt.layers.activation import GeluAndMul, SiluAndMul, SituAndMul
+from sglang.srt.layers.activation import GeluAndMul, ReLU2, SiluAndMul, SituAndMul
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     swiglu_gpt_oss_sigmoid_alpha,
@@ -33,25 +33,30 @@ def fused_moe_forward_native(
     topk_weights, topk_ids, _ = topk_output
 
     w13_weights = layer.w13_weight[topk_ids]
-    w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
     w2_weights = layer.w2_weight[topk_ids]
-    x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
-    if moe_runner_config.activation == "silu":
-        x1 = F.silu(x1)
-    elif moe_runner_config.activation == "gelu":
-        x1 = F.gelu(x1)
-    elif moe_runner_config.activation == "situ":
-        beta = (
-            moe_runner_config.gemm1_alpha
-            if moe_runner_config.gemm1_alpha is not None
-            else 4.0
-        )
-        x1 = beta * torch.tanh(x1.float() / beta) * torch.sigmoid(x1.float())
-        x1 = x1.to(x.dtype)
+    if moe_runner_config.activation == "relu2":
+        x1 = torch.einsum("ti,taoi -> tao", x, w13_weights)
+        expert_acts = F.relu(x1).square()
     else:
-        raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
-    x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
-    expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
+        w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
+        x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
+        if moe_runner_config.activation == "silu":
+            x1 = F.silu(x1)
+        elif moe_runner_config.activation == "gelu":
+            x1 = F.gelu(x1)
+        elif moe_runner_config.activation == "situ":
+            beta = (
+                moe_runner_config.gemm1_alpha
+                if moe_runner_config.gemm1_alpha is not None
+                else 4.0
+            )
+            x1 = beta * torch.tanh(x1.float() / beta) * torch.sigmoid(x1.float())
+            x1 = x1.to(x.dtype)
+        else:
+            raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
+        x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
+        expert_acts = x1 * x3
+    expert_outs = torch.einsum("tao, taio -> tai", expert_acts, w2_weights)
     expert_outs = torch.einsum(
         "tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype)
     )
@@ -93,6 +98,8 @@ def moe_forward_native(
         )
         situ_linear_beta = moe_runner_config.gemm1_clamp_limit
         act = SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
+    elif moe_runner_config.activation == "relu2":
+        act = ReLU2()
     else:
         raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
 

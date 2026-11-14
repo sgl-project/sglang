@@ -180,6 +180,27 @@ inline void gelu_and_mul_stub(
 }
 
 template <typename scalar_t, typename input_t>
+inline void relu2_stub(scalar_t* __restrict__ out, const input_t* __restrict__ input, int64_t size) {
+  static_assert(
+      std::is_same_v<input_t, float> || std::is_same_v<input_t, scalar_t>,
+      "relu2_stub only supports input_t == float or input_t == scalar_t");
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  const fVec zero = fVec(0.f);
+
+#pragma GCC unroll 4
+  for (int64_t d = 0; d < size; d += bVec::size()) {
+    auto [x0, x1] = load_float_vec2(input + d);
+    x0 = at::vec::maximum(x0, zero);
+    x1 = at::vec::maximum(x1, zero);
+    x0 = x0 * x0;
+    x1 = x1 * x1;
+    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+    out_vec.store(out + d);
+  }
+}
+
+template <typename scalar_t, typename input_t>
 inline void clamp_sigmoid_and_mul_stub(
     scalar_t* __restrict__ out, const input_t* __restrict__ input, int64_t size, const float alpha, const float limit) {
   static_assert(

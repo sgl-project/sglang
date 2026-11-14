@@ -32,6 +32,7 @@ dependencies = [
   "intel-openmp; platform_machine == 'x86_64'",
   "interegular",
   "IPython",
+  "librosa",
   "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",
