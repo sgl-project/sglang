@@ -7,7 +7,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use tokio::sync::{SetOnce, mpsc};
+use tokio::sync::{SetOnce, mpsc, watch};
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::finish_reason::{AbortReason, FinishKind};
@@ -26,7 +26,8 @@ use super::control::PEER_ABORT_MAX_IN_FLIGHT;
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{
-    CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, InFlight, RequestLog,
+    AbortHook, CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, InFlight,
+    RequestLog,
 };
 
 /// How long the listeners keep open connections after a drain's requests
@@ -55,6 +56,9 @@ pub(crate) struct CoreConfig {
     /// A model package's admission check, run on every client generation
     /// before media prefetch.
     pub(crate) generate_validator: Option<Arc<dyn GenerateValidator>>,
+    /// A model package's hook, told of every abort that names live requests
+    /// ([`CoreHandle::abort`]).
+    pub(crate) abort_hook: Option<Arc<dyn AbortHook>>,
 }
 
 /// Immutable, transport-independent metadata retained by the core.
@@ -152,6 +156,8 @@ pub(super) struct CoreInner {
     pub(super) response_capacity: usize,
     pub(super) response_activity: ActivityCounter,
     pub(super) startup_ready: AtomicBool,
+    /// `true` while Python runs its `--warmups` through this listener.
+    pub(super) custom_warmups_pending: watch::Sender<bool>,
     pub(super) is_disaggregation: bool,
     pub(super) mm_limits: Vec<(String, usize)>,
     pub(super) multimodal: bool,
@@ -167,6 +173,7 @@ pub(super) struct CoreInner {
     pub(super) dp_rank: RankId,
     pub(super) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
     pub(super) generate_validator: Option<Arc<dyn GenerateValidator>>,
+    pub(super) abort_hook: Option<Arc<dyn AbortHook>>,
     /// Shared by every transport (see [`CoreHandle::begin_drain`]).
     pub(super) drain: Arc<DrainState>,
     /// Overrides [`GRACEFUL_CLOSE_TIMEOUT`] (see
@@ -207,6 +214,7 @@ impl CoreHandle {
                 response_capacity: config.response_capacity,
                 response_activity: config.response_activity,
                 startup_ready: AtomicBool::new(config.startup_ready),
+                custom_warmups_pending: watch::Sender::new(false),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
                 multimodal: config.multimodal,
@@ -218,6 +226,7 @@ impl CoreHandle {
                 dp_rank,
                 peer_endpoints: config.peer_endpoints,
                 generate_validator: config.generate_validator,
+                abort_hook: config.abort_hook,
                 drain: Arc::default(),
                 graceful_close_timeout: OnceLock::new(),
                 peer_abort_permits: tokio::sync::Semaphore::new(PEER_ABORT_MAX_IN_FLIGHT),
@@ -237,10 +246,32 @@ impl CoreHandle {
     }
 
     /// Whether health may answer 200: startup warmup finished (or was
-    /// skipped) and, for a multimodal model, the MM pool's processor is
-    /// installed, so a generation would be admitted rather than wait.
+    /// skipped), Python's `--warmups` finished, and, for a multimodal model,
+    /// the MM pool's processor is installed, so a generation would be admitted
+    /// rather than wait.
     pub(crate) fn is_serving(&self) -> bool {
-        self.is_ready() && (!self.inner.multimodal || self.inner.mm_processor.get().is_some())
+        self.is_ready()
+            && !*self.inner.custom_warmups_pending.borrow()
+            && (!self.inner.multimodal || self.inner.mm_processor.get().is_some())
+    }
+
+    /// Hold health at 503 until [`CoreHandle::finish_custom_warmups`]; set at
+    /// boot, before any listener accepts a connection.
+    pub(crate) fn hold_for_custom_warmups(&self) {
+        self.inner.custom_warmups_pending.send_replace(true);
+    }
+
+    /// Python's `--warmups` finished: health may answer 200 once the rest of
+    /// [`CoreHandle::is_serving`] holds.
+    pub(crate) fn finish_custom_warmups(&self) {
+        self.inner.custom_warmups_pending.send_replace(false);
+    }
+
+    /// Wait until Python's `--warmups` finished (at once without them).
+    pub(crate) async fn custom_warmups_finished(&self) {
+        let mut pending = self.inner.custom_warmups_pending.subscribe();
+        // Errs only once the sender is dropped, and `self` holds it.
+        let _ = pending.wait_for(|pending| !*pending).await;
     }
 
     /// The request metrics, when enabled.
@@ -410,9 +441,7 @@ impl CoreHandle {
 
 pub(super) fn translate_runtime_error(error: Error) -> CoreError {
     match error {
-        Error::Validation(message) => {
-            CoreError::InvalidArgument(format!("validation failed: {message}"))
-        }
+        Error::Validation(message) => CoreError::InvalidArgument(message),
         Error::Encode(error) => error.into(),
         Error::QueueFull => CoreError::Overloaded("to_scheduler channel full".into()),
         Error::Disconnected => CoreError::Cancelled("client disconnected".into()),
@@ -718,8 +747,7 @@ mod tests {
     fn runtime_errors_become_transport_neutral_categories() {
         assert!(matches!(
             translate_runtime_error(Error::Validation("bad input".into())),
-            CoreError::InvalidArgument(message)
-                if message == "validation failed: bad input"
+            CoreError::InvalidArgument(message) if message == "bad input"
         ));
         assert!(matches!(
             translate_runtime_error(Error::QueueFull),

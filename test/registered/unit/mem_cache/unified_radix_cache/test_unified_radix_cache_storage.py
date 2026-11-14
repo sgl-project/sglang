@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -46,6 +47,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingPrefetch,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.device import is_pin_memory_available
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -94,6 +96,10 @@ def _window_hit(req):
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
+
+
+# About 0.15 s on a 2 GHz GPU, far longer than any admission step.
+GPU_STALL_CYCLES = 300_000_000
 
 
 class TestUnifiedRadixCacheEagleHiCacheStorageKey(
@@ -1324,6 +1330,36 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             source.host_pool.free(indices)
 
     @requires_hicache
+    @requires_swa
+    def test_buffer_only_kv_short_prefetch_heals_swa_window_beliefs(self):
+        """A rank whose KV read falls short skips the SWA read; its discard must
+        still drop the window beliefs that a peer which read the window drops."""
+        storage_dir = self._make_storage_dir()
+        seq = self._buffer_swa_seq()
+        prod, prod_alloc, prod_rtp = self._build_buffer_hicache_fixture(storage_dir)
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        leaf = match_prefix(prod, seq).last_device_node
+        self._buffer_backup_and_wait(prod, leaf)
+        page_hashes = self._all_page_hashes(prod, leaf)
+
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+        swa_beliefs = cons.storage_existence_cache.pool(PoolName.SWA)
+        swa_beliefs.add(page_hashes)
+        req_id = CacheRequestHandle("kv-short", 0)
+        with mock.patch.object(cons.cache_controller, "page_get_func", return_value=0):
+            cons.prefetch_from_storage(
+                req_id, cons.root_node_handle(), array("q", seq), None, None
+            )
+            self._pump_hicache_until(
+                cons,
+                lambda: cons.check_prefetch_progress(req_id),
+                "short prefetch did not finish",
+            )
+        self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
+        self.assertFalse(swa_beliefs.contains(page_hashes[-1]))
+        cons.sanity_check()
+
+    @requires_hicache
     def test_buffer_only_read_path_roundtrip(self):
         """Read path end to end: prefetch -> staged -> load-back that evicts before
         alloc and publishes pre-ack -> ack frees the bounce."""
@@ -1458,6 +1494,107 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
 
         cons.sanity_check()
+
+    @requires_hicache
+    def test_buffer_only_load_back_admission_never_waits_for_the_gpu(self):
+        """init_load_back returns while a queued GPU stall still runs: in
+        serving that stall is the forward the scheduler stream waits on."""
+        if not is_pin_memory_available("cuda"):
+            self.skipTest("without pinned memory the flag copy waits for the GPU")
+        storage_dir = self._make_storage_dir()
+        seq = self._buffer_swa_seq()
+        warm_seq = self._make_seq(100001, len(seq) // self.cfg.page_size)
+        self._produce_buffer_l3(storage_dir, warm_seq)
+        self._produce_buffer_l3(storage_dir, seq)
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+
+        def stage(name, tokens):
+            req_id = CacheRequestHandle(name, 0)
+            cons.prefetch_from_storage(
+                req_id, cons.root_node_handle(), array("q", tokens), None, None
+            )
+            self._pump_hicache_until(
+                cons,
+                lambda: (
+                    cons.check_prefetch_progress(req_id)
+                    and cons.buffer_pipeline.has_staged(req_id)
+                ),
+                "prefetch did not stage",
+            )
+            return req_id
+
+        # A process's first load-back loads its CUDA kernels, which waits for the GPU once.
+        self._consume_staged_prefetch(cons, stage("warm-up", warm_seq))
+        req_id = stage("load-back-no-sync", seq)
+        init_load_back = cons.init_load_back
+
+        def init_load_back_without_sync(params):
+            torch.cuda.synchronize()
+            torch.cuda._sleep(GPU_STALL_CYCLES)
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                result = init_load_back(params)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            self.assertFalse(
+                torch.cuda.current_stream().query(), "init_load_back waited for the GPU"
+            )
+            torch.cuda.synchronize()
+            return result
+
+        with mock.patch.object(
+            cons, "init_load_back", side_effect=init_load_back_without_sync
+        ):
+            spliced = self._consume_staged_prefetch(cons, req_id)
+        self.assertEqual(len(spliced), len(seq))
+        self.assertFalse(
+            cons.buffer_pipeline._ownership_checks, "an ack left its check pending"
+        )
+        cons.sanity_check()
+
+    @requires_hicache
+    def test_buffer_only_load_back_row_mismatch_raises_at_the_ack(self):
+        """Rows that differ from the H2D destinations at the same length pass
+        admission and raise when the load-back's ack reads the GPU comparison."""
+        storage_dir = self._make_storage_dir()
+        seq = self._buffer_swa_seq()
+        self._produce_buffer_l3(storage_dir, seq)
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+        req_id = CacheRequestHandle("row-mismatch", 0)
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
+            "prefetch did not stage",
+        )
+        path_device_indices = cons.path_device_indices
+
+        def path_with_last_rows_swapped(node):
+            rows = path_device_indices(node).clone()
+            rows[[-2, -1]] = rows[[-1, -2]]
+            return rows
+
+        init_load_back = cons.init_load_back
+        admitted = []
+
+        def init_load_back_with_swapped_rows(params):
+            with mock.patch.object(
+                cons, "path_device_indices", side_effect=path_with_last_rows_swapped
+            ):
+                admitted.append(init_load_back(params))
+            return admitted[-1]
+
+        with mock.patch.object(
+            cons, "init_load_back", side_effect=init_load_back_with_swapped_rows
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ownership violation"):
+                self._consume_staged_prefetch(cons, req_id)
+        self.assertEqual(len(admitted), 1, "admission raised instead of the ack")
 
     @requires_hicache
     @requires(
@@ -1949,6 +2086,130 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                 self._assert_masked_full_is_reused(
                     storage_dir, seq, live_tail=self.cfg.page_size
                 )
+
+    @requires_hicache
+    @requires(lambda cfg: cfg.has_swa, "a window repair requires an SWA component")
+    @requires(
+        lambda cfg: -(-cfg.sliding_window_size // cfg.page_size) >= 2,
+        "a one-page window never reaches past the node holding the splice base",
+    )
+    def test_buffer_only_window_repair_keeps_its_resident_rows_locked(self):
+        """The admission lock must cover every window row a staged repair keeps,
+        even when the FULL match ends inside a longer node: the reclaim the
+        admission runs before the load may not strip those rows."""
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+        page_size = self.cfg.page_size
+        sw_pages = -(-self.cfg.sliding_window_size // page_size)
+        storage_dir = self._make_storage_dir()
+        # The span ends one page past `head`. Its window keeps the head's
+        # resident SWA tail and repairs the page behind the head.
+        head = self._make_seq(1, sw_pages)
+        span = head + self._make_seq(5000, 1)
+        full = span + self._make_seq(9000, sw_pages)
+        self._produce_buffer_l3(storage_dir, span)
+
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
+        head_value = self._alloc(cons_alloc, len(head))[: len(head)]
+        cons.insert(
+            InsertParams(
+                key=RadixKey(array("q", head)),
+                value=head_value,
+                component_evicted_seqlens={ComponentType.SWA: page_size},
+            )
+        )
+        cons_alloc.free_swa(head_value[:page_size])
+        resident = head_value[page_size:]
+        resident_swa = cons_alloc.full_to_swa_index_mapping[resident].clone()
+        self.assertTrue(bool((resident_swa > 0).all()), "head tail not resident")
+
+        req_id = CacheRequestHandle("window-repair-lock", 0)
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", span), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
+            "prefetch did not stage",
+        )
+        cons.pop_prefetch_loaded_tokens(req_id)
+        staged = cons.buffer_pipeline.staged_prefetches[req_id]
+        self.assertEqual(
+            (staged.matched_len, staged.num_tokens), (len(head), page_size)
+        )
+
+        # While the request waits, another one inserts a longer path through the
+        # span end, so the span's FULL becomes resident inside one node longer
+        # than a window, with no SWA of its own.
+        tail_value = self._alloc(cons_alloc, len(full) - len(head))
+        tail_value = tail_value[: len(full) - len(head)]
+        cons.insert(
+            InsertParams(
+                key=RadixKey(array("q", full)),
+                value=torch.cat([head_value, tail_value]),
+                prev_prefix_len=len(head),
+                component_evicted_seqlens={ComponentType.SWA: len(full)},
+            )
+        )
+        cons_alloc.free_swa(tail_value)
+        # The request's joint match runs over its whole input, which follows the
+        # node past the span end, so it splits nothing there.
+        self.assertEqual(match_prefix(cons, full).device_prefix_len, 0)
+        full_len, _, pinned_len = cons.tree_core.match_full_device_prefix(
+            RadixKey(array("q", span))
+        )
+        self.assertEqual((full_len, pinned_len), (len(span), len(full)))
+
+        req = self._make_req(cons_rtp)
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.extra_key = None
+        req.cache_salt = None
+        req.prefix_len = 0
+        req.last_node = cons.root_node_handle()
+        self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
+        plan = req.staged_prefetch_plan
+        window = plan.windows[ComponentType.SWA]
+        self.assertEqual(plan.full_tokens, 0)
+        self.assertEqual(window.missing_ranges, ((len(head), len(span)),))
+        anchor_end = len(cons.path_device_indices(req.last_node))
+
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.tree_cache = cons
+        with adder._lock_node(req.last_node):
+            # The unified budget's prepare_load_back reclaims SWA first here.
+            cons.evict(
+                EvictParams(
+                    window_num_tokens={
+                        cons.window_sub_pool_of_slot(ComponentType.SWA): len(resident)
+                    }
+                )
+            )
+            loaded = cons.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=None,
+                    host_hit_length=req.host_hit_length,
+                    req=req,
+                )
+            )
+        self.assertEqual(anchor_end, len(span), "anchor does not end at the splice")
+        self.assertIsNotNone(loaded)
+        self.assertTrue(
+            torch.equal(cons_alloc.full_to_swa_index_mapping[resident], resident_swa),
+            "a kept window row was reclaimed before the load published",
+        )
+        cons.ready_to_load_host_cache()
+        self._pump_hicache_until(
+            cons,
+            lambda: not cons.buffer_pipeline.ongoing_buffer_load_back,
+            "window repair did not commit",
+        )
+        self.assertEqual(match_prefix(cons, span).device_prefix_len, len(span))
+        cons.sanity_check()
 
     @requires_hicache
     @requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
@@ -2532,6 +2793,33 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 define_config_test_classes(UnifiedRadixCacheStorageSuite, globals())
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestBufferLoadBackOwnershipCheck(CustomTestCase):
+    def test_ownership_mismatch_raises_at_the_ack(self):
+        """One differing row raises at the ack, after the queued compare ran."""
+        if not is_pin_memory_available("cuda"):
+            self.skipTest("without pinned memory the flag copy waits for the GPU")
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline._ownership_checks = {}
+        canonical = torch.arange(64, device="cuda")
+        # Equal rows pass; this also loads the compare's kernels before the stall.
+        pipeline._check_ownership(-2, canonical, canonical.clone(), "violation")
+        pipeline._verify_ownership(-2)
+        moved = canonical.clone()
+        moved[5] += 1
+        torch.cuda.synchronize()
+        torch.cuda._sleep(GPU_STALL_CYCLES)
+        pipeline._check_ownership(-1, canonical, moved, "violation")
+        self.assertFalse(
+            torch.cuda.current_stream().query(), "the check waited for the GPU"
+        )
+        copied = pipeline._ownership_checks[-1].copied
+        with self.assertRaisesRegex(RuntimeError, "violation"):
+            pipeline._verify_ownership(-1)
+        self.assertTrue(copied.query(), "the ack read the flag before the compare ran")
+        self.assertFalse(pipeline._ownership_checks)
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTestCase):
     cfg = CacheConfig(
@@ -2671,7 +2959,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache.page_size = 1
         cache.enable_storage_metrics = False
         cache.buffer_pipeline = None  # cache-mode commit path
-        cache.cache_controller.pp_prefetch_decisions = {}
+        cache._is_pp_ticketed.return_value = False
         walk_action = object()
         insert_result = mock.MagicMock()
         insert_result.cache_actions = [walk_action]

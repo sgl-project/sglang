@@ -257,6 +257,30 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
                 self.assertTrue(torch.equal(actual_conv, expected_conv_buf))
         cache.sanity_check()
 
+    @requires_hicache
+    def test_load_back_commits_once_through_commit_load_back(self):
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        base = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, base)
+        node = match_prefix(cache, base).last_device_node
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(num_tokens=len(base)))
+
+        with mock.patch.object(
+            cache, "_commit_load_back", wraps=cache._commit_load_back
+        ) as commit:
+            # An aborted load-back never reaches the commit.
+            self.assertFalse(cache.load_back(node, mem_quota=-(10**9)))
+            commit.assert_not_called()
+            self._load_back_node(cache, node)
+
+        commit.assert_called_once()
+        committed_node, committed_indices = commit.call_args.args[:2]
+        self.assertEqual(committed_node, node)
+        # The load refilled the whole evicted path, so the commit gets all its pages.
+        self.assertTrue(torch.equal(committed_indices, cache.path_device_indices(node)))
+        cache.sanity_check()
+
     @requires(
         lambda cfg: (
             cfg.has_swa
