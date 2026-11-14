@@ -520,24 +520,34 @@ class ExpertPackStore:
                 f"runtime top-k must be exactly {self.header.top_k}; "
                 f"received shape {tuple(topk_ids.shape)}"
             )
-        route_ids = [int(value) for value in topk_ids.detach().cpu().reshape(-1)]
+        route_ids: list[int] = (
+            (
+                topk_ids.detach()
+                if topk_ids.dtype
+                in (torch.int32, torch.int64, torch.int16, torch.int8, torch.uint8)
+                else topk_ids.detach().to(dtype=torch.int64)
+            )
+            .reshape(-1)
+            .tolist()
+        )
         if is_prefill is None:
             is_prefill = topk_ids.shape[0] > 1
-        if any(expert < 0 or expert >= self.header.num_experts for expert in route_ids):
+        unique_experts = sorted(set(route_ids))
+        if unique_experts and (
+            unique_experts[0] < 0 or unique_experts[-1] >= self.header.num_experts
+        ):
             raise ValueError("route contains an out-of-range expert id")
-        requested = {(layer, expert) for expert in route_ids}
+        requested_keys = [(layer, expert) for expert in unique_experts]
+        requested = set(requested_keys)
         events: list[torch.cuda.Event] = []
 
         with self._lock:
-            for key in requested:
+            for key in requested_keys:
                 self._key_frequency[key] = min(self._key_frequency.get(key, 0) + 1, 255)
             self._active_keys.update(requested)
             self._route_calls_by_layer[layer] += 1
             self._route_tokens_by_layer[layer] += int(topk_ids.shape[0])
             pending: list[tuple[tuple[int, int], int]] = []
-            requested_keys = sorted(
-                dict.fromkeys((layer, expert) for expert in route_ids)
-            )
             for key in requested_keys:
                 slot_index = self._key_to_slot.get(key)
                 generation = self.entries[(key[0], key[1], 0)].generation
@@ -627,7 +637,11 @@ class ExpertPackStore:
             current_stream = torch.cuda.current_stream(cache_device)
             for event in events:
                 current_stream.wait_event(event)
-            slots = [self._key_to_slot[(layer, expert)] for expert in route_ids]
+            slot_by_expert = {
+                expert: self._key_to_slot[key]
+                for expert, key in zip(unique_experts, requested_keys)
+            }
+            slots = [slot_by_expert[expert] for expert in route_ids]
             self.stats["resident_experts"] = len(self._key_to_slot)
             self.stats["resident_bytes"] = (
                 len(self._key_to_slot) * self.object_payload_bytes
