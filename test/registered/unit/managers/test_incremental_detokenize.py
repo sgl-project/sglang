@@ -12,6 +12,7 @@ from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.incremental_detokenize import (
     DetokenizeHeader,
+    DetokenizeState,
     DetokenizeStateTable,
 )
 from sglang.srt.managers.io_struct import (
@@ -158,6 +159,49 @@ def _deliver(detok, outputs):
 class TestDetokenizeState(CustomTestCase):
     def setUp(self) -> None:
         self.enterContext(get_context().override_server_args(kv_canary="none"))
+
+    def test_utf8_printable_prefix_shrink_does_not_repeat_sent_text(self):
+        # Byte tokens split "中😀文" after the first byte of the emoji and of
+        # the last character. The printable prefix shrinks from "中" to ""
+        # while both decoded prefixes still end in an incomplete UTF-8 sequence.
+        token_bytes = bytes.fromhex("e4b8adf09f9880e69687")
+        chunks = (token_bytes[:4], token_bytes[4:8], token_bytes[8:])
+
+        def trim_matched_stop(text, _reason, _no_trim):
+            return text
+
+        for finish_last in (False, True):
+            with self.subTest(finish_last=finish_last):
+                state = DetokenizeState.from_header(header=_header([]), vocab_size=256)
+                texts, sent_offsets = [], []
+                for i, chunk in enumerate(chunks):
+                    finished_reason = (
+                        {"type": "length"} if finish_last and i == 2 else None
+                    )
+                    state.append_row(
+                        rid="utf8",
+                        output_ids=list(chunk),
+                        completion_tokens=sum(map(len, chunks[: i + 1])),
+                        is_beam=False,
+                        vocab_size=256,
+                    )
+                    read_ids, surr_ids = state.decode_inputs(
+                        finished_reason=finished_reason,
+                        trim_matched_stop=trim_matched_stop,
+                    )
+                    texts.append(
+                        state.step(
+                            read_text=bytes(read_ids).decode("utf-8", errors="replace"),
+                            surr_text=bytes(surr_ids).decode("utf-8", errors="replace"),
+                            finished_reason=finished_reason,
+                            trim_matched_stop=trim_matched_stop,
+                        )
+                    )
+                    sent_offsets.append(state.sent_offset)
+
+                self.assertEqual(texts, ["中", "", "😀文"])
+                self.assertEqual("".join(texts), token_bytes.decode("utf-8"))
+                self.assertEqual(sent_offsets, [1, 1, 3])
 
     def test_later_rows_decode_with_the_first_rows_header(self):
         detok = _detokenizer()

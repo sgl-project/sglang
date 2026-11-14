@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import enum
 import importlib
+import logging
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -21,6 +22,8 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
+
+logger = logging.getLogger(__name__)
 
 # bumped on any breaking change to the contracts in this module
 MEGAKERNEL_API_VERSION = 2
@@ -95,6 +98,10 @@ class BuildContext(msgspec.Struct, frozen=True):
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
     binding: Any = None
+    # Configured request buckets before KV sizing, unlike ``widths`` token rows.
+    # Providers convert requests to token rows once. Later pool-clamped buckets
+    # may be absent here and must not trigger new resource allocation at replay.
+    capture_widths: Optional[tuple[int, ...]] = None
 
 
 class Step(msgspec.Struct, frozen=True):
@@ -581,28 +588,97 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
 
 
-# HF architecture -> the "module:attribute" path of its spec
+# Built-in ownership is separate from external registrations. Keep these paths
+# lazy so importing the contract or registering other models loads no kernels.
+_BUILTIN_SPECS: dict[str, str] = {
+    "KimiK3ForConditionalGeneration": (
+        "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec:SPEC"
+    ),
+}
+
+# External HF architecture -> the "module:attribute" path of its spec.
 _REGISTRY: dict[str, str] = {}
+# Architectures deliberately replaced with register(..., override=True). Kept
+# separate from _REGISTRY so a built-in stays discoverable to
+# builtin_spec_registered() while find_spec() resolves the opted-in override.
+_OVERRIDES: dict[str, str] = {}
 
 
-def register(*, architecture: str, path: str) -> None:
-    """Register a module:attribute spec path from the plugin entry point."""
-    if _REGISTRY.get(architecture, path) != path:
+def register(*, architecture: str, path: str, override: bool = False) -> bool:
+    """Register a module:attribute spec path from the plugin entry point.
+
+    Returns True when ``path`` is now the resolved spec for ``architecture``,
+    False when an in-tree built-in keeps ownership. A plugin can therefore tell
+    whether its kernel actually took effect instead of being silently ignored,
+    with no change to startup: the entry point still registers harmlessly and
+    built-ins still own their architecture (see the note in find_spec).
+
+    Pass ``override=True`` to deliberately replace a built-in; the new path
+    then wins in find_spec() and the replacement is logged. Two different
+    external paths for one architecture still conflict (ValueError), and
+    re-registering an identical external path stays idempotent (entry points
+    may load twice).
+    """
+    if override:
+        previous = (
+            _OVERRIDES.get(architecture)
+            or _BUILTIN_SPECS.get(architecture)
+            or _REGISTRY.get(architecture)
+        )
+        _OVERRIDES[architecture] = path
+        logger.warning(
+            "megakernel spec for %s explicitly overridden: %s -> %s; SGLang's "
+            "in-tree guarantee no longer applies to this architecture",
+            architecture,
+            previous or "<none>",
+            path,
+        )
+        return True
+
+    builtin = _BUILTIN_SPECS.get(architecture)
+    if builtin is not None:
+        # Built-in ownership is intentional (see the note in find_spec). Do not
+        # raise: the plugin entry point calls register() at startup, so raising
+        # would break every install still shipping the external
+        # nvidia_megakernel package. Make the ineffective registration
+        # observable instead, including the identical-path case that used to
+        # return with no signal at all.
+        logger.warning(
+            "external megakernel spec %s for %s did NOT take effect: the "
+            "architecture is owned in-tree by SGLang (%s). Pass "
+            "override=True to register(...) to replace the built-in explicitly.",
+            path,
+            architecture,
+            builtin,
+        )
+        return False
+
+    existing = _OVERRIDES.get(architecture) or _REGISTRY.get(architecture)
+    if existing is not None and existing != path:
         raise ValueError(
-            f"a megakernel spec for {architecture} is already registered: "
-            f"{_REGISTRY[architecture]}"
+            f"a megakernel spec for {architecture!r} is already registered by "
+            f"{existing}; refusing {path!r}. Pass override=True to register(...) "
+            f"to replace it explicitly."
         )
     _REGISTRY[architecture] = path
+    return True
 
 
 def registered_architectures() -> list[str]:
-    """The architectures with a registered spec; empty when no plugin registered any."""
-    return sorted(_REGISTRY)
+    """The architectures with a built-in, external or overridden spec."""
+    return sorted(_BUILTIN_SPECS.keys() | _REGISTRY.keys() | _OVERRIDES.keys())
+
+
+def builtin_spec_registered(architectures: Optional[Sequence[str]]) -> bool:
+    """Whether any architecture has a built-in spec, without importing it."""
+    return any(arch in _BUILTIN_SPECS for arch in architectures or ())
 
 
 def spec_registered(architectures: Optional[Sequence[str]]) -> bool:
     """Whether any of the architectures has a registered spec, usable or not."""
-    return any(arch in _REGISTRY for arch in architectures or ())
+    return builtin_spec_registered(architectures) or any(
+        arch in _REGISTRY or arch in _OVERRIDES for arch in architectures or ()
+    )
 
 
 def find_spec(
@@ -610,8 +686,17 @@ def find_spec(
 ) -> tuple[Optional[MegakernelSpec], str]:
     """The compatible spec and an empty reason, or None and a rejection reason."""
     why = []
-    for arch in architectures or ():
-        path = _REGISTRY.get(arch)
+    # A built-in owns the model even when another HF architecture is listed
+    # first. An incompatible built-in must not fall back to an external spec.
+    # This is intentional: register() must not raise at startup for a built-in
+    # name (the external entry point registers unconditionally). An explicit
+    # register(..., override=True) is the one exception and is resolved first
+    # below, so the caller's choice actually takes effect.
+    builtin_architectures = [
+        arch for arch in architectures or () if arch in _BUILTIN_SPECS
+    ]
+    for arch in builtin_architectures or architectures or ():
+        path = _OVERRIDES.get(arch) or _BUILTIN_SPECS.get(arch) or _REGISTRY.get(arch)
         if path is None:
             continue
         module, _, attr = path.partition(":")

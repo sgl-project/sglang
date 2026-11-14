@@ -47,6 +47,184 @@ The framework provides two plugin types, both discovered via Python's standard `
 
 The platform plugin system targets **out-of-tree (OOT) hardware platforms**. Diffusion support is experimental and covers the seams documented below, not every device-specific branch.
 
+## Built-in Kimi K3 specialized decode
+
+**Experimental candidate.** The implementation in
+[PR #48510](https://github.com/sgl-project/sglang/pull/48510) brings Kimi K3
+specialized decode into the existing NVIDIA megakernel framework. Its first
+landing slice, placement and maintenance ownership are under discussion in
+[RFC #49536](https://github.com/sgl-project/sglang/issues/49536).
+
+Current evidence covers individual consumers and host/lifetime contracts.
+Whole-model TP8/DCP accuracy, native HiCache transfers/restoration, retained KV
+capacity and matched serving performance still need qualification.
+
+### Implemented behavior
+
+The candidate contains the 93-layer language-model executor, including embedding,
+MLA/KDA, projections, routed/shared experts and AttnRes. It uses
+`--enable-nvidia-megakernel` and built-in registration. The K3 payload is included
+in the source package. `SGLANG_PLUGINS` continues to filter external
+plugins. SGLang retains scheduling, cache allocation, recurrent state,
+restoration, sampling and API ownership.
+
+The executor and kernels reuse the community implementation introduced in
+[sgl-nvidia-mega #17](https://github.com/sgl-project/sgl-nvidia-mega/pull/17).
+The source package retains original notices and a file-level `SOURCE_MAPPING.json`.
+The optional FI primitive and initial adapter build on yyihuang's work in
+[FlashInfer #8867](https://github.com/flashinfer-ai/flashinfer/pull/8867).
+
+### Component evidence
+
+| Check | Observed scope |
+| --- | --- |
+| Actual AttnRes consumers | At `f36efc0`, `ClusterAttnRes`/`OprojConsumer` pass eager and three graph replays at B1/B64, including empty-bank/final branches, finite FP64-reference agreement and unchanged prefix/bank. |
+| Prepared FI value-gate adapter | Source-package operator checks cover real preparation/registry use, native-load failure recovery, and unchanged CuTe `MlaValue` agreement in eager/changed-input graphs. |
+| Native/FI consumer experiment | Synthetic rank-local tensors exercise native helper methods and FI's public API. Graph medians are 12.418/12.371 µs at B8 and 16.534/18.485 µs at B32 for native BF16/FI FP32. Their rounding policies differ. |
+
+The AttnRes run uses normal SGLang package initialization, Torch 2.14.1+cu130 and
+CuTe DSL 4.8.0. It qualifies consumer arithmetic and barriers. TP8 producers,
+TwoShot and full-model behavior remain outside that fixture.
+
+The native/FI experiment is a stitched consumer segment with a synthetic owner,
+local weights and driver-controlled capture flags. FI's maximum absolute
+output difference from native BF16 is 0.00048828125. The tested FI source package
+uses its public loader to JIT-compile FI-shipped Cake CUDA. Native BF16 remains
+the serving path while precision, valid-row metadata and gate ownership are
+evaluated. See the [samples and full measurement conditions](/images/kimi-k3-specialized-decode/native-consumer-measurements.json)
+and the [RFC evidence discussion](https://github.com/sgl-project/sglang/issues/49536#issuecomment-6765773450).
+
+Run the existing AttnRes fixture from the repository root in a matching environment:
+
+```bash
+python -m pytest -q test/registered/kernels/ops/layernorm/test_kimi_k3_attnres_stability.py
+```
+
+### Experimental target configuration
+
+These are the candidate's admission and implementation targets. Full validation
+of the combined configuration remains pending.
+
+| Setting | Target |
+| --- | --- |
+| Platform | Linux, NVIDIA CUDA 13, B300/GB300 SM103 with at least 148 SMs |
+| Model | Kimi K3 packed-MXFP4 experts and BF16 activations |
+| Parallelism | Single node, TP8, DCP1 or DCP8, no speculative decoding |
+| Cache | FP8 E4M3 KV, page size 64, with HiCache restore binding implemented |
+| Execution | Full decode CUDA graphs, configured request buckets up to 64 |
+
+For experimental validation, install the full-attention dependency and select a
+profile before starting a server.
+
+```bash
+python -m pip install -e './python[k3-full-decode]'
+export SGLANG_NVIDIA_MEGAKERNEL_SLOTS=k3_full_decode
+```
+
+Add `--enable-nvidia-megakernel` to a launch configured as above, with
+`--model-path` pointing to your K3 checkpoint. `k3_full_decode` uses fused MLA/DCP,
+prepared TP embedding, B1/B2 tiny GEMM and B1–8 L2 weight prefetch.
+`k3_native_mla` uses the same prepared executor with SGLang's native MLA/DCP
+attention as a control. It does not require TokenSpeed. Select exactly one
+profile.
+
+The full-decode extra pins `tokenspeed-mla==2.0.3`. SGLang also pins
+`nvidia-cutlass-dsl[cu13]==4.8.0` and `apache-tvm-ffi==0.1.11`. CuTe 4.6.2 lacks
+the `cutlass.experimental` primitives this payload imports. Preparation checks
+dependency ABI and model geometry before allocating specialized resources.
+
+The optional `k3_flashinfer_mla_value` slot uses FI wherever the prepared decode
+calls `MlaValue`. This includes the default `community` executor,
+`k3_native_mla` with DCP1/DCP8, and `k3_full_decode` with DCP1. Fused DCP8 keeps
+`DcpValue`. You can combine the native-MLA profile and FI slot.
+
+```bash
+export SGLANG_NVIDIA_MEGAKERNEL_SLOTS=k3_native_mla,k3_flashinfer_mla_value
+```
+
+That slot requires a FI build exposing `flashinfer.cake_mla_value_gate`. The
+candidate's pinned 0.7.2 and the official 0.7.3 wheel inspected on November 10,
+2026 lack the module, so they retain `MlaValue`. Installed-build qualification
+also needs coherent FI Python/cubin/JIT-cache versions. A preparation that FI
+cannot serve retains `MlaValue`; errors during a captured launch propagate.
+
+TP16, SM100, multi-node execution, DSpark and auxiliary hidden-state capture
+(`--enable-return-aux-hidden-states`) are outside these profiles. Use the native
+model path for layer-tap outputs. A configured context up to 1,048,576 tokens is
+an admission limit. Capacity and 1M-input quality require separate validation.
+
+### Fallback and resource lifetime
+
+Providers, workspaces and prefetch tables are prepared before KV sizing for
+widths 1–8/16/32/48/64 plus configured request buckets up to 64. Prefill, eager
+profiling, warmup and unprepared buckets use the original model. A later
+pool-clamped bucket does not allocate providers. Startup rejects an enabled
+runner when none of its captured buckets uses the specialized path.
+
+Retaining a Torch `Parameter` does not preserve storage after a backend replaces
+its `.data`. After backend setup, `ResourceSet.bind()` binds CuTe views and
+prefetch ranges to final weight storage before graph capture. Prefetch refresh
+updates the existing table in place and preserves its CuTe/driver pointers.
+Layout changes are rejected. Replay does not rebind addresses or allocate
+replacement tables.
+
+The typed binding carries owner-local KV writes, global/local lengths,
+recurrent-state views and live per-layer restore joins. Those hooks require
+whole-model native HiCache host/store qualification in the target configuration.
+Online weight updates are rejected before writes because the prepared providers
+retain additional derived weights and captured addresses. Restart to change
+weights with these profiles, or use the native model path when online updates
+are required.
+
+### Remaining whole-model acceptance
+
+Use the exact candidate revision with fixed checkpoint/tokenizer, dependencies,
+inputs/prefix reuse, thinking and termination policy, graph coverage, hardware
+and memory budget.
+
+- Compare stock, `k3_native_mla` and `k3_full_decode` at TP8/DCP8, with a focused
+  DCP1 comparison.
+- Check representative task outputs and numerical drift against stock-run
+  variability, including naturally terminated answers and native HiCache
+  host/store transfers and restoration.
+- Measure TTFT, decode latency/throughput, peak memory and retained KV capacity.
+  Repeat representative points and separate prefill, decode and restore time.
+
+### Historical integrated-build comparison before the fixes
+
+![Historical pre-fix integrated-build throughput and p95 time to first token](/images/kimi-k3-specialized-decode/integrated-comparison.png)
+
+The 2026-11-04 UTC integrated-build/profile comparison recorded the following
+results before the AttnRes and Unicode fixes.
+
+| Metric | Feature OFF | Feature ON + runtime profile | Change |
+| --- | ---: | ---: | ---: |
+| Output throughput | 595.606 tokens/s | 660.974 tokens/s | +10.97% |
+| p95 TTFT | 24.993 s | 22.730 s | −9.05% |
+
+The recorded OFF runtime revision was `c986a255`, using profile
+`k3-specialized-c986a255-8544b239-off-20261104`. The ON runtime revision was
+`7f3128d2`, using profile
+`k3-specialized-repair3-7f3128d2-5f6bb926-capacity133-on-20261105`.
+The ON memory plan changed `mem_fraction_static` from 0.90 to 0.909 and set
+`max-total-tokens=1144704` physical rows per rank and
+`max-mamba-cache-size=533` to retain the cache capacity and admission limit.
+These measurements apply to the earlier integrated builds. Full-model
+acceptance and matched performance for the current PR head remain pending.
+
+Each arm used three warmups and 128 formal requests, 32,768 input tokens with a
+27,648-token reused prefix, 300 output tokens including reasoning, and concurrency
+64 on B300 TP8/DCP8 without speculation. Source/image and memory/inference
+profiles changed together. All requests reached the output cap. The original
+120-second after-peer metadata deadline failed. Later metadata-only closure sent
+no generation requests and retained the original strict-comparator failure.
+
+The [original conditions and data](/images/kimi-k3-specialized-decode/measurements.json),
+[vector figure](/images/kimi-k3-specialized-decode/integrated-comparison.pdf) and
+plot source in `docs/images/kimi-k3-specialized-decode/plot_measurements.py` are
+preserved for reproduction.
+
+
 ## Architecture
 
 ### Runtime-specific platform interfaces

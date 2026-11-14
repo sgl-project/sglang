@@ -15,9 +15,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fakes import ARCH, ISA, server_args  # noqa: E402
+from _fakes import ARCH, ISA, SPEC, server_args  # noqa: E402
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
+KIMI_ARCH = "KimiK3ForConditionalGeneration"
+KIMI_MODULE = "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec"
 
 
 class TestMegakernelGuards(CustomTestCase):
@@ -25,17 +28,153 @@ class TestMegakernelGuards(CustomTestCase):
         registry_patch = patch.dict(registry._REGISTRY, clear=True)
         registry_patch.start()
         self.addCleanup(registry_patch.stop)
+        overrides_patch = patch.dict(registry._OVERRIDES, clear=True)
+        overrides_patch.start()
+        self.addCleanup(overrides_patch.stop)
 
     def test_a_disabled_flag_looks_nothing_up_and_keeps_the_forward(self):
-        with patch.object(binding, "plugin_reasons") as plugin:
-            binding.handle_nvidia_megakernel(server_args())
+        cfg = server_args()
+        with (
+            patch.object(binding, "plugin_reasons") as plugin,
+            patch.object(registry.importlib, "import_module") as import_module,
+        ):
+            binding.handle_nvidia_megakernel(cfg)
         plugin.assert_not_called()
+        import_module.assert_not_called()
         model = SimpleNamespace()  # any attribute read would raise
         with patch.object(binding, "megakernel_enabled", return_value=False):
             binding.install_megakernel(
                 model=model, hf_config=None, capture_tail_hooks=[], is_draft=False
             )
         self.assertEqual(vars(model), {})
+
+    def test_builtin_registration_is_lazy_and_reports_external_collisions(self):
+        external_specs = (
+            ("DeepseekV4ForCausalLM", "external.deepseek:SPEC"),
+            ("Qwen3_5MoeForConditionalGeneration", "external.qwen:SPEC"),
+        )
+        with patch.object(registry.importlib, "import_module") as import_module:
+            for architecture, path in external_specs:
+                self.assertTrue(registry.register(architecture=architecture, path=path))
+            # Built-in ownership stays the intentional default: the external
+            # entry point still registers harmlessly (no startup-breaking
+            # exception), but the ineffective registration is now observable.
+            with patch.object(registry, "logger") as logger:
+                result = registry.register(
+                    architecture=KIMI_ARCH,
+                    path="sgl_nvidia_mega.kimi_k3.spec:SPEC",
+                )
+            self.assertFalse(result)
+            logger.warning.assert_called_once()
+            message = " ".join(str(a) for a in logger.warning.call_args.args)
+            self.assertIn("did NOT take effect", message)
+            self.assertIn(registry._BUILTIN_SPECS[KIMI_ARCH], message)
+            self.assertIn("sgl_nvidia_mega.kimi_k3.spec:SPEC", message)
+            self.assertIn("override=True", message)
+            self.assertEqual(
+                registry.registered_architectures(),
+                sorted([a for a, _ in external_specs] + [KIMI_ARCH]),
+            )
+            self.assertTrue(registry.builtin_spec_registered([KIMI_ARCH]))
+            self.assertTrue(registry.spec_registered([KIMI_ARCH]))
+            self.assertFalse(registry.builtin_spec_registered([ARCH]))
+            self.assertNotIn(KIMI_ARCH, registry._REGISTRY)
+            self.assertNotIn(KIMI_ARCH, registry._OVERRIDES)
+            import_module.assert_not_called()
+
+            import_module.return_value = SimpleNamespace(SPEC=SPEC)
+            self.assertEqual(
+                registry.find_spec(architectures=[KIMI_ARCH], isa=ISA), (SPEC, "")
+            )
+            import_module.assert_called_once_with(KIMI_MODULE)
+
+            import_module.reset_mock()
+            architectures = ["DeepseekV4ForCausalLM", KIMI_ARCH]
+            self.assertEqual(
+                registry.find_spec(architectures=architectures, isa=ISA), (SPEC, "")
+            )
+            import_module.assert_called_once_with(KIMI_MODULE)
+
+            import_module.reset_mock()
+            spec, reason = registry.find_spec(architectures=architectures, isa="sm_100")
+            self.assertIsNone(spec)
+            self.assertIn("not sm_100", reason)
+            import_module.assert_called_once_with(KIMI_MODULE)
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            registry.register(
+                architecture="DeepseekV4ForCausalLM", path="different.deepseek:SPEC"
+            )
+
+    def test_an_explicit_override_replaces_the_builtin_in_find_spec(self):
+        """override=True is the documented escape hatch and must take effect."""
+        override_path = "sgl_nvidia_mega.kimi_k3.spec:SPEC"
+        with patch.object(registry, "logger") as logger:
+            result = registry.register(
+                architecture=KIMI_ARCH, path=override_path, override=True
+            )
+        self.assertTrue(result)
+        logger.warning.assert_called_once()
+        self.assertEqual(registry._OVERRIDES[KIMI_ARCH], override_path)
+        self.assertNotIn(KIMI_ARCH, registry._REGISTRY)
+        # built-in ownership stays discoverable for startup gating
+        self.assertTrue(registry.builtin_spec_registered([KIMI_ARCH]))
+        with patch.object(
+            registry.importlib,
+            "import_module",
+            return_value=SimpleNamespace(SPEC=SPEC),
+        ) as import_module:
+            self.assertEqual(
+                registry.find_spec(architectures=[KIMI_ARCH], isa=ISA), (SPEC, "")
+            )
+            import_module.assert_called_once_with("sgl_nvidia_mega.kimi_k3.spec")
+
+    def test_builtin_setup_needs_no_plugin_and_still_checks_requirements(self):
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[KIMI_ARCH]), dtype="bfloat16"
+        )
+        cfg = server_args(enable_nvidia_megakernel=True)
+        with (
+            patch.object(binding, "resolving_view", return_value=cfg),
+            patch.object(binding, "model_config_of", return_value=model_config),
+            patch.object(binding, "device_isa", return_value=ISA),
+            patch.object(binding, "entry_points", return_value=[]) as entry_points,
+            patch.object(
+                registry.importlib,
+                "import_module",
+                return_value=SimpleNamespace(SPEC=SPEC),
+            ),
+            binding.envs.SGLANG_PLUGINS.override("unrelated_plugin"),
+        ):
+            binding.handle_nvidia_megakernel(cfg)
+            cfg.tp_size = 8  # The fake spec requires TP4, even for the built-in path.
+            with self.assertRaisesRegex(ValueError, "tp_size"):
+                binding.handle_nvidia_megakernel(cfg)
+            entry_points.assert_not_called()
+
+    def test_other_models_still_require_the_external_plugin_and_allowlist(self):
+        model_config = SimpleNamespace(hf_config=SimpleNamespace(architectures=[ARCH]))
+        cfg = server_args(enable_nvidia_megakernel=True)
+        with (
+            patch.object(binding, "resolving_view", return_value=cfg),
+            patch.object(binding, "model_config_of", return_value=model_config),
+            patch.object(binding, "entry_points", return_value=[]),
+            binding.envs.SGLANG_PLUGINS.override(""),
+        ):
+            with self.assertRaisesRegex(ValueError, "plugin is not installed"):
+                binding.handle_nvidia_megakernel(cfg)
+        with (
+            patch.object(binding, "resolving_view", return_value=cfg),
+            patch.object(binding, "model_config_of", return_value=model_config),
+            patch.object(
+                binding,
+                "entry_points",
+                return_value=[SimpleNamespace(name=registry.ENTRY_POINT)],
+            ),
+            binding.envs.SGLANG_PLUGINS.override("unrelated_plugin"),
+        ):
+            with self.assertRaisesRegex(ValueError, "does not list"):
+                binding.handle_nvidia_megakernel(cfg)
 
     def test_an_unmet_tp_size_is_refused_and_an_empty_field_accepts_any(self):
         hf_config = SimpleNamespace(architectures=[ARCH], model_type="fake")
