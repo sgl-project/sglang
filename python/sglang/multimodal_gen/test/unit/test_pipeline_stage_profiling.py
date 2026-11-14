@@ -53,13 +53,13 @@ def test_profiler_window_contains_requested_steps(tmp_path, requested):
         num_inference_steps=6,
         log_dir=str(tmp_path),
     )
-    try:
+    # Sampled profiling is bounded by the denoising stage, so the trace is
+    # collected inside that context and exported when the stage exits.
+    with profiler.profile_denoising_stage():
         for step in range(6):
             with torch.profiler.record_function(f"denoise_step_{step}"):
                 torch.ones(8).add_(1)
             profiler.step_denoising_step()
-    finally:
-        profiler.stop()
     path = next(tmp_path.glob("*.trace.json.gz"))
     with gzip.open(path, "rt") as file:
         events = json.load(file)["traceEvents"]
