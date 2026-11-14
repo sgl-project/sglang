@@ -255,9 +255,11 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.req_pool_indices[:bs]
             ).to(dtype=torch.int32)
         if forward_batch.mamba_track_indices is not None:
+            # Kept int64 when translated: every layer's track writes index the pool
+            # with these, and indexing with an int32 tensor casts it to int64 each time.
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
-            )
+            ).to(torch.int64)
         # Resolve the tracked-row selection once per forward
         cpu_track_metadata = self._has_cpu_prefill_track_metadata(forward_batch)
         if cpu_track_metadata:
