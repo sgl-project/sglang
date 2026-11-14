@@ -466,6 +466,9 @@ class Envs:
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
+    SGLANG_PROFILE_KERNEL_SUMMARY = EnvBool(False)
+    SGLANG_PROFILE_STEP_KERNELS = EnvBool(False)
+    SGLANG_PROFILE_STEP_TRACE_MAX_BYTES = EnvInt(8 * 1024 * 1024)
     # profile_by_stage: do not start the decode-stage capture until a decode batch
     # reaches this many requests (0 = first decode batch). Lets a batch-size bench
     # capture steady-state full-admission decode steps instead of the ramp-up.
