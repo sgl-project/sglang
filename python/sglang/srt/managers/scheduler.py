@@ -347,7 +347,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.capacity import shares_memory
+from sglang.srt.mem_cache.capacity import admission_capacity_grew, shares_memory
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
@@ -4508,8 +4508,19 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
+        if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
+            running_batch.batch_is_full = False
+        elif (
+            self.is_hybrid_swa
+            and running_batch.batch_is_full
+            and admission_capacity_grew(
+                running_batch.capacity_at_refusal,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+            )
+        ):
+            # Window rows and finished backups free capacity mid-step.
             running_batch.batch_is_full = False
         if running_batch.is_empty():
             # An empty batch has no request left to leave, and only a leaving
@@ -4765,6 +4776,9 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     running_batch.batch_is_full = adder.batch_is_full_after_rejection(
                         req
+                    )
+                    running_batch.capacity_at_refusal = (
+                        adder.memory_budget.admission_capacity()
                     )
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not

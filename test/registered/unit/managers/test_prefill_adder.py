@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.capacity import admission_capacity_grew
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
@@ -2932,6 +2933,38 @@ class TestPrefillAdder(CustomTestCase):
                 window_host_hit_lengths={"swa": 4096},
             )
         )
+
+    def test_swa_admission_retries_once_capacity_grows(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_tree_cache.full_evictable_size.return_value = 0
+        self.mock_tree_cache.window_evictable_size.return_value = 0
+        allocator = self.create_token_allocator(
+            full_available_size=2000, swa_available_size=300
+        )
+        allocator.page_size = 1
+        allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
+            SWAPrefillBudget(allocator, tree_cache, **kwargs)
+        )
+        budget = allocator.create_prefill_budget(self.mock_tree_cache)
+        budget.current_offset += 1500
+        budget.swa_offset += 200
+        refused = budget.admission_capacity()
+        self.assertEqual(refused, (500, 100))
+        allocator.full_available_size.return_value = 500
+        allocator.swa_available_size.return_value = 100
+        self.assertFalse(
+            admission_capacity_grew(refused, allocator, self.mock_tree_cache)
+        )
+        self.mock_tree_cache.full_evictable_size.return_value = 1
+        self.assertTrue(
+            admission_capacity_grew(refused, allocator, self.mock_tree_cache)
+        )
+        self.mock_tree_cache.full_evictable_size.return_value = 0
+        self.mock_tree_cache.window_evictable_size.return_value = 1
+        self.assertTrue(
+            admission_capacity_grew(refused, allocator, self.mock_tree_cache)
+        )
+        self.assertTrue(admission_capacity_grew(None, allocator, self.mock_tree_cache))
 
     def test_swa_never_fits_is_gated_by_pool_capacity(self):
         # Same request; only the pool size changes. Proves the check compares

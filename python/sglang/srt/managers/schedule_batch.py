@@ -1967,6 +1967,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
+    # Free plus evictable capacity when admission last refused for memory.
+    capacity_at_refusal: Optional[Tuple[int, ...]] = None
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
