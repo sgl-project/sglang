@@ -25,6 +25,7 @@
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 
+#include <cassert>
 #include <cstdint>
 #include <type_traits>
 
