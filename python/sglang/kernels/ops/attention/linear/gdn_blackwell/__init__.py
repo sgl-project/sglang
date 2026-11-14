@@ -11,6 +11,8 @@ from cuda.bindings.driver import CUstream
 from cutlass import Int32, cute
 from quack.compile_utils import make_fake_tensor
 
+from sglang.kernels.arch import current_arch
+
 from .kernel_h import h_cutedsl
 from .kernel_kkt_inv_uw import kkt_inv_uw_cutedsl
 from .kernel_o import o_cutedsl
@@ -198,7 +200,7 @@ def chunk_gated_delta_rule_cutedsl(
     u = q_3d.new_empty(pad_t, num_v_heads, head_v_dim)
     w = q_3d.new_empty(pad_t, num_v_heads, head_k_dim)
 
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = current_arch().num_sms
     kkt_inv_uw_cutedsl(
         k_3d,
         v_3d,

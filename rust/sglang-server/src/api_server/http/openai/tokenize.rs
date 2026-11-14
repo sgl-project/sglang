@@ -16,8 +16,9 @@ use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::chat::ChatRequest;
-use super::{AppState, contains_media};
+use super::chat::{ChatBody, ChatRequest};
+use super::template::{RenderedChat, render_chat};
+use super::{AppState, contains_media, lowered};
 use crate::api_server::core::CoreError;
 use crate::message::types::{OneOrMany, TokenIds};
 
@@ -78,11 +79,17 @@ fn bad_request(message: impl Into<String>) -> Response {
     error_body(StatusCode::BAD_REQUEST, "BadRequestError", message)
 }
 
-/// A failed core operation: a rejected input is the client's 400; anything
-/// else is the 500 Python's catch-all returns.
+/// A failed core operation: a rejected input is the client's 400, and a full
+/// queue the 503 every other overloaded route answers (typed by its status,
+/// as Python types an `HTTPException`); anything else is the 500 Python's
+/// catch-all returns.
 fn core_error(error: CoreError, operation: &str) -> Response {
     match error {
         CoreError::InvalidArgument(message) => bad_request(message),
+        error @ CoreError::Overloaded(_) => {
+            let status = error.http_status();
+            error_body(status, status.as_str(), error.to_string())
+        }
         other => error_body(
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalServerError",
@@ -103,26 +110,40 @@ async fn tokenize(
         Ok(body) => body,
         Err(error) => return invalid_body(error.to_string()),
     };
+    let max_model_len = state.server_args.tokenizer_model_max_length;
+    let one = |tokens: TokenIds| {
+        json!({
+            "tokens": tokens,
+            "count": tokens.len(),
+            "max_model_len": max_model_len,
+        })
+    };
     let (texts, add_special_tokens) = match (body.prompt, body.messages) {
         (Some(prompt), None) => (prompt, body.add_special_tokens),
-        // The rendered template owns its special tokens, as on the chat path
-        // (Python encodes it with `add_special_tokens=False`).
-        (None, Some(messages)) => match render_chat_prompt(&state, messages, body.rest) {
-            Ok(prompt) => (OneOrMany::One(prompt), false /* add_special_tokens */),
-            Err((error_type, message)) => {
-                return error_body(StatusCode::BAD_REQUEST, error_type, message);
+        // Encoded as on the chat path (Python's `add_special_tokens=False`).
+        (None, Some(messages)) => {
+            let chat = chat_body(messages, body.rest);
+            // The ids chat would send, from the lowered path where chat takes it.
+            let bytes = serde_json::to_vec(&chat).expect("JSON values serialize");
+            if let Some(ids) = lowered::prompt_ids(&state, bytes.into()).await {
+                return Json(one(ids)).into_response();
             }
-        },
+            let rendered = match render_chat_prompt(&state, chat) {
+                Ok(rendered) => rendered,
+                Err((error_type, message)) => {
+                    return error_body(StatusCode::BAD_REQUEST, error_type, message);
+                }
+            };
+            return match state.core.tokenize_chat(rendered).await {
+                Ok(tokens) => Json(one(tokens)).into_response(),
+                Err(error) => core_error(error, "tokenization"),
+            };
+        }
         _ => return invalid_body("Exactly one of 'prompt' or 'messages' must be provided."),
     };
-    let max_model_len = state.server_args.tokenizer_model_max_length;
     let response = match texts {
         OneOrMany::One(text) => match state.core.tokenize(text, add_special_tokens).await {
-            Ok(tokens) => json!({
-                "tokens": tokens,
-                "count": tokens.len(),
-                "max_model_len": max_model_len,
-            }),
+            Ok(tokens) => one(tokens),
             Err(error) => return core_error(error, "tokenization"),
         },
         OneOrMany::Many(texts) => {
@@ -141,28 +162,30 @@ async fn tokenize(
     Json(response).into_response()
 }
 
-/// Render `messages` through the chat template, like Python's
+/// The chat request for `messages`, like Python's
 /// `TokenizeRequest.to_chat_completion_request`: every other tokenize field
-/// except `prompt` and `add_special_tokens` carries over to the chat request.
-/// A failure is a 400, returned as its error type and message.
-fn render_chat_prompt(
-    state: &AppState,
-    messages: Value,
-    mut fields: Map<String, Value>,
-) -> Result<String, (&'static str, String)> {
-    const INVALID_BODY: &str = "Bad Request";
-    const BAD_REQUEST: &str = "BadRequestError";
+/// except `prompt` and `add_special_tokens` carries over.
+fn chat_body(messages: Value, mut fields: Map<String, Value>) -> Value {
     fields.insert("messages".into(), messages);
     // Python's `TokenizeRequest.model` default; the chat request requires one.
     fields
         .entry("model")
         .or_insert_with(|| Value::from("default"));
-    let ChatRequest {
-        request,
-        chat_template_kwargs,
-        ..
-    } = serde_json::from_value(Value::Object(fields))
-        .map_err(|error| (INVALID_BODY, error.to_string()))?;
+    Value::Object(fields)
+}
+
+/// Render a chat request through the typed handler's path. A failure is a 400,
+/// returned as its error type and message.
+fn render_chat_prompt(
+    state: &AppState,
+    body: Value,
+) -> Result<RenderedChat, (&'static str, String)> {
+    const INVALID_BODY: &str = "Bad Request";
+    const BAD_REQUEST: &str = "BadRequestError";
+    let ChatBody {
+        request: ChatRequest { request, .. },
+        raw: body,
+    } = ChatBody::deserialize(body).map_err(|error| (INVALID_BODY, error.to_string()))?;
     if request.messages.is_empty() {
         return Err((BAD_REQUEST, "messages cannot be empty".into()));
     }
@@ -175,9 +198,13 @@ fn render_chat_prompt(
     let Some(formatter) = &state.chat_formatter else {
         return Err((BAD_REQUEST, "this model has no usable chat template".into()));
     };
-    formatter
-        .render(&request, chat_template_kwargs.as_ref())
-        .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
+    render_chat(
+        formatter,
+        body,
+        &request,
+        &state.server_args.default_chat_template_kwargs,
+    )
+    .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
 }
 
 async fn detokenize(
@@ -221,12 +248,11 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
-    use super::super::template_loader::load_chat_formatter;
     use super::super::test_utils::{body_json, post_json};
     use super::*;
-    use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::ServerArgs;
-    use crate::message::request::RequestKind;
+    use crate::message::request::{RequestKind, TokenizeInput};
     use crate::message::response::ResponseItem;
     use crate::tokenizer_manager::wiring::TmEvent;
 
@@ -239,13 +265,23 @@ mod tests {
             while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
                 assert!(admission.try_accept());
                 let item = match &request.kind {
-                    RequestKind::Tokenize {
+                    // What intake answers when the tokenizer pool is full.
+                    RequestKind::Tokenize(TokenizeInput::Text { text, .. }) if text == "full" => {
+                        ResponseItem::Error(crate::utils::error::Error::QueueFull)
+                    }
+                    RequestKind::Tokenize(TokenizeInput::Text {
                         text,
                         add_special_tokens,
-                    } => {
+                    }) => {
                         let bos = add_special_tokens.then_some(0);
                         let words = text.split_whitespace().map(|w| w.len() as i64);
                         ResponseItem::TokenIds(bos.into_iter().chain(words).collect())
+                    }
+                    RequestKind::Tokenize(TokenizeInput::Chat(chat)) => {
+                        let text = chat.as_ref().clone().into_text();
+                        ResponseItem::TokenIds(
+                            text.split_whitespace().map(|w| w.len() as i64).collect(),
+                        )
                     }
                     RequestKind::Detokenize {
                         token_ids,
@@ -270,7 +306,13 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(server_args.as_ref()),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(
@@ -278,7 +320,7 @@ mod tests {
             ),
             server_args,
             chat_formatter: Some(
-                load_chat_formatter(
+                sglang_processor::load_chat_formatter(
                     None,           /* config_file */
                     None,           /* model_path */
                     None,           /* model_type */
@@ -286,6 +328,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            generate_hook: None,
+            openai_chat: None,
         })
     }
 
@@ -367,5 +411,26 @@ mod tests {
         let (status, error) = call("/v1/tokenize", json!({"messages": []})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error["type"], "BadRequestError");
+    }
+
+    /// A full tokenizer pool is overload, not an internal error: the 503 the
+    /// generate routes answer, in this endpoint's flat error body.
+    #[tokio::test]
+    async fn full_tokenizer_pool_is_a_503() {
+        for prompt in [json!("full"), json!(["a", "full"])] {
+            let (status, error) = call("/v1/tokenize", json!({"prompt": prompt})).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{prompt}");
+            assert_eq!(
+                error,
+                json!({
+                    "object": "error",
+                    "message": "to_scheduler channel full",
+                    "type": "503",
+                    "param": null,
+                    "code": 503,
+                }),
+                "{prompt}"
+            );
+        }
     }
 }
