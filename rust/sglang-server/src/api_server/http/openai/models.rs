@@ -16,7 +16,7 @@ use super::{AppState, openai_error, unix_seconds_u32};
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/models", get(available_models))
-        .route("/v1/models/{model}", get(retrieve_model))
+        .route("/v1/models/{*model}", get(retrieve_model))
 }
 
 /// `GET /v1/models` — OpenAI-compatible model list. Served from core metadata;
@@ -32,11 +32,12 @@ async fn available_models(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn retrieve_model(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
+    let requested = model.trim_start_matches('/');
     let Some(card) = state
         .core
         .list_models()
         .into_iter()
-        .find(|card| card.id == model)
+        .find(|card| card.id.trim_start_matches('/') == requested)
     else {
         return openai_error(
             StatusCode::NOT_FOUND,
