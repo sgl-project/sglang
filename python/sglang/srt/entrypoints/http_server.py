@@ -518,6 +518,13 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 
     app.add_middleware(RequestDecompressionMiddleware)
 
+if envs.SGLANG_ENABLE_RESPONSE_COMPRESSION.get():
+    from sglang.srt.entrypoints.http_response_compression import (
+        ResponseCompressionMiddleware,
+    )
+
+    app.add_middleware(ResponseCompressionMiddleware)
+
 # Registered at import so that tokenizer workers, which re-import this module, get it too.
 add_http_request_metrics_middleware(app)
 
