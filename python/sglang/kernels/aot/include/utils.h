@@ -339,6 +339,10 @@ inline bool getEnvEnablePDL() {
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
+// WARP_SIZE is a compile-time constant for device code: on ROCm 64 for CDNA (gfx9) and 32 for the wave32
+// targets (gfx11, gfx12). The host pass of a HIP build is shared by every --offload-arch and always sees 64,
+// so host-side launch geometry must come from sgl_launch_warp_size(), and kernels whose layout depends on
+// the wave size are instantiated per wave size and selected with SGL_DISPATCH_WARP_SIZE.
 #ifndef USE_ROCM
 #define WARP_SIZE 32
 #else
@@ -347,6 +351,47 @@ inline bool getEnvEnablePDL() {
 #else
 #define WARP_SIZE 32
 #endif
+#endif
+
+// False only in a device pass whose wave size differs from WAVE; such instantiations are never launched,
+// so their bodies are dropped instead of being compiled for the wrong wave size.
+#if defined(USE_ROCM) && defined(__HIP_DEVICE_COMPILE__)
+template <int WAVE>
+inline constexpr bool sgl_wave_matches_target = (WAVE == WARP_SIZE);
+#else
+template <int WAVE>
+inline constexpr bool sgl_wave_matches_target = true;
+#endif
+
+#ifdef USE_ROCM
+#include <ATen/cuda/CUDAContext.h>
+
+inline int sgl_launch_warp_size() {
+  return at::cuda::getCurrentDeviceProperties()->warpSize;
+}
+
+// Calls the lambda argument with `constexpr int kWarpSize` equal to the current device's wave size.
+#define SGL_DISPATCH_WARP_SIZE(...)                                            \
+  [&] {                                                                        \
+    const int sgl_warp_size = sgl_launch_warp_size();                          \
+    if (sgl_warp_size == 32) {                                                 \
+      constexpr int kWarpSize = 32;                                            \
+      return (__VA_ARGS__)();                                                  \
+    }                                                                          \
+    TORCH_CHECK(sgl_warp_size == 64, "Unsupported wave size ", sgl_warp_size); \
+    constexpr int kWarpSize = 64;                                              \
+    return (__VA_ARGS__)();                                                    \
+  }()
+#else
+inline int sgl_launch_warp_size() {
+  return WARP_SIZE;
+}
+
+#define SGL_DISPATCH_WARP_SIZE(...)      \
+  [&] {                                  \
+    constexpr int kWarpSize = WARP_SIZE; \
+    return (__VA_ARGS__)();              \
+  }()
 #endif
 
 #ifdef USE_ROCM
