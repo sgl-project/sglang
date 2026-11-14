@@ -1183,6 +1183,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please add `--disable-radix-cache` when you launch the server "
                     "if you want to use input_embeds as inputs."
                 )
+            if get_spec().speculative_algorithm:
+                raise ValueError(
+                    "input_embeds is provided while speculative decoding is "
+                    "enabled. Speculative algorithms need the prompt's token "
+                    "ids, and draft models consume the request's embeddings in "
+                    "their prefill (a crash when draft and target hidden sizes "
+                    "differ, a corrupted draft KV cache otherwise). Launch the "
+                    "server without --speculative-algorithm to use input_embeds."
+                )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
         elif obj.input_ids is not None:
