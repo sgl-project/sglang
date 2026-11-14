@@ -80,6 +80,98 @@ def test_apply_weights_defaults_swiglu_limit_zero_without_clamp(monkeypatch):
     assert store["quant_info"].swiglu_limit == 0.0
 
 
+def _deterministic_mode(monkeypatch, module, enabled):
+    monkeypatch.setattr(
+        module,
+        "get_exec",
+        lambda: SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=enabled)
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "deterministic, activation, supports_option, expected",
+    [
+        (False, "swiglu_oai", True, False),  # normal mode is unchanged
+        (True, "swiglu_oai", True, True),  # SwiGLU experts
+        (True, "silu", True, True),  # gated SiLU experts (GLM-5.3)
+        (True, "gelu", True, False),  # not covered
+        (True, "swiglu_oai", False, False),  # AITER without the option
+    ],
+)
+def test_deterministic_mode_preshuffles_gate_up_interleaved(
+    monkeypatch, deterministic, activation, supports_option, expected
+):
+    import sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe as mod
+
+    monkeypatch.setattr(mod, "_use_triton_w4a16", False)
+    monkeypatch.setattr(mod, "_is_shuffle_moe_mxfp4", True)
+    monkeypatch.setattr(mod, "_is_gfx1250", False)
+    _deterministic_mode(monkeypatch, mod, deterministic)
+    scheme = _make_scheme()
+    scheme._owns_moe_runner = True
+    scheme._owns_moe_weight_layout = True
+    calls = []
+    monkeypatch.setattr(
+        scheme, "_shuffle_gu_interleaved", lambda layer: calls.append(layer)
+    )
+    monkeypatch.setattr(mod, "e8m0_shuffle", lambda t: t, raising=False)
+    monkeypatch.setattr(mod, "shuffle_weight", lambda t, _: t, raising=False)
+    layer = _fake_layer()
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.moe_runner.aiter.is_gfx95_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.moe_runner.aiter._aiter_fused_moe_supports_deterministic",
+        lambda: supports_option,
+    )
+    layer.moe_runner_config = (
+        MoeRunnerConfig(
+            activation="silu", gemm1_alpha=1.702, gemm1_beta=1.0, gemm1_clamp_limit=7.0
+        )
+        if activation == "swiglu_oai"
+        else MoeRunnerConfig(activation=activation)
+    )
+    layer.w13_weight_scale = torch.zeros((1, 2, 2), dtype=torch.uint8)
+    layer.w2_weight_scale = torch.zeros((1, 2, 2), dtype=torch.uint8)
+    layer.dispatcher.set_quant_config = lambda config: None
+
+    scheme.process_weights_after_loading(layer)
+
+    assert (calls == [layer]) is expected
+    assert getattr(layer, "w13_gu_interleaved", False) is expected
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_apply_weights_gate_mode_follows_the_preshuffle(monkeypatch, interleaved):
+    import sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe as mod
+
+    fake = SimpleNamespace(
+        GateMode=SimpleNamespace(
+            INTERLEAVE=SimpleNamespace(value="INTERLEAVE"),
+            SEPARATED=SimpleNamespace(value="SEPARATED"),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.moe_common", fake)
+    monkeypatch.setattr(mod, "_is_gfx1250", False)
+    monkeypatch.setattr(mod, "_is_gfx95", True)
+    monkeypatch.delattr(torch, "float4_e2m1fn_x2", raising=False)
+    scheme = _make_scheme()
+    scheme.moe_runner_config = MoeRunnerConfig(activation="silu")
+    store = {}
+    scheme.runner = _capturing_runner(store)
+    layer = _fake_layer()
+    if interleaved:
+        layer.w13_gu_interleaved = True
+
+    scheme.apply_weights(layer, dispatch_output=object())
+
+    assert store["quant_info"].fused_moe_kwargs["gate_mode"] == (
+        "INTERLEAVE" if interleaved else "SEPARATED"
+    )
+
+
 class TestOnlineWeightLoader(CustomTestCase):
     def test_nonlocal_w13_after_quantization(self):
         self._check_no_copy("w13")
