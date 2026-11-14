@@ -48,9 +48,10 @@ class TestEmbeddingsAPI(CustomTestCase):
                 num_requests=500,
                 input_tokens=500,
             ),
-            # batch size, avg ms, p95 ms, then the same two relaxed for mi300x
+            # batch size, avg ms, p95 ms, then the same two relaxed for mi300x.
+            # mi300x p95 at size 10 is usually 52-65 ms but some runs reach 90-96.
             [
-                (10, 44, 52, 80, 90),
+                (10, 44, 52, 80, 110),
                 (25, 72, 101, 140, 150),
                 (50, 126, 200, 230, 240),
             ],
