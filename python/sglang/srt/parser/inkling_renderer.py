@@ -101,9 +101,8 @@ def render_inkling_messages(
     reasoning_effort: float | None = None,
     spec: str = "inkling",
 ) -> list[int]:
-    """Media parts emit one placeholder each for later MM expansion.
-    Inkling samples its own assistant header. The tool-choice instruction
-    joins the first system message: the effort directive if none was sent."""
+    """Media parts emit one placeholder each; Inkling samples its own assistant header.
+    The tool-choice instruction joins the first system message."""
     tml = load_tml_renderers(spec)
     media_marker = f"sglang-inkling-media-{uuid.uuid4().hex}:"
     oss_messages, media_kinds = _to_oss_messages(messages, media_marker)

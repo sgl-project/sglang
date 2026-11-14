@@ -205,9 +205,8 @@ class TestInklingOutputParser(unittest.TestCase):
                     self.assertEqual(parsed.content, payload + "after")
 
     def test_truncated_message_surfaces_unstreamed_payload(self):
-        """A message cut off before <|end_message|> (max_tokens) keeps what the
-        model generated: a call payload becomes content, streamed text is not repeated,
-        and a call header cut before its payload adds no content."""
+        """A message cut off by max_tokens keeps the generated payload as content;
+        streamed text is not repeated and a bare call header adds nothing."""
         cases = [
             (
                 (
