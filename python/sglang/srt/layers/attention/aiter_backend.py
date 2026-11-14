@@ -1836,6 +1836,10 @@ class AiterAttnBackend(AttentionBackend):
                 window=uni_window[0] + 1 if swa_gluon else 0,
             )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        # FP8 KV cache: quantize Q with the static q scale as forward_decode does,
+        # unless the Muse extend path above already produced an FP8 Q.
+        if q_descale is None and self.kv_cache_dtype == fp8_dtype:
+            q_u, q_descale = self._quantize_q_fp8(q_u)
         unified_attention(
             q=q_u,
             k=k_paged,
