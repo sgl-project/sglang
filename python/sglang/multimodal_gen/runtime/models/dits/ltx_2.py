@@ -52,6 +52,12 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
+    apply_convrot_int8_gelu_input,
+    apply_convrot_int8_shared_input,
+    convrot_int8_fuses_gelu_input,
+    convrot_int8_shares_input,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -907,17 +913,27 @@ class LTX2Attention(nn.Module):
     ) -> torch.Tensor:
         gate_input = x
         context_ = x if context is None else context
-        if context_kv is None:
-            v, _ = self.to_v(context_)
-        else:
-            k, v = context_kv
         use_attention = not all_perturbed
+        gate_logits = None
+        if context_kv is not None:
+            k, v = context_kv
+        if use_attention:
+            # convrot_int8 rotates and quantizes each shared input once for
+            # all of its projections, bitwise identical to separate calls.
+            if context is None and context_kv is None:
+                q, k, v, gate_logits = self._project_shared(
+                    x, (self.to_q, self.to_k, self.to_v), self.to_gate_logits
+                )
+            else:
+                if context_kv is None:
+                    k, v, _ = self._project_shared(context, (self.to_k, self.to_v))
+                q, gate_logits = self._project_shared(
+                    x, (self.to_q,), self.to_gate_logits
+                )
+        elif context_kv is None:
+            v, _ = self.to_v(context_)
 
         if use_attention:
-            q, _ = self.to_q(x)
-            if context_kv is None:
-                k, _ = self.to_k(context_)
-
             fused_qk = None
             if pe is not None:
                 cos, sin = pe
@@ -1041,7 +1057,8 @@ class LTX2Attention(nn.Module):
             out = v
 
         if self.to_gate_logits is not None:
-            gate_logits, _ = self.to_gate_logits(gate_input)
+            if gate_logits is None:
+                gate_logits, _ = self.to_gate_logits(gate_input)
             gate = torch.sigmoid(gate_logits)
             out = head_gate_mul(out, gate)
 
@@ -1050,12 +1067,28 @@ class LTX2Attention(nn.Module):
 
         return out_proj
 
+    @staticmethod
+    def _project_shared(
+        x: torch.Tensor,
+        layers: tuple[nn.Module, ...],
+        optional: nn.Module | None = None,
+    ) -> list[torch.Tensor | None]:
+        """``[layer(x)[0] for layer in layers]`` followed by ``optional(x)[0]``
+        (``None`` when ``optional`` is ``None``); ``x`` is rotated and quantized
+        once when the layers share a convrot_int8 input."""
+        if optional is not None and convrot_int8_shares_input((*layers, optional)):
+            return apply_convrot_int8_shared_input(x=x, layers=(*layers, optional))
+        if convrot_int8_shares_input(layers):
+            outs = apply_convrot_int8_shared_input(x=x, layers=layers)
+        else:
+            outs = [layer(x)[0] for layer in layers]
+        return [*outs, None if optional is None else optional(x)[0]]
+
     def project_context_kv(
         self, context: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The normed K and the V that ``forward`` projects from an unrotated ``context``."""
-        v, _ = self.to_v(context)
-        k, _ = self.to_k(context)
+        k, v, _ = self._project_shared(context, (self.to_k, self.to_v))
         if self.qk_norm:
             assert self.k_norm is not None
             k_dtype = k.dtype
@@ -1131,6 +1164,12 @@ class LTX2FeedForward(nn.Module):
         FUSED_LINEAR_GELU.mark(self, "proj_in")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Checked per call: LoRA mounting swaps proj_out for a wrapper.
+        if convrot_int8_fuses_gelu_input(self.proj_out):
+            # proj_out's rotate kernel applies GELU(tanh) to its input
+            # bit-exactly, so the standalone activation kernel is skipped.
+            x, _ = self.proj_in(x)
+            return apply_convrot_int8_gelu_input(layer=self.proj_out, x=x)
         if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(self.proj_in, x):
             x = fused_linear_gelu_tanh(x, self.proj_in.weight, self.proj_in.bias)
         else:
