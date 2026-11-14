@@ -27,6 +27,8 @@ class _CompletionsHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         self.rfile.read(int(self.headers["Content-Length"]))
         self.server.seen.append((self.client_address[1], self.headers.get("Cookie")))
+        if self.server.barrier is not None:
+            self.server.barrier.wait()  # all requests must be open at once
         chunk = {"choices": [{"index": 0, "text": "hi"}]}
         payload = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
         self.send_response(200)
@@ -40,10 +42,15 @@ class _CompletionsHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _Server(ThreadingHTTPServer):
+    request_queue_size = 128  # room for every connection of the concurrency test
+
+
 class TestBenchServingClientSession(CustomTestCase):
     def setUp(self):
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _CompletionsHandler)
+        self.server = _Server(("127.0.0.1", 0), _CompletionsHandler)
         self.server.seen = []
+        self.server.barrier = None
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -94,6 +101,25 @@ class TestBenchServingClientSession(CustomTestCase):
     def test_shared_session_sends_no_cookies(self):
         cookies = [cookie for _, cookie in self._run(shared=True)]
         self.assertEqual(cookies, [None, None, None])
+
+    def test_shared_session_has_no_connection_limit(self):
+        # aiohttp's default connector holds at most 100 connections.
+        n = 101
+        self.server.barrier = threading.Barrier(n, timeout=10)
+
+        async def main():
+            async with _shared_bench_client_session():
+                outs = await asyncio.gather(
+                    *(
+                        async_request_openai_completions(self._request())
+                        for _ in range(n)
+                    )
+                )
+            for out in outs:
+                self.assertTrue(out.success, out.error)
+
+        asyncio.run(main())
+        self.assertEqual(len({port for port, _ in self.server.seen}), n)
 
     def test_standalone_requests_open_their_own_connection(self):
         ports = {port for port, _ in self._run(shared=False)}

@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import contextvars
 import copy
+import functools
 import importlib.util
 import json
 import math
@@ -113,9 +114,11 @@ async def _create_bench_client_session():
 @contextlib.asynccontextmanager
 async def _shared_bench_client_session():
     # limit=0: max_concurrency, not the connector, bounds the open requests.
+    # keepalive_timeout: below the 5 s idle timeout of SGLang's server, so a
+    # request does not reuse a connection that the server is closing.
     # DummyCookieJar: requests stay independent, as with one session each.
     async with _new_bench_client_session(
-        connector=aiohttp.TCPConnector(limit=0),
+        connector=aiohttp.TCPConnector(limit=0, keepalive_timeout=4),
         cookie_jar=aiohttp.DummyCookieJar(),
     ) as session:
         token = _SHARED_BENCH_SESSION.set(session)
@@ -1418,12 +1421,6 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
-async def benchmark(*args, **kwargs):
-    """Run _benchmark with one client session for all of its requests."""
-    async with _shared_bench_client_session():
-        return await _benchmark(*args, **kwargs)
-
-
 async def _benchmark(
     backend: str,
     api_url: str,
@@ -2010,6 +2007,13 @@ async def _benchmark(
         file.write(json.dumps(result_for_dump) + "\n")
 
     return result | result_details
+
+
+@functools.wraps(_benchmark)
+async def benchmark(*args, **kwargs):
+    """Run _benchmark with one client session for all of its requests."""
+    async with _shared_bench_client_session():
+        return await _benchmark(*args, **kwargs)
 
 
 def has_chat_template(tokenizer) -> bool:
