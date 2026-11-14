@@ -202,10 +202,7 @@ class DynamicGradMode(_DecoratorContextManager):
     def __init__(self, mode=True):
         if not torch._jit_internal.is_scripting():
             super().__init__()
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            self.mode = mode
-        else:
-            self.prev = False
+        self.mode = mode
 
     def __new__(cls, mode_or_orig_func=True if _ENABLE_TORCH_INFERENCE_MODE else None):
         if mode_or_orig_func is None or isinstance(mode_or_orig_func, bool):
@@ -213,27 +210,21 @@ class DynamicGradMode(_DecoratorContextManager):
         return cls()(mode_or_orig_func)
 
     def __enter__(self) -> None:
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            self._inference_mode_context = torch._C._InferenceMode(self.mode)
-            self._inference_mode_context.__enter__()
-        else:
-            self.prev = torch.is_grad_enabled()
-            torch.set_grad_enabled(False)
+        self._grad_context = (
+            torch.inference_mode(self.mode)
+            if _ENABLE_TORCH_INFERENCE_MODE
+            else torch.no_grad()
+        )
+        self._grad_context.__enter__()
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            self._inference_mode_context.__exit__(exc_type, exc_value, traceback)
-        else:
-            torch.set_grad_enabled(self.prev)
+        self._grad_context.__exit__(exc_type, exc_value, traceback)
 
     def clone(self) -> DynamicGradMode:
         r"""
         Create a copy of this class
         """
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            return self.__class__(self.mode)
-        else:
-            return self.__class__()
+        return self.__class__(self.mode)
 
 
 def set_random_seed(seed: int) -> None:
