@@ -643,6 +643,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
+    # The full prefill runner's request slots; None unless it captures.
+    full_prefill_request_slots: Optional[int] = None
 
     def _create_kernel_dispatcher(self, backends):
         return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
@@ -685,7 +687,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and self._prefill_graph_extend_supported()
         )
 
-    def _prefill_graph_extend_supported(self) -> bool:
+    def _prefill_graph_extend_supported(self, graph: str = "breakable") -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
             get_prefill_num_tokens_to_capture,
         )
@@ -704,11 +706,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 get_prefill_num_tokens_to_capture(capture_tokens)
             )
         )
-        rank0_log(
-            "GDN prefill extend inside breakable prefill CUDA graphs: "
-            + ("on" if supported else "unsupported here, layers keep breaking")
-        )
+        if supported:
+            status = "on"
+        elif graph == "breakable":
+            status = "unsupported here, layers keep breaking"
+        else:
+            status = "unsupported here"
+        rank0_log(f"GDN prefill extend inside {graph} prefill CUDA graphs: {status}")
         return supported
+
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        if is_xpu():
+            # The static tables are CUDA-only; XPU full graphs keep the base hook.
+            super().init_prefill_cuda_graph_state(
+                max_num_tokens=max_num_tokens, max_req_slots=max_req_slots
+            )
+            return
+        # A full graph has no eager break to fall back to, so the extend runs on
+        # the static tables of breakable graphs, for targets and drafts alike.
+        if not self._prefill_graph_extend_supported(graph="full"):
+            raise ValueError(
+                "Full prefill CUDA graphs need the GDN extend on static tables, "
+                "which this setup does not support (Triton GDN prefill kernel on "
+                "CUDA, no --enable-mis, contiguous state pools, capture buckets "
+                "that keep the eager chunk size). Use --linear-attn-prefill-backend "
+                "triton, or --cuda-graph-backend-prefill breakable."
+            )
+        if max_req_slots > self.prefill_graph_max_seqs:
+            raise ValueError(
+                f"full_prefill_max_req={max_req_slots} exceeds the "
+                f"{self.prefill_graph_max_seqs} sequences a captured GDN extend "
+                "holds (SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS, request pool size)."
+            )
+        self.full_prefill_request_slots = max_req_slots
+        self.full_prefill_graph_tables = {}
 
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
@@ -725,6 +758,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
+            request_slots=self.full_prefill_request_slots,
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
@@ -818,6 +852,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self._is_full_prefill_graph_extend(forward_batch):
+            self._init_full_prefill_graph_metadata(forward_batch, in_capture)
+            self._use_strided_target_verify_qkv = False
+            return
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
 

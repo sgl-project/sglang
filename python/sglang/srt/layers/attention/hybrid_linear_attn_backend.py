@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -58,6 +59,18 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 logger = logging.getLogger(__name__)
+
+# Per-request ForwardBatch fields the prefill graph tables read, beyond the
+# request-slot tensors they index by row.
+_FULL_PREFILL_PER_REQUEST_FIELDS = (
+    "extend_prefix_lens_cpu",
+    "mamba_prefill_track_mask_cpu",
+    "mamba_track_seqlens_cpu",
+    "mamba_track_indices",
+    "mamba_track_mask",
+    "mamba_track_seqlens",
+)
+
 _validate_mamba_replay_state_indices = (
     envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
 )
@@ -83,6 +96,11 @@ class MambaAttnBackendBase(AttentionBackend):
     # Most sequences the prefill graph tables hold (larger batches replay no
     # graph); set at init by backends whose supports_prefill_graph_extend holds.
     prefill_graph_max_seqs: int
+
+    # Full prefill CUDA graphs: the static extend tables of every captured bucket
+    # (bucket token count -> the backend's prefill graph metadata). None unless
+    # the backend's init_prefill_cuda_graph_state opted in.
+    full_prefill_graph_tables: Optional[dict] = None
 
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
@@ -190,6 +208,44 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def refresh_prefill_graph_metadata(self, meta, forward_batch: ForwardBatch):
         raise NotImplementedError()
+
+    def _is_full_prefill_graph_extend(self, forward_batch: ForwardBatch) -> bool:
+        # The full prefill runner replays MIXED batches on the EXTEND graphs.
+        return self.full_prefill_graph_tables is not None and (
+            forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        )
+
+    def _init_full_prefill_graph_metadata(
+        self, forward_batch: ForwardBatch, in_capture: bool
+    ) -> None:
+        # The runner pads the request axis to its slot count with zero-length
+        # sentinels (host lengths too at capture); the tables keep real rows only.
+        lens = list(forward_batch.extend_seq_lens_cpu)
+        while lens and lens[-1] == 0:
+            lens.pop()
+        bs = len(lens)
+        view = copy.copy(forward_batch)
+        view.batch_size = bs
+        view.extend_seq_lens_cpu = lens
+        for name in _FULL_PREFILL_PER_REQUEST_FIELDS:
+            values = getattr(forward_batch, name)
+            if values is not None:
+                setattr(view, name, values[:bs])
+        # The bucket-sized static input slot, at capture and at replay alike
+        # (a replay's positions are the live, unpadded tensor).
+        num_tokens = forward_batch.input_ids.shape[0]
+        if in_capture:
+            meta = self.init_prefill_graph_metadata(view)
+            self.full_prefill_graph_tables[num_tokens] = meta
+        else:
+            meta = self.full_prefill_graph_tables[num_tokens]
+            self.refresh_prefill_graph_metadata(meta, view)
+        # Readers of this forward's slots (forward_state_slots, the PLE track)
+        # index the runner's padded request axis, so the captured views span it;
+        # padded rows carry PAD_SLOT_ID and checkpoint into dummy slot 0.
+        if self.forward_metadata.mamba_track_indices is not None:
+            meta.track_dst[bs:].zero_()
+            self.forward_metadata.mamba_track_indices = meta.track_dst
 
     @property
     def mamba_chunk_size(self) -> int:
@@ -1479,6 +1535,14 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_prefill_cuda_graph_state(
+                max_num_tokens=max_num_tokens, max_req_slots=max_req_slots
+            )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

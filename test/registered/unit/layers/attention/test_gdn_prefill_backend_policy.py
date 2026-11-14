@@ -1,5 +1,6 @@
 import unittest
 from contextlib import contextmanager
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, sentinel
 
@@ -16,6 +17,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     validate_gdn_mis_backend,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -88,26 +90,41 @@ def make_runner(
 
 class TestGDNPrefillGraphExtend(CustomTestCase):
     @contextmanager
-    def _setup(self, *, cuda=True, enable_mis=False, draft=False):
+    def _setup(
+        self,
+        *,
+        cuda=True,
+        xpu=False,
+        enable_mis=False,
+        draft=False,
+        extend_kernel=TritonGDNKernel,
+        chunk_size=64,
+        contiguous=True,
+        buckets_keep_chunk_size=True,
+    ):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
-        cuda, enable_mis or draft say otherwise."""
+        the arguments say otherwise."""
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
         backend.is_draft_worker = draft
         backend.enable_mis = enable_mis
-        backend._mamba_chunk_size = 64
+        backend._mamba_chunk_size = chunk_size
         backend.kernel_dispatcher = SimpleNamespace(
-            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
+            extend_kernel=extend_kernel.__new__(extend_kernel)
         )
-        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
+        temporal = torch.zeros(2, 3) if contiguous else torch.zeros(3, 2).t()
+        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=temporal)
         backend.state_pool = SimpleNamespace(mamba_cache=cache)
         graph = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
         )
         with (
             patch.object(gdn_backend, "is_cuda", return_value=cuda),
+            patch.object(gdn_backend, "is_xpu", return_value=xpu),
             patch.object(gdn_backend, "FLA_CHUNK_SIZE", 64, create=True),
             patch.object(
-                gdn_backend, "buckets_keep_chunk_o_block_size", return_value=True
+                gdn_backend,
+                "buckets_keep_chunk_o_block_size",
+                return_value=buckets_keep_chunk_size,
             ),
             patch.object(
                 gdn_backend, "get_exec", return_value=SimpleNamespace(graph=graph)
@@ -137,6 +154,54 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 self._setup(**setup) as backend,
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+
+    def test_full_prefill_graphs_take_the_tables_or_refuse_up_front(self):
+        """Full prefill graphs have no eager break, so a CUDA setup without the
+        graph-safe chain fails at init; XPU is handed to the base hook instead."""
+
+        def base_hook(backend, *, max_num_tokens, max_req_slots):
+            backend.base_hook_sizes = (max_num_tokens, max_req_slots)
+
+        for setup, slots, outcome in (
+            # The breakable switch is off: full graphs take the tables regardless.
+            ({}, 4, "tables"),
+            (dict(draft=True), 4, "tables"),
+            (dict(cuda=False), 4, "refused"),
+            (dict(enable_mis=True), 4, "refused"),
+            # The SM90/SM100 default prefill kernel plans on the host.
+            (dict(extend_kernel=FlashInferGDNKernel), 4, "refused"),
+            (dict(chunk_size=128), 4, "refused"),
+            (dict(contiguous=False), 4, "refused"),
+            (dict(buckets_keep_chunk_size=False), 4, "refused"),
+            ({}, 129, "refused"),
+            (dict(cuda=False, xpu=True), 4, "base hook"),
+        ):
+            with (
+                self.subTest(slots=slots, **setup),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(False),
+                patch.object(
+                    MambaAttnBackendBase, "init_prefill_cuda_graph_state", base_hook
+                ),
+                self._setup(**setup) as backend,
+            ):
+                backend.prefill_graph_max_seqs = 128
+                backend.base_hook_sizes = None
+                init = partial(
+                    backend.init_prefill_cuda_graph_state,
+                    max_num_tokens=512,
+                    max_req_slots=slots,
+                )
+                if outcome == "refused":
+                    with self.assertRaises(ValueError):
+                        init()
+                else:
+                    init()
+                expected_tables = {} if outcome == "tables" else None
+                self.assertEqual(backend.full_prefill_graph_tables, expected_tables)
+                self.assertEqual(
+                    backend.base_hook_sizes,
+                    (512, slots) if outcome == "base hook" else None,
+                )
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):

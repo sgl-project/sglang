@@ -280,5 +280,140 @@ class TestGDNPrefillGraph(CustomTestCase):
                     )
 
 
+def _pad_request_axis(batch, slots, *, bucket, capture):
+    """The batch a full prefill CUDA graph runner hands the backend: the device
+    request axis padded to ``slots`` with zero-length sentinels and a bucket-sized
+    static ``input_ids``. Capture also pads the host lengths and passes
+    bucket-sized positions; replay keeps the live host lengths and positions."""
+    pad = slots - batch.batch_size
+    dev = "cuda"
+
+    def padded(t):
+        return torch.cat([t, torch.zeros(pad, dtype=t.dtype, device=dev)])
+
+    num_tokens = sum(batch.extend_seq_lens_cpu)
+    batch.batch_size = slots
+    batch.req_pool_indices = padded(batch.req_pool_indices)
+    batch.extend_seq_lens = padded(batch.extend_seq_lens)
+    batch.extend_prefix_lens = padded(batch.extend_prefix_lens)
+    if capture:
+        batch.extend_seq_lens_cpu = batch.extend_seq_lens_cpu + [0] * pad
+        batch.extend_prefix_lens_cpu = batch.extend_prefix_lens_cpu + [0] * pad
+    batch.input_ids = torch.zeros(bucket, dtype=torch.int64, device=dev)
+    batch.positions = torch.arange(bucket if capture else num_tokens, device=dev)
+    return batch
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestGDNFullPrefillGraph(TestGDNPrefillGraph):
+    """The same captured extend reached through the full prefill CUDA graph
+    path: init_forward_metadata_out_graph on a request axis padded to the
+    runner's slots, keyed by the bucket."""
+
+    SLOTS = 6
+    # Below the slot count, as the smallest default buckets are.
+    SMALL_BUCKET = 4
+
+    def _out_graph(self, batch, *, in_capture):
+        with (
+            patch(
+                "sglang.srt.layers.attention.linear.gdn_backend.mamba_cache_chunk_size",
+                return_value=CHUNK,
+            ),
+            patch(
+                "sglang.srt.layers.attention.linear.gdn_backend.get_exec",
+                return_value=SimpleNamespace(
+                    mamba=SimpleNamespace(enable_mamba_extra_buffer=True)
+                ),
+            ),
+        ):
+            self.backend.init_forward_metadata_out_graph(batch, in_capture=in_capture)
+
+    def _capture(self, bucket):
+        capture_batch = _pad_request_axis(
+            _batch([bucket], [0], track={}), self.SLOTS, bucket=bucket, capture=True
+        )
+        self._out_graph(capture_batch, in_capture=True)
+        meta = self.backend.full_prefill_graph_tables[bucket]
+        self.assertIs(self.backend.prefill_graph_metadata, meta)
+        self.assertEqual((meta.num_tokens, meta.max_seqs), (bucket, self.SLOTS))
+        snapshot = (self.conv_pool.clone(), self.ssm_pool.clone())
+
+        def run():
+            return self.backend.forward_extend(
+                self.layer,
+                capture_batch,
+                self.mixed[:bucket],
+                self.a[:bucket],
+                self.b[:bucket],
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = run()
+        self.conv_pool.copy_(snapshot[0])
+        self.ssm_pool.copy_(snapshot[1])
+        return meta, graph, out
+
+    def _fill(self, meta, batch):
+        bs = batch.batch_size
+        padded = _pad_request_axis(
+            batch, self.SLOTS, bucket=meta.num_tokens, capture=False
+        )
+        self._out_graph(padded, in_capture=False)
+        self.assertIs(self.backend.prefill_graph_metadata, meta)
+        # Graph-captured readers index every request slot: the views must span
+        # the padded axis, with padded rows checkpointing into dummy slot 0.
+        slots = self.backend.forward_state_slots(self.SLOTS, None).working
+        self.assertEqual(slots.data_ptr(), meta.cache_indices.data_ptr())
+        self.assertEqual(slots.shape[0], self.SLOTS)
+        track = self.backend.state_tracking_indices
+        if padded.mamba_track_indices is None:
+            self.assertIsNone(track)
+            return
+        self.assertEqual(track.data_ptr(), meta.track_dst.data_ptr())
+        self.assertEqual(track.shape[0], self.SLOTS)
+        torch.testing.assert_close(
+            track[:bs], padded.mamba_track_indices[:bs].to(track.dtype)
+        )
+        self.assertTrue(bool((track[bs:] == 0).all()))
+
+    def test_replays_match_eager(self):
+        # (bucket, extend lens, prefix lens, track); replays alternate buckets.
+        small = self.SMALL_BUCKET
+        cases = [
+            (BUCKET, [37, 100, 5, 192], [0, 64, 130, 0], {1: 70, 3: 192}),
+            (small, [1], [900], None),
+            (BUCKET, [BUCKET], [256], {0: 300}),
+            (small, [1, 1, 2], [57, 0, 90], None),
+            (BUCKET, [200, 11], [0, 0], None),
+            (small, [4], [0], None),
+            (BUCKET, [1, 1, 300], [57, 90, 0], {2: 256}),
+        ]
+        for ssm_dtype in (torch.float32, torch.bfloat16):
+            self._setup(ssm_dtype)
+            self.backend.prefill_graph_max_seqs = MAX_SEQS
+            self.backend.full_prefill_request_slots = self.SLOTS
+            self.backend.full_prefill_graph_tables = {}
+            graphs = {bucket: self._capture(bucket) for bucket in (BUCKET, small)}
+            for i, (bucket, lens, prefixes, track) in enumerate(cases):
+                meta, graph, out = graphs[bucket]
+                with self.subTest(ssm_dtype=ssm_dtype, case=i):
+                    self._check_replay(
+                        meta,
+                        graph,
+                        out,
+                        lens=lens,
+                        prefixes=prefixes,
+                        track=track,
+                        seed=200 + i,
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
