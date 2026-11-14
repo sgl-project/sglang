@@ -22,6 +22,51 @@ class Schedule(msgspec.Struct):
     _NS_PATH = "schedule"
 
     # -------------------------------------------------------------------------
+    # SLA-constrained dynamic batching
+    # -------------------------------------------------------------------------
+    enable_sla_constraint: A[
+        bool,
+        "Enable SLA-constrained dynamic batching during decode phase.",
+    ] = False
+    sla_latency: A[
+        float,
+        "Target SLA decode latency D_SLA in seconds (default: 0.05s = 50ms).",
+    ] = 0.05
+    sla_epsilon: A[
+        float,
+        "SLA tolerance epsilon_D in seconds, defines the acceptable latency range (default: 0.01s = 10ms).",
+    ] = 0.01
+    sla_alpha: A[
+        int,
+        "Minimum search-interval width alpha in the SLA algorithm (default: 20).",
+    ] = 20
+    sla_sigma: A[
+        int,
+        "Conservative corrective step size delta in the SLA algorithm (default: 5).",
+    ] = 5
+    sla_max_change_per_step: A[
+        int,
+        "Maximum batch size change per step to prevent oscillation (default: 10).",
+    ] = 10
+    batch_size_lower: A[
+        int,
+        "Hard lower bound B_min for the SLA search space (default: 4).",
+    ] = 4
+    batch_size_upper: A[
+        int,
+        "Hard upper bound B_max for the SLA search space (default: 256).",
+    ] = 256
+    sla_avg_tokens_per_req: A[
+        int,
+        "Average tokens per request for KV cache memory estimation (default: 50).",
+    ] = 50
+    sla_max_growth_rate: A[
+        float,
+        "Maximum growth rate of upper bound to prevent overshoot (default: 1.2).",
+    ] = 1.2
+
+
+    # -------------------------------------------------------------------------
     # Memory and scheduling
     # -------------------------------------------------------------------------
     mem_fraction_static: A[
