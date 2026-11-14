@@ -919,12 +919,15 @@ def build_grammar_vocab_mask(
 
 
 def load_token_map(token_map_path: str) -> List[int]:
+    use_modelscope = envs.SGLANG_DRAFT_USE_MODELSCOPE.get()
+    if use_modelscope is None:
+        use_modelscope = envs.SGLANG_USE_MODELSCOPE.get()
     if not os.path.exists(token_map_path):
         repo_id = os.path.dirname(token_map_path)
         file_name = os.path.basename(token_map_path)
 
         cache_dir = None
-        if envs.SGLANG_USE_MODELSCOPE.get():
+        if use_modelscope:
             from modelscope.utils.file_utils import get_model_cache_root
 
             cached_repo_path = os.path.join(get_model_cache_root(), repo_id)
@@ -932,7 +935,7 @@ def load_token_map(token_map_path: str) -> List[int]:
                 cache_dir = cached_repo_path
 
         if cache_dir is None:
-            if envs.SGLANG_USE_MODELSCOPE.get():
+            if use_modelscope:
                 from modelscope.hub.snapshot_download import (
                     snapshot_download as download_func,
                 )

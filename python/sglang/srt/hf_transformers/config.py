@@ -219,13 +219,20 @@ class HfModelConfigParser(ModelConfigParserBase):
         model,
         trust_remote_code: bool,
         revision: Optional[str] = None,
+        use_modelscope: Optional[bool] = None,
         **kwargs,
     ):
         config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
-            config = AutoConfig.from_pretrained(
+            config_class = AutoConfig
+            if use_modelscope is False:
+                from transformers import AutoConfig as config_class
+            elif use_modelscope is True:
+                from modelscope import AutoConfig as config_class
+
+            config = config_class.from_pretrained(
                 model,
                 trust_remote_code=trust_remote_code,
                 revision=revision,

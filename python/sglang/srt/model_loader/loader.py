@@ -137,7 +137,6 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_device_capability,
     is_npu,
     is_pin_memory_available,
@@ -497,7 +496,10 @@ class DefaultModelLoader(BaseModelLoader):
 
         Returns the path to the downloaded model, or the original model path if
         not downloaded from ModelScope."""
-        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+        use_modelscope = self.load_config.use_modelscope
+        if use_modelscope is None:
+            use_modelscope = envs.SGLANG_USE_MODELSCOPE.get()
+        if use_modelscope:
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
             # pylint: disable=C.
@@ -976,6 +978,7 @@ class DefaultModelLoader(BaseModelLoader):
             hf_config = get_config(
                 model_config.model_path,
                 trust_remote_code=True,
+                use_modelscope=model_config.use_modelscope,
             )
         with init_empty_weights():
             torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
@@ -1250,7 +1253,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     ):
         """Standard weight preparation using base model path."""
         logger.info(f"[QuantizedRL] Loading from base model: {model_name_or_path}")
-        temp_config = LoadConfig(load_format=LoadFormat.AUTO)
+        temp_config = LoadConfig(
+            load_format=LoadFormat.AUTO, use_modelscope=self.load_config.use_modelscope
+        )
         temp_loader = DefaultModelLoader(temp_config)
         return temp_loader._prepare_weights(
             model_name_or_path, revision, fall_back_to_pt, allow_patterns_overrides
@@ -4218,6 +4223,8 @@ def get_model_loader(
     load_config: LoadConfig, model_config: Optional[ModelConfig] = None
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
+    if model_config is not None:
+        load_config.use_modelscope = getattr(model_config, "use_modelscope", None)
 
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)

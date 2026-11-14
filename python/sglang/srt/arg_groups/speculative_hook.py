@@ -101,7 +101,10 @@ def _resolve_speculative_algorithm_alias(
         from sglang.srt.hf_transformers import get_config
 
         cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
+            speculative_draft_model_path,
+            trust_remote_code=trust_remote_code,
+            use_modelscope=envs.SGLANG_DRAFT_USE_MODELSCOPE.get(),
+            **kwargs,
         )
         draft_archs = getattr(cfg, "architectures", None) or []
         is_gemma4_draft = any(
@@ -913,6 +916,7 @@ def _load_draft_hf_config(cfg):
         trust_remote_code=cfg.trust_remote_code,
         revision=cfg.speculative_draft_model_revision,
         model_override_args=json.loads(cfg.json_model_override_args),
+        use_modelscope=envs.SGLANG_DRAFT_USE_MODELSCOPE.get(),
     )
 
 
@@ -1156,6 +1160,7 @@ def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
         cfg.speculative_draft_model_path,
         trust_remote_code=cfg.trust_remote_code,
         revision=cfg.speculative_draft_model_revision,
+        use_modelscope=envs.SGLANG_DRAFT_USE_MODELSCOPE.get(),
     )
     if not isinstance(draft, IQuestQ1MTPConfig):
         raise ValueError("IQuest Q1 requires an independent MTP draft checkpoint.")
@@ -1224,6 +1229,7 @@ def _fall_back_xpu_draft_attention_for_head_size(server_args: ServerArgs) -> Non
             cfg.speculative_draft_model_path,
             trust_remote_code=cfg.trust_remote_code,
             revision=cfg.speculative_draft_model_revision,
+            use_modelscope=envs.SGLANG_DRAFT_USE_MODELSCOPE.get(),
         )
     )
     # head_dim is optional in HF configs; without it the head size is hidden / heads.

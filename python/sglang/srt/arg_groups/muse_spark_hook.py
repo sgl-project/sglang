@@ -109,6 +109,7 @@ def _apply_muse_spark_launch_defaults(server_args: Any) -> None:
             trust_remote_code=cfg.trust_remote_code,
             revision=cfg.speculative_draft_model_revision,
             model_override_args=json.loads(cfg.json_model_override_args),
+            use_modelscope=envs.SGLANG_DRAFT_USE_MODELSCOPE.get(),
         )
         if "DFlash2DraftModel" in (getattr(draft_config, "architectures", None) or []):
             if cfg.speculative_draft_attention_backend is None and (

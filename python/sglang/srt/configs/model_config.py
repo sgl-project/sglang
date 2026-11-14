@@ -700,6 +700,11 @@ class ModelConfig:
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
+        self.use_modelscope = (
+            envs.SGLANG_DRAFT_USE_MODELSCOPE.get() if is_draft_model else None
+        )
+        if self.use_modelscope is None:
+            self.use_modelscope = envs.SGLANG_USE_MODELSCOPE.get()
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
         self.uocr_v2_default_context_len = uocr_v2_default_context_len
@@ -717,7 +722,7 @@ class ModelConfig:
         self._maybe_pull_model_for_runai(self.model_path)
         self._maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
-        kwargs = {}
+        kwargs = {"use_modelscope": self.use_modelscope}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
         # get_config() is cached. ModelConfig mutates hf_config for draft-model
@@ -1932,8 +1937,8 @@ class ModelConfig:
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
             if not is_local:
-                # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
-                if envs.SGLANG_USE_MODELSCOPE.get():
+                # Use this model's source, including the draft override.
+                if self.use_modelscope:
                     from modelscope import HubApi, model_file_download
 
                     hf_api = HubApi()
@@ -1961,7 +1966,7 @@ class ModelConfig:
                             return quant_cfg  # None
 
                     # Download (online mode) or read from cache (offline mode)
-                    if envs.SGLANG_USE_MODELSCOPE.get():
+                    if self.use_modelscope:
                         quant_config_file = model_file_download(
                             model_id=self.model_path,
                             file_path="hf_quant_config.json",

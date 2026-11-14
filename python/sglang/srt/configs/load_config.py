@@ -131,6 +131,9 @@ class LoadConfig:
     # and runai_model_streamer, could also benefit from honoring this group.
     load_group: LoadGroup = field(default=_DEFAULT_LOAD_GROUP, repr=False)
 
+    # None preserves the global source for callers without a ModelConfig.
+    use_modelscope: Optional[bool] = None
+
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}
         if isinstance(model_loader_extra_config, str):

@@ -33,6 +33,7 @@ import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import sglang.srt.connector as connector_module
@@ -41,7 +42,9 @@ from sglang.srt.arg_groups.model_path_hook import (
     handle_modelscope_paths,
     resolve_hf_gguf_model_path,
 )
+from sglang.srt.arg_groups.serving_hook import handle_missing_default_values
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
@@ -236,6 +239,81 @@ class TestTheModelScopeArm(_ModelSourceCase):
             os.path.join(download_dir, _MODELSCOPE_REPO),
         )
         self.assertEqual(calls, [])
+
+    def test_mixed_model_sources_in_both_directions(self):
+        from huggingface_hub import constants
+        from modelscope import AutoConfig as ModelScopeAutoConfig
+        from transformers import AutoConfig
+
+        from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+        from sglang.srt.configs.load_config import LoadConfig
+        from sglang.srt.model_loader import weight_utils
+        from sglang.srt.model_loader.loader import get_model_loader
+
+        hf, ms, revision = "org/hf", "org/ms", "a" * 40
+        for hf_is_draft in (False, True):
+            with self.subTest(hf_is_draft=hf_is_draft):
+                cache, ms_path = self._directory(), self._directory()
+                snapshot = Path(cache, "models--org--hf", "snapshots", revision)
+                snapshot.mkdir(parents=True)
+                (snapshot / "config.json").write_text(json.dumps(_MINI_CONFIG))
+                Path(ms_path, "config.json").write_text(json.dumps(_MINI_CONFIG))
+                refs = snapshot.parents[1] / "refs"
+                refs.mkdir()
+                (refs / "main").write_text(revision)
+                server_args = ServerArgs(
+                    model_path=ms if hf_is_draft else hf,
+                    speculative_draft_model_path=hf if hf_is_draft else ms,
+                    revision=revision,
+                    speculative_draft_model_revision=revision,
+                    device="cpu",
+                )
+                ms_patch, _ = self._modelscope(self._directory(), {ms: ms_path})
+                with (
+                    ms_patch,
+                    envs.SGLANG_USE_MODELSCOPE.override(hf_is_draft),
+                    envs.SGLANG_DRAFT_USE_MODELSCOPE.override(not hf_is_draft),
+                    envs.SGLANG_IS_IN_CI.override(False),
+                    mock.patch.object(constants, "HF_HUB_CACHE", cache),
+                    mock.patch.object(constants, "HF_HUB_OFFLINE", True),
+                    mock.patch(
+                        "sglang.srt.hf_transformers.config.AutoConfig",
+                        ModelScopeAutoConfig,
+                    ),
+                    mock.patch.object(
+                        ModelScopeAutoConfig,
+                        "from_pretrained",
+                        side_effect=AssertionError(
+                            "unexpected global ModelScope config"
+                        ),
+                    ),
+                    mock.patch.object(
+                        weight_utils,
+                        "snapshot_download",
+                        side_effect=RuntimeError("HF weight download"),
+                    ) as hf_download,
+                ):
+                    sys.modules["modelscope"].AutoConfig = AutoConfig
+                    handle_missing_default_values(server_args)
+                    handle_speculative_decoding(server_args)
+                    cfg = resolving_view(server_args)
+                    paths = (cfg.model_path, cfg.speculative_draft_model_path)
+                    self.assertEqual(
+                        paths, (ms_path, hf) if hf_is_draft else (hf, ms_path)
+                    )
+                    config = ModelConfig.from_server_args(
+                        server_args,
+                        model_path=paths[int(hf_is_draft)],
+                        is_draft_model=hf_is_draft,
+                    )
+                    self.assertEqual(config.model_path, hf)
+                    loader = get_model_loader(
+                        LoadConfig(load_format="safetensors", download_dir=cache),
+                        config,
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "HF weight download"):
+                        loader.download_model(config)
+                    self.assertEqual(hf_download.call_args.args[0], hf)
 
     def test_a_draft_repo_id_is_resolved_with_its_own_revision(self):
         cache_root = self._directory()
