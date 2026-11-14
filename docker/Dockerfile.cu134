@@ -12,7 +12,7 @@ ARG TORCHVISION_VERSION=0.29.2+cu134
 ARG TORCHAUDIO_VERSION=2.11.1+cu134
 # source: build sglang-kernel / sgl-deep-gemm / sgl-deep-ep from source; pypi: download released wheels.
 ARG SGL_WHEELS_SOURCE=source
-ARG SGL_KERNEL_VERSION=0.4.10
+ARG SGL_KERNEL_VERSION=0.4.11
 # Wheel build args
 ARG MANYLINUX_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
 ARG DEEPGEMM_REF=v0.2.8
