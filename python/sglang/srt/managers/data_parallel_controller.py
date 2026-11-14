@@ -37,6 +37,7 @@ from sglang.srt.elastic_ep.topology import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.incremental_detokenize import LimitedCapacityDict
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -108,6 +109,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    FOLLOW_ROUTING_KEY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -185,16 +187,19 @@ class DataParallelController:
         # Dispatch method
         self.round_robin_counter = 0
         self.health_round_robin_counter = 0
+        self.routing_key_to_rank = LimitedCapacityDict(capacity=1 << 16)
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.FOLLOW_ROUTING_KEY: self.follow_routing_key_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.FOLLOW_ROUTING_KEY,
         )
 
         parallel = get_parallel()
@@ -906,6 +911,23 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def follow_routing_key_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        # Keyed by hash, so the capacity also bounds memory for long keys.
+        key = None if req.routing_key is None else hash(req.routing_key)
+        target_rank = self.routing_key_to_rank.get(key)
+        if target_rank in self._active_workers:
+            self.dp_budget.total_requests[target_rank] += 1
+            self.routing_key_to_rank.move_to_end(key)
+        else:
+            target_rank = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+            if key is not None:
+                self.routing_key_to_rank.pop(key, None)
+                self.routing_key_to_rank[key] = target_rank
+        sock_send(self.workers[target_rank], req)
 
     def event_loop(self):
         while True:
