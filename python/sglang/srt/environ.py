@@ -282,6 +282,9 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
+    # Offline Engine: collect, then freeze the GC after startup, as `sglang serve`
+    # does after warmup. Disable to keep the calling process's heap collectable.
+    SGLANG_ENGINE_FREEZE_GC_AFTER_STARTUP = EnvBool(True)
     # Explicit child values override this default for megakernel runtime optimizations.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
 
