@@ -40,6 +40,8 @@ struct BlockRecord {
     token_count: u32,
     /// Resident component snapshot for each `(worker, tier)`.
     placements: HashMap<(String, i32), u32>,
+    /// One component snapshot per shared DRAM pool, independent of its members.
+    pool_placements: HashMap<String, u32>,
     /// Workers for which the root-to-this-block prefix is complete and this
     /// boundary is servable by the Legacy/FULL-only fast path.
     prefix_complete_workers: HashSet<String>,
@@ -54,12 +56,21 @@ struct WorkerRecord {
     /// Number of non-legacy component placements. A spec-less worker can use
     /// the derived fast path only while this is zero.
     component_placement_count: usize,
+    /// Shared DRAM pool this worker reads; empty for none.
+    dram_pool_id: String,
+}
+
+#[derive(Debug, Default)]
+struct PoolRecord {
+    holdings: HashSet<i64>,
+    members: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
 struct State {
     blocks: HashMap<i64, BlockRecord>,
     workers: HashMap<String, WorkerRecord>,
+    pools: HashMap<String, PoolRecord>,
     hit_counts: HashMap<i64, u64>,
 }
 
@@ -112,18 +123,32 @@ impl InMemoryKvIndexerBackend {
         req: ApplyExternalKvBatchRequest,
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
         let mut state = self.write_state()?;
-        let worker_id = req.worker_id;
-
         validate_actions(&state, &req.actions)?;
+        if req.worker_id.is_empty() {
+            apply_pool(&mut state, req);
+            return Ok(ApplyExternalKvBatchResponse {});
+        }
+        let worker_id = req.worker_id;
 
         let previous_fast_path = state.workers.get(&worker_id).and_then(fast_path_kind);
 
-        // Address and spec are snapshots carried on every batch. Empty address
-        // makes the worker unroutable; absent spec returns it to legacy mode.
-        {
+        // Address, spec and pool binding are snapshots carried on every batch.
+        // Empty address makes the worker unroutable; absent spec returns it to
+        // legacy mode.
+        let old_pool = {
             let worker = state.workers.entry(worker_id.clone()).or_default();
             worker.address = req.worker_address;
             worker.spec = req.cache_spec;
+            std::mem::replace(&mut worker.dram_pool_id, req.dram_pool_id.clone())
+        };
+        if old_pool != req.dram_pool_id {
+            if let Some(pool) = state.pools.get_mut(&old_pool) {
+                pool.members.remove(&worker_id);
+            }
+            if !req.dram_pool_id.is_empty() {
+                let pool = state.pools.entry(req.dram_pool_id).or_default();
+                pool.members.insert(worker_id.clone());
+            }
         }
 
         let mut dirty_roots = Vec::new();
@@ -288,11 +313,12 @@ impl InMemoryKvIndexerBackend {
             let Some(block) = state.blocks.get(hash) else {
                 continue;
             };
-            if block.placements.is_empty() {
+            let mut placements = effective_placements(state, block).peekable();
+            if placements.peek().is_none() {
                 continue;
             }
             matched_hashes.push(*hash);
-            for ((worker, tier), mask) in &block.placements {
+            for (worker, tier, mask) in placements {
                 let view = by_worker.entry(worker.as_str()).or_insert_with(|| {
                     worker_order.push(worker.as_str());
                     let metadata = state.workers.get(worker);
@@ -315,11 +341,11 @@ impl InMemoryKvIndexerBackend {
                         token_count: block.token_count,
                         tier_masks: Vec::new(),
                     });
-                    components.tier_masks.push((*tier, *mask));
+                    components.tier_masks.push((tier, mask));
                 } else {
-                    view.hashes_by_tier.entry(*tier).or_default().push((
+                    view.hashes_by_tier.entry(tier).or_default().push((
                         *hash,
-                        *mask,
+                        mask,
                         block.token_count,
                     ));
                 }
@@ -364,7 +390,7 @@ impl InMemoryKvIndexerBackend {
         let Some(first) = state
             .blocks
             .get(&hashes[0])
-            .filter(|block| !block.placements.is_empty())
+            .filter(|block| !block.placements.is_empty() || !block.pool_placements.is_empty())
         else {
             return Ok(MatchExternalKvPrefixResponse {
                 matches: Vec::new(),
@@ -388,13 +414,11 @@ impl InMemoryKvIndexerBackend {
             HashSet::new()
         };
         let mut seen = HashSet::new();
-        let mut candidates: Vec<PrefixCandidate> = first
-            .placements
-            .keys()
-            .filter(|(worker, _)| {
+        let mut candidates: Vec<PrefixCandidate> = effective_placements(&state, first)
+            .filter(|(worker, _, _)| {
                 !fast_worker_ids.contains(worker.as_str()) && seen.insert(worker.as_str())
             })
-            .map(|(worker, _)| {
+            .map(|(worker, _, _)| {
                 let metadata = state.workers.get(worker);
                 PrefixCandidate {
                     address: metadata
@@ -449,13 +473,13 @@ impl InMemoryKvIndexerBackend {
                     block.tier_masks.clear();
                 }
                 if let Some(block) = state.blocks.get(hash) {
-                    for ((worker, tier), mask) in &block.placements {
+                    for (worker, tier, mask) in effective_placements(&state, block) {
                         let Some(&index) = candidate_by_id.get(worker) else {
                             continue;
                         };
                         present[index] = true;
                         block_views[index].token_count = block.token_count;
-                        block_views[index].tier_masks.push((*tier, *mask));
+                        block_views[index].tier_masks.push((tier, mask));
                     }
                 }
                 for (index, candidate) in candidates.iter_mut().enumerate() {
@@ -499,7 +523,74 @@ impl InMemoryKvIndexerBackend {
     }
 }
 
+// Placements as workers see them: a member's own DRAM/SSD is replaced by its
+// pool's DRAM. Expanded per query, never stored.
+fn effective_placements<'a>(
+    state: &'a State,
+    block: &'a BlockRecord,
+) -> impl Iterator<Item = (&'a String, i32, u32)> {
+    let private = block
+        .placements
+        .iter()
+        .filter(|((worker, tier), _)| {
+            *tier == TierType::TierHbm as i32
+                || state
+                    .workers
+                    .get(worker)
+                    .is_none_or(|w| w.dram_pool_id.is_empty())
+        })
+        .map(|((worker, tier), mask)| (worker, *tier, *mask));
+    let shared = block.pool_placements.iter().flat_map(|(id, mask)| {
+        state.pools.get(id).into_iter().flat_map(move |pool| {
+            pool.members
+                .iter()
+                .map(move |worker| (worker, TierType::TierDram as i32, *mask))
+        })
+    });
+    private.chain(shared)
+}
+
+fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) {
+    let id = req.dram_pool_id;
+    state.pools.entry(id.clone()).or_default();
+    for action in req.actions {
+        if action.r#type == ExternalKvActionType::ActionReport as i32 {
+            apply_report_chain(state, action.parent_block_hash, &action.hashes);
+            for (i, hash) in action.hashes.into_iter().enumerate() {
+                let block = state.blocks.entry(hash).or_default();
+                block
+                    .pool_placements
+                    .insert(id.clone(), action.component_masks[i]);
+                if action.block_sizes[i] > 0 {
+                    block.token_count = action.block_sizes[i];
+                }
+                state.pools.get_mut(&id).unwrap().holdings.insert(hash);
+            }
+        } else {
+            let hashes = if action.r#type == ExternalKvActionType::ActionClearAllAtTier as i32 {
+                std::mem::take(&mut state.pools.get_mut(&id).unwrap().holdings)
+            } else {
+                action.hashes.into_iter().collect()
+            };
+            for hash in hashes {
+                state.pools.get_mut(&id).unwrap().holdings.remove(&hash);
+                if let Some(block) = state.blocks.get_mut(&hash) {
+                    block.pool_placements.remove(&id);
+                    if block.placements.is_empty() && block.pool_placements.is_empty() {
+                        state.hit_counts.remove(&hash);
+                    }
+                }
+                prune_empty_leaf(state, hash);
+            }
+        }
+    }
+}
+
 fn fast_path_kind(worker: &WorkerRecord) -> Option<FastPathKind> {
+    // The fast path tracks only the worker's own placements.
+    if !worker.dram_pool_id.is_empty() {
+        return None;
+    }
     match worker.spec.as_ref() {
         None if worker.component_placement_count == 0 => Some(FastPathKind::Legacy),
         Some(spec) if spec.version <= 1 && spec.components == COMPONENT_FULL => {
@@ -825,7 +916,7 @@ fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
     if state
         .blocks
         .get(hash)
-        .is_some_and(|block| block.placements.is_empty())
+        .is_some_and(|block| block.placements.is_empty() && block.pool_placements.is_empty())
     {
         state.hit_counts.remove(hash);
     }
@@ -837,6 +928,7 @@ fn prune_empty_leaf(state: &mut State, mut hash: i64) {
             return;
         };
         if !block.placements.is_empty()
+            || !block.pool_placements.is_empty()
             || !block.children.is_empty()
             || !block.prefix_complete_workers.is_empty()
         {
