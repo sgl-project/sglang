@@ -80,6 +80,7 @@ class BaseReasoningFormatDetector:
         reasoning_default: str = "always",
         force_nonempty_content: bool = False,
         tool_start_at_line_start: bool = False,
+        continuation_target: Optional[str] = None,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
@@ -114,6 +115,22 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = True
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
+
+        self.continuation_target = continuation_target
+        self._continuation_close_prefix = ""
+        self._continuation_close_buffer = ""
+        if continuation_target is not None:
+            # The prompt already opened the selected field. Generated openers
+            # are literal text; only an explicit close can end reasoning.
+            self.force_reasoning = continuation_target == "reasoning_content"
+            self._in_reasoning = self.force_reasoning
+            self.stripped_think_start = True
+            self.tool_start_token = None
+            if self._in_reasoning:
+                prefix_len = self._ends_with_partial_token(
+                    previous_content, self.think_end_token
+                )
+                self._continuation_close_prefix = self.think_end_token[:prefix_len]
 
     @property
     def in_reasoning(self) -> bool:
@@ -165,6 +182,15 @@ class BaseReasoningFormatDetector:
         )
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        if self.continuation_target is not None:
+            text = self._consume_continuation_close(text, final=True)
+            if not self._in_reasoning:
+                return StreamingParseResult(normal_text=text)
+            reasoning_text, _, normal_text = text.partition(self.think_end_token)
+            return StreamingParseResult(
+                reasoning_text=reasoning_text, normal_text=normal_text
+            )
+
         in_reasoning = self._in_reasoning or self.think_start_token in text
 
         if not in_reasoning:
@@ -207,6 +233,26 @@ class BaseReasoningFormatDetector:
             # think_end_token is in self.previous_content for continue_final_message=True case
             return StreamingParseResult(normal_text=processed_text)
 
+    def _consume_continuation_close(self, text: str, final: bool = False) -> str:
+        """Complete a close marker split across the supplied prefix and new text.
+
+        Only new characters are buffered or returned. A mismatch or truncated
+        completion remains literal reasoning; supplied characters are never echoed.
+        """
+        if not self._continuation_close_prefix:
+            return text
+        self._continuation_close_buffer += text
+        text = self._continuation_close_buffer
+        completion = self.think_end_token[len(self._continuation_close_prefix) :]
+        if text.startswith(completion):
+            self._in_reasoning = False
+            text = text[len(completion) :]
+        elif completion.startswith(text) and not final:
+            return ""
+        self._continuation_close_prefix = ""
+        self._continuation_close_buffer = ""
+        return text
+
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
         Streaming incremental parsing for reasoning content.
@@ -226,8 +272,13 @@ class BaseReasoningFormatDetector:
         return ret
 
     def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        new_text = self._consume_continuation_close(new_text)
         self._buffer += new_text
         current_text = self._buffer
+
+        if self.continuation_target is not None and not self._in_reasoning:
+            self._buffer = ""
+            return StreamingParseResult(normal_text=current_text)
 
         think_start_text = self.think_start_token + self.think_start_self_label
 
@@ -342,6 +393,7 @@ class BaseReasoningFormatDetector:
         (e.g. max_tokens cut it short), instead of dropping it: the whole block under
         stream_reasoning=False, the held-back token suffix under stream_reasoning=True.
         force_nonempty_content emits it as normal_text, else as reasoning_text."""
+        self._buffer += self._consume_continuation_close("", final=True)
         if not self._in_reasoning:
             # Same as the reasoning-side flush below: a held-back slice that never
             # became a token is content.
@@ -351,7 +403,9 @@ class BaseReasoningFormatDetector:
 
         # Defensive: subclasses that fill _buffer themselves may not have stripped
         # the opening think token that _parse_streaming_increment_impl removes.
-        buffer = self._strip_leading_think_start(self._buffer)
+        buffer = self._buffer
+        if self.continuation_target is None:
+            buffer = self._strip_leading_think_start(buffer)
         buffer = self._strip_partial_tool_start(buffer, self._streamed_reasoning_tail)
         self._buffer = ""
 
@@ -396,6 +450,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
+        continuation_target: Optional[str] = None,
     ):
         # DeepSeek-R1 is assumed to be reasoning until `</think>` token
         super().__init__(
@@ -406,6 +461,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             force_nonempty_content=force_nonempty_content,
+            continuation_target=continuation_target,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
@@ -465,6 +521,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
+        continuation_target: Optional[str] = None,
     ):
         think_excluded_tokens = [
             "<tool_call>",
@@ -486,6 +543,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             thinks_internally=True,
             reasoning_default="enable_thinking",
             force_nonempty_content=force_nonempty_content,
+            continuation_target=continuation_target,
         )
 
 
@@ -2396,6 +2454,13 @@ class ReasoningParser:
         "xing4_0": Xing4_0Detector,
     }
 
+    @classmethod
+    def supports_field_continuation(cls, model_type: str) -> bool:
+        return cls.DetectorMap.get(model_type.lower()) in {
+            Qwen3Detector,
+            DeepSeekR1Detector,
+        }
+
     def __init__(
         self,
         model_type: Optional[str] = None,
@@ -2412,6 +2477,14 @@ class ReasoningParser:
         detector_class = self.DetectorMap.get(model_type.lower())
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
+
+        continuation_target = getattr(request, "continue_final_message", False)
+        if isinstance(
+            continuation_target, str
+        ) and not self.supports_field_continuation(model_type):
+            raise ValueError(
+                f"Reasoning parser {model_type!r} does not support field continuation."
+            )
 
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
 
@@ -2443,7 +2516,7 @@ class ReasoningParser:
         if (
             request is not None
             and isinstance(request, ChatCompletionRequest)
-            and request.continue_final_message
+            and request.continue_final_message is True
             and request.messages[-1].role == "assistant"
         ):
             kwargs["continue_final_message"] = True
@@ -2495,6 +2568,12 @@ class ReasoningParser:
                     request._response_parser_grammar_start,
                 )
 
+        if isinstance(continuation_target, str):
+            kwargs["continuation_target"] = continuation_target
+            if continuation_target == "reasoning_content" and isinstance(
+                request, ChatCompletionRequest
+            ):
+                kwargs["previous_content"] = request.messages[-1].reasoning_content
         self.detector = detector_class(**kwargs)
 
     def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:

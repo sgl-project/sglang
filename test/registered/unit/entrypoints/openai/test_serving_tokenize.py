@@ -112,6 +112,30 @@ class TestTokenizeFormattingOptions(CustomTestCase):
             with self.subTest(prompt=prompt, special=special):
                 self.assertEqual(_tokenize(serving, **body), (200, _ids(text)))
 
+    def test_field_continuation_accepts_disabled_generation_prompt(self):
+        serving = self._serving()
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        self.assertEqual(
+            _tokenize(
+                serving,
+                messages=messages,
+                continue_final_message="content",
+                add_generation_prompt=False,
+            ),
+            (200, _ids("<user> hi </s> <assistant> hello")),
+        )
+        status, message = _tokenize(
+            serving,
+            messages=messages,
+            continue_final_message="content",
+            add_generation_prompt=True,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("conflicts", message)
+
     def test_options_that_cannot_apply_are_rejected(self):
         chatml = self._serving(chat_template="chatml")
         self.assertEqual(_tokenize(chatml, messages=HISTORY)[0], 200)

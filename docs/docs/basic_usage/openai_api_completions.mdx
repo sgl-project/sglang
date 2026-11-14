@@ -179,6 +179,54 @@ Thus, the total count is **3**.
 Setting `"enable_thinking": False` disables reasoning for Qwen3. Omitting the parameter follows the model's chat-template default; Qwen3 enables thinking by default. Qwen3-Thinking models always generate reasoning content and do not support the `enable_thinking` parameter.
 </Note>
 
+#### Continue an assistant field
+
+For the Python OpenAI server with Hugging Face chat templates, set `continue_final_message` to
+`"content"` or `"reasoning_content"` to resume that field in the final assistant
+message. The renderer receives the complete message and keeps the model's
+reasoning/answer boundary. Responses contain only the newly generated suffix;
+the supplied prefix is not repeated.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:30000/v1")
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-4B",
+    messages=[
+        {"role": "user", "content": "What is 6 times 7?"},
+        {
+            "role": "assistant",
+            "reasoning_content": "Six groups of seven are forty-two.",
+            "content": "The answer is ",
+        },
+    ],
+    max_tokens=32,
+    extra_body={"continue_final_message": "content"},
+)
+print(response.choices[0].message.content)
+```
+
+To resume unfinished reasoning instead, pass its prefix in `reasoning_content`,
+set `content` to `""`, and choose `"reasoning_content"`. An empty string is a valid
+prefix, including completed reasoning followed by an empty answer. `/tokenize`
+accepts the same selector with `messages` and does not require an output reasoning
+parser, since it only renders the input. The existing boolean `true` and
+`false` values retain their previous behavior.
+
+Field-specific continuation currently supports the Hugging Face renderer and,
+when separating reasoning, Qwen3 and DeepSeek-R1 parsers (including aliases
+using the same detectors). Start the server with the appropriate
+`--reasoning-parser`, such as `qwen3`. Without a reasoning parser, `"content"`
+works normally; use `separate_reasoning=false` if you intentionally want raw
+reasoning output. Native encoders, legacy conversation templates, unsupported
+reasoning parsers, and `input_ids` requests reject explicit field targets before
+generation. Set the selector at the request's top level rather than overriding
+it through `chat_template_kwargs`.
+
+The separate Rust model processor and router paths do not yet support these
+string selectors.
+
 #### Set a Default for OpenAI Chat Completions
 
 If most OpenAI chat-completion requests should use the same chat-template mode, set a default when launching the server:
