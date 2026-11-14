@@ -24,11 +24,14 @@ def _gfx950():
 
 @unittest.skipUnless(_gfx950(), "gfx950 (MI35x) only")
 class TestSmallMMoeGfx950(CustomTestCase):
-    E, INTER, DIM, TOPK = (
+    """MXFP4 at the TP4 per-rank intermediate 256; CAP is its dispatch cap."""
+
+    E, INTER, DIM, TOPK, CAP = (
         16,
         256,
         4096,
         10,
+        40,
     )  # 10 distinct experts per token, like Qwen3.5's routed topk
 
     @classmethod
@@ -90,7 +93,7 @@ class TestSmallMMoeGfx950(CustomTestCase):
 
     def _routing(self, tok):
         # distinct experts per token (as topk produces); the kernel's per-expert token list holds up to 64 entries,
-        # which tok <= 40 with distinct slots can never exceed
+        # which tok <= 64 with distinct slots can never exceed
         ids = (
             torch.stack(
                 [
@@ -116,7 +119,7 @@ class TestSmallMMoeGfx950(CustomTestCase):
             self.assertFalse(M.smallm_moe_enabled())
         finally:
             os.environ.pop("SGLANG_ROCM_SMALLM_MOE", None)
-        for tok in (1, 3, 16, 40):
+        for tok in (1, 3, 16, self.CAP):
             x = torch.randn(tok, self.DIM, device=self.dev, dtype=torch.bfloat16)
             ids, wts = self._routing(tok)
             self.assertTrue(
@@ -133,8 +136,8 @@ class TestSmallMMoeGfx950(CustomTestCase):
             self.assertLess(rel, 5e-3, f"tok={tok}: rel_l2={rel:.3e}")
             self.assertFalse(out.isnan().any().item())
         # above the dispatch cap the caller must stay on aiter's fused_moe
-        x = torch.randn(64, self.DIM, device=self.dev, dtype=torch.bfloat16)
-        ids, _ = self._routing(64)
+        x = torch.randn(self.CAP + 1, self.DIM, device=self.dev, dtype=torch.bfloat16)
+        ids, _ = self._routing(self.CAP + 1)
         self.assertFalse(
             M.smallm_moe_supported(
                 x, self.w13, self.w2, ids, None, False, True, False, None
@@ -171,6 +174,12 @@ class TestSmallMMoeGfx950(CustomTestCase):
         g.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(gout, eager))
+
+
+class TestSmallMMoeGfx950I128(TestSmallMMoeGfx950):
+    """MXFP4 at the TP8 per-rank intermediate 128 (4 scale columns, which e8m0_shuffle pads to 8)."""
+
+    INTER, CAP = 128, 56
 
 
 @unittest.skipUnless(_gfx950(), "gfx950 (MI35x) only")
