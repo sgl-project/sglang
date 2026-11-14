@@ -29,8 +29,9 @@ import os
 import pickle
 import socket
 import struct
+from collections import deque
 from datetime import timedelta
-from typing import Any, Dict, List
+from typing import Any, Deque, Dict, List
 
 import torch
 import torch.distributed as dist
@@ -96,7 +97,7 @@ class FlexKVComm:
     ):
         model_config = rank_info.model_config
         self.world_rank = world_rank
-        self._async_works: List = []
+        self._async_works: Deque = deque()
         self._reap_high: int = self._REAP_HIGH_BASE
         self._reap_calls: int = 0
         self._reap_stuck_total: int = 0
@@ -329,7 +330,7 @@ class FlexKVComm:
             except RuntimeError:
                 stuck = True
                 break
-            self._async_works.pop(0)
+            self._async_works.popleft()
             drained += 1
 
         self._reap_calls += 1

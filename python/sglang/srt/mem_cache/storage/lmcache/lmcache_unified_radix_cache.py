@@ -9,6 +9,7 @@ import atexit
 import dataclasses
 import logging
 from array import array
+from collections import deque
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -79,7 +80,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
         self._external_flows: dict[str, LMCacheExternalFlow] = {}
         self._forward_stream = forward_stream
-        self._pending_stores: list[LMCachePendingStore] = []
+        self._pending_stores: deque[LMCachePendingStore] = deque()
         self._pending_store_counts: dict[str, int] = {}
         self._session_finish_requested: set[str] = set()
         self._lmcache_closed = False
@@ -303,7 +304,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             [pending.operation for pending in self._pending_stores]
         )
         for _ in range(ready_stores):
-            pending = self._pending_stores.pop(0)
+            pending = self._pending_stores.popleft()
             rid = pending.operation.request_id
             try:
                 self.lmcache_connector.complete_store(pending.operation)
