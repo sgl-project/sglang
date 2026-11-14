@@ -445,7 +445,7 @@ uses CP4 within each DP group. Dense FFNs retain their configured TP width:
 the default runs them over the full TP group, while `--moe-dense-tp-size 1`
 runs them independently on local token shards.
 
-When deploying with PD Disaggregation, a **prefill worker using the Mooncake transfer backend** can enable the [LayerSplit](https://z.ai/blog/scaling-pain) technique with
+When deploying with PD Disaggregation, a **prefill worker using the Mooncake or NIXL transfer backend** can enable the [LayerSplit](https://z.ai/blog/scaling-pain) technique with
 ```bash
 --enable-dsa-cache-layer-split \
 --enable-prefill-cp \

@@ -393,19 +393,21 @@ def handle_model_specific_adjustments(server_args: Any):
                     "--enable-dsa-cache-layer-split requires "
                     "--enable-prefill-cp and --cp-strategy interleave."
                 )
-            # Layer split relies on the mooncake all-CP-rank KV/indexer
-            # transfer path. mori/nixl support is a temporary limitation
-            # and will be added later by the community.
+            # Layer split relies on the all-CP-rank KV/indexer transfer path:
+            # every CP rank sends the layers it owns. mooncake and nixl map a
+            # rank's entries onto its layer span of the decode pool; mori
+            # support is a temporary limitation and will be added later by the
+            # community.
             if (
                 cfg.enable_dsa_cache_layer_split
-                and cfg.disaggregation_transfer_backend != "mooncake"
+                and cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split currently only supports "
-                    "the mooncake transfer backend (mooncake / mooncake_tcp). "
-                    f"Got --disaggregation-transfer-backend "
-                    f"{cfg.disaggregation_transfer_backend!r}. mori/nixl "
-                    "support will be added later by the community."
+                    "the mooncake (mooncake / mooncake_tcp) and nixl transfer "
+                    f"backends. Got --disaggregation-transfer-backend "
+                    f"{cfg.disaggregation_transfer_backend!r}. mori support "
+                    "will be added later by the community."
                 )
             if cfg.enable_dsa_cache_layer_split and cfg.pp_size > 1:
                 raise ValueError(
