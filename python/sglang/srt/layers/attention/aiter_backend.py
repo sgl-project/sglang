@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.graph_variants import SeqLenBucketGraphVariants
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
@@ -416,6 +417,20 @@ def _kv_cache_is_vectorized_5d(pool) -> bool:
         has_full = router.sub_pool(IdSpaceKind.FULL) is not None
         pool = router.view(IdSpaceKind.FULL if has_full else IdSpaceKind.SLIDING_WINDOW)
     return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
+
+
+def _dspark_mha_draft_uses_unified_attention(
+    *,
+    is_draft_worker: bool,
+    is_dspark: bool,
+    use_mla: bool,
+    kv_cache_is_vectorized_5d: bool,
+) -> bool:
+    # A DSpark MHA draft verifies a few rows against the full prefix, the split-KV
+    # shape unified_attention serves; its 4D view cannot address a SHUFFLE 5D pool.
+    return (
+        is_draft_worker and is_dspark and not use_mla and not kv_cache_is_vectorized_5d
+    )
 
 
 def _require_untranslated_storage(*pools) -> None:
@@ -827,11 +842,19 @@ class AiterAttnBackend(AttentionBackend):
         )
         _require_untranslated_storage(model_runner.token_to_kv_pool, self.swa_kv_pool)
 
+        use_unified_attn_env = envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True
+        elif use_unified_attn_env is not None:
+            self.use_triton_unified_attention = use_unified_attn_env
         else:
-            self.use_triton_unified_attention = get_bool_env_var(
-                "SGLANG_USE_AITER_UNIFIED_ATTN"
+            self.use_triton_unified_attention = (
+                _dspark_mha_draft_uses_unified_attention(
+                    is_draft_worker=model_runner.is_draft_worker,
+                    is_dspark=model_runner.spec_algorithm.is_dspark(),
+                    use_mla=self.use_mla,
+                    kv_cache_is_vectorized_5d=self.kv_cache_is_vectorized_5d,
+                )
             )
         # Deterministic mode allows aiter decode only for the paged_attention_ragged
         # path and aiter prefill only for the batch prefill path; the unified-attention
@@ -875,7 +898,14 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention
             and not self.use_mla
             and self.topk == 1
-            and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+            and envs.SGLANG_AITER_UNIFIED_VERIFY.get()
+        )
+        # A DSpark draft runner captures only target_verify, which on unified verify
+        # reads the page table instead of the flat CUDA-graph KV indices.
+        self._graph_reads_flat_kv_indices = not (
+            self._use_unified_verify
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
         )
 
         # Muse Spark TP8 shapes on gfx950: head_dim 64, GQA 8, SWA KV pool, unified
@@ -3541,7 +3571,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.cuda_graph_cprr_empty_rows = torch.zeros(
                     (n_verify_rows,), dtype=torch.bool, device=self.device
                 )
-        if kv_indices_buf is None:
+        if kv_indices_buf is None and self._graph_reads_flat_kv_indices:
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
@@ -3601,7 +3631,9 @@ class AiterAttnBackend(AttentionBackend):
                 (max_bs,), dtype=torch.int32, device=self.device
             )
 
-        if not self.skip_prefill:
+        # Only the non-unified target_verify reads the custom mask.
+        self.cuda_graph_custom_mask = None
+        if not self.skip_prefill and not self._use_unified_verify:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
@@ -3921,12 +3953,9 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 kv_lens = seq_lens
-            if self.use_muse_attention_paths and self._use_unified_verify:
-                # Unified verify reads the block page table only; the token-level
-                # KV index build (cumsum + index kernel over the whole context)
-                # would be wasted replay preparation.
-                kv_indptr = kv_indices = None
-            else:
+            # Unified verify reads the page table, not these flat indices.
+            kv_indptr = kv_indices = None
+            if not self._use_unified_verify:
                 kv_indptr = self.kv_indptr[: bs + 1]
                 kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
                 kv_indices = self.cuda_graph_kv_indices
@@ -4112,10 +4141,12 @@ class AiterAttnBackend(AttentionBackend):
                         verify_seqlen_k=verify_seqlen_k,
                     )
                 else:
-                    custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    custom_mask = None
+                    if spec_info.custom_mask is not None:
+                        custom_mask = self.cuda_graph_custom_mask
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -4963,6 +4994,8 @@ class AiterAttnBackend(AttentionBackend):
                     num_queries_per_kv = layer.tp_q_head_num // layer.tp_k_head_num
                     use_unified_attention_3d_mtp = (
                         is_gfx95_supported()
+                        # this kernel is causal-only
+                        and layer.attn_type != AttentionType.ENCODER_ONLY
                         and 1 < self.forward_metadata.max_q_len <= 4
                         and max_kv_len > 512
                         and (
@@ -5066,7 +5099,7 @@ class AiterAttnBackend(AttentionBackend):
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
-                        causal=True,
+                        causal=layer.attn_type != AttentionType.ENCODER_ONLY,
                         window_size=window_size,
                         block_table=page_table,
                         softcap=layer.logit_cap,
@@ -5103,7 +5136,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.forward_metadata.kv_indptr,
                     self.forward_metadata.kv_indices,
                     self.forward_metadata.custom_mask,
-                    True,  # causal
+                    layer.attn_type != AttentionType.ENCODER_ONLY,  # causal
                     self.forward_metadata.mask_indptr,
                     self.forward_metadata.max_extend_len,
                     k_scale,

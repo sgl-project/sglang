@@ -12,6 +12,7 @@ from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp import planner as dcp_planner
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -133,6 +134,66 @@ class TestAiterUnifiedVerifyWithoutHostSeqLens(CustomTestCase):
         )
 
 
+class TestDSparkDraftUnifiedAttention(CustomTestCase):
+    def test_only_dspark_mha_draft_on_4d_pool_routes_to_unified(self):
+        """A target model, an MLA self-draft, another algorithm's draft or a SHUFFLE
+        5D pool must keep its own AITER path; only the DSpark MHA draft switches."""
+        route = aiter_backend._dspark_mha_draft_uses_unified_attention
+        dspark_draft = dict(
+            is_draft_worker=True,
+            is_dspark=True,
+            use_mla=False,
+            kv_cache_is_vectorized_5d=False,
+        )
+        self.assertTrue(route(**dspark_draft))
+        for field in dspark_draft:
+            with self.subTest(flipped=field):
+                self.assertFalse(
+                    route(**{**dspark_draft, field: not dspark_draft[field]})
+                )
+
+
+class TestUnifiedVerifyGraphBuffers(CustomTestCase):
+    def setUp(self):
+        patcher = patch.object(
+            aiter_backend, "reset_verify_attn_plan_cache", lambda: None, create=True
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _init_graph_state(self, *, use_unified_verify, reads_flat_kv_indices):
+        backend = _unified_verify_backend()
+        backend._use_unified_verify = use_unified_verify
+        backend._graph_reads_flat_kv_indices = reads_flat_kv_indices
+        backend.skip_prefill = False
+        backend.dcp_world_size = 1
+        backend.decode_uses_page_table = True
+        backend.mask_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int64)
+        backend.init_cuda_graph_state(
+            max_bs=_BATCH_SIZE, max_num_tokens=_BATCH_SIZE * _VERIFY_TOKENS_PER_REQ
+        )
+        return backend
+
+    def test_dspark_draft_skips_the_buffers_unified_verify_never_reads(self):
+        """A DSpark draft runner on unified verify allocated a max_bs x context flat
+        KV-index buffer and a max_tokens x context mask its target_verify graph never
+        reads; a non-unified verify, or another runner's decode/draft-extend graph, still
+        needs them."""
+        backend = self._init_graph_state(
+            use_unified_verify=True, reads_flat_kv_indices=False
+        )
+        self.assertIsNone(backend.cuda_graph_kv_indices)
+        self.assertIsNone(backend.cuda_graph_custom_mask)
+        backend.init_forward_metadata_out_graph(_verify_batch(), in_capture=False)
+        self.assertIsNone(backend.forward_metadata.kv_indptr)
+
+        backend = self._init_graph_state(
+            use_unified_verify=False, reads_flat_kv_indices=True
+        )
+        self.assertIsNotNone(backend.cuda_graph_kv_indices)
+        self.assertIsNotNone(backend.cuda_graph_custom_mask)
+
+
 _DCP_SIZE = 8
 _DRAFT_TOKENS = 8
 _DCP_MAX_CONTEXT_LEN = 128
@@ -152,6 +213,7 @@ def _dcp_verify_backend(asm_cprr):
     backend.use_mla = True
     backend.use_mla_dcp_asm = False
     backend._use_unified_verify = False
+    backend._graph_reads_flat_kv_indices = True
     backend.use_sliding_window_kv_pool = False
     backend.use_muse_attention_paths = False
     backend.muse_reuse_verify_lengths = False
@@ -279,6 +341,7 @@ def _init_mha_backend(kv_cache_layout):
         runner_ids=None,
         token_to_kv_pool=pool,
         is_draft_worker=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
         token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
     )
     spec = SimpleNamespace(
