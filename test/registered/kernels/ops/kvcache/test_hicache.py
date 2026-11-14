@@ -992,5 +992,94 @@ def test_dsv4_v41_draft_swa_sidecar_moves_whole_pages():
         reset_context()
 
 
+def test_hybrid_draft_restores_full_and_swa_layers():
+    """A draft with both full and SWA layers gets one sidecar per component,
+    and its full-attention KV round-trips through the host."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    publish(
+        ServerArgs(
+            model_path="dummy", page_size=PAGE_SIZE, hicache_mem_layout="page_first"
+        ),
+        role="test",
+    )
+    draft = SWAKVPool(
+        size=POOL_SIZE,
+        size_swa=POOL_SIZE // 2,
+        page_size=PAGE_SIZE,
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=128,
+        full_attention_layer_ids=[2],
+        swa_attention_layer_ids=[0, 1, 3, 4],
+        device=DEVICE,
+        token_to_kv_pool_class=MHATokenToKVPool,
+    )
+    target_swa = SimpleNamespace(
+        size=POOL_SIZE // 2, page_size=PAGE_SIZE, layout="page_first"
+    )
+    tree_cache = SimpleNamespace(
+        cache_controller=SimpleNamespace(
+            page_size=PAGE_SIZE,
+            transfer_layer_id_max=NUM_LAYERS,
+            mem_pool_host=SimpleNamespace(
+                logical_size=POOL_SIZE,
+                entry_map={PoolName.SWA: SimpleNamespace(host_pool=target_swa)},
+            ),
+        )
+    )
+    with (
+        patch.object(assembler, "_get_allocator_type", return_value="default"),
+        patch.object(assembler, "target_window_host_pool", return_value=PoolName.SWA),
+    ):
+        specs, entries = assembler.build_hicache_draft_sidecars(
+            draft_device_pools=(draft,), tree_cache=tree_cache
+        )
+    assert [(s.pool_name, s.indices_from_pool) for s in specs] == [
+        (PoolName.DRAFT, PoolName.KV),
+        (PoolName.DRAFT_SWA, PoolName.SWA),
+    ]
+    full_entry, swa_entry = entries
+    assert full_entry.device_pool is draft.full_kv_pool
+    assert swa_entry.device_pool is draft.swa_kv_pool
+
+    host, device_pool = full_entry.host_pool, full_entry.device_pool
+    buffers = [*device_pool.k_buffer, *device_pool.v_buffer]
+    engine = L2TransferEngine("kernel")
+    try:
+        for buffer in buffers:
+            buffer.copy_(torch.randn_like(buffer))
+        source = _token_indices_for_pages(torch.tensor([3, 1]))
+        destination = _token_indices_for_pages(torch.tensor([2, 4]))
+        # Staged write-back reads host indices on CPU; load-back on device.
+        host_indices = _token_indices_for_pages(torch.tensor([1, 3]), device="cpu")
+        expected = [buffer[source].clone() for buffer in buffers]
+        engine.submit_device_to_host(
+            [L2Transfer(host, device_pool, host_indices, source)]
+        ).finish_event.synchronize()
+        for buffer in buffers:
+            buffer.zero_()
+        engine.submit_host_to_device(
+            [
+                L2Transfer(
+                    host, device_pool, host_indices.to(DEVICE), destination, {0: 0}.get
+                )
+            ],
+            transfer_layer_id_max=1,
+        ).finish_event.synchronize()
+        for buffer, saved in zip(buffers, expected, strict=True):
+            torch.testing.assert_close(buffer[destination], saved, rtol=0, atol=0)
+    finally:
+        torch.cuda.synchronize()
+        for entry in entries:
+            entry.host_pool.destroy()
+        reset_context()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
