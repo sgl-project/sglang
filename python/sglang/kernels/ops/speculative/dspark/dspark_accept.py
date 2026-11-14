@@ -43,6 +43,18 @@ else:
     )
 
 
+def _speculative_accept_threshold_acc() -> float:
+    """Live ``--speculative-accept-threshold-acc`` for DSpark rejection sampling.
+
+    ``/set_internal_state`` writes the field onto the spec config bag, so the
+    next verify step sees it without a restart. Values below 1e-9 are clamped
+    so the kernel never divides by zero. 1.0 keeps the unscaled accept test.
+    """
+    from sglang.srt.runtime_context import get_spec
+
+    return max(float(get_spec().speculative_accept_threshold_acc), 1e-9)
+
+
 class AcceptSampling:
     @classmethod
     def execute(
@@ -216,7 +228,7 @@ def _accept_sampling_core(
         target_probs=target_probs,
         draft_probs=draft_probs,
         threshold_single=1.0,
-        threshold_acc=1.0,
+        threshold_acc=_speculative_accept_threshold_acc(),
         deterministic=True,
     )
     correct_len = accept_token_num
