@@ -479,6 +479,13 @@ class TestDiffusionPlugins(unittest.TestCase):
         self.assertIs(plugins.HookRegistry._hooks[target][0][1], hook)
         self.assertNotIn(target, SrtHookRegistry._hooks)
 
+    def test_diffusion_registry_rebinds_all_registry_state(self):
+        # State added to SRT's HookRegistry must be rebound here too, or diffusion
+        # hooks and hook status leak into SRT's applied_targets()/failed_targets().
+        for name, value in vars(SrtHookRegistry).items():
+            if isinstance(value, (dict, set, list)):
+                self.assertIsNot(getattr(plugins.HookRegistry, name), value, name)
+
     def test_excludes_every_unselected_platform_distribution(self):
         entries = [
             _entry_point("selected", "selected-package"),
