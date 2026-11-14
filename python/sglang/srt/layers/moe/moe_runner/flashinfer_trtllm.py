@@ -2161,6 +2161,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
+        elif get_parallel().tp_size == 1:
+            # flashinfer-ai/flashinfer#6077, as on the routed path: without an output,
+            # do_finalize=False profiles a (N, 0) placeholder that misses every tuned
+            # (N, hidden) autotune entry. This buffer keeps the tuned key; it is unwritten.
+            moe_kwargs["output"] = hs_fp4.new_empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16
+            )
 
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
