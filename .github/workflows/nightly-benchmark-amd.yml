@@ -354,9 +354,11 @@ jobs:
           overwrite: true
 
   # ============================================================================
-  # MiniMax-M3.1-Flash with DSpark: the whole row, TP4 on GPU KV up to c32 and
-  # with HiCache host-DRAM offload at c48 and c64, 8 points. The model must
-  # already be in each perf-bench node's HF cache (see the test).
+  # MiniMax-M3.1-Flash with DSpark: the row's TP4 points on GPU KV, c1-c32, 6
+  # points. Its HiCache points (c48, c64) are dispatch-only until #50553 is
+  # fixed: at c48 the TP ranks' HiCache write-back state diverged and every
+  # scheduler failed. The model must already be in each perf-bench node's HF
+  # cache (see the test).
   # SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D only changes how MoE weights are
   # loaded, as every MI35x nightly model load sets it.
   # ============================================================================
@@ -366,7 +368,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        point: ${{ fromJson(inputs.minimax_m31_flash_point && inputs.minimax_m31_flash_point != 'all' && format('["{0}"]', inputs.minimax_m31_flash_point) || '["tp4-c1", "tp4-c2", "tp4-c4", "tp4-c8", "tp4-c16", "tp4-c32", "tp4-c48", "tp4-c64"]') }}
+        point: ${{ fromJson(inputs.minimax_m31_flash_point && inputs.minimax_m31_flash_point != 'all' && format('["{0}"]', inputs.minimax_m31_flash_point) || '["tp4-c1", "tp4-c2", "tp4-c4", "tp4-c8", "tp4-c16", "tp4-c32"]') }}
     runs-on: linux-sglang-mi35x-perf-bench
     timeout-minutes: 610
     steps:
