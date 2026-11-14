@@ -867,3 +867,75 @@ class TestNgramCorpusMultiSam(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
+
+
+class TestNgramCorpusNamespace(CustomTestCase):
+    def test_cache_namespaces_do_not_share_online_trie_paths(self):
+        # Reproduces the cross-tenant oracle in #49626 against the real C++ corpus.
+        from sglang.srt.mem_cache.utils import storage_namespace_seed
+
+        depth, k = 18, 8
+        known = [5001, 5002, 5003, 5004]
+        secret = [7101, 7102, 7103, 7104, 7105, 7106]
+        corpus = NgramCorpus(
+            min_bfs_breadth=1,
+            max_bfs_breadth=10,
+            match_type="BFS",
+            capacity=10_000,
+            max_trie_depth=depth,
+            draft_token_num=k,
+        )
+        ns_a = storage_namespace_seed(None, "tenant-A")
+        ns_b = storage_namespace_seed(None, "tenant-B")
+        self.assertNotEqual(ns_a, ns_b)
+
+        def window(prompt, output):
+            output = output[-depth:]
+            if len(output) == depth:
+                return output
+            return prompt[-(depth - len(output)) :] + output
+
+        a_prompt, a_output = list(range(100, 140)), []
+        for tok in known + secret + [9000, 9001]:
+            a_output.append(tok)
+            corpus.batch_put([window(a_prompt, a_output)], namespaces=[ns_a])
+        corpus.synchronize()
+
+        b_prompt, b_output = list(range(300, 340)), list(known)
+        drafts, _ = corpus.batch_get(
+            ["req-B"],
+            [window(b_prompt, b_output)],
+            [len(b_prompt) + len(b_output)],
+            namespaces=[ns_b],
+        )
+        drafts = drafts.tolist()
+        leaked = [tok for tok in drafts if tok in secret]
+        self.assertEqual(
+            leaked,
+            [],
+            f"tenant B drafts leaked tenant A secrets: {drafts}",
+        )
+
+        # The same query in tenant A's namespace still sees the secret path.
+        a_drafts, _ = corpus.batch_get(
+            ["req-A"],
+            [window(b_prompt, b_output)],
+            [len(b_prompt) + len(b_output)],
+            namespaces=[ns_a],
+        )
+        self.assertTrue(any(tok in secret for tok in a_drafts.tolist()))
+
+    def test_unnamespaced_and_same_namespace_still_share(self):
+        corpus = _make_corpus(capacity=10000, max_trie_depth=12, draft_token_num=8)
+        corpus.batch_put([[1, 2, 3, 4, 5, 6, 7, 8]])
+        corpus.synchronize()
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
+        self.assertIn(4, ids.reshape(-1).tolist())
+
+        ns = "same-namespace"
+        corpus.batch_put([[10, 11, 12, 13, 14]], namespaces=[ns])
+        corpus.synchronize()
+        ids_a, _ = corpus.batch_get(["a"], [[10, 11, 12]], [3], namespaces=[ns])
+        ids_b, _ = corpus.batch_get(["b"], [[10, 11, 12]], [3], namespaces=[ns])
+        self.assertIn(13, ids_a.tolist())
+        self.assertIn(13, ids_b.tolist())

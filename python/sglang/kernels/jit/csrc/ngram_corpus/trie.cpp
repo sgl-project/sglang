@@ -20,7 +20,34 @@ Trie::Trie(size_t capacity, const Param& param) : param_(param) {
   root_ = getNode();
 }
 
-void Trie::insert(const int32_t* tokens, size_t len) {
+TrieNode* Trie::mutableEffectiveRoot(uint64_t ns_key) {
+  if (ns_key == 0) {
+    return root_;
+  }
+  auto it = ns_roots_.find(ns_key);
+  if (it != ns_roots_.end()) {
+    return it->second;
+  }
+  if (free_node_count_ == 0) {
+    squeeze(1);
+  }
+  TrieNode* node = getNode();
+  node->parent = nullptr;
+  node->token = 0;
+  ns_roots_[ns_key] = node;
+  return node;
+}
+
+const TrieNode* Trie::effectiveRoot(uint64_t ns_key) const {
+  if (ns_key == 0) {
+    return root_;
+  }
+  auto it = ns_roots_.find(ns_key);
+  return it == ns_roots_.end() ? nullptr : it->second;
+}
+
+void Trie::insert(const int32_t* tokens, size_t len, uint64_t ns_key) {
+  TrieNode* base = mutableEffectiveRoot(ns_key);
   for (size_t i = 0; i < len; ++i) {
     auto start = tokens + i;
     auto end = start + std::min(len - i, param_.max_trie_depth);
@@ -29,7 +56,7 @@ void Trie::insert(const int32_t* tokens, size_t len) {
       squeeze(end - start - free_node_count_);
     }
 
-    TrieNode* cursor = root_;
+    TrieNode* cursor = base;
     path_.clear();
     while (start != end) {
       auto token = *start;
@@ -98,6 +125,7 @@ void Trie::reset() {
   ++trie_epoch_;
   global_lru_.clear();
   path_.clear();
+  ns_roots_.clear();
   node_pool_.clear();
   for (auto& node : nodes_) {
     node_pool_.emplace_back(&node);
@@ -125,15 +153,21 @@ bool Trie::validateMatchState_(const MatchState& state) const {
   return true;
 }
 
-void Trie::rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
+void Trie::rebuildMatchState_(
+    const int32_t* context, size_t len, MatchState& state, size_t total_len, uint64_t ns_key) const {
   const auto max_match_depth = std::min(len, param_.max_trie_depth);
   state.trie_epoch = trie_epoch_;
+  state.ns_key = ns_key;
   state.processed_total_len = total_len;
   state.anchors.assign(max_match_depth, {});
+  const TrieNode* base = effectiveRoot(ns_key);
+  if (base == nullptr) {
+    return;
+  }
   for (size_t match_depth = 1; match_depth <= max_match_depth; ++match_depth) {
     auto start = context + len - match_depth;
     auto end = start + match_depth;
-    auto cursor = root_;
+    auto cursor = base;
     while (start != end) {
       auto iter = cursor->child.find(*start);
       if (iter == cursor->child.end()) {
@@ -149,8 +183,14 @@ void Trie::rebuildMatchState_(const int32_t* context, size_t len, MatchState& st
   }
 }
 
-bool Trie::advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const {
-  if (!validateMatchState_(state)) {
+bool Trie::advanceMatchState_(
+    MatchState& state, const int32_t* tokens, size_t len, size_t total_len, uint64_t ns_key) const {
+  if (!validateMatchState_(state) || state.ns_key != ns_key) {
+    return false;
+  }
+
+  const TrieNode* base = effectiveRoot(ns_key);
+  if (base == nullptr) {
     return false;
   }
 
@@ -162,9 +202,9 @@ bool Trie::advanceMatchState_(MatchState& state, const int32_t* tokens, size_t l
     const auto next_depth = std::min(state.anchors.size() + 1, param_.max_trie_depth);
     next.assign(next_depth, {});
 
-    // Root is never evicted, so we access it directly; the epoch was already
-    // validated above.
-    if (auto iter = root_->child.find(tokens[i]); iter != root_->child.end()) {
+    // Namespace roots (and the default root) are pinned, so we access the
+    // effective root directly; the epoch was already validated above.
+    if (auto iter = base->child.find(tokens[i]); iter != base->child.end()) {
       next[0] = capture(iter->second);
     }
 
@@ -202,18 +242,18 @@ std::vector<std::pair<const TrieNode*, int32_t>> Trie::getExpandableAnchors_(con
 }
 
 std::vector<std::pair<const TrieNode*, int32_t>>
-Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
+Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_len, uint64_t ns_key) const {
   const bool has_forward_progress = total_len >= state.processed_total_len;
   const auto appended_len = has_forward_progress ? total_len - state.processed_total_len : 0;
   const auto expected_prev_depth = std::min(state.processed_total_len, param_.max_trie_depth);
-  const bool can_advance = state.trie_epoch == trie_epoch_ && has_forward_progress && appended_len <= len &&
-                           state.anchors.size() == expected_prev_depth;
+  const bool can_advance = state.trie_epoch == trie_epoch_ && state.ns_key == ns_key && has_forward_progress &&
+                           appended_len <= len && state.anchors.size() == expected_prev_depth;
 
-  if (can_advance && advanceMatchState_(state, context + len - appended_len, appended_len, total_len)) {
+  if (can_advance && advanceMatchState_(state, context + len - appended_len, appended_len, total_len, ns_key)) {
     return getExpandableAnchors_(state);
   }
 
-  rebuildMatchState_(context, len, state, total_len);
+  rebuildMatchState_(context, len, state, total_len, ns_key);
   return getExpandableAnchors_(state);
 }
 
@@ -224,8 +264,9 @@ Result Trie::buildRecency(
     size_t draft_token_num,
     const Param& param,
     MatchState& state,
-    size_t total_len) const {
-  auto anchors = match(context, len, state, total_len);
+    size_t total_len,
+    uint64_t ns_key) const {
+  auto anchors = match(context, len, state, total_len, ns_key);
   const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
   double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
 
@@ -270,8 +311,9 @@ Result Trie::buildFrequency(
     size_t draft_token_num,
     const Param& param,
     MatchState& state,
-    size_t total_len) const {
-  auto anchors = match(context, len, state, total_len);
+    size_t total_len,
+    uint64_t ns_key) const {
+  auto anchors = match(context, len, state, total_len, ns_key);
   struct CompareByLastDouble {
     bool operator()(
         const std::tuple<double, const TrieNode*, double>& a,

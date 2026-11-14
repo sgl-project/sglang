@@ -12,6 +12,7 @@ register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_worker import NGRAMWorker
@@ -82,6 +83,52 @@ class TestNgramWorkerPrompt(CustomTestCase):
                         req.output_ids.append(6)
                     self.assertEqual(req.origin_input_ids, padded)
                     self.assertEqual(list(req.origin_input_ids_unpadded), [1, 2, 3])
+
+    def test_cache_salt_isolates_drafts(self):
+        worker = object.__new__(NGRAMWorker)
+        worker.max_trie_depth = 18
+        worker.draft_token_num = 8
+        worker.ngram_corpus = NgramCorpus(
+            max_trie_depth=18,
+            min_bfs_breadth=1,
+            max_bfs_breadth=10,
+            draft_token_num=8,
+            capacity=10000,
+        )
+        known = [5001, 5002, 5003, 5004]
+        secret = [7101, 7102, 7103, 7104, 7105, 7106]
+        req_a = Req(
+            "tenant-A",
+            "",
+            array("q", list(range(100, 140))),
+            SamplingParams(),
+            cache_salt="tenant-A",
+        )
+        req_a.output_ids = array("q", known + secret + [9000, 9001])
+        req_a.inflight_steps = 1
+        batch_a = SimpleNamespace(reqs=[req_a], spec_info=None)
+        worker.prev_token_ids = []
+        worker.prev_accept_lens = [0]
+        worker._update_ngram_corpus(batch_a)
+        worker.ngram_corpus.synchronize()
+
+        req_b = Req(
+            "tenant-B",
+            "",
+            array("q", list(range(300, 340))),
+            SamplingParams(),
+            cache_salt="tenant-B",
+        )
+        req_b.output_ids = array("q", list(known))
+        req_b.inflight_steps = 1
+        batch_b = SimpleNamespace(reqs=[req_b], spec_info=None)
+        drafts, _ = worker._prepare_draft_tokens(batch_b)
+        leaked = [tok for tok in drafts.tolist() if tok in secret]
+        self.assertEqual(leaked, [], f"worker leaked tenant A secrets: {drafts}")
+        self.assertNotEqual(
+            storage_namespace_seed(None, "tenant-A"),
+            storage_namespace_seed(None, "tenant-B"),
+        )
 
 
 if __name__ == "__main__":

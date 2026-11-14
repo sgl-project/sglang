@@ -1,5 +1,4 @@
 import logging
-from typing import List, Optional
 
 import numpy as np
 import torch
@@ -15,6 +14,7 @@ from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import (
@@ -116,7 +116,7 @@ class NGRAMWorker(BaseSpecWorker):
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
-        self.grammar_tree_host: Optional[tuple] = None
+        self.grammar_tree_host: tuple | None = None
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=get_spec().speculative_ngram_min_bfs_breadth,
@@ -150,7 +150,7 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
     @property
-    def draft_worker(self) -> Optional[EagleDraftWorkerBase]:
+    def draft_worker(self) -> EagleDraftWorkerBase | None:
         # NGRAM has no draft model; drafts come from the CPU-side corpus.
         return None
 
@@ -176,13 +176,23 @@ class NGRAMWorker(BaseSpecWorker):
     def list_external_corpora(self) -> dict[str, int]:
         return self.ngram_corpus.list_external_corpora()
 
-    def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
+    def _efficient_concat_last_n(self, seq1: list[int], seq2: list[int], n: int):
         seq2_len = len(seq2)
         if seq2_len >= n:
             return seq2[-n:]
 
         need_from_seq1 = n - seq2_len
         return seq1[-need_from_seq1:] + seq2
+
+    def _request_namespaces(self, batch: ScheduleBatch) -> list[str | None]:
+        # Same identity HiCache L3 / LMCache use: extra_key (LoRA) and cache_salt.
+        return [
+            storage_namespace_seed(
+                getattr(req, "extra_key", None) or None,
+                getattr(req, "cache_salt", None),
+            )
+            for req in batch.reqs
+        ]
 
     def _init_preallocated_tensors(self):
         max_total_drafts = self.max_batch_size * self.draft_token_num
@@ -222,7 +232,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.retrieve_next_sibling_batch = []
         self.positions_batch = []
 
-        for bs in range(0, self.max_batch_size + 1):
+        for bs in range(self.max_batch_size + 1):
             self.retrieve_indexes_batch.append(self.retrieve_indexes[:bs, :])
             self.retrieve_next_token_batch.append(self.retrieve_next_token[:bs, :])
             self.retrieve_next_sibling_batch.append(self.retrieve_next_sibling[:bs, :])
@@ -304,7 +314,10 @@ class NGRAMWorker(BaseSpecWorker):
             batch_tokens.append(check_token)
             total_lens.append(base_lens[i] + len(prev_tokens))
         req_drafts, mask = self.ngram_corpus.batch_get(
-            req_ids, batch_tokens, total_lens
+            req_ids,
+            batch_tokens,
+            total_lens,
+            namespaces=self._request_namespaces(batch),
         )
         total_draft_token_num = len(req_drafts)
 
@@ -422,7 +435,9 @@ class NGRAMWorker(BaseSpecWorker):
             )
             batch_tokens.append(put_ids)
             i += 1
-        self.ngram_corpus.batch_put(batch_tokens)
+        self.ngram_corpus.batch_put(
+            batch_tokens, namespaces=self._request_namespaces(batch)
+        )
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
