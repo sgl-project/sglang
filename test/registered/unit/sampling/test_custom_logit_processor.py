@@ -697,6 +697,31 @@ class TestPageLengthCap(CustomTestCase):
         self.assertEqual(self._forced(3, [P, 10, 11, 12, 13]), P)
         self.assertEqual(self._forced(3, [P, 10, P, 11, P, 12, 13, 14, 15]), self.EOS)
 
+    def test_malformed_lookahead_turns_the_guard_off(self):
+        """A malformed lookahead turns the guard off instead of raising."""
+        P = self.PAGE
+        over_cap = [P, 10, 11, 12, 13]
+        self.assertEqual(self._forced(3, over_cap), P)
+        for lookahead in ("x", [1]):
+            with self.subTest(lookahead=lookahead):
+                req = _make_req(
+                    origin_input_ids=[P, self.IMG, self.IMG] * 3, output_ids=over_cap
+                )
+                req.uocr_doc = UocrReqState(context_pages=0)
+                params = [
+                    {
+                        "__req__": req,
+                        "max_page_tokens": 4,
+                        "page_token_id": P,
+                        "eos_token_id": self.EOS,
+                        "uocr_doc_lookahead": lookahead,
+                    }
+                ]
+                row = DeepseekOCRNoRepeatNGramLogitProcessor()(
+                    torch.zeros(1, self.VOCAB), params
+                )[0]
+                self.assertTrue(torch.isfinite(row).all())
+
     def test_page_under_the_cap_is_untouched(self):
         P = self.PAGE
         self.assertIsNone(self._forced(3, [P, 10, 11, 12, 13, P, 20, 21, 22]))
