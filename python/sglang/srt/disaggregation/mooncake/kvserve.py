@@ -109,30 +109,18 @@ class KVServeAdapter:
         self.cache_blocks = min(x[0].shape[0] for x in caches.values())
         from sglang.srt.disaggregation.kvserve_runtime import take_runtime
 
-        self.runtimes = take_runtime(self.device)
-        if not self.runtimes:
+        self.runtime = take_runtime(self.device)
+        if self.runtime is None:
             raise RuntimeError(
                 "KVServe runtime was not reserved before KV cache sizing"
             )
-        self.runtime = self.runtimes[0]
-        ptrs, sizes = [], []
-        for runtime in self.runtimes:
-            if runtime.config != self.config or len(runtime.slots) != len(
-                self.runtime.slots
-            ):
-                raise ValueError("KVServe reserved plan does not match bound caches")
-            runtime.bind_kv_caches(caches, {name: 0 for name in caches})
-            runtime.stream.synchronize()
-            runtime_ptrs, runtime_sizes = runtime.registered_memory()
-            ptrs.extend(runtime_ptrs)
-            sizes.extend(runtime_sizes)
-        if len({runtime.wire_profile for runtime in self.runtimes}) != len(
-            self.runtimes
-        ):
-            raise ValueError("KVServe decode representations must be distinct")
-        owned_bytes = sum(
-            r.plan.reserved_bytes - r.plan.retained_driver_bytes for r in self.runtimes
-        )
+        plan = self.runtime.plan
+        if self.runtime.config != self.config:
+            raise ValueError("KVServe reserved plan does not match bound caches")
+        owned_bytes = plan.reserved_bytes - plan.retained_driver_bytes
+        self.runtime.bind_kv_caches(caches, {name: 0 for name in caches})
+        self.runtime.stream.synchronize()
+        ptrs, sizes = self.runtime.registered_memory()
         rc = manager.engine.batch_register(ptrs, sizes)
         if rc not in (None, 0):
             raise RuntimeError(f"Failed to register KVServe buffers: {rc}")
@@ -167,12 +155,10 @@ class KVServeAdapter:
             {
                 "event": "init",
                 "profile": self.runtime.wire_profile,
-                "reserved_bytes": sum(r.plan.reserved_bytes for r in self.runtimes),
+                "reserved_bytes": plan.reserved_bytes,
                 "owned_plan_bytes": owned_bytes,
-                "driver_retention_estimate_bytes": sum(
-                    r.plan.retained_driver_bytes for r in self.runtimes
-                ),
-                "bulk_bytes": sum(r.bulk.numel() for r in self.runtimes),
+                "driver_retention_estimate_bytes": plan.retained_driver_bytes,
+                "bulk_bytes": self.runtime.bulk.numel(),
                 "cache_blocks": self.cache_blocks,
                 "raw_per_token": self.raw_per_token,
                 "config": values,
@@ -204,10 +190,10 @@ class KVServeAdapter:
                 f.write(json.dumps({"time": time.time(), **value}) + "\n")
 
     def registration(self):
-        def describe(runtime):
+        def describe(profile):
             return {
                 "version": 3,
-                "profile": runtime.wire_profile,
+                "profile": profile,
                 "page_size": self.page_size,
                 "has_mamba": self.has_mamba,
                 "slots": [
@@ -215,14 +201,15 @@ class KVServeAdapter:
                         "ptrs": [slot.arena_a.data_ptr(), slot.aux.data_ptr()],
                         "capacities": [slot.arena_a.numel(), slot.aux.numel()],
                     }
-                    for slot in runtime.slots
+                    for slot in self.runtime.slots
                 ],
             }
 
-        profiles = [describe(r) for r in getattr(self, "runtimes", (self.runtime,))]
-        if len(profiles) > 1:
-            profiles[0]["alternatives"] = profiles[1:]
-        return profiles[0]
+        registration = describe(self.runtime.wire_profile)
+        standard = getattr(self.runtime, "standard_wire_profile", None)
+        if standard and self.runtime.execution == "decode":
+            registration["alternatives"] = [describe(standard)]
+        return registration
 
     def select_receive_profile(self, metas):
         if (
@@ -241,12 +228,14 @@ class KVServeAdapter:
         with self.submit_lock:
             if self._closing:
                 raise RuntimeError("KVServe adapter is closing")
-            runtimes = {r.wire_profile: r for r in self.runtimes}
-            if profile not in runtimes or self._receive_profile not in (None, profile):
+            supported = {self.runtime.wire_profile}
+            standard = getattr(self.runtime, "standard_wire_profile", None)
+            if standard:
+                supported.add(standard)
+            if profile not in supported or self._receive_profile not in (None, profile):
                 raise ValueError("KVServe receive profile is not available")
             if self._receive_profile is None:
                 logger.info("KVServe selected receive profile: %s", profile)
-            self.runtime = runtimes[profile]
             self._receive_profile = profile
 
     def expect_room(self, room, indices, is_dummy):
@@ -497,7 +486,7 @@ class KVServeAdapter:
         if (
             self.poisoned
             or meta.get("version") != 3
-            or meta["profile"] != self.runtime.wire_profile
+            or meta["profile"] != self._receive_profile
         ):
             raise ValueError("Invalid or poisoned KVServe receive session")
         pages = meta["indices"]
@@ -570,5 +559,4 @@ class KVServeAdapter:
                 )
         self.notifier.close()
         self.manager.engine.batch_deregister(self.registered_ptrs)
-        for runtime in getattr(self, "runtimes", (self.runtime,)):
-            runtime.shutdown()
+        self.runtime.shutdown()

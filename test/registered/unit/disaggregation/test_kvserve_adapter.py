@@ -95,13 +95,14 @@ class TestAdapterProtocol(unittest.TestCase):
             return SimpleNamespace(wire_profile=profile, slots=[slot, slot])
 
         fused, standard = runtime("fused", 4096), runtime("standard", 16384)
-        self.adapter.runtime, self.adapter.runtimes = fused, (fused, standard)
+        fused.standard_wire_profile, fused.execution = "standard", "decode"
+        self.adapter.runtime = fused
         peer = self.adapter.registration()
         self.assertEqual(peer["profile"], "fused")
         self.assertEqual(peer["alternatives"][0]["profile"], "standard")
-        self.adapter.runtime, self.adapter.runtimes = standard, (standard,)
+        self.adapter.runtime = standard
         selected = self.adapter.validate_peer(peer)
-        self.assertEqual(selected["slots"][0]["ptrs"], [16384, 20480])
+        self.assertEqual(selected["slots"][0]["ptrs"], [4096, 8192])
         for invalid in (
             {**peer, "alternatives": []},
             {**peer, "alternatives": [selected, selected]},
@@ -112,9 +113,8 @@ class TestAdapterProtocol(unittest.TestCase):
 
     def test_ready_selects_one_advertised_profile_and_never_switches(self):
         adapter = object.__new__(OptimizedKVServeAdapter)
-        fused = SimpleNamespace(wire_profile="fused")
-        standard = SimpleNamespace(wire_profile="standard")
-        adapter.runtime, adapter.runtimes = fused, (fused, standard)
+        fused = SimpleNamespace(wire_profile="fused", standard_wire_profile="standard")
+        adapter.runtime = fused
         adapter._receive_profile = None
         adapter._closing = False
         adapter.submit_lock = threading.Lock()
@@ -135,16 +135,15 @@ class TestAdapterProtocol(unittest.TestCase):
                 send(invalid)
         self.assertIsNone(adapter._receive_profile)
         self.assertTrue(send([{"profile": "standard"}]))
-        self.assertIs(adapter.runtime, standard)
+        self.assertIs(adapter.runtime, fused)
         self.assertTrue(send([{"profile": "standard"}]))
         with self.assertRaises(ValueError):
             send([{"profile": "fused"}])
         self.assertEqual(adapter._receive_pipeline_v2.accept.call_count, 7)
 
-    def test_close_releases_all_advertised_runtimes(self):
-        fused = SimpleNamespace(shutdown=Mock())
+    def test_close_releases_runtime(self):
         standard = SimpleNamespace(shutdown=Mock())
-        self.adapter.runtime, self.adapter.runtimes = standard, (fused, standard)
+        self.adapter.runtime = standard
         self.adapter.poisoned = False
         self.adapter.pending_lock = threading.Lock()
         self.adapter.pending = {}
@@ -156,7 +155,6 @@ class TestAdapterProtocol(unittest.TestCase):
         self.adapter.manager.engine.batch_deregister.assert_called_once_with(
             [4096, 8192]
         )
-        fused.shutdown.assert_called_once()
         standard.shutdown.assert_called_once()
 
     def test_duplicate_and_stale_ack_never_release_another_credit(self):
@@ -418,6 +416,7 @@ class FakeReceiveAdapter(KVServeAdapter):
         self.lock = threading.Lock()
         self.slot_locks = [threading.Lock(), threading.Lock()]
         self.device, self.poisoned, self.verify = "fake", False, False
+        self._receive_profile = "profile"
         self.chunk_size, self.cache_blocks, self.page_size = 1024, 100, 1
         self.expected_rooms = {7: {10}}
         self.restored_rooms = {7: {0: set(), 1: set()}}

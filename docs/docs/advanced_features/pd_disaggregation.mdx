@@ -296,7 +296,7 @@ On NVIDIA CUDA, you can enable KVServe compression for Mooncake P/D transfer. In
 Install the pinned KVServe revision on both workers. For CUDA 13, for example:
 
 ```bash
-pip install "kvserve_v1[runtime-fused-cu13] @ git+https://github.com/hpdps-group/KVServe.git@14a87a227a935257f8ab6749f809539d3a24ca60"
+pip install "kvserve_v1[runtime-fused-cu13] @ git+https://github.com/hpdps-group/KVServe.git@37f4d4789483df3a94c3dc296d7e775708c0df2b"
 ```
 
 For CUDA 12, use `runtime-fused-cu12` instead. Both extras install nvCOMP 6.0.0.12; prefill and decode must use the same nvCOMP version because it is not included in the wire-profile check.
@@ -328,7 +328,7 @@ You can choose the stages and quantization parameters in the same file. For exam
 
 `pipeline` selects an ordered subset of `transformer`, `quantizer`, and `codec`; it must include `quantizer` or `codec`. The available transformer is `hadamard`, and the available codec is `ans`. The C++/CUDA quantizer supports `channel` and `token` axes and 2–256 levels. To split by attention head instead of layer, set `split_type` to `head`, provide `score_path` on both workers, and optionally set `hybrid_ratio` to the fraction of heads assigned low precision. `score_path` and `hybrid_ratio` apply only to head-split quantization.
 
-The default algorithm profile uses the fused backend when supported. Other profiles use KVServe's standard C++/CUDA backend. Decode advertises its available representations so Prefill can automatically select a compatible one. When its default backend is fused, Decode reserves an additional standard-format workspace before sizing its KV cache. The `slot_count` may differ between workers, but the codec chunk size and algorithm settings must match; incompatible profiles are rejected.
+The default algorithm profile uses the fused backend when supported. Other profiles use KVServe's standard C++/CUDA backend. Decode advertises compatible representations so Prefill can automatically select one. The `slot_count` may differ between workers, but the codec chunk size and algorithm settings must match; incompatible profiles are rejected.
 
 #### NVLink Transport Configuration
 To enable NVLink transport for KV cache transfers with the mooncake backend (recommended for NVL72 deployments), set the following environment variables. Note that auxiliary data transfer will still use TCP as a temporary workaround.

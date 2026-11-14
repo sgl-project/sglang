@@ -390,6 +390,11 @@ class RestorePipeline:
                 meta["codec_bytes"],
                 meta["u8_bytes"],
                 valid_tokens_by_group={0: len(ids)},
+                **(
+                    {"wire_profile": meta["profile"]}
+                    if meta["profile"] != a.runtime.wire_profile
+                    else {}
+                ),
             )
             job["event"] = event
             job["event_recorded"] = True

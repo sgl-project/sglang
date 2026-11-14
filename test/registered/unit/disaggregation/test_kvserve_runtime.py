@@ -219,8 +219,6 @@ class TestKVServeStartup(CustomTestCase):
         ):
             with self.subTest(role=role, changes=changes):
                 calls = []
-                created = []
-                fail_standard = False
                 parallel = types.SimpleNamespace(attn_tp_size=1, attn_dcp_size=1)
                 context = types.ModuleType("sglang.srt.runtime_context")
                 context.get_parallel = lambda: parallel
@@ -240,8 +238,6 @@ class TestKVServeStartup(CustomTestCase):
 
                 def create(*args, **kwargs):
                     calls.append((args, kwargs))
-                    if fail_standard and kwargs["backend"] == "standard":
-                        raise RuntimeError("standard reservation failed")
                     cls = (
                         FakeFused
                         if kwargs["backend"] == "auto"
@@ -252,7 +248,6 @@ class TestKVServeStartup(CustomTestCase):
                         bulk=types.SimpleNamespace(numel=lambda: 64),
                         shutdown=Mock(),
                     )
-                    created.append(runtime)
                     return runtime
 
                 fused.create_runtime = create
@@ -297,19 +292,9 @@ class TestKVServeStartup(CustomTestCase):
                     before = os.environ.copy()
                     module.prepare_runtime(kvc)
                     self.assertEqual(os.environ, before)
-                    runtimes = module.take_runtime(types.SimpleNamespace(index=0))
-                    expected_count = (
-                        2 if role == "decode" and expected_backend == "auto" else 1
-                    )
-                    self.assertEqual(len(runtimes), expected_count)
-                    if expected_count == 2:
-                        fail_standard = True
-                        with self.assertRaisesRegex(RuntimeError, "reservation failed"):
-                            module.prepare_runtime(kvc)
-                        created[-1].shutdown.assert_called_once()
-                        self.assertIsNone(
-                            module.take_runtime(types.SimpleNamespace(index=0))
-                        )
+                    runtime = module.take_runtime(types.SimpleNamespace(index=0))
+                    self.assertIsNotNone(runtime)
+                    self.assertEqual(len(calls), 1)
                 selected = api.build_memory_plan.call_args.args[0]
                 self.assertEqual(
                     (selected.slot_count, selected.logical_blocks_per_chunk),
@@ -327,16 +312,6 @@ class TestKVServeStartup(CustomTestCase):
                         "standard_backend": "cpp",
                     },
                 )
-                if expected_count == 2:
-                    self.assertEqual(
-                        calls[1][1],
-                        {
-                            "backend": "standard",
-                            "output_slots": 0,
-                            "execution": "decode",
-                            "standard_backend": "cpp",
-                        },
-                    )
 
 
 if __name__ == "__main__":
