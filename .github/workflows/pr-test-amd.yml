@@ -9,12 +9,12 @@ on:
     # images (09:00-11:00) -> rocm10 PR test (13:00) -> rocm10 nightly (16:00)
     # -> rocm724/rocm720 PR test (19:00) -> rocm724/rocm720 nightly (21:00)
     # -> MILES (22:00).
-    # rocm10 runs every day. rocm724 runs on even days of the month and rocm720 on
-    # odd days, here and in nightly-test-amd.yml, so the PR test and the nightly
-    # of one ROCm version always land on the same day.
+    # rocm10 runs every day. The ROCm 7.2 lanes run on weekends only: rocm724 on
+    # Saturday and rocm720 on Sunday, here and in nightly-test-amd.yml, so the
+    # PR test and the nightly of one ROCm version always land on the same day.
     - cron: '0 1,13 * * *'  # rocm10: every 12 hours, 13:00 first after the 09:00 UTC rocm10 image
-    - cron: '0 19 2-30/2 * *'  # rocm724: even days of the month
-    - cron: '0 19 1-31/2 * *'  # rocm720: odd days of the month
+    - cron: '0 19 * * 6'  # rocm724: Saturday
+    - cron: '0 19 * * 0'  # rocm720: Sunday
   pull_request:
     paths:
       - "python/**"
@@ -173,9 +173,9 @@ jobs:
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
       # Keep rocm10 on the twice-daily cadence. The 19:00 UTC schedules run
-      # rocm724 on even days and rocm720 on odd days. Dispatch/call inputs select one version
+      # rocm724 on Saturday and rocm720 on Sunday. Dispatch/call inputs select one version
       # or all three, while a pull_request falls through to the rocm10 default.
-      rocm_versions: ${{ inputs.rocm_version == 'all' && '["rocm10","rocm724","rocm720"]' || inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 19 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 19 1-31/2 * *' && '["rocm720"]' || '["rocm10"]' }}
+      rocm_versions: ${{ inputs.rocm_version == 'all' && '["rocm10","rocm724","rocm720"]' || inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 19 * * 6' && '["rocm724"]' || github.event.schedule == '0 19 * * 0' && '["rocm720"]' || '["rocm10"]' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
