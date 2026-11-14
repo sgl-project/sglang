@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.function_call.utils import (
     get_schema_properties,
+    infer_type_from_json_schema,
     safe_literal_eval,
 )
 
@@ -41,7 +42,9 @@ def get_argument_type(
     params = tool.function.parameters or {}
     if not isinstance(params, dict):
         return None
-    return get_schema_properties(params).get(arg_key, {}).get("type")
+    # Resolve type lists and anyOf/oneOf so nullable params (e.g. Optional[str])
+    # keep their declared type instead of being treated as untyped.
+    return infer_type_from_json_schema(get_schema_properties(params).get(arg_key, {}))
 
 
 def parse_arguments(json_value):

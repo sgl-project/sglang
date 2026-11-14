@@ -13,6 +13,7 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.function_call.utils import (
     get_schema_properties,
+    infer_type_from_json_schema,
     safe_literal_eval,
 )
 
@@ -178,7 +179,13 @@ class PoolsideV1Detector(BaseFormatDetector):
         streaming JSON emission downstream.
         """
         spec = schema.get(key) if isinstance(schema, dict) else None
-        param_type = str(spec.get("type", "")).lower() if isinstance(spec, dict) else ""
+        # Resolve type lists and anyOf/oneOf so nullable params (e.g. Optional[str])
+        # keep their declared type instead of being treated as untyped.
+        param_type = (
+            str(infer_type_from_json_schema(spec) or "").lower()
+            if isinstance(spec, dict)
+            else ""
+        )
         if param_type in PoolsideV1Detector._STRING_TYPES:
             return raw
 

@@ -275,6 +275,43 @@ def test_malformed_xml_with_unescaped_ampersand_falls_back_to_regex():
     assert json.loads(result.calls[0].parameters)["city"] == "A & B"
 
 
+def make_tools_nullable():
+    return [
+        Tool(
+            function=Function(
+                name="lookup",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "zip_code": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                        "area_code": {"type": ["string", "null"]},
+                        "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                        "metric": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+                    },
+                },
+            )
+        )
+    ]
+
+
+def test_nullable_params_keep_declared_type_v3():
+    """Optional[...] params (anyOf / type lists with null) are coerced by their
+    non-null type: numeric-looking strings stay strings, ints become ints."""
+    detector = MiniCPM5Detector()
+    text = (
+        '<function name="lookup">'
+        '<param name="zip_code">10001</param>'
+        '<param name="area_code">212</param>'
+        '<param name="limit">5</param>'
+        '<param name="metric">true</param>'
+        "</function>\n"
+    )
+    res = detector.detect_and_parse(text, make_tools_nullable())
+    assert len(res.calls) == 1
+    args = json.loads(res.calls[0].parameters)
+    assert args == {"zip_code": "10001", "area_code": "212", "limit": 5, "metric": True}
+
+
 if __name__ == "__main__":
     import sys
 
