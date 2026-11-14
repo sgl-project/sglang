@@ -999,6 +999,55 @@ class TestDeepSelectFullTopKDecode(CustomTestCase):
         select_decode.assert_called_once_with(inputs, data, 2)
 
 
+class TestFullTopKDecodeDeepSelectGate(CustomTestCase):
+    """Hopper (SM90) full top-k decode stays on select_decode (#49336); DeepSelect
+    decode is chosen only off SM90, with DeepGEMM decode off and the device supported."""
+
+    @staticmethod
+    def _use_deep_select_decode(*, sm, use_deep_gemm_decode, supported):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
+
+        arch = MagicMock()
+        arch.is_sm.side_effect = lambda major, minor=None: major == sm
+        with (
+            patch.object(mod, "current_arch", return_value=arch),
+            patch.object(mod, "is_deep_select_supported", return_value=supported),
+        ):
+            indexer = mod.FullTopKIndexer(
+                token_to_kv_pool=None,
+                req_to_token=None,
+                use_deep_gemm_prefill=False,
+                use_deep_gemm_decode=use_deep_gemm_decode,
+            )
+        return indexer.use_deep_select_decode
+
+    def test_hopper_keeps_select_decode(self):
+        self.assertFalse(
+            self._use_deep_select_decode(
+                sm=9, use_deep_gemm_decode=False, supported=True
+            )
+        )
+
+    def test_non_hopper_uses_deep_select_when_supported(self):
+        self.assertTrue(
+            self._use_deep_select_decode(
+                sm=10, use_deep_gemm_decode=False, supported=True
+            )
+        )
+
+    def test_deep_gemm_decode_and_unsupported_device_disable_deep_select(self):
+        self.assertFalse(
+            self._use_deep_select_decode(
+                sm=10, use_deep_gemm_decode=True, supported=True
+            )
+        )
+        self.assertFalse(
+            self._use_deep_select_decode(
+                sm=10, use_deep_gemm_decode=False, supported=False
+            )
+        )
+
+
 class TestChunkedPagedDecode(CustomTestCase):
     """An eager decode whose paged-MQA metadata is split into row chunks (#40637):
     every DeepGEMM call must get its own chunk's schedule and every top-k its own
