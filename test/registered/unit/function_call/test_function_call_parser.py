@@ -2441,6 +2441,12 @@ class TestQwen3CoderDetector(unittest.TestCase):
             schema, '[1.5,1e3,"NaN","Infinity"]', [1.5, 1000.0, "NaN", "Infinity"]
         )
 
+    def test_number_parameter_nonfinite_values_remain_strings(self):
+        """A number parameter must not turn into Infinity/NaN, which is invalid JSON."""
+        for raw in ("1e999", "-1e999", "inf", "nan", "Infinity"):
+            self._check_structured_union_value({"type": "number"}, raw, raw)
+        self._check_structured_union_value({"type": "number"}, "1.5", 1.5)
+
     def test_union_validation_errors_preserve_tool_calls(self):
         """Invalid or recursive schemas must preserve strings in both parse modes."""
         for branch in (
