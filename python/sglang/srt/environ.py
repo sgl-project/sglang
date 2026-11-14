@@ -294,6 +294,9 @@ class Envs:
     # GDN ReplaySSM verify commit as the tiled Triton kernel (bitwise the stock commit,
     # supported shapes only). Opt-in.
     SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT = EnvRuntimeBool(False)
+    # Verify commit: conv-window and PLE rollbacks as one multi-pair launch each (same
+    # bytes). Opt-in.
+    SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER = EnvRuntimeBool(False)
     # EAGLE verify tree sampling as multi-CTA kernels (bitwise; fp32, <= 64 rows).
     SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
