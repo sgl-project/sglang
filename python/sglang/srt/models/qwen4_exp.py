@@ -59,9 +59,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptMixedPrecisionConfig,
-)
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptMixedPrecisionConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -100,10 +98,14 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, logger
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+if _is_npu:
+    from sgl_kernel_npu.operators.mamba import short_conv as ple_short_conv
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -595,8 +597,9 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
-            self._jit_group_size is not None
+            not _is_npu
             and x.is_cuda
+            and self._jit_group_size is not None
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
@@ -1246,13 +1249,22 @@ class Qwen4ExpPLELayer(nn.Module):
                     dtype=x.dtype
                 )
                 conv_input = torch.cat([state, x.unsqueeze(-1)], dim=-1)
-            conv_output = F.conv1d(
-                conv_input,
-                self.conv1d.weight.to(dtype=x.dtype),
-                bias=None,
-                dilation=self.short_conv_dilation,
-                groups=self.conv_channels,
-            ).squeeze(-1)
+            # The NPU kernel is graph-capturable and returns [B, C] directly.
+            if _is_npu:
+                conv_output = ple_short_conv(
+                    conv_input,
+                    self.conv1d.weight.to(dtype=x.dtype),
+                    self.short_conv_dilation,
+                    single_token=True,
+                )
+            else:
+                conv_output = F.conv1d(
+                    conv_input,
+                    self.conv1d.weight.to(dtype=x.dtype),
+                    bias=None,
+                    dilation=self.short_conv_dilation,
+                    groups=self.conv_channels,
+                ).squeeze(-1)
             next_state = conv_input[:, :, batch.row_width :]
             if not fused_state:
                 conv_state[batch.state_indices] = next_state.to(dtype=conv_state.dtype)
@@ -1269,13 +1281,22 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         padded_seq[batch.req_indices, batch.token_offsets] = x
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
-        conv_output = F.conv1d(
-            conv_input,
-            self.conv1d.weight.to(dtype=x.dtype),
-            bias=None,
-            dilation=self.short_conv_dilation,
-            groups=self.conv_channels,
-        ).transpose(1, 2)
+        # Decode/verify use the graph-capturable NPU kernel. Its output is
+        # already [B, W, C]; ordinary prefill retains native convolution.
+        if _is_npu and (batch.mode.is_target_verify() or batch.mode.is_decode()):
+            conv_output = ple_short_conv(
+                conv_input,
+                self.conv1d.weight.to(dtype=x.dtype),
+                self.short_conv_dilation,
+            )
+        else:
+            conv_output = F.conv1d(
+                conv_input,
+                self.conv1d.weight.to(dtype=x.dtype),
+                bias=None,
+                dilation=self.short_conv_dilation,
+                groups=self.conv_channels,
+            ).transpose(1, 2)
 
         if batch.mode.is_target_verify():
             intermediate_cache = short_conv.view.layer_intermediate_cache(
@@ -1495,7 +1516,11 @@ class Qwen4ExpPLELayer(nn.Module):
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
-        if self.ple_embedding.enable_ple_fusion and batch.mode.is_target_verify():
+        if (
+            not _is_npu
+            and self.ple_embedding.enable_ple_fusion
+            and batch.mode.is_target_verify()
+        ):
             from sglang.kernels.ops.mamba.qwen4_short_conv import (
                 can_fuse_qwen4_verify_conv,
                 fused_qwen4_verify_conv,
