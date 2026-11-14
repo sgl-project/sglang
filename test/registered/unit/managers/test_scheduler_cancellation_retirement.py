@@ -145,12 +145,16 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         enter_scope(self, envs.SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS.override(True))
         self.outputs = []
         self.abort_observer = None
+        self.drop_receipt_sends = 0
 
     def _scheduler(self, *, cache_enabled=False):
         return make_cpu_scheduler(self._send_output, cache_enabled=cache_enabled)
 
     def _send_output(self, output, req):
         if isinstance(output, CancellationRetirementOutput):
+            if self.drop_receipt_sends > 0:
+                self.drop_receipt_sends -= 1
+                raise OSError("control link down")
             self.outputs.append((output, req))
         elif self.abort_observer is not None:
             self.abort_observer(req)
@@ -346,6 +350,29 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertEqual(self.outputs[-1][0].reason, "receipt_expired")
         self.assertTrue(req.kv.holds_kv)
         self.assertEqual(req.inflight_steps, 1)
+
+    def test_failed_receipt_delivery_is_retried_within_ttl(self):
+        self.drop_receipt_sends = 1
+        scheduler = self._scheduler()
+        req = self._req(scheduler)
+        move([req], scheduler.waiting_queue)
+        control = self._cancel(scheduler, req)
+
+        # The cached result exists, but the first delivery failed and the
+        # route is kept on the completed entry for a later scheduler step.
+        self.assertEqual(self.outputs, [])
+        entry = scheduler._cancellation_retirements[control.cancellation_id]
+        self.assertEqual(entry.status, "retired")
+        self.assertEqual(len(entry.replies), 1)
+
+        entry.next_retry_at = 0.0
+        scheduler._check_cancellation_retirements()
+        self.assertEqual([out.status for out, _ in self.outputs], ["retired"])
+        self.assertEqual(entry.replies, {})
+
+        # A frontend retry with the same operation replays the cached result.
+        self._cancel(scheduler, req)
+        self.assertEqual([out.status for out, _ in self.outputs][-1], "retired")
 
     def test_legacy_prefix_abort_and_targeted_chunk_retry_remain_separate(self):
         scheduler = self._scheduler()

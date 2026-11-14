@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.entrypoints import http_server
 from sglang.srt.environ import envs
 from sglang.srt.managers.cancellation_retirement import CancellationRetirementRegistry
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CancellationRetirementOutput,
@@ -339,7 +340,7 @@ class TestCancelRetirementFrontend(unittest.IsolatedAsyncioTestCase):
             scheduler, rid="request", instance=state.request_instance_id
         )
         neighbor = allocate_cpu_req(scheduler, rid="neighbor", instance="neighbor")
-        scheduler.waiting_queue.join([target, neighbor])
+        move([target, neighbor], scheduler.waiting_queue)
         self.assertEqual(scheduler.req_to_token_pool.available_size(), 6)
         self.assertEqual(scheduler.token_to_kv_pool_allocator.available_size(), 26)
 
