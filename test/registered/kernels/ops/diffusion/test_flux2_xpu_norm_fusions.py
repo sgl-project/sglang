@@ -192,6 +192,27 @@ class TestFlux2XpuNormFusions(CustomTestCase):
         expected = impl.forward(q.contiguous(), k.contiguous(), v.contiguous())
         self.assertTrue(torch.equal(impl.forward(q, k, v), expected))
 
+    def test_attention_input_traces_under_torch_compile(self):
+        # Compiled FLUX.2 klein serving failed every request once a dynamic-shape
+        # recompile met an untraceable pointer check here; this path must trace.
+        from sglang.multimodal_gen.runtime.layers.attention.backends import (
+            xpu_backend,
+        )
+
+        heads, head_dim = 12, 128
+
+        def k_input(proj):
+            k = proj[..., heads * head_dim : 2 * heads * head_dim]
+            return xpu_backend._as_fa_input(k, proj.shape[1], heads, head_dim) * 2
+
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            k_input, backend="aot_eager", fullgraph=True, dynamic=True
+        )
+        for tokens in (256, 240):
+            proj = torch.randn(1, tokens, 13824, device="xpu", dtype=torch.bfloat16)
+            self.assertTrue(torch.equal(compiled(proj), k_input(proj)))
+
     def test_launchers_reject_layouts_they_do_not_replicate(self):
         x, update, gate, scale, shift = _inputs(16, 1.0, 4)
         strided = x.transpose(1, 2).contiguous().transpose(1, 2)
