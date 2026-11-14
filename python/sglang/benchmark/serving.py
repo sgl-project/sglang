@@ -1115,8 +1115,15 @@ async def get_request(
 
             yield request
     else:
+        target_arrival_time = time.perf_counter()
         input_requests_iter = iter(input_requests)
         for request in input_requests_iter:
+            if request_rate != float("inf"):
+                # Compensate for late wake-ups and work done by the consumer.
+                sleep_duration = target_arrival_time - time.perf_counter()
+                if sleep_duration > 0:
+                    await asyncio.sleep(sleep_duration)
+
             yield request
 
             if request_rate == float("inf"):
@@ -1124,9 +1131,10 @@ async def get_request(
                 continue
 
             # Sample the request interval from the exponential distribution.
+            # Keep the final draw for RNG compatibility, but do not wait after
+            # the last request since there is no next arrival to schedule.
             interval = np.random.exponential(1.0 / request_rate)
-            # The next request will be sent after the interval.
-            await asyncio.sleep(interval)
+            target_arrival_time += interval
 
 
 def calculate_metrics(
