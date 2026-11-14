@@ -113,8 +113,10 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
             "8",
             "--speculative-token-map",
             FR_SPEC_TOKEN_MAP_PATH,
+            # The hot token ids are global, so the shared target lm_head must
+            # not be vocab-sharded; sgl-project/sglang#42397.
             "--tp-size",
-            "4",
+            "1",
             "--mem-fraction-static",
             "0.7",
             "--disable-cuda-graph",
