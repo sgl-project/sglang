@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
@@ -14,6 +16,40 @@ def apply_scaling_penalties(logits, scaling_penalties):
         logits * scaling_penalties,
         logits / scaling_penalties,
     )
+
+
+def apply_repetition_penalty_with_prefix(
+    logits: torch.Tensor,
+    history_scaling: torch.Tensor,
+    repetition_penalties: torch.Tensor,
+    verify_input_ids: torch.Tensor,
+    committed_tokens: Optional[torch.Tensor] = None,
+    committed_lens: Optional[torch.Tensor] = None,
+) -> None:
+    """Apply ordinary decode's repetition penalty to each causal verify row.
+
+    Row j predicts the token *after* verify_input_ids[:, j]. Column zero is
+    the already sampled anchor; the remaining columns are hypothetical draft
+    tokens. Neither those tokens nor an unaccepted suffix may mutate history.
+    The overlap relay supplies the previous committed block, which the CPU
+    history can still be missing. Union is idempotent if it is already present.
+    Only one [bs, vocab] scratch buffer is needed, independent of block width.
+    """
+    scaling = history_scaling.clone()
+    penalties = repetition_penalties.reshape(-1, 1)
+    if committed_tokens is not None:
+        assert committed_lens is not None
+        for column in range(committed_tokens.shape[1]):
+            valid = column < committed_lens
+            # Uncommitted entries may contain -1 or arbitrary draft garbage.
+            index = torch.where(valid, committed_tokens[:, column], 0).long()[:, None]
+            previous = scaling.gather(1, index)
+            scaling.scatter_(1, index, torch.where(valid[:, None], penalties, previous))
+
+    for position in range(verify_input_ids.shape[1]):
+        index = verify_input_ids[:, position].long()[:, None]
+        scaling.scatter_(1, index, penalties)
+        apply_scaling_penalties(logits[:, position, :], scaling)
 
 
 class BatchedRepetitionPenalizer(_BatchedPenalizer):
@@ -49,12 +85,19 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             .unsqueeze_(1)
         )
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
-        self.cumulated_repetition_penalties.scatter_(
-            dim=1,
-            index=output_ids.unsqueeze(1),
-            src=self.repetition_penalties,
-        )
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, valid: Optional[torch.Tensor] = None
+    ):
+        index = output_ids.unsqueeze(1)
+        src = self.repetition_penalties
+        if valid is not None:
+            # Padding entries write back the value already stored at their index.
+            src = torch.where(
+                valid.unsqueeze(1),
+                src,
+                self.cumulated_repetition_penalties.gather(dim=1, index=index),
+            )
+        self.cumulated_repetition_penalties.scatter_(dim=1, index=index, src=src)
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         apply_scaling_penalties(logits, self.cumulated_repetition_penalties)
