@@ -582,7 +582,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             assistant_prefix = detector.answer_opener(prompt) + assistant_prefix
         encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-        if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
+        if encoded and self._starts_with_bos(encoded):
             encoded = encoded[1:]
         return prompt_ids + encoded
 
@@ -1181,6 +1181,10 @@ class OpenAIServingChat(OpenAIServingBase):
             return "text", processed_messages.prompt_ids
         return "input_ids", processed_messages.prompt_ids
 
+    def _starts_with_bos(self, token_ids: list[int]) -> bool:
+        bos_token_id = getattr(self.tokenizer_manager.tokenizer, "bos_token_id", None)
+        return bos_token_id is not None and token_ids[0] == bos_token_id
+
     def _can_reuse_text_only_prompt_ids(
         self, processed_messages: MessageProcessingResult, is_multimodal: bool
     ) -> bool:
@@ -1196,9 +1200,14 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.chat_encoding_spec is None
             and self.template_manager.chat_template_name is None
             and not self._prompt_text_round_trip_is_lossy
-            and not self._tokenizer_auto_adds_specials
             and isinstance(processed_messages.prompt_ids, list)
             and bool(processed_messages.prompt_ids)
+            # When the template already wrote BOS, re-encoding the text with a
+            # tokenizer that adds specials would prepend a second one.
+            and (
+                not self._tokenizer_auto_adds_specials
+                or self._starts_with_bos(processed_messages.prompt_ids)
+            )
             and not processed_messages.image_data
             and not processed_messages.video_data
             and not processed_messages.audio_data

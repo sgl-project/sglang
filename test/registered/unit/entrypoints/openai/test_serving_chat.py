@@ -1783,6 +1783,45 @@ class ServingChatTestCase(CustomTestCase):
                     self.assertEqual(adapted.text, "rendered prompt")
                     self.assertIsNone(adapted.input_ids)
 
+    def test_prompt_reuse_when_template_already_wrote_bos(self):
+        # Re-tokenizing the rendered text would prepend a second BOS when the
+        # tokenizer adds one and the template already wrote it; without a
+        # template BOS the text path still has the tokenizer add it.
+        self.tm.model_config.is_multimodal = True
+        self.tm.model_config.hf_config.architectures = ["LlamaForCausalLM"]
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = True
+        self.chat._prompt_text_round_trip_is_lossy = False
+        # (bos_token_id, prompt_ids, reuses the rendered token ids)
+        cases = {
+            "template wrote BOS": (1, [1, 22, 33], True),
+            "no BOS in template": (1, [11, 22, 33], False),
+            "tokenizer has no BOS": (None, [1, 22, 33], False),
+        }
+        for name, (bos_token_id, prompt_ids, reuses_ids) in cases.items():
+            with self.subTest(name):
+                self.tm.tokenizer.bos_token_id = bos_token_id
+                processed = MessageProcessingResult(
+                    prompt="rendered prompt",
+                    prompt_ids=prompt_ids,
+                    image_data=None,
+                    audio_data=None,
+                    video_data=None,
+                    modalities=[],
+                    stop=[],
+                )
+                with patch.object(
+                    self.chat, "_process_messages", return_value=processed
+                ):
+                    adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+                if reuses_ids:
+                    self.assertEqual(adapted.input_ids, prompt_ids)
+                    self.assertIsNone(adapted.text)
+                else:
+                    self.assertEqual(adapted.text, "rendered prompt")
+                    self.assertIsNone(adapted.input_ids)
+
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
             model="x",
