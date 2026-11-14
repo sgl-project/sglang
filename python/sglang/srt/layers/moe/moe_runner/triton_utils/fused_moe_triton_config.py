@@ -10,10 +10,11 @@ import torch
 import triton
 
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import get_device_name, is_hip
+from sglang.srt.utils import get_device_name, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_is_gfx95 = _is_hip and is_gfx95_supported()
 _LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES = 128 * 1024
 
 
@@ -177,6 +178,45 @@ def get_moe_configs(
     return None
 
 
+# Deterministic mode cannot pick a config by M from tuned files, since a token's
+# result must not depend on how many tokens share its batch.
+_DETERMINISTIC_CONFIG = {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 8,
+}
+# Measured on MI350X for bf16 MoE (E = 64-128, top-k 6-8): 1.7-1.9x faster than
+# _DETERMINISTIC_CONFIG at 4k-16k tokens, but ~3% slower at a few tokens. It gives
+# the same bits as _DETERMINISTIC_CONFIG, which is what makes switching by M safe.
+_DETERMINISTIC_CONFIG_GFX950_LARGE_M = {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 4,
+    "num_stages": 2,
+}
+_DETERMINISTIC_GFX950_SMALL_M = 64
+
+
+def _deterministic_config(
+    M: int,
+    dtype: Optional[str],
+    is_marlin: bool,
+    block_shape: Optional[List[int]],
+) -> Dict[str, int]:
+    if (
+        _is_gfx95
+        and dtype is None
+        and block_shape is None
+        and not is_marlin
+        and M > _DETERMINISTIC_GFX950_SMALL_M
+    ):
+        return dict(_DETERMINISTIC_CONFIG_GFX950_LARGE_M)
+    return dict(_DETERMINISTIC_CONFIG)
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -188,13 +228,7 @@ def get_default_config(
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
     if get_exec().deterministic.enable_deterministic_inference:
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-        }
-        return config
+        return _deterministic_config(M, dtype, is_marlin, block_shape)
     if dtype == "fp8_w8a8":
         if block_shape is None:
             if _use_low_smem_fp8_default():
