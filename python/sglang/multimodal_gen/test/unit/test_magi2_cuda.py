@@ -34,10 +34,17 @@ def _bucketed_grid(*, num_tail_tokens: int) -> Magi2BlockGrid:
     )
 
 
-def _qkv(grid: Magi2BlockGrid, *, device):
+def _qkv(grid: Magi2BlockGrid, *, device, dtype=torch.float32):
     generator = torch.Generator(device=device).manual_seed(0)
     return [
-        torch.randn(grid.seq_len, _HEADS, _HEAD_DIM, device=device, generator=generator)
+        torch.randn(
+            grid.seq_len,
+            _HEADS,
+            _HEAD_DIM,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
         for _ in range(3)
     ]
 
@@ -60,15 +67,19 @@ class TestFlexAttentionPath(unittest.TestCase):
         # The tile occupancy handed to from_kv_blocks is a superset that mask_mod
         # refines, so too tight a superset silently drops keys.
         grid = _grid()
-        tensors = _qkv(grid, device=self.device)
+        # bf16 as served. These 8-token blocks put several patterns in one 128-key
+        # tile, and on fp32 input torch 2.14's compiled flex kernel gets them wrong
+        # once its key tile is narrower than 128; eager flex agrees with the mask.
+        tensors = _qkv(grid, device=self.device, dtype=torch.bfloat16)
         dense = Magi2BlockGridAttention(
             num_heads=_HEADS, head_dim=_HEAD_DIM, dense_fallback=True
         )
+        # bf16 rounding reaches 0.0034 here; a dropped key tile moves it by 0.47.
         torch.testing.assert_close(
-            _attend(self.attention, tensors, grid),
-            _attend(dense, tensors, grid),
-            rtol=1e-4,
-            atol=1e-4,
+            _attend(self.attention, tensors, grid).float(),
+            _attend(dense, [t.float() for t in tensors], grid),
+            rtol=0,
+            atol=1e-2,
         )
 
     def test_full_blocks_match_the_dense_reference(self):
