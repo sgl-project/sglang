@@ -322,10 +322,10 @@ def get_attn_backend(
         # Reuse the backend's opt-in and capability checks without overriding
         # an explicit backend or a layer's declared default.
         from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
-            resolve_mx_fa_scheme,
+            _can_use_mxfp8_attention,
         )
 
-        if resolve_mx_fa_scheme(quant_config) is not None:
+        if _can_use_mxfp8_attention(quant_config):
             selected_backend = AttentionBackendEnum.FA
 
     allowed_fallback_reason = None

@@ -87,9 +87,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -637,7 +634,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 prefix=f"{prefix}.to_add_out" if prefix else "",
             )
 
-        # TODO Need to create mxfp8 attention scheme and port the code below
         from sglang.multimodal_gen import envs
 
         quant_description = getattr(quant_config, "quant_description", {})
@@ -768,13 +764,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-        # Offline rotations belong to the MXFP8 FA contract.
-        if (
-            self.use_offline_qk_rotation
-            and self.attn.backend is AttentionBackendEnum.FA
-            and query.shape[1:3] == key.shape[1:3]
-            and key.shape == value.shape
-            and (query.shape[0] * query.shape[1]) % 64 == 0
+        if self.use_offline_qk_rotation and self.attn.should_apply_qk_rot(
+            query, key, value
         ):
             self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
             self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)

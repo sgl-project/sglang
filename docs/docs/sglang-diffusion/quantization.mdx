@@ -1305,19 +1305,162 @@ sglang generate \
 
 ## MXFP4 Offline Quantization (msmodelslim)
 
-Pre-quantized MXFP4 weights exported by msmodelslim are auto-detected via
-`quant_model_description.json` (`W4A4_MXFP4` / `W4A4_MXFP4_DUALSCALE` scheme).
-Use `wan_repack.py` to convert the quantized weights to Diffusers format, then load
-the converted model with `--model-path`:
+Use an offline ModelSlim checkpoint to run supported diffusion models with
+MXFP4 weights and activations on Ascend. SGLang reads each layer's precision
+from `quant_model_description.json`, so you only need to point it at the
+prepared model directory. Do not add an online `--quantization` option.
 
-```bash
-sglang generate \
-  --model-path {path_to_converted_mxfp4_model} \
-  --prompt "a beautiful sunset" \
-  --save-output
-```
+The checkpoint must match a model and export format supported by SGLang's
+loader. The steps below describe the shared workflow; Wan conversion is one
+model-specific example.
 
-The offline MXFP4 checkpoint stores weights in an FP8 container and includes dual-level
-scales (`weight_scale`, `weight_dual_scale`). If exported with smooth quantization,
-`mul_scale` is loaded and applied before activation quantization to keep activations
-aligned with the calibrated weights.
+### Requirements
+
+| Component | Required capability |
+| --- | --- |
+| Hardware | Ascend 950PR/DT Series |
+| Linear operators | CANN and torch_npu with MXFP4 quantization and matmul support |
+| Checkpoint | ModelSlim weights, scales, smoothing data, and `quant_model_description.json` |
+| Model format | The format expected by the selected model loader; for example, Diffusers for Wan |
+
+<Note>
+  Check [Eco-Tech on ModelScope](https://modelscope.cn/organization/Eco-Tech)
+  for a checkpoint matching your model and device. A checkpoint already in
+  the format expected by its SGLang loader can be used directly.
+</Note>
+
+### Usage Examples
+
+<Steps>
+  <Step title="Prepare the checkpoint">
+    Choose an offline MXFP4 export matching your model and device. To create your own,
+    use the corresponding recipe in the
+    [ModelSlim multimodal quantization examples](https://gitcode.com/Ascend/msmodelslim/blob/master/example/multimodal_sd/README.md).
+    Keep embeddings unquantized.
+  </Step>
+  <Step title="Check the model format">
+    Convert the export only if your model's SGLang loader expects a different
+    directory structure or tensor names. Conversion is model-specific;
+    `wan_repack.py` is for Wan exports.
+
+    <Accordion title="Example: convert a Wan2.2 export to Diffusers">
+      Run from the SGLang repository root. The original Diffusers model supplies
+      the pipeline configuration and non-transformer components. The ModelSlim
+      export supplies the quantized transformer weights and metadata.
+
+      ```bash
+      python python/sglang/multimodal_gen/tools/wan_repack.py \
+        --model-type Wan2.2-T2V-A14B \
+        --original-model-path /path/to/wan2_2_diffusers_model \
+        --quant-path /path/to/wan2_2_mxfp4_export \
+        --output-path /path/to/wan2_2_mxfp4_diffusers_model
+      ```
+
+      Use a new output directory. For A14B exports, the repacker maps
+      `high_noise_model` to `transformer` and `low_noise_model` to `transformer_2`.
+      It preserves the precision settings, smoothing scales, and Q/K rotations
+      exported by ModelSlim.
+    </Accordion>
+  </Step>
+</Steps>
+
+#### Run inference
+
+Replace `/path/to/mxfp4_model` with your prepared checkpoint directory. Set the
+device count (`--num-gpus`), parallelism, image or video dimensions, and other generation
+options according to your model's serving recipe.
+
+<Tabs>
+  <Tab title="Generate once">
+    ```bash
+    sglang generate \
+      --model-path /path/to/mxfp4_model \
+      --attention-backend fa \
+      --prompt "A curious raccoon exploring a forest" \
+      --save-output
+    ```
+  </Tab>
+  <Tab title="Launch a server">
+    ```bash
+    sglang serve \
+      --model-path /path/to/mxfp4_model \
+      --attention-backend fa \
+      --port 30000
+    ```
+
+    See the [serving API](/docs/sglang-diffusion/api/openai_api) for sending requests.
+  </Tab>
+</Tabs>
+
+### MXFP4 attention
+
+MXFP4 linear layers and MXFP4 attention are configured separately. A checkpoint
+that marks its self-attention layers as `MXFP4_DYNAMIC` also uses FP4 for the
+attention inputs (queries, keys, and values). Otherwise, loading MXFP4 linear
+weights alone does not enable this attention path.
+
+Use `--attention-backend fa` on Ascend. The model must pass its attention
+metadata and any exported Q/K rotations to this backend.
+
+| Requirement | Supported configuration |
+| --- | --- |
+| Hardware | Ascend 950 |
+| PyTorch / torch_npu | `float8_e8m0fnu`, torch_npu's packed `float4_e2m1fn_x2` dtype, and dynamic MXFP4 quantization |
+| CANN extension | `cann_ops_transformer.ops.quant_flash_attn` and `quant_flash_attn_metadata` with MXFP4 support |
+| Attention pattern | Noncausal self-attention, head size 128, no ring parallelism or softmax LSE output |
+| Inputs | Dense or packed variable-length sequences |
+
+<Note>
+  MXFP4 attention requires the experimental CANN extension above. Installing a
+  torch_npu build with MXFP4 linear operators alone is insufficient. The metadata
+  API must expose `quant_mode` and `layout_q_descale`.
+</Note>
+
+`timestep_policy.fa` can select `FLOAT` or `MXFP4` per step. Without an attention
+policy, `MXFP4_DYNAMIC` descriptors use MXFP4 throughout; the linear-layer
+W4A8 boundary schedule does not change attention precision. `FP8_DYNAMIC`
+attention descriptors are unsupported by this descriptor path.
+
+<Accordion title="Attention padding and exported rotations">
+  `mxfp4_attention_pad_size` selects a padding multiple of `256` or `512`
+  (default: `512`). Real sequence lengths exclude padding from softmax. Packed
+  inputs are grouped by padded length and evaluated per bucket.
+
+  The loader accepts exported rotation names `to_q_rot` / `to_k_rot` and the
+  earlier names `q_rot` / `k_rot`.
+</Accordion>
+
+### Precision during denoising
+
+`W4A4` means 4-bit weights and 4-bit activations; `W4A8` keeps the same weights
+but uses 8-bit activations. Single-level MXFP4 linears use W4A8 for the first two and last two denoising
+steps, and W4A4 otherwise. For 40 steps, the W4A8 indices are `0`, `1`, `38`,
+and `39`. Checkpoint entries in `timestep_policy.w4a4_linear` override this
+schedule; `{"default": "W4A4"}` selects W4A4 throughout. Dual-scale layers stay
+W4A4 and reject W4A8 switching.
+
+These rules apply to the shared MXFP4 linear implementation, independently of
+the model-specific checkpoint conversion.
+
+<Accordion title="Checkpoint storage and activation quantization">
+  The repacker accepts numeric FP8 containers or packed `uint8` weights and
+  produces packed FP4 `[out, in/2]` with `weight_scale` `[out, in/32]`.
+  Dual-scale layers also require `weight_dual_scale` `[out, in/512, 1]`.
+  Single-level weights use ND layout; dual-scale weights require NZ. Each TP
+  input partition must be divisible by `64` or `512`, respectively.
+
+  Existing ModelSlim checkpoints with numeric FP8 containers `[out, in]` also
+  load directly: the loader packs the FP4 values before dtype conversion and
+  tensor-parallel slicing. Already-packed FP4 and genuine MXFP8 weights retain
+  their existing loading paths.
+
+  Both `div.mul_scale` and `mul_scale` descriptors are accepted. Single-level
+  layers apply smoothing once before quantization; dual-scale layers pass it as
+  `smooth_scale` to the quantization operator.
+
+  Single-level W4A4 linears and MXFP4 attention use `round_mode="rint"`,
+  `scale_alg=2`, and `dst_type_max=7.25`. The checkpoint's `mxfp4_scale_alg` and
+  `mxfp4_dst_type_max` override the latter two values. W4A8 steps keep the FP8
+  activation operator defaults. W4A8 matmul uses BF16 bias with shape `[1, out]`
+  in both SRT and diffusion.
+</Accordion>
