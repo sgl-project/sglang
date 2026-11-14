@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from transformers import PretrainedConfig
+
 from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
@@ -31,10 +33,12 @@ def _cp_args(arch="DeepseekV4ForCausalLM", model_type="deepseek_v4", **overrides
             **overrides,
         }
     )
+    hf_config = PretrainedConfig(architectures=[arch], model_type=model_type)
     args._model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=[arch], model_type=model_type),
-        hf_text_config=SimpleNamespace(model_type=model_type),
+        hf_config=hf_config,
+        hf_text_config=hf_config,
         is_multimodal=False,
+        linear_attn_registry_result=None,
     )
     return args
 
