@@ -251,6 +251,19 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.moe_runner_backend != "auto":
         return {}
+    if (
+        get_platform().is_sm90
+        and cfg.moe_a2a_backend == "none"
+        and not cfg.enable_waterfill
+        and _is_mxfp4_pack_quantized(hf_config)
+    ):
+        # The auto runner on SM90 is Triton, which upcasts the packed MXFP4
+        # experts to BF16 at load (~3.8x the expert memory; the full Kimi-K3.1
+        # at TP16/EP16 is estimated at ~317 GiB per GPU). Marlin reads packed
+        # MXFP4 and implements SiTU, but has a fused path only without an
+        # all-to-all backend, and Waterfill later switches the backend to DeepEP.
+        logger.info("Kimi-K3 on SM90: moe_runner_backend=marlin.")
+        return {"moe_runner_backend": "marlin"}
     if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103, 107)):
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):

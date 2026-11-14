@@ -851,6 +851,72 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         set_global_server_args_for_scheduler(server_args)
         return get_server_args()
 
+    _KIMI_K31_TEXT_CONFIG = {
+        "model_type": "kimi_linear",
+        "hidden_act": "situ",
+        "q_lora_rank": 32,
+        "num_experts": 8,
+        "num_experts_per_token": 2,
+        "moe_intermediate_size": 32,
+        "num_shared_experts": 1,
+        "first_k_dense_replace": 1,
+        "linear_attn_config": {
+            "full_attn_layers": [2],
+            "kda_layers": [1],
+            "head_dim": 16,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+        },
+        "dsa_config": {
+            "dsa_layers": [2],
+            "index_topk": 64,
+            "index_head_dim": 16,
+            "index_num_heads": 4,
+        },
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "mxfp4-pack-quantized",
+            "config_groups": {"group_0": {"format": "mxfp4-pack-quantized"}},
+        },
+    }
+
+    def test_kimi_k31_sm90_moe_runner_follows_final_a2a_backend(self):
+        from sglang.srt.server_args import ServerArgs
+
+        # KimiK31Config derives hidden_size from text_config, so the mini
+        # fields go there rather than through _construct's top level.
+        config = {
+            "architectures": ["KimiK31ForConditionalGeneration"],
+            "model_type": "kimi_k31",
+            "text_config": dict(self._MINI_CONFIG, **self._KIMI_K31_TEXT_CONFIG),
+        }
+        config_dir = tempfile.mkdtemp(prefix="golden_override_")
+        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as f:
+            json.dump(config, f)
+
+        def _resolve(**server_kwargs):
+            reset_context()
+            with (
+                override_platform(is_cuda=True, is_sm90=True, is_sm100=False),
+                # The DSA branch of handle_model_specific_adjustments queries
+                # the device directly.
+                patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            ):
+                sa = ServerArgs(model_path=config_dir, device="cuda", **server_kwargs)
+                sa.resolve_once()
+            return (
+                self._resolved(sa, "moe_runner_backend"),
+                self._resolved(sa, "moe_a2a_backend"),
+            )
+
+        self.assertEqual(_resolve(), ("marlin", "none"))
+        self.assertEqual(_resolve(moe_runner_backend="triton"), ("triton", "none"))
+        # Marlin has no fused path under DeepEP; Waterfill switches to DeepEP
+        # after the model overrides run.
+        self.assertEqual(_resolve(moe_a2a_backend="deepep"), ("auto", "deepep"))
+        self.assertEqual(_resolve(enable_waterfill=True), ("auto", "deepep"))
+
     def test_explicit_extra_buffer_without_mamba_state_fails_fast(self):
         with self.assertRaisesRegex(ValueError, "needs mamba state"):
             self._construct(
@@ -1195,6 +1261,48 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _cohere2_moe_runner_overrides(_args(None), SimpleNamespace()),
                 {"moe_runner_backend": "flashinfer_trtllm"},
             )
+
+    def test_kimi_k3_sm90_mxfp4_defaults_to_marlin(self):
+        from sglang.srt.arg_groups.model_overrides.kimi_k3 import (
+            _kimi_k3_moe_runner_overrides,
+        )
+
+        def _k3_hf(fmt):
+            qc = {"config_groups": {"group_0": {"format": fmt}}}
+            return SimpleNamespace(text_config=SimpleNamespace(quantization_config=qc))
+
+        def _run(runner, hf_config, a2a="none", waterfill=False, **platform):
+            with override_platform(**platform):
+                return _kimi_k3_moe_runner_overrides(
+                    SimpleNamespace(
+                        moe_runner_backend=runner,
+                        moe_a2a_backend=a2a,
+                        enable_waterfill=waterfill,
+                    ),
+                    hf_config,
+                )
+
+        hopper = dict(is_cuda=True, is_sm90=True, is_sm100=False, device_sm=90)
+        self.assertEqual(
+            _run("auto", _k3_hf("mxfp4-pack-quantized"), **hopper),
+            {"moe_runner_backend": "marlin"},
+        )
+        # An explicit runner is the user's choice; a non-MXFP4 checkpoint keeps auto.
+        self.assertEqual(_run("triton", _k3_hf("mxfp4-pack-quantized"), **hopper), {})
+        self.assertEqual(_run("auto", _k3_hf("float-quantized"), **hopper), {})
+        # Marlin has no fused path under an all-to-all backend, and Waterfill
+        # later forces DeepEP.
+        self.assertEqual(
+            _run("auto", _k3_hf("mxfp4-pack-quantized"), a2a="deepep", **hopper), {}
+        )
+        self.assertEqual(
+            _run("auto", _k3_hf("mxfp4-pack-quantized"), waterfill=True, **hopper), {}
+        )
+        blackwell = dict(is_cuda=True, is_sm90=False, is_sm100=True, device_sm=100)
+        self.assertEqual(
+            _run("auto", _k3_hf("mxfp4-pack-quantized"), **blackwell),
+            {"moe_runner_backend": "flashinfer_mxfp4"},
+        )
 
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
