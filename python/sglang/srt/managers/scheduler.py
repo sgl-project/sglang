@@ -67,7 +67,6 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.distributed import barrier
 
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
@@ -330,6 +329,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.rpc import execute_rpc_request
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -927,8 +927,12 @@ class Scheduler(
         ):
             self.idle_sleeper = IdleSleeper(
                 sockets=[
-                    self.ipc_channels.recv_from_tokenizer,
-                    self.ipc_channels.recv_from_rpc,
+                    socket
+                    for socket in (
+                        self.ipc_channels.recv_from_tokenizer,
+                        self.ipc_channels.recv_from_rpc,
+                    )
+                    if socket is not None
                 ],
                 can_empty_cache=lambda: not self.pause_state.paused,
             )
@@ -6379,26 +6383,7 @@ class Scheduler(
         self.weight_updater.save_sharded_model(kwargs)
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
-        # Handle RPC requests
-        logger.info(
-            f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
-        )
-
-        success = True
-        exec = None
-        try:
-            func = getattr(self, recv_req.method)
-            if recv_req.parameters is not None:
-                func(**recv_req.parameters)
-            else:
-                func()
-        except Exception as e:
-            success = False
-            exec = e
-            logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
-
-        barrier(group=self.tp_group.cpu_group)
-        return RpcReqOutput(success=success, message="" if not exec else str(exec))
+        return execute_rpc_request(self, recv_req, self.tp_group)
 
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput

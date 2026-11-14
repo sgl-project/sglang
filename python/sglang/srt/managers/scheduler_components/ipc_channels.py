@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import zmq
 
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import get_zmq_socket
 
@@ -45,8 +46,18 @@ class SchedulerIpcChannels:
                 recv_from_tokenizer = ScriptedTokenizerRecvProxy(
                     underlying=recv_from_tokenizer
                 )
-            recv_from_rpc = get_zmq_socket(
-                context, zmq.DEALER, port_args.rpc_ipc_name, False
+            parallel = get_parallel()
+            # The global control broadcast originates at TP rank 0. Connecting
+            # every attention-DP leader lets DEALER route RPCs to a leader whose
+            # control list is discarded, and produces multiple replies per call.
+            owns_rpc = not parallel.attn_dp_enabled or (
+                parallel.tp_rank == 0
+                and not parallel.enable_dp_attention_local_control_broadcast
+            )
+            recv_from_rpc = (
+                get_zmq_socket(context, zmq.DEALER, port_args.rpc_ipc_name, False)
+                if owns_rpc
+                else None
             )
 
             send_to_tokenizer_raw = get_zmq_socket(

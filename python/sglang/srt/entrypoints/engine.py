@@ -1955,6 +1955,16 @@ class Engine(EngineScoreMixin, EngineBase):
     """
 
     def collective_rpc(self, method: str, **kwargs):
+        parallel = get_parallel()
+        if (
+            parallel.attn_dp_enabled
+            and parallel.enable_dp_attention_local_control_broadcast
+        ):
+            raise ValueError(
+                "collective_rpc requires the global control broadcast with "
+                "DP-attention. Start the engine with "
+                "enable_dp_attention_local_control_broadcast=False."
+            )
         obj = RpcReqInput(method=method, parameters=kwargs)
         sock_send(self.send_to_rpc, obj)
         recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
