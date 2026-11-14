@@ -1819,6 +1819,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Sanitize NaN logits before sampling kernels and emit a throttled warning.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KDA target verify with <code>--linear-attn-verify-backend triton</code> and a chain draft (<code>--speculative-eagle-topk 1</code>): run the causal conv update and the gated delta rule recurrence in one fused Triton kernel. Tree drafts keep the unfused kernels. Deprecated alias: <code>SGLANG_OPT_FUSED_KDA_VERIFY</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
