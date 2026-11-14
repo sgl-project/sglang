@@ -82,7 +82,11 @@ class TestBasicSanityEagle3(
                 "--enable-metrics",
                 "--cuda-graph-backend-prefill=disabled",
             ],
-            env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
+            env={
+                "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
+                # The EAGLE3 draft derives a shorter context than the target.
+                "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+            },
         )
 
     @classmethod
