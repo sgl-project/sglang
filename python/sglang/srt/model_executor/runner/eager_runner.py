@@ -68,6 +68,28 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _cp_full_sequence_embeds(model: Any, forward_batch: ForwardBatch, input_embeds):
+    """Embed the whole extend layout when a CP hook returned no embeddings.
+
+    CP hands each rank a different slice of the request, so those ids are not a
+    partition whose embeddings may be combined with the other ranks':
+    ``VocabParallelEmbedding`` ends in a tensor-parallel all-reduce, which would
+    sum unrelated rows and corrupt every row the rank then computes on. Text
+    comes out as fluent garbage while images stay right, because their
+    embeddings are produced over the full sequence before the shard. Embedding
+    the full layout here and letting ``cp_shard_model_inputs`` shard the result
+    keeps that all-reduce over identical ids, matching the branch that has no
+    ``prepare_cp_inputs`` hook at all.
+    """
+    if input_embeds is not None:
+        return input_embeds
+    pp_group = getattr(model, "pp_group", None)
+    if pp_group is not None and not pp_group.is_first_rank:
+        # Only the first pipeline stage owns the embedding table.
+        return None
+    return model.get_input_embeddings()(forward_batch.input_ids)
+
+
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
@@ -349,6 +371,7 @@ class EagerRunner(BaseRunner):
             input_embeds, positions, model_kwargs = prepare_inputs(
                 forward_batch, **kwargs
             )
+            input_embeds = _cp_full_sequence_embeds(model, forward_batch, input_embeds)
         else:
             input_embeds = kwargs.get("input_embeds")
             if input_embeds is None:
