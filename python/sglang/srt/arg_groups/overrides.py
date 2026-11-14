@@ -1037,7 +1037,6 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 
 @register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
-
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
         logger.warning(
             "Overlap scheduler is disabled when using sparse head for embedding model."
@@ -1430,12 +1429,13 @@ def _hisparse_validation(view: Any) -> dict:
 
 @register_post_process
 def _cutedsl_prefill_backend_fill(view: Any) -> dict:
-    """Validate decode-only CuteDSL MLA and default its prefill backend to trtllm_mla."""
-    if not (
+    """Validate target/draft CuTeDSL MLA; fill only the target prefill default."""
+    target_cutedsl = (
         view.attention_backend == "cutedsl_mla"
         or view.decode_attention_backend == "cutedsl_mla"
         or view.prefill_attention_backend == "cutedsl_mla"
-    ):
+    )
+    if not target_cutedsl and view.speculative_draft_attention_backend != "cutedsl_mla":
         return {}
     assert view.prefill_attention_backend != "cutedsl_mla", (
         "CuteDSL MLA only supports decoding for now"
@@ -1453,7 +1453,7 @@ def _cutedsl_prefill_backend_fill(view: Any) -> dict:
         raise ValueError(
             "CuteDSL MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
         )
-    if view.prefill_attention_backend is None:
+    if target_cutedsl and view.prefill_attention_backend is None:
         return {"prefill_attention_backend": "trtllm_mla"}
     return {}
 
@@ -1850,7 +1850,6 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
-
     moe_a2a_backend = view.moe_a2a_backend
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(

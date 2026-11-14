@@ -3071,6 +3071,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 decode_attention_backend="cutedsl_mla",
                 prefill_attention_backend=None,
                 kv_cache_dtype="auto",
+                speculative_draft_attention_backend=None,
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
@@ -3102,6 +3103,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with override_platform(is_sm100=False):
             with self.assertRaises(ValueError):
                 _cutedsl_prefill_backend_fill(_view())
+
+        draft_only = _view(
+            decode_attention_backend=None,
+            speculative_draft_attention_backend="cutedsl_mla",
+        )
+        with override_platform(is_sm100=False):
+            with self.assertRaisesRegex(ValueError, "SM100"):
+                _cutedsl_prefill_backend_fill(draft_only)
+        with override_platform(is_sm100=True):
+            self.assertEqual(_cutedsl_prefill_backend_fill(draft_only), {})
+            with self.assertRaisesRegex(ValueError, "kv-cache-dtype"):
+                _cutedsl_prefill_backend_fill(
+                    _view(
+                        decode_attention_backend=None,
+                        speculative_draft_attention_backend="cutedsl_mla",
+                        kv_cache_dtype="fp8_e5m2",
+                    )
+                )
 
     def test_moss_vl_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.moss_vl import _moss_vl_overrides

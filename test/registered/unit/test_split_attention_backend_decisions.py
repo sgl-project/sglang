@@ -238,11 +238,6 @@ class TestDraftFactoryStamping(CustomTestCase):
         self.assertEqual(product.prefill_attention_backend_str, "trtllm_mha")
 
     def test_cutedsl_draft_extend_stamps_the_effective_kernel(self):
-        # cutedsl_mla only supports decode; the draft-extend map builds the
-        # trtllm-mla backend, and the *constructor* answers the effective
-        # name, so the stamp says what actually runs with no rename table --
-        # and the conv-sidecar wrapper that enters the ForwardContext must
-        # answer with the wrapped backend's stamp.
         from types import SimpleNamespace
         from unittest import mock
 
@@ -250,19 +245,34 @@ class TestDraftFactoryStamping(CustomTestCase):
 
         self._publish(attention_backend="triton")
         factory = self._factory(draft_backend="cutedsl_mla")
+        factory.draft_model_runner.use_mla_backend = True
         built = SimpleNamespace()
-        factory._create_trtllm_mla_prefill_backend = lambda: ("trtllm_mla", built)
+        constructor = mock.Mock(return_value=built)
         wrapper = SimpleNamespace()
-        with mock.patch.object(
-            attention_registry,
-            "attn_backend_wrapper_for_draft_extend",
-            lambda runner, backend: wrapper,
+        with (
+            mock.patch.dict(
+                "sys.modules",
+                {
+                    "sglang.srt.layers.attention.cutedsl_mla_backend": SimpleNamespace(
+                        CuteDslMLABackend=constructor
+                    )
+                },
+            ),
+            mock.patch.object(
+                attention_registry,
+                "attn_backend_wrapper_for_draft_extend",
+                return_value=wrapper,
+            ) as wrap,
         ):
             product = factory.create_draft_extend_backend()
+        constructor.assert_called_once_with(
+            factory.draft_model_runner, skip_prefill=False
+        )
+        wrap.assert_called_once_with(factory.draft_model_runner, built)
         self.assertIs(product, wrapper)
-        self.assertEqual(built.prefill_attention_backend_str, "trtllm_mla")
-        self.assertEqual(product.prefill_attention_backend_str, "trtllm_mla")
-        self.assertEqual(product.decode_attention_backend_str, "trtllm_mla")
+        self.assertEqual(built.prefill_attention_backend_str, "cutedsl_mla")
+        self.assertEqual(product.prefill_attention_backend_str, "cutedsl_mla")
+        self.assertEqual(product.decode_attention_backend_str, "cutedsl_mla")
 
     def test_a_host_dependent_alias_stamps_the_concrete_kernel(self):
         # A backend constructor that picks its kernel by host cannot be renamed
