@@ -1243,6 +1243,27 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
+    def test_quantized_fa_preserves_text_encoder_backend(self):
+        for components, roles in (
+            ({}, {}),
+            ({"text_encoder": "fa"}, {}),
+            ({}, {"text_encoder": {"self": "fa"}}),
+        ):
+            with (
+                self.subTest(components=components, roles=roles),
+                patch.object(current_platform, "is_npu", return_value=True),
+            ):
+                args = ServerArgs.__new__(ServerArgs)
+                args.pipeline_config = MiniMaxH3PipelineConfig()
+                args.ring_degree = 1
+                args.attention_backend = "fa"
+                args.attention_backend_config = {"precision": "fp8"}
+                args.component_attention_backends = dict(components)
+                args.component_attention_backend_roles = dict(roles)
+                args._adjust_attention_backend()
+                self.assertEqual(args.component_attention_backends, components)
+                self.assertEqual(args.component_attention_backend_roles, roles)
+
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"

@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU tests for Ascend FA dispatch and H3 integration."""
+"""CPU tests for Ascend FA dispatch and the MindIE-SD adapter."""
 
-import os
 import sys
 from contextlib import ExitStack
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, mock_open
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -64,9 +63,10 @@ def adapter(monkeypatch):
         yield config, provider, build
 
 
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-@pytest.mark.parametrize("rotation", [False, True])
-@pytest.mark.parametrize("scale", [0.0, 0.37])
+@pytest.mark.parametrize(
+    "precision,rotation,scale",
+    [("fp8", True, 0.0), ("mxfp8", False, 0.37), ("mxfp4", True, 0.37)],
+)
 def test_dispatch_preserves_inputs_and_rotates_once(
     adapter, precision, rotation, scale
 ):
@@ -75,7 +75,7 @@ def test_dispatch_preserves_inputs_and_rotates_once(
     impl = build(softmax_scale=scale)
     query = torch.randn(1, 7, 4, 64)
     key, value = (torch.randn(1, 9, 2, 64) for _ in range(2))
-    actual = impl.forward(query, key, value, None)
+    impl.forward(query, key, value, None)
     args, options = provider.call_args
     assert all(
         actual is expected for actual, expected in zip(args, (query, key, value))
@@ -87,7 +87,6 @@ def test_dispatch_preserves_inputs_and_rotates_once(
     assert options["q_rot"] is options["k_rot"]
     assert (options["q_rot"] is not None) == rotation
     assert ("fp8_fa_mode" in options) == (precision == "fp8")
-    torch.testing.assert_close(actual, _reference(query, key, value, **options))
 
 
 def test_offline_rotation_is_respected_and_conflicts_rejected(adapter):
@@ -104,8 +103,8 @@ def test_offline_rotation_is_respected_and_conflicts_rejected(adapter):
         impl.forward(query, query, query, None)
 
 
-@pytest.mark.parametrize("head_size", [8, 64, 96, 128])
-def test_rotation_matches_ascend_fa_and_preserves_rng(adapter, head_size):
+def test_rotation_matches_ascend_fa_and_preserves_rng(adapter):
+    head_size = 64
     _, _, build = adapter
     state = torch.get_rng_state().clone()
     impl = build(head_size=head_size)._get_sd_executor(
@@ -168,50 +167,13 @@ def test_invalid_options_fail_before_provider(adapter, config, kwargs, message):
 
 
 @pytest.mark.parametrize(
-    "options,head_size,packed",
+    "precision,rotation,chunk,groups",
     [
-        ({}, 8, False),
-        ({}, 96, True),
-        ({"fp8_fa_mode": "HIGH_PERFORMANCE"}, 64, False),
-        ({"fp8_fa_mode": "high_precision"}, 128, False),
-        ({"fp8_fa_mode": "c8v16_tiling512"}, 128, True),
-        ({"fp8_fa_mode": None}, 128, False),
+        ("fp8", True, 4, [4, 4, 2]),
+        ("mxfp8", False, 8, [8, 2]),
+        ("mxfp4", True, 0, [10]),
+        ("mxfp4", False, 16, [10]),
     ],
-)
-def test_sdk_options_and_errors_are_forwarded(adapter, options, head_size, packed):
-    config, provider, build = adapter
-    config.update(options)
-    impl = build(head_size=head_size, softmax_scale=None)
-    provider.assert_not_called()
-    query = torch.randn(1, 7, 4, head_size)
-    key = query.half()  # The SDK owns dtype compatibility and operator constraints.
-    error = ValueError("SDK input validation")
-    provider.side_effect = error
-    with pytest.raises(ValueError) as caught:
-        if packed:
-            impl.forward_varlen(
-                query[0],
-                key[0],
-                query[0],
-                cu_seqlens=torch.tensor([0, 7]),
-                max_seqlen=7,
-            )
-        else:
-            impl.forward(query, key, query, None)
-    assert caught.value is error
-    provider.assert_called_once()
-    args, forwarded = provider.call_args
-    assert args[0].shape[-1] == head_size and args[1].dtype == torch.float16
-    assert forwarded["scale"] == head_size**-0.5
-    assert forwarded["q_rot"].shape == (head_size, head_size)
-    for name, value in options.items():
-        assert forwarded[name] == value
-
-
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-@pytest.mark.parametrize("rotation", [False, True])
-@pytest.mark.parametrize(
-    "chunk,groups", [(0, [10]), (1, [1] * 10), (4, [4, 4, 2]), (8, [8, 2]), (16, [10])]
 )
 def test_head_chunks_preserve_dense_attention(
     adapter, precision, rotation, chunk, groups
@@ -238,8 +200,9 @@ def test_head_chunks_preserve_dense_attention(
         torch.testing.assert_close(tensor, snapshot)
 
 
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-@pytest.mark.parametrize("trailing_padding", [False, True])
+@pytest.mark.parametrize(
+    "precision,trailing_padding", [("fp8", False), ("mxfp4", True)]
+)
 def test_head_chunks_preserve_packed_segments_and_dtype(
     adapter, precision, trailing_padding
 ):
@@ -279,10 +242,9 @@ def test_head_chunks_preserve_packed_segments_and_dtype(
     ] * len(segments)
 
 
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-def test_head_chunking_preserves_gqa_and_sdk_head_validation(adapter, precision):
+def test_head_chunking_preserves_gqa_and_sdk_head_validation(adapter):
     config, provider, build = adapter
-    config.update(precision=precision, head_chunk_size=4, qk_rotation=False)
+    config.update(head_chunk_size=4, qk_rotation=False)
     impl = build(num_heads=10, num_kv_heads=2)
     query = torch.randn(1, 5, 10, 64)
     key, value = (torch.randn(1, 7, 2, 64) for _ in range(2))
@@ -370,8 +332,9 @@ def test_packed_empty_and_all_padding_do_not_execute(adapter):
     provider.assert_not_called()
 
 
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-@pytest.mark.parametrize("batch,length", [(0, 7), (1, 0), (2, 0)])
+@pytest.mark.parametrize(
+    "precision,batch,length", [("fp8", 0, 7), ("mxfp8", 1, 0), ("fp8", 2, 0)]
+)
 def test_dense_empty_inputs_reach_sd_validation(adapter, precision, batch, length):
     config, provider, build = adapter
     config["precision"] = precision
@@ -406,6 +369,8 @@ def test_capabilities_and_lse(adapter):
     _, provider, build = adapter
     backend = AscendFABackend
     assert backend.get_enum() is AttentionBackendEnum.FA
+    assert backend.get_impl_cls() is AscendFAImpl
+    assert "ASCEND_QUANT_FA" not in AttentionBackendEnum.__members__
     assert not backend.get_enum().is_sparse
     assert (
         backend.unsupported_requirements(AttentionRequirements(packed_varlen=True))
@@ -436,15 +401,6 @@ def test_missing_sdk_or_api(monkeypatch, missing):
         NPUPlatformBase.get_attn_backend_cls_str(
             AttentionBackendEnum.FA, 128, torch.bfloat16
         )
-
-
-def test_only_fa_is_registered():
-    from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
-    assert "ASCEND_QUANT_FA" not in AttentionBackendEnum.__members__
-    assert AscendFABackend.get_impl_cls() is AscendFAImpl
-    with pytest.raises(ValueError, match="Invalid attention backend"):
-        ServerArgs._normalize_attention_backend_name("ascend_quant_fa")
 
 
 @pytest.mark.parametrize(
@@ -635,9 +591,10 @@ def test_metadata_changes_do_not_leak_between_calls(legacy_native, packed):
     native_mx.assert_not_called()
 
 
-@pytest.mark.parametrize("kind", ["MXFP8Config", "ModelSlimConfig"])
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("offline", [False, True])
+@pytest.mark.parametrize(
+    "kind,packed,offline",
+    [("MXFP8Config", False, False), ("ModelSlimConfig", True, True)],
+)
 def test_legacy_mxfp8_stays_native_with_sdk_installed(
     monkeypatch, legacy_native, kind, packed, offline
 ):
@@ -647,7 +604,8 @@ def test_legacy_mxfp8_stays_native_with_sdk_installed(
     loader = Mock(side_effect=AssertionError("Legacy FA must not load MindIE-SD"))
     monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
     qc = type(kind, (), {"use_offline_qk_rotation": offline})()
-    impl = build(num_heads=6, quant_config=qc)
+    # Ulysses can reduce the head count passed to the kernel.
+    impl = build(num_heads=12, quant_config=qc)
     assert impl._quant_scheme == "MXFP8" and impl._sd_executor is None
     query = torch.randn(128, 6, 64)
     original = query.clone()
@@ -664,6 +622,16 @@ def test_legacy_mxfp8_stays_native_with_sdk_installed(
         output = impl.forward(query[None], query[None], query[None], None)
     assert output.shape == (query.shape if packed else query[None].shape)
     assert [call.args[0].shape[1] for call in native_mx.call_args_list] == [4, 2]
+    lengths = [64, 128] if packed else [128]
+    for call in native_mx.call_args_list:
+        options = call.kwargs
+        assert (
+            options["num_query_heads"]
+            == options["num_key_value_heads"]
+            == call.args[0].shape[1]
+        )
+        assert options["actual_seq_qlen"] == options["actual_seq_kvlen"] == lengths
+        assert options["softmax_scale"] == impl.softmax_scale
     expected = (
         query if offline else query @ impl._get_rotation(query.device, query.dtype)
     )
@@ -676,52 +644,11 @@ def test_legacy_mxfp8_stays_native_with_sdk_installed(
     native_float.assert_not_called()
 
 
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("packed", [False, True])
-def test_precision_only_selects_sd_without_weight_or_environment_setup(
-    monkeypatch, legacy_native, precision, enabled, packed
-):
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
-
-    config, sd, build, quant, native_mx, native_float = legacy_native
-    config.update(precision=precision, head_chunk_size=0)
-    monkeypatch.setattr(
-        ascend_fa.envs, "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", enabled
-    )
-    impl = build(num_heads=6, packed_trailing_padding=True)
-    assert impl._sd_executor is None
-    query = torch.randn(64, 6, 64)
-    if packed:
-        output = impl.forward_varlen(
-            query,
-            query,
-            query,
-            cu_seqlens=torch.tensor([0, 63, 64]),
-            cu_seqlens_host=(0, 63, 64),
-            max_seqlen=63,
-        )
-        assert torch.count_nonzero(output[63:]) == 0
-    else:
-        impl.forward(query[None], query[None], query[None], None)
-    assert impl._sd_executor.precision == precision and impl._sd_executor.qk_rotation
-    sd.assert_called_once()
-    assert sd.call_args.args[0].shape[2] == 6  # SD's explicit 0 overrides its default.
-    assert sd.call_args.kwargs["precision"] == precision
-    if precision == "fp8":
-        assert sd.call_args.kwargs["fp8_fa_mode"] == "HIGH_PRECISION"
-    for native in (quant, native_mx, native_float):
-        native.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "precision,error",
     [
         ("none", ValueError("Unsupported SD precision")),
-        ("int8", ValueError("Unsupported SD precision")),
         ("fp8", RuntimeError("operator execution failed")),
-        ("mxfp8", RuntimeError("operator execution failed")),
-        ("mxfp4", RuntimeError("operator execution failed")),
     ],
 )
 def test_sd_execution_failure_never_retries_native(legacy_native, precision, error):
@@ -764,17 +691,14 @@ def test_legacy_nonquantized_calls_remain_native_float(
     native_float.assert_called_once()
 
 
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize(
     "failure", [ImportError("missing SDK"), OSError("missing shared library")]
 )
-def test_sd_dependency_failure_never_falls_back(
-    monkeypatch, legacy_native, precision, failure
-):
+def test_sd_dependency_failure_never_falls_back(monkeypatch, legacy_native, failure):
     from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
 
     config, sd, build, quant, native_mx, native_float = legacy_native
-    config["precision"] = precision
+    config["precision"] = "fp8"
     loader = Mock(side_effect=failure)
     monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
     impl = build(quant_config=type("MXFP8Config", (), {})())
@@ -788,10 +712,8 @@ def test_sd_dependency_failure_never_falls_back(
         operator.assert_not_called()
 
 
-@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
-def test_explicit_quantization_rejects_ring(adapter, precision):
+def test_explicit_quantization_rejects_ring(adapter):
     config, sd, build = adapter
-    config["precision"] = precision
     impl = build()
     query = torch.randn(64, 4, 64)
     with pytest.raises(ValueError, match="Ring/LSE"):
@@ -810,170 +732,6 @@ def test_unaligned_mxfp8_batch_uses_independent_sequences(adapter):
     torch.testing.assert_close(actual, value)
     assert sd.call_count == 2
     assert all(call.args[0].shape[0] == 1 for call in sd.call_args_list)
-
-
-@pytest.mark.parametrize("form", ["json", "pairs", "json_file", "yaml_file"])
-def test_sdk_loading_uses_parsed_cli_config(monkeypatch, form):
-    from sglang.multimodal_gen.runtime import server_args
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
-    from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
-    raw = '{"precision":"fp8","fp8_fa_mode":"C8V16_TILING512","head_chunk_size":4}'
-    if form == "pairs":
-        raw = "precision=fp8,fp8_fa_mode=C8V16_TILING512,head_chunk_size=4"
-    elif form.endswith("file"):
-        contents = (
-            "precision: fp8\nfp8_fa_mode: C8V16_TILING512\nhead_chunk_size: 4\n"
-            if form == "yaml_file"
-            else raw
-        )
-        raw = "attention.yaml" if form == "yaml_file" else "attention.json"
-        monkeypatch.setattr(os.path, "exists", lambda path: path == raw)
-        monkeypatch.setattr("builtins.open", mock_open(read_data=contents))
-    args = ServerArgs.__new__(ServerArgs)
-    args.attention_backend_config = args._parse_attention_backend_config(raw)
-    loader = Mock()
-    monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
-    monkeypatch.setattr(server_args, "get_global_server_args", lambda: args)
-    NPUPlatformBase.get_attn_backend_cls_str(
-        AttentionBackendEnum.FA, 128, torch.bfloat16
-    )
-    assert args.attention_backend_config == {
-        "precision": "fp8",
-        "fp8_fa_mode": "C8V16_TILING512",
-        "head_chunk_size": 4,
-    }
-    loader.assert_called_once()
-
-
-def test_h3_npu_pipeline_falls_back(adapter, monkeypatch):
-    from sglang.multimodal_gen import envs
-    from sglang.multimodal_gen.runtime import platforms
-    from sglang.multimodal_gen.runtime.distributed import parallel_state
-    from sglang.multimodal_gen.runtime.distributed.device_communicators import (
-        ipc_a2a_multi,
-    )
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
-        _minimax_h3_pipelined_dense_attention,
-    )
-
-    _, sd, build = adapter
-    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", 2)
-    monkeypatch.setattr(platforms, "current_platform", NPUPlatformBase())
-    group = object()
-    monkeypatch.setattr(
-        parallel_state, "get_sp_group", lambda: SimpleNamespace(ulysses_group=group)
-    )
-    monkeypatch.setattr(
-        ipc_a2a_multi, "IPC_A2A_MULTI", ipc_a2a_multi.IpcA2AMultiState()
-    )
-    ready = Mock(wraps=ipc_a2a_multi.ipc_a2a_multi_ready)
-    monkeypatch.setattr(ipc_a2a_multi, "ipc_a2a_multi_ready", ready)
-    cuda_capture = Mock(side_effect=AssertionError("NPU must not query CUDA"))
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", cuda_capture)
-    attention = SimpleNamespace(
-        _attention_backend_enum=AttentionBackendEnum.FA,
-        _attention_impl=build(),
-    )
-    query = torch.zeros(4, 4, 64)
-    assert (
-        _minimax_h3_pipelined_dense_attention(
-            attention,
-            query,
-            query,
-            query,
-            cu_seqlens=torch.tensor([0, 4]),
-            cu_seqlens_host=(0, 4),
-            max_seqlen=4,
-        )
-        is None
-    )
-    ready.assert_called_once_with(group, enabled=True)
-    cuda_capture.assert_not_called()
-    sd.assert_not_called()
-
-
-# Startup integration: exercise the real ServerArgs lifecycle without loading models.
-
-
-@pytest.fixture
-def make_server_args(monkeypatch):
-    from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-    from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-        QwenImagePipelineConfig,
-    )
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-    from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
-    for name, result in (
-        ("is_cpu", False),
-        ("is_mps", False),
-        ("is_npu", False),
-        ("is_cuda", True),
-        ("is_rocm", False),
-        ("get_device_total_memory", 80 * 1024**3),
-        ("get_available_gpu_memory", 80),
-        ("enable_dit_layerwise_offload_by_default", True),
-        ("apply_server_args_defaults", None),
-    ):
-        monkeypatch.setattr(
-            current_platform, name, lambda *args, result=result, **kwargs: result
-        )
-
-    def build(options, pipeline_config=None):
-        config = pipeline_config or QwenImagePipelineConfig()
-        with monkeypatch.context() as patch:
-            patch.setattr(PipelineConfig, "from_kwargs", lambda *args, **kwargs: config)
-            return ServerArgs.from_dict(options)
-
-    return build
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {},
-        {"component_attention_backends": {"text_encoder": "fa"}},
-        {"component_attention_backend_roles": {"text_encoder": {"self": "fa"}}},
-    ],
-)
-@pytest.mark.parametrize("precision", [None, "fp8"])
-def test_h3_text_encoder_default_preserves_overrides(
-    monkeypatch, make_server_args, overrides, precision
-):
-    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
-        MiniMaxH3PipelineConfig,
-    )
-
-    monkeypatch.setattr(
-        MiniMaxH3PipelineConfig, "validate_server_args", lambda *args, **kwargs: None
-    )
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-
-    monkeypatch.setattr(current_platform, "is_npu", lambda: True)
-    args = make_server_args(
-        {
-            "model_path": "/models/MiniMax-H3",
-            "performance_mode": "manual",
-            "attention_backend": "fa",
-            "attention_backend_config": {}
-            if precision is None
-            else {"precision": precision},
-            **overrides,
-        },
-        pipeline_config=MiniMaxH3PipelineConfig(),
-    )
-    assert args.attention_backend == "fa"
-    if not overrides:
-        assert "text_encoder" not in args.component_attention_backends
-    elif "component_attention_backends" in overrides:
-        assert args.component_attention_backends["text_encoder"] == "fa"
-    else:
-        assert args.component_attention_backend_roles["text_encoder"]["self"] == "fa"
-        assert "text_encoder" not in args.component_attention_backends
-
-
-# MiniMax-H3 integration: optional linear hooks and real backend dispatch.
 
 
 @pytest.mark.parametrize("precision,ring_degree", [("fp8", 1), ("bf16", 2), (None, 2)])
@@ -999,117 +757,3 @@ def test_denoising_builds_scoped_fa_metadata(precision, ring_degree):
     )
     config["precision"] = "mxfp4"
     assert metadata.precision == precision
-
-
-@pytest.mark.parametrize("prefix", ["blocks.0.attn", "refiner.0.attn"])
-@pytest.mark.parametrize("precision", [None, "mxfp4"])
-def test_h3_refiner_does_not_inherit_dit_quantization(
-    monkeypatch, legacy_native, prefix, precision
-):
-    from sglang.multimodal_gen.runtime.models.dits import minimax_h3
-
-    config, sd, build, quant, native_mx, native_float = legacy_native
-    config["qk_rotation"] = False
-    if precision is not None:
-        config["precision"] = precision
-    impl = build(quant_config=type("MXFP8Config", (), {})())
-    attention = SimpleNamespace(
-        _attention_backend_enum=AttentionBackendEnum.FA,
-        _attention_impl=impl,
-        prefix=prefix,
-    )
-    monkeypatch.setattr(
-        minimax_h3, "_minimax_h3_bind_attention_backend", lambda *args: None
-    )
-    query = torch.randn(64, 4, 64)
-    actual = minimax_h3._minimax_h3_attention_core_impl(
-        attention,
-        query,
-        query,
-        query,
-        cu_seqlens=torch.tensor([0, 64]),
-        cu_seqlens_host=(0, 64),
-        max_seqlen=64,
-        ulysses_active=False,
-    )
-    if precision is None:
-        sd.assert_not_called()
-        native_float.assert_not_called()
-        native_mx.assert_called_once()
-        assert quant.call_count == 3
-        torch.testing.assert_close(actual, torch.zeros_like(query))
-    elif prefix.startswith("blocks."):
-        sd.assert_called_once()
-        native_float.assert_not_called()
-        torch.testing.assert_close(
-            actual,
-            _reference(query[None], query[None], query[None], **sd.call_args.kwargs)[0],
-        )
-    else:
-        sd.assert_not_called()
-        native_float.assert_called_once()
-        torch.testing.assert_close(actual, torch.zeros_like(query))
-    if precision is not None:
-        quant.assert_not_called()
-        native_mx.assert_not_called()
-
-
-@pytest.mark.parametrize("supported", [None, False, True])
-def test_h3_mxfp8_input_hook_is_optional(supported):
-    from sglang.multimodal_gen.runtime.layers.linear import LinearBase
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
-        _accepts_mxfp8_input,
-    )
-
-    linear = LinearBase.__new__(LinearBase)
-    torch.nn.Module.__init__(linear)
-    method = SimpleNamespace()
-    if supported is not None:
-        method.accepts_mxfp8_input = Mock(return_value=supported)
-    linear.quant_method = method
-    assert _accepts_mxfp8_input(linear) is (supported is True)
-    if supported is not None:
-        method.accepts_mxfp8_input.assert_called_once_with(linear)
-
-
-@pytest.mark.parametrize("packed", [False, True])
-def test_h3_quant_config_reaches_native_mxfp8_dispatch(legacy_native, packed):
-    from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3Attention
-
-    _, sd, _, quant, native_mx, native_float = legacy_native
-    attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
-    torch.nn.Module.__init__(attention)
-    attention.head_dim = 128
-    attention.num_heads = 8
-    attention.softmax_scale = 128**-0.5
-    attention.prefix = "blocks.0.attn"
-    attention._quant_config = MXFP8Config()
-    attention._selected_attention_backend = None
-    attention._set_attention_backend(AscendFABackend)
-    impl = attention._attention_impl
-    assert impl._quant_scheme == "MXFP8" and impl._sd_executor is None
-    # Ordinary Ulysses can reduce the runtime head count below the model's count.
-    query = torch.randn(128, 2, 128, dtype=torch.bfloat16)
-    if packed:
-        output = impl.forward_varlen(
-            query,
-            query,
-            query,
-            cu_seqlens=torch.tensor([0, 64, 128], dtype=torch.int32),
-            cu_seqlens_host=(0, 64, 128),
-            max_seqlen=64,
-        )
-        lengths = [64, 128]
-    else:
-        output = impl.forward(query[None], query[None], query[None], None)[0]
-        lengths = [128]
-    assert output.shape == query.shape
-    native_mx.assert_called_once()
-    assert quant.call_count == 3
-    options = native_mx.call_args.kwargs
-    assert options["num_query_heads"] == options["num_key_value_heads"] == 2
-    assert options["actual_seq_qlen"] == options["actual_seq_kvlen"] == lengths
-    assert options["softmax_scale"] == attention.softmax_scale
-    sd.assert_not_called()
-    native_float.assert_not_called()

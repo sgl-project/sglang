@@ -505,7 +505,7 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
     attention.softmax_scale = 128**-0.5
     attention.prefix = "test.attn"
     attention._cube_sparse_capable = False
-    attention._quant_config = None
+    attention._quant_config = object()
 
     with patch(
         "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
@@ -514,11 +514,114 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
         attention._set_attention_backend(cube)
 
     assert attention._attention_backend_enum is AttentionBackendEnum.FA
+    assert attention._attention_impl.kwargs["quant_config"] is attention._quant_config
     resolve.assert_called_once_with(
         128,
         torch.bfloat16,
         selected_attention_backend=AttentionBackendEnum.FA,
     )
+
+
+@pytest.mark.parametrize(
+    "prefix,precision,expected",
+    [
+        ("blocks.0.attn", "mxfp4", None),
+        ("token_refiner.blocks.0.attn", "mxfp4", "bf16"),
+        ("token_refiner.blocks.0.attn", None, None),
+    ],
+)
+def test_ascend_fa_scopes_quantization_to_dit_blocks(prefix, precision, expected):
+    from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+        AscendFAMetadata,
+    )
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3
+
+    impl = Mock()
+    attention = SimpleNamespace(
+        prefix=prefix,
+        _attention_backend_enum=AttentionBackendEnum.FA,
+        _attention_impl=impl,
+    )
+    q = torch.zeros(2, 1, 8)
+    with (
+        patch.object(minimax_h3.current_platform, "is_npu", return_value=True),
+        set_forward_context(0, AscendFAMetadata(precision=precision)),
+    ):
+        minimax_h3._minimax_h3_attention_core_impl(
+            attention,
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 2]),
+            cu_seqlens_host=(0, 2),
+            max_seqlen=2,
+            ulysses_active=False,
+        )
+    override = impl.forward_varlen.call_args.kwargs.get("attn_metadata")
+    assert override == (AscendFAMetadata(precision=expected) if expected else None)
+
+
+def test_npu_falls_back_from_pipelined_attention(monkeypatch):
+    from sglang.multimodal_gen import envs
+    from sglang.multimodal_gen.runtime import platforms
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
+    from sglang.multimodal_gen.runtime.distributed.device_communicators import (
+        ipc_a2a_multi,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        _minimax_h3_pipelined_dense_attention,
+    )
+    from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformBase
+
+    monkeypatch.setattr(envs, "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", 2)
+    monkeypatch.setattr(platforms, "current_platform", NPUPlatformBase())
+    monkeypatch.setattr(
+        parallel_state, "get_sp_group", lambda: SimpleNamespace(ulysses_group=object())
+    )
+    monkeypatch.setattr(
+        ipc_a2a_multi, "IPC_A2A_MULTI", ipc_a2a_multi.IpcA2AMultiState()
+    )
+    attention = SimpleNamespace(
+        _attention_backend_enum=AttentionBackendEnum.FA,
+        _attention_impl=SimpleNamespace(),
+    )
+    q = torch.zeros(2, 1, 8)
+    with patch.object(
+        torch.cuda,
+        "is_current_stream_capturing",
+        side_effect=AssertionError("NPU queried CUDA"),
+    ):
+        assert (
+            _minimax_h3_pipelined_dense_attention(
+                attention,
+                q,
+                q,
+                q,
+                cu_seqlens=torch.tensor([0, 2]),
+                cu_seqlens_host=(0, 2),
+                max_seqlen=2,
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize("supported", [None, False, True])
+def test_optional_mxfp8_linear_input_hook(supported):
+    from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        _accepts_mxfp8_input,
+    )
+
+    linear = Mock(spec=LinearBase)
+    linear.quant_method = SimpleNamespace()
+    if supported is not None:
+        linear.quant_method.accepts_mxfp8_input = Mock(return_value=supported)
+    assert _accepts_mxfp8_input(linear) is (supported is True)
+    if supported is not None:
+        linear.quant_method.accepts_mxfp8_input.assert_called_once_with(linear)
 
 
 def test_meta_model_captures_component_attention_override():
