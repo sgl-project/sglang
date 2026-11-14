@@ -547,28 +547,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 for _ in range(self.num_wrappers)
             ]
 
-        fmha_backend = "auto"
-        if get_platform().is_sm100:
-            fmha_backend = "fa2"
-            # Disable CUTLASS backend when piecewise cuda graph is enabled
-            # due to TMA descriptor initialization issues on SM100 GPUs. The
-            # current FlashInfer SM100 CUTLASS FMHA dispatch only instantiates
-            # 64x64, 128x128, and 192x128 head dimensions. Keep unsupported
-            # shapes (for example Qwen3.5's 256x256) on the FA2 fallback.
-            cutlass_supported_head_dims = {
-                (64, 64),
-                (128, 128),
-                (192, 128),
-            }
-            head_dims = (
-                model_runner.model_config.head_dim,
-                model_runner.model_config.v_head_dim,
-            )
-            if (
-                head_dims in cutlass_supported_head_dims
-                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-            ):
-                fmha_backend = "cutlass"
+        fmha_backend = self._select_ragged_fmha_backend(model_runner)
 
         # Sliding/full or decoder/cross-attention layers use separate plans.
         self.prefill_wrappers_ragged = []
@@ -634,6 +613,36 @@ class FlashInferAttnBackend(AttentionBackend):
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
+
+    def _select_ragged_fmha_backend(self, model_runner: ModelRunner) -> str:
+        """Select the FlashInfer ragged prefill backend for the active platform."""
+        if not get_platform().is_sm100:
+            return "auto"
+        # Disable CUTLASS backend when piecewise cuda graph is enabled due to
+        # TMA descriptor initialization issues on SM100 GPUs, or for dLLM with
+        # FULL decode CUDA graph where non-causal masks during replay crash.
+        # The current FlashInfer SM100 CUTLASS FMHA dispatch only instantiates
+        # 64x64, 128x128, and 192x128 head dimensions. Keep unsupported shapes
+        # (for example Qwen3.5's 256x256) on the FA2 fallback.
+        cutlass_supported_head_dims = {
+            (64, 64),
+            (128, 128),
+            (192, 128),
+        }
+        head_dims = (
+            model_runner.model_config.head_dim,
+            model_runner.model_config.v_head_dim,
+        )
+        if (
+            head_dims in cutlass_supported_head_dims
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+            and not (
+                self.is_dllm_model
+                and check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+            )
+        ):
+            return "cutlass"
+        return "fa2"
 
     def prefill_cp_unsupported_reason(self) -> Optional[str]:
         """Why zigzag prefill CP cannot run on this backend, or None if it can.

@@ -205,5 +205,47 @@ class TestTRTLLMMLAGraphMetadata(unittest.TestCase):
         )
 
 
+class TestFlashInferSM100RaggedBackendSelection(unittest.TestCase):
+    def test_sm100_dllm_full_cuda_graph_disables_cutlass_ragged_backend(self):
+        from sglang.srt.layers.attention import flashinfer_backend as fi
+        from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+
+        backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+        model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(head_dim=128, v_head_dim=128)
+        )
+        platform = SimpleNamespace(is_sm100=True)
+
+        with patch.object(fi, "get_platform", return_value=platform):
+            backend.is_dllm_model = True
+            with patch.object(
+                fi,
+                "check_cuda_graph_backend",
+                side_effect=lambda phase, cg_backend: (
+                    phase == Phase.DECODE and cg_backend == Backend.FULL
+                ),
+            ):
+                self.assertEqual(
+                    backend._select_ragged_fmha_backend(model_runner), "fa2"
+                )
+
+            with patch.object(fi, "check_cuda_graph_backend", return_value=False):
+                self.assertEqual(
+                    backend._select_ragged_fmha_backend(model_runner), "cutlass"
+                )
+
+            backend.is_dllm_model = False
+            with patch.object(
+                fi,
+                "check_cuda_graph_backend",
+                side_effect=lambda phase, cg_backend: (
+                    phase == Phase.DECODE and cg_backend == Backend.FULL
+                ),
+            ):
+                self.assertEqual(
+                    backend._select_ragged_fmha_backend(model_runner), "cutlass"
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
