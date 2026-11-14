@@ -32,16 +32,28 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     MooncakeBaseStore,
     MooncakeStore,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_context,
+    get_memory,
+    get_parallel,
+    get_server_args,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -99,6 +111,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
     def _scheduler(store=None, *, hierarchical=True):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_hierarchical_cache = hierarchical
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.page_size = 64
         scheduler.max_total_num_tokens = 8192
         scheduler.max_req_input_len = 4096
@@ -251,6 +264,77 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         self.assertEqual(
             scheduler.get_init_info()["hicache_object_layout"], reply.layout
         )
+
+    def test_direct_linker_describes_its_own_store(self):
+        """The direct external linker has no HiCache controller or host KV buffer:
+        its own MooncakeStore is described, with KV among the registered pools,
+        and a pool indexed from SWA keeps the trailing-page policy it is read with."""
+        sources = {
+            PoolName.KV: PoolName.KV,
+            PoolName.SWA: PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4_STATE: PoolName.SWA,
+        }
+        entries = [
+            DevicePoolEntry(
+                name=name,
+                indices_from_pool=source,
+                device_pool=None,
+                components=[[torch.zeros(4, 8)]],
+                layer_mapping={0: 0},
+                page_size=64,
+                rows_are_pages=True,
+            )
+            for name, source in sources.items()
+        ]
+        store = self._store()
+        store.mem_pool_host = DevicePoolGroup(entries, num_layers=1, page_size=64)
+        store.registered_pools = {entry.name: entry for entry in entries}
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.storage = store
+        scheduler = self._scheduler(hierarchical=False)
+        scheduler.enable_unified_cache_external_linker = True
+        scheduler.tree_cache.linker = SimpleNamespace(cache_linker=linker)
+        scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
+            full_window_pages=2, pool_name=PoolName.SWA
+        )
+        scheduler.tree_cache._window_slots = (ComponentType.SWA,)
+
+        reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
+        self.assertTrue(reply.layout["enabled"])
+        pools = reply.layout["hicache_object_layout"]["pools"]
+        self.assertEqual(
+            [p["pool"] for p in pools], ["kv", "swa", "deepseek_v4_c4_state"]
+        )
+        self.assertEqual(
+            [p["suffixes"] for p in pools],
+            [["__k"], ["__swa"], ["__deepseek_v4_c4_state"]],
+        )
+        self.assertEqual(
+            [p["hit_policy"] for p in pools],
+            ["all_pages", "trailing_pages", "trailing_pages"],
+        )
+        self.assertEqual([p.get("trailing_pages") for p in pools], [None, 2, 2])
+        self.assertEqual(
+            scheduler.get_init_info()["hicache_object_layout"], reply.layout
+        )
+
+        with get_parallel().override(tp_size=2, attn_cp_size=2, moe_tp_size=2):
+            reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
+        self.assertFalse(reply.layout["enabled"])
+        self.assertIn("context parallelism", reply.layout["reason"])
+
+        backend = get_memory().unified_cache_external_linker_backend
+        scheduler.tree_cache.linker = SimpleNamespace(cache_linker=object())
+        reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
+        self.assertFalse(reply.layout["enabled"])
+        self.assertEqual(reply.layout["backend"], backend)
+        self.assertIn("not Mooncake", reply.layout["reason"])
+
+        scheduler.tree_cache.linker = None
+        reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
+        self.assertFalse(reply.layout["enabled"])
+        self.assertEqual(reply.layout["backend"], backend)
+        self.assertIn("not attached", reply.layout["reason"])
 
     def test_sidecar_window_uses_its_source_and_preserves_its_policy(self):
         store = self._store(

@@ -9,7 +9,7 @@ use axum::Router;
 
 use super::generate_hook::GenerateHook;
 use super::{
-    auth, dp_relay, hicache, info, loads, metrics, native_api, openai, pre_generate,
+    auth, connections, dp_relay, hicache, info, loads, metrics, native_api, openai, pre_generate,
     request_decompression,
 };
 use crate::HttpLayer;
@@ -49,13 +49,16 @@ pub(super) struct AppState {
 /// Once warm (or with the warmup skipped, or past the PD exception), the
 /// scheduler ranks freeze their garbage collectors, as after Python's
 /// post-warmup `/freeze_gc`: the objects startup allocated then stay out of
-/// every later full collection.
+/// every later full collection. Python runs `--warmups` before its startup
+/// warmup, so this waits for them first (see
+/// [`CoreHandle::custom_warmups_finished`]); its timeout starts after them.
 async fn startup_warmup(
     core: CoreHandle,
     server_args: Arc<ServerArgs>,
     timeout: Duration,
     startup_failure: flume::Sender<String>,
 ) {
+    core.custom_warmups_finished().await;
     if !core.is_ready() {
         let error = match tokio::time::timeout(
             timeout,
@@ -229,26 +232,24 @@ pub async fn serve(
             return;
         }
     };
-    // `with_connect_info` exposes the peer address to the access-log middleware.
+    if let Some(http2) = &server_args.http2 {
+        tracing::info!(
+            max_concurrent_streams = http2.max_concurrent_streams,
+            initial_connection_window_size = http2.initial_connection_window_size,
+            "HTTP/2 (h2c) enabled on the HTTP listener, beside HTTP/1.1"
+        );
+    }
     // Once a drain ends, stop accepting, let the requests still on open
     // connections finish (the last bytes of the drained responses, or one
     // that raced the close), close idle keep-alive connections, and return.
     let graceful = drain.clone();
-    let serve = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    let serve = connections::serve(listener, app, server_args.http2.as_ref(), async move {
         if graceful.drain_ended().await == DrainEnd::Drained {
             tracing::info!("drain: no request left in flight; closing the HTTP listener");
         }
     });
     tokio::select! {
-        r = serve => {
-            if let Err(e) = r {
-                tracing::error!(error = %e, "axum serve exited");
-            }
-        }
+        () = serve => {}
         // Dropping `serve` closes the listener without waiting; the requests
         // still in flight end with the api runtime.
         () = drain.drain_close_deadline() => {
@@ -310,6 +311,7 @@ mod tests {
                 request_log: None,
                 peer_endpoints: Vec::new(),
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let (failure_tx, failure_rx) = flume::bounded(1);
@@ -363,6 +365,7 @@ mod tests {
                     request_log: None,
                     peer_endpoints: Vec::new(),
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             let (failure_tx, failure_rx) = flume::bounded(1);
@@ -425,5 +428,60 @@ mod tests {
             assert!(intake_rx.is_empty(), "{case}: froze GC more than once");
             assert!(failure_rx.is_empty(), "{case}: reported a failure");
         }
+    }
+
+    /// The startup warmup waits for Python's `--warmups`, as Python runs them
+    /// first: no warmup generation and no GC freeze while they run.
+    #[tokio::test]
+    async fn startup_warmup_runs_after_custom_warmups() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: false,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                metadata: CoreMetadata::default(),
+                metrics: None,
+                request_log: None,
+                peer_endpoints: Vec::new(),
+                generate_validator: None,
+                abort_hook: None,
+            },
+        );
+        core.hold_for_custom_warmups();
+        let (failure_tx, failure_rx) = flume::bounded(1);
+        let warmup = tokio::spawn(startup_warmup(
+            core.clone(),
+            Arc::new(ServerArgs::default()),
+            Duration::from_secs(60),
+            failure_tx,
+        ));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(intake_rx.is_empty(), "warmed up during the custom warmups");
+        assert!(!core.is_ready());
+
+        core.finish_custom_warmups();
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("the warmup generation must come first");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Done(ChunkEvent::default()))
+            .unwrap();
+        let TmEvent::OneWay { queued, .. } = intake_rx.recv_async().await.unwrap() else {
+            panic!("expected the FreezeGCReq");
+        };
+        queued.send(Ok(())).unwrap();
+        warmup.await.unwrap();
+        assert!(core.is_serving());
+        assert!(failure_rx.is_empty());
     }
 }

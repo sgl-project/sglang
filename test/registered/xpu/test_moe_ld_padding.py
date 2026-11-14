@@ -74,8 +74,8 @@ class TestXpuMoeLdPadding(CustomTestCase):
                 self.moe_runner_config = MoeRunnerConfig(activation="silu")
                 self.moe_runner_config.is_gated = True
 
-        def build(device, use_triton_kernels=False):
-            method = UnquantizedFusedMoEMethod(use_triton_kernels=use_triton_kernels)
+        def build(device):
+            method = UnquantizedFusedMoEMethod()
             layer = _Layer()
             with torch.device(device):
                 method.create_weights(
@@ -105,9 +105,6 @@ class TestXpuMoeLdPadding(CustomTestCase):
             if torch.xpu.is_available():
                 w13_xpu, _ = build("xpu")
                 self.assertFalse(w13_xpu.is_contiguous())
-                # The Triton path stores B transposed and ignores row stride.
-                w13_triton, _ = build("xpu", use_triton_kernels=True)
-                self.assertTrue(w13_triton.is_contiguous())
 
         # Backend forced to Triton -> never padded, even on XPU.
         with (

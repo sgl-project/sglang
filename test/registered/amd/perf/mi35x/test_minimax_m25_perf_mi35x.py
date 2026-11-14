@@ -20,7 +20,10 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 register_amd_ci(
-    est_time=5400, suite="nightly-perf-8-gpu-mi35x-minimax-m25", nightly=True
+    est_time=5400,
+    suite="nightly-perf-8-gpu-mi35x-minimax-m25",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 

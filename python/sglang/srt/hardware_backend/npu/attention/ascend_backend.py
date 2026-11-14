@@ -1871,6 +1871,16 @@ class AscendAttnBackend(AttentionBackend):
         # V2: Q is already sharded to local by the strategy; single sparse-attn
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+            return self._forward_fp8_sparse(
+                q_nope,
+                q_pe,
+                k_nope,
+                topk_indices,
+                layer,
+                actual_seq_qlen,
+                actual_seq_lengths_kv,
+            )
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=k_nope,
@@ -1894,6 +1904,45 @@ class AscendAttnBackend(AttentionBackend):
             return_softmax_lse=False,
         )
         return attn_out
+
+    def _forward_fp8_sparse(
+        self,
+        q_nope,
+        q_pe,
+        packed_kv,
+        topk_indices,
+        layer,
+        actual_seq_qlen,
+        actual_seq_lengths_kv,
+    ):
+        assert q_nope.dtype == q_pe.dtype == torch.bfloat16
+        packed = packed_kv.view(torch.float8_e4m3fn)
+        return torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
+            key=packed,
+            value=packed,
+            sparse_indices=topk_indices,
+            scale_value=layer.scaling,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            key_dequant_scale=None,
+            value_dequant_scale=None,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            block_table=self.forward_metadata.block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=128,
+            rope_head_dim=self.qk_rope_head_dim,
+        )
 
     def do_cp_attn_fia(
         self,
@@ -2053,33 +2102,14 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                 )
             if self.kv_cache_dtype == torch.float8_e4m3fn:
-                assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-                packed = k_nope.view(torch.float8_e4m3fn)
-                attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
-                    query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
-                    key=packed,
-                    value=packed,
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    key_quant_mode=2,
-                    value_quant_mode=2,
-                    key_dequant_scale=None,
-                    value_dequant_scale=None,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    quant_scale_repo_mode=1,
-                    tile_size=128,
-                    rope_head_dim=self.qk_rope_head_dim,
+                attn_out = self._forward_fp8_sparse(
+                    q_nope,
+                    q_pe,
+                    k_nope,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    actual_seq_lengths_kv,
                 )
             else:
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(

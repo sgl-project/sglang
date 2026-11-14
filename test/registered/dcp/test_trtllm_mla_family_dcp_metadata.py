@@ -126,7 +126,12 @@ class _DCPMetadataTests:
 
         backend.token_to_kv_pool = _routed(SimpleNamespace(set_mla_kv_buffer=real_path))
         backend._run_decode_kernel = real_path
-        layer = SimpleNamespace(layer_id=0, tp_q_head_num=heads, v_head_dim=v_head_dim)
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=heads,
+            v_head_dim=v_head_dim,
+            sliding_window_size=-1,
+        )
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
             out_cache_loc=None,

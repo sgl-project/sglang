@@ -8,6 +8,7 @@ images onto the checkpoint-configured background
 at load time.
 """
 
+import asyncio
 import functools
 import math
 import re
@@ -17,6 +18,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.entrypoints.openai.serving_kimi_k3 import KIMI_K3_VIDEO_SLOT
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.kimi_k3 import (
@@ -32,6 +34,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     fill_transparent_bg as _fill_transparent_bg,
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
+    normalization_tensors,
     to_chw_uint8,
 )
 from sglang.srt.multimodal.media_artifacts import (
@@ -67,6 +70,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
@@ -154,6 +158,125 @@ def _expand_k3_image_prompt_text(
             )
         )
     return "".join(output)
+
+
+def _format_k3_timestamp(frame_index: int, fps: float) -> str:
+    ms = round(frame_index * 1_000_000 / fps) // 1000
+    hours, minutes, secs = ms // 3600000, ms // 60000 % 60, ms // 1000 % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms % 1000:03d}"
+
+
+def _plan_k3_video(
+    num_frames: int,
+    fps: Optional[float],
+    width: int,
+    height: int,
+    media_proc_cfg: dict,
+    config: KimiK3PreprocessConfig,
+) -> tuple[list[int], dict]:
+    if media_proc_cfg["timestamp_mode"] != "hh:mm:ss.fff":
+        raise ValueError(
+            f"Unsupported timestamp_mode: {media_proc_cfg['timestamp_mode']}"
+        )
+    if num_frames <= 0 or fps is None or not fps > 0:
+        raise ValueError(f"Invalid video: {num_frames} frames at {fps} fps")
+    resize_config = navit_resize_config(
+        width,
+        height,
+        config.patch_size,
+        config.merge_kernel_size,
+        media_proc_cfg["in_patch_limit_each_frame"],
+        config.patch_limit_on_one_side,
+        config.fixed_output_tokens,
+    )
+    frame_patches = math.ceil(resize_config["new_width"] / config.patch_size) * (
+        math.ceil(resize_config["new_height"] / config.patch_size)
+    )
+    # A video over in_patch_limit_video keeps the frame size and samples fewer frames.
+    max_frames = media_proc_cfg["in_patch_limit_video"] // frame_patches
+    if media_proc_cfg["max_num_frames_each_video"] is not None:
+        max_frames = min(max_frames, media_proc_cfg["max_num_frames_each_video"])
+    sample_fps = min(media_proc_cfg["sample_fps"], fps)
+    count = min(max(round(num_frames * sample_fps / fps), 1), max(max_frames, 1))
+    indices = np.linspace(0, num_frames - 1, count).round().astype(int).tolist()
+    return indices, resize_config
+
+
+def _k3_video_prompt_ids(
+    tokenizer,
+    size: tuple[int, int],
+    timestamps: list[str],
+    chunk_tokens: int,
+    pad_id: int,
+) -> list[int]:
+    width, height = size
+    output = _encode_k3_special_tokens(
+        tokenizer, f"<|media_begin|>video {width}x{height}<|media_content|>"
+    )
+    for timestamp in timestamps:
+        output += _encode_k3_special_tokens(tokenizer, timestamp)
+        output += [pad_id] * chunk_tokens
+    return output + _encode_k3_special_tokens(tokenizer, "<|media_end|>")
+
+
+def _preprocess_k3_video(
+    video: VideoDecoderWrapper, media_proc_cfg: dict, config: KimiK3PreprocessConfig
+) -> tuple[tuple[int, int], list[str], int, list]:
+    height, width = video.frame_shape
+    indices, resize_config = _plan_k3_video(
+        len(video), video.avg_fps, width, height, media_proc_cfg, config
+    )
+    image_scale, image_bias = normalization_tensors(
+        config.image_mean, config.image_std, "cpu"
+    )
+    chunk_size = media_proc_cfg["temporal_merge_kernel_size"]
+    timestamps, chunks = [], []
+    for start in range(0, len(indices), chunk_size):
+        chunk = indices[start : start + chunk_size]
+        frames = torch.as_tensor(video.get_frames_at(chunk)).permute(0, 3, 1, 2)
+        pixel_values, grids = _gpu_preprocess_images(
+            list(frames),
+            [resize_config] * len(chunk),
+            image_scale,
+            image_bias,
+            config.patch_size,
+            to_chw=lambda frame: frame,
+        )
+        _, grid_h, grid_w = grids[0].tolist()
+        timestamps.append(_format_k3_timestamp(chunk[0], video.avg_fps))
+        chunks.append((pixel_values, (len(chunk), grid_h, grid_w)))
+    return (width, height), timestamps, resize_config["num_tokens"], chunks
+
+
+def _splice_k3_media(
+    input_ids: List[int],
+    *,
+    image_token_id: int,
+    video_slot_token_id: int,
+    images: list[tuple[list[int], list]],
+    videos: list[tuple[list[int], list]],
+) -> tuple[List[int], list]:
+    image_count = input_ids.count(image_token_id)
+    video_count = input_ids.count(video_slot_token_id)
+    if image_count != len(images) or video_count != len(videos):
+        raise ValueError(
+            "Media placeholders must map one-to-one to media data: expected "
+            f"{len(images)} image(s) and {len(videos)} video(s), found "
+            f"{image_count} and {video_count}"
+        )
+    image_iter, video_iter = iter(images), iter(videos)
+    output, items = [], []
+    for token_id in input_ids:
+        if token_id == image_token_id:
+            span_ids, span_items = next(image_iter)
+        elif token_id == video_slot_token_id:
+            span_ids, span_items = next(video_iter)
+        else:
+            output.append(token_id)
+            continue
+        output += span_ids
+        items += span_items
+    return output, items
 
 
 def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
@@ -357,7 +480,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         grids = [tuple(int(value) for value in grid) for grid in grid_thws.tolist()]
         patch_counts = [math.prod(grid) for grid in grids]
         if sum(patch_counts) != pixel_values.shape[0]:
-            raise ValueError(
+            raise RuntimeError(
                 "Kimi-K3 processor feature length does not match image grids: "
                 f"{pixel_values.shape[0]} != {sum(patch_counts)}"
             )
@@ -388,6 +511,7 @@ class KimiK3ImageProcessor(
     supports_mm_processor_concurrency = True
     preserve_processor_input_ids = True
     uses_wide_image_identity = True
+    video_preprocessing_device = "cpu"
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         mm_tokens = MultimodalSpecialTokens(
@@ -408,6 +532,10 @@ class KimiK3ImageProcessor(
         )
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
         self.mm_tokens = mm_tokens
+        (self.video_slot_token_id,) = _encode_k3_special_tokens(
+            _processor.tokenizer, KIMI_K3_VIDEO_SLOT
+        )
+        self.media_proc_cfg = _processor.media_processor.media_proc_cfg
 
     def _should_defer_gpu_preprocessing(self, images) -> bool:
         """
@@ -474,7 +602,7 @@ class KimiK3ImageProcessor(
             input_ids.flatten(), self.mm_tokens.image_token_id
         )
         if len(offsets) != len(base_output.images):
-            raise ValueError("Expected one Kimi-K3 image span for each image")
+            raise RuntimeError("Expected one Kimi-K3 image span for each image")
 
         items = []
         for image, resize_config, offset in zip(images, resize_configs, offsets):
@@ -636,7 +764,7 @@ class KimiK3ImageProcessor(
         ).flatten()
         offsets = self.get_mm_items_offset(input_ids, self.mm_tokens.image_token_id)
         if len(offsets) != len(artifacts):
-            raise ValueError("Expected one Kimi-K3 image span for each image")
+            raise RuntimeError("Expected one Kimi-K3 image span for each image")
 
         # 2. build request-owned items from prompt-independent artifacts
         items = []
@@ -727,6 +855,121 @@ class KimiK3ImageProcessor(
             digest, media.image if isinstance(media, KimiLoadedImage) else media
         )
 
+    async def _process_video_request(self, image_data, input_text, request_obj):
+        if request_obj.mm_content_hashes:
+            raise ValueError("Video requests do not support mm_content_hashes")
+        if any(self._is_preprocessed_input(image) for image in image_data or []):
+            raise ValueError("Video requests do not support preprocessed images")
+        input_ids = (
+            _encode_k3_special_tokens(self._tokenizer, input_text)
+            if isinstance(input_text, str)
+            else torch.as_tensor(input_text).flatten().tolist()
+        )
+
+        base_output = await self.fast_load_mm_data(
+            prompt="",  # the prompt is spliced below from input_ids
+            image_data=image_data,
+            video_data=request_obj.video_data,
+            multimodal_tokens=self.mm_tokens,
+            discard_alpha_channel=False,
+        )
+        if not all(
+            isinstance(video, VideoDecoderWrapper) for video in base_output.videos
+        ):
+            # Decoded frames and preprocessed videos carry no frame rate.
+            raise ValueError("Video input must be a URL, file path or encoded bytes")
+        # Videos need no processor clone, so they decode on the IO pool and do
+        # not hold the processor workers that image requests wait on.
+        loop = asyncio.get_running_loop()
+        video_futures = [
+            loop.run_in_executor(
+                self.io_executor,
+                _preprocess_k3_video,
+                video,
+                self.media_proc_cfg,
+                self._processor.preprocess_config,
+            )
+            for video in base_output.videos
+        ]
+        try:
+            if not base_output.images:
+                image_features = ([], [], [], [])
+            elif self.mm_processor_executor is None:
+                image_features = self._prepare_image_features(base_output.images)
+            else:
+                image_features = await self.mm_processor_executor.run(
+                    self._prepare_image_features, base_output.images
+                )
+            videos = await asyncio.gather(*video_futures)
+        except BaseException:
+            # A failed or cancelled request must not keep decoding its videos.
+            for future in video_futures:
+                future.cancel()
+            raise
+
+        pad_id = self.mm_tokens.image_token_id
+        images = [
+            (
+                _expand_k3_image_prompt_token_ids(
+                    [pad_id],
+                    pad_id,
+                    [resize_config["num_tokens"]],
+                    [size],
+                    self._tokenizer,
+                )
+                .flatten()
+                .tolist(),
+                [(feature, grid)],
+            )
+            for feature, size, resize_config, grid in zip(*image_features)
+        ]
+        videos = [
+            (
+                _k3_video_prompt_ids(
+                    self._tokenizer, size, timestamps, chunk_tokens, pad_id
+                ),
+                chunks,
+            )
+            for size, timestamps, chunk_tokens, chunks in videos
+        ]
+        input_ids, features = _splice_k3_media(
+            input_ids,
+            image_token_id=pad_id,
+            video_slot_token_id=self.video_slot_token_id,
+            images=images,
+            videos=videos,
+        )
+        offsets = self.get_mm_items_offset(torch.tensor(input_ids), pad_id)
+        if len(offsets) != len(features):
+            raise RuntimeError("Expected one Kimi-K3 media span per image or chunk")
+        items = []
+        for (feature, grid_thw), offset in zip(features, offsets):
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=feature,
+                offsets=[offset],
+                model_specific_data={
+                    "image_grid_thw": torch.tensor([grid_thw], dtype=torch.int64)
+                },
+            )
+            if feature.is_cuda and self.keep_mm_features_on_device:
+                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
+                    True
+                )
+            items.append(item)
+        # Host-side video chunks are hashed on the hash pool, not the event loop.
+        await self.hash_executor.set_pad_values(items)
+        self._precompute_hashes_before_cpu_transfer(items)
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=self._prepare_mm_items_for_transport(items),
+            im_token_id=pad_id,
+        )
+
+    def _prepare_image_features(self, images, *, processor=None):
+        processor = processor or self._processor
+        return processor.prepare_image_features(unwrap_kimi_images(images))
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes, Dict]],
@@ -735,9 +978,13 @@ class KimiK3ImageProcessor(
         *args,
         **kwargs,
     ):
-        if request_obj.video_data or kwargs.get("audio_data"):
-            raise ValueError("Kimi-K3 supports image input only")
+        if kwargs.get("audio_data"):
+            raise ValueError("Kimi-K3 supports image and video input only")
         self.reject_caller_image_identity(image_data, request_obj)
+        if request_obj.video_data:
+            return await self._process_video_request(
+                image_data, input_text, request_obj
+            )
 
         expected_image_count = len(image_data or [])
         placeholder_count = self.count_image_placeholders(

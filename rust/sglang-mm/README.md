@@ -191,8 +191,9 @@ impl ImageProcessorSpec for MyModelProcessor {
 
 - All fan-out goes through `common::par`, so whether this crate owns threads is
   decided by the `parallel` feature alone. With it on: CPU pool capped at
-  `min(8, cores)` (override `SGL_MM_RS_THREADS`). With it off: no rayon, no
-  threads, everything inline. Output is bit-identical either way — the fan-outs
+  `min(8, cores)` (override `SGLANG_MM_RS_THREADS`; the deprecated
+  `SGL_MM_RS_THREADS` is still read). With it off: no rayon, no threads,
+  everything inline. Output is bit-identical either way — the fan-outs
   are order-preserving maps and writes into disjoint slices, never reductions.
   Note that sizing a pool to 1 is *not* the same as off: `install` blocks the
   caller and would serialize every concurrent request in the process.

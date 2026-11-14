@@ -194,6 +194,7 @@ class TestXpuCallSitesNeverPassTheSentinel(CustomTestCase):
         moe_method = SimpleNamespace(
             moe_runner_config=MoeRunnerConfig(activation="silu"),
             use_deep_gemm=False,
+            use_aiter_moe=False,
         )
         with self.xpu_branch(
             mxfp4_module, _is_xpu=True, _is_cpu=False, _use_aiter=False

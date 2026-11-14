@@ -179,6 +179,7 @@ class TestApplyWithAddend(CustomTestCase):
                     )
                 )
             elif route == "low_m_autotune":
+                enter(patch.object(unquant, "get_is_capture_mode", return_value=True))
                 enter(patch.object(unquant, "_CUTE_DSL_BF16_CTA_K", 64))
                 enter(
                     patch.object(

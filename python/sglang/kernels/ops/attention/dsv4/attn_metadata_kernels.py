@@ -221,7 +221,8 @@ def expand_prefill_causally_triton(
     req_pool_indices_repeated = torch.empty(
         total_tokens, dtype=req_pool_indices.dtype, device=device
     )
-    BLOCK = 256
+    bs_p2 = triton.next_power_of_2(max(bs, 1))
+    BLOCK = min(256, max(16, 2048 // bs_p2))
     _expand_prefill_causally_kernel[(triton.cdiv(total_tokens, BLOCK),)](
         req_pool_indices,
         seq_lens,
@@ -232,7 +233,7 @@ def expand_prefill_causally_triton(
         num_tokens,
         total_tokens,
         BLOCK=BLOCK,
-        BS_P2=triton.next_power_of_2(max(bs, 1)),
+        BS_P2=bs_p2,
     )
     return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,

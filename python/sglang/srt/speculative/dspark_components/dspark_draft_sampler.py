@@ -24,6 +24,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
     step_logits_width,
 )
+from sglang.srt.speculative.online_acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.utils import is_xpu
 
@@ -49,6 +52,7 @@ class DsparkDraftSampler:
         greedy_draft: bool,
         sharded_accept: bool = False,
         out=None,
+        acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
         markov_walker: Optional[MarkovWalker] = None,
     ):
         self.model = model
@@ -73,7 +77,15 @@ class DsparkDraftSampler:
                 (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
             )
         confidence_head = model.confidence_head
-        if confidence_head is None:
+        self.acceptance_estimator = acceptance_estimator
+        self.acceptance_features_out: Optional[torch.Tensor] = None
+        if acceptance_estimator is not None:
+            self.acceptance_features_out = torch.empty(
+                (self.max_bs, self.gamma), dtype=torch.float32, device=device
+            )
+            self.confidence_out = torch.empty_like(self.acceptance_features_out)
+            self.confidence_raw_out = None
+        elif confidence_head is None:
             self.confidence_out = self.confidence_raw_out = None
         else:
             self.confidence_out = torch.empty(
@@ -117,6 +129,7 @@ class DsparkDraftSampler:
                 dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
                 device=self.out.device,
             ),
+            specialize=acceptance_estimator is None,
         )
         self._draft_strategy = bound_strategy.strategy
         self.step_logits = bound_strategy.step_logits
@@ -189,7 +202,14 @@ class DsparkDraftSampler:
             batch_size=bs,
             stock=self._markov_block,
         )
-        if self.confidence_out is not None:
+        if self.acceptance_estimator is not None:
+            self.acceptance_estimator.predict(
+                logits=self.step_logits[:bs],
+                temperatures=self.params.step_temperatures[:bs],
+                features_out=self.acceptance_features_out[:bs],
+                predictions_out=self.confidence_out[:bs],
+            )
+        elif self.confidence_out is not None:
             confidence, confidence_raw = self.model.compute_confidence(
                 anchor_tokens=anchor,
                 draft_tokens=draft_tokens,
@@ -257,6 +277,7 @@ def maybe_build_draft_sampler(
     tp_sync: SpecTpSync,
     sharded_accept: bool = False,
     out=None,
+    acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -279,6 +300,7 @@ def maybe_build_draft_sampler(
             device=device,
             seed=noise.key,
             megakernel=megakernel_draft_sampler(draft_model) is not None,
+            online_estimator=acceptance_estimator is not None,
             tp_rank=tp_rank,
         )
     sampler = DsparkDraftSampler(
@@ -291,6 +313,7 @@ def maybe_build_draft_sampler(
         greedy_draft=greedy_draft,
         sharded_accept=sharded_accept,
         out=out,
+        acceptance_estimator=acceptance_estimator,
         markov_walker=markov_walker,
     )
     if tp_rank == 0:
@@ -303,7 +326,7 @@ def maybe_build_draft_sampler(
 
 
 def _int8_markov_walk_unsupported_reason(
-    *, draft_model, megakernel: bool
+    *, draft_model, megakernel: bool, online_estimator: bool
 ) -> Optional[str]:
     """None when the int8 kernel computes this drafter's default walk, up to the
     int8 weights and bf16 rounding; MarkovWalker checks the GPU, rank and gamma."""
@@ -311,6 +334,8 @@ def _int8_markov_walk_unsupported_reason(
         return "the NVIDIA megakernel plugin runs the draft sampler"
     if block_accept_estimate_enabled():
         return "the block-accept estimator reads greedy rows' step logits"
+    if online_estimator:
+        return "the online acceptance estimator reads greedy rows' step logits"
     head = draft_model.markov_head
     if head.vocab_shard is not None:
         return "markov_w2 is vocab-sharded over the TP ranks"
@@ -339,10 +364,13 @@ def _build_int8_markov_walker(
     device,
     seed: int,
     megakernel: bool,
+    online_estimator: bool,
     tp_rank: int,
 ) -> MarkovWalker:
     reason = _int8_markov_walk_unsupported_reason(
-        draft_model=draft_model, megakernel=megakernel
+        draft_model=draft_model,
+        megakernel=megakernel,
+        online_estimator=online_estimator,
     )
     if reason is not None:
         raise ValueError(

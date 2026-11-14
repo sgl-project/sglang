@@ -12,6 +12,9 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from sglang.multimodal_gen import registry
+from sglang.multimodal_gen.configs.pipeline_configs import (
+    minimax_h3_image as image_config,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_image import (
     MiniMaxH3ImagePipelineConfig,
 )
@@ -29,6 +32,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY as PLAN,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -62,7 +66,16 @@ def normalized_args(**overrides):
     return args
 
 
-def test_image_config_accepts_release_precisions_and_requests_fa():
+@pytest.fixture(
+    params=[AttentionBackendEnum.FA, AttentionBackendEnum.AITER], ids=["cuda", "rocm"]
+)
+def dense_backend(request, monkeypatch):
+    # The platform's dense FlashAttention: FA on CUDA, AITer on ROCm (no FA3).
+    monkeypatch.setattr(image_config, "_dense_attention_backend", lambda: request.param)
+    return request.param
+
+
+def test_image_config_accepts_release_precisions_and_requests_dense_fa(dense_backend):
     args = normalized_args(
         component_precisions={
             "transformer": "bf16",
@@ -72,7 +85,9 @@ def test_image_config_accepts_release_precisions_and_requests_fa():
         component_residency={"transformer": "component-offload"},
     )
     MiniMaxH3ImagePipelineConfig().validate_server_args(args)
-    assert args.component_attention_backends["transformer"] == "fa"
+    assert (
+        args.component_attention_backends["transformer"] == dense_backend.name.lower()
+    )
 
 
 def test_image_deployment_has_no_cfg_parallel():
@@ -86,7 +101,6 @@ def test_image_deployment_has_no_cfg_parallel():
     [
         {"num_gpus": 2, "sp_degree": 2, "ulysses_degree": 2},
         {"num_gpus": 2, "tp_size": 2},
-        {"num_gpus": 4, "sp_degree": 2, "ring_degree": 2},
         {"num_gpus": 4, "sp_degree": 4, "ulysses_degree": 4},
         {"num_gpus": 4, "tp_size": 2, "sp_degree": 2},
         # sp_degree=2 with no explicit split: the auto K/V-gather alias.
@@ -99,8 +113,17 @@ def test_image_deployment_has_no_cfg_parallel():
         },
     ],
 )
-def test_image_config_accepts_tp_and_sp(override):
+def test_image_config_accepts_tp_and_sp(override, dense_backend):
     MiniMaxH3ImagePipelineConfig().validate_server_args(normalized_args(**override))
+
+
+def test_image_config_ring_requires_fa(dense_backend):
+    args = normalized_args(num_gpus=4, sp_degree=2, ring_degree=2)
+    if dense_backend is AttentionBackendEnum.FA:
+        MiniMaxH3ImagePipelineConfig().validate_server_args(args)
+    else:
+        with pytest.raises(ValueError, match="ring parallelism requires FA"):
+            MiniMaxH3ImagePipelineConfig().validate_server_args(args)
 
 
 @pytest.mark.parametrize(
