@@ -139,6 +139,39 @@ def test_matches_reference(steps, vocab, block):
     assert (final_coins <= upper + 1e-6).all()
 
 
+@pytest.mark.parametrize("block", [False, True])
+@pytest.mark.parametrize("rejected", [False, True])
+def test_final_token_has_weight_at_largest_coin(rejected, block):
+    # norm_sum and the CDF's running sum add the same weights in different
+    # orders. At the largest coin below 1, float32 rounding must not select a
+    # token without weight, such as a padding row of the LM head.
+    torch.manual_seed(0)
+    batch, vocab = 2048, 4096
+    support = torch.rand(batch, vocab - 1).argsort(-1)[:, :21]
+    target = torch.zeros(batch, vocab).scatter_(
+        1, support[:, :20], (torch.randn(batch, 20) * 4).softmax(-1)
+    )
+    rows = torch.arange(batch)
+    if rejected:
+        candidates = support[:, 20]  # no target weight
+        draft = 0.5 * target
+        draft[rows, candidates] = 0.5
+    else:
+        candidates = support[:, 0]  # draft equals target
+        draft = target.clone()
+    lengths, output = _verify(
+        torch.stack([target, target], 1).to(DEVICE),
+        draft[:, None].to(DEVICE),
+        torch.stack([torch.zeros_like(candidates), candidates], 1).to(DEVICE),
+        torch.full((batch, 2), 0.5, device=DEVICE),
+        torch.full((batch,), 1 - 2**-24, device=DEVICE),
+        block=block,
+    )
+    assert (lengths.cpu() == int(not rejected)).all()
+    final = output.cpu()[rows, int(not rejected)].long()
+    assert (target[rows, final] > 0).all()
+
+
 def test_accepts_longer_prefix_after_rejection():
     target = torch.tensor([[[1 / 3, 2 / 3]] * 3], device=DEVICE)
     draft = torch.tensor([[[2 / 3, 1 / 3]] * 2], device=DEVICE)

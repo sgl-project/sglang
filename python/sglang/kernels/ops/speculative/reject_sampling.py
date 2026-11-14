@@ -206,9 +206,9 @@ def speculative_sampling_classic_kernel(
 
             norm_sum += tl.sum(val)
 
-    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
-    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
-    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
+    # Pass 2: CDF. norm_sum and the running sum below add the same weights in
+    # different orders, so in float32 an entry without weight can be the first
+    # to pass target_u: only entries with weight are selected.
     target_u = coin_final * norm_sum
     cum_sum = 0.0
     final_token = VOCAB_SIZE - 1
@@ -235,7 +235,7 @@ def speculative_sampling_classic_kernel(
             block_cumsum = tl.cumsum(val, axis=0)
             total_cumsum = cum_sum + block_cumsum
 
-            candidates_mask = total_cumsum > target_u
+            candidates_mask = (total_cumsum > target_u) & (val > 0.0)
             has_match = tl.max(candidates_mask, axis=0)
 
             if has_match:
@@ -244,6 +244,30 @@ def speculative_sampling_classic_kernel(
                 found = 1
 
             cum_sum += tl.sum(val)
+
+    # Pass 3, only when a coin near 1 left target_u above the whole running sum:
+    # take the last entry with weight. A degenerate residual (norm_sum == 0, i.e.
+    # p == q everywhere on rejection) has none and keeps VOCAB_SIZE - 1.
+    if found == 0:
+        for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+            v_offsets = v_start + tl.arange(0, BLOCK_V)
+            mask = v_offsets < VOCAB_SIZE
+
+            p_ptr = tp_base_ptr + v_offsets * stride_tp_v
+            p_val = tl.load(p_ptr, mask=mask, other=0.0)
+
+            if all_drafts_accepted:
+                val = p_val
+            else:
+                q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+                q_val = tl.load(q_ptr, mask=mask, other=0.0)
+                # Same guard as pass 1.
+                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+                val = residual_scale * p_val - q_val
+
+            last_with_mass = tl.max(tl.where(val > 0.0, v_offsets, -1), axis=0)
+            if last_with_mass >= 0:
+                final_token = last_with_mass
 
     tl.store(Predicts + last_accepted_global_idx, final_token)
 
