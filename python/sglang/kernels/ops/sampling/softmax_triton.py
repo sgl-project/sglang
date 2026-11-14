@@ -1,13 +1,14 @@
-"""Split-row temperature softmax for low-row-count sampling workloads."""
+"""Split-row temperature softmax for sampling workloads."""
 
 import torch
 import triton
 import triton.language as tl
 
-# Split low-row-count reductions across CTAs and fuse temperature scaling.
+# Split row reductions across CTAs and fuse temperature scaling. _MAX_BLOCK keeps
+# many-row batches from getting one huge block per row, which spills registers.
 _MIN_BLOCK = 2048
+_MAX_BLOCK = 4096
 _TARGET_CTAS = 512
-ROW_LIMIT = 32
 
 
 @triton.jit
@@ -42,44 +43,30 @@ def _partial_max_sumexp_kernel(
 
 
 @triton.jit
-def _combine_kernel(
-    partial_max,
-    partial_sum,
-    row_max,
-    row_sum,
-    num_splits,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK)
-    mask = offsets < num_splits
-    m = tl.load(
-        partial_max + row * num_splits + offsets, mask=mask, other=-float("inf")
-    )
-    s = tl.load(partial_sum + row * num_splits + offsets, mask=mask, other=0.0)
-    m_all = tl.max(m, axis=0)
-    s_all = tl.sum(tl.where(mask, s * tl.exp(m - m_all), 0.0), axis=0)
-    tl.store(row_max + row, m_all)
-    tl.store(row_sum + row, s_all)
-
-
-@triton.jit
 def _normalize_kernel(
     logits,
     temperatures,
-    row_max,
-    row_sum,
+    partial_max,
+    partial_sum,
     probs,
     logits_row_stride,
     probs_row_stride,
     vocab_size,
+    num_splits,
     BLOCK: tl.constexpr,
+    SPLITS_BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
+    s_offsets = tl.arange(0, SPLITS_BLOCK)
+    s_mask = s_offsets < num_splits
+    pm = tl.load(
+        partial_max + row * num_splits + s_offsets, mask=s_mask, other=-float("inf")
+    )
+    ps = tl.load(partial_sum + row * num_splits + s_offsets, mask=s_mask, other=0.0)
+    m = tl.max(pm, axis=0)
+    s = tl.sum(tl.where(s_mask, ps * tl.exp(pm - m), 0.0), axis=0)
     t = tl.load(temperatures + row)
-    m = tl.load(row_max + row)
-    s = tl.load(row_sum + row)
     offsets = split * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < vocab_size
     x = tl.load(logits + row * logits_row_stride + offsets, mask=mask, other=0.0)
@@ -93,6 +80,7 @@ def _split_geometry(rows: int, vocab_size: int):
         triton.cdiv(_TARGET_CTAS, rows), max(1, triton.cdiv(vocab_size, _MIN_BLOCK))
     )
     block = max(_MIN_BLOCK, triton.next_power_of_2(triton.cdiv(vocab_size, splits)))
+    block = min(block, _MAX_BLOCK)
     return block, triton.cdiv(vocab_size, block)
 
 
@@ -105,7 +93,6 @@ def temperature_softmax(
         or logits.dtype != torch.float32
         or logits.shape[0] == 0
         or logits.shape[1] == 0
-        or logits.shape[0] > ROW_LIMIT
         or logits.stride(1) != 1
         or not logits.is_cuda
     ):
@@ -132,9 +119,6 @@ def temperature_softmax(
     partial_sum = torch.empty(
         (rows, num_splits), dtype=torch.float32, device=logits.device
     )
-    row_max = torch.empty((rows,), dtype=torch.float32, device=logits.device)
-    row_sum = torch.empty((rows,), dtype=torch.float32, device=logits.device)
-
     _partial_max_sumexp_kernel[(rows, num_splits)](
         logits,
         t,
@@ -146,25 +130,18 @@ def temperature_softmax(
         BLOCK=block,
         num_warps=8,
     )
-    _combine_kernel[(rows,)](
-        partial_max,
-        partial_sum,
-        row_max,
-        row_sum,
-        num_splits,
-        BLOCK=triton.next_power_of_2(num_splits),
-        num_warps=1,
-    )
     _normalize_kernel[(rows, num_splits)](
         logits,
         t,
-        row_max,
-        row_sum,
+        partial_max,
+        partial_sum,
         probs,
         logits.stride(0),
         probs.stride(0),
         vocab_size,
+        num_splits,
         BLOCK=block,
+        SPLITS_BLOCK=triton.next_power_of_2(num_splits),
         num_warps=8,
     )
     return probs
