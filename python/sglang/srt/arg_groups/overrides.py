@@ -491,7 +491,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
 @register_post_process
 def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     """Default DSA KV-cache dtype before resolving split attention backends."""
-    from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
+    from sglang.srt.configs.model_config import (
+        get_dsa_config,
+        is_deepseek_dsa,
+        is_kimi_k31,
+    )
 
     hf_config = model_config_of(view).hf_config
     kimi_k31 = is_kimi_k31(hf_config)
@@ -535,6 +539,9 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             f"got kv_cache_dtype={kv_cache_dtype}."
         )
     if kv_cache_dtype == "auto":
+        checkpoint_allows_fp8 = getattr(
+            get_dsa_config(hf_config), "dsa_fp8_kv_cache", True
+        )
         # gfx950 reports capability 9.x, but its triton/tilelang DSA kernels
         # take fp8 KV and the gfx950-tuned sparse-MLA path requires it. The raw
         # fp8 MLA layout is only read back on the aiter path (forward_mha.py).
@@ -547,7 +554,9 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
         kv_cache_dtype = (
             "fp8_e4m3"
-            if (major >= 10 or hip_gfx95_fp8) and not has_attention_sinks
+            if (major >= 10 or hip_gfx95_fp8)
+            and not has_attention_sinks
+            and checkpoint_allows_fp8
             else "bfloat16"
         )
         logger.warning(
@@ -572,9 +581,27 @@ def _check_dsa_backend_constraints(
     *,
     hip: bool,
     dcp_size: int = 1,
+    disaggregation_mode: str = "null",
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
+
+    # A TRTLLM or Prims-TS consumer makes the shared pool store raw FP8 rows, which the
+    # other backend's scaled-FP8 / BF16 kernels cannot read.
+    if (
+        not hip
+        and kv_cache_dtype == "fp8_e4m3"
+        and disaggregation_mode == "null"
+        and (prefill_backend in ("trtllm", "prims_ts"))
+        != (decode_backend in ("trtllm", "prims_ts"))
+    ):
+        raise ValueError(
+            f"FP8 KV with --dsa-prefill-backend {prefill_backend!r} and "
+            f"--dsa-decode-backend {decode_backend!r} is unsupported: trtllm and "
+            "prims_ts store raw FP8 rows that the other backend cannot read. "
+            "Use raw FP8 backends for both phases, or choose BF16-compatible "
+            "backends with --kv-cache-dtype bfloat16."
+        )
 
     # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
     if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
@@ -732,6 +759,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             decode,
             hip=get_platform().is_hip,
             dcp_size=getattr(view, "dcp_size", 1) or 1,
+            disaggregation_mode=getattr(view, "disaggregation_mode", "null"),
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -766,6 +794,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         decode,
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
+        disaggregation_mode=getattr(view, "disaggregation_mode", "null"),
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
@@ -868,6 +897,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "DeepseekV32ForCausalLM",
         "KimiK25ForConditionalGeneration",
         "MistralLarge3ForCausalLM",
+        "MistralLarge4ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
         "Glm5NextForConditionalGeneration",

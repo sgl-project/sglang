@@ -3,7 +3,10 @@
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.overrides import _check_tilelang_dsa_fp8_kv
+from sglang.srt.arg_groups.overrides import (
+    _check_dsa_backend_constraints,
+    _check_tilelang_dsa_fp8_kv,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,7 +46,22 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
 
     def test_cuda_fp8_non_tilelang_allowed(self):
         # fp8-capable backends must pass
-        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "trtllm", hip=False)
+        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "flashmla_kv", hip=False)
+        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "trtllm", "trtllm", hip=False)
+
+    def test_prims_ts_shared_pool_layout_compatibility(self):
+        for prefill, decode in (("prims_ts", "trtllm"), ("trtllm", "prims_ts")):
+            with self.subTest(prefill=prefill, decode=decode):
+                _check_dsa_backend_constraints("fp8_e4m3", prefill, decode, hip=False)
+        for prefill, decode in (
+            ("prims_ts", "flashmla_kv"),
+            ("flashmla_kv", "prims_ts"),
+        ):
+            with self.subTest(prefill=prefill, decode=decode):
+                with self.assertRaisesRegex(ValueError, "raw FP8"):
+                    _check_dsa_backend_constraints(
+                        "fp8_e4m3", prefill, decode, hip=False
+                    )
 
 
 if __name__ == "__main__":

@@ -372,7 +372,9 @@ def get_config(
 
     if model_config_parser == "auto":
         # `model` is post-rewrite (gguf parent / runai uri / remote pull).
-        model_config_parser = "mistral" if is_mistral_model(model) else "hf"
+        model_config_parser = (
+            "mistral" if is_mistral_model(model, revision=revision) else "hf"
+        )
 
     parser = get_model_config_parser(model_config_parser)
     try:

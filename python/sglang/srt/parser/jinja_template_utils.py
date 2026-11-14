@@ -240,6 +240,21 @@ def process_content_for_template_format(
         # Already a string or None, no processing needed
         return {k: v for k, v in msg_dict.items() if v is not None}
 
+    # Templates read prior-turn reasoning from reasoning_content, not from content
+    # parts, so fold assistant thinking parts into it unless it is set, even to "".
+    if (
+        msg_dict.get("role") == "assistant"
+        and msg_dict.get("reasoning_content") is None
+    ):
+        thinking = [
+            chunk["thinking"] if chunk.get("thinking") is not None else chunk["text"]
+            for chunk in msg_dict["content"]
+            if isinstance(chunk, dict)
+            and chunk.get("type") in ("thinking", "reasoning")
+        ]
+        if thinking:
+            msg_dict = {**msg_dict, "reasoning_content": "".join(thinking)}
+
     if content_format == "openai" or use_dpsk_v32_encoding:
         # OpenAI format: preserve structured content list, normalize types
         # V32 encoding: extract multimodal data but convert content to string
