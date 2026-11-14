@@ -40,6 +40,16 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 <Qwen3Deployment />
 
+### Experimental Apple Silicon decode
+
+Qwen3-0.6B supports experimental compiled MLX decode with
+`--device mps --dtype bfloat16 --mps-execution-backend mlx-compiled`.
+Build the Metal extension first and keep the default page size 1.
+Torch retains model loading, KV ownership and sampling; prefill remains eager
+MPS. Native MLX is unchanged and remains faster for the measured batch-1 workload.
+See the [Apple Silicon guide](/docs/hardware-platforms/apple_metal#experimental-direct-compiled-mlx-decode)
+for setup and limitations.
+
 ### 3.2 Configuration Tips
 
 - **Qwen3-8B on B300 (BF16, TP1):** SGLang selects `trtllm_mha` by default when speculative decoding is disabled. If your launch command sets `--attention-backend flashinfer`, remove it or replace it with `--attention-backend trtllm_mha`.

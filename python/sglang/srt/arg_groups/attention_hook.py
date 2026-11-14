@@ -141,11 +141,18 @@ def handle_attention_backend_compatibility(server_args: Any):
                 cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
             ),
         )
+        prefill_backend = Backend.DISABLED
+        if cfg.device == "mps" and cfg.mps_execution_backend == "mlx-compiled":
+            if (
+                (Phase.PREFILL, "backend") not in server_args._cuda_graph_config_locked
+                or cfg.cuda_graph_config.prefill.backend == Backend.FULL
+            ):
+                prefill_backend = Backend.FULL
         declare_resolution(
             server_args,
             "_handle_attention_backend_compatibility",
             cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                cfg.cuda_graph_config, Phase.PREFILL, backend=prefill_backend
             ),
         )
 
