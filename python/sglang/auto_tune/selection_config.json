@@ -1,0 +1,32 @@
+{
+  "sglang_custom_allreduce": {
+    "opener": "custom_allreduce",
+    "kind": "sglang",
+    "lift_cap": false
+  },
+  "aiter_custom_allreduce": {
+    "opener": "custom_allreduce",
+    "kind": "aiter",
+    "lift_cap": false
+  },
+  "custom_allreduce_v2": {
+    "opener": "custom_allreduce_v2"
+  },
+  "nccl": {
+    "opener": "nccl"
+  },
+  "torch_symm_mem": {
+    "opener": "torch_symm_mem"
+  },
+  "quick_allreduce_INT4": {
+    "opener": "quick_allreduce",
+    "impl": "hip",
+    "quant": "INT4",
+    "cast_bf16_to_fp16": true
+  },
+  "quick_allreduce_flydsl_INT4": {
+    "opener": "quick_allreduce_flydsl",
+    "impl": "flydsl",
+    "quant": "INT4"
+  }
+}
