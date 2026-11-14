@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_sglang_generate,
     calculate_metrics,
     set_global_args,
 )
@@ -112,8 +113,7 @@ class _StrictStringTokenizer:
 
 
 class TestBenchServingReasoningStream(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
+    def setUp(self):
         set_global_args(
             Namespace(
                 disable_stream=False,
@@ -124,7 +124,12 @@ class TestBenchServingReasoningStream(CustomTestCase):
             )
         )
 
-    def _run(self, chunks):
+    def _run(
+        self,
+        chunks,
+        request_func=async_request_openai_chat_completions,
+        path="/v1/chat/completions",
+    ):
         port = _free_port()
 
         class Handler(_SSEHandler):
@@ -137,7 +142,7 @@ class TestBenchServingReasoningStream(CustomTestCase):
         try:
             req = RequestFuncInput(
                 prompt="hello",
-                api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
+                api_url=f"http://127.0.0.1:{port}{path}",
                 prompt_len=1,
                 output_len=64,
                 model="dummy-model",
@@ -145,10 +150,35 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 image_data=None,
                 extra_request_body={},
             )
-            return asyncio.run(async_request_openai_chat_completions(req))
+            return asyncio.run(request_func(req))
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_native_generate_stream_error(self):
+        set_global_args(
+            Namespace(
+                temperature=0.0,
+                top_p=1.0,
+                disable_ignore_eos=True,
+                disable_stream=False,
+                return_logprob=False,
+                return_routed_experts=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                header=None,
+            )
+        )
+        message = "The input is longer than the model's context length."
+        out = self._run(
+            [{"error": {"message": message}}],
+            async_request_sglang_generate,
+            "/generate",
+        )
+        self.assertFalse(out.success)
+        self.assertIn(message, out.error)
+        self.assertEqual(out.output_len, 0)
 
     def test_reasoning_only_stream_populates_metrics(self):
         chunks = [
