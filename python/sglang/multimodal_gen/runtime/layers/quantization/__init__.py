@@ -22,6 +22,13 @@ QuantizationMethods = Literal[
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
+# Methods that quantize a BF16/FP16 checkpoint after it loads, rather than
+# reading a format fixed on disk. Only these take --quantization-ignored-layers
+# and only these can be mixed per layer by --quantization-overrides.
+ONLINE_QUANTIZATION_METHODS: frozenset[str] = frozenset(
+    {"fp8", "mxfp4", "convrot_int8"}
+)
+
 
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
@@ -72,6 +79,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
 
 __all__ = [
+    "ONLINE_QUANTIZATION_METHODS",
     "QuantizationMethods",
     "QuantizationConfig",
     "get_quantization_config",

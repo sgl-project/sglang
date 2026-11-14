@@ -529,6 +529,39 @@ sglang generate \
 
 Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantized if its prefix contains any of the given patterns.
 
+### Mixing Formats Per Layer
+
+`--quantization` picks one online format for every linear in the component.
+`--quantization-overrides` routes named layers to a different online format, so
+most of a transformer can run narrow while the layers that carry the most
+quality run wide:
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
+  --quantization mxfp4 \
+  --quantization-overrides blocks.0=fp8 blocks.1=fp8 '*.ffn.fc_out=fp8' \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+Each entry is `<layer-pattern>=<format>`. A pattern without a glob character is
+matched the way `--quantization-ignored-layers` matches, on dotted path
+boundaries, so `blocks.1` claims `blocks.1.to_q` but not `blocks.10.to_q`. A
+pattern holding `*`, `?` or `[` is matched as a glob against the whole layer
+prefix, which is how a rule names a leaf across every block
+(`'*.ffn.fc_out=fp8'`).
+
+Entries are tried in order and the first match wins, so a specific rule placed
+ahead of a broader one overrides it. A layer no rule claims takes the
+`--quantization` format, and `--quantization-ignored-layers` outranks every
+rule.
+
+Both sides must be formats quantized after load (`fp8`, `mxfp4`,
+`convrot_int8`), because a pre-quantized checkpoint fixes each tensor's format
+on disk. The resolved plan is logged once per component after the model is
+built, including a warning for any pattern no layer matched.
+
 ## Transformers-managed Quantized Components
 
 Model components that already have a native Transformers loading path delegate

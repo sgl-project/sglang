@@ -602,6 +602,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             nunchaku_config=None,
             quantization=None,
             quantization_ignored_layers=None,
+            quantization_overrides=None,
             revision="test-revision",
             tp_size=1,
             dit_cpu_offload=False,

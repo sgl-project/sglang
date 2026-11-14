@@ -182,7 +182,10 @@ supported for the primary DiT. Do not mechanically replace it with
 actual component name, which is pipeline-specific. Use `--quantization` only
 to override the method inferred by the transformer loader, and
 `--quantization-ignored-layers` to keep matching transformer layers
-unquantized during online quantization.
+unquantized during online quantization. `--quantization-overrides
+{PATTERN}={METHOD}...` routes matching transformer layers to a different online
+method than `--quantization` selects, first matching entry winning; see
+[Mixing Formats Per Layer](/docs/sglang-diffusion/quantization#mixing-formats-per-layer).
 
 For a native text encoder:
 
