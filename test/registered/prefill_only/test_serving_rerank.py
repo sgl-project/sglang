@@ -13,6 +13,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 try:
     from sglang.srt.entrypoints.openai.serving_rerank import (
         OpenAIServingRerank,
+        _get_yes_no_token_ids,
         _is_qwen3_reranker_template,
         _qwen3_rerank_score,
         _render_jinja_chat_template,
@@ -127,6 +128,37 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
     def test_helper_qwen3_rerank_score(self):
         self.assertAlmostEqual(_qwen3_rerank_score(0.9, 0.1), 0.9)
         self.assertAlmostEqual(_qwen3_rerank_score(0.0, 0.0), 0.0)
+
+    def test_helper_get_yes_no_token_ids_rejects_unk_and_duplicates(self):
+        # 1. Valid single-token encode result is returned directly.
+        tok = Mock()
+        tok.unk_token_id = 0
+        tok.encode.side_effect = lambda s, add_special_tokens=False: (
+            [101] if s == "yes" else [102]
+        )
+        self.assertEqual(_get_yes_no_token_ids(tok), (101, 102))
+
+        # 2. If encode returns unk_token_id, fall through to convert_tokens_to_ids.
+        tok = Mock()
+        tok.unk_token_id = 0
+        tok.encode.return_value = [0]
+        tok.convert_tokens_to_ids.side_effect = lambda s: 201 if s == "yes" else 202
+        self.assertEqual(_get_yes_no_token_ids(tok), (201, 202))
+
+        # 3. Multi-token encode + convert_tokens_to_ids returning unk_token_id
+        # must fall back to (9693, 2152) instead of returning (unk, unk).
+        tok = Mock()
+        tok.unk_token_id = 3
+        tok.encode.return_value = [10, 20]
+        tok.convert_tokens_to_ids.return_value = 3
+        self.assertEqual(_get_yes_no_token_ids(tok), (9693, 2152))
+
+        # 4. Colliding token IDs (yes_id == no_id) must fall back to (9693, 2152).
+        tok = Mock()
+        tok.unk_token_id = None
+        tok.encode.return_value = [55]
+        tok.convert_tokens_to_ids.return_value = 55
+        self.assertEqual(_get_yes_no_token_ids(tok), (9693, 2152))
 
     def test_helper_render_jinja_chat_template(self):
         # Skip if jinja2 isn't installed in this environment.
