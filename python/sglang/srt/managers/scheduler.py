@@ -4247,9 +4247,6 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
-        # Admission gate: block batches during FLIP_MASK -> RECONFIG (stale expert map).
-        if self._elastic_scale_down_in_transition():
-            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
@@ -4327,6 +4324,11 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
+
+        # Admission gate: block batches during FLIP_MASK -> RECONFIG (stale expert map).
+        # Below the merge, else last tick's launched prefill never joins running_batch.
+        if self._elastic_scale_down_in_transition():
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch, staged)

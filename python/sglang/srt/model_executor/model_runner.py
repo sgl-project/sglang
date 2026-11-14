@@ -658,7 +658,7 @@ class ModelRunner:
     def _joiner_ready_is_deferred(self) -> bool:
         """Defer ready to capture; it resolves the graph config survivors all-gather."""
         return (
-            get_exec().moe.is_ep_scale_joiner
+            get_exec().moe.is_ep_offset_joiner
             and not self.is_draft_worker
             and self._elastic_cuda_graph_enabled()
         )
@@ -1319,7 +1319,9 @@ class ModelRunner:
         #     )
 
         #     warmup_all_flashinfer_megamoe_layers(self.model)
-        is_scale_joiner = get_exec().moe.is_ep_scale_joiner and not self.is_draft_worker
+        is_scale_joiner = (
+            get_exec().moe.is_ep_offset_joiner and not self.is_draft_worker
+        )
         defer_decode_capture = (
             is_scale_joiner
             and capture_decode_cuda_graph
