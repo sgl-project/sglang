@@ -125,7 +125,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
     "enable_trace",
-    "warmups",
     "completion_template",
     "hf_chat_template_name",
     "enable_custom_logit_processor",
@@ -134,8 +133,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "lora_paths",
     "tokenizer_mode",
     "tokenizer_backend",
-    # Python warns on long GCs only when this is positive.
-    "gc_warning_threshold_secs",
     "tokenizer_metrics_allowed_custom_labels",
     # The Rust listener speaks HTTP/1 only.
     "enable_http2",
@@ -162,7 +159,6 @@ def rust_server_unsupported_args(
 
     An argument counts as set when it differs from its default; where the
     default is off (``None``, ``False`` or empty), any falsy value is off too.
-    A threshold Python disables when not positive is set only when positive.
     """
     cfg = resolving_view(server_args)
     defaults = {
@@ -173,9 +169,7 @@ def rust_server_unsupported_args(
         if name in honored:
             continue
         value, default = getattr(cfg, name), defaults[name]
-        if name == "gc_warning_threshold_secs":
-            is_set = value > 0
-        elif default is None or default is False or default == []:
+        if default is None or default is False or default == []:
             is_set = bool(value)
         else:
             is_set = value != default

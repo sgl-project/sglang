@@ -176,6 +176,7 @@ class TestPrefillAdder(CustomTestCase):
             max_new_tokens=max_new_tokens, ignore_eos=False
         )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.arrival_processed_tokens = 0
         req.retracted_stain = False
         req.host_hit_length = 0
         req.window_host_hit_lengths = {}
@@ -282,7 +283,11 @@ class TestPrefillAdder(CustomTestCase):
             req.full_untruncated_fill_ids = list(range(length))
             req.num_matched_prefix_tokens = 0
         adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
-            continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+            continuation,
+            waiting,
+            adder.rem_chunk_tokens,
+            adder.page_size,
+            processed_tokens=0,
         )
         self.assertIs(adder.add_chunked_req(continuation), continuation)
         self.assertEqual(continuation.extend_len, 2560)
