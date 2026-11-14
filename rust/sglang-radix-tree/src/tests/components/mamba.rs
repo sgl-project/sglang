@@ -612,6 +612,53 @@ fn write_back_reinsert_defers_the_mamba_backup_to_eviction() {
 }
 
 #[test]
+fn linker_branch_checkpoint_on_stored_node_emits_a_state_offload() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_enable_external_cache_linker(true).unwrap();
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params_mamba(&key, &[10, 11, 12, 13], Some(7)));
+    let leaf = tc.match_prefix(&match_params(&key)).best_match_node_id;
+    let root = tc.arena.node(tc.arena.root()).id;
+    tc.mark_external_cache_stored_path(leaf, root).unwrap();
+
+    let prefix = vec![1, 2];
+    let result = tc.insert(&insert_params_mamba(&prefix, &[10, 11], Some(8)));
+    let branch = tc.match_prefix(&match_params(&prefix)).best_match_node_id;
+    let backups = result
+        .cache_actions
+        .iter()
+        .filter_map(|action| action.as_any().downcast_ref::<BackupKV>())
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(backups[0].node_ids, vec![branch]);
+    assert!(
+        tc.build_external_linker_offload_transfers(branch)
+            .unwrap()
+            .is_none()
+    );
+    let transfers = tc
+        .build_external_linker_state_offload_transfers(branch)
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].name, PoolName::Mamba);
+    assert!(
+        transfers[0]
+            .device_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[8i64]))
+    );
+
+    let again = tc.insert(&insert_params_mamba(&prefix, &[10, 11], Some(9)));
+    assert!(
+        !again
+            .cache_actions
+            .iter()
+            .any(|action| action.as_any().is::<BackupKV>())
+    );
+}
+
+#[test]
 fn tombstone_refill_moves_the_node_from_host_to_device_lru() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
