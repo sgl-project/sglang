@@ -131,6 +131,21 @@ class TestBatchInvariantOps(CustomTestCase):
             if original_mode is not None:
                 deep_gemm.use_deterministic_algorithms(original_mode)
 
+    def test_linear_bias_on_column_slice(self):
+        """A biased linear on a column slice of a wider activation (row stride > K)
+        must give a row the same output alone and in a batch."""
+        generator = torch.Generator(device=device_type).manual_seed(0)
+        K, N = 48, 1536
+        x = torch.randn(8, K + 32, dtype=torch.bfloat16, generator=generator)[:, :K]
+        weight = torch.randn(N, K, dtype=torch.bfloat16, generator=generator)
+        bias = torch.randn(N, dtype=torch.bfloat16, generator=generator)
+        with set_batch_invariant_mode(True):
+            ref = torch.nn.functional.linear(x[:1], weight, bias)
+            for batch_size in (2, 8):
+                with self.subTest(batch_size=batch_size):
+                    out = torch.nn.functional.linear(x[:batch_size], weight, bias)
+                    torch.testing.assert_close(out[:1], ref, rtol=0, atol=0)
+
     def test_small_matrices(self):
         """Test batch invariance with small matrix sizes"""
         test_cases = [
