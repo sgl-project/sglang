@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Union
 
 from sglang.srt.debug_utils import cuda_coredump
-from sglang.srt.utils.common import kill_process_tree
+from sglang.srt.utils.process import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
 
 # Configure logger to output to stdout

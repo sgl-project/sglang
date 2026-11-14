@@ -5,7 +5,7 @@ python3 -m unittest test_pp_with_hicache.TestPPWithHiCache.test_eval_accuracy
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=143, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=143, stage="extra-b", runner_config="4-gpu-h100")
 
 import os
 import subprocess
@@ -99,6 +99,8 @@ class TestPPWithHiCache(unittest.TestCase):
                     "python3",
                     "-m",
                     "mooncake.http_metadata_server",
+                    "--host",
+                    "127.0.0.1",
                     "--port",
                     str(cls._mooncake_metadata_port),
                 ],

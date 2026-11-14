@@ -95,10 +95,9 @@ Docker is also recommended for AMD GPUs. Use a ROCm image matched to your GPU an
 
 For **Strix Halo / gfx1151**, use `rocm/sgl-dev:*-gfx1151*` (image sets `SGLANG_USE_AITER=0`) and pass `--attention-backend torch_sdpa --num-gpus 1`. Do not use AITER on wave32 gfx115x. See the Strix Halo section in [AMD GPUs](../hardware-platforms/amd_gpu).
 
-## Platform-Specific: MUSA (Moore Threads GPUs)
 ## Moore Threads GPUs (MUSA)
 
-For Moore Threads GPUs (MTGPU) with the MUSA software stack, follow the platform guide first. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:
+For Moore Threads GPUs (MTGPU) with the MUSA software stack, follow the [Moore Threads GPU guide](/docs/hardware-platforms/mthreads_gpu) first. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:
 
 ```bash Command
 # Clone the repository

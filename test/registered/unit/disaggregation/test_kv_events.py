@@ -9,8 +9,10 @@ the router can subscribe per replica (the `dp_size` it reads from
 
 import atexit
 import json
+import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import msgspec
 import zmq
@@ -84,6 +86,26 @@ class TestLocalKvEventSource(CustomTestCase):
                     break
             else:
                 self.fail("No event received from the advertised local source")
+
+
+class TestOffsetEndpointPort(CustomTestCase):
+    def test_ipc_endpoint_gets_a_dp_suffix(self):
+        self.assertEqual(
+            ZmqEventPublisher.offset_endpoint_port("ipc:///tmp/kv_events", 2),
+            "ipc:///tmp/kv_events_dp2",
+        )
+
+
+class TestShutdown(CustomTestCase):
+    def test_full_queue_does_not_skip_socket_cleanup(self):
+        with patch.object(threading.Thread, "start"):
+            publisher = ZmqEventPublisher(
+                attn_dp_rank=0, endpoint="inproc://kv-shutdown-test", max_queue_size=1
+            )
+        atexit.unregister(publisher.shutdown)
+        publisher.publish(KVEventBatch(ts=1.0, events=[]))
+        publisher.shutdown()
+        self.assertTrue(publisher._pub.closed)
 
 
 class TestResolveLoadPubRange(CustomTestCase):

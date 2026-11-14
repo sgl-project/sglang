@@ -1,16 +1,18 @@
 import functools
 import logging
+import os
 import sys
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
@@ -191,11 +193,31 @@ def set_default_server_args(args: "ServerArgs"):
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        if use_mla_backend(args):
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        # Only DSV4 and MLA have migrated to AIV transfers so far;
+        # all remaining paths will migrate soon.
+        if is_deepseek_v4(model_config_of(args).hf_config):
+            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
             declare_resolution(
                 args,
                 "set_default_server_args",
-                hicache_mem_layout="page_first_kv_split",
+                hicache_mem_layout=(
+                    "layer_first"
+                    if cfg.hicache_mem_layout == "layer_first"
+                    else "page_first"
+                ),
+            )
+        elif use_mla_backend(args):
+            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                hicache_mem_layout=(
+                    "layer_first_kv_split"
+                    if cfg.hicache_mem_layout in ("layer_first", "layer_first_kv_split")
+                    else "page_first_kv_split"
+                ),
             )
         else:
             declare_resolution(
@@ -214,10 +236,9 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
-        logger.warning("NPU custom kernel packages unavailable: %s", e)
+        logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
 
     import torch_npu
 
@@ -229,6 +250,7 @@ def init_npu_backend():
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
         torch_npu.npu.config.allow_internal_format = True
+        torch.cuda.get_device_capability = lambda device=None: (0, 0)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
@@ -387,7 +409,7 @@ def lazy_init_zbal_gva_mem(
         return 1
 
     global gva_is_inited
-    from sglang.srt.utils.common import get_available_gpu_memory
+    from sglang.srt.utils.device import get_available_gpu_memory
 
     # TODO need to use allgather if you want use total_memory stats from mem_get_info as unbalance os
     total_memory = 61.2  # 2.5GB for other (workspace & os) outside torch

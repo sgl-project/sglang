@@ -11,7 +11,6 @@ import pytest
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
@@ -23,7 +22,7 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     REFINER_PIPELINE_NAME,
     LingBotVideoMoESamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.registry import _get_config_info, get_model_info
 from sglang.multimodal_gen.runtime.distributed import sp_shard_utils as sps
 from sglang.multimodal_gen.runtime.layers.moe import (
@@ -41,7 +40,6 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoBlock,
     LingBotVideoTransformer3DModel,
     _joint_position_ids,
-    make_joint_position_ids,
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
@@ -574,6 +572,19 @@ def test_preprocess_packs_w1_w3_into_w13_weight():
     torch.testing.assert_close(out["blocks.0.ffn.experts.w2"], w2)
 
 
+def _one_prompt_position_ids(text_len, grid_t, grid_h, grid_w, device):
+    """The per-sample (video; text) positions: video t after the prompt, text on t."""
+    tt = torch.arange(grid_t, device=device, dtype=torch.int32) + (text_len + 1)
+    hh = torch.arange(grid_h, device=device, dtype=torch.int32)
+    ww = torch.arange(grid_w, device=device, dtype=torch.int32)
+    grid = torch.stack(torch.meshgrid(tt, hh, ww, indexing="ij"), dim=-1).flatten(0, 2)
+    text_t = torch.arange(text_len, device=device, dtype=torch.int32) + 1
+    text_pos = torch.stack(
+        [text_t, torch.zeros_like(text_t), torch.zeros_like(text_t)], dim=-1
+    )
+    return torch.cat([grid, text_pos], dim=0)
+
+
 def test_joint_position_ids_match_reference_and_cover_padding():
     dev = torch.device("cpu")
     gt, gh, gw = 2, 3, 4
@@ -581,13 +592,13 @@ def test_joint_position_ids_match_reference_and_cover_padding():
 
     # B==1, no padding: byte-identical to the per-sample reference.
     vec = _joint_position_ids(torch.tensor([5]), gt, gh, gw, 5, dev)
-    torch.testing.assert_close(vec, make_joint_position_ids(5, gt, gh, gw, dev))
+    torch.testing.assert_close(vec, _one_prompt_position_ids(5, gt, gh, gw, dev))
 
     # B==1 with padding: real tokens match the text_len=4 reference; the extra
     # padding row is (0,0,0). vec has n_video+L rows (matches q for B*S).
     vec_p = _joint_position_ids(torch.tensor([4]), gt, gh, gw, 5, dev)
     torch.testing.assert_close(
-        vec_p[: n_video + 4], make_joint_position_ids(4, gt, gh, gw, dev)
+        vec_p[: n_video + 4], _one_prompt_position_ids(4, gt, gh, gw, dev)
     )
     torch.testing.assert_close(
         vec_p[n_video + 4 :], torch.zeros((1, 3), dtype=torch.int32)
@@ -602,7 +613,7 @@ def test_joint_position_ids_match_reference_and_cover_padding():
         start = i * (n_video + L)
         real = n_video + t
         torch.testing.assert_close(
-            vec_b[start : start + real], make_joint_position_ids(t, gt, gh, gw, dev)
+            vec_b[start : start + real], _one_prompt_position_ids(t, gt, gh, gw, dev)
         )
 
 

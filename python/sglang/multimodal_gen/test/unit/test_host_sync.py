@@ -253,7 +253,7 @@ def _run_request(device, wrap_device_tensor=lambda t: t, guard=nullcontext()):
         guidance_rescale=0.0,
         is_cfg_negative=False,
         return_trajectory_latents=False,
-        sampling_params=SimpleNamespace(cfg_gate_step=None),
+        sampling_params=SimpleNamespace(cfg_gate_step=None, quality="lossless"),
         extra={},
         metrics=None,
         perf_dump_path=None,

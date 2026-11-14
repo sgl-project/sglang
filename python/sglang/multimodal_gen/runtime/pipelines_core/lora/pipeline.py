@@ -341,7 +341,7 @@ class LoRAPipeline(ComposedPipelineBase):
         elif target is not None:
             if use_module_names_only:
                 if target == "all":
-                    module_names = ["transformer", "transformer_2"]
+                    module_names = ["transformer", "transformer_2", "critic"]
                 elif target in ["transformer", "transformer_2", "critic"]:
                     module_names = [target]
             else:
@@ -505,7 +505,7 @@ class LoRAPipeline(ComposedPipelineBase):
         model half converted, and covers the dynamic ``set_lora`` API as well as
         a startup ``--lora-path``.
         """
-        for module_name in ("transformer", "transformer_2"):
+        for module_name in ("transformer", "transformer_2", "fake_score_transformer"):
             module = self.modules.get(module_name)
             if module is None:
                 continue
@@ -748,7 +748,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 return False
             if has_unmergeable_weights:
                 logger.info(
-                    "Using dynamic LoRA for %s because its quantized weights cannot be merged in place.",
+                    "Using dynamic LoRA for %s because its quantized or AMX-packed weights cannot be merged in place.",
                     module_name,
                 )
                 return False
@@ -756,7 +756,7 @@ class LoRAPipeline(ComposedPipelineBase):
         if has_unmergeable_weights:
             raise ValueError(
                 f"LoRA merge mode is unavailable for {module_name} because its "
-                "quantized weights cannot be updated in place; use merge mode 'dynamic'"
+                "quantized or AMX-packed weights cannot be updated in place; use merge mode 'dynamic'"
             )
         if uses_dtensor_weights:
             logger.warning(
@@ -1171,8 +1171,14 @@ class LoRAPipeline(ComposedPipelineBase):
             elif (
                 alpha is not None and self.loaded_adapter_alphas.get(nickname) != alpha
             ):
-                self.loaded_adapter_alphas[nickname] = alpha
+                # Reload: fused GQA groups bake the alpha into lora_B at load time.
                 adapter_updated = True
+                self.load_lora_adapter(
+                    self.loaded_adapter_paths[nickname],
+                    nickname,
+                    rank,
+                    lora_alpha=alpha,
+                )
 
         # Group by target to apply separately
         target_to_indices = {}
@@ -1205,11 +1211,6 @@ class LoRAPipeline(ComposedPipelineBase):
             first_effective_merge_weights = self._should_merge_lora_for_layers(
                 first_module_name, first_lora_layers_dict, merge_mode
             )
-            if not first_effective_merge_weights and len(tgt_nicknames) > 1:
-                raise ValueError(
-                    "Dynamic LoRA currently supports only one adapter per target. "
-                    "Use merge_mode='merge' for multiple adapters."
-                )
 
             merge_weights_by_module = {}
             for module_name, lora_layers_dict in target_modules:
@@ -1226,10 +1227,23 @@ class LoRAPipeline(ComposedPipelineBase):
                     module_name,
                     tgt_nicknames,
                     tgt_strengths,
-                    merge_weights_by_module[module_name],
+                    merge_weights_by_module[module_name]
+                    # auto already kept this adapter unmerged; that state matches
+                    and not (
+                        merge_mode == "auto"
+                        and self._auto_merge_rounds_away(
+                            module_name,
+                            lora_layers_dict,
+                            tgt_nicknames,
+                            tgt_paths,
+                            rank,
+                            tgt_strengths,
+                            measure=False,
+                        )
+                    ),
                     adapter_updated,
                 )
-                for module_name, _ in target_modules
+                for module_name, lora_layers_dict in target_modules
             ):
                 logger.info("LoRA configuration matches exactly, skipping")
                 continue
@@ -1250,7 +1264,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     if (
                         effective_merge_weights
                         and merge_mode == "auto"
-                        and len(tgt_nicknames) == 1
                         and self._auto_merge_rounds_away(
                             module_name,
                             lora_layers_dict,
@@ -1333,9 +1346,11 @@ class LoRAPipeline(ComposedPipelineBase):
         paths: list[str | None],
         rank: int,
         strengths: list[float],
+        measure: bool = True,
     ) -> bool:
         """Whether merge_mode "auto" should keep this adapter unmerged on the
-        module. It is attached unmerged to measure, which is where it stays."""
+        module. It is attached unmerged to measure, which is where it stays.
+        With ``measure=False`` only a cached result is used."""
         key = (
             module_name,
             tuple(paths),
@@ -1343,6 +1358,8 @@ class LoRAPipeline(ComposedPipelineBase):
             tuple(self.loaded_adapter_alphas.get(n) for n in nicknames),
         )
         if key not in self.auto_merge_rounding_loss:
+            if not measure:
+                return False
             self._apply_lora_to_layers(
                 lora_layers,
                 nicknames,
@@ -1508,7 +1525,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         if layer.merged:
                             layer.unmerge_lora_weights()
                         layer.disable_lora = False
-                        layer.strength = strength
+                        layer.set_dynamic_strength(strength)
                     self.is_lora_merged[module_name] = False
                     self._record_merge_strength(module_name, strength)
                     logger.info(

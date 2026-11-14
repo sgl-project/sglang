@@ -3,6 +3,11 @@
 
 use serde_json::Value;
 
+/// `protocol.ReasoningEffortTier`.
+pub(crate) const EFFORT_TIERS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
+];
+
 /// The request's effort: `reasoning.effort`, then `reasoning.reasoning_effort`,
 /// then the top-level `reasoning_effort`.
 pub fn requested_effort(request: &Value) -> Option<&Value> {

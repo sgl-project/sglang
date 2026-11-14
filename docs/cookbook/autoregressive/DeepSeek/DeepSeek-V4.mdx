@@ -276,8 +276,7 @@ DeepSeek-V4 uses hybrid compressed attention for long-context efficiency. `SGLAN
 ```bash Command
 SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 \
 sglang serve \
-  --model-path deepseek-ai/DeepSeek-V4-Flash \
-  <other args>
+  --model-path deepseek-ai/DeepSeek-V4-Flash
 ```
 
 This BF16 setting applies only to the compressed attention state pools and reduces the GPU memory footprint of each compressed-state slot. It does not change model weight precision or the main KV cache dtype. With automatic pool sizing and no explicit capacity cap, the same memory budget holds more slots, and the startup log shows larger `c4_state` and `c128_state` pool sizes. Keep the default `float32` setting for the most conservative behavior.
@@ -393,6 +392,39 @@ Two options are available for running DeepSeek-V4 on Hopper:
 - **Converted FP8 checkpoints** (H100 and H200 only) — pre-repackaged FP8 weights at [`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8) and [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8) unlock DP-attention + DeepEP and richer parallelism (e.g. Pro TP=16 across 2 nodes).
 
 On these FP8 checkpoints you can additionally enable the all-FP8 **MegaMoE** path on SM90 for higher long-context / large-decode throughput — see the **SM90 (Hopper) FP8 MegaMoE** note in Configuration Tips below.
+
+The experimental native-H16 CuTe DSL sparse-prefill kernel can be selected on
+SM90 when tensor parallelism leaves exactly 16 query heads per rank:
+
+```bash Command
+MODEL_PATH=deepseek-ai/DeepSeek-V4-Pro
+
+sglang serve \
+  --model-path "$MODEL_PATH" \
+  --tp 8 \
+  --context-length 49152 \
+  --dsv4-prefill-backend cutedsl_h16
+```
+
+This path requires BF16 query and sparse-workspace tensors with 512-wide Q/K/V
+heads. It is used only for ordinary eager sparse prefill; the existing
+sparse-prefill threshold and environment selection still apply. Speculative
+forwards and prefill CUDA graphs, TBO, context-parallel prefill and bounded-replay tails retain
+the existing FlashMLA implementation. DeepSeek-V4.1 is not supported by this
+backend. The default
+`auto` backend is unchanged. For C128 layers the combined TOPK width is fixed
+from `--context-length` and
+padded to a multiple of 128, allowing different live chunk lengths to reuse the
+same compiled kernel. The first use of each distinct query-storage-head and
+TOPK bucket triggers its own JIT specialization, so warm up every bucket used
+by the serving configuration before measuring steady state. The padded C4 and
+C128 combined TOPK widths must not exceed 16384; the default 1M context needs
+a width of 8320. Unsupported configurations fail
+during server startup. When the live C128 width is smaller than the fixed width,
+the cached padded tensor adds
+`4 * TQ * fixed_combined_topk` bytes of int32 indices per active prefill chunk
+(for example, TQ=4096 at the 16384 limit adds 256 MiB), in addition to the live
+combined-indices tensor. No extra tensor is allocated when the widths match.
 
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
@@ -780,13 +812,10 @@ Adjustments are not in the commands below. Add them when they apply:
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
-SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
-SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
@@ -821,13 +850,10 @@ python3 -m sglang.launch_server \
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
-SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
-SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 SGLANG_SHARED_EXPERT_TP1=1 \
 SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
 SGLANG_DP_USE_GATHERV=1 \
@@ -871,14 +897,10 @@ python3 -m sglang.launch_server \
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
-SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
-SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
-SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
 SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=16384 \
 SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR=512 \
 AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023 \
@@ -929,7 +951,7 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-This command adds expert parallelism on top of the DP8 one. [§3.7](#3-7-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_USE_FLYDSL_MEGA_MOE`, `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only. `SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE=7` keeps each RCCL P2P group under 31 ops during EPLB rebalance.
+This command adds expert parallelism on top of the DP8 one. [§3.7](#3-7-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only. `SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE=7` keeps each RCCL P2P group under 31 ops during EPLB rebalance.
 
 ### 3.7 PD Disaggregation on MI355X (MORI-IO)
 
@@ -997,7 +1019,6 @@ The two commands below are that pair at concurrency 256, on one prefill node and
 
 ```bash Command
 GPU_MAX_HW_QUEUES=5 \
-SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
 SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
 MORI_SHMEM_HEAP_SIZE=8G \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
@@ -1099,7 +1120,7 @@ The rest of the difference is the prefill-only set already described above: `--c
 
 On the prefill env:
 
-- `SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1` is required. `--moe-a2a-backend megamoe` alone runs the DeepGEMM MegaMoE path, which has no ROCm kernel. Do not set this variable on decode: the scheduler reads it too, so it also changes how decode schedules batches.
+- On ROCm, `--moe-a2a-backend megamoe` runs Aiter MegaMoEv2.
 - `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` must be at least `--chunked-prefill-size / attn_dp_size`, here 65536 / 8. Below that SGLang reports no error and runs fused MoE for the extra tokens. 8192 is the default, so the command omits this variable. Set it explicitly if you increase the per-rank chunk size.
 - `MORI_SHMEM_HEAP_SIZE` sizes the MORI symmetric heap, where MegaMoEv2 allocates its dispatch and combine buffers. It needs about 0.51 GiB per 1024 tokens of MTPR — about 4.2 GiB at 8192 — and the 4 GiB default fails during CUDA graph capture. SGLang allocates the whole heap at the first MegaMoE forward pass, after the KV cache pool, so it consumes the GPU memory `--mem-fraction-static` left free whether MegaMoE fills it or not. 8 GiB fits next to `0.92`; [§3.6](#3-6-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) runs at `0.85` and can afford more.
 

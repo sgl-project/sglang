@@ -11,7 +11,7 @@ import triton.testing
 from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
     per_tensor_quant_fp8,
 )
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
 # Optional imports
 try:
@@ -26,7 +26,7 @@ from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 

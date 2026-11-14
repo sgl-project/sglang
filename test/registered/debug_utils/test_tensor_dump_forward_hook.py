@@ -11,9 +11,10 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
 from sglang.srt.distributed.parallel_state import get_default_distributed_backend
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import add_prefix, get_device
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase

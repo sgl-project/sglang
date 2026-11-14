@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=647, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=647, stage="nightly", runner_config="4-gpu-b200")
 
 MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 
@@ -52,7 +52,7 @@ class TestCuteDslFlashinferA2A(CustomTestCase):
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",
                 "--moe-a2a-backend",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
                 "--max-prefill-tokens",
                 "4096",
                 "--disable-radix-cache",

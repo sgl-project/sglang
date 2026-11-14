@@ -160,7 +160,9 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
 
         if graph_key not in self.block_output:
             self.block_output[graph_key] = x_3d
-            self.block_input[graph_key] = x_3d
+            # Vision blocks update their input in place. Capture must not
+            # modify the caller's tensor before the first replay copies it.
+            self.block_input[graph_key] = x_3d.clone()
             self.block_ws[graph_key] = torch.empty(
                 seq_len,
                 num_heads,
@@ -208,7 +210,9 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         if output_indices is not None:
             out = out.index_select(0, output_indices)
 
-        return out
+        # Cache entries and split views outlive this invocation. Graph replay
+        # (including another graph using the shared pool) may overwrite out.
+        return out.clone() if output_indices is None else out
 
     def run(
         self,

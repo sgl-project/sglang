@@ -2,10 +2,8 @@
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 
 REFINER_PIPELINE_NAME = "LingBotVideoRefinerPipeline"
 # The reference base pass for the refiner.
@@ -40,7 +38,7 @@ class LingBotVideoMoESamplingParams(SamplingParams):
     def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any]:
         # The image and text conditioning stages build one sample,
         # so each output becomes its own request, as the offline path does.
-        from sglang.multimodal_gen.runtime.entrypoints.utils import (
+        from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
             expand_request_outputs,
         )
 

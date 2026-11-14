@@ -10,7 +10,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
