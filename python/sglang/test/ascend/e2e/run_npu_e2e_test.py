@@ -355,6 +355,12 @@ def monitor_pod_logs(
     patterns = [re.compile(line_pattern) for line_pattern in pattern_lines]
     pattern_ok = re.compile(r"^OK$")
 
+    # [METRIC] lines are printed by dump_metric while the test runs, i.e. before
+    # the pod-side log is archived. Collect them from the stream so results do
+    # not depend on the pod winning the race against delete_pod() below.
+    streamed_metrics = {}
+    metric_pattern = re.compile(r"^\[METRIC\] (\S+)=(\S+)")
+
     process = None
     try:
         # Start kubectl logs process
@@ -386,6 +392,14 @@ def monitor_pod_logs(
                 if line:
                     line = line.rstrip("\n")
                     print(line)
+                    metric_match = metric_pattern.match(line)
+                    if metric_match:
+                        key, raw_value = metric_match.group(1), metric_match.group(2)
+                        try:
+                            raw_value = float(raw_value)
+                        except ValueError:
+                            pass
+                        streamed_metrics[key] = raw_value
                     # Check if current line matches expected pattern
                     if match_state < len(patterns) and patterns[match_state].match(
                         line
@@ -499,37 +513,48 @@ def monitor_pod_logs(
             except subprocess.TimeoutExpired:
                 process.kill()
 
+    return streamed_metrics
 
-def generate_metrics_json(metrics_data_file, test_case, status):
+
+def generate_metrics_json(metrics_data_file, test_case, status, streamed_metrics=None):
     """Collect [METRIC] lines from the log and write metrics.json.
 
     This writes ${metrics_data_file}/metrics.json only, which feeds the
     persistence-directory output (e.g. /root/.cache/tests/output/...).
     It is NOT consumed by CI artifacts (the former /tmp/metrics.json +
     'Upload metrics' path was removed).
+
+    ``streamed_metrics`` carries the [METRIC] values already parsed from the
+    live pod log; they are merged in because the archived test_output.log can
+    be missing when the pod is deleted as soon as the test finishes.
     """
     log_file = os.path.join(metrics_data_file, "test_output.log")
 
     metrics = {}
     baselines = {}
 
+    def _record_metric(key, value):
+        if key.endswith("_baseline"):
+            baselines[key[: -len("_baseline")]] = value
+        else:
+            metrics[key] = value
+
     if os.path.exists(log_file):
         with open(log_file, "r") as f:
             for line in f:
                 m = re.match(r"\[METRIC\] (\S+)=(\S+)", line.strip())
                 if m:
-                    key = m.group(1)
                     value = m.group(2)
                     try:
                         value = float(value)
                     except ValueError:
                         pass
-                    if key.endswith("_baseline"):
-                        baselines[key[:-9]] = value
-                    else:
-                        metrics[key] = value
+                    _record_metric(m.group(1), value)
     else:
         logger.warning(f"Metrics log file not found: {log_file}")
+
+    for key, value in (streamed_metrics or {}).items():
+        _record_metric(key, value)
 
     tc_name = test_case.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
@@ -576,6 +601,7 @@ def run_npu_e2e_test_case(
     trouble_shotting=False,
     transformers_version="",
     run_id: str = "",
+    container_patches: str = "",
     accuracy_dataset: str = "",
 ):
     """The method for running a npu e2e test case.
@@ -692,6 +718,7 @@ def run_npu_e2e_test_case(
                 "prefill_size": resource_info["prefill_size"],
                 "decode_size": resource_info["decode_size"],
                 "router_size": resource_info["router_size"],
+                "container_patches": container_patches,
                 "sglang_source_relative_path": sglang_source_relative_path,
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
@@ -738,8 +765,9 @@ def run_npu_e2e_test_case(
             logger.info("Pod not ready, maybe not enough resource")
 
         monitor_success = False
+        streamed_metrics = {}
         try:
-            monitor_pod_logs(
+            streamed_metrics = monitor_pod_logs(
                 kube_job_type, final_kube_job_name, kube_name_space, LOCAL_TIMEOUT
             )
             monitor_success = True
@@ -750,7 +778,9 @@ def run_npu_e2e_test_case(
             if metrics_data_file:
                 status = "pass" if monitor_success else "fail"
                 try:
-                    generate_metrics_json(metrics_data_file, test_case, status)
+                    generate_metrics_json(
+                        metrics_data_file, test_case, status, streamed_metrics
+                    )
                 except Exception as e:
                     logger.error(f"Failed to generate metrics JSON: {e}", exc_info=True)
     finally:
@@ -904,6 +934,14 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--container-patches",
+        type=str,
+        required=False,
+        default="",
+        help="Comma separated container patch sets applied inside every pod before the test. Empty keeps the image untouched.",
+    )
+
+    parser.add_argument(
         "--accuracy-dataset",
         type=str,
         required=False,
@@ -929,6 +967,7 @@ if __name__ == "__main__":
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
     run_id = args.run_id
+    container_patches = args.container_patches
     accuracy_dataset = args.accuracy_dataset
 
     kube_name_space = args.kube_name_space
@@ -960,5 +999,6 @@ if __name__ == "__main__":
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
         run_id=run_id,
+        container_patches=container_patches,
         accuracy_dataset=accuracy_dataset,
     )

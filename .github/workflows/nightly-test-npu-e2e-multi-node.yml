@@ -64,6 +64,11 @@ on:
         type: string
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
+      container_patches:
+        required: false
+        type: string
+        default: ""
+        description: "Comma separated container patch sets under scripts/ci/npu/patches. Empty keeps the image untouched."
       accuracy_dataset:
         required: false
         type: string
@@ -208,6 +213,18 @@ jobs:
             --kube-job-name-prefix ${KUBE_JOB_NAME} \
             --run-id ${{ github.run_id }}"
 
+          container_patches="${{ inputs.container_patches }}"
+          if [ "$container_patches" != "" ]; then
+            # The value is appended to a string that is later eval'ed, so it
+            # must be strictly validated here instead of only inside the pods.
+            if ! echo "${container_patches}" | grep -Eq '^[a-z0-9_]+(\.[a-z0-9_]+)*(,[a-z0-9_]+(\.[a-z0-9_]+)*)*$'; then
+              echo "Invalid container_patches: ${container_patches}"
+              exit 1
+            fi
+            echo "Container patches: ${container_patches}"
+            CMD="${CMD} --container-patches ${container_patches}"
+          fi
+
           accuracy_dataset="${{ inputs.accuracy_dataset }}"
           case "${accuracy_dataset}" in
             ""|gsm8k|gpqa_diamond) ;;
@@ -252,6 +269,16 @@ jobs:
 
           echo "Run command: ${CMD}"
           eval "${CMD}"
+
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-metrics-${{ inputs.test_config_name }}
+          # output/<branch>-<create_time>-<run_id>-<run_attempt>/<workflow>/<test_type>/<case>
+          path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
+          if-no-files-found: ignore
+          retention-days: 90
 
       - name: Post process
         if: always()

@@ -1,0 +1,193 @@
+# Key-model performance/accuracy data collection for NPU releases.
+#
+# Runs a curated matrix of multi-node PD cases through the same reusable
+# workflow as the nightly, so metrics land in the versioned shared-disk layout
+# (/root/.cache/tests/output/...) consumed by the data dashboard, and are also
+# uploaded as workflow artifacts for direct download.
+#
+name: Release Model Data (NPU)
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release-model-data-npu.yml"
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'NPU image used by the prefill/decode pods.'
+        required: false
+        type: string
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-mooncake-v2'
+
+concurrency:
+  group: npu-release-model-data-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: build-run-metadata
+    runs-on: ubuntu-latest
+    outputs:
+      run_start_metadata: ${{ steps.meta.outputs.run_start_metadata }}
+    steps:
+      - name: Build run metadata
+        id: meta
+        run: |
+          BRANCH_LABEL="${{ github.ref_name }}"
+          BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
+          # Same {branch_label, workflow_name, create_time} layout as the nightly
+          # pipeline, so release data shares the dashboard's directory scheme.
+          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
+          echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
+
+  collect:
+    name: ${{ matrix.name }}
+    needs: [metadata]
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          # DeepSeek-V4-Flash-0731-w8a8: one prefill node + one decode node,
+          # mooncake + TENT transport, GPQA accuracy.
+          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_mooncake_gpqa
+            test_type: accuracy
+            prefill_decode_deployment: separation
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+            # cann9.1.0-a3-mooncake-v2 already ships the mooncake + TENT transfer
+            # stack and the blake3 dependency, so no container patches are needed.
+          # Add performance / more key models here, e.g.:
+          # - name: <model>_w8a8_1p1d_32p_in1k_out1k
+          #   test_type: perf
+          #   prefill_decode_deployment: separation
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/<model>/<case>.py
+    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
+    with:
+      runner: linux-amd64-cpu-4
+      test_type: ${{ matrix.test_type }}
+      test_config_name: ${{ matrix.name }}
+      prefill_size: ${{ matrix.prefill_size }}
+      decode_size: ${{ matrix.decode_size }}
+      router_size: ${{ matrix.router_size }}
+      test_case: ${{ matrix.test_case }}
+      # PR-triggered runs have no inputs: they fall back to the dispatch image.
+      # The image already ships the sglang build, so the source install is off.
+      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-mooncake-v2' }}
+      install_sglang_from_source: false
+      prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
+      container_patches: ${{ matrix.container_patches }}
+      run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
+    secrets: inherit
+
+  publish:
+    name: publish-release-data
+    needs: [collect]
+    # Publish whatever was collected even if some case failed; skip on cancel.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download metrics artifacts
+        # No artifacts exist if every collect job failed before running the
+        # test; the consolidation step reports the empty result in that case.
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npu-metrics-*
+          path: release-data
+
+      - name: Consolidate release data
+        env:
+          INPUT_DIR: release-data
+          OUTPUT_JSON: release-data.json
+          OUTPUT_MARKDOWN: release-data.md
+          RUN_ID: ${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          input_dir = os.environ["INPUT_DIR"]
+
+          # Merge the downloaded per-case metrics.json files, one entry per
+          # (test_case, test_type) so a re-run overwrites instead of duplicating.
+          cases = {}
+          for filepath in sorted(
+              glob.glob(os.path.join(input_dir, "**", "metrics.json"), recursive=True)
+          ):
+              try:
+                  with open(filepath, encoding="utf-8") as f:
+                      data = json.load(f)
+              except (json.JSONDecodeError, OSError) as e:
+                  print(f"Warning: failed to read {filepath}: {e}")
+                  continue
+              test_case = data.get("test_case")
+              if not test_case:
+                  print(f"Warning: {filepath} has no test_case, skipped")
+                  continue
+              test_type = data.get("test_type", "unknown")
+              if (test_case, test_type) in cases:
+                  print(f"Warning: duplicate metrics for {(test_case, test_type)}")
+              cases[(test_case, test_type)] = {
+                  "test_case": test_case,
+                  "test_type": test_type,
+                  "metrics": data.get("metrics") or {},
+                  "baselines": data.get("baselines") or {},
+              }
+
+          ordered = [cases[key] for key in sorted(cases)]
+          payload = {
+              "source": "npu-key-model-release",
+              "run_id": os.environ["RUN_ID"],
+              "commit_sha": os.environ["COMMIT_SHA"],
+              "branch": os.environ["BRANCH"],
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "cases": ordered,
+          }
+          with open(os.environ["OUTPUT_JSON"], "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+
+          lines = ["# NPU Key Model Release Data", ""]
+          if not ordered:
+              lines.append("No metrics were collected.")
+          else:
+              lines.append("| Test case | Type | Metric | Value | Baseline |")
+              lines.append("| --- | --- | --- | --- | --- |")
+              for case in ordered:
+                  if not case["metrics"]:
+                      lines.append(
+                          f"| {case['test_case']} | {case['test_type']} | - | - | - |"
+                      )
+                      continue
+                  for name in sorted(case["metrics"]):
+                      baseline = case["baselines"].get(name, "-")
+                      lines.append(
+                          f"| {case['test_case']} | {case['test_type']} | "
+                          f"{name} | {case['metrics'][name]} | {baseline} |"
+                      )
+          markdown = "\n".join(lines) + "\n"
+          with open(os.environ["OUTPUT_MARKDOWN"], "w", encoding="utf-8") as f:
+              f.write(markdown)
+
+          print(f"Collected {len(ordered)} case(s) from {input_dir}")
+          print(markdown)
+          PY
+          cat release-data.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release data
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-release-data-${{ github.run_id }}
+          path: |
+            release-data.json
+            release-data.md
+          retention-days: 7

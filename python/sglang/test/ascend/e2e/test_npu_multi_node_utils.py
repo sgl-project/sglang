@@ -383,11 +383,23 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
     return False
 
 
-def _get_nnodes_from_args(args_list):
+def _get_arg_value(args_list, name):
     for i, arg in enumerate(args_list):
-        if arg == "--nnodes" and i + 1 < len(args_list):
-            return int(args_list[i + 1])
+        # Args are not always strings: launcher-injected values (ports,
+        # sizes) are ints and must not be probed for a "--key=value" prefix.
+        if not isinstance(arg, str):
+            continue
+        if arg == name and i + 1 < len(args_list):
+            return args_list[i + 1]
+        # Also accept the --key=value form.
+        if arg.startswith(f"{name}="):
+            return arg[len(name) + 1 :]
     return None
+
+
+def _get_nnodes_from_args(args_list):
+    nnodes = _get_arg_value(args_list, "--nnodes")
+    return int(nnodes) if nnodes is not None else None
 
 
 def _get_pod_ip_by_keyword(configmap_data, keyword):
@@ -554,9 +566,23 @@ def launch_pd_separation_node(model_config):
     # Generate prefill/decode run command
     service_args = list()
 
-    mf_addr = f"tcp://{master_prefill_ip}:24666"
-    os.environ["ASCEND_MF_STORE_URL"] = mf_addr
-    logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    # ASCEND_MF_STORE_URL belongs to the Ascend memfabric transfer path. Other
+    # backends (e.g. mooncake with TENT) configure their metadata through their
+    # own config (MC_TENT_CONF), so the legacy store URL must not leak into the
+    # launched process.
+    role_args = (
+        model_config["prefill_args"]
+        if role == "prefill"
+        else model_config["decode_args"]
+    )
+    transfer_backend = _get_arg_value(role_args, "--disaggregation-transfer-backend")
+    if transfer_backend in (None, "ascend"):
+        mf_addr = f"tcp://{master_prefill_ip}:24666"
+        os.environ["ASCEND_MF_STORE_URL"] = mf_addr
+        logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    else:
+        os.environ.pop("ASCEND_MF_STORE_URL", None)
+        logger.info(f"Skip ASCEND_MF_STORE_URL for transfer backend {transfer_backend}")
 
     if role == "prefill":
         # Current node is prefill
