@@ -1871,8 +1871,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
         """
         Args:
             sample (`torch.Tensor`): Input sample.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
+            sample_posterior (`bool`, *optional*, defaults to `False`):
+                Whether to sample from the posterior distribution instead of using its mode.
+            generator (`torch.Generator`, *optional*):
+                Generator used when sampling from the posterior.
         """
         x = sample
         posterior = self.encode(x).latent_dist
