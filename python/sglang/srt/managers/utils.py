@@ -274,8 +274,42 @@ class GenerationBatchResult:
             self.forward_auxiliary_output = None
 
 
+def get_preserve_last_token_id(tokenizer, is_generation: bool) -> Optional[int]:
+    """Token to keep last when auto-truncating: the separator for embedding models."""
+    if is_generation or tokenizer is None:
+        return None
+    # Non-HF tokenizers (e.g. TiktokenTokenizer) have no sep_token_id.
+    return getattr(tokenizer, "sep_token_id", None)
+
+
+def truncate_input_ids(
+    input_ids: List[int],
+    max_len: int,
+    preserve_last_token_id: Optional[int] = None,
+) -> List[int]:
+    """Head-truncate ``input_ids`` to ``max_len`` tokens.
+
+    If the input ended with ``preserve_last_token_id`` (e.g. a BERT ``[SEP]``),
+    that token stays last, as with Hugging Face ``truncation=True``; encoder
+    embedding models depend on it. ``None`` gives a plain head slice.
+    """
+    truncated = input_ids[:max_len]
+    if (
+        preserve_last_token_id is not None
+        and input_ids
+        and input_ids[-1] == preserve_last_token_id
+        and truncated
+        and truncated[-1] != preserve_last_token_id
+    ):
+        truncated[-1] = preserve_last_token_id
+    return truncated
+
+
 def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
+    req: Req,
+    max_req_input_len: int,
+    allow_auto_truncate: bool,
+    preserve_last_token_id: Optional[int] = None,
 ) -> Optional[str]:
     """Validate and potentially truncate input length.
 
@@ -283,6 +317,7 @@ def validate_input_length(
         req: The request containing input_ids to validate
         max_req_input_len: Maximum allowed input length
         allow_auto_truncate: Whether to truncate long inputs
+        preserve_last_token_id: See ``truncate_input_ids``.
 
     Returns:
         Error message if validation fails, None if successful
@@ -294,7 +329,11 @@ def validate_input_length(
                 "the max context length. Truncated. "
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            req.origin_input_ids = truncate_input_ids(
+                req.origin_input_ids,
+                max_len=max_req_input_len,
+                preserve_last_token_id=preserve_last_token_id,
+            )
             return None
         else:
             # OpenAI-compatible clients (e.g. LiteLLM) recognize a context
