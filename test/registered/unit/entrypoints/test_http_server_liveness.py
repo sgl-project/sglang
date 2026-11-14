@@ -11,7 +11,11 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -95,10 +99,13 @@ class TestHTTPServerLiveness(CustomTestCase):
                 return ping_response, generate_response
 
         try:
-            with patch.object(
-                http_server,
-                "_global_state",
-                http_server._GlobalState(manager, None, {}),
+            with (
+                published_topology(role="tokenizer"),
+                patch.object(
+                    http_server,
+                    "_global_state",
+                    http_server._GlobalState(manager, None, {}),
+                ),
             ):
                 ping_response, generate_response = asyncio.run(call_generate_and_ping())
         finally:
