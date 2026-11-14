@@ -17,7 +17,7 @@ from sglang.srt.layers.moe.topk import (
     fused_shared_expert_weight,
     is_routed_scaling_factor_fused_in_topk,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -101,9 +101,15 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
             return
 
 
-def init_lplb_solvers(*, model_config: ModelConfig) -> None:
+def init_lplb_solvers(*, model_config: ModelConfig, update_layer_ids=None) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.runtime_context import get_parallel
+
+    if get_device().device == "npu":
+        from sglang.srt.hardware_backend.npu.moe.lplb import init_npu_lplb_solvers
+
+        init_npu_lplb_solvers(model_config, update_layer_ids)
+        return
 
     # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
     # don't participate in the EP all-reduce (would deadlock under DP-

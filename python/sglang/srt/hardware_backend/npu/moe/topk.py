@@ -5,6 +5,7 @@ from sgl_kernel_npu.operators.moe import moe_gating_top_k
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
+from sglang.srt.hardware_backend.npu.moe.lplb import solve_npu_lplb
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _zero_topk_weights_padded_region,
@@ -135,7 +136,17 @@ def _finalize_topk_npu(
     num_shared = topk_config.num_shared_topk_slots
     routed_ids = topk_ids[:, :-num_shared] if num_shared else topk_ids
     capture_routed_experts_if_allowed(topk_config, layer_id, routed_ids)
-    routed_ids = topk_ids_logical_to_physical(routed_ids, expert_location_dispatch_info)
+    probabilities = None
+    if (
+        expert_location_dispatch_info is not None
+        and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
+    ):
+        probabilities = solve_npu_lplb(
+            routed_ids, expert_location_dispatch_info, layer_id, num_token_non_padded
+        )
+    routed_ids = topk_ids_logical_to_physical(
+        routed_ids, expert_location_dispatch_info, probabilities
+    )
     topk_ids = (
         torch.cat([routed_ids, topk_ids[:, -num_shared:]], dim=-1)
         if num_shared
