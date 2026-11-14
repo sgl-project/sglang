@@ -245,7 +245,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     ),
     (
         "diffusion.residual_gate_add_sum2",
-        KernelBackend.TRITON,
+        KernelBackend.KDA,
         "sglang.kernels.kda_kernels.residual_gate_add_jit:residual_gate_add_sum2",
         _CUDA_SM90_PLUS,
     ),
