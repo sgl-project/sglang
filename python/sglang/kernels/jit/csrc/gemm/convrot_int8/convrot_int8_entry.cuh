@@ -588,8 +588,15 @@ void dispatch_convrot_int8_gemm(const GemmOperands& op) {
     } else {
       run_convrot_int8_gemm_mma_sync<GemmShape<128, 128, 64>, GemmShape<64, 64, 64>, 5>(op);
     }
+  } else if (M >= 6144 && (op.K >= 8192 || N >= 16384)) {
+    // Measured on RTX 5090 (170 SMs): from M = 6144 on, the wide tile runs the long-K
+    // down projection and the wide up projection 3-8% faster; below that it leaves
+    // too few CTAs per SM and loses to the 128x128 tile.
+    run_convrot_int8_gemm_mma_sync<GemmShape<128, 256, 64>, GemmShape<64, 64, 64>, 3>(op);
   } else {
-    run_convrot_int8_gemm_mma_sync<GemmShape<128, 128, 64>, GemmShape<64, 64, 64>, 5>(op);
+    // Three stages (48 KB) fit two CTAs per SM, which hides the epilogue and the wave
+    // tail: 3-11% faster than five stages (80 KB, one CTA) from M = 512 to 8160.
+    run_convrot_int8_gemm_mma_sync<GemmShape<128, 128, 64>, GemmShape<64, 64, 64>, 3>(op);
   }
 }
 
