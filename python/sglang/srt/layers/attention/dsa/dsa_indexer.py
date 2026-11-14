@@ -15,8 +15,10 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     prepare_aiter_rope_caches,
 )
 from sglang.kernels.ops.attention.dsa.litetopk_prefill import (
+    FP8_INDEXER_MAX_SPAN,
     fp8_indexer_topk,
     is_fp8_indexer_supported,
+    is_fp8_indexer_topk_supported,
 )
 from sglang.kernels.ops.attention.topk_page_table import topk_page_table_transform_
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
@@ -472,16 +474,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
-        # Prefill top-k from the sampled-threshold fp8 indexer (kernels/ops/attention/dsa/litetopk_prefill): 32 or 64
-        # index heads, a supported top-k and no forced init / local tokens.
+        # Prefill top-k from the sampled-threshold fp8 indexer (kernels/ops/attention/dsa/litetopk_prefill): up to
+        # 64 index heads and a supported top-k; forced init / local tokens are kept outside the selection.
         self.use_prefill_lite_topk = (
             envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
             and envs.SGLANG_DSA_FUSE_TOPK.get()
             and is_fp8_indexer_supported()
-            and self.n_heads in (32, 64)
-            and self.index_topk in (512, 1024, 2048)
-            and self.num_init_tokens == 0
-            and self.num_local_tokens == 0
+            and is_fp8_indexer_topk_supported(
+                num_heads=self.n_heads,
+                topk=self.index_topk,
+                num_forced_tokens=self.num_init_tokens + self.num_local_tokens,
+            )
         )
         if dsa_shards_index_k() and (self.num_init_tokens or self.num_local_tokens):
             raise ValueError(
@@ -1774,9 +1777,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         k_offset = k_fp8.shape[0]
         # Short contexts keep the dense path: with fewer than ~8 x topk keys the sampled filter keeps most keys
         # and loses to DeepGEMM logits + top-k (measured on B200 / B300).
+        # A block spans at most k_offset keys (a conservative bound); past FP8_INDEXER_MAX_SPAN rows lose the sample.
         if (
             self.use_prefill_lite_topk
             and max_seq_len >= 8 * self.index_topk
+            and k_offset <= FP8_INDEXER_MAX_SPAN
             and isinstance(metadata, DSAIndexerMetadata)
             and not metadata.force_unfused_topk
         ):
@@ -1786,7 +1791,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 k_fp8,
                 k_scale,
                 ks,
-                ke,
+                # The dense top-k stops at ks + seq_lens_expanded; ERNIE's window shortens only those lengths.
+                torch.minimum(ke, ks + seq_lens_expanded),
                 metadata,
                 topk_result[:q_offset],
             )
@@ -1971,6 +1977,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             ke,
             self.index_topk,
             out_offsets=None if offsets is None else offsets[: out.shape[0]],
+            num_init_tokens=self.num_init_tokens,
+            num_local_tokens=self.num_local_tokens,
+            num_ctas=self._lite_topk_num_ctas(),
             out=out,
         )
         if metadata.topk_transform_method == TopkTransformMethod.PAGED:
@@ -1981,6 +1990,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 metadata.get_token_to_batch_idx()[: out.shape[0]],
                 metadata.attn_metadata.page_size,
             )
+
+    def _lite_topk_num_ctas(self) -> int:
+        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            return 0  # one CTA per SM
+        with self._with_real_sm_count():
+            # DeepGEMM's live count, as the dense logits get it: two-batch overlap lowers it, and on PP ranks
+            # _with_real_sm_count replaces it with the recv reserve (resolve_num_sms is cached at init).
+            return deep_gemm.get_num_sms()
 
     @staticmethod
     def _dcp_gather_index_k(

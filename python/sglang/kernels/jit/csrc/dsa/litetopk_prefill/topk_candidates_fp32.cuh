@@ -70,7 +70,7 @@ struct TopKCandidatesFP32Params {
 
 // The fp32 candidate top-k of one row: one CTA of 256 threads per row, `run` is the kernel
 // body.
-// kTopK_ Selected elements per row (512 / 1024 / 2048).
+// kTopK_ Selected elements per row: a multiple of 4 up to 2048 (512 / 1024 / 2048, or k minus the forced keys).
 template <uint32_t kTopK_>
 struct TopKCandidatesFP32Impl {
   static constexpr uint32_t kTopK = kTopK_;
@@ -86,7 +86,7 @@ struct TopKCandidatesFP32Impl {
   static constexpr uint32_t kStageBytes = kStageElems * sizeof(float);
   static constexpr uint32_t kElemsPerThread = kStageElems / kBlockSize;  // per stage
   static constexpr uint32_t kGroups = kElemsPerThread / 4;               // groups of 4 elements
-  static_assert(kTopK == 512 || kTopK == 1024 || kTopK == 2048);
+  static_assert(kTopK % 4 == 0 && 4 <= kTopK && kTopK <= 2048);  // the gather stores quads
   static_assert(kElemsPerThread % 4 == 0 && kElemsPerThread <= 16);  // one 16-bit mask per stage
   static_assert(kTopK % (4 * kBlockSize) == 0 || kTopK % 4 == 0);
   static_assert(kMaxCands < 0x10000);  // every counter packs in 16 bits
