@@ -1640,6 +1640,19 @@ def _fp8_kv_reference(inputs, q_lens, window=None, q=None, images=()):
     return torch.cat(outs)
 
 
+def _assert_fp8_kv_close(out, ref, fp8_mma):
+    """The fp16 cast matches the fp32 reference to 1e-2. FP8 MMA (hd 512, page 64,
+    intra-WG overlap) rounds Q and P to e4m3 pairs and sums QK in FP8 WGMMA, which
+    accumulates below fp32, so a few outputs land further out: bound the worst
+    and the mean error instead (observed on Gemma-4 shapes: 0.048 and 1.5e-3)."""
+    if not fp8_mma:
+        torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.01)
+        return
+    err = (out.float() - ref).abs()
+    assert err.max().item() <= 0.06, f"max abs error {err.max().item()}"
+    assert err.mean().item() <= 2.5e-3, f"mean abs error {err.mean().item()}"
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9,
     "Requires Hopper",
@@ -1650,8 +1663,9 @@ class TestFlashAttention4SM90(CustomTestCase):
 
         Covers both K/V producers (TMA at page 64, cp.async at page 1), both
         consumer schedules, split-KV with empty splits, decode, MTP verify and
-        chunked prefill over a cached prefix, at hd 512 (full attention, V cast
-        per warpgroup half) and hd 256 (Gemma-4 sliding window, V cast whole).
+        chunked prefill over a cached prefix, at hd 512 (full attention: FP8 MMA
+        at page 64 with intra-WG overlap, otherwise V cast per warpgroup half)
+        and hd 256 (Gemma-4 sliding window, V cast whole).
         """
         cases = (
             # page_size, q_len, cache lengths, num_splits, intra_wg_overlap
@@ -1693,11 +1707,35 @@ class TestFlashAttention4SM90(CustomTestCase):
                     intra_wg_overlap=overlap,
                 )
                 self.assertEqual(out.dtype, torch.bfloat16)
-                torch.testing.assert_close(
-                    out.float(),
+                _assert_fp8_kv_close(
+                    out,
                     _fp8_kv_reference(inputs, q_len, window),
-                    atol=0.01,
-                    rtol=0.01,
+                    fp8_mma=dim == 512 and page_size == 64 and overlap,
+                )
+
+    def test_fp8_kv_cache_fp16_q(self):
+        """fp16 Q on both hd 512 paths: FP8 MMA (page 64) keeps 8 of its 11
+        significant bits in the e4m3 pair, the cast (page 1) all of them."""
+        for page_size in (64, 1):
+            with self.subTest(page=page_size):
+                inputs = _gemma4_fp8_kv_inputs((2100, 3000), 2048, page_size, seed=2)
+                q = inputs["q"].half()
+                out, _ = _flash_attn_fwd(
+                    q,
+                    inputs["k"],
+                    inputs["v"],
+                    cu_seqlens_q=inputs["cu_seqlens_q"],
+                    seqused_k=inputs["cache_seqlens"],
+                    max_seqlen_q=2048,
+                    page_table=inputs["page_table"],
+                    softmax_scale=1.0,
+                    causal=True,
+                    k_descale=inputs["k_descale"],
+                    v_descale=inputs["v_descale"],
+                )
+                self.assertEqual(out.dtype, torch.float16)
+                _assert_fp8_kv_close(
+                    out, _fp8_kv_reference(inputs, 2048, q=q), fp8_mma=page_size == 64
                 )
 
     def test_fp8_kv_cache_rejects_smem_pv(self):
@@ -1762,7 +1800,7 @@ class TestFlashAttention4SM90(CustomTestCase):
                         q=q,
                         images=images,
                     )
-                    torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.01)
+                    _assert_fp8_kv_close(out, ref, fp8_mma=dim == 512)
 
     def test_fp8_kv_cache_decode_replays_in_cuda_graph(self):
         """A captured FP8-KV decode reads the cache and descales afresh on replay."""
@@ -1793,9 +1831,7 @@ class TestFlashAttention4SM90(CustomTestCase):
         for name in ("q", "k", "v", "k_descale", "v_descale"):
             inputs[name].copy_(fresh[name])
         graph.replay()
-        torch.testing.assert_close(
-            out.float(), _fp8_kv_reference(inputs, 1), atol=0.01, rtol=0.01
-        )
+        _assert_fp8_kv_close(out, _fp8_kv_reference(inputs, 1), fp8_mma=True)
 
     def test_paged_attention(self):
         cases = (
