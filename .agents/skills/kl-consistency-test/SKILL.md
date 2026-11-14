@@ -176,8 +176,8 @@ first layer whose output differs while its inputs are bit-identical.
 ```bash
 DUMPER_ENABLE=0 DUMPER_SERVER_PORT=reuse DUMPER_NON_INTRUSIVE_MODE=all \
 DUMPER_DIR=/path/to/dumps python3 -m sglang.launch_server ... \
-  --disable-cuda-graph --disable-prefill-cuda-graph
-curl -X POST localhost:PORT/dumper/configure -d '{"enable": true, "exp_name": "dec"}'
+  --disable-cuda-graph --disable-prefill-cuda-graph --admin-api-key "$ADMIN_API_KEY"
+curl -X POST localhost:PORT/dumper/configure -H "Authorization: Bearer $ADMIN_API_KEY" -d '{"enable": true, "exp_name": "dec"}'
 ```
 
 Five settings that are each required, and each fails silently if wrong:

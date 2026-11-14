@@ -1149,6 +1149,7 @@ async def clear_hicache_storage_backend():
 # example usage:
 # curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
 #  -H 'Content-Type: application/json' \
+#  -H "Authorization: Bearer $ADMIN_API_KEY" \
 #   -d '{
 #     "hicache_storage_backend": "file",
 #     "hicache_storage_backend_extra_config_json": "{}",

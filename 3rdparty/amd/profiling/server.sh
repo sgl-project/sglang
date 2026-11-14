@@ -17,4 +17,5 @@ loadTracer.sh python3 -m sglang.launch_server \
     --quantization fp8 \
     --tp 8 \
     --port 30000 \
+    --admin-api-key "${ADMIN_API_KEY}" \
     --disable-radix-cache 2>&1 | tee "$LOGFILE"

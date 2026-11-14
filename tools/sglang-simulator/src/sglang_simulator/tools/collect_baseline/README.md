@@ -9,6 +9,7 @@ command, which can run from any directory:
 sglang-simulator-collect \
   --collection-output-dir /tmp/baseline-001 \
   --model-path /path/to/model \
+  --admin-api-key "${ADMIN_API_KEY}" \
   --disable-overlap-schedule --host 127.0.0.1 --port 30000
 ```
 
@@ -16,10 +17,12 @@ Other flags are standard SGLang server arguments. The output directory must be
 new or empty. After warmup, collect a request with:
 
 ```bash
-curl -f -X POST http://127.0.0.1:30000/start_profile -H 'Content-Type: application/json' -d '{}'
+curl -f -X POST http://127.0.0.1:30000/start_profile -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer ${ADMIN_API_KEY}" -d '{}'
 curl -f http://127.0.0.1:30000/generate -H 'Content-Type: application/json' \
   -d '{"text":"Hello","sampling_params":{"max_new_tokens":16,"ignore_eos":true}}'
-curl -f -X POST http://127.0.0.1:30000/stop_profile -H 'Content-Type: application/json' -d '{}'
+curl -f -X POST http://127.0.0.1:30000/stop_profile -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer ${ADMIN_API_KEY}" -d '{}'
 ```
 
 Replace the generate call with your benchmark; wait for all requests before stop.

@@ -339,6 +339,7 @@ loadTracer.sh python3 -m sglang.launch_server \
     --quantization fp8 \
     --tp 8 \
     --port 30000 \
+    --admin-api-key "${ADMIN_API_KEY}" \
     --disable-radix-cache 2>&1 | tee "$LOGFILE"
 ```
 6. Open another terminal for the same docker container, and run the rpd enabled ./client.sh after you see "The server is fired up and is ready to roll!" message from server side terminal.
@@ -354,7 +355,7 @@ client.sh
 #!/bin/bash
 
 # Start profiling via API
-curl http://localhost:30000/start_profile -H "Content-Type: application/json"
+curl http://localhost:30000/start_profile -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_API_KEY}"
 
 # Benchmark serving using sglang with random dataset and tokenizer
 # Define the log file with a timestamp
@@ -373,7 +374,7 @@ python3 -m sglang.benchmark.serving \
     --output-file online.jsonl 2>&1 | tee "$LOGFILE"
 
 # Stop profiling via API
-curl http://localhost:30000/stop_profile -H "Content-Type: application/json"
+curl http://localhost:30000/stop_profile -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_API_KEY}"
 
 # Convert tracing file to csv & json
 sqlite3 trace.rpd ".mode csv" ".header on" ".output trace.csv" "select * from top;" ".output stdout"
