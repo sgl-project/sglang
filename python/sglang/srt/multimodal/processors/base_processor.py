@@ -58,6 +58,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import envs, logger
 
+# A fork pool starts every worker on the first submit; at os.cpu_count() (512 seen)
+# that alone overran the request timeout. Arbitrary cap; SGLANG_CPU_WORKERS overrides.
+_DEFAULT_MAX_CPU_WORKERS = 16
+
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
@@ -413,7 +417,12 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         )
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            max_workers=int(
+                os.environ.get(
+                    "SGLANG_CPU_WORKERS",
+                    min(os.cpu_count() or 1, _DEFAULT_MAX_CPU_WORKERS),
+                )
+            ),
             initializer=_init_cpu_worker,
             initargs=(media_url_security_config(),),
         )
