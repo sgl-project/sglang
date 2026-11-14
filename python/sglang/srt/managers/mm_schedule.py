@@ -311,6 +311,7 @@ def _get_chunked_embedding_full(
     extend_seq_len: int,
     input_ids: torch.Tensor,
     device: torch.device,
+    encoded: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """
     Fallback: encode all items at once, cache combined result, extract chunk.
@@ -338,8 +339,10 @@ def _get_chunked_embedding_full(
             embedding_per_req = None
 
     if embedding_per_req is None:
-        _move_items_to_device(embedding_items_per_req, device, data_embedding_func)
-        embedding = data_embedding_func(embedding_items_per_req)
+        embedding = encoded
+        if embedding is None:
+            _move_items_to_device(embedding_items_per_req, device, data_embedding_func)
+            embedding = data_embedding_func(embedding_items_per_req)
         if isinstance(embedding, list):
             # This path caches the combined per-request embedding, so the
             # per-item form is flattened here.
@@ -481,6 +484,35 @@ def _batch_encode_per_image_misses(
             hash_to_embedding[cache_key] = emb
 
     return hash_to_embedding
+
+
+def _batch_encode_full_path_misses(
+    data_embedding_func: DataEmbeddingFunc,
+    full_path_requests: List[PerImageRequestInfo],
+    device: torch.device,
+) -> Dict[int, torch.Tensor]:
+    """One encoder call for the uncached full-path requests, keyed by req_idx."""
+    owner = getattr(data_embedding_func, "__self__", None)
+    # EVS prunes one video per call; HIP/XPU keep per-request encoding.
+    if _is_hip or _is_xpu or getattr(owner, "evs_enabled", False):
+        return {}
+    misses, seen = [], set()
+    for req in full_path_requests:
+        # A repeated request is left to the cache, as the per-image path dedups.
+        key = tuple(item.cache_key for item in req.items)
+        if key not in seen and embedding_cache.get(list(key)) is None:
+            misses.append(req)
+        seen.add(key)
+    if len(misses) < 2:
+        return {}
+    items = [item for req in misses for item in req.items]
+    _move_items_to_device(items, device, data_embedding_func)
+    embedding = _flatten_embedding_result(data_embedding_func(items))
+    embedding = embedding.reshape(-1, embedding.shape[-1])
+    sizes = [sum(end - start + 1 for start, end in req.items_offset) for req in misses]
+    if embedding.shape[0] != sum(sizes):
+        return {}
+    return {req.req_idx: emb for req, emb in zip(misses, embedding.split(sizes))}
 
 
 def _get_chunked_embedding_by_item(
@@ -680,6 +712,11 @@ def _get_chunked_prefill_embedding(
         )
         all_chunks.extend((req_info.req_idx, chunk) for chunk in chunk_slices)
 
+    encoded = _batch_encode_full_path_misses(
+        data_embedding_func=data_embedding_func,
+        full_path_requests=full_path_requests,
+        device=device,
+    )
     for req_info in full_path_requests:
         chunk_embedding, input_ids = _get_chunked_embedding_full(
             data_embedding_func,
@@ -689,6 +726,7 @@ def _get_chunked_prefill_embedding(
             req_info.extend_seq_len,
             input_ids,
             device,
+            encoded=encoded.get(req_info.req_idx),
         )
         if chunk_embedding is not None:
             all_chunks.append((req_info.req_idx, chunk_embedding))
