@@ -31,6 +31,9 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+    _matmul_persistent_triton,
+)
 
 # Configs
 from sglang.srt.configs.model_config import (
@@ -326,6 +329,36 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
+
+
+def _forward_ba_proj(
+    ba_proj: nn.Module,
+    x: torch.Tensor,
+    forward_batch: Optional[ForwardBatch],
+) -> torch.Tensor:
+    if (
+        _is_cuda
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and type(ba_proj) is MergedColumnParallelLinear
+        and isinstance(ba_proj.quant_method, UnquantizedLinearMethod)
+        and ba_proj.bias is None
+        and not ba_proj.gather_output
+        and not get_forward().sp_active
+        and isinstance(x, torch.Tensor)
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and ba_proj.weight.dtype == torch.bfloat16
+        and x.shape[0] > 0
+        and x.numel() > 0
+    ):
+        # Keep GDN gate projections M-invariant across padded prefill graph buckets.
+        return _matmul_persistent_triton(
+            x.reshape(-1, x.shape[-1]), ba_proj.weight.t(), torch.bfloat16
+        ).view(*x.shape[:-1], ba_proj.weight.shape[0])
+    out, _ = ba_proj(x)
+    return out
 
 
 if _is_npu:
@@ -822,7 +855,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         )
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_input_proj(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -904,7 +941,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba = _forward_ba_proj(
+                    self.in_proj_ba, hidden_states, forward_batch
+                )
             current_stream.wait_stream(self.alt_stream)
         elif self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
@@ -917,7 +956,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_ba = _forward_ba_proj(
+                self.in_proj_ba, hidden_states, forward_batch
+            )
         return projected_states_qkvz, projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
@@ -965,7 +1006,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         3. Output projection
         """
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, forward_batch
         )
 
         use_strided_prefill_z = False

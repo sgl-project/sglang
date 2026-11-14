@@ -93,6 +93,25 @@ python -m sglang.launch_server \
     --cuda-graph-backend-decode breakable
 ```
 
+### Gated-DeltaNet Prefill Buckets
+
+Gated-DeltaNet (GDN) models replay prefill graphs only at exact captured token
+counts by default. For example, with buckets `[16, 20]`, a 20-token extend can
+replay, while a 17-token extend runs eagerly instead of padding to 20.
+This restriction also applies with `--enable-mixed-chunk`, including batches
+containing no decode requests, and on Blackwell GPUs.
+
+A checkpoint's FP8/FP4 quantization label does not guarantee that every
+projection is batch-invariant: mixed checkpoints can retain BF16 projections
+whose reduction order changes with the token count. Exact buckets avoid adding
+this source of numerical drift to prefill outputs and cached recurrent states.
+The tradeoff is less graph coverage for non-bucket prefills.
+
+`SGLANG_ENABLE_PADDED_GDN_PREFILL_GRAPH=1` explicitly opts into padded replay.
+Use it only after validating the actual model, kernels, and GPU configuration;
+it can reintroduce logprob and cached-state differences. It is not enabled
+automatically by a scheduling flag or quantization name.
+
 ### Server Args
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

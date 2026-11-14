@@ -5,6 +5,11 @@ from unittest import mock
 import torch
 
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
+from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.scheduler_components.dp_attn import (
     _local_prefill_cuda_graph_vote,
@@ -18,12 +23,15 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
+    _requires_exact_gdn_prefill_bucket,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.runtime_context import get_context, override_platform
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestPrefillCudaGraphPadding(CustomTestCase):
@@ -303,6 +311,285 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
 
         self.assertIsNone(runner.max_context_size)
         self.assertIn("fixed metadata extent", "\n".join(logs.output))
+
+    def test_requires_exact_gdn_prefill_bucket_policy(self):
+        """Scheduling flags and checkpoint labels must not enable padded GDN
+        replay: an FP4/mixed checkpoint can retain BF16 projections."""
+        gdn_leaf = GDNAttnBackend.__new__(GDNAttnBackend)
+        hybrid_gdn = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        hybrid_gdn.linear_attn_backend = gdn_leaf
+        hybrid_non_gdn = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        hybrid_non_gdn.linear_attn_backend = SimpleNamespace()
+        non_gdn = SimpleNamespace()
+
+        cases = (
+            # The scheduling flag applies even when this batch has no decode rows.
+            (hybrid_gdn, False, "modelopt_fp4", False, True, True),
+            # Blackwell quantization labels do not describe each projection.
+            (hybrid_gdn, True, "modelopt_fp4", False, False, True),
+            (hybrid_gdn, True, "modelopt_mixed", False, True, True),
+            (gdn_leaf, False, None, False, False, True),
+            # Non-GDN attention backends keep normal bucket padding.
+            (non_gdn, False, None, False, False, False),
+            (hybrid_non_gdn, True, "modelopt_mixed", False, True, False),
+            # Only an explicit numerical-risk opt-in disables the guard.
+            (hybrid_gdn, True, "modelopt_mixed", True, False, False),
+        )
+        for (
+            attn_backend,
+            is_sm100,
+            quantization,
+            allow_padded_env,
+            mixed_chunk,
+            expected,
+        ) in cases:
+            with (
+                self.subTest(
+                    backend=type(attn_backend).__name__,
+                    is_sm100=is_sm100,
+                    quantization=quantization,
+                    allow_padded_env=allow_padded_env,
+                    mixed_chunk=mixed_chunk,
+                ),
+                override_platform(is_sm100=is_sm100),
+                envs.SGLANG_ENABLE_PADDED_GDN_PREFILL_GRAPH.override(allow_padded_env),
+                get_context().override_server_args(enable_mixed_chunk=mixed_chunk),
+            ):
+                model_runner = SimpleNamespace(
+                    attn_backend=attn_backend,
+                    model_config=SimpleNamespace(quantization=quantization),
+                )
+                self.assertEqual(
+                    _requires_exact_gdn_prefill_bucket(model_runner), expected
+                )
+                runner = self._make_runner()
+                runner.prefill_backend_name = Backend.BREAKABLE
+                runner.capture_num_tokens = [16, 20]
+                runner.max_num_tokens = 20
+                runner._requires_exact_prefill_bucket = (
+                    _requires_exact_gdn_prefill_bucket(model_runner)
+                )
+                # Ordinary prefill with no decode rows, even with mixed-chunk on.
+                self.assertEqual(
+                    runner.can_run_graph(self._make_forward_batch(17)), not expected
+                )
+                self.assertTrue(runner.can_run_graph(self._make_forward_batch(20)))
+
+    def test_exact_prefill_bucket_guard_and_dp_vote_consensus(self):
+        """When exact GDN prefill buckets are required, padded token counts run
+        eagerly while exact buckets replay, and active/idle DP ranks agree."""
+        runner = self._make_runner()
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.capture_num_tokens = [4, 8, 12, 16, 20, 24, 28, 32]
+        runner.max_num_tokens = 32
+        runner._requires_exact_prefill_bucket = True
+
+        padded_cases = (13, 14, 17, 21, 27, 29)
+        exact_cases = (4, 16, 20, 24, 28, 32)
+
+        for num_tokens in padded_cases:
+            with self.subTest(local_only=num_tokens):
+                self.assertFalse(
+                    runner.can_run_graph(self._make_forward_batch(num_tokens))
+                )
+        for num_tokens in exact_cases:
+            with self.subTest(local_only=num_tokens):
+                self.assertTrue(
+                    runner.can_run_graph(self._make_forward_batch(num_tokens))
+                )
+
+        for num_tokens, expected in [
+            *((n, False) for n in padded_cases),
+            *((n, True) for n in exact_cases),
+        ]:
+            with self.subTest(dp_tokens=num_tokens, expected=expected):
+                active = self._make_forward_batch(num_tokens)
+                schedule_batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=lambda: 1,
+                    extend_num_tokens=num_tokens,
+                    input_embeds=None,
+                    replace_embeds=None,
+                    prefix_lens=[0],
+                    return_logprob=False,
+                    multimodal_inputs=None,
+                    seq_lens_cpu=active.seq_lens_cpu,
+                )
+                votes = [
+                    _local_prefill_cuda_graph_vote(
+                        local_batch=batch,
+                        num_tokens=num_tokens if batch is not None else 0,
+                        prefill_graph_runner=runner,
+                        coordinated_prefill=True,
+                        breakable_prefill=True,
+                        spec_algorithm=None,
+                        model_config=None,
+                    )
+                    for batch in (schedule_batch, None)
+                ]
+                self.assertEqual(votes, [expected, True])
+                bucket = min(b for b in runner.capture_num_tokens if b >= num_tokens)
+                idle = self._make_forward_batch(bucket)
+                for batch in (active, idle):
+                    batch.global_num_tokens_cpu = (
+                        [bucket, bucket] if expected else [num_tokens, 0]
+                    )
+                    batch.can_run_dp_prefill_cuda_graph = all(votes)
+                    self.assertEqual(runner.can_run_graph(batch), expected)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required for Triton GDN ba_proj")
+class TestGDNBatchInvariantBaProjCUDA(CustomTestCase):
+    def test_ba_proj_extend_is_batch_invariant_and_cuda_graph_safe(self):
+        """EXTEND GDN ba_proj must keep real rows bit-identical across padded
+        buckets and CUDA graph replay (default and side stream), while leaving
+        DECODE and TARGET_VERIFY on the standard linear path."""
+        import types
+
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        import sglang.srt.models.qwen3_5 as qwen3_5_mod
+        import sglang.srt.models.qwen3_next as qwen3_next_mod
+        from sglang.srt.layers.linear import MergedColumnParallelLinear
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+        from sglang.srt.utils import LazyValue
+
+        device = torch.device("cuda")
+        hidden_size = 5120
+        num_v_heads = 48
+        out_features = 2 * num_v_heads
+        gen = torch.Generator(device=device).manual_seed(49133)
+
+        ba_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[num_v_heads, num_v_heads],
+            bias=False,
+            params_dtype=torch.bfloat16,
+            parallel_group="replicated",
+        ).to(device)
+        ba_proj.weight.data.copy_(
+            (
+                torch.randn((out_features, hidden_size), generator=gen, device=device)
+                * 0.02
+            ).to(torch.bfloat16)
+        )
+        x_full = torch.randn(
+            (128, hidden_size), generator=gen, device=device, dtype=torch.bfloat16
+        )
+        extend_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        mixed_batch = SimpleNamespace(forward_mode=ForwardMode.MIXED)
+        decode_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        verify_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+        for helper in (qwen3_5_mod._forward_ba_proj, qwen3_next_mod._forward_ba_proj):
+            ref_13 = helper(ba_proj, x_full[:13].contiguous(), extend_batch)
+            ref_fp32 = F.linear(x_full[:13].float(), ba_proj.weight.float()).to(
+                torch.bfloat16
+            )
+            torch.testing.assert_close(ref_13, ref_fp32, atol=1e-2, rtol=1e-2)
+
+            for padded_m in (16, 20, 24, 28, 32, 48, 64, 96, 128):
+                x_padded = torch.zeros(
+                    (padded_m, hidden_size), device=device, dtype=torch.bfloat16
+                )
+                x_padded[:13].copy_(x_full[:13])
+                out_extend = helper(ba_proj, x_padded, extend_batch)
+                self.assertEqual(tuple(out_extend.shape), (padded_m, out_features))
+                self.assertTrue(
+                    torch.equal(out_extend[:13], ref_13),
+                    f"padded M={padded_m} diverged from M=13 on EXTEND",
+                )
+                out_mixed = helper(ba_proj, x_padded, mixed_batch)
+                self.assertTrue(torch.equal(out_mixed[:13], ref_13))
+
+            # Also verify 48 -> 96 and 64 -> 128 where Ampere cuBLAS F.linear splits.
+            ref_48 = helper(ba_proj, x_full[:48].contiguous(), extend_batch)
+            for padded_m in (64, 96, 128):
+                x_padded = torch.zeros(
+                    (padded_m, hidden_size), device=device, dtype=torch.bfloat16
+                )
+                x_padded[:48].copy_(x_full[:48])
+                self.assertTrue(
+                    torch.equal(
+                        helper(ba_proj, x_padded, extend_batch)[:48],
+                        ref_48,
+                    )
+                )
+            # DECODE and TARGET_VERIFY stay on ba_proj.forward directly.
+            for non_prefill_batch in (decode_batch, verify_batch, None):
+                with mock.patch.object(
+                    ba_proj, "forward", wraps=ba_proj.forward
+                ) as spy_fwd:
+                    out_non_prefill = helper(
+                        ba_proj, x_full[:4].contiguous(), non_prefill_batch
+                    )
+                    spy_fwd.assert_called_once()
+                expected_direct, _ = ba_proj(x_full[:4].contiguous())
+                self.assertTrue(torch.equal(out_non_prefill, expected_direct))
+
+        # Verify _forward_input_proj CUDA graph capture + replay on both
+        # default stream and alt_stream for Qwen3.5 and Qwen3-Next GDN.
+        qkvz_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[256, 256],
+            bias=False,
+            params_dtype=torch.bfloat16,
+            parallel_group="replicated",
+        ).to(device)
+        qkvz_proj.weight.data.normal_(0.0, 0.02, generator=gen)
+
+        class _DummyGDN(nn.Module):
+            def __init__(self, gdn_cls, alt_stream):
+                super().__init__()
+                self.in_proj_qkvz = qkvz_proj
+                self.in_proj_ba = ba_proj
+                self._fused_in_proj_weight = None
+                self._fused_in_proj_scale = None
+                self._fused_input_proj_cpu_enabled = LazyValue(lambda: False)
+                self.alt_stream = alt_stream
+                self._forward_input_proj = types.MethodType(
+                    gdn_cls._forward_input_proj, self
+                )
+
+        bucket_m = 32
+        for gdn_cls in (
+            qwen3_5_mod.Qwen3_5GatedDeltaNet,
+            qwen3_next_mod.Qwen3GatedDeltaNet,
+        ):
+            eager_gdn = _DummyGDN(gdn_cls, alt_stream=None)
+            _, eager_ba_13 = eager_gdn._forward_input_proj(
+                x_full[:13].contiguous(), extend_batch
+            )
+            for use_alt_stream in (False, True):
+                alt_stream = (
+                    torch.cuda.Stream(device=device) if use_alt_stream else None
+                )
+                gdn = _DummyGDN(gdn_cls, alt_stream=alt_stream)
+                static_x = torch.zeros(
+                    (bucket_m, hidden_size), device=device, dtype=torch.bfloat16
+                )
+                capture_stream = torch.cuda.Stream(device=device)
+                capture_stream.wait_stream(torch.cuda.current_stream(device))
+                with model_capture_mode():
+                    with torch.cuda.stream(capture_stream):
+                        for _ in range(2):
+                            gdn._forward_input_proj(static_x, extend_batch)
+                    torch.cuda.current_stream(device).wait_stream(capture_stream)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=capture_stream):
+                        _, static_ba = gdn._forward_input_proj(static_x, extend_batch)
+
+                static_x.zero_()
+                static_x[:13].copy_(x_full[:13])
+                graph.replay()
+                torch.cuda.synchronize(device)
+                self.assertTrue(
+                    torch.equal(static_ba[:13], eager_ba_13),
+                    f"{gdn_cls.__name__} replay (alt_stream={use_alt_stream}) diverged",
+                )
 
 
 if __name__ == "__main__":
