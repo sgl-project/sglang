@@ -88,6 +88,24 @@ state objects. This is per-client transient memory, separate from the shared
 To keep the storage engine independent of a PD NVLink engine, set
 `SGLANG_HICACHE_MOONCAKE_REUSE_TE=0`.
 
+### Direct linker (no host tier)
+
+`--enable-unified-cache-external-linker` skips the host tier entirely and links
+the device pools straight to the store. Mooncake backs it with one page layout
+per KV pool:
+
+* MLA (`MLATokenToKVPool`): one object per page holding every layer's latent KV.
+  MLA KV is replicated across TP ranks, so keys carry no tp suffix and only
+  rank 0 writes.
+* MHA/GQA (`MHATokenToKVPool`): one object per page holding the K rows of every
+  layer followed by the V rows. Keys keep the tp suffix, since the shards
+  differ per rank.
+
+Objects are page-granular (`--page-size`), so a prefix is restorable in whole
+pages only and a prompt shorter than one page reuses nothing. `linker_load_layer_group`
+in `--unified-cache-external-linker-config` sets how many transfer layers share
+one read request.
+
 ## Install Mooncake
 
 **Method 1: with pip**

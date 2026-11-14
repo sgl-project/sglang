@@ -101,6 +101,38 @@ class TestDevicePoolEntry(CustomTestCase):
                             pool.get_prepared_layer_range_meta(locations, 0), expected
                         )
 
+    def test_layer_group_meta_batches_several_layers(self):
+        k0 = torch.zeros((8, 3), dtype=torch.uint8)
+        k1 = torch.zeros((8, 5), dtype=torch.uint8)
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[k0, k1]],
+            layer_mapping={0: 0, 1: 1},
+            page_size=1,
+            rows_are_pages=True,
+        )
+
+        pointers, sizes, offsets = pool.get_prepared_layer_group_meta([0, 4], (0, 1))
+        self.assertEqual(
+            pointers,
+            [
+                [k0[0].data_ptr(), k1[0].data_ptr()],
+                [k0[4].data_ptr(), k1[4].data_ptr()],
+            ],
+        )
+        self.assertEqual(sizes, [[3, 5], [3, 5]])
+        # Both layers of a page share one object, so the second starts after it.
+        self.assertEqual(offsets, [[0, 3], [0, 3]])
+
+        # A layer this pool does not serve adds no range, and a chunk with no
+        # served layer is empty instead of a zero-length transfer.
+        pointers, sizes, _ = pool.get_prepared_layer_group_meta([0], (1, 7))
+        self.assertEqual(pointers, [[k1[0].data_ptr()]])
+        self.assertEqual(sizes, [[5]])
+        self.assertIsNone(pool.get_prepared_layer_group_meta([0], (7,)))
+
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
             DevicePoolEntry(
@@ -958,7 +990,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             {name: entry.tp_replicated for name, entry in group.entry_map.items()},
             {
                 PoolName.KV: True,
-                PoolName.INDEXER: True,
+                PoolName.INDEXER: False,
                 PoolName.MAMBA: False,
                 PoolName.DRAFT: False,
             },
@@ -986,12 +1018,28 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         params.sidecar_draft_device_pools = (draft,)
 
         params.mtp_draft_device_pools = (object(),)
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
+        with self.assertRaisesRegex(ValueError, "plain MLA, MHA or DSA"):
             resolve()
         params.mtp_draft_device_pools = ()
-        kvcache.full_kv_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
+
+        mha = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        mha.k_scale_buffer = mha.native_k_scale_buffer = None
+        mha.k_buffer = [torch.zeros((8, 3), dtype=torch.uint8) for _ in range(2)]
+        mha.v_buffer = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(2)]
+        kvcache.full_kv_pool = mha
+        group = resolve()
+        kv = group.entry_map[PoolName.KV]
+        self.assertFalse(group.rank_replicated)
+        self.assertEqual(kv.layer_mapping, {1: (0, 2), 3: (1, 3)})
+        self.assertFalse(kv.tp_replicated)
+        self.assertFalse(kv.dcp_sharded)
+        self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
+        # One slot transfers a whole page: its K block then its V block.
+        self.assertEqual(kv.get_page_buffer_meta(torch.tensor([2, 3]))[1], [6, 6, 8, 8])
+        mha.k_scale_buffer = object()
+        with self.assertRaisesRegex(ValueError, "scaled KV"):
             resolve()
+        mha.k_scale_buffer = None
 
     def test_minimax_m31_nvfp4_maps_page_rows_and_draft(self):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -1059,6 +1107,104 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         params.mtp_draft_device_pools = ()
         kvcache.main_pool = page_rows(MHATokenToKVPool, 5)
         with self.assertRaisesRegex(ValueError, "M3.1 NVFP4"):
+            resolve()
+
+    def test_plain_mla_pool_links_kv_pages(self):
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        kvcache = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        kvcache.start_layer, kvcache.layer_num = 0, 3
+        kvcache.kv_buffer = [
+            torch.zeros((8, 1, 5), dtype=torch.uint8) for _ in range(3)
+        ]
+        kvcache.kv_scale_buffer = None
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(), sidecar_draft_device_pools=()
+        )
+
+        def resolve(dcp_size=1):
+            with patch.object(
+                linker_pool_assembler,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+            ):
+                return resolve_hybrid_device_pool_group(
+                    kvcache=kvcache,
+                    page_size=2,
+                    params=params,
+                    components={ComponentType.FULL},
+                )
+
+        group = resolve()
+        self.assertEqual(group.num_layers, 3)
+        # MLA latent KV is replicated across TP ranks, so keys drop the tp suffix.
+        self.assertTrue(group.rank_replicated)
+        self.assertEqual(set(group.entry_map), {PoolName.KV})
+        self.assertEqual(group.sources[PoolName.KV], PoolName.KV)
+
+        kv = group.entry_map[PoolName.KV]
+        self.assertEqual(kv.layer_mapping, {0: 0, 1: 1, 2: 2})
+        self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
+
+        pointers, sizes, offsets = kv.get_prepared_layer_range_meta([2], 1)
+        self.assertEqual(pointers, [[kvcache.kv_buffer[1][2].data_ptr()]])
+        self.assertEqual(sizes, [[10]])
+        self.assertEqual(offsets, [[10]])
+
+        with self.assertRaisesRegex(ValueError, "DCP on a plain KV pool"):
+            resolve(dcp_size=2)
+        params.mtp_draft_device_pools = (object(),)
+        with self.assertRaisesRegex(ValueError, "packed draft KV"):
+            resolve()
+        params.mtp_draft_device_pools = ()
+        kvcache.kv_scale_buffer = [torch.zeros(1, dtype=torch.float32)]
+        with self.assertRaisesRegex(ValueError, "scaled MLA KV"):
+            resolve()
+
+    def test_plain_mha_pool_splits_k_and_v_rows(self):
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        kvcache = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        kvcache.start_layer, kvcache.layer_num = 0, 2
+        kvcache.k_scale_buffer = kvcache.native_k_scale_buffer = None
+        kvcache.k_buffer = [torch.zeros((8, 3), dtype=torch.uint8) for _ in range(2)]
+        kvcache.v_buffer = [torch.zeros((8, 3), dtype=torch.uint8) for _ in range(2)]
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(), sidecar_draft_device_pools=()
+        )
+
+        def resolve(dcp_size=1):
+            with patch.object(
+                linker_pool_assembler,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+            ):
+                return resolve_hybrid_device_pool_group(
+                    kvcache=kvcache,
+                    page_size=2,
+                    params=params,
+                    components={ComponentType.FULL},
+                )
+
+        group = resolve()
+        # MHA KV is TP-sharded, so keys keep the tp suffix.
+        self.assertFalse(group.rank_replicated)
+        kv = group.entry_map[PoolName.KV]
+        self.assertEqual(kv.layer_mapping, {0: (0, 2), 1: (1, 3)})
+
+        pointers, sizes, offsets = kv.get_prepared_layer_range_meta([0], 1)
+        self.assertEqual(
+            pointers,
+            [[kvcache.k_buffer[1][0].data_ptr(), kvcache.v_buffer[1][0].data_ptr()]],
+        )
+        self.assertEqual(sizes, [[6, 6]])
+        # Page objects pack every buffer: K rows first, then V rows.
+        self.assertEqual(offsets, [[6, 18]])
+
+        kvcache.k_scale_buffer = [torch.zeros(1, dtype=torch.float32)]
+        with self.assertRaisesRegex(ValueError, "scaled KV caches"):
             resolve()
 
     def test_unsupported_strategy_fails_with_context(self):
