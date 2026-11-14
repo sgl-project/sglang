@@ -166,6 +166,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    ShutdownReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -186,6 +187,7 @@ from sglang.srt.managers.tokenizer_manager import (
     ServerStatus,
     TokenizerManager,
     get_tokenizer_worker_class,
+    wait_for_schedulers_to_exit,
 )
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
@@ -2758,6 +2760,18 @@ def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
     supervisor.run()
 
 
+def _shutdown_schedulers_after_http_workers(
+    *,
+    router: MultiTokenizerRouter,
+    subprocess_watchdog: Optional[SubprocessWatchdog],
+) -> None:
+    if subprocess_watchdog is not None:
+        subprocess_watchdog.stop()
+    router.dispatch_to_scheduler(ShutdownReq())
+    wait_for_schedulers_to_exit()
+    kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+
+
 class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
     """Give each uvicorn worker a private SO_REUSEPORT listener.
 
@@ -3181,6 +3195,9 @@ def _setup_and_run_http_server(
                     supervisor.run()
                 else:
                     _run_uvicorn_workers(app_path, **uvicorn_options)
+            _shutdown_schedulers_after_http_workers(
+                router=tokenizer_manager, subprocess_watchdog=subprocess_watchdog
+            )
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
