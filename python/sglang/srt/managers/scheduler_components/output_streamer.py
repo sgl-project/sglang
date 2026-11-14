@@ -106,7 +106,6 @@ class SchedulerOutputStreamer:
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     _test_stream_output_count: int = 0
     output_sink: OutputSink = field(init=False)
-    enable_metrics: bool = field(init=False)
 
     def __post_init__(self, skip_tokenizer_init: bool) -> None:
         if self.rust_server is not None:
@@ -120,7 +119,6 @@ class SchedulerOutputStreamer:
                 "a streamer's additional customized_info needs TokenizerManager "
                 "hooks (update_request_meta_info) the Rust frontend does not run"
             )
-        self.enable_metrics = get_observability().enable_metrics
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -190,11 +188,11 @@ class SchedulerOutputStreamer:
             image_tokens=image_tokens,
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
-            # Embedding outputs carry no time stats.
+            # Embedding outputs carry no time stats. Time stats are recorded
+            # for every generation request, so they are reported whether or
+            # not Prometheus metrics are enabled.
             time_stats=(
-                req.time_stats.to_output_time_stats()
-                if self.enable_metrics and self.is_generation
-                else None
+                req.time_stats.to_output_time_stats() if self.is_generation else None
             ),
         )
 
@@ -206,15 +204,11 @@ class SchedulerOutputStreamer:
         """A finished request's ``meta_info`` keys that Python's
         TokenizerManager derives from scheduler state, built with the helpers
         it uses, for the Rust frontend to report as they are: the retraction
-        count, the scheduler's timings when metrics are on, and the
-        speculative-decoding stats. TokenizerManager also reports the first
-        two on intermediate frames; the frontend reports them only on the
-        terminal one."""
+        count, the scheduler's timings, and the speculative-decoding stats.
+        TokenizerManager also reports the first two on intermediate frames;
+        the frontend reports them only on the terminal one."""
         stats: Dict[str, Any] = {"num_retractions": req.retraction_count}
-        if get_observability().enable_metrics:
-            output_time_stats = req.time_stats.to_output_time_stats()
-            if output_time_stats is not None:
-                stats.update(output_time_stats.to_meta_info())
+        stats.update(req.time_stats.to_output_time_stats().to_meta_info())
         if not self.spec_algorithm.is_none():
             populate_spec_info(
                 stats,

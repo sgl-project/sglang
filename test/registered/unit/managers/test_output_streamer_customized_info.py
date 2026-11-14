@@ -658,19 +658,27 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
         observability.start()
         self.addCleanup(observability.stop)
 
-    def test_request_stats_carry_time_stats_only_with_metrics_on(self):
+    def test_request_stats_carry_time_stats_without_metrics(self):
         timed = SchedulerReqTimeStats(enable_metrics=True)
         timed.queue_duration_s = 0.25
 
-        def time_stats(enable_metrics, req_time_stats):
+        def time_stats(enable_metrics, req_time_stats, is_generation=True):
             self._set_metrics(enable_metrics)
             req = _FakeReq("r", [1])
             req.time_stats = req_time_stats
-            return _streamer([]).build_request_stats(req).time_stats
+            return (
+                _streamer([], is_generation=is_generation)
+                .build_request_stats(req)
+                .time_stats
+            )
 
         self.assertEqual(time_stats(True, timed), timed.to_output_time_stats())
-        self.assertIsNone(time_stats(True, SchedulerReqTimeStats()))
-        self.assertIsNone(time_stats(False, timed))
+        self.assertEqual(time_stats(False, timed), timed.to_output_time_stats())
+        self.assertEqual(
+            time_stats(True, SchedulerReqTimeStats()),
+            SchedulerReqTimeStats().to_output_time_stats(),
+        )
+        self.assertIsNone(time_stats(False, timed, is_generation=False))
 
     def test_request_stats_go_out_on_first_output_retraction_and_finish(self):
         """A request's stats go out with its first output, with the first
@@ -901,15 +909,16 @@ class TestOutputStreamerRustRequestStats(unittest.TestCase):
     def test_rust_frames_carry_finished_requests_stats(self):
         """A finished request's frame carries the `meta_info` keys Python's
         TokenizerManager derives from scheduler state, in its order: the
-        retraction count, the scheduler's timings with metrics on (realtime
-        stamps), and the speculative stats with speculative decoding; a
-        running request's carries none. None of the keys is one the api.v1
-        schema writes."""
+        retraction count, the scheduler's timings (realtime stamps, with or
+        without metrics on), and the speculative stats with speculative
+        decoding; a running request's carries none. None of the keys is one
+        the api.v1 schema writes."""
         with patch(
             "sglang.srt.observability.req_time_stats.global_diff_realtime_monotonic",
             1_760_000_000.0,
         ):
             stats = self._stats_sent(metrics=True, speculative=True)
+            stats_no_metrics = self._stats_sent(metrics=False, speculative=False)
         expected = {
             "num_retractions": 2,
             "storage_prefetch_wait": 0.5,
@@ -929,8 +938,16 @@ class TestOutputStreamerRustRequestStats(unittest.TestCase):
         self.assertFalse(set(stats[1]) & set(GenerateMetaInfo.__struct_fields__))
 
         self.assertEqual(
-            self._stats_sent(metrics=False, speculative=False),
-            {1: {"num_retractions": 2}},
+            stats_no_metrics,
+            {
+                1: {
+                    "num_retractions": 2,
+                    "storage_prefetch_wait": 0.5,
+                    "forward_entry_time": 1_760_000_100.25,
+                    "prefill_finished_time": 1_760_000_100.75,
+                    "queue_time": 0.125,
+                }
+            },
         )
 
 

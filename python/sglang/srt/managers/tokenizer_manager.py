@@ -492,7 +492,7 @@ _NO_SCHEDULER_TIME_STATS = SchedulerOutputTimeStats()
 def _scheduler_time_stats(
     request_stats: RequestOutputStats,
 ) -> SchedulerOutputTimeStats:
-    # Embedding requests, and requests whose own metrics are off, carry none.
+    # Embedding requests carry none.
     return request_stats.time_stats or _NO_SCHEDULER_TIME_STATS
 
 

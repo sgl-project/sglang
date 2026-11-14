@@ -54,10 +54,20 @@ class TestOutputTimeStatsKeepUnsetStamps(CustomTestCase):
         self.assertNotIn("prefill_finished_time", sent.to_meta_info())
         self.assertAlmostEqual(sent.forward_entry_time, 1_000_123.456)
 
-    def test_metrics_disabled_sends_no_time_stats(self):
+    def test_metrics_disabled_still_sends_time_stats(self):
+        # Scheduler timestamps are recorded for every request, so the output
+        # stats are sent even when Prometheus metrics are off; only stamps
+        # that were never recorded stay None.
         stats = rts.SchedulerReqTimeStats()
         stats.forward_entry_time = 123.456
-        self.assertIsNone(stats.to_output_time_stats())
+        stats.prefill_finished_time = 0.0
+
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
+            sent = _round_trip(stats.to_output_time_stats())
+
+        self.assertAlmostEqual(sent.forward_entry_time, 1_000_123.456)
+        self.assertIsNone(sent.prefill_finished_time)
+        self.assertNotIn("prefill_finished_time", sent.to_meta_info())
 
 
 class TestOutputMetaInfo(CustomTestCase):
