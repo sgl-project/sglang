@@ -2089,6 +2089,14 @@ class Envs:
     # bf16 logits vary with the tile's row count, so picks near the selection
     # floor can differ there.
     SGLANG_OPT_DSV4_INDEXER_TP_SHARD = EnvBool(False)
+    # Model-internal row pipelining; independent of scheduler/TBO overlap.
+    # All paths remain opt-in. Query lookahead only advances row-local work.
+    SGLANG_DSV4_MOE_MICROBATCHES = EnvInt(0)
+    SGLANG_DSV4_MOE_MIN_ROWS = EnvInt(1024)
+    SGLANG_DSV4_MOE_PACKED_GATHER = EnvBool(False)
+    SGLANG_DSV4_MOE_EPILOGUE_PIPELINE = EnvBool(False)
+    SGLANG_DSV4_QUERY_LOOKAHEAD = EnvBool(False)
+    SGLANG_DSV4_MOE_COMM_PRIORITY = EnvInt(0)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.

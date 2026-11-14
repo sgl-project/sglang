@@ -2282,8 +2282,20 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
+        query_cache = getattr(self, "_query_lookahead", None)
+        self._query_lookahead = None
+        if query_cache is not None and (
+            query_cache.batch is not forward_batch
+            or query_cache.input_rows is not x
+            or query_cache.positions is not positions
+            or x_quant is not None
+        ):
+            query_cache = None
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
+            if query_cache is None:
+                qkv_a, _ = self.wqkv_a(x_linear)
+            else:
+                qkv_a = query_cache.qkv_a
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
             q_lora, _ = self.wq_a(x_linear)
@@ -2515,14 +2527,18 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
-            if _is_hip:
-                q, q_lora, fuse_q_rope = _hip.compute_q_b(
-                    self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
-                )
-            else:
-                q = self._compute_q_b(q_for_wqb, positions, q_out)
+            if query_cache is not None:
+                q_lora, q = query_cache.q_lora, query_cache.q
                 fuse_q_rope = False
+            else:
+                q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+                if _is_hip:
+                    q, q_lora, fuse_q_rope = _hip.compute_q_b(
+                        self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
+                    )
+                else:
+                    q = self._compute_q_b(q_for_wqb, positions, q_out)
+                    fuse_q_rope = False
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -2677,6 +2693,7 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         x_quant: Optional[torch.Tensor] = None,
         defer_all_reduce: bool = False,
+        defer_output_projection: bool = False,
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
@@ -2784,12 +2801,7 @@ class MQALayer(MqaAttentionBase):
         k_nope, k_rope = None, None
         if self.use_mega_attention:
             kernel_num_heads = 64 if self.n_local_heads <= 64 else 128
-        elif (
-            self.is_dsv41
-            and not self.q_head_norm
-            and get_token_to_kv_pool().uniform_fp8
-            and self.n_local_heads in (8, 16, 32, 64, 128)
-        ):
+        elif self.uses_uniform_fp8_query():
             kernel_num_heads = self.n_local_heads
             q_out = torch.empty(
                 (x.shape[0], self.n_local_heads, self.head_dim),
@@ -3024,7 +3036,9 @@ class MQALayer(MqaAttentionBase):
                 self.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
             )
             fuse_rope_wo_a = (
-                self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
+                not defer_output_projection
+                and self.use_fused_wo_a
+                and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
             )
 
             fuse_rope_quant = (
@@ -3057,6 +3071,10 @@ class MQALayer(MqaAttentionBase):
                 )
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
+            if defer_output_projection:
+                # The epilogue pipeline consumes these final attention rows.
+                # Inverse RoPE has run; O-A/O-B are owned by each row slice.
+                return o
 
             if fuse_rope_wo_a:
                 wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -3189,6 +3207,28 @@ class MQALayer(MqaAttentionBase):
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
         return o
+
+    def uses_uniform_fp8_query(self):
+        """Query dtype shared by the normal and lookahead preparation paths."""
+        return (
+            self.is_dsv41
+            and not self.q_head_norm
+            and get_token_to_kv_pool().uniform_fp8
+            and self.n_local_heads in (8, 16, 32, 64, 128)
+        )
+
+    def project_row_epilogue(self, output):
+        """Supported BF16 O-A and O-B path for one finalized attention slice."""
+        weight = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        output = _apply_wo_a_bf16_matmul(
+            output,
+            weight,
+            is_decode=False,
+            is_target_verify=False,
+            fuse_mxfp8_quant=False,
+        )
+        output, _ = self.wo_b(output.flatten(1), skip_all_reduce=True)
+        return output
 
     # ---- TBO op decomposition (prefill two-batch-overlap) ----
     def op_attn(self, state):
@@ -3702,6 +3742,9 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         super().__init__(*args, **kwargs)
         self.self_attn.wo_b.reduce_results = False
         self.mlp.reduce_results = False
+        from sglang.srt.models.deepseek_v4_moe_pipeline import RowPipelineConfig
+
+        self._row_pipeline_config = RowPipelineConfig.from_env()
         declarations = hc_boundary.stages(self.config, self.layer_id, layer=self)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (declarations[0], self.input_layernorm),
@@ -3744,13 +3787,53 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         input_ids_global,
         *,
         allow_cross_layer_fusion=True,
+        query_lookahead_layer=None,
     ):
         call = hc_boundary.LayerCall(
             input_ids, input_ids_global, allow_cross_layer_fusion
         )
-        hidden_states = self.attn_boundary.prepare(
-            hidden_states, forward_batch, read_context=call
-        )
+        config = self._row_pipeline_config
+        if config.microbatches > 1:
+            from sglang.srt.models.deepseek_v4_moe_pipeline import (
+                eligible,
+                run_pipeline,
+                take_prepared_attention,
+            )
+
+            prepared = take_prepared_attention(
+                self, hidden_states, forward_batch, positions, call
+            )
+            hidden_states = (
+                self.attn_boundary.prepare(
+                    hidden_states, forward_batch, read_context=call
+                )
+                if prepared is None
+                else prepared
+            )
+            if eligible(self, hidden_states, forward_batch, config):
+                with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                    attention_output = self.self_attn(
+                        x=hidden_states,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        x_quant=residual_batch.written_residual(
+                            forward_batch
+                        ).quantized,
+                        defer_all_reduce=False,
+                        defer_output_projection=config.epilogue,
+                    )
+                return run_pipeline(
+                    self,
+                    attention_output,
+                    forward_batch,
+                    positions,
+                    config,
+                    next_layer=query_lookahead_layer,
+                )
+        else:
+            hidden_states = self.attn_boundary.prepare(
+                hidden_states, forward_batch, read_context=call
+            )
         quantized = residual_batch.written_residual(forward_batch).quantized
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self._run_boundary_attention(
@@ -3892,6 +3975,8 @@ DeepseekV4DecoderLayer = (
 
 
 class DeepseekV4Model(nn.Module):
+    _query_lookahead_enabled = False
+
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
@@ -3903,6 +3988,11 @@ class DeepseekV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self._query_lookahead_enabled = (
+            _is_cuda
+            and envs.SGLANG_DSV4_MOE_MICROBATCHES.get() > 1
+            and envs.SGLANG_DSV4_QUERY_LOOKAHEAD.get()
+        )
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
@@ -4366,6 +4456,15 @@ class DeepseekV4Model(nn.Module):
                         input_ids=input_ids,
                         forward_batch=forward_batch,
                         input_ids_global=input_ids_global,
+                        query_lookahead_layer=(
+                            self.layers[i + 1]
+                            if self._query_lookahead_enabled
+                            and i + 1 < self.end_layer
+                            and not capture_dspark
+                            and self.layers[i + 1].engram is None
+                            and (tail is None or i + 1 < self.late_layer_start)
+                            else None
+                        ),
                     )
                 else:
                     if _is_hip and self.layers[i].hc_boundary_fused:
@@ -4563,6 +4662,12 @@ class DeepseekV4Model(nn.Module):
                     input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
                 )
         finally:
+            # A request may abort after producing a next-layer cache but before
+            # its consumer runs. Never retain that invocation's GPU buffers.
+            if self._query_lookahead_enabled:
+                for i in range(self.start_layer, self.end_layer):
+                    self.layers[i]._query_lookahead = None
+                    self.layers[i].self_attn._query_lookahead = None
             residual_batch.clear(forward_batch)
 
     @torch.no_grad()
@@ -4691,6 +4796,14 @@ class DeepseekV4Model(nn.Module):
                             forward_batch=forward_batch,
                             input_ids=input_ids,
                             input_ids_global=input_ids_global,
+                            query_lookahead_layer=(
+                                self.layers[i + 1]
+                                if self._query_lookahead_enabled
+                                and i + 1 < self.end_layer
+                                and not capture_dspark
+                                and self.layers[i + 1].engram is None
+                                else None
+                            ),
                         )
                     else:
                         hidden_states, prev_residual, prev_post, prev_comb = layer(
