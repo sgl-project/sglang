@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
@@ -1332,12 +1333,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 assert ring_indices is not None, "request-scoped ring without rows"
                 ring_kwargs["ring_indices"] = ring_indices
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-            self.req_to_token_pool.size,
-        )
+        # The compare is an argument, so it launches even when the helper
+        # discards it. Skip it unless PP x speculative decoding is on.
+        intermediate_state_indices = self.verify_intermediate_state_indices
+        if pp_spec_stable_rows_enabled():
+            intermediate_state_indices = select_verify_intermediate_state_indices(
+                self.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                self.req_to_token_pool.size,
+            )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.ragged_verify_layout
