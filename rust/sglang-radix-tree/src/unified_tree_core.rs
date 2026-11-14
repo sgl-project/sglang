@@ -315,6 +315,8 @@ pub(crate) struct InsertWalkState<K: ChildKeyType> {
     result: Option<InsertResult>,
     /// Emitted actions awaiting the next barrier flush (or the final step).
     pub(crate) pending_actions: CacheActions,
+    /// The node the walk's last buffer-only backup ended on; later chains stop there.
+    backup_chain_tail: Option<NodeId>,
 }
 
 /// A new walk or the result of an empty or declined insert.
@@ -1953,6 +1955,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 ..InsertResult::default()
             }),
             pending_actions: Vec::new(),
+            backup_chain_tail: None,
         })
     }
 
@@ -2236,8 +2239,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // Nodes this request already inserted were counted back then.
         let node_end = state.total_prefix_length + prefix_len;
         if node_end > state.inserted_len && self.inc_hit_count_and_check_(node_id) {
-            let backup = self
-                .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
+            let backup = self.insert_backup_action_(state, node_id);
             state.pending_actions.push(Box::new(backup));
         }
         state.node_id = node_id;
@@ -2373,8 +2375,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         if self.should_backup_after_insert_(state, target_node_id) {
-            let backup =
-                self.build_backup_kv_action_(self.arena.node(target_node_id), self.is_write_back);
+            let backup = self.insert_backup_action_(state, target_node_id);
             state.pending_actions.push(Box::new(backup));
         }
     }
@@ -4605,28 +4606,48 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.build_backup_kv_action_(self.arena.node(node_id), false))
     }
 
+    /// The walk's write-through backup for a node; buffer-only chains stop where the
+    /// previous one ended.
+    fn insert_backup_action_(&self, state: &mut InsertWalkState<K>, node_id: NodeIdx_) -> BackupKV {
+        let node = self.arena.node(node_id);
+        if !self.is_host_memory_buffer_only {
+            return self.build_backup_kv_action_(node, /* write_back = */ false);
+        }
+        let stop_at = state.backup_chain_tail.replace(node.id);
+        self.build_backup_chain_(node, stop_at)
+    }
+
     /// Build the backup action for a node; write-through also chains its
     /// unbacked ancestors.
     pub fn build_backup_kv_action_(&self, node: &Node<K>, write_back: bool) -> BackupKV {
-        let mut chain = vec![node.id];
-        if !write_back {
-            let mut ancestor = node.try_parent();
-            while let Some(ancestor_idx) = ancestor {
-                let ancestor_node = self.arena.node(ancestor_idx);
-                if ancestor_node.is_root()
-                    || ancestor_node.backuped()
-                    || ancestor_node.external_cache_stored
-                    || (self.enable_external_cache_linker
-                        && ancestor_node.write_through_pending_id.is_some())
-                {
-                    break;
-                }
-                chain.push(ancestor_node.id);
-                ancestor = ancestor_node.try_parent();
-            }
-            // write_through: Ancestors first to preserve backup invariant
-            chain.reverse();
+        if write_back {
+            return BackupKV {
+                node_ids: vec![node.id],
+            };
         }
+        self.build_backup_chain_(node, /* stop_at = */ None)
+    }
+
+    /// The node and its unbacked ancestors below `stop_at`, ancestors first.
+    fn build_backup_chain_(&self, node: &Node<K>, stop_at: Option<NodeId>) -> BackupKV {
+        let mut chain = vec![node.id];
+        let mut ancestor = node.try_parent();
+        while let Some(ancestor_idx) = ancestor {
+            let ancestor_node = self.arena.node(ancestor_idx);
+            if Some(ancestor_node.id) == stop_at
+                || ancestor_node.is_root()
+                || ancestor_node.backuped()
+                || ancestor_node.external_cache_stored
+                || (self.enable_external_cache_linker
+                    && ancestor_node.write_through_pending_id.is_some())
+            {
+                break;
+            }
+            chain.push(ancestor_node.id);
+            ancestor = ancestor_node.try_parent();
+        }
+        // write_through: Ancestors first to preserve backup invariant
+        chain.reverse();
         BackupKV { node_ids: chain }
     }
 

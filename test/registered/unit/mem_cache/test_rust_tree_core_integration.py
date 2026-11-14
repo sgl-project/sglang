@@ -4973,6 +4973,40 @@ def test_fresh_swa_leaf_forwards_buffer_split_action(backend, window):
     )
 
 
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("buffer_only", [False, True])
+@pytest.mark.parametrize("inserted_len", [0, 2])
+def test_buffer_only_insert_lists_each_unbacked_ancestor_once(
+    backend, buffer_only, inserted_len
+):
+    core = _tree_core(backend)
+    # One node per token, so the path holds four unbacked nodes.
+    for n in range(1, 5):
+        _insert(core, list(range(n)), list(range(n)))
+    core.set_hicache_enabled()
+    if buffer_only:
+        core.set_host_memory_buffer_only()
+    core.write_through_threshold = 1
+    result = _pump_insert(
+        core,
+        InsertParams(
+            key=_key(list(range(5))),
+            value=torch.arange(5, dtype=torch.int64),
+            inserted_len=inserted_len,
+        ),
+    )
+    chains = [a.node_ids for a in result.cache_actions if isinstance(a, BackupKV)]
+    (path,) = core.collect_path_info([result.last_device_node])
+    nodes = [node.node_id for node in path]
+    # Nodes the request already inserted are not counted, so the first backup carries them.
+    first = inserted_len + 1
+    if buffer_only:
+        # A buffer-only walk lists each node once: later chains stop at the previous tail.
+        assert chains == [nodes[:first]] + [[node] for node in nodes[first:]]
+    else:
+        assert chains == [nodes[:end] for end in range(first, len(nodes) + 1)]
+
+
 def test_python_fresh_swa_leaf_cap_rejects_write_through_ack():
     core, _ = _swa_transfer_core("python", window=2)
     core.set_host_memory_buffer_only()
