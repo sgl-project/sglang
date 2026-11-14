@@ -1351,6 +1351,8 @@ class Envs:
     # Force FlashInfer decode on (1) or off (0) tensor cores; unset picks from
     # the KV cache dtype and the GQA group size.
     SGLANG_FLASHINFER_USE_TENSOR_CORE = EnvBool(None)
+    # Share completed-block refresh with next-block denoising for SDAR N1.
+    SGLANG_SDAR_REFRESH_PAIR = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
