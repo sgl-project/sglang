@@ -218,7 +218,9 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             full_available_size=MagicMock(return_value=512),
         )
         queue.token_to_kv_pool_allocator = SimpleNamespace(
-            logical_attn_allocator=logical_allocator, storage=None
+            logical_attn_allocator=logical_allocator,
+            storage=None,
+            pools_share_memory=False,
         )
         queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
         queue.retracted_queue = []
@@ -267,6 +269,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator = SimpleNamespace(
             state=None,
             storage=None,
+            pools_share_memory=False,
             # The window pool, keeping the scheduler's window.
             window_pool_names=lambda: ("swa",),
             target_window_pool=lambda: "swa",
@@ -421,6 +424,14 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         np.testing.assert_array_equal(info.dst_kv_indices, host_pages)
         np.testing.assert_array_equal(info.dst_device_kv_indices, device_pages)
+
+
+class TestHiSparseRetraction(CustomTestCase):
+    def test_retraction_rebootstraps_instead_of_host_backup(self):
+        from sglang.srt.mem_cache.common import retraction_needs_rebootstrap
+
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        self.assertTrue(retraction_needs_rebootstrap(allocator))
 
 
 if __name__ == "__main__":

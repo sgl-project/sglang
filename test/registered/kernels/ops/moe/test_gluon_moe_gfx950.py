@@ -143,6 +143,55 @@ class TestGluonMoeGfx950(CustomTestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
 
+    def test_tp8_m32768_raw_partials_beyond_2gib(self):
+        """Escaped FP32 partials past 2 GiB of a 3-GiB half must not be dropped.
+
+        Freed cache blocks are filled with NaN first, so any partial the kernel
+        fails to write is read back as NaN. Each token must also match the
+        same token run in a 4224-row batch, whose workspace stays below 2 GiB.
+        """
+        from sglang.kernels.ops.moe.gluon_moe_gfx950.fused_moe_tp8_m4193_16768 import (
+            fused_moe,
+        )
+        from sglang.srt.layers.moe.glm_mxfp4_gluon import _pack_scale, _pack_weight
+
+        device = torch.device("cuda")
+        generator = torch.Generator(device=device).manual_seed(0)
+
+        def randint(low, high, shape):
+            return torch.randint(
+                low, high, shape, device=device, dtype=torch.uint8, generator=generator
+            )
+
+        # Dense random routing escapes a few rows in every 32K batch.
+        w13 = _pack_weight(randint(0, 256, (257, 512, 3072)))
+        w13_scale = _pack_scale(randint(121, 124, (257, 512, 192)))
+        w2 = _pack_weight(randint(0, 256, (257, 6144, 128)))
+        w2_scale = _pack_scale(randint(121, 124, (257, 6144, 8)))
+        router = (
+            torch.randn((256, 6144), device=device, generator=generator) * 0.02
+        ).bfloat16()
+        bias = torch.zeros((256,), device=device)
+        x = torch.randn((32768, 6144), device=device, generator=generator).bfloat16()
+        weights = (router, bias, w13, w13_scale, w2, w2_scale)
+
+        try:
+            empty_gpu_cache()
+            poison = torch.full(
+                ((16 << 30) // 4,), float("nan"), dtype=torch.float32, device=device
+            )
+            del poison
+            output = fused_moe(x, *weights)
+            torch.cuda.synchronize()
+            self.assertEqual((~torch.isfinite(output)).any(dim=1).sum().item(), 0)
+            for end in (*range(4224, 32768, 4224), 32768):
+                start = end - 4224
+                expected = fused_moe(x[start:end].contiguous(), *weights)
+                torch.testing.assert_close(output[start:end], expected, rtol=0, atol=0)
+        finally:
+            del x, weights, router, bias, w13, w13_scale, w2, w2_scale
+            empty_gpu_cache()
+
     def test_tp8_m1_kernel_compiles_and_runs(self):
         """Keep relocation and ABI regressions from hiding behind dispatcher-only tests."""
         from sglang.kernels.ops.moe.gluon_moe_gfx950.fused_moe_tp8_m1_16 import (

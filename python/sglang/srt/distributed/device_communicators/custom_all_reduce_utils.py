@@ -431,12 +431,11 @@ def is_weak_contiguous(inp: torch.Tensor):
 
 
 def can_p2p(rank: int, world_size: int) -> bool:
-    # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
-    SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"
+    skip_p2p_check = sglang_envs.SGLANG_SKIP_P2P_CHECK.get()
     for i in range(world_size):
         if i == rank:
             continue
-        if SGLANG_SKIP_P2P_CHECK:
+        if skip_p2p_check:
             logger.info("Skipping P2P check and trusting the driver's P2P report.")
             return torch.cuda.can_device_access_peer(rank, i)
         if not gpu_p2p_access_check(rank, i):

@@ -82,20 +82,20 @@ class TestMediaIdentity(unittest.TestCase):
 
     def test_relative_local_path_uses_file_bytes(self):
         payload = b"relative-image-bytes"
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "image.png"
-            path.write_bytes(payload)
-            previous = Path.cwd()
-            try:
-                os.chdir(directory)
-                snapshot = snapshot_media("image.png")
-            finally:
-                os.chdir(previous)
+        for name in ("image.png", "image.bmp", "image.tiff", "image.heic"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / name).write_bytes(payload)
+                previous = Path.cwd()
+                try:
+                    os.chdir(directory)
+                    snapshot = snapshot_media(name)
+                finally:
+                    os.chdir(previous)
 
-        self.assertEqual(snapshot.data, payload)
-        self.assertEqual(
-            snapshot.content_digest, snapshot_media(payload).content_digest
-        )
+                self.assertEqual(snapshot.data, payload)
+                self.assertEqual(
+                    snapshot.content_digest, snapshot_media(payload).content_digest
+                )
 
     def test_same_url_with_new_contents_misses(self):
         with patch(

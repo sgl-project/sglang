@@ -128,57 +128,36 @@ class StateStorage:
             + int(req.kv.mamba_cow_src_index is not None)
         )
 
-    def acquire(
-        self,
-        table,
-        reqs: List[Req],
-        rows: List[int],
-        fresh_rows: List[bool],
-        *,
-        reset_request_parts: bool = True,
-    ) -> None:
+    def acquire(self, table, reqs: List[Req], rows: List[int]) -> None:
         """Gives each request of newly bound ``rows`` its state slot and, with
         the extra buffer, its ping-pong tracking slots, and writes them into
         the table's columns. A request that already holds a slot (a radix hit,
-        a continuing chunk) keeps it. ``fresh_rows`` marks rows the requests
-        did not hold before: their speculative ReplaySSM cursors restart."""
-        # FIXME: these cursor resets run on the schedule stream when a row is
-        # reused, while the forward of the row's previous request may still be
-        # running and advancing the same cursors (the write-after-read barrier
-        # orders only shared reads). Order the reset after that forward.
-        spec_write_pos = self.pool.replayssm_spec_write_pos
-        if spec_write_pos is not None and reset_request_parts:
-            fresh_indices = [idx for idx, fresh in zip(rows, fresh_rows) if fresh]
-            if fresh_indices:
-                fresh = async_h2d(fresh_indices, dtype=torch.int64, device=table.device)
-                spec_write_pos.index_fill_(0, fresh, 0)
-                self.pool.replayssm_cache_base.index_fill_(0, fresh, 0)
-                self.pool.replayssm_is_flush.index_fill_(0, fresh, 0)
-
+        a continuing chunk) keeps it."""
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         # What this call hands out, given back if a later request finds no slot.
         given_state: list[Req] = []
         given_tracking: list[Req] = []
-        for req in reqs:
-            if req.kv.holds_mamba:  # for radix cache / continuing chunked
-                pass
-            else:
-                mid = self.slots.alloc(1)
-                if mid is None:
-                    self._give_back(given_state, given_tracking)
-                    raise StateSlotsExhausted(
-                        f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.pool.size=}, {self.slots.available_size()=}, {len(reqs)=}"
-                    )
-                req.kv.mamba_pool_idx = mid[0]
-                given_state.append(req)
+        # The requests holding no slot (a radix hit or a continuing chunk keeps
+        # its own) take theirs in one allocation.
+        needing = [req for req in reqs if not req.kv.holds_mamba]
+        if needing:
+            mids = self.slots.alloc(len(needing))
+            if mids is None:
+                raise StateSlotsExhausted(
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {self.pool.size=}, {self.slots.available_size()=}, {len(needing)=}"
+                )
+            for req, mid in zip(needing, mids):
+                req.kv.mamba_pool_idx = mid
                 req.kv.mamba_needs_clear = True
-                # A zero write_pos empties the ReplaySSM ring;
-                # decode then reads only the checkpoint written by prefill.
-                if self.pool.replayssm_write_pos is not None:
-                    self.pool.replayssm_write_pos.index_fill_(
-                        0, self.slots.translate(mid).to(torch.int64), 0
-                    )
+            given_state.extend(needing)
+            # A zero write_pos empties the ReplaySSM ring;
+            # decode then reads only the checkpoint written by prefill.
+            if self.pool.replayssm_write_pos is not None:
+                self.pool.replayssm_write_pos.index_fill_(
+                    0, self.slots.translate(mids).to(torch.int64), 0
+                )
+        for req in reqs:
             mamba_indices.append(req.kv.mamba_pool_idx)
             if table.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:
@@ -208,6 +187,18 @@ class StateStorage:
             table.req_index_to_mamba_ping_pong_track_buffer_mapping[row_ids] = (
                 ping_pong_tensor
             )
+
+    def reset_request_rows(self, rows: List[int], *, device) -> None:
+        """Restart the speculative ReplaySSM cursors of ``rows``, which start a
+        new request; on the forward stream (`RowResets`). Static pools only: a
+        unified pool resets them with the rest of its request memory."""
+        write_pos = self.pool.replayssm_spec_write_pos
+        if write_pos is None:
+            return
+        indices = async_h2d(rows, dtype=torch.int64, device=device)
+        write_pos.index_fill_(0, indices, 0)
+        self.pool.replayssm_cache_base.index_fill_(0, indices, 0)
+        self.pool.replayssm_is_flush.index_fill_(0, indices, 0)
 
     def alloc_ping_pong_buffer(self, table, req: Req) -> bool:
         """Return False if slots are exhausted. Lazy mode starts with one slot

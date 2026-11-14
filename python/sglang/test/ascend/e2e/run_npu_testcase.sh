@@ -10,6 +10,10 @@ fi
 # shadow the installed package on sys.path.
 cd "${sglang_source_path}"
 
+# CI hosts mount /root/.cache/huggingface read-only, but --trust-remote-code
+# needs a writable transformers dynamic-module cache.
+export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
+
 echo "NPU info:"
 npu-smi info
 

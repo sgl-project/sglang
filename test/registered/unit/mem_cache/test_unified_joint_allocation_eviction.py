@@ -25,6 +25,7 @@ from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.unified_allocator_fixtures import (
     build_swa_cache,
     hold_band,
+    largest_take,
     release_band,
     setup_allocator_context,
 )
@@ -131,7 +132,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                         allocator.free(temporary)
                     else:
                         allocator.free_segment(temporary, start_pos=0)
-                    self.assertLess(allocator.available_size(), 4 * page_size)
+                    self.assertLess(largest_take(allocator), 4 * page_size)
                     self.assertTrue(evict_from_tree_cache(cache, 4 * page_size))
                     out = allocator.alloc(4 * page_size)
                     self.assertIsNotNone(out)
@@ -171,7 +172,12 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 before = allocator.full_attn_allocator.available_size()
                 if allocation:
                     # The demand: two tokens past what the owner serves now.
-                    demand = allocator.full_available_size() + 2
+                    demand = (
+                        largest_take(
+                            allocator, allocator.full_attn_allocator.sub_pool_name
+                        )
+                        + 2
+                    )
                     result = cache.evict_for_alloc(KVDemand(full_tokens=demand))
                 else:
                     result = cache.evict(EvictParams(num_tokens=2))
@@ -224,7 +230,13 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                         patch.object(cache, "_evict_units", side_effect=record)
                     )
                     # Two FULL tokens past what the owner serves now.
-                    demand = KVDemand(allocator.full_available_size() + 2, {window: 0})
+                    demand = KVDemand(
+                        largest_take(
+                            allocator, allocator.full_attn_allocator.sub_pool_name
+                        )
+                        + 2,
+                        {window: 0},
+                    )
                     cache.evict_for_alloc(demand)
                     self.assertTrue(allocator.ensure_capacity(demand))
                     self.assertEqual(walks[0], {window} if windows_first else {owner})
@@ -312,7 +324,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 self.assertIsNotNone(extra)
                 allocator.free_group_begin()
                 allocator.free_full(extra[:2])
-                self.assertLess(allocator.available_size(), 4)
+                self.assertLess(largest_take(allocator), 4)
                 self.assertTrue(evict_from_tree_cache(cache, 4))
                 out = allocator.alloc(4)
                 self.assertIsNotNone(out)
@@ -503,7 +515,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         for key in branch_keys:
             cache.match_prefix(MatchPrefixParams(key=key))
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 96)
-        self.assertEqual(allocator.available_size(), 3)
+        self.assertEqual(largest_take(allocator), 3)
         kv = allocator.get_kvcache()
         for layer, member in enumerate(allocator.members):
             ids = member.ids.translate(slots[12:13])

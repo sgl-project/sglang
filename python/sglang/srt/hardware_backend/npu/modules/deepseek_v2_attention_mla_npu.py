@@ -595,26 +595,18 @@ def forward_dsa_core_npu(
         topk_indices=topk_indices,
     )
 
-    if _is_npu_arch35 or (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_draft_extend_v2()
-        and not forward_batch.forward_mode.is_target_verify()
-    ):
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
-    else:
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
-        )
-        attn_output = attn_output.contiguous()
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    perm_x1 = (1, 0, 2)
+    if not _is_npu_arch35 and m.num_local_heads * m.kv_lora_rank >= 65536:
+        # A2/A3's fused input transpose requires heads * kv_lora_rank < 65536.
+        attn_output = attn_output.transpose(0, 1).contiguous()
+        perm_x1 = (0, 1, 2)
+    attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+        attn_output,
+        m.w_vc,
+        perm_x1=perm_x1,
+        perm_x2=(0, 1, 2),
+        perm_y=(1, 0, 2),
+    )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
@@ -708,7 +700,7 @@ def npu_mla_preprocess(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
             q_lora = m.q_a_layernorm(q)
-            torch.npu.current_stream().wait_event(m.alt_stream)
+            torch.npu.current_stream().wait_stream(m.alt_stream)
         else:
             (
                 q_pe,

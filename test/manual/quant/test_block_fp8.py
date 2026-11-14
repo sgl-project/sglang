@@ -1,6 +1,5 @@
 import itertools
 import unittest
-from functools import lru_cache
 
 import torch
 
@@ -26,18 +25,6 @@ from sglang.srt.utils import is_blackwell_supported, is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
-
-
-# For test
-@lru_cache(maxsize=1)
-def _get_triton_mxfp8_upcast():
-    try:
-        from triton_kernels.numerics_details.mxfp import upcast_from_mxfp_torch
-    except Exception as err:
-        raise RuntimeError(
-            "MXFP8 dequantization requires triton_kernels with MXFP8 support."
-        ) from err
-    return upcast_from_mxfp_torch
 
 
 # For test
@@ -445,8 +432,9 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
 
 
 def _mxfp8_group_dequant(q: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
-    upcast_from_mxfp_torch = _get_triton_mxfp8_upcast()
-    return upcast_from_mxfp_torch(q, scale_u8, torch.float32, axis=1)
+    m, k = q.shape
+    scale = (scale_u8.to(torch.int32) << 23).view(torch.float32)
+    return (q.float().view(m, k // 32, 32) * scale.unsqueeze(-1)).view(m, k)
 
 
 class TestMXFP8DenseLinear(CustomTestCase):

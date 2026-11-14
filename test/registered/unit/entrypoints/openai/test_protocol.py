@@ -197,6 +197,19 @@ class TestChatCompletionRequest(CustomTestCase):
         )
         self.assertEqual(request.messages[0].content[0].image_url.detail, "auto")
 
+    def test_image_url_may_be_a_bare_string(self):
+        url = "https://example.com/a.png"
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": url}],
+                },
+            ],
+        )
+        self.assertEqual(request.messages[0].content[0].image_url.url, url)
+
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
             model="x",
@@ -908,6 +921,91 @@ class TestValidationEdgeCases(CustomTestCase):
         """Test negative token limits"""
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
+
+
+class TestAssistantToolCallNames(unittest.TestCase):
+    """A tool call in the conversation history must name its function."""
+
+    def _request(self, function):
+        return ChatCompletionRequest(
+            model="m",
+            messages=[
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": function}
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            ],
+        )
+
+    def test_named_tool_call_accepted(self):
+        request = self._request({"name": "get_weather", "arguments": "{}"})
+        self.assertEqual(request.messages[1].tool_calls[0].function.name, "get_weather")
+
+    def test_nameless_tool_call_rejected(self):
+        for label, function in {
+            "missing": {"arguments": "{}"},
+            "null": {"name": None, "arguments": "{}"},
+            "empty": {"name": "", "arguments": "{}"},
+        }.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValidationError) as ctx:
+                    self._request(function)
+                self.assertIn("'function.name' is required", str(ctx.exception))
+
+
+class TestThinkingObject(unittest.TestCase):
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def _request(self, **kwargs):
+        return ChatCompletionRequest(model="m", messages=self.MESSAGES, **kwargs)
+
+    def test_disabled_turns_reasoning_off(self):
+        request = self._request(thinking={"type": "disabled"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+        self.assertIs(request.chat_template_kwargs["enable_thinking"], False)
+
+    def test_enabled_is_the_default_type(self):
+        request = self._request(thinking={"keep": "all"})
+        self.assertIs(request.chat_template_kwargs["thinking"], True)
+
+    def test_effort_outranks_reasoning_effort(self):
+        request = self._request(
+            reasoning_effort="max", thinking={"type": "enabled", "effort": "low"}
+        )
+        self.assertEqual(request.reasoning_effort, "low")
+
+    def test_effort_outranks_reasoning_object(self):
+        request = self._request(reasoning={"effort": "max"}, thinking={"effort": "low"})
+        self.assertEqual(request.reasoning_effort, "low")
+
+    def test_reasoning_effort_survives_without_thinking_effort(self):
+        request = self._request(reasoning_effort="low", thinking={"type": "enabled"})
+        self.assertEqual(request.reasoning_effort, "low")
+
+    def test_disabled_wins_over_an_effort_derived_toggle(self):
+        request = self._request(reasoning_effort="high", thinking={"type": "disabled"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+
+    def test_invalid_effort_names_the_thinking_field(self):
+        with self.assertRaisesRegex(ValidationError, "invalid thinking effort"):
+            self._request(thinking={"type": "enabled", "effort": "bogus"})
+
+    def test_non_object_thinking_leaves_the_toggle_unset(self):
+        request = self._request(thinking=False)
+        self.assertIsNone(request.chat_template_kwargs)
+
+    def test_adaptive_is_treated_as_enabled(self):
+        request = self._request(thinking={"type": "adaptive"})
+        self.assertIs(request.chat_template_kwargs["thinking"], True)
+
+    def test_explicit_none_effort_survives_a_thinking_object(self):
+        request = self._request(reasoning_effort="none", thinking={"keep": "all"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
 
 
 if __name__ == "__main__":

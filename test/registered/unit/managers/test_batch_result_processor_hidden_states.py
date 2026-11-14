@@ -16,6 +16,10 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
@@ -59,6 +63,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         request_retirer=release_only_retirer(),
         abort_request=lambda *args, **kwargs: None,
         still_in_batch=lambda req: True,
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
     )
 
 
@@ -66,7 +71,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
     def test_failed_kv_load_discarded_with_mixed_embedding_formats(self):
         reason = FINISH_ABORT("External KV cache load failed", 503)
         reqs = [
-            SimpleNamespace(
+            FakeReq(
                 encoding_format=encoding_format,
                 discard_output_reason=discard_reason,
                 is_retracted=False,
@@ -77,7 +82,6 @@ class TestPrefillEmbeddingResults(CustomTestCase):
                 time_stats=Mock(),
                 update_finish_state=Mock(),
                 finished_reason=None,
-                exit_via=None,
                 finished=lambda: True,
                 kv=SimpleNamespace(
                     holds_kv=True, holds_mamba=False, retraction_backup=None

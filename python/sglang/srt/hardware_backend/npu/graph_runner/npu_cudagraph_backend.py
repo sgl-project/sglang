@@ -29,10 +29,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
+    BaseGraphBackend,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import empty_context, get_bool_env_var, get_compiler_backend
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class NPUCudaGraphBackend(BaseCudaGraphBackend):
+class NPUCudaGraphBackend(BaseGraphBackend):
     """One torch.npu.NPUGraph per shape; attention metadata captured
     inside the graph. replay_with_input_update substitutes fresh
     seq_lens without re-recording."""
@@ -396,6 +397,24 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             self._capture_stream = None
 
     def capture_one(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        capture_inputs: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
+    ) -> None:
+        # Some capture callbacks call the model directly, bypassing
+        # ModelRunner.forward and its recording context. Guard both warmups and
+        # capture here, including calls that do not enter capture_session.
+        record_ctx = (
+            get_global_expert_distribution_recorder().disable_this_region()
+            if self._decode_runner.model_runner.is_draft_worker
+            else empty_context()
+        )
+        with record_ctx:
+            self._capture_one(shape_key, forward_fn, capture_inputs, post_warmup_hook)
+
+    def _capture_one(
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],

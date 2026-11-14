@@ -7,11 +7,16 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import msgspec
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -29,6 +34,22 @@ DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"
 def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     """Return whether a DSpark checkpoint samples the anchor query row."""
     return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
+
+
+def builds_confidence_head(draft_hf_config: Any) -> bool:
+    """Whether the draft builds its trained confidence head; ragged verify
+    without one takes its confidences from the online acceptance estimator."""
+    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+        return False
+    enabled = _cfg_get(draft_hf_config, "enable_confidence_head")
+    if enabled is False or envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.get():
+        return False
+    if enabled is None:
+        logger.warning(
+            "DSpark draft config has no enable_confidence_head field; treating the "
+            "confidence head as enabled."
+        )
+    return True
 
 
 def draft_uses_compressed_kv_attention() -> bool:
