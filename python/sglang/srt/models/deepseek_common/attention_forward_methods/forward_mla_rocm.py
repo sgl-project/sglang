@@ -166,6 +166,25 @@ if _use_gfx1250_fused_mla_rope:
 
 _GFX1250_FUSED_ROPE_BACKENDS = ("aiter", "triton")
 
+_use_fused_mla_value_mxfp4_quant = (
+    _use_aiter_gfx95 and envs.SGLANG_OPT_HIP_FUSE_MLA_VALUE_MXFP4_QUANT.get()
+)
+if _use_fused_mla_value_mxfp4_quant:
+    # The fused kernel imports private AITER Triton helpers; if AITER moves them,
+    # keep the split value projection rather than failing every MLA model import.
+    try:
+        from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (
+            batched_gemm_a16wfp4_flatten_mxfp4_quant,
+            can_fuse_mla_value_bmm_mxfp4_quant,
+        )
+    except ImportError as e:
+        logger.warning(
+            "Fused MLA value projection + MXFP4 quant is unavailable (%s); "
+            "using the split path.",
+            e,
+        )
+        _use_fused_mla_value_mxfp4_quant = False
+
 
 _ABSORB_BMM_DECODE_MAX_M = 256
 _absorb_bmm_num_cu = 0
@@ -297,14 +316,40 @@ def rocm_absorb_q_bmm(
     return q_nope_out
 
 
+def _can_fuse_rocm_mla_value_mxfp4_quant(
+    attn: DeepseekV2AttentionMLA,
+    forward_batch: ForwardBatch,
+) -> bool:
+    # The caller has already checked that w_vc is MXFP4.
+    return (
+        _use_fused_mla_value_mxfp4_quant
+        and forward_batch.forward_mode.is_decode_or_idle()
+        and attn.current_attention_backend == "aiter"
+        and not attn.use_dsa
+        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        and not is_kv_b_lora_active(attn)
+        and attn.o_proj.weight.dtype == torch.uint8
+        and attn.kv_lora_rank == 512
+        and attn.v_head_dim == 128
+    )
+
+
 def rocm_absorb_v_bmm(
     attn: DeepseekV2AttentionMLA,
     attn_output: torch.Tensor,
+    forward_batch: ForwardBatch,
 ) -> torch.Tensor:
     """Absorb ``attn_output @ w_vc`` (+ optional fused flatten quant) on HIP."""
     # TODO(haishaw): add bmm_fp8 to ROCm
     if _use_aiter_gfx95 and attn.w_vc.dtype == torch.uint8:
         x = attn_output.transpose(0, 1)
+        w_vc = attn.w_vc.transpose(-2, -1)
+        w_scale_v = attn.w_scale_v.transpose(-2, -1)
+        if _can_fuse_rocm_mla_value_mxfp4_quant(
+            attn=attn, forward_batch=forward_batch
+        ) and can_fuse_mla_value_bmm_mxfp4_quant(x, w_vc, w_scale_v):
+            # Emits the flattened MXFP4 o_proj input; there is no BF16 value output.
+            return batched_gemm_a16wfp4_flatten_mxfp4_quant(x, w_vc, w_scale_v)
         B_heads, M_batch = x.shape[0], x.shape[1]
         N_vdim = attn.w_vc.shape[2]
         # Allocate in (batch, heads, dim) so the post-GEMM
@@ -319,8 +364,8 @@ def rocm_absorb_v_bmm(
         attn_bmm_output = _bmm_buf.transpose(0, 1)
         batched_gemm_afp4wfp4_pre_quant(
             x,
-            attn.w_vc.transpose(-2, -1),
-            attn.w_scale_v.transpose(-2, -1),
+            w_vc,
+            w_scale_v,
             torch.bfloat16,
             attn_bmm_output,
         )
@@ -1188,7 +1233,7 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
+            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output, forward_batch)
 
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
