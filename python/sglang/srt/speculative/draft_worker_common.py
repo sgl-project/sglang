@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
+from sglang.srt.arg_groups.choices import (
+    DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+)
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -28,10 +31,6 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     draft_model_runner: ModelRunner
     draft_model: torch.nn.Module
     resolved_attention_backend: str
-
-
-# Draft backends that serve only MLA layers; DFLASH takes them for MLA drafts.
-DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
 
 
 def dflash_dcp_mla_draft_backend() -> str:
@@ -74,7 +73,6 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     if draft_backend is None:
         return platform_fallback
     if algo_label == "DFLASH" and draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
-        # MLA-only backends: the DFLASH hook admits them for MLA drafts only.
         return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback

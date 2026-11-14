@@ -202,6 +202,12 @@ class OpenAIServingBase(ABC):
         """Validate request"""
         pass
 
+    def _top_logprobs_error(self, field: str, value: Optional[int]) -> Optional[str]:
+        vocab_size = self.tokenizer_manager.model_config.vocab_size
+        if value is not None and not 0 <= value <= vocab_size:
+            return f"{field} must be in [0, {vocab_size}], got {value}."
+        return None
+
     def create_error_response(
         self,
         message: str,

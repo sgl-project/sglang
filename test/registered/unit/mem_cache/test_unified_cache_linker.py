@@ -213,7 +213,6 @@ class TestMooncakePrefetch(CustomTestCase):
         linker.layer_done_counter = LayerWiseLoadCounter(2)
         linker.gc_frozen = True
         linker.pending_loads, linker.broadcast_loads = {}, {}
-        linker.load_queued_at = {}
         linker.load_queue, linker.offload_queue, linker.offload_results = (
             Queue() for _ in range(3)
         )
@@ -2436,7 +2435,6 @@ class TestTransferReadyEvents(CustomTestCase):
                 linker.mla_broadcaster = None
                 linker.gc_frozen = True
                 linker.pending_loads = {"rid": ["transfer"]}
-                linker.load_queued_at = {}
                 linker.stats = {"load": 0}
                 linker.load_queue = queue.Queue()
                 if prefetch:
@@ -2464,9 +2462,7 @@ class TestTransferReadyEvents(CustomTestCase):
                         if prefetch
                         else [
                             call.record_transfer_ready(),
-                            call.load_layer_wise(
-                                3, [["transfer"]], ready, [("rid", None)]
-                            ),
+                            call.load_layer_wise(3, [["transfer"]], ready),
                         ]
                     ),
                 )

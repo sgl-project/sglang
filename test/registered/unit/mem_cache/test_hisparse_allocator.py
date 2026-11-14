@@ -430,8 +430,6 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
 class TestHiSparseRetraction(CustomTestCase):
     def test_retraction_rebootstraps_instead_of_host_backup(self):
-        """A retracted HiSparse decode request is recomputed by the prefill;
-        the allocator cannot take a host copy of its KV."""
         from sglang.srt.mem_cache.common import retraction_needs_rebootstrap
 
         allocator = object.__new__(HiSparseTokenToKVPoolAllocator)

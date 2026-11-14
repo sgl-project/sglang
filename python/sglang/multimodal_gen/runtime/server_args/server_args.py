@@ -2568,8 +2568,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "instead of Ulysses all-to-all. Non-causal attention only; "
                 "does not compose with --ulysses-degree/--ring-degree yet. "
                 "When no SP degree is set explicitly, sp_degree=2 defaults to "
-                "kv_gather_degree=2 (its measured-win zone) and higher "
-                "degrees default to Ulysses."
+                "kv_gather_degree=2 (its measured-win zone); higher degrees "
+                "default to Ulysses when the DiT's attention heads divide by "
+                "sp_degree, and to K/V gather otherwise."
             ),
         )
         parser.add_argument(

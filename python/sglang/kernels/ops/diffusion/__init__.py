@@ -902,6 +902,8 @@ _EXPORTS: dict[str, str] = {
     "QWEN_IMAGE_ADDED_QKV": "sites.qwen_image_added_qkv_site",
     "SANA_VIDEO_LINEAR_ATTENTION": "sites.sana_video_linear_attention_site",
     "try_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
+    "SANA_VIDEO2_SOFTMAX_ATTENTION": "sites.sana_video2_softmax_attention_site",
+    "try_sana_video2_softmax_attention": "sites.sana_video2_softmax_attention_site",
     "QualityGatedFusion": "sites.quality_gate",
     # JIT C++/CUDA extensions (not kernels, not in the registry)
     "interpolate": "ext.hunyuan3d_rasterizer",

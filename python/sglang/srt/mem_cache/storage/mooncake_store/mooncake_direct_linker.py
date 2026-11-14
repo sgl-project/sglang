@@ -140,9 +140,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
 
-        parallel = get_parallel()
         tp_rank = 0
-        tp_size = parallel.tp_size
+        tp_size = get_parallel().tp_size
         tp_group = params.attn_tp_cache_group or params.tp_cache_group
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             tp_rank = torch.distributed.get_rank(group=tp_group)
@@ -237,11 +236,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
         )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
-        # rid -> when load() queued it; filled only with log_load_timing.
-        self.load_queued_at: dict[str, float] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
-            tuple[int, dict[str, list[PoolTransfer]], object, dict[str, float]]
+            tuple[int, dict[str, list[PoolTransfer]], object]
             | tuple[Future[bool], list[PoolTransfer], object]
             | None
         ] = Queue()
@@ -314,8 +311,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
-        if self.log_load_timing:
-            self.load_queued_at[rid] = time.monotonic()
         return True
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
@@ -352,7 +347,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        self.load_queued_at.pop(rid, None)
         return self.pending_loads.pop(rid, None) is not None
 
     def finish_layer_wise_loading(self, counter_index: int) -> bool:
@@ -389,11 +383,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.freeze_gc_once()
         pending = self.pending_loads
         self.pending_loads = {}
-        queued_at = {
-            rid: self.load_queued_at.pop(rid)
-            for rid in pending
-            if rid in self.load_queued_at
-        }
 
         counter_index = self.layer_done_counter.update_producer()
         if broadcaster is not None:
@@ -412,7 +401,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if broadcaster is not None:
             self.broadcast_loads[counter_index] = (0, prepared, ready)
         if broadcaster is None or broadcaster.is_src:
-            self.load_queue.put((counter_index, pending, ready, queued_at))
+            self.load_queue.put((counter_index, pending, ready))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -442,8 +431,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                # Layer-wise tasks also carry each request's queue time.
-                completion, pending, ready = task[:3]
+                completion, pending, ready = task
                 prefetch = isinstance(completion, Future)
                 if prefetch and not completion.set_running_or_notify_cancel():
                     continue
@@ -452,13 +440,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         ready.synchronize()
                         completion.set_result(self.load_all_layers(pending))
                     else:
-                        queued_at = task[3]
-                        self.load_layer_wise(
-                            completion,
-                            list(pending.values()),
-                            ready,
-                            [(rid, queued_at.get(rid)) for rid in pending],
-                        )
+                        self.load_layer_wise(completion, list(pending.values()), ready)
                 except BaseException as error:
                     if prefetch:
                         completion.set_result(False)
@@ -476,31 +458,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         counter_index: int,
         request_transfers: list[list[PoolTransfer]],
         ready_event=None,
-        requests: list[tuple[str, float | None]] | None = None,
     ) -> None:
-        """``requests`` names each entry of ``request_transfers`` and when its
-        load was queued; with ``log_load_timing`` each one is logged once all
-        layers land."""
         session_keys = []
         futures: list[list[Future]] = []
-        began = time.monotonic()
-        timed = self.log_load_timing and requests is not None
-        # Per request: the key range each pool's batch holds for it.
-        spans: list[list[tuple[PoolName, int, int]]] = []
-        loaded = [0] * len(request_transfers)
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
-                span = []
                 for transfer in transfers:
                     keys, _ = batches.setdefault(transfer.name, ([], []))
                     component_keys, _ = self.storage._get_hybrid_page_component_keys(
                         list(transfer.keys), transfer
                     )
-                    first = len(keys)
                     keys.extend(self.storage._tag_keys(component_keys))
-                    span.append((transfer.name, first, len(keys)))
-                spans.append(span)
             # Wait before opening sessions so the slot fence does not consume
             # their leases. Key preparation above still overlaps the GPU work.
             if ready_event is not None:
@@ -512,7 +481,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if list(result) != [0] * len(session_keys):
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(session_keys)}, "
-                        f"result_sample={list(result)[:8]}"
+                        f"results={result}"
                     )
             for transfers in request_transfers:
                 for transfer in transfers:
@@ -535,26 +504,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 futures.append(group_futures)
                 for name, (keys, locations) in batches.items():
                     meta = self._group_range_meta(name, locations, group)
-                    if meta is None:
-                        continue
-                    group_futures.extend(self._submit_range_gets(name, keys, *meta))
-                    if timed:
-                        sizes = meta[1]
-                        for index, span in enumerate(spans):
-                            for pool, first, last in span:
-                                if pool == name:
-                                    loaded[index] += sum(
-                                        sum(row) for row in sizes[first:last]
-                                    )
+                    if meta is not None:
+                        group_futures.extend(self._submit_range_gets(name, keys, *meta))
             for group, group_futures in zip(groups, futures):
                 for future in group_futures:
                     future.result()
                 for layer in group:
                     self.layer_done_counter.complete(counter_index, layer)
-            if timed:
-                self._log_load_timing(
-                    request_transfers, requests, loaded, began, time.monotonic()
-                )
         except BaseException as error:
             # Failure wakes consumers, which may release the destination rows.
             # Stop every submitted write before publishing it.
@@ -571,30 +527,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
-
-    @staticmethod
-    def _log_load_timing(request_transfers, requests, loaded, began, landed):
-        """``wait``: queued until this thread started reading, which includes
-        the rest of admission and the batch launch; ``xfer``: until the last
-        layer landed. Bytes are this rank's share only."""
-        rate = sum(loaded) / max(landed - began, 1e-9) / 1e9
-        for transfers, (rid, queued_at), nbytes in zip(
-            request_transfers, requests, loaded
-        ):
-            pages = next((len(t.keys) for t in transfers if t.name == PoolName.KV), 0)
-            queued_at = began if queued_at is None else queued_at
-            logger.info(
-                "Mooncake linker load rid=%s pages=%d bytes=%d wait=%.0fms "
-                "xfer=%.0fms total=%.0fms batch_reqs=%d batch_rate=%.2fGB/s",
-                rid,
-                pages,
-                nbytes,
-                (began - queued_at) * 1e3,
-                (landed - began) * 1e3,
-                (landed - queued_at) * 1e3,
-                len(request_transfers),
-                rate,
-            )
 
     def _group_range_meta(self, name: PoolName, locations: list[int], group: range):
         merged = None
@@ -680,9 +612,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         expected = [sum(item) for item in sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
             raise RuntimeError(
-                f"Mooncake range get failed for pool={name}: objects={len(keys)}, "
-                f"transferred_sample={result[:8] if isinstance(result, list) else result}, "
-                f"expected_sample={expected[:8]}"
+                f"Mooncake range get failed for pool={name}: "
+                f"transferred={result}, expected={expected}"
             )
 
     def offload(
@@ -736,7 +667,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def reset(self) -> None:
         self.pending_loads.clear()
-        self.load_queued_at.clear()
         # Both load modes must stop writing before any destination is recycled.
         self.load_queue.join()
         self.offload_queue.join()

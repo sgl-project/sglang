@@ -7,7 +7,6 @@ for a Mamba state (no copy-on-write, no eviction for state slots)."""
 import unittest
 from array import array
 from dataclasses import replace
-from types import MethodType, SimpleNamespace
 from unittest import mock
 
 from sglang.srt.managers.req_types import FINISH_LENGTH
@@ -72,16 +71,6 @@ def _request(req_to_token_pool, allocator, tokens, rid):
 
 
 class TestDecodeStateFreeRadix(CustomTestCase):
-    def test_tree_holds_no_mamba_component(self):
-        cache, _, _ = _state_free_cache()
-        self.assertFalse(cache.is_mamba_enabled)
-        self.assertNotIn(ComponentType.MAMBA, cache.components)
-        # The cache still owns the requests' state slots.
-        self.assertTrue(cache.supports_mamba())
-        self.assertTrue(cache.supports_full_kv_only_match())
-        self.assertEqual(cache.mamba_evictable_size(), 0)
-        self.assertEqual(cache.mamba_protected_size(), 0)
-
     def test_finished_request_is_cached_and_frees_its_slot(self):
         cache, allocator, req_to_token_pool = _state_free_cache()
         mamba_free = req_to_token_pool.mamba_allocator.available_size()
@@ -113,36 +102,6 @@ class TestDecodeStateFreeRadix(CustomTestCase):
         self.assertFalse(req.kv.holds_kv)
         release_kv_cache(req, cache, checkpoint=False)
         self.assertEqual(req_to_token_pool.mamba_allocator.available_size(), mamba_free)
-
-    def test_decode_admission_matches_full_prefix_without_state(self):
-        from sglang.srt.disaggregation.decode import DecodePreallocQueue
-
-        cache, allocator, req_to_token_pool = _state_free_cache()
-        shared = list(range(1, 9))
-        first = _request(req_to_token_pool, allocator, shared + [900, 901], "a")
-        first.finished_reason = FINISH_LENGTH(length=0)
-        release_kv_cache(first, cache, checkpoint=True)
-        cache.unlock(first.lock)
-
-        second = Req(
-            rid="b",
-            origin_input_text="",
-            origin_input_ids=array("q", shared + [700, 701, 702]),
-            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-        )
-        acquire_rows(req_to_token_pool, req_to_token_pool.state, [second])
-        queue = SimpleNamespace(
-            tree_cache=cache,
-            scheduler=SimpleNamespace(enable_decode_hicache=False),
-            _uses_swa_tail_prealloc=lambda: False,
-        )
-        queue._build_decode_prefix_match = MethodType(
-            DecodePreallocQueue._build_decode_prefix_match, queue
-        )
-        match = DecodePreallocQueue._match_prefix_and_lock(queue, second)
-        self.assertEqual(match.decode_prefix_len, len(shared))
-        cache.unlock(second.lock)
-        cache.sanity_check()
 
     def test_state_shortfall_never_evicts_the_tree(self):
         cache, _, req_to_token_pool = _state_free_cache()

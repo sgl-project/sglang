@@ -170,8 +170,6 @@ class UnifiedCacheLinker(ABC):
     prefetch_policy = "timeout"
     # None when the current stream is the only one using the pages.
     forward_stream: Optional[torch.cuda.Stream] = None
-    # Log each request's load time and bytes.
-    log_load_timing: bool = False
 
     def record_transfer_ready(self) -> TransferReady:
         """Record what a transfer waits on before it touches device pages.
@@ -880,11 +878,6 @@ class UnifiedCacheLinkerWrapper:
         for rid in rids:
             self.private_load_indices.pop(rid, None)
         if landed.item():
-            logger.info(
-                "External linker stage load completed: requests=%d rids=%s",
-                len(rids),
-                rids,
-            )
             return []
         logger.error(
             "External linker load failed; aborting %d request(s): %s", len(rids), rids

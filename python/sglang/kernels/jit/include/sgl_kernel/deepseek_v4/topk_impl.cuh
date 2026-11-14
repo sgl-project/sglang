@@ -28,6 +28,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #if !defined(USE_ROCM)
 // currently only apply cluster for SM90 & SM100, SM120 has poor cluster performance
@@ -58,7 +59,11 @@ static_assert(SGL_TOPK_MODE >= 0 && SGL_TOPK_MODE <= 2, "SGL_TOPK_MODE must be 0
 // different modes can be loaded into one process without colliding.
 #define SGL_TOPK_CONCAT_IMPL(a, b) a##b
 #define SGL_TOPK_CONCAT(a, b) SGL_TOPK_CONCAT_IMPL(a, b)
+#ifdef SGL_TOPK_SCORE_BF16
+#define SGL_TOPK_MODE_NAMESPACE SGL_TOPK_CONCAT(SGL_TOPK_CONCAT(topk_mode_, SGL_TOPK_MODE), _bf16)
+#else
 #define SGL_TOPK_MODE_NAMESPACE SGL_TOPK_CONCAT(topk_mode_, SGL_TOPK_MODE)
+#endif
 
 namespace sglang {
 
@@ -76,6 +81,20 @@ inline constexpr bool kExact = kExactness != Exactness::FAST;
 inline constexpr bool kDeterministic = kExactness == Exactness::DETERMINISTIC;
 /// Mode 2's cluster tie keys order equal values by a 20-bit row index; longer rows are rejected.
 inline constexpr uint32_t kDeterministicIdxBits = 20;
+
+#ifdef SGL_TOPK_SCORE_BF16
+using score_t = bf16_t;
+#else
+using score_t = float;
+#endif
+
+SGL_DEVICE float score_to_float(score_t x) {
+  if constexpr (std::is_same_v<score_t, float>) {
+    return x;
+  } else {
+    return __bfloat162float(x);
+  }
+}
 
 /// Hints that `value` is warp-uniform so it can live in a uniform register. The
 /// caller must already guarantee that: on ROCm this is the identity, since the
@@ -189,7 +208,7 @@ struct alignas(8) TieValue {
 // ---------------------------------------------------------------------------
 
 struct TopKProblem {
-  const float* __restrict__ in;
+  const score_t* __restrict__ in;
   int32_t* __restrict__ out;  // page_indices [topk]
   uint32_t topk;
   uint32_t seq_len;
@@ -591,6 +610,19 @@ struct TopKRadixBase : TopKConfig {
   static constexpr uint32_t kHistSize = 1 << kHistBits;
   using vec_t = AlignedVector<float, kVecSize>;
 
+  SGL_DEVICE static void load_scores(vec_t& v, const score_t* in, int64_t vi) {
+    if constexpr (std::is_same_v<score_t, float>) {
+      v.load(in, vi);
+    } else {
+      AlignedVector<score_t, kVecSize> raw;
+      raw.load(in, vi);
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        v[j] = score_to_float(raw[j]);
+      }
+    }
+  }
+
   struct Smem {
     uint32_t count_eq;
     uint32_t count_gt;
@@ -633,7 +665,7 @@ struct TopKRadixBase : TopKConfig {
   }
 
   template <uint32_t N = 1, typename F>
-  SGL_DEVICE static void for_each_input(const float* __restrict__ in_, uint32_t seq_len, F&& fn) {
+  SGL_DEVICE static void for_each_input(const score_t* __restrict__ in_, uint32_t seq_len, F&& fn) {
     // Only the one-block paths: the cluster scan measured slower with LDG than LD.E.
     const auto in = N == 1 ? assume_global(in_) : in_;
     constexpr auto kStride = N * kBlockSize;
@@ -644,12 +676,12 @@ struct TopKRadixBase : TopKConfig {
     auto vi = N == 1 ? tx : (tx % kChunk) + blockIdx.y * kChunk + (tx / kChunk) * (N * kChunk);
     if (vi < num_full) {
       vec_t next_vec;
-      next_vec.load(in, vi);
+      load_scores(next_vec, in, vi);
 #pragma unroll 1
       do {
         const auto cur = next_vec;
         vi += kStride;
-        if (vi < num_full) next_vec.load(in, vi);
+        if (vi < num_full) load_scores(next_vec, in, vi);
         const auto base = (vi - kStride) * kVecSize;
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -662,7 +694,7 @@ struct TopKRadixBase : TopKConfig {
       const auto base = vi * kVecSize;
       if (base == seq_len) return;
       vec_t cur;
-      cur.load(in, vi);
+      load_scores(cur, in, vi);
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         if (base + j < seq_len) fn(cur[j], base + j);
@@ -777,12 +809,12 @@ struct TopKRadixBase : TopKConfig {
       const auto num_vec = (seq_len + kVecSize - 1) / kVecSize;
       uint32_t vi = kBlockSize - 1 - tx;
       vec_t cur;
-      if (vi < num_vec) cur.load(in, vi);
+      if (vi < num_vec) load_scores(cur, in, vi);
 #pragma unroll 1
       while (vi < num_vec) {
         const auto next_vi = vi + kBlockSize;
         vec_t next;
-        if (next_vi < num_vec) next.load(in, next_vi);
+        if (next_vi < num_vec) load_scores(next, in, next_vi);
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
           if (vi * kVecSize + j < seq_len) fn(cur[j], vi * kVecSize + j);
@@ -888,7 +920,7 @@ struct TopKRadixBase : TopKConfig {
 #pragma unroll 1
       for (uint32_t vi = kBlockSize - 1 - tx; vi < num_vec; vi += kBlockSize) {
         vec_t cur;
-        cur.load(in, vi);
+        load_scores(cur, in, vi);
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
           const auto idx = vi * kVecSize + j;
@@ -913,7 +945,7 @@ struct TopKRadixBase : TopKConfig {
 #pragma unroll 1
     for (uint32_t vi = kBlockSize - 1 - tx; vi < num_vec; vi += kBlockSize) {
       vec_t cur;
-      cur.load(in, vi);
+      load_scores(cur, in, vi);
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         const auto idx = vi * kVecSize + j;
@@ -976,7 +1008,7 @@ struct TopKRegister : TopKRadixBase<12> {
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
-      if (vi < num_full) local_vecs[i].load(in, vi);
+      if (vi < num_full) load_scores(local_vecs[i], in, vi);
     }
 
     const auto tail_start = (problem.seq_len - 1) % kVecSize + 1;
@@ -1409,16 +1441,16 @@ struct TopKCluster : TopKRadixBase<11> {
   /// for_each_input<kClusterSize> by whole vectors: fn_vec(vec, idx of vec[0]) for each of the
   /// first `num_vecs` vectors, a partial last one included (pad_tail).
   template <typename FV>
-  SGL_DEVICE static void for_each_vec(const float* __restrict__ in, uint32_t num_vecs, FV&& fn_vec) {
+  SGL_DEVICE static void for_each_vec(const score_t* __restrict__ in, uint32_t num_vecs, FV&& fn_vec) {
     auto vi = scan_start();
     if (vi < num_vecs) {
       vec_t next_vec;
-      next_vec.load(in, vi);
+      load_scores(next_vec, in, vi);
 #pragma unroll 1
       do {
         const auto cur = next_vec;
         vi += kScanStride;
-        if (vi < num_vecs) next_vec.load(in, vi);
+        if (vi < num_vecs) load_scores(next_vec, in, vi);
         fn_vec(cur, (vi - kScanStride) * kVecSize);
       } while (vi < num_vecs);
     }
@@ -1433,10 +1465,10 @@ struct TopKCluster : TopKRadixBase<11> {
     const auto num_valid = problem.seq_len % kVecSize;
     const auto start = scan_start();
     if (num_valid == 0 || last < start || (last - start) % kScanStride != 0) return;
-    const auto tail = const_cast<float*>(problem.in) + last * kVecSize;
+    const auto tail = const_cast<score_t*>(problem.in) + last * kVecSize;
 #pragma unroll
     for (uint32_t j = 1; j < kVecSize; ++j) {  // a runtime trip count here spills on C8
-      if (j >= num_valid) tail[j] = padding_value();
+      if (j >= num_valid) tail[j] = static_cast<score_t>(padding_value());
     }
     atomicSub(&smem->histogram[extract_coarse_bin<kHistBits>(padding_value())], kVecSize - num_valid);
   }

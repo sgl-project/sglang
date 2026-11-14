@@ -17,6 +17,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.runtime_context import get_context
 
@@ -69,9 +70,9 @@ class TestHeldRowAdmission(CustomTestCase):
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
         s.waiting_queue = IndexedReqList(ListKind.WAITING)
-        s.waiting_queue.join(waiting)
+        move(waiting, s.waiting_queue)
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
-        s.chunked_reqs.join([final_chunk])
+        move([final_chunk], s.chunked_reqs)
         s.min_free_slots_delayer = None
         s.invariant_checker = Mock()
         s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
@@ -113,7 +114,9 @@ class TestHeldRowAdmission(CustomTestCase):
         s.req_to_token_pool = SimpleNamespace(
             available_size=lambda: NUM_ROWS - len(running) - 1
         )
-        s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        s.beam_coordinator = SimpleNamespace(
+            pending_member_rows=lambda batch: 0, pending_member_rows_of=lambda reqs: 0
+        )
         s.running_reqs = KeyedReqList(ListKind.DECODING)
         s.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         return s

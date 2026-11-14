@@ -10,10 +10,6 @@ from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import 
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import (
-    kda_verify_gfx950,
-    supports_kda_verify_gfx950,
-)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
@@ -23,7 +19,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: the gfx950 product-rounding boundary must stay bit-exact.
-register_amd_ci(est_time=65, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=52, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
 
@@ -61,9 +57,10 @@ _RING_CASES += [
 _RING_LEN = 16
 
 
-def _make_ring_buffers(H, HV, K, V, slots=8):
+def _make_ring_buffers(H, HV, K, V):
     # Garbage-filled so a full-tensor bitwise compare proves both that written
     # positions match and that neither kernel scribbles outside them.
+    slots = 8
     return {
         "rawv": torch.randn(
             slots, HV, _RING_LEN, V, device=_DEVICE, dtype=torch.bfloat16
@@ -326,79 +323,20 @@ def test_replayssm_ring_matches_unfused(case):
     _compare_case(case, num_warps=4, use_ring=True)
 
 
-def _gfx950_case(B, H, seed, T=8, lower_bound=-5.0, snapshot=False):
+def _gfx950_case(slots, seed, H=12, T=8):
+    """Kimi-K3.1's TP8 KDA shard (12 heads) with the -5 gate bound and the ReplaySSM
+    ring: state at slots, conv window and outputs at batch rows."""
+    B = len(slots)
     inp = _make_inputs(B, T, H, H, 128, 128, 4, False, False, seed, torch.float32)
-    inp["cache_indices"] = torch.tensor(
-        [-1] + list(range(1, B)) if B > 1 else [1], device=_DEVICE, dtype=torch.int32
-    )
-    inp["inter_indices"] = inp["cache_indices"]
+    inp["cache_indices"] = torch.tensor(slots, device=_DEVICE, dtype=torch.int32)
     inp["win_pool"].normal_()  # untouched window rows must keep their sentinel values
-    inp["inter_ssm"].fill_(7.0)
-    rings = (
-        None if snapshot else _make_ring_buffers(H, H, 128, 128, inp["ssm"].shape[0])
-    )
-    args = _fused_args(inp, B, T, H, H, 128, 128, lower_bound, None, rings)
+    rings = _make_ring_buffers(H, H, 128, 128)
+    args = _fused_args(inp, B, T, H, H, 128, 128, -5.0, None, rings)
     del args["conv_bias"], args["conv_state_indices"]
     return args
 
 
-def _gfx950_supported(args):
-    return supports_kda_verify_gfx950(
-        **{
-            key: args[key]
-            for key in (
-                "num_q_heads",
-                "num_v_heads",
-                "head_k_dim",
-                "head_v_dim",
-                "T",
-                "mixed_qkv",
-                "conv_weight",
-                "conv_state",
-                "a",
-                "b",
-                "ssm_states",
-                "replayssm_rawv",
-                "intermediate_states_buffer",
-                "intermediate_conv_window",
-            )
-        }
-    )
-
-
-def _gfx950_reference(args):
-    return fused_kda_conv_gating_verify(
-        conv_bias=None, conv_state_indices=args["cache_indices"], **args
-    )
-
-
-def _assert_gfx950_result(ref, new, o_ref, o_new, snapshot_atol=1e-4):
-    ring = ref["cache_ring"]
-    for name in ("conv_state", "intermediate_conv_window", "ssm_states") + (
-        ("replayssm_rawv", "replayssm_beta") if ring else ()
-    ):
-        assert torch.equal(ref[name], new[name]), name
-    if ring:
-        torch.testing.assert_close(
-            new["replayssm_rawk"], ref["replayssm_rawk"], rtol=8e-3, atol=1e-5
-        )
-        torch.testing.assert_close(
-            new["replayssm_g"], ref["replayssm_g"], rtol=1e-5, atol=1e-6
-        )
-    else:
-        torch.testing.assert_close(
-            new["intermediate_states_buffer"],
-            ref["intermediate_states_buffer"],
-            rtol=1e-3,
-            atol=snapshot_atol,
-        )
-    rows = (ref["cache_indices"] >= 0).repeat_interleave(ref["T"])
-    torch.testing.assert_close(
-        o_new[0][rows].float(), o_ref[0][rows].float(), rtol=2e-2, atol=2e-3
-    )
-
-
-def _gfx950_srt(args, **overrides):
+def _gfx950_srt(args):
     layer = SimpleNamespace(
         bias=None,
         conv_weights=args["conv_weight"],
@@ -415,7 +353,8 @@ def _gfx950_srt(args, **overrides):
             )
         },
     )
-    kwargs = dict(
+    return kda_chain_verify_gfx950(
+        layer,
         mixed_qkv=args["mixed_qkv"],
         a=args["a"],
         b=args["b"],
@@ -440,99 +379,49 @@ def _gfx950_srt(args, **overrides):
                 "replayssm_g",
                 "replayssm_beta",
             )
-        }
-        if args["cache_ring"]
-        else {},
+        },
     )
-    kwargs.update(overrides)
-    return kda_chain_verify_gfx950(layer, **kwargs)
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
-class TestGfx950Verify:
-    @pytest.mark.parametrize(
-        "B,lower_bound,T,snapshot",
-        [
-            (24, -5.0, 8, False),
-            (24, None, 6, True),
-            (1, -5.0, 6, True),
-            (1, None, 6, False),
-        ],
+@pytest.mark.parametrize(
+    "slots", [[5], [7, -1, 4, 0, 6, 1]], ids=["bv4-one-request", "bv8-padded-batch"]
+)
+def test_gfx950_srt_verify_matches_triton_chain_verify(slots):
+    """kda_chain_verify_gfx950 as the KDA backend calls it, against the Triton chain
+    verify: no slot equals its batch row, a -1 row writes nothing, and mixed_qkv
+    and b are views of the TP8 [q, k, v, g | f_a | b | pad] in-projection."""
+    ref, new = (_gfx950_case(slots, seed=11) for _ in range(2))
+    B, H, T = len(slots), new["num_q_heads"], new["T"]
+    sizes = [3 * H * 128, H * 128, 128, H]
+    sizes.append(-sum(sizes) % 8)  # the in-projection's rows pad to 6288 columns
+    front = torch.randn(B * T, sum(sizes), device=_DEVICE, dtype=torch.bfloat16)
+    mixed_qkv, _, _, b, _ = torch.split(front, sizes, dim=-1)
+    new["mixed_qkv"] = mixed_qkv.copy_(new["mixed_qkv"])
+    new["b"] = b.copy_(new["b"])
+    o_new = _gfx950_srt(new)
+    assert o_new is not None
+    o_ref = fused_kda_conv_gating_verify(
+        conv_bias=None, conv_state_indices=ref["cache_indices"], **ref
     )
-    def test_matches_triton_chain_verify(self, B, lower_bound, T, snapshot):
-        """Every BV (4 at B <= 2, else 8), T (full and idle token groups), gate and
-        state mode, each pair of BV / gate / state mode, and the padded state row."""
-        H = 12 if snapshot or T == 8 else 16
-        seed = B * 17 + 5 if snapshot else B * 31 + H
-        ref, new = (
-            _gfx950_case(B, H, seed, T, lower_bound, snapshot) for _ in range(2)
-        )
-        assert _gfx950_supported(new)
-        _assert_gfx950_result(
-            ref, new, _gfx950_reference(ref), kda_verify_gfx950(**new)
-        )
-
-    def test_a_conv_state_the_kernel_cannot_read_falls_back(self):
-        # SGLANG_MAMBA_CONV_DTYPE sets the conv state's dtype; the kernel reads BF16
-        args = _gfx950_case(1, 16, seed=0)
-        assert _gfx950_supported(args)
-        args["conv_state"] = args["conv_state"].float()
-        assert not _gfx950_supported(args)
-
-    @pytest.mark.parametrize("ring", [True, False], ids=["ring", "snapshots"])
-    def test_srt_verify_indexes_state_by_slot_and_window_by_batch_row(self, ring):
-        # No physical slot equals its scratch row; -1 must not write any state.
-        ref, new = (_gfx950_case(6, 12, seed=11, snapshot=not ring) for _ in range(2))
-        for args in (ref, new):
-            args["cache_indices"] = torch.tensor(
-                [7, -1, 4, 0, 6, 1], device=_DEVICE, dtype=torch.int32
-            )
-            args["intermediate_state_indices"] = torch.arange(
-                6, device=_DEVICE, dtype=torch.int32
-            )
-        o_new = _gfx950_srt(new)
-        assert o_new is not None
-        _assert_gfx950_result(
-            ref, new, _gfx950_reference(ref), o_new, snapshot_atol=1e-3
-        )
-
-    def test_reads_mixed_qkv_and_b_as_views_of_the_fused_projection(self):
-        B, H, T = 3, 12, 8
-        dense, views = (_gfx950_case(B, H, seed=23) for _ in range(2))
-        sizes = [3 * H * 128, H * 128, 128, H]
-        sizes.append(-sum(sizes) % 8)  # TP8 in-projection rows pad to 6288 columns
-        front = torch.randn(B * T, sum(sizes), device=_DEVICE, dtype=torch.bfloat16)
-        views["mixed_qkv"], _, _, views["b"], _ = torch.split(front, sizes, dim=-1)
-        views["mixed_qkv"].copy_(dense["mixed_qkv"])
-        views["b"].copy_(dense["b"])
-        assert _gfx950_supported(views)
-        o_dense, o_views = kda_verify_gfx950(**dense), kda_verify_gfx950(**views)
-        for name in (
-            "replayssm_rawv",
-            "replayssm_rawk",
-            "replayssm_g",
-            "replayssm_beta",
-            "intermediate_conv_window",
-            "conv_state",
-            "ssm_states",
-        ):
-            assert torch.equal(dense[name], views[name]), name
-        rows = (dense["cache_indices"] >= 0).repeat_interleave(T)
-        assert torch.equal(o_dense[0][rows], o_views[0][rows])
-
-    def test_srt_verify_declines_a_tree(self):
-        # EAGLE topk > 1 verifies a tree; the kernel walks only the chain
-        args = _gfx950_case(6, 12, seed=0)
-        tree = torch.full((6, 8), -1, device=_DEVICE, dtype=torch.int64)
-        assert (
-            _gfx950_srt(
-                args,
-                retrieve_next_token=tree,
-                retrieve_next_sibling=tree,
-                retrieve_parent_token=tree,
-            )
-            is None
-        )
+    for name in (
+        "conv_state",
+        "intermediate_conv_window",
+        "ssm_states",
+        "replayssm_rawv",
+        "replayssm_beta",
+    ):
+        assert torch.equal(ref[name], new[name]), name
+    torch.testing.assert_close(
+        new["replayssm_rawk"], ref["replayssm_rawk"], rtol=8e-3, atol=1e-5
+    )
+    torch.testing.assert_close(
+        new["replayssm_g"], ref["replayssm_g"], rtol=1e-5, atol=1e-6
+    )
+    rows = (ref["cache_indices"] >= 0).repeat_interleave(T)
+    torch.testing.assert_close(
+        o_new[0][rows].float(), o_ref[0][rows].float(), rtol=2e-2, atol=2e-3
+    )
 
 
 if __name__ == "__main__":

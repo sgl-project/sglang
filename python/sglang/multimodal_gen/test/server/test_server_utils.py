@@ -704,12 +704,15 @@ class PerformanceValidator:
                 "skipping the host budget check"
             )
             return
+        tolerance = self.scenario.host_anon_tolerance
+        if tolerance is None:
+            tolerance = self.tolerances.host_anon
         if expected_load_mb is not None:
             self._assert_le(
                 "Load Peak Host Anon",
                 summary.load_peak_host_anon_mb,
                 expected_load_mb,
-                self.tolerances.host_anon,
+                tolerance,
                 min_abs_tolerance=256.0,
                 unit=" MiB",
             )
@@ -718,7 +721,7 @@ class PerformanceValidator:
                 "Runtime Peak Host Anon",
                 summary.runtime_peak_host_anon_mb,
                 expected_runtime_mb,
-                self.tolerances.host_anon,
+                tolerance,
                 min_abs_tolerance=256.0,
                 unit=" MiB",
             )

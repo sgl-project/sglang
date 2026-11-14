@@ -98,22 +98,51 @@ def test_denoising_uses_request_flow_shift(
     monkeypatch.setattr(
         sana_video2, "sample_ltx_euler" if conditioned else "sample_flow_dpm", sample
     )
+    stage = _denoising_stage()
+    batch = _denoising_batch(
+        condition_image=object() if conditioned else None, flow_shift=flow_shift
+    )
+    stage.forward(batch, SimpleNamespace(pipeline_config=SanaVideo2PipelineConfig()))
+    assert shifts == [expected]
+
+
+def _denoising_stage(transformer=None):
     stage = object.__new__(sana_video2.SanaVideo2DenoisingStage)
-    stage.transformer = None
+    stage.transformer = transformer
+    stage._mounted_quality = "exact"
     stage.begin_declared_component_use = lambda **_: None
     stage.progress_bar = lambda **_: nullcontext()
-    batch = SimpleNamespace(
+    return stage
+
+
+def _denoising_batch(quality="exact", condition_image=None, flow_shift=None):
+    return SimpleNamespace(
         do_classifier_free_guidance=False,
         prompt_embeds=[torch.zeros(1, 300, 4)],
         prompt_attention_mask=[torch.ones(1, 300)],
-        condition_image=object() if conditioned else None,
+        condition_image=condition_image,
         latents=torch.zeros(1, 2, 3, 1, 1),
         num_inference_steps=2,
         is_warmup=False,
         flow_shift=flow_shift,
+        sampling_params=SimpleNamespace(quality=quality),
     )
-    stage.forward(batch, SimpleNamespace(pipeline_config=SanaVideo2PipelineConfig()))
-    assert shifts == [expected]
+
+
+def test_denoising_toggles_quality_fusions_at_quality_changes(monkeypatch):
+    toggles = []
+    monkeypatch.setattr(sana_video2, "sample_flow_dpm", lambda *args, **_: args[1])
+    monkeypatch.setattr(
+        sana_video2,
+        "toggle_quality_fusions",
+        lambda transformers, quality: toggles.append((transformers, quality)),
+    )
+    transformer = object()
+    stage = _denoising_stage(transformer)
+    server_args = SimpleNamespace(pipeline_config=SanaVideo2PipelineConfig())
+    for quality in ("high", "high", "exact"):
+        stage.forward(_denoising_batch(quality), server_args)
+    assert toggles == [([transformer], "high"), ([transformer], "exact")]
 
 
 def test_denoising_stage_role():

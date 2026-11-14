@@ -13,14 +13,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.communication import sp_collective
+from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.dflash import (
     dflash_grouped_conv,
     selector_walk_triton,
 )
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
+from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
@@ -44,7 +45,7 @@ from sglang.srt.layers.quantization.unquant import (
     get_bf16_gemm_backend,
     register_gfx950_unquantized_gemm_shapes,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -66,9 +67,18 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import BumpAllocator, is_gfx95_supported, is_hip, is_npu
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import (
+    BumpAllocator,
+    is_cuda,
+    is_flashinfer_available,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+)
 from sglang.srt.utils.device import get_compiler_backend
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_hip:
     from sglang.srt.models import dflash_hip
@@ -100,19 +110,6 @@ _GFX950_ROWMAJOR_WEIGHTS = ((2560, 8192), (8192, 7168), (14336, 8192))
 _GFX950_HIPBLASLT_WEIGHTS = ((14336, 8192),)
 _GFX950_HIPBLASLT_ROWS = range(33, 129)
 logger = logging.getLogger(__name__)
-
-
-try:
-    from flashinfer import top_k as _flashinfer_top_k
-except ImportError:
-    _flashinfer_top_k = None
-
-
-def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    # The selector's largest single cost: it reads the whole logits tensor.
-    if _flashinfer_top_k is not None:
-        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
-    return torch.topk(scores, k, dim=-1)
 
 
 def _logical_linear_weight_shape(
@@ -150,8 +147,8 @@ def _project_candidate_logits(
             return bf16_gemm_dispatch(hidden, weight[:num_org], None)
         return torch.matmul(hidden, weight[:num_org].T)
     # A packed weight can't be row-sliced to the org vocab like the dense path,
-    # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
-    # mask the padded tail out of the top-k instead.
+    # and flashinfer's radix top-k only reads dense rows (a crop view would be
+    # copied), so mask the padded tail out of the top-k instead.
     logits = lm_head.quant_method.apply(lm_head, hidden, None).contiguous()
     if logits.shape[-1] > num_org:
         logits[:, num_org:] = float("-inf")
@@ -264,16 +261,13 @@ def candidate_topk(
             "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
             "or a supported lm_head.quant_method."
         )
-    # Gather over the group the head is vocab-sharded on: under DP attention with
-    # --enable-dp-lm-head that is the attention-TP group, whose ranks share this
-    # DP rank's tokens (the full TP group mixes other DP ranks' rows).
-    parallel = get_parallel()
-    group = (
-        parallel.attn_tp_group
-        if getattr(lm_head, "use_attn_tp_group", False)
-        else parallel.tp_group
-    )
-    tp = group.world_size == 1
+    if lm_head.tp_size > 1 and lm_head.tp_size != get_parallel().tp_size:
+        raise RuntimeError(
+            "DFlash candidate top-k: the target lm_head is vocab-sharded over a "
+            "group other than the draft's; with dp attention, pass "
+            "--enable-dp-lm-head."
+        )
+    tp = lm_head.tp_size == 1
     num_org = (
         int(lm_head.org_vocab_size)
         if tp
@@ -285,9 +279,7 @@ def candidate_topk(
     if merged_unary_transform is not None and not tp and not with_partition:
         multiplier, softcap = merged_unary_transform
         start = int(lm_head.shard_indices.org_vocab_start_index)
-        gathered = tensor_model_parallel_all_gather(
-            topk_packed(logits, k, start), dim=-1
-        )
+        gathered = lm_head.tp_group.all_gather(topk_packed(logits, k, start), dim=-1)
         ids, vals = merge_candidates(
             gathered, k, multiplier=multiplier, softcap=softcap
         )
@@ -296,20 +288,27 @@ def candidate_topk(
     if with_partition:
         vals, ids, lse = lilicorr_topk_lse(logits, k)
     else:
-        vals, ids = _radix_topk(logits, k)
+        # The selector's largest single cost: it reads the whole logits tensor.
+        vals, ids = radix_topk(logits, k)
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered = _fused_candidate_all_gather(group, vals, global_ids)
+    gathered = _fused_candidate_all_gather(lm_head.tp_group, vals, global_ids)
     if gathered is not None:
         gathered_vals, gathered_ids = gathered
     else:
-        gathered_vals = group.all_gather(vals.float(), dim=-1)
-        gathered_ids = group.all_gather(global_ids, dim=-1)
+        gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
+        gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
-        lse = torch.logsumexp(group.all_gather(lse.unsqueeze(-1), dim=-1), dim=-1)
+        lse = torch.logsumexp(
+            lm_head.tp_group.all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
+        )
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
+
+
+def _is_pow2_above_one(n: int) -> bool:
+    return n > 1 and n & (n - 1) == 0
 
 
 _ROPE_DIM_SUPERSEDED_KEYS = frozenset(
@@ -605,6 +604,39 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         sliding_window_size, attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
+        if sliding_window_size > -1 or attn_type != AttentionType.DECODER:
+            from sglang.srt.speculative.draft_worker_common import (
+                resolve_draft_worker_attention_backend,
+            )
+
+            # DSPARK builds this layer too; its worker resolves without the DFLASH label.
+            is_dflash = SpeculativeAlgorithm.from_string(
+                get_spec().speculative_algorithm
+            ).is_dflash()
+            draft_attention_backend = resolve_draft_worker_attention_backend(
+                algo_label="DFLASH" if is_dflash else None
+            )
+            # The other MLA backends ignore a layer's sliding window.
+            if sliding_window_size > -1 and draft_attention_backend not in (
+                "triton",
+                *DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+            ):
+                raise ValueError(
+                    "DFLASH mla sliding_attention layers require "
+                    "--speculative-draft-attention-backend triton, trtllm_mla or "
+                    f"cutedsl_mla, got {draft_attention_backend!r}."
+                )
+            if attn_type != AttentionType.DECODER and (
+                draft_attention_backend == "trtllm_mla"
+                or (
+                    sliding_window_size > -1
+                    and draft_attention_backend == "cutedsl_mla"
+                )
+            ):
+                raise ValueError(
+                    f"{draft_attention_backend} runs DFLASH MLA draft attention "
+                    "causally; this draft sets is_causal=False."
+                )
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and rope_scaling.get(
             "rope_type", rope_scaling.get("type")
@@ -881,14 +913,15 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
-        if hidden_states.is_cuda and hidden_states.dim() == 2:
+        # NVIDIA only: the Triton kernel is not validated on ROCm.
+        if _is_cuda and hidden_states.is_cuda and hidden_states.dim() == 2:
             return dflash_grouped_conv(
-                hidden_states,
-                delta,
-                self.base_kernel[side],
-                self.block_size,
-                self.group_size,
-                self.taps,
+                hidden_states=hidden_states,
+                delta=delta,
+                base=self.base_kernel[side],
+                block_size=self.block_size,
+                group_size=self.group_size,
+                taps=self.taps,
             )
         # Marked here, not inside: by the time the compiled function traces, the dim
         # is symbolic and the group index costs an integer div and mod per element.
@@ -1572,7 +1605,27 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(projected)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+# The ROCm images set TORCHINDUCTOR_MAX_AUTOTUNE=1, which benchmarks this einsum's
+# bmm in every process and keeps whichever Triton template was fastest there. TP
+# ranks then run different templates whose K reductions round differently, the
+# replicated selector walks a different path on some rank, the ranks verify
+# different draft blocks, commit different lengths and finish the request at
+# different steps: one rank runs a forward the others never join and the server
+# hangs. The scores must be bit-identical on every rank, so keep this one off the
+# autotuner (the default lowering is chosen by shape alone).
+_RANK_IDENTICAL_COMPILE_OPTIONS = (
+    {"max_autotune": False, "max_autotune_gemm": False}
+    if is_hip() and get_compiler_backend() == "inductor"
+    else None
+)
+
+
+@torch.compile(
+    dynamic=True,
+    backend=get_compiler_backend(),
+    options=_RANK_IDENTICAL_COMPILE_OPTIONS,
+    disable=_is_npu,
+)
 def _score_edges(
     *,
     predecessor_table: torch.Tensor,
@@ -1623,7 +1676,7 @@ class CandidateSelector(nn.Module):
         top_k: int,
     ) -> None:
         super().__init__()
-        if _flashinfer_top_k is None:
+        if not is_flashinfer_available():
             logger.warning(
                 "flashinfer is unavailable; the DFlash2 selector falls back to "
                 "torch.topk, which roughly halves end-to-end throughput on a large "
@@ -1750,12 +1803,10 @@ class DFlash2DraftModel(DFlashDraftModel):
         self.lm_head: Optional[nn.Module] = None
         # MI355X (SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES): under TP the ranks' candidates
         # travel in one all-gather and one kernel merges them and applies the transform.
-        tp_size = int(get_parallel().tp_size)
+        # The head's shard count is checked per call: the head is attached later.
         self.merge_candidates_fused = (
             _is_gfx95
             and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES.get()
-            and tp_size > 1
-            and tp_size & (tp_size - 1) == 0
             and int(config.vocab_size) < MAX_PACKED_ID
         )
 
@@ -1774,7 +1825,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
-        if self.merge_candidates_fused:
+        fused = self.merge_candidates_fused and _is_pow2_above_one(self.lm_head.tp_size)
+        if fused:
             ids, vals, _ = candidate_topk(
                 hidden,
                 self.lm_head,

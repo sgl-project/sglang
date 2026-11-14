@@ -249,12 +249,6 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
-    def node_hit_count(self, node_id: NodeId) -> int:
-        """The node's accumulated match count, which write-through compares with
-        ``write_through_threshold``."""
-        ...
-
-    @abstractmethod
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         ...

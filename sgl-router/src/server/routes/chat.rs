@@ -192,8 +192,9 @@ impl Endpoint {
 }
 
 /// Validate the body and resolve its routing policy, as `endpoint` does over HTTP.
-/// Parsing and rebuilding a large body is CPU work too, so the whole step runs
-/// through [`off_worker::run`] (render and tokenize also do so on their own).
+/// Render and tokenize leave the async worker on their own. Parsing and
+/// rebuilding a large body is CPU work too, so for a large body the whole step
+/// runs through [`off_worker::run_for_body`].
 async fn prepare<'a>(
     ctx: &'a AppContext,
     endpoint: Endpoint,
@@ -201,7 +202,9 @@ async fn prepare<'a>(
     body: Bytes,
     grpc: bool,
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
-    off_worker::run(|| prepare_now(ctx, endpoint, headers, body, grpc))
+    off_worker::run_for_body(body.len(), || {
+        prepare_now(ctx, endpoint, headers, body, grpc)
+    })
 }
 
 fn prepare_now<'a>(
@@ -423,7 +426,7 @@ impl<'a> ModelRouting<'a> {
     }
 }
 
-fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
+pub(crate) fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
     let model = model.0.clone();
     match error {
         PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers { model },

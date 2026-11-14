@@ -12,7 +12,7 @@ static_assert(
 
 inline constexpr uint32_t kKimiK3RoutingMaxTokens = 256;
 inline constexpr uint32_t kKimiK3RoutingMaxExpanded = kKimiK3RoutingMaxTokens * kTopK_;
-inline constexpr uint32_t kKimiK3RoutingExpertsPerThread = kNumExperts_ / LargeRouterRadixTrait::kBlockSize;
+inline constexpr uint32_t kKimiK3MetaThreads = 1024;
 
 struct KimiK3RoutingMetaParams {
   void* __restrict__ expert_weights;
@@ -23,9 +23,6 @@ struct KimiK3RoutingMetaParams {
   int32_t* __restrict__ num_non_exiting_ctas;
   int32_t* __restrict__ total_num_padded_tokens;
   int32_t* __restrict__ num_tokens_per_expert;
-  // NOTE(nvpohanh): The last routing CTA resets the counter to zero, so
-  // launches sharing one must not overlap.
-  uint32_t* __restrict__ counter;
   const int32_t* __restrict__ num_valid_ptr;
   int32_t num_valid_value;
   int32_t local_expert_offset;
@@ -41,7 +38,7 @@ struct KimiK3FusedRoutingParams {
 };
 
 struct KimiK3RoutingSmem {
-  uint32_t warp_sum[LargeRouterRadixTrait::kNumWarps];
+  uint32_t warp_sum[kKimiK3MetaThreads / device::kWarpThreads];
   int32_t num_ctas;
   int32_t expert_count[kNumExperts_];
   int32_t expert_offset[kNumExperts_];
@@ -51,8 +48,8 @@ struct KimiK3RoutingSmem {
 SGL_DEVICE void kimi_k3_build_routing_metadata(
     const RouteRadixParams& route, const KimiK3RoutingMetaParams& meta, KimiK3RoutingSmem& smem) {
   using T = LargeRouterRadixTrait;
-  constexpr uint32_t kThreads = T::kBlockSize;
-  constexpr uint32_t kEPT = kKimiK3RoutingExpertsPerThread;
+  constexpr uint32_t kThreads = kKimiK3MetaThreads;
+  constexpr uint32_t kEPT = (kNumExperts_ + kThreads - 1) / kThreads;
   const uint32_t tx = threadIdx.x;
   const uint32_t lane_id = tx % device::kWarpThreads;
   const uint32_t warp_id = tx / device::kWarpThreads;
@@ -113,9 +110,6 @@ SGL_DEVICE void kimi_k3_build_routing_metadata(
         const int32_t mn_limit = min(tile_end, limit);
         meta.cta_idx_xy_to_batch_idx[cta] = e;
         meta.cta_idx_xy_to_mn_limit[cta] = mn_limit;
-        for (int32_t p = mn_limit; p < tile_end; ++p) {
-          meta.permuted_idx_to_token_idx[p] = -1;
-        }
       }
     }
     cta_offset += num_ctas[j];
@@ -123,6 +117,10 @@ SGL_DEVICE void kimi_k3_build_routing_metadata(
   for (int32_t e = static_cast<int32_t>(tx); e < static_cast<int32_t>(kNumExperts_); e += kThreads) {
     const int32_t local = e - first;
     meta.num_tokens_per_expert[e] = (local >= 0 && local < num_local) ? smem.expert_count[local] : 0;
+  }
+  __syncthreads();
+  for (int32_t p = static_cast<int32_t>(tx); p < smem.num_ctas * tile; p += kThreads) {
+    meta.permuted_idx_to_token_idx[p] = -1;
   }
   __syncthreads();
   if (tx == 0) {
@@ -148,17 +146,13 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
   const auto M = static_cast<uint32_t>(params.route.M);
   const uint32_t tx = threadIdx.x;
   if (blockIdx.x < M) {
-    __shared__ union {
-      typename T::Smem route;
-      KimiK3RoutingSmem meta;
-    } smem;
-    __shared__ bool is_last;
+    __shared__ typename T::Smem smem_route;
     const auto& meta = params.meta;
     device::PDLWaitPrimary<kUsePDL>();
     const int32_t num_valid = meta.num_valid_ptr != nullptr ? meta.num_valid_ptr[0] : meta.num_valid_value;
-    route_radix_block</*kUsePDL=*/false, TScore>(params.route, smem.route);
+    route_radix_block</*kUsePDL=*/false, TScore>(params.route, smem_route);
     // NOTE(nvpohanh): Early trigger is safe: the dependent's
-    // griddepcontrol.wait still waits for this whole grid, metadata included.
+    // griddepcontrol.wait still waits for this whole grid.
     device::PDLTriggerSecondary<kUsePDL>();
 
     const uint32_t row = blockIdx.x;
@@ -173,22 +167,21 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
         static_cast<bf16_t*>(meta.expert_weights)[row * T::kTopK + tx] = __float2bfloat16_rn(w);
       }
     }
-    __syncthreads();
-    if (tx == 0) {
-      __threadfence();
-      is_last = atomicAdd(meta.counter, 1u) == M - 1;
-      if (is_last) __threadfence();
-    }
-    __syncthreads();
-    if (!is_last) return;
-    kimi_k3_build_routing_metadata(params.route, meta, smem.meta);
-    if (tx == 0) *meta.counter = 0u;
   } else {
     device::PDLWaitPrimary<kUsePDL>();
     using Q = RouteQuantTraitT<TX>;
     Q::run(params.quant, /*expert_idx=*/0, blockIdx.x - M, threadIdx.x / Q::kNumLanes, threadIdx.x % Q::kNumLanes);
     device::PDLTriggerSecondary<kUsePDL>();
   }
+}
+
+template <bool kUsePDL>
+__global__ __launch_bounds__(kKimiK3MetaThreads) void kimi_k3_routing_metadata_kernel(
+    const __grid_constant__ KimiK3FusedRoutingParams params) {
+  __shared__ KimiK3RoutingSmem smem;
+  device::PDLWaitPrimary<kUsePDL>();
+  device::PDLTriggerSecondary<kUsePDL>();
+  kimi_k3_build_routing_metadata(params.route, params.meta, smem);
 }
 
 template <bool kUsePDL>
@@ -209,7 +202,6 @@ struct KimiK3FusedRoutingKernel {
       const tvm::ffi::TensorView num_non_exiting_ctas,
       const tvm::ffi::TensorView total_num_padded_tokens,
       const tvm::ffi::TensorView num_tokens_per_expert,
-      const tvm::ffi::TensorView counter,
       const tvm::ffi::Optional<tvm::ffi::TensorView> num_valid,
       int64_t topk,
       double routed_scaling_factor,
@@ -247,7 +239,6 @@ struct KimiK3FusedRoutingKernel {
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(num_non_exiting_ctas);
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(total_num_padded_tokens);
     TensorMatcher({N_}).with_dtype<int32_t>().with_device(device).verify(num_tokens_per_expert);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(counter);
 
     RuntimeCheck(
         N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
@@ -308,7 +299,6 @@ struct KimiK3FusedRoutingKernel {
              static_cast<int32_t*>(num_non_exiting_ctas.data_ptr()),
              static_cast<int32_t*>(total_num_padded_tokens.data_ptr()),
              static_cast<int32_t*>(num_tokens_per_expert.data_ptr()),
-             static_cast<uint32_t*>(counter.data_ptr()),
              num_valid_ptr,
              static_cast<int32_t>(M),
              static_cast<int32_t>(local_expert_offset),
@@ -335,6 +325,8 @@ struct KimiK3FusedRoutingKernel {
       }
     }
 #undef SGL_KIMI_K3_ROUTING_LAUNCH
+    LaunchKernel(1, kKimiK3MetaThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(kimi_k3_routing_metadata_kernel<kUsePDL>, params);
   }
 };
 

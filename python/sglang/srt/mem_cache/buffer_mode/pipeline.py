@@ -290,7 +290,6 @@ class BufferModePipeline:
         # Window slots beyond the tree's first, each with its own host pool.
         self._further_window_components = tuple(further_window_components)
         self._swa_tail_only = envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.get()
-        self._mamba_request_end_only = envs.SGLANG_HICACHE_MAMBA_REQUEST_END_ONLY.get()
         # Metadata-only pending-write backlog cap, measured in unique FULL
         # snapshot spans; beyond it new spans are dropped at admission.
         self.write_backlog_cap = write_backlog_cap
@@ -334,22 +333,8 @@ class BufferModePipeline:
     # Opt-in: a backup stores only the SWA window ending at its node, the one
     # a prefetch ending there restores, instead of the node's every SWA page.
     _swa_tail_only: bool = False
-    _mamba_request_end_only: bool = False
-    _insert_is_request_end: Optional[bool] = None
-    _insert_key_len: int = 0
-
-    def _should_backup_mamba(self, node_id: NodeId) -> bool:
-        if self._insert_is_request_end is None:
-            return True  # Preserve direct/manual backups without request context.
-        if not self._insert_is_request_end:
-            return False
-        # BackupKV also visits ancestors; only the actual endpoint qualifies.
-        (path,) = self._cache.tree_core.collect_path_info([node_id])
-        return bool(path) and path[-1].path_end == self._insert_key_len
 
     def reset(self) -> None:
-        self._insert_is_request_end = None
-        self._insert_key_len = 0
         # Load pipeline: hits awaiting a staging grant (park-and-retry),
         # enqueue-time prefix context, completed prefetches staged until
         # prefill admission, and load-backs in flight (keyed by synthetic
@@ -698,35 +683,13 @@ class BufferModePipeline:
         else:
             self._queued_span_refs[span] = refs - 1
 
-    def begin_insert_walk(
-        self, *, is_request_end: Optional[bool] = None, key_len: int = 0
-    ) -> None:
+    def begin_insert_walk(self) -> None:
         """Admit each node once per insert walk: the trigger chains every
         unbacked ancestor, so a depth-d path is presented d(d+1)/2 times."""
         self._walk_admitted = set()
-        self._insert_is_request_end = is_request_end
-        self._insert_key_len = key_len
-
-    def on_insert_complete(self, result: InsertResult) -> None:
-        """Retry a formerly intermediate checkpoint when it becomes an endpoint."""
-        if (
-            not self._mamba_request_end_only
-            or self._insert_is_request_end is not True
-            or result.rotation_tail_declined
-        ):
-            return
-        # An endpoint retry must obey the write policy without counting a new hit.
-        cache = self._cache
-        if cache.is_write_back:
-            return
-        node_id = result.last_device_node
-        if cache.tree_core.node_hit_count(node_id) >= cache.write_through_threshold:
-            self.enqueue_backup_intent(node_id)
 
     def end_insert_walk(self) -> None:
         self._walk_admitted = None
-        self._insert_is_request_end = None
-        self._insert_key_len = 0
 
     def enqueue_backup_intent(self, node_id: NodeId) -> None:
         """Queue one intent per pool with something to write; rejected intents
@@ -758,12 +721,6 @@ class BufferModePipeline:
         page_size = self._cache.page_size
         span = (snapshot.node_id, len(snapshot.key))
         for pool, keys in intents:
-            if (
-                pool == PoolName.MAMBA
-                and self._mamba_request_end_only
-                and not self._should_backup_mamba(node_id)
-            ):
-                continue
             if pool in pending:
                 continue
             intent_tokens = len(keys) * page_size
@@ -918,11 +875,6 @@ class BufferModePipeline:
                 keys = dict(self._write_intents(piece)).get(intent.pool)
                 if not keys:
                     continue  # covered since admission
-                if intent.pool == PoolName.MAMBA and self._mamba_request_end_only:
-                    # A split must not turn one admitted endpoint checkpoint
-                    # into additional intermediate-state writes.
-                    if any(key not in intent.keys for key in keys):
-                        continue
                 repaired = _UnifiedBackupIntent(
                     snapshot=piece, pool=intent.pool, keys=list(keys)
                 )

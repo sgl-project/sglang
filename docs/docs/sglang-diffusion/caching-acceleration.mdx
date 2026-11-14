@@ -136,11 +136,11 @@ See [TeaCache](./teacache) for detailed documentation.
 ### Supported Models
 
 - Wan2.1
-- Z-Image
+- Z-Image: not wired yet; enabling TeaCache is accepted but currently no-ops
 - Wan2.2: coefficients are not calibrated yet; enabling TeaCache is accepted but currently no-ops
 - HunyuanVideo: not supported yet
 
-For Flux and Qwen models, TeaCache is automatically disabled when CFG is enabled.
+Flux and Qwen models do not implement TeaCache yet; `--enable-teacache` is accepted but has no effect.
 
 ## Spectrum
 

@@ -728,17 +728,20 @@ pub(super) fn forwarded_prompt_ids(
 
 /// `text` as the engine's `input_ids`, of the same shape; `None` when the caller sent ids.
 fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Value> {
-    if has_caller_input_ids(value) {
+    if has_caller_input_ids(value) || !ctx.tokenizers.can_encode_prompt(&model.0) {
         return None;
     }
     let encode = |text: &Value| ctx.tokenizers.encode_prompt(&model.0, text.as_str()?);
     match &value["text"] {
         // An empty batch stays text; as `input_ids: []` it would read as one empty prompt.
-        Value::Array(texts) if !texts.is_empty() => texts
-            .iter()
-            .map(encode)
-            .collect::<Option<Vec<_>>>()
-            .map(Value::from),
+        // One handoff for the whole batch: each `encode_prompt` inside runs inline.
+        Value::Array(texts) if !texts.is_empty() => crate::off_worker::run(|| {
+            texts
+                .iter()
+                .map(encode)
+                .collect::<Option<Vec<_>>>()
+                .map(Value::from)
+        }),
         text => encode(text).map(Value::from),
     }
 }
@@ -851,13 +854,16 @@ fn tokenize_input_text(ctx: &AppContext, model: &ModelId, input: &Value) -> Opti
         text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
             .is_empty()
     };
-    if texts.iter().any(blank) {
+    if texts.iter().any(blank) || !ctx.tokenizers.can_encode_prompt(&model.0) {
         return None;
     }
-    texts
-        .into_iter()
-        .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
-        .collect()
+    // One handoff for the whole batch: each `encode_prompt` inside runs inline.
+    crate::off_worker::run(|| {
+        texts
+            .into_iter()
+            .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
+            .collect()
+    })
 }
 
 /// Prompt text bytes of a string, a multimodal item or a list of content parts;

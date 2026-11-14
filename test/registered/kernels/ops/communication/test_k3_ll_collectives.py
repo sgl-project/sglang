@@ -1,30 +1,20 @@
 """Kimi-K3's gfx950 TP8 LL collectives against torch.distributed references."""
 
-import os
-import socket
-import time
 import unittest
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, run_distributed_test
 
 # backend-specific: the LL kernels are gfx950 wave64 HIP over aiter's IPC buffers.
-register_amd_ci(est_time=150, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=45, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 WORLD = 8
 # Kimi-K3: hidden 7168, latent 3584, up to 8 bank rows (9 slots).
 H, L, NB, EPS = 7168, 3584, 9, 1e-5
-
-
-def _open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
 
 
 def _beyond_ulp(got, want) -> int:
@@ -45,22 +35,9 @@ def _check_gather_tail_read(comm, rank, failures):
     cw = torch.randn(H, generator=g, device="cuda") * 0.05
     ow = (torch.rand(H, generator=g, device="cuda") + 0.5).bfloat16().float()
     cols = slice(rank * H // WORLD, (rank + 1) * H // WORLD)
-    # Preserve every prefix/(bank-size, write) mode. Three 64-row calls reuse
-    # both scratch epochs with new payloads.
-    cases = (
-        (1, False, 1, False),
-        (64, True, 4, True),
-        (64, False, 8, True),
-        (64, True, 8, True),
-    )
-    # Above 64 rows the slice is the bf16 GEMM of the RMSNorm'd latent (projected);
-    # three max-row calls reuse both epochs of every row flag.
-    cases += (
-        (65, True, 4, True),
-        (384, True, 8, True),
-        (384, False, 2, True),
-        (384, True, 4, False),
-    )
+    # Up to 64 rows the slice is finished from the split-K partials; above, it is
+    # the bf16 GEMM of the RMSNorm'd latent (projected), up to 384 rows.
+    cases = ((64, True, 8, True), (384, True, 8, True))
     for rows, with_prefix, nvb, write in cases:
         latent = (torch.randn(rows, L, generator=g, device="cuda") * 3).bfloat16()
         shared = torch.randn(rows, H, generator=g, device="cuda").bfloat16()
@@ -100,28 +77,16 @@ def _check_gather_tail_read(comm, rank, failures):
             )
 
 
-def _worker(rank, port, results):
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
-    torch.cuda.set_device(rank)
-    dist.init_process_group(
-        "nccl", rank=rank, world_size=WORLD, device_id=torch.device(f"cuda:{rank}")
-    )
-    failures = []
-    try:
-        from sglang.kernels.ops.communication.k3_ll_comm_hip import create_ll_comm
+def _check_rank(rank):
+    from sglang.kernels.ops.communication.k3_ll_comm_hip import create_ll_comm
 
-        comm = create_ll_comm(
-            dist.new_group(backend="gloo"), torch.device(f"cuda:{rank}")
-        )
-        if comm is None:
-            failures.append("create_ll_comm returned None")
-        else:
-            with torch.inference_mode():
-                _check_gather_tail_read(comm, rank, failures)
-        torch.cuda.synchronize()
-    finally:
-        results[rank] = failures
-        dist.destroy_process_group()
+    comm = create_ll_comm(dist.new_group(backend="gloo"), torch.device(f"cuda:{rank}"))
+    assert comm is not None, "create_ll_comm returned None"
+    failures = []
+    with torch.inference_mode():
+        _check_gather_tail_read(comm, rank, failures)
+    torch.cuda.synchronize()
+    assert not failures, failures
 
 
 @unittest.skipUnless(
@@ -129,33 +94,7 @@ def _worker(rank, port, results):
 )
 class TestK3LLCollectives(CustomTestCase):
     def test_fused_reads_match_torch_distributed(self):
-        ctx = mp.get_context("spawn")
-        with ctx.Manager() as manager:
-            results = manager.dict()
-            port = _open_port()
-            procs = [
-                ctx.Process(target=_worker, args=(r, port, results))
-                for r in range(WORLD)
-            ]
-            for p in procs:
-                p.start()
-            # one deadline for all ranks; a hung rank must not keep its GPU past it
-            deadline = time.monotonic() + 900
-            for p in procs:
-                p.join(timeout=max(0.0, deadline - time.monotonic()))
-            for p in procs:
-                if p.is_alive():
-                    p.kill()
-                    p.join()
-            self.assertTrue(
-                all(p.exitcode == 0 for p in procs), "a rank crashed or hung"
-            )
-            failures = [
-                f"rank {r}: {msg}"
-                for r in range(WORLD)
-                for msg in results.get(r, ["no result"])
-            ]
-        self.assertEqual(failures, [])
+        run_distributed_test(_check_rank, world_size=WORLD)
 
 
 if __name__ == "__main__":

@@ -127,6 +127,11 @@ Add `--image-path first_frame.png` to condition the video on an image. Frame
 counts align to `8n+1`; width and height must be divisible by 32. The 4-step
 preview is a different checkpoint and is not supported by this pipeline.
 
+Add `--quality high` to run the eight softmax anchor layers with BF16-input
+flash attention instead of the FP32 memory-efficient kernel the default path
+uses. Accumulation stays FP32 inside the kernel, but the output is no longer
+bit-identical to the default path.
+
 With two GPUs, add `--num-gpus 2` to split the video tokens across them
 (sequence parallelism). The result is not bit-identical to the single-GPU
 result. The sequence-parallel degree must divide the 10 softmax attention

@@ -23,9 +23,6 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestDFlashDPAdmission(CustomTestCase):
-    def setUp(self):
-        self.enterContext(envs.SGLANG_DFLASH_DRAFT_KV_RING.override(False))
-
     def _args(self, **overrides):
         fields = dict(
             model_path="dummy",

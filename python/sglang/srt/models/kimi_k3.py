@@ -163,7 +163,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
-from sglang.srt.utils.log_utils import rank0_log
+from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
@@ -180,78 +180,34 @@ if _is_hip:
     from sglang.srt.models.kimi_k3_amd.attention import mono_output_gate_hip
     from sglang.srt.models.kimi_k3_amd.gemm import k3_bf16_gemm_hip, kda_f_b_gemm_hip
 
-# Kimi-K3.1 dense GEMMs routed to TGV for every caller of the shape: (n, k) ->
-# ((m_lo, m_hi, tactic), ...), tactic None = the ladder pick.
-# K=7168 shapes up to 64 decode rows on any SM10x (B300, CUDA graph, cold HBM
-# via rotated weights: e.g. m=64 MoE front 16.0 vs 19.4 us, KDA qkvg 16.3 vs
-# 19.6 us).
-_K31_TGV_M_RANGES = {
+# (n, k) -> ((m_lo, m_hi, tactic), ...); tactic None = the ladder pick.
+_K3_TGV_M_RANGES = {
     (6144, 7168): ((1, 64, None),),  # KDA fused qkvg
     (6016, 7168): ((1, 64, None),),  # merged MoE front
     (1536, 7168): ((1, 64, None),),  # MLA q_a / shared gate_up / output gate
     (2112, 7168): ((1, 64, None),),  # MLA fused q_a + kv_a
 }
 
-# GB300 (SM103) TP8 decode / DFLASH-verify rows (M = 6 x graph bs) where a fixed
-# TGV tactic beats the cuBLAS / ladder pick. CUDA graph, cold HBM, us per GEMM,
-# old pick -> TGV:
-#   KDA qkvg          M 72-96   18.4-18.6 -> 17.0-17.3 (cuBLAS wins above)
-#   MLA qkv_a         M 72-288  9.6-16.4 -> 9.0-12.6 (cuBLAS ties at 144)
-#   MLA g_proj        M 72-288  8.3-12.0 -> 7.5-9.8 (ties at 108-156)
-#   KDA / MLA o_proj  M 72-84   6.1-6.3 -> 5.6-5.8 (cuBLAS wins above)
-#   latent-up slice   M 84-156  4.8 -> 4.5 (ladder ties above)
-_K31_GB300_TGV_M_RANGES = {
-    (6144, 7168): ((72, 96, 24),),
+# Fixed TGV tactics measured on GB300 at TP8 verify rows.
+_K3_GB300_TGV_M_RANGES = {
+    (6144, 7168): ((72, 96, 24),),  # KDA fused qkvg
     (2112, 7168): ((72, 120, 21), (132, 132, 23), (156, 240, 23), (264, 288, 24)),
-    (1536, 7168): ((72, 192, 21), (240, 288, 23)),
-    (7168, 1536): ((72, 84, 24),),
-    # TP-sharded latent-up slice (k3_ar_fusion.slice_gemm)
-    (896, 3584): ((84, 156, 21),),
+    (1536, 7168): ((72, 192, 21), (240, 288, 23)),  # MLA output gate
+    (7168, 1536): ((72, 84, 24),),  # KDA / MLA o_proj
+    (896, 3584): ((84, 156, 21),),  # TP-sharded latent-up slice
 }
 
-# GB300 TP8 KDA [f_a | b] (144 x 7168) on the attention side stream only: a
-# 12-16 CTA TGV streams beside the wide [q,k,v,g] GEMM, where cuBLAS split-K
-# waits for SMs (qkvg + [f_a|b] + f_b 24.1-25.9 -> 19.7-21.8 us at M 72-120,
-# 29.3-34.5 serial -> 23.8-29.9 at 132-288). Not registered globally: run
-# alone, the few CTAs lose, so every other caller of the shape keeps its pick.
-_K31_GB300_BFA_SIDE_TGV_M_RANGES = {
+# KDA [f_a | b] on the attention side stream only; run alone these tactics lose.
+_K3_GB300_BFA_SIDE_TGV_M_RANGES = {
     (144, 7168): ((72, 128, 21), (129, 256, 23), (257, 288, 24)),
 }
 
 
-def _k31_gb300_tuning(config) -> bool:
-    """Kimi-K3.1 on GB300: _K31_GB300_* tactics and the 288-row side streams.
-    SGLANG_K31_DECODE_GEMM_TACTICS=0 restores the generic picks."""
-    return (
-        is_kimi_k31(config)
-        and get_platform().device_sm == 103
-        and envs.SGLANG_K31_DECODE_GEMM_TACTICS.get()
-    )
-
-
-def _k3_side_stream_max_tokens(config) -> int:
-    """Largest graphed decode / verify batch whose attention side-stream GEMMs
-    (MLA g_proj, KDA [f_a | b] -> f_b) overlap the main stream. Above it the
-    attention core fills the SMs and the overlap only adds sync overhead; on
-    K3.1 GB300 the TGV picks above keep the gate and [f_a | b] cheap enough to
-    hide up to 288 verify rows."""
+def _k3_side_stream_max_tokens() -> int:
+    """Largest graphed batch whose attention side-stream GEMMs overlap."""
     if not get_platform().is_blackwell:
         return 64
-    return 288 if _k31_gb300_tuning(config) else 128
-
-
-def _k3_bfa_side_gemm(
-    x: torch.Tensor, w: torch.Tensor, tgv_tactic: Optional[int]
-) -> torch.Tensor:
-    """[f_a | b] GEMM on the KDA attention side stream: TGV with tgv_tactic,
-    or the tiny GEMM when it is None."""
-    if tgv_tactic is None:
-        from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
-
-        return kimi_k3_tiny_gemm(x, w)
-    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm
-
-    return cutedsl_bf16_gemm(x, w, tactic=tgv_tactic)
+    return 288 if get_platform().device_sm == 103 else 128
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -263,6 +219,13 @@ def _uses_modelopt_fp8_pb_wo(
 ) -> bool:
     resolver = getattr(quant_config, "_resolve_quant_algo", None)
     return resolver is not None and resolver(prefix) == "FP8_PB_WO"
+
+
+def _uses_modelopt_mxfp8(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    resolver = getattr(quant_config, "_resolve_quant_algo", None)
+    return resolver is not None and resolver(prefix) == "MXFP8"
 
 
 def _uses_split_gguf_kv_b(
@@ -282,13 +245,18 @@ def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
 
 
 def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
-    """Return a dense weight with serialized block-FP8 scales applied."""
+    """Return a dense weight with serialized block-FP8 or MXFP8 scales applied."""
     weight = module.weight.data
     if not hasattr(module, "weight_scale_inv"):
         return weight
+    scale = module.weight_scale_inv.data
+    if scale.dtype == torch.uint8:
+        # MXFP8 UE8M0 exponents, still in checkpoint layout: the model's
+        # post-load runs before process_weights_after_loading reorders them.
+        scale = torch.exp2(scale.to(torch.float32) - 127.0)
     return block_quant_dequant(
         weight,
-        module.weight_scale_inv,
+        scale,
         module.quant_method.weight_block_size,
         module.params_dtype,
     )
@@ -1884,9 +1852,8 @@ class KimiK3DeltaAttention(nn.Module):
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
         self._bfa_alt_stream = bfa_alt_stream
         self._bfa_bs_limit = (
-            _k3_side_stream_max_tokens(config) if bfa_alt_stream is not None else 0
+            _k3_side_stream_max_tokens() if bfa_alt_stream is not None else 0
         )
-        # TGV m ranges of the side-stream [f_a | b] GEMM, set with _bfa_w.
         self._bfa_side_tgv_m_ranges: Optional[TGVMRanges] = None
         self.tp_size = get_parallel().tp_size
         # KDA is an attention layer: head-sharded params follow the
@@ -1914,6 +1881,9 @@ class KimiK3DeltaAttention(nn.Module):
             "use_full_rank_gate", False
         )
         self._bfa_uses_block_fp8 = self.use_full_rank_gate and _uses_modelopt_fp8_pb_wo(
+            quant_config, f"{prefix}.b_proj"
+        )
+        self._bfa_uses_mxfp8 = self.use_full_rank_gate and _uses_modelopt_mxfp8(
             quant_config, f"{prefix}.b_proj"
         )
 
@@ -2202,7 +2172,7 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_f_b_w = self.f_b_proj.weight
             return
         mods = [self.f_a_proj, self.b_proj]
-        if self._bfa_uses_block_fp8:
+        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
             weights = [_get_k3_dense_weight(mod) for mod in mods]
             sizes = [weight.shape[0] for weight in weights]
             pad = (-sum(sizes)) % 8
@@ -2229,11 +2199,11 @@ class KimiK3DeltaAttention(nn.Module):
         self._bfa_fa_size, self._bfa_b_size = sizes
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
-        if _k31_gb300_tuning(self.config) and get_bf16_gemm_backend().is_cutedsl():
+        if get_platform().device_sm == 103 and get_bf16_gemm_backend().is_cutedsl():
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
 
             m_ranges = TGVMRanges()
-            for m_lo, m_hi, tactic in _K31_GB300_BFA_SIDE_TGV_M_RANGES.get(
+            for m_lo, m_hi, tactic in _K3_GB300_BFA_SIDE_TGV_M_RANGES.get(
                 tuple(self._bfa_w.shape), ()
             ):
                 m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
@@ -2286,9 +2256,9 @@ class KimiK3DeltaAttention(nn.Module):
             return False
         if not self.use_full_rank_gate:
             return False
-        # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
+        # Block-FP8 / MXFP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
-        if self._bfa_uses_block_fp8:
+        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
             return False
         ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
@@ -2299,6 +2269,27 @@ class KimiK3DeltaAttention(nn.Module):
         if not _is_unquantized_mergeable(ws):
             return False
         return len({(w.dtype, w.shape[1]) for w in ws}) == 1
+
+    def _fused_decode_f_b_weight(self) -> Optional[torch.Tensor]:
+        """Dense BF16 f_b for the HIP fused KDA decode, which takes no weight scale."""
+        from sglang.srt.models.kimi_k3_rocm_quant import k3_fused_decode_f_b_weight
+
+        # _merge_bfa_weights() leaves the BF16 f_b here, dequantized for block-FP8.
+        merged = self._bfa_f_b_w if self.use_full_rank_gate else None
+        if (
+            merged is not None
+            and merged.dtype == torch.bfloat16
+            and merged.shape == (12 * 128, 128)
+        ):
+            return merged
+        f_b_weight = k3_fused_decode_f_b_weight(self.f_b_proj)
+        if f_b_weight is not None and f_b_weight.dtype != torch.bfloat16:
+            print_warning_once(
+                "Kimi-K3 fused KDA decode not armed: no BF16 f_b for the kernel "
+                f"(f_b_proj holds {f_b_weight.dtype}); decode runs the unfused chain"
+            )
+            return None
+        return f_b_weight
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
@@ -2315,21 +2306,28 @@ class KimiK3DeltaAttention(nn.Module):
             )
 
             layer = self.attn
+            # A re-run that fails to arm must not leave the previous f_b serving decode.
+            self._kda_hip_fused_decode_ready = False
+            layer._k3_hip_fused_decode_args = None
+            layer._k3_hip_fused_decode_backend = ""
+            layer._k3_hip_fused_decode_ops = None
             w = layer.conv_weights
-            f_b_weight = self.f_b_proj.weight
-            backend = envs.SGLANG_ROCM_K3_KDA_FUSED_BACKEND.get().lower()
+            backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
             fused_ops = {
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,
             }.get(backend)
+            state_dtype = self.config.mamba2_cache_params.dtype.temporal
             backend_available = fused_ops is not None and fused_ops.available(
-                f_b_weight.device
+                device=self.f_b_proj.weight.device, state_dtype=state_dtype
             )
+            f_b_weight = self._fused_decode_f_b_weight() if backend_available else None
             if (
                 backend_available
                 and w is not None
                 and tuple(w.shape) == (3 * 12 * 128, 4)
                 and w.dtype == torch.float32
+                and f_b_weight is not None
                 and f_b_weight.shape == (12 * 128, 128)
                 and f_b_weight.dtype == torch.bfloat16
                 and layer.A_log is not None
@@ -2357,10 +2355,17 @@ class KimiK3DeltaAttention(nn.Module):
                     lower_bound=float(layer.lower_bound),
                     norm_weight=norm_weight,
                     norm_eps=float(self.o_norm.eps),
+                    state_dtype=state_dtype,
                 )
                 layer._k3_hip_fused_decode_backend = backend
                 layer._k3_hip_fused_decode_ops = fused_ops
-                self._kda_hip_fused_decode_ready = True
+                # Either ReplaySSM flag allocates the ring (kv_cache_configurator.py),
+                # whose decode skips the fused kernel and needs f_b already applied.
+                mamba = get_exec().mamba
+                replayssm_ring = (
+                    mamba.enable_linear_replayssm or mamba.enable_linear_replayssm_spec
+                )
+                self._kda_hip_fused_decode_ready = not replayssm_ring
             return
         layer = self.attn
         w = layer.conv_weights
@@ -2464,7 +2469,14 @@ class KimiK3DeltaAttention(nn.Module):
                         None if m_ranges is None else m_ranges(hidden_states.shape[0])
                     )
                     with torch.cuda.stream(alt):
-                        bfa = _k3_bfa_side_gemm(hidden_states, w, tgv_tactic=tgv_tactic)
+                        if tgv_tactic is None:
+                            bfa = gemm(hidden_states, w)
+                        else:
+                            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                                cutedsl_bf16_gemm,
+                            )
+
+                            bfa = cutedsl_bf16_gemm(hidden_states, w, tactic=tgv_tactic)
                         forget_gate = (
                             bfa[..., :n_fa]
                             if defer_f_b
@@ -2727,9 +2739,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_pending_stream = None
             self._gate_alt_stream = gate_alt_stream
             self._gate_bs_limit = (
-                _k3_side_stream_max_tokens(config)
-                if self._gate_alt_stream is not None
-                else 0
+                _k3_side_stream_max_tokens() if self._gate_alt_stream is not None else 0
             )
             self._pre_o_proj_out: Optional[torch.Tensor] = None
             self._return_pre_o_proj = False
@@ -3547,14 +3557,16 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        if is_kimi_k31(config) and not _is_hip:
+        if not _is_hip:
+            # The CuTe DSL GEMM module imports cuda.bindings and cutlass at
+            # module level; neither ships on ROCm.
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
                 register_tgv_m_ranges,
             )
 
-            register_tgv_m_ranges(_K31_TGV_M_RANGES)
-            if _k31_gb300_tuning(config):
-                register_tgv_m_ranges(_K31_GB300_TGV_M_RANGES)
+            register_tgv_m_ranges(_K3_TGV_M_RANGES)
+            if get_platform().device_sm == 103:
+                register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
@@ -3868,8 +3880,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
-                    if name.endswith(".b_proj.weight_scale_inv"):
-                        # All TP ranks share K3's single beta output-scale block.
+                    if (
+                        name.endswith(".b_proj.weight_scale_inv")
+                        and param.data.shape == loaded_weight.shape
+                    ):
+                        # FP8_PB_WO: all TP ranks share K3's single beta
+                        # output-scale block. MXFP8 per-row scales shard below.
                         param.data.copy_(loaded_weight)
                     else:
                         weight_loader = getattr(

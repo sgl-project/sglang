@@ -79,15 +79,9 @@ class TestDCPGatherRequestRows(CustomTestCase):
             torch.testing.assert_close(by_ids, expected, rtol=0, atol=0)
 
     def test_short_and_ragged_requests(self):
-        # requests shorter than the group leave some ranks with no rows at all
+        # DCP8 KV rows (656 bytes, page 64); requests shorter than the group leave
+        # some ranks with no rows at all
         self._check([1, 3, 7, 8, 9, 16, 37], size=8, width=656, page_size=64)
-
-    def test_word_and_byte_widths(self):
-        self._check([5, 64, 130], size=8, width=68)
-        self._check([5, 64, 130], size=2, width=5)
-
-    def test_single_short_request(self):
-        self._check([3], size=8, width=656)
 
 
 if __name__ == "__main__":

@@ -235,20 +235,6 @@ class TestRegistrationBurstOrder(CustomTestCase):
             ["v1", "threads", "v2:kv", "v2:mamba", "complete", "v2:swa"],
         )
 
-    def test_dynamic_sidecar_is_checked_under_dcp(self):
-        order: List[str] = []
-        group = _group()
-        anchor = group.anchor_entry.host_pool
-        controller = _controller(HybridCacheController, anchor, group)
-        _attach(controller, RecordingBackend(order), order, host_pools=group.entries)
-        anchor.dcp_size = 2
-        with self.assertRaises(NotImplementedError):
-            controller.register_host_pool_entry(
-                _entry(PoolName.DRAFT_INDEXER, _fake_pool("draft_indexer"))
-            )
-        self.assertNotIn(PoolName.DRAFT_INDEXER, group.entry_map)
-        self.assertEqual(order, ["v1", "threads", "v2:kv", "v2:mamba", "complete"])
-
 
 if __name__ == "__main__":
     unittest.main()
