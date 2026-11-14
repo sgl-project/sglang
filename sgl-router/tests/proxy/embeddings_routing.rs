@@ -100,7 +100,7 @@ async fn embeddings_route_text_to_the_worker_caching_its_prefix() {
 }
 
 #[tokio::test]
-async fn embeddings_reject_prefill_decode_workers_and_other_models() {
+async fn embeddings_reject_prefill_decode_workers_for_any_model() {
     let (prefill, decode) = (
         MockWorker::start(vec![]).await,
         MockWorker::start(vec![]).await,
@@ -111,9 +111,9 @@ async fn embeddings_reject_prefill_decode_workers_and_other_models() {
     ];
     let app = radix_router(&workers, HashTree::new());
 
-    let res = send(&app, json!({"model": MODEL, "input": "hi"})).await;
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    let res = send(&app, json!({"model": "other", "input": "hi"})).await;
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    for model in [MODEL, "other"] {
+        let res = send(&app, json!({"model": model, "input": "hi"})).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{model}");
+    }
     assert!(prefill.captured.lock().unwrap().last_body.is_none());
 }

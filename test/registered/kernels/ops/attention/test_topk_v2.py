@@ -55,6 +55,9 @@ PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
 PAGE_MASK = PAGE_SIZE - 1
 MAX_PERMIT_ERROR = 5
+# The default top-k mode is exact, so CUDA pins the packed kernel to exact
+# (ROCm keeps the default tolerance).
+PACKED_PERMIT_ERROR = MAX_PERMIT_ERROR if is_hip() else 0
 
 # (batch, seq) chosen to land on each template and each dispatch boundary.
 FIXED_CONFIGS = [
@@ -773,7 +776,15 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
         window = scores_cpu[r, start : start + L]
         ref = torch.topk(window, k, sorted=False).indices.tolist()
         our = _invert(out_cpu[r], inv_cpu[req])
-        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
+        _assert_topk_close(
+            window.unsqueeze(0),
+            [ref],
+            [our],
+            1,
+            [L],
+            k,
+            max_permit_error=PACKED_PERMIT_ERROR,
+        )
 
 
 @pytest.mark.parametrize("residue", [1, 2, 3])
@@ -835,7 +846,15 @@ def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
             assert all(v == -1 for v in out_cpu[r][L:]), f"row {r} padding wrong"
             continue
         ref = torch.topk(window, k, sorted=False).indices.tolist()
-        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
+        _assert_topk_close(
+            window.unsqueeze(0),
+            [ref],
+            [our],
+            1,
+            [L],
+            k,
+            max_permit_error=PACKED_PERMIT_ERROR,
+        )
 
 
 @pytest.mark.skipif(is_hip(), reason="ROCm split path keeps its own tie merge")
@@ -1161,6 +1180,41 @@ def test_topk_v2_zero_candidates_graph_replay(batch: int, seq: int, k: int) -> N
             assert (out_cpu == seq - 1).any(dim=1).all()
         for row in range(batch):
             _assert_topk_values(scores_cpu[row], out_cpu[row], k)
+
+
+@pytest.mark.skipif(not is_hip(), reason="ROCm split path")
+@pytest.mark.parametrize(
+    "lens,width",
+    [
+        ([20000], 41024),  # every row short, the width alone takes the split launch
+        ([33822], 1 << 20),  # a static graph-width score buffer
+        ([605805, 33822], 605824),  # one split row next to one short row
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_split_short_row_zero_bin_page_table(lens, width) -> None:
+    """Short rows of a split launch, staged for the page transform.
+
+    Rows at or below split_floor run on rank 0 of topk_split_select with the
+    ordinary one-block paths, staging their picks in shared memory before the
+    page transform. Scores that all round to binary16 +0 but are not all +0
+    overflow the zero bin and take the streaming path's exact refinement.
+    Rows are 4 per request, as in MTP verify and draft extend.
+    """
+    k = 2048
+    device = "cuda"
+    rows = [n - 3 + j for n in lens for j in range(4)]
+    batch = len(rows)
+    g = torch.Generator().manual_seed(width + batch)
+    scores = (torch.randn((batch, width), generator=g) * 1e-7).to(device)
+    seq_lens = torch.tensor(rows, dtype=torch.int32, device=device)
+    num_pages = (width + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        batch, num_pages, "perm", device, per_row=True
+    )
+    our_raw = _run(scores, seq_lens, page_table, inv_cpu, k)
+    for row, n in enumerate(rows):
+        _assert_topk_values(scores[row, :n], torch.tensor(our_raw[row]), k)
 
 
 if __name__ == "__main__":

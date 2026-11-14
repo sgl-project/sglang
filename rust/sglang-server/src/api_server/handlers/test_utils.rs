@@ -62,6 +62,9 @@ pub(super) fn configured_handle(
             metrics: None,
             peer_endpoints: Vec::new(),
             metadata: CoreMetadata::default(),
+            request_log: None,
+            generate_validator: None,
+            abort_hook: None,
         },
     )
 }

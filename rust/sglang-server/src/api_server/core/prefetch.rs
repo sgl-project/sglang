@@ -6,26 +6,36 @@
 //! inline sources resolve through `sglang-mm`'s `fetch_bytes_budgeted` (one
 //! owner for proxy/timeout/cap semantics); trusted local files skip the remote
 //! per-source cap but share the whole-request budget. An external processor
-//! may check a request's media first and resolve URI schemes of its own (see
-//! [`MmProcessor::fetch_media`]). Resolved bytes ride out-of-band as
+//! may check a request's media first, serve sources it already holds, and
+//! resolve URI schemes of its own (see [`MmProcessor::fetch_media`]).
+//! Resolved bytes ride out-of-band as
 //! [`crate::message::request::MmData::prefetched`], which
-//! [`crate::multi_modality::payload::to_mm_input`] swaps back in.
+//! [`crate::multi_modality::payload::resolve_media_work`] swaps back in.
+//!
+//! Blocking fetches share one global bound, so hung reads cannot take over the
+//! runtime's blocking pool, which other request work shares. A source the
+//! processor already holds skips the bound, and the processor's deadline
+//! covers the wait for a slot as well as the fetch.
 
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use bytes::Bytes;
 use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted};
 use sglang_mm::driver::MAX_REQUEST_BYTES;
 use tokio::sync::Semaphore;
 
-use crate::message::request::{GenerateRequest, MmData};
+use crate::message::request::{GenerateRequest, MmData, ProcessorFetch};
 use crate::multi_modality::encoded::MmModality;
 use crate::multi_modality::payload::io_sources;
 use crate::multi_modality::worker::{MediaError, MmProcessor};
 
-/// Global bound on concurrent media fetches across all in-flight requests;
-/// excess acquisitions queue on the semaphore without holding a thread.
-static PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
+/// Global bound on concurrent blocking media fetches across all in-flight
+/// requests; excess acquisitions queue on the semaphore without holding a
+/// thread.
+const MAX_CONCURRENT_FETCHES: usize = 32;
+static PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES)));
 
 /// Fill [`MmData::prefetched`] for every request, all fetches across the batch
 /// concurrent. Any failure rejects the call: bad input is a 400 and a fault on
@@ -90,16 +100,31 @@ pub async fn prefetch_all(
         .iter()
         .map(|r| plan(&r.mm))
         .collect::<Result<Vec<_>, MediaError>>()?;
-    let fetches = plans
-        .into_iter()
-        .map(|sources| fetch_ordered(sources, MAX_REQUEST_BYTES, processor.cloned()));
+    let fetches = plans.into_iter().map(|sources| async {
+        let started = Instant::now();
+        let fetched =
+            fetch_ordered(sources, MAX_REQUEST_BYTES, processor.cloned(), &PERMITS).await?;
+        Ok::<_, MediaError>((fetched, started.elapsed()))
+    });
     let fetched = futures::future::try_join_all(fetches).await?;
-    for (req, bytes) in requests.iter_mut().zip(fetched) {
-        if !bytes.is_empty() {
-            req.mm.as_mut().expect("sources came from mm").prefetched = bytes;
-        }
+    for (req, (fetched, elapsed)) in requests.iter_mut().zip(fetched) {
+        let Some(mm) = req.mm.as_mut() else {
+            continue;
+        };
+        mm.admission.prefetch = elapsed;
+        mm.admission.processor_fetches = fetched
+            .iter()
+            .filter_map(|source| source.by_processor)
+            .collect();
+        mm.prefetched = fetched.into_iter().map(|source| source.bytes).collect();
     }
     Ok(())
+}
+
+/// One resolved source, and its timing when the processor fetched it.
+struct Fetched {
+    bytes: Bytes,
+    by_processor: Option<ProcessorFetch>,
 }
 
 /// The modality's name as `--limit-mm-data-per-request` keys it.
@@ -111,30 +136,59 @@ fn modality_name(modality: MmModality) -> &'static str {
     }
 }
 
-/// Resolve one request's sources concurrently (globally bounded), in order.
-/// All inputs share `total_bytes`; trusted local files skip only the remote
-/// per-source cap, matching Python's URL-only security limit. Overflow rejects
-/// before or during I/O and `try_join_all` drops the rest, so queued sources
-/// never start. The processor, when there is one, sees each source first.
+/// Resolve one request's sources concurrently (blocking fetches bounded by
+/// `permits`), in order. All inputs share `total_bytes`; trusted local files
+/// skip only the remote per-source cap, matching Python's URL-only security
+/// limit. Overflow rejects before or during I/O and `try_join_all` drops the
+/// rest, so queued sources never start. The processor, when there is one,
+/// sees each source first: a source it holds resolves without a permit, and
+/// its deadline fails a fetch that is not done in time, queued or running.
 async fn fetch_ordered(
     sources: Vec<(String, MmModality)>,
     total_bytes: u64,
     processor: Option<Arc<dyn MmProcessor>>,
-) -> Result<Vec<Bytes>, MediaError> {
+    permits: &Arc<Semaphore>,
+) -> Result<Vec<Fetched>, MediaError> {
     let budget = Arc::new(ByteBudget::new(total_bytes));
     futures::future::try_join_all(sources.into_iter().map(|(src, modality)| {
         let budget = Arc::clone(&budget);
         let processor = processor.clone();
         async move {
+            if let Some(processor) = &processor {
+                let started = Instant::now();
+                if let Some(bytes) = processor.cached_media(&src, modality, &budget) {
+                    return Ok(Fetched {
+                        by_processor: Some(ProcessorFetch {
+                            started,
+                            elapsed: started.elapsed(),
+                            bytes: bytes.len(),
+                        }),
+                        bytes,
+                    });
+                }
+            }
+            let deadline = processor
+                .as_ref()
+                .and_then(|processor| processor.media_fetch_deadline());
+            let source = src.clone();
             // Blocking I/O: parks a lazily-spawned blocking-pool thread, never
             // an API worker. Those threads are pinned round-robin over the api
             // core set (see `on_thread_start` in `runtime::start`) — off the
             // CPU-bound stages, and mostly I/O-parked, so sharing is fine.
-            run_blocking_bounded(Arc::clone(&PERMITS), move || {
-                if let Some(processor) = processor
-                    && let Some(bytes) = processor.fetch_media(&src, modality, &budget)?
-                {
-                    return Ok(bytes);
+            let fetch = run_blocking_bounded(Arc::clone(permits), move || {
+                if let Some(processor) = processor {
+                    let started = Instant::now();
+                    if let Some(bytes) = processor.fetch_media(&src, modality, &budget)? {
+                        let by_processor = ProcessorFetch {
+                            started,
+                            elapsed: started.elapsed(),
+                            bytes: bytes.len(),
+                        };
+                        return Ok(Fetched {
+                            bytes,
+                            by_processor: Some(by_processor),
+                        });
+                    }
                 }
                 let fetched = if src.starts_with('/') || src.starts_with("file://") {
                     fetch_local_file_budgeted(&src, &budget)
@@ -143,10 +197,24 @@ async fn fetch_ordered(
                 } else {
                     Err(format!("media fetch: unsupported URI: {src}"))
                 };
-                fetched.map(Bytes::from).map_err(MediaError::Client)
-            })
-            .await
-            .map_err(MediaError::Server)?
+                let bytes = fetched.map(Bytes::from).map_err(MediaError::Client)?;
+                Ok(Fetched {
+                    bytes,
+                    by_processor: None,
+                })
+            });
+            // Past the deadline the request fails; a fetch already running
+            // finishes on its own, keeping its permit, and its result is
+            // dropped.
+            let joined = match deadline {
+                None => fetch.await,
+                Some(deadline) => tokio::time::timeout(deadline, fetch).await.map_err(|_| {
+                    MediaError::Server(format!(
+                        "Error while loading data {source}: fetch timed out after {deadline:?}"
+                    ))
+                })?,
+            };
+            joined.map_err(MediaError::Server)?
         }
     }))
     .await
@@ -188,7 +256,8 @@ mod tests {
             .into_iter()
             .map(|source| (source, MmModality::Image))
             .collect();
-        fetch_ordered(sources, total_bytes, None).await
+        let fetched = fetch_ordered(sources, total_bytes, None, &PERMITS).await?;
+        Ok(fetched.into_iter().map(|source| source.bytes).collect())
     }
 
     fn serve(bodies: Vec<Vec<u8>>) -> std::net::SocketAddr {
@@ -293,8 +362,9 @@ mod tests {
         );
     }
 
-    /// Serves `custom://` sources (or fails them, by name), rejects audio
-    /// before any fetch, and leaves every other source to the built-in fetcher.
+    /// Serves `custom://` sources, each in [`CUSTOM_FETCH_TIME`] (or fails
+    /// them, by name), rejects audio before any fetch, and leaves every other
+    /// source to the built-in fetcher.
     struct CustomScheme;
 
     impl MmProcessor for CustomScheme {
@@ -325,6 +395,7 @@ mod tests {
                 Some("server") => Err(MediaError::Server("backend down".into())),
                 Some("panic") => panic!("fetch panicked"),
                 Some(name) => {
+                    std::thread::sleep(CUSTOM_FETCH_TIME);
                     let bytes = Bytes::from(format!("{modality:?}:{name}"));
                     budget
                         .charge_existing(bytes.len(), source)
@@ -334,6 +405,9 @@ mod tests {
             }
         }
     }
+
+    /// How long [`CustomScheme`] takes to fetch one of its URIs.
+    const CUSTOM_FETCH_TIME: std::time::Duration = std::time::Duration::from_millis(10);
 
     /// A processor's URIs resolve in request order beside built-in sources;
     /// its failures keep their class, a scheme nobody serves is a client error
@@ -361,11 +435,25 @@ mod tests {
             .await
             .unwrap();
         std::fs::remove_file(&path).ok();
-        let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
+        let mm = requests[0].mm.as_ref().unwrap();
         assert_eq!(
-            fetched.iter().map(Bytes::as_ref).collect::<Vec<_>>(),
+            mm.prefetched.iter().map(Bytes::as_ref).collect::<Vec<_>>(),
             vec![b"Image:a".as_ref(), b"zzz".as_ref(), b"Video:b".as_ref()]
         );
+        // Only the processor's own fetches are timed, in source order; the
+        // request's prefetch covers them all.
+        let fetches = &mm.admission.processor_fetches;
+        assert_eq!(
+            fetches.iter().map(|fetch| fetch.bytes).collect::<Vec<_>>(),
+            [7, 7]
+        );
+        assert!(
+            fetches
+                .iter()
+                .all(|fetch| fetch.elapsed >= CUSTOM_FETCH_TIME)
+        );
+        assert!(mm.admission.prefetch >= CUSTOM_FETCH_TIME);
+        assert!(mm.admission.queued_at.is_none());
 
         let unsupported =
             |source: &str| MediaError::Client(format!("media fetch: unsupported URI: {source}"));
@@ -414,6 +502,140 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err, MediaError::Client("no audio".into()));
+    }
+
+    /// Holds every `custom://hung` fetch until released, failing the request
+    /// at [`HUNG_DEADLINE`], and serves `custom://cached` without a blocking
+    /// fetch (its blocking fetch, unused, would serve it too).
+    #[derive(Default)]
+    struct Hung {
+        started: std::sync::atomic::AtomicUsize,
+        released: std::sync::Mutex<bool>,
+        release: std::sync::Condvar,
+    }
+
+    const HUNG_DEADLINE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    impl Hung {
+        async fn wait_started(&self, n: usize) {
+            while self.started.load(std::sync::atomic::Ordering::SeqCst) < n {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    /// Releases the hung fetches when dropped, so a failing test's runtime
+    /// does not wait on their threads forever.
+    struct Release(Arc<Hung>);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.released.lock().unwrap() = true;
+            self.0.release.notify_all();
+        }
+    }
+
+    impl MmProcessor for Hung {
+        fn process(
+            &self,
+            _input_ids: crate::message::types::TokenIds,
+            _mm: MmData,
+        ) -> Result<crate::multi_modality::worker::MmProcessOutput, MediaError> {
+            unreachable!("prefetch never processes")
+        }
+
+        fn cached_media(
+            &self,
+            source: &str,
+            _modality: MmModality,
+            _budget: &ByteBudget,
+        ) -> Option<Bytes> {
+            (source == "custom://cached").then(|| Bytes::from_static(b"cached"))
+        }
+
+        fn fetch_media(
+            &self,
+            source: &str,
+            _modality: MmModality,
+            _budget: &ByteBudget,
+        ) -> Result<Option<Bytes>, MediaError> {
+            match source {
+                "custom://cached" => Ok(Some(Bytes::from_static(b"cached"))),
+                "custom://hung" => {
+                    self.started
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let released = self.released.lock().unwrap();
+                    drop(self.release.wait_while(released, |released| !*released));
+                    Ok(Some(Bytes::from_static(b"late")))
+                }
+                _ => Ok(None),
+            }
+        }
+
+        fn media_fetch_deadline(&self) -> Option<std::time::Duration> {
+            Some(HUNG_DEADLINE)
+        }
+    }
+
+    /// With every permit held by a hung fetch, a source the processor holds
+    /// still resolves; uncached sources queued behind the hung fetches fail
+    /// at the deadline instead of waiting forever, and never start, so no
+    /// more than [`MAX_CONCURRENT_FETCHES`] fetch threads are parked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hung_fetches_hold_every_permit_but_not_cached_sources_or_the_deadline() {
+        let hung = Arc::new(Hung::default());
+        let _release = Release(Arc::clone(&hung));
+        let processor: Arc<dyn MmProcessor> = hung.clone();
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+        let fetch = |source: String| {
+            let processor = Arc::clone(&processor);
+            let permits = Arc::clone(&permits);
+            tokio::spawn(async move {
+                let sources = vec![(source, MmModality::Image)];
+                let fetched =
+                    fetch_ordered(sources, MAX_REQUEST_BYTES, Some(processor), &permits).await?;
+                Ok::<_, MediaError>(fetched.into_iter().map(|f| f.bytes).collect::<Vec<_>>())
+            })
+        };
+        let hung_requests = (0..MAX_CONCURRENT_FETCHES + 8)
+            .map(|_| fetch("custom://hung".into()))
+            .collect::<Vec<_>>();
+        hung.wait_started(MAX_CONCURRENT_FETCHES).await;
+
+        let path =
+            std::env::temp_dir().join(format!("sglang-prefetch-queued-{}", std::process::id()));
+        std::fs::write(&path, b"zzz").unwrap();
+        let queued = fetch(path.display().to_string());
+        let cached = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch("custom://cached".into()),
+        )
+        .await
+        .expect("a cached source waited for a permit")
+        .unwrap();
+        assert_eq!(cached, Ok(vec![Bytes::from_static(b"cached")]));
+
+        let timed_out = |source: &str| {
+            Err(MediaError::Server(format!(
+                "Error while loading data {source}: fetch timed out after {HUNG_DEADLINE:?}"
+            )))
+        };
+        let within = |request| tokio::time::timeout(std::time::Duration::from_secs(5), request);
+        let queued = within(queued)
+            .await
+            .expect("a queued fetch outlived its deadline");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(queued.unwrap(), timed_out(&path.display().to_string()));
+        for request in hung_requests {
+            let error = within(request)
+                .await
+                .expect("a hung fetch outlived its deadline");
+            assert_eq!(error.unwrap(), timed_out("custom://hung"));
+        }
+        assert_eq!(
+            hung.started.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CONCURRENT_FETCHES
+        );
     }
 
     /// Without `--limit-mm-data-per-request`, a request with far more items

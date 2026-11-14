@@ -106,6 +106,32 @@ Then state the result three ways: the **`r` value**, the **predicted clamp** (if
 3. Compute `r*`. If `r*` would drive the state pool below one request's worth (`mamba_budget < S · per_req`, happens at very long `L`), **switch to pinning `--max-mamba-cache-size = target_concurrency · S`** and let the rest go to KV — a sub-0.15 `r` is fragile.
 4. Report `r`, predicted clamp, binding pool, and any dtype accuracy gate that applies.
 
+## Multi-turn and agentic traffic: size for residency, not only concurrency
+
+The formula balances the pools for the requests that are *running*. For multi-turn chat and agents, also budget the KV prefixes and recurrent checkpoints you want to retain between turns. A prefix needs a matching device state or a usable host backup; enough KV alone does not guarantee reuse.
+
+- **KV demand** ≈ retained sessions × average session context (not running requests × `L`). KV eviction can cause a sharp loss of reuse before a session's next turn.
+- **State demand** includes `S` (+`D`) slots per running request and retained device checkpoints for idle sessions. A starting estimate is about one checkpoint per idle session with `--mamba-max-states-per-path 1`, but this is a soft cap: tail, fork, locked, and device-leaf states can be preserved. Budget margin and verify actual occupancy. Account for usable host backups separately, including space for restoring states to the device.
+- Size the state pool for the peak *simultaneous* running-state and retained-checkpoint demand, plus margin. Count any checkpoint already included in the running-request budget only once. `S × peak concurrency` plus margin is a starting point for concurrency, not a guarantee of session residency. Slack may cover idle checkpoints when retained sessions are close to peak concurrency, as in the trace below; do not assume this when sessions greatly outnumber running requests.
+- Pin `--max-mamba-cache-size` to that state budget, then check that the remaining KV pool holds the retained sessions' context. Lower the ratio to give KV more memory only after checking that the state pool can sustain both concurrency and checkpoint residency. Prefer `extra_buffer_lazy` (`S` 4 instead of 5) where supported, and recheck both pools.
+
+Validate with your session count, concurrency, and time between turns, including a case with many more sessions than concurrent requests. Track prefix reuse and both pools' occupancy; do not infer checkpoint headroom from active-request usage alone.
+
+Measured (GLM-5.3-Flash NVFP4, TP2 B300, AgentX trace replay, 48 sessions, pools fixed at a 67 GB budget, device only, `--mamba-max-states-per-path 1`; the S=3 rows add `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` to `extra_buffer_lazy`):
+
+| state slots / KV tokens (S) | effective `r` | hit rate | output tok/min/GPU |
+|---|---|---|---|
+| 429 / 5.89M (S=5, default 0.9) | 0.90 | 0.06 | 7.6K |
+| 300 / 7.48M (S=5) | 0.48 | 0.22 | 9.2K |
+| 240 / 8.22M (S=5) | 0.36 | 0.85 | 29.8K |
+| 192 / 8.81M (S=4, lazy) | 0.27 | 0.89 | 36.4K |
+| 144 / 9.41M (S=3) | 0.18 | 0.88 | 35.1K |
+| 120 / 9.70M (S=3, running capped at 40) | 0.15 | 0.84 | 29.7K |
+
+Total sessions and peak concurrency were both 48 (p50 concurrency 27); reported state-pool usage never passed 72% even at 144 slots. This trace does not establish the state budget for workloads with sessions far above peak concurrency. GLM-5.3-Flash now defaults to `r = 0.25` with `extra_buffer_lazy` (model override), and its high-throughput recipes pin 0.9 on GPUs where 0.25 would cap running requests below the benchmarked concurrency (e.g. GB300 TP4 FP8: 219 running requests at 0.25).
+
+The direction is model- and deployment-specific: the Kimi-K3.1 cookbook's agentic PD decode recipe runs at 1.2, above the default. Measure; do not carry a ratio across models.
+
 ## Worked examples (TP8, B300, validated against measured clamps)
 
 Constants (from boot logs): `state_bytes_per_slot ≈ 56.4 MB` (fp32 ssm), `kv_bytes_per_token ≈ 13.8 KB` (fp8) → `token_equiv ≈ 4080`. Cache strategy `extra_buffer_lazy` → `S = 4`. Workload `L = 9216` (8192 in + 1024 out). NOSPEC → `D = 0`.

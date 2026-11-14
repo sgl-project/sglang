@@ -20,6 +20,11 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.kernels.ops.diffusion import modulate_scale_shift, residual_gate_add
+from sglang.kernels.ops.diffusion.norm.rmsnorm_cast_before_weight_bitexact import (
+    can_use_rmsnorm_mean_square,
+    rmsnorm_mean_square_bitexact,
+)
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
@@ -32,6 +37,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.visual_embedding import ModulateProjection
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+_MEAN_SQUARE = BitExactFusionGate("Nomas mean square", per_signature=True)
 
 
 def attention(q, k, v, attn_mask):
@@ -265,15 +274,27 @@ def _compiled_norm_rotate():
 
 
 def rms_norm_rotate(norm, x, freqs_cis, dtype):
-    """``apply_rotary_emb_single(norm(x).to(dtype), freqs_cis)`` with one fused kernel.
+    """Normalize and rotate without materializing the FP32 input and its square.
 
-    The mean-square reduction stays in ATen so its summation order is unchanged;
-    the normalisation, weight, cast and rotation are fused with the same rounding.
+    The mean-square kernel preserves ATen's reduction order; the existing
+    compiled normalization and rotation keep their original rounding.
     """
     if not _fused_ok(x):
         return apply_rotary_emb_single(norm(x).to(dtype), freqs_cis)
     cos, sin = _rope_tables(x, freqs_cis)
-    mean_square = x.float().pow(2).mean(-1, keepdim=True)
+
+    def reference():
+        return x.float().pow(2).mean(-1, keepdim=True)
+
+    if can_use_rmsnorm_mean_square(x):
+        mean_square = _MEAN_SQUARE.run(
+            lambda: rmsnorm_mean_square_bitexact(x),
+            reference,
+            sig=(x.shape, x.stride(), x.device),
+            logger=logger,
+        )
+    else:
+        mean_square = reference()
     with torch.autocast(x.device.type, enabled=False):
         return _compiled_norm_rotate()(
             x, mean_square, norm.eps, norm.weight, cos, sin, dtype

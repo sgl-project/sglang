@@ -86,11 +86,6 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mlu = is_mlu()
-# Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
-# through the pre-registered IPC pool instead of registering graph-pool tensors:
-# the registered path makes peers read stale data over IPC on replay (garbage
-# rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
-_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -1217,7 +1212,10 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or _AITER_CAPTURE_COPY_IN:
+                if (
+                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                    or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+                ):
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
@@ -1334,7 +1332,7 @@ class GroupCoordinator:
                 if torch.cuda.is_current_stream_capturing():
                     if (
                         envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                        or _AITER_CAPTURE_COPY_IN
+                        or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
                     ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
@@ -2117,6 +2115,15 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
+        # Also before destroy_process_group(): the symmetric workspace is released
+        # collectively on cpu_group, after the custom all-reduce drops its views.
+        self.ca_comm = None
+        if self.cpu_group is not None:
+            from sglang.srt.distributed.device_communicators.symm_workspace import (
+                close_group_symm_workspaces,
+            )
+
+            close_group_symm_workspaces(self.cpu_group)
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -2127,8 +2134,6 @@ class GroupCoordinator:
             self.pynccl_comm = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -2598,8 +2603,9 @@ def initialize_model_parallel(
             the KV cache across GPUs within each tensor-parallel group during
             decoding. Must be a divisor of `tp_size` and is currently only
             supported on the AMD HIP platform.
-        shared_experts_tp_size: optional shared-expert TP width. Must divide
-            attention TP; subgroups never cross attention replicas.
+        shared_experts_tp_size: optional shared-expert TP width. May span
+            interleave prefill CP within one attention replica; the validated
+            width divides attention TP x CP and never crosses DP or PP.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2831,8 +2837,9 @@ def initialize_model_parallel(
         if shared_experts_tensor_parallel_size == attn_tp_size:
             _SHARED_EXPERTS_TP = _ATTN_TP
         else:
-            # Attention TP groups are contiguous, and the requested width
-            # divides each one. These groups also stay inside their PP stage.
+            # Rank layout is [PP, attention DP, CP, attention TP]. The
+            # validated width divides attention TP x CP, so contiguous groups
+            # may span interleave PCP but never cross DP replicas or PP stages.
             shared_size = shared_experts_tensor_parallel_size
             shared_group_ranks = [
                 list(range(start, start + shared_size))
@@ -3328,6 +3335,39 @@ def destroy_distributed_environment():
     _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def close_custom_all_reduce() -> None:
+    """Release ROCm carv2 multi-node workspaces while the groups still exist.
+
+    Graceful shutdown aborts the process groups instead of destroying them, and
+    carv2 frees a FABRIC workspace collectively on its group.
+    """
+    if not is_hip():
+        return
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        close_multinode_symm_workspaces,
+        is_multinode_symm_group,
+    )
+
+    for name in sorted(_groups):
+        group = _groups[name]()
+        if group is None or not is_multinode_symm_group(group.cpu_group):
+            continue
+        try:
+            if group.ca_comm is not None:
+                group.ca_comm.close()
+        except Exception as e:
+            logger.warning(
+                f"Custom all-reduce close on shutdown failed, {type(e).__name__}: {e}"
+            )
+        group.ca_comm = None
+    try:
+        close_multinode_symm_workspaces()
+    except Exception as e:
+        logger.warning(
+            f"Symmetric workspace close on shutdown failed, {type(e).__name__}: {e}"
+        )
 
 
 def abort_distributed_environment() -> None:

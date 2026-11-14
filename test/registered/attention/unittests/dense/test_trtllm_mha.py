@@ -10,7 +10,7 @@ from sglang.srt.layers.attention import trtllm_mha_backend
 from sglang.srt.layers.attention.trtllm_mha_decode_groups import DecodeGroupPlans
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,

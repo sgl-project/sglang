@@ -60,6 +60,7 @@ def _manager(manager_class=CommonKVManager):
     manager._deferred_ack_poisoned_rooms = set()
     manager.enable_staging = False
     manager.customized_info_enabled = False
+    manager.exchange_aux_item_lens = False
     return manager
 
 
@@ -176,6 +177,7 @@ class TestReceiverControlMessages(CustomTestCase):
             state_layer_ids=[[7]],
             engine_rank=0,
             gpu_id=0,
+            draft_rows_dcp_collapsed=True,
         )
         manager.agent = SimpleNamespace(
             name="nixl-peer", get_agent_metadata=lambda: b"agent-desc"
@@ -235,6 +237,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"0",
                 b"",
                 struct.pack("Q", 16),
+                b"1",
             ],
             "nixl": [
                 b"NixlMsgGuard",
@@ -262,6 +265,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"1",
                 b"0",
                 struct.pack("<IIQ", 1, 8, 512),
+                b"1",
             ],
             "mori": [
                 b"MoriMsgGuard",
@@ -284,16 +288,21 @@ class TestReceiverControlMessages(CustomTestCase):
                 layer,
             ],
         }
-        for backend, enabled in product(self.backends, (False, True)):
-            with self.subTest(backend=backend, customized_info=enabled):
+        for backend, (enabled, exchange) in product(
+            self.backends, ((False, False), (True, True), (False, True))
+        ):
+            with self.subTest(
+                backend=backend, customized_info=enabled, exchange=exchange
+            ):
                 receiver, sent = self._make_receiver(backend)
                 receiver.kv_mgr.customized_info_enabled = enabled
+                receiver.kv_mgr.exchange_aux_item_lens = exchange
                 expected_frames = list(expected[backend])
                 if backend != "mori":
                     # aux_item_lens follows aux_ptrs; empty when disabled.
                     expected_frames.insert(
                         expected_frames.index(aux) + 1,
-                        struct.pack("Q", 64) if enabled else b"",
+                        struct.pack("Q", 64) if exchange else b"",
                     )
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
@@ -308,9 +317,10 @@ class TestReceiverControlMessages(CustomTestCase):
                 else:
                     registration_type = MooncakeKVArgsRegisterInfo
                 info = registration_type.from_zmq(frames)
-                self.assertEqual(info.dst_aux_item_lens, [64] if enabled else None)
+                self.assertEqual(info.dst_aux_item_lens, [64] if exchange else None)
                 self.assertEqual(info.dst_kv_item_lens, [16])
                 self.assertEqual(info.dst_state_item_lens, [[32]])
+                self.assertTrue(info.dst_draft_rows_dcp_collapsed)
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
 
