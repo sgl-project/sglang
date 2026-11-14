@@ -6,7 +6,8 @@ name: Nightly Benchmark (AMD)
 # test/registered/amd/perf/mi35x/test_<model>_agentx_mi35x.py (harness in
 # sglang.test.agentx_common), one `<curve>-agentx-mi35x` job, one summary job
 # and one dispatch input here. Adding or dropping a curve touches only those.
-# The points must be the matrix row of the harness's INFERENCEX_COMMIT. The
+# The points must be the matrix row of the curve's InferenceX commit (the
+# harness's INFERENCEX_COMMIT unless the test pins its own). The
 # ROCm/sglang-ci dashboard finds the curves by the `<curve>-agentx-mi35x` job
 # ids and reads the `agentx-<curve without dashes>-<point>` artifacts.
 #
@@ -39,6 +40,12 @@ on:
         default: 'none'
         type: choice
         options: [none, all, tp8-c1, tp8-c2, tp8-c4, tp4-c4, tp4-c8, tp4-c10, tp4-c12, tp4-c14, tp4-c16, tp4-dcp4-c16, tp4-dcp4-c24, tp4-dcp4-c40, tp4-dcp4-c48]
+      kimi_k31_pro_point:
+        description: 'Kimi-K3.1-Pro MXFP4 DFlash point to run (none: skip the curve)'
+        required: false
+        default: 'none'
+        type: choice
+        options: [none, all, tp8-c1, tp8-c4, tp8-dcp8-c8, tp8-dcp8-c16, tp8-dcp8-c24, tp8-dcp8-c32, tp8-dcp8-c48, tp8-dcp8-c56]
 
 # sbatch exports the launcher's environment to the cluster job, where
 # amd_ci_start_container.sh logs in to Docker Hub. HF_TOKEN comes from the
@@ -344,5 +351,106 @@ jobs:
         with:
           name: agentx-glm52mxfp4-summary
           path: agentx-glm52mxfp4-summary.json
+          retention-days: 90
+          overwrite: true
+
+  # ============================================================================
+  # Kimi-K3.1-Pro MXFP4 with DFlash: both ends of each of the row's two TP8 arms
+  # (GPU KV with the AMD monokernel, DCP8 with HiCache host-DRAM offload), 4
+  # points. The row's middle DCP8 points are left out to keep the nightly within
+  # the partition's day; dispatch runs any of them. The model must already be in
+  # each perf-bench node's HF cache (see the test).
+  # SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D only changes how MoE weights are
+  # loaded, as every MI35x nightly model load sets it.
+  # ============================================================================
+  kimi-k31-pro-agentx-mi35x:
+    name: kimi-k31-pro-agentx-mi35x ${{ matrix.point }}
+    if: github.repository == 'sgl-project/sglang' && (github.event_name == 'schedule' || inputs.kimi_k31_pro_point != 'none')
+    strategy:
+      fail-fast: false
+      matrix:
+        point: ${{ fromJson(inputs.kimi_k31_pro_point && inputs.kimi_k31_pro_point != 'all' && format('["{0}"]', inputs.kimi_k31_pro_point) || '["tp8-c1", "tp8-c4", "tp8-dcp8-c8", "tp8-dcp8-c56"]') }}
+    runs-on: linux-sglang-mi35x-perf-bench
+    timeout-minutes: 610
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Model load and the one-hour window; this row has no warmup grace.
+      - name: Run point on a cluster node
+        timeout-minutes: 600
+        env:
+          AGENTX_POINT: ${{ matrix.point }}
+          MATRIX_CONFIG_NAME: ${{ matrix.point }}
+          TIME_LIMIT: '04:00:00'
+        run: |
+          bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
+            --suite nightly-perf-8-gpu-mi35x-kimi-k31-pro-agentx \
+            --env "AGENTX_POINT=$AGENTX_POINT" \
+            --env SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -- --nightly --timeout-per-file 12600
+
+      - name: Summarize
+        if: always()
+        run: cat ci_artifacts/*.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentx-kimik31pro-${{ matrix.point }}
+          path: ci_artifacts/*.json
+          if-no-files-found: ignore
+          retention-days: 90
+          # A re-run attempt replaces the earlier attempt's result.
+          overwrite: true
+
+      - name: Cancel cluster jobs on failure/cancel
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          # Same prefix launch_amd_ci_mi35x.sh names its jobs with. %200j widens
+          # the name column; Spur's squeue does not accept --me.
+          PREFIX="amd-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-"
+          JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$PREFIX" | awk '{print $1}' || true)
+          if [ -n "$JOBS" ]; then
+            echo "Cancelling: $JOBS"
+            scancel $JOBS
+          fi
+
+  # One JSON list of the points' records per run. (The ROCm/sglang-ci dashboard
+  # reads the per-point artifacts, not this list.)
+  kimi-k31-pro-agentx-summary:
+    needs: kimi-k31-pro-agentx-mi35x
+    if: always() && github.repository == 'sgl-project/sglang' && (github.event_name == 'schedule' || inputs.kimi_k31_pro_point != 'none')
+    runs-on: ubuntu-latest
+    steps:
+      # A night on which no point got as far as a result still writes an empty
+      # list. The pattern stops at the point so the summary itself is not merged
+      # back in on a re-run.
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: agentx-kimik31pro-tp*
+          path: points
+          merge-multiple: true
+
+      - name: Merge points
+        run: |
+          shopt -s nullglob
+          files=(points/*.json)
+          if (( ${#files[@]} )); then
+            jq -s 'sort_by(.point)' "${files[@]}" > agentx-kimik31pro-summary.json
+          else
+            echo '[]' > agentx-kimik31pro-summary.json
+          fi
+          echo "Merged ${#files[@]} points"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentx-kimik31pro-summary
+          path: agentx-kimik31pro-summary.json
           retention-days: 90
           overwrite: true
