@@ -190,7 +190,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
                 f"largest decode graph bucket x tokens per request = {decode_tokens}, "
                 f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
                 f"{max_tokens_per_rank}. Raise the env var to at least "
-                f"{decode_tokens} or lower --cuda-graph-max-bs / "
+                f"{decode_tokens} or lower --cuda-graph-max-bs-decode / "
                 "--max-running-requests / --speculative-num-draft-tokens."
             )
     if cfg.disaggregation_mode == "decode":
