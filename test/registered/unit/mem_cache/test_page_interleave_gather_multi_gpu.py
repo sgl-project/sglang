@@ -50,6 +50,7 @@ import math
 import os
 import unittest
 import unittest.mock
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -176,7 +177,11 @@ def _check(rank, name, got, expect, atol=0.0):
     assert ok, f"[rank {rank}] {name} mismatch (max_err={max_err})"
 
 
-def _run_mla(rank, world, port, multicast=None):
+def _run_mla(rank, world, port, multicast=None, pool_patch=None):
+    """``pool_patch``: a context manager entered around the pool construction
+    only, so that it does not touch the rendezvous that the communicators
+    make during ``initialize_model_parallel`` (the symmetric-workspace
+    multicast probe, for one)."""
     _dist_init(rank, world, port, attn_cp_size=1)
 
     group = get_parallel().attn_tp_group
@@ -187,20 +192,21 @@ def _run_mla(rank, world, port, multicast=None):
     assert get_kv_shard_group(use_mla_backend=False).world_size == 1
     spec = _gather_make_spec(shard_rank=group.rank_in_group)
 
-    pool = PageInterleaveMLATokenToKVPool(
-        _GATHER_SIZE,
-        page_size=_GATHER_PAGE_SIZE,
-        dtype=_GATHER_DTYPE,
-        kv_lora_rank=_GATHER_KV_LORA_RANK,
-        qk_rope_head_dim=_GATHER_QK_ROPE,
-        layer_num=_GATHER_LAYER_NUM,
-        device=f"cuda:{rank}",
-        enable_memory_saver=False,
-        start_layer=0,
-        end_layer=_GATHER_LAYER_NUM - 1,
-        shard_spec=spec,
-        shard_group=group,
-    )
+    with pool_patch if pool_patch is not None else nullcontext():
+        pool = PageInterleaveMLATokenToKVPool(
+            _GATHER_SIZE,
+            page_size=_GATHER_PAGE_SIZE,
+            dtype=_GATHER_DTYPE,
+            kv_lora_rank=_GATHER_KV_LORA_RANK,
+            qk_rope_head_dim=_GATHER_QK_ROPE,
+            layer_num=_GATHER_LAYER_NUM,
+            device=f"cuda:{rank}",
+            enable_memory_saver=False,
+            start_layer=0,
+            end_layer=_GATHER_LAYER_NUM - 1,
+            shard_spec=spec,
+            shard_group=group,
+        )
     _check_gather_path(pool, multicast)
     device = pool.kv_buffer[0].device
 
@@ -815,13 +821,19 @@ def _run_unmapped_rank_mla(rank, world, port, unmapped_call):
             return _WithoutMulticast(handle)
         return handle
 
-    with unittest.mock.patch.object(
-        symm_mem, "rendezvous", rendezvous_on_rank_1_without_multicast
-    ):
-        pool, req_to_token, prefix_len, seq_len = _run_mla(
-            rank, world, port, multicast=False
-        )
-    assert len(calls) == 2
+    # Around the pool construction only: the communicators built by
+    # initialize_model_parallel rendezvous too (the symmetric-workspace
+    # multicast probe), and those must not be counted or unmapped.
+    pool, req_to_token, prefix_len, seq_len = _run_mla(
+        rank,
+        world,
+        port,
+        multicast=False,
+        pool_patch=unittest.mock.patch.object(
+            symm_mem, "rendezvous", rendezvous_on_rank_1_without_multicast
+        ),
+    )
+    assert len(calls) == 2, [tensor.nbytes for tensor in calls]
     activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
     assert any("nccl" in name.lower() for name in activity), activity
 
