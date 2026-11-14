@@ -146,8 +146,7 @@ def _write_host_ints_kernel(destinations, encoded):
 def write_host_ints(dsts, values):
     """Write host integer lists into small 1-D CUDA tensors with one launch.
 
-    The values travel as kernel arguments, so unlike a host-to-device copy the
-    write never waits on a copy engine behind other transfers.
+    The values travel as kernel arguments, so the write issues no host-to-device copy.
     """
     if len(dsts) != len(values):
         raise ValueError(
