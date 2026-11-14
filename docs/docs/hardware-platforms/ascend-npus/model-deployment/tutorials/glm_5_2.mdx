@@ -191,6 +191,53 @@ python3 -m sglang.launch_server \
         --moe-a2a-backend deepep --deepep-mode auto
 ```
 
+### Single-node W4A8 deployment
+
+Use the [GLM-5.2-w4a8 checkpoint](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w4a8) on one Ascend A3 Series node with 16 NPU devices (8 physical cards). The following configuration was exercised with the `main-cann9.1.0-a3` SGLang image. Apply the CPU settings from the preceding example, then run the following commands in the container with the checkpoint mounted.
+
+```bash
+MODEL_PATH=/path/to/GLM-5.2-w4a8
+
+unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export DEEPEP_HCCL_BUFFSIZE=1000
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
+export DEEPEP_HYBRID_DEPLOYMENT=1
+
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --disable-shared-experts-fusion \
+    --chunked-prefill-size 8192 \
+    --max-prefill-tokens 280000 \
+    --trust-remote-code \
+    --mem-fraction-static 0.78 \
+    --served-model-name GLM-5.2-w4a8 \
+    --max-running-requests 16 \
+    --cuda-graph-max-bs-decode 16 \
+    --quantization modelslim \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --load-balance-method round_robin \
+    --host 127.0.0.1 --port 8000
+```
+
 ### Multi-node deployment
 
 Quantized model `GLM-5.2-w8a8` can be deployed on two Ascend A3 Series nodes.
@@ -465,6 +512,44 @@ For complete optimal configurations with deployment scripts and benchmark comman
 
 For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
 guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
+
+### Tune concurrency for the W4A8 long-context workload
+
+Use a custom JSONL dataset with 128K-token prompts sharing a 90% prefix and set the output length to 1024 tokens. Prepare a second JSONL file containing prompts that warm the same prefix. Run the benchmark client in the same container as the server.
+
+```bash
+MODEL_PATH=/path/to/GLM-5.2-w4a8
+DATASET_DIR=/path/to/benchmark-data
+CONCURRENCY=4
+
+export SGLANG_IS_IN_CI=false
+
+common_args=(
+    --backend sglang
+    --host 127.0.0.1 --port 8000
+    --model "$MODEL_PATH"
+    --served-model-name GLM-5.2-w4a8
+    --tokenizer "$MODEL_PATH"
+    --dataset-name custom
+    --temperature 1.1 --top-p 0.95
+    --seed 42 --warmup-requests 0
+)
+
+# Start each trial from an empty cache on the idle benchmark server.
+curl -fsS -X POST 'http://127.0.0.1:8000/flush_cache?timeout=20'
+
+python3 -m sglang.benchmark.serving "${common_args[@]}" \
+    --dataset-path "$DATASET_DIR/warmup.jsonl" \
+    --sharegpt-output-len 4 --num-prompts 2 --max-concurrency 1 \
+    --output-file /dev/null
+
+python3 -m sglang.benchmark.serving "${common_args[@]}" \
+    --dataset-path "$DATASET_DIR/requests.jsonl" \
+    --sharegpt-output-len 1024 \
+    --num-prompts "$((CONCURRENCY * 4))" --max-concurrency "$CONCURRENCY"
+```
+
+Repeat both phases for each concurrency level. Check that all requests succeeded, then compare output token throughput, mean and P99 time per output token (TPOT), and mean and P99 time to first token (TTFT). For a mean TPOT budget such as 50 ms, repeat the candidates within budget and compare throughput against the increase in TTFT. Apply the budget to P99 TPOT when the deployment has a tail-latency requirement.
 
 ## FAQ
 
