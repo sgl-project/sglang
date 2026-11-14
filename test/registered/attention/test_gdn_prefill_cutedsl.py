@@ -176,6 +176,179 @@ def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
     assert buffer_state_error.max().item() == 0
 
 
+def test_gdn_chunk_cutedsl_newton_schulz_precision():
+    """Regression test for precision loss in the Newton-Schulz inverse.
+
+    The nearly collinear K vectors produce numerically sensitive 16x16
+    diagonal blocks in I + A. A single-BF16 Newton-Schulz operand loses
+    enough precision to produce a large error, while the compensated
+    BF16x2 implementation stays close to the recurrent reference.
+    """
+
+    dtype = torch.bfloat16
+    total_tokens = 64
+
+    # Match Qwen3.5-35B-A3B GDN shapes.
+    num_k_heads = 16
+    num_v_heads = 32
+    head_k_dim = 128
+    head_v_dim = 128
+
+    # A compact, deterministic near-collinear pattern. Each row contains
+    # two non-zero coordinates and is normalized before conversion to BF16.
+    #
+    # Repeating the 16-row pattern four times targets all four 16x16
+    # diagonal blocks processed by the Newton-Schulz phase of one
+    # 64-token GDN chunk.
+    k_pattern_2d = torch.tensor(
+        [
+            [0.96875000, 0.25390625],
+            [0.96875000, 0.25390625],
+            [0.97265625, 0.23925781],
+            [0.98437500, 0.18261719],
+            [0.95312500, 0.29882812],
+            [0.95312500, 0.30273438],
+            [0.92187500, 0.38476562],
+            [0.97656250, 0.22265625],
+            [0.90625000, 0.42578125],
+            [0.92187500, 0.38867188],
+            [0.85156250, 0.52343750],
+            [0.78906250, 0.61718750],
+            [0.36523438, 0.92968750],
+            [0.01489258, 1.00000000],
+            [-0.06347656, 0.99609375],
+            [0.26953125, 0.96484375],
+        ],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    k_pattern_2d = F.normalize(
+        k_pattern_2d,
+        p=2,
+        dim=-1,
+    ).to(dtype)
+
+    k_base = torch.zeros(
+        total_tokens,
+        head_k_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    k_base[:, :2] = k_pattern_2d.repeat(4, 1)
+
+    # Use the same normalized K pattern on every QK head. This keeps the
+    # test deterministic and exercises the exact Qwen3.5 TP1 head shape.
+    k = (
+        k_base[None, :, None, :]
+        .expand(
+            1,
+            total_tokens,
+            num_k_heads,
+            head_k_dim,
+        )
+        .contiguous()
+    )
+    q = k.clone()
+
+    # Deterministic V values avoid dependence on CUDA RNG implementation.
+    v = torch.linspace(
+        -0.5,
+        0.5,
+        steps=total_tokens * num_v_heads * head_v_dim,
+        device="cuda",
+        dtype=torch.float32,
+    ).reshape(
+        1,
+        total_tokens,
+        num_v_heads,
+        head_v_dim,
+    ).to(dtype)
+
+    # These values are within the GDN kernel contract:
+    #   g is a small negative decay
+    #   beta is close to, but below, one
+    #
+    # Together with the correlated K vectors, they form a precision-
+    # sensitive I + A without requiring model weights.
+    g = torch.full(
+        (1, total_tokens, num_v_heads),
+        -1.0e-4,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    beta = torch.full(
+        (1, total_tokens, num_v_heads),
+        0.99,
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    initial_state = torch.zeros(
+        1,
+        num_v_heads,
+        head_v_dim,
+        head_k_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    cu_seqlens = torch.tensor(
+        [0, total_tokens],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    chunk_indices, chunk_offsets = prepare_metadata_cutedsl(
+        cu_seqlens,
+        total_tokens,
+    )
+
+    ref_o, ref_state = fused_recurrent_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens.to(torch.int64),
+        use_qk_l2norm_in_kernel=False,
+    )
+
+    actual_o, actual_state = chunk_gated_delta_rule_cutedsl(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state.clone(),
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+    )
+    torch.cuda.synchronize()
+
+    # Keep explicit finite checks so a regression reports the numerical
+    # failure directly instead of only producing an assert_close message
+    # containing NaN/Inf.
+    assert torch.isfinite(ref_o).all()
+    assert torch.isfinite(ref_state).all()
+    assert torch.isfinite(actual_o).all()
+    assert torch.isfinite(actual_state).all()
+
+    torch.testing.assert_close(
+        actual_o.float(),
+        ref_o.float(),
+        atol=5.0e-2,
+        rtol=5.0e-2,
+    )
+    torch.testing.assert_close(
+        actual_state.float(),
+        ref_state.float(),
+        atol=5.0e-2,
+        rtol=5.0e-2,
+    )
+
+
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 def test_gdn_chunk_cutedsl_pool_mode_matches_dense(state_dtype: torch.dtype):
     """Pool mode (initial_state_indices) must reproduce the dense gather/scatter
