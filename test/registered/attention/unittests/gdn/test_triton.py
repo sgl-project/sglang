@@ -16,6 +16,7 @@ from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import 
     GDNAttentionCase,
     make_gdn_cases,
     run_gdn_attention_case,
+    run_gdn_mixed_decode_tail_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_gdn_cuda_graph_decode_case,
@@ -216,6 +217,22 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_gdn_attention_case(self, case)
+
+    def test_deterministic_mixed_batch_decode_tail_matches_decode(self):
+        """Under deterministic inference, a running request mixed into a prefill
+        batch gets the same GDN output and state, bit for bit, as in a decode step."""
+        case = GDNAttentionCase(
+            name="gdn_deterministic_mixed_decode_tail",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=16,
+            prefix_lens=(0, 24, 31),
+            extend_lens=(40, 1, 1),
+            enable_deterministic_inference=True,
+        )
+        run_gdn_mixed_decode_tail_case(self, case, num_decode=2)
 
     def test_multi_item_scoring_mixed_batch_with_empty_query(self):
         case = GDNAttentionCase(
