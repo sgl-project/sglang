@@ -1091,7 +1091,7 @@ libraries, and operator failures raise errors rather than falling back to native
 | `precision` | `str` | `bf16` selects native floating-point FA; `fp8`, `mxfp8`, or `mxfp4` selects MindIE-SD. | Unset (existing native selection) |
 | `fp8_fa_mode` | `str` | FP8 only; `HIGH_PRECISION` or `C8V16_TILING512` (head dimension 128). | `HIGH_PRECISION` |
 | `head_chunk_size` | `int` | MHA heads per SD call. Use `0` to disable chunking, or another positive integer. | `4` |
-| `qk_rotation` | `bool` | Apply online Q/K rotation before quantization. | `true`; `false` for checkpoints with offline Q/K rotation |
+| `qk_rotation` | `bool` | Apply online Q/K rotation before quantization. Not used by the native BF16 path. | `true`, or `false` when the checkpoint already includes offline Q/K rotation |
 
 `C8V16_TILING512` is an alternative FP8 compute/tiling mode for head dimension
 128. It changes the V block layout and the fused kernel's internal precision
