@@ -13,7 +13,7 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
+use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -42,15 +42,25 @@ fn build_ctx(url: String) -> Arc<AppContext> {
 }
 
 fn build_ctx_with(url: String, cfg: Config) -> Arc<AppContext> {
+    build_ctx_with_workers(cfg, [(url, WireProtocol::default().into())])
+}
+
+fn build_ctx_with_workers(
+    cfg: Config,
+    workers: impl IntoIterator<Item = (String, EngineProfile)>,
+) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
-    let _ = registry.add(WorkerSpec {
-        id: WorkerId(url.clone()),
-        url,
-        mode: WorkerMode::Plain,
-        model_ids: vec![ModelId(MODEL.into())],
-        ..Default::default()
-    });
+    for (url, profile) in workers {
+        let spec = WorkerSpec {
+            id: WorkerId(url.clone()),
+            url,
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId(MODEL.into())],
+            ..Default::default()
+        };
+        registry.add_with_cb(spec, None, profile).unwrap();
+    }
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
@@ -266,10 +276,13 @@ async fn count_tokens() {
     let dir = tempfile::tempdir().unwrap();
     let tokenizer = dir.path().join("tokenizer.json");
     std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tokenizer).unwrap();
+    // Known by its markers as Qwen3.8, which renders a system message only
+    // first, as in SGLang; other templates demote a later one to a user turn.
+    let template = "{# <function= <parameter= preserve_thinking Reasoning effort is set to #}\
+        {% for m in messages %}<|im_start|>{{ m.role }}:{{ m.content }};{% endfor %}";
     std::fs::write(
         dir.path().join("tokenizer_config.json"),
-        json!({"chat_template": "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}"})
-            .to_string(),
+        json!({ "chat_template": template }).to_string(),
     )
     .unwrap();
     let mut cfg = config();
@@ -287,6 +300,16 @@ async fn count_tokens() {
         assert!(v["input_tokens"].as_u64().unwrap() > 0, "{model}: {v}");
     }
 
+    // The worker does not report rendering a later system message, so an
+    // inline system turn is lifted to the front and the template accepts it.
+    let inline_system = json!({"model": MODEL, "messages": [
+        {"role": "user", "content": "hello"},
+        {"role": "system", "content": "env"},
+        {"role": "user", "content": "world"},
+    ]});
+    let (status, _, body) = post(ctx.clone(), "/v1/messages/count_tokens", inline_system).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
     // Without a chat template there is no exact count, and no raw-text guess.
     let (status, _, body) = post(
         build_ctx(mock.url.clone()),
@@ -300,6 +323,47 @@ async fn count_tokens() {
         captured(&mock).is_none(),
         "count_tokens is answered by the router"
     );
+}
+
+/// An inline system turn reaches the engine in place only when every worker
+/// reports a template that renders it there; one that does not lifts it.
+#[tokio::test]
+async fn inline_system_turns_follow_every_workers_template() {
+    let req = json!({"model": MODEL, "max_tokens": 8, "messages": [
+        {"role": "user", "content": "a"},
+        {"role": "system", "content": "env"},
+        {"role": "user", "content": "b"},
+    ]});
+    let in_place = req["messages"].clone();
+    let lifted = json!([
+        {"role": "system", "content": "env"},
+        {"role": "user", "content": "a"},
+        {"role": "user", "content": "b"},
+    ]);
+    for (reports, want) in [(&[true][..], in_place), (&[true, false], lifted)] {
+        let mut mocks = Vec::new();
+        for _ in reports {
+            mocks.push(MockWorker::start(vec![]).await);
+        }
+        let workers = mocks
+            .iter()
+            .zip(reports)
+            .map(|(mock, &supports_inline_system)| {
+                let profile = EngineProfile {
+                    supports_inline_system,
+                    ..WireProtocol::default().into()
+                };
+                (mock.url.clone(), profile)
+            });
+        let ctx = build_ctx_with_workers(config(), workers);
+        let (status, _, body) = post(ctx, "/v1/messages", req.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let sent = mocks
+            .iter()
+            .find_map(captured)
+            .expect("one worker served it");
+        assert_eq!(sent["messages"], want, "{reports:?}");
+    }
 }
 
 #[tokio::test]
