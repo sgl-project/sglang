@@ -1,7 +1,9 @@
+import json
 import logging
 from typing import Any, Literal
 
 import torch
+from tokenizers.decoders import Decoder
 
 from sglang.srt.entrypoints.openai.protocol import (
     CachedTokensDetails,
@@ -43,32 +45,35 @@ def _build_byte_decoder() -> dict[str, int]:
     return dict(zip(cs, bs))
 
 
+def _decoder_uses_byte_level(config: dict) -> bool:
+    return config["type"] == "ByteLevel" or (
+        config["type"] == "Sequence"
+        and any(_decoder_uses_byte_level(child) for child in config["decoders"])
+    )
+
+
 def _is_byte_level_tokenizer(tokenizer) -> bool:
-    """Heuristically determine whether *tokenizer* uses GPT-2 byte-level BPE.
+    """Use decoder metadata when available, otherwise probe the vocabulary.
 
-    Only GPT-2 family (GPT2Tokenizer, Llama, Qwen, etc.) store vocabulary
-    tokens as the ``bytes_to_unicode`` printable-char mapping. SentencePiece
-    tokenizers (Mistral, Gemma, T5) store raw Unicode pieces, so applying the
-    byte decoder to them corrupts multi-byte characters.
-
-    We probe by checking ``is_byte_level`` (HuggingFace fast tokenizers) or
-    by verifying that a known multi-byte character (é, U+00E9) round-trips:
-    GPT-2 encodes it as a single byte-level piece ``chr(233)`` whose byte
-    decoder output [233] does NOT form valid UTF-8, while SentencePiece stores
-    the full character ``é`` whose UTF-8 is [195, 169].
+    A byte-level BPE vocabulary stores raw bytes as printable characters;
+    applying that mapping to Unicode pieces corrupts their UTF-8 bytes.
     """
     tid = id(tokenizer)
     if tid in _BYTE_LEVEL_TOKENIZERS:
         return True
 
-    # Fast path: HuggingFace fast tokenizers expose is_byte_level.
     is_bl = getattr(tokenizer, "is_byte_level", None)
+    if not isinstance(is_bl, bool):
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        decoder = getattr(backend, "decoder", None)
+        if isinstance(decoder, Decoder):
+            is_bl = _decoder_uses_byte_level(json.loads(decoder.__getstate__()))
     if isinstance(is_bl, bool):
         if is_bl:
             _BYTE_LEVEL_TOKENIZERS.add(tid)
         return is_bl
 
-    # Slow path: probe with a known é token.
+    # Compatibility fallback for tokenizers without decoder metadata.
     global _BYTE_DECODER
     if not _BYTE_DECODER:
         _BYTE_DECODER = _build_byte_decoder()
