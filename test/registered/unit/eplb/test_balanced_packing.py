@@ -5,9 +5,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.eplb.eplb_algorithms import deepseek
 from sglang.srt.eplb.eplb_algorithms.deepseek import balanced_packing
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,6 +27,78 @@ class TestBalancedPacking(CustomTestCase):
     """
 
     # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _rank_scan(weight, num_packs):
+        """Greedy policy with the lowest rank winning equal-load ties."""
+        capacity = weight.shape[1] // num_packs
+        if capacity == 1:
+            return (
+                torch.arange(weight.shape[1]).expand(weight.shape),
+                torch.zeros_like(weight, dtype=torch.int64),
+            )
+        assignments = torch.empty(weight.shape, dtype=torch.int64)
+        positions = torch.empty_like(assignments)
+        for layer, order in enumerate(weight.float().argsort(descending=True).tolist()):
+            loads = [0] * num_packs
+            counts = [0] * num_packs
+            values = weight[layer].tolist()
+            for item in order:
+                rank = min(
+                    (rank for rank in range(num_packs) if counts[rank] < capacity),
+                    key=loads.__getitem__,
+                )
+                assignments[layer, item] = rank
+                positions[layer, item] = counts[rank]
+                counts[rank] += 1
+                loads[rank] += values[item]
+        return assignments, positions
+
+    def test_matches_rank_scan_with_ties_and_random_loads(self):
+        generator = torch.Generator().manual_seed(42)
+        for packs in (1, 2, 4, 8, 32):
+            for capacity in (1, 2, 5, 14):
+                shape = (3, packs * capacity)
+                cases = (
+                    torch.zeros(shape),
+                    torch.ones(shape),
+                    torch.randint(0, 4, shape, generator=generator),
+                    torch.rand(shape, generator=generator),
+                    torch.randint(0, 100000, shape, generator=generator).double(),
+                )
+                for weight in cases:
+                    with self.subTest(
+                        packs=packs, capacity=capacity, dtype=weight.dtype
+                    ):
+                        expected = self._rank_scan(weight, packs)
+                        actual = balanced_packing(weight, packs)
+                        for output, reference in zip(actual, expected):
+                            torch.testing.assert_close(
+                                output, reference, rtol=0, atol=0
+                            )
+
+    def test_complete_placement_matches_rank_scan(self):
+        generator = torch.Generator().manual_seed(17)
+        for logical, physical, groups, nodes, ranks in (
+            (12, 16, 4, 2, 4),
+            (384, 448, 8, 8, 32),
+        ):
+            for hierarchical in (False, True):
+                loads = torch.randint(0, 64, (3, logical), generator=generator).float()
+                kwargs = dict(
+                    weight=loads,
+                    num_replicas=physical,
+                    num_groups=groups,
+                    num_nodes=nodes,
+                    num_gpus=ranks,
+                    enable_hierarchical=hierarchical,
+                )
+                with self.subTest(logical=logical, hierarchical=hierarchical):
+                    actual = deepseek.rebalance_experts(**kwargs)
+                    with patch.object(deepseek, "balanced_packing", self._rank_scan):
+                        expected = deepseek.rebalance_experts(**kwargs)
+                    for output, reference in zip(actual, expected):
+                        torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
     def _check_shapes(self, weight, pack_index, rank_in_pack):
         self.assertEqual(pack_index.shape, weight.shape)
