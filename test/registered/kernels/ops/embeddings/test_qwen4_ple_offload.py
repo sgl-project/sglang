@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -14,6 +15,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpNGramEmbedding,
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
@@ -210,6 +212,61 @@ def single_rank_runtime_context():
             yield
     finally:
         override.restore()
+
+
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize(
+    "exclusion,explicit_fp8,expected_dtype",
+    [
+        ("table", False, torch.bfloat16),
+        ("shards", False, torch.bfloat16),
+        ("partial", False, None),
+        ("unrelated", False, torch.float8_e4m3fn),
+        ("table", True, torch.float8_e4m3fn),
+    ],
+)
+def test_qwen4_ple_fp8_exclusions(
+    single_rank_runtime_context, offload, exclusion, explicit_fp8, expected_dtype
+):
+    # BF16 checkpoint shards excluded from FP8 must not be downcast on load.
+    prefix = "model.layers.0.ple.ple_embedding"
+    table = f"{prefix}.ngram_embedding"
+    ignored = {
+        "table": [table],
+        "shards": [f"{table}.shard_{i}".removeprefix("model.") for i in range(4)],
+        "partial": [f"{table}.shard_0"],
+        "unrelated": [f"{table}.shard_4"],
+    }[exclusion]
+    quant = Fp8Config.from_config(
+        dict(
+            quant_method="fp8",
+            activation_scheme="dynamic",
+            modules_to_not_convert=ignored,
+        )
+    )
+    config = Qwen4ExpTextConfig(
+        vocab_size=64,
+        ngram_vocab_size_base=64,
+        ngram_size=2,
+        heads_per_ngram=1,
+        eos_token_id=1,
+        split_ngram_parts=4,
+        ple_offload_embedding=offload,
+        ple_embedding_dtype="float8_e4m3fn" if explicit_fp8 else None,
+    )
+    with torch.device(DEVICE):
+        if expected_dtype is None:
+            with pytest.raises(ValueError, match="some but not all shards"):
+                Qwen4ExpNGramEmbedding(config, 8, quant_config=quant, prefix=prefix)
+            return
+        emb = Qwen4ExpNGramEmbedding(
+            config, 8, quant_config=quant, prefix=prefix
+        ).ngram_embedding
+    assert emb.weight.dtype == expected_dtype
+    if expected_dtype == torch.bfloat16:
+        rows = torch.full_like(emb.weight, 1.0078125)
+        emb.weight.weight_loader(emb.weight, rows)
+        torch.testing.assert_close(emb.weight, rows, rtol=0, atol=0)
 
 
 def test_qwen4_ple_offload_avoids_device_table(single_rank_runtime_context):
