@@ -63,18 +63,6 @@ def available() -> bool:
         return False
 
 
-_counters: dict[int, torch.Tensor] = {}
-
-
-def _counter(device: torch.device) -> torch.Tensor:
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    counter = _counters.get(index)
-    if counter is None:
-        counter = torch.zeros(1, dtype=torch.int32, device=device)
-        _counters[index] = counter
-    return counter
-
-
 def covered(
     scores: torch.Tensor, bias: torch.Tensor, topk: int, x: torch.Tensor
 ) -> bool:
@@ -148,7 +136,6 @@ def fused_routing(
         metadata.num_non_exiting_ctas,
         metadata.total_num_padded_tokens,
         metadata.num_tokens_per_expert,
-        _counter(device),
         num_token_non_padded,
         topk,
         float(routed_scaling_factor),
