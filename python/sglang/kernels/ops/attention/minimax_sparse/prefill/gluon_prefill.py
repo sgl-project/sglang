@@ -57,6 +57,34 @@ _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 _MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
 
 
+_DETERMINISTIC_PART_NUM = 1
+_deterministic_inference = None
+
+
+def _is_deterministic_inference() -> bool:
+    global _deterministic_inference
+    if _deterministic_inference is None:
+        from sglang.srt.runtime_context import get_exec
+
+        try:
+            exec_cfg = get_exec()
+        except ValueError:
+            return False  # not published yet, ask again on the next call
+        _deterministic_inference = bool(
+            exec_cfg.deterministic.enable_deterministic_inference
+        )
+    return _deterministic_inference
+
+
+def _max_part_num(num_seqs: int) -> int:
+    # The recommended split count follows the number of query tokens in the forward,
+    # so a request's reduction order would depend on its batch and its cached
+    # prefix; deterministic inference uses one partition for every forward.
+    if _is_deterministic_inference():
+        return _DETERMINISTIC_PART_NUM
+    return get_recommended_splits(num_seqs, 1)
+
+
 class GluonPrefillUnavailableError(RuntimeError):
     """Raised when the scratch cannot hold this forward; the caller falls back to Triton."""
 
@@ -463,8 +491,13 @@ def can_use_gluon_prefill(
 def _pair_prefill_module(
     q: torch.Tensor, k_cache: Union[torch.Tensor, Nvfp4Cache]
 ) -> Optional[ModuleType]:
-    """The two-queries-per-program kernel module when it serves this forward, else None."""
-    if gluon_prefill_pair_gfx950 is None:
+    """The two-queries-per-program kernel module when it serves this forward, else None.
+
+    Deterministic inference never uses it: it serves forwards from a token count
+    on, and walks the union of two neighbouring queries' blocks, so a query's
+    result would depend on its batch.
+    """
+    if gluon_prefill_pair_gfx950 is None or _is_deterministic_inference():
         return None
     fp8_pool = not isinstance(k_cache, Nvfp4Cache) and k_cache.dtype == _FP8_KV_DTYPE
     return (
@@ -569,7 +602,7 @@ def _gluon_sparse_prefill_group(
     out = torch.empty_like(q)
     num_seqs = total_q
     ctx_part = 256
-    max_part_num = get_recommended_splits(num_seqs, 1)
+    max_part_num = _max_part_num(num_seqs)
     intermediate_shape = (num_seqs, 1, max_part_num, num_q_heads)
     exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
     max_logits = torch.empty_like(exp_sums)
