@@ -9,6 +9,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_tokens,
 )
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.observability.prefill_admission_trace import record_admission_wait
 from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
@@ -1711,6 +1712,13 @@ class PrefillAdder:
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
+            if envs.SGLANG_TRACE_PREFILL_ADMISSION.get():
+                record_admission_wait(
+                    req,
+                    "prefill_max_requests",
+                    selected_requests=len(self.can_run_list),
+                    max_requests=x,
+                )
             return AddReqResult.OTHER
 
         if self.chunked_req_waits:
@@ -1955,6 +1963,14 @@ class PrefillAdder:
             and self.can_run_list
             and input_tokens >= self.rem_input_tokens
         ):
+            if envs.SGLANG_TRACE_PREFILL_ADMISSION.get():
+                record_admission_wait(
+                    req,
+                    "prefill_input_budget",
+                    input_tokens=input_tokens,
+                    remaining_input_tokens=self.rem_input_tokens,
+                    selected_requests=len(self.can_run_list),
+                )
             return AddReqResult.OTHER
 
         is_chunked = False
