@@ -206,6 +206,12 @@ template <typename T, bool kUsePDL, bool kFastMath>
 struct ActivationKernel {
   static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
   static constexpr auto kBlockSize = 256u;
+  // the SiLU table serves 16-bit types on CUDA; ROCm never selects it
+#ifdef USE_ROCM
+  static constexpr bool kSiluTableUnsupported = true;
+#else
+  static constexpr bool kSiluTableUnsupported = sizeof(T) != sizeof(uint16_t);
+#endif
 
   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, kFastMath, false>);
   using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL, kFastMath>);
@@ -342,8 +348,8 @@ struct ActivationKernel {
 
   static void build_silu_rounding_table(const tvm::ffi::TensorView table) {
     using namespace host;
-    if constexpr (sizeof(T) != sizeof(uint16_t)) {
-      Panic("the SiLU table covers 16-bit types only");
+    if constexpr (kSiluTableUnsupported) {
+      Panic("the SiLU table covers 16-bit types on CUDA only");
     } else {
       auto device_ = SymbolicDevice{};
       device_.set_options<kDLGPU>();
@@ -358,8 +364,8 @@ struct ActivationKernel {
   static void run_silu_and_mul_rounded_table(
       const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, const tvm::ffi::TensorView table) {
     using namespace host;
-    if constexpr (sizeof(T) != sizeof(uint16_t)) {
-      Panic("the SiLU table covers 16-bit types only");
+    if constexpr (kSiluTableUnsupported) {
+      Panic("the SiLU table covers 16-bit types on CUDA only");
     } else {
       auto N = SymbolicSize{"num_tokens"};
       auto D_in = SymbolicSize{"input_width"};
@@ -386,7 +392,7 @@ struct ActivationKernel {
       RuntimeCheck(num_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
       constexpr auto kernel = silu_and_mul_rounded_table_kernel<T, kUsePDL, kReuseInput>;
       constexpr std::size_t kSmemBytes = kSiluTableSize * sizeof(T);
-      [[maybe_unused]] static const bool smem_set = [] {
+      [[maybe_unused]] static const bool smem_set = [&] {
         RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
         return true;
       }();
