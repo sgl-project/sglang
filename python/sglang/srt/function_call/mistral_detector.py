@@ -125,6 +125,18 @@ class MistralDetector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
+        # Later calls of a JSON array no longer carry the marker: it was consumed
+        # together with the first call, so what remains starts with the separator.
+        # Without recognising that, every remaining call is flushed as normal text
+        # and lost.
+        if self.current_tool_id > 0 and self._tool_calls_marker not in current_text:
+            if current_text.startswith(self.tool_call_separator):
+                return super().parse_streaming_increment(new_text="", tools=tools)
+            if current_text and self.tool_call_separator.startswith(current_text):
+                # Separator itself is still arriving; keep buffering so it is not
+                # emitted as content one character at a time.
+                return StreamingParseResult()
+
         # No marker: either flush as normal text or keep buffering a partial marker.
         if self._tool_calls_marker not in current_text:
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
