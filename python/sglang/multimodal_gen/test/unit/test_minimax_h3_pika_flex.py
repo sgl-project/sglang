@@ -86,7 +86,9 @@ def test_knot_schedule(shift: float) -> None:
 
 
 def test_renoise_update() -> None:
-    state, velocity = torch.randn(4, 8), torch.randn(4, 8)
+    """The released FP32 equations round multiply and add separately."""
+    generator = torch.Generator().manual_seed(42)
+    state, velocity = [torch.randn(4, 8, generator=generator) for _ in range(2)]
     denoised = state + 0.8 * velocity
     out = state.clone()
     _minimax_h3_renoise_target_rows_(
@@ -97,12 +99,12 @@ def test_renoise_update() -> None:
         generator=torch.Generator().manual_seed(7),
     )
     noise = torch.randn(4, 8, generator=torch.Generator().manual_seed(7))
-    torch.testing.assert_close(out, 0.5 * denoised + 0.5 * noise)
+    torch.testing.assert_close(out, 0.5 * denoised + 0.5 * noise, rtol=0, atol=0)
     last = state.clone()
     _minimax_h3_renoise_target_rows_(
         last, velocity, sigma=0.8, sigma_next=0.0, generator=torch.Generator()
     )
-    torch.testing.assert_close(last, denoised)
+    torch.testing.assert_close(last, denoised, rtol=0, atol=0)
 
 
 def _renoise_run(seed: int | None) -> tuple[torch.Tensor, torch.Tensor]:

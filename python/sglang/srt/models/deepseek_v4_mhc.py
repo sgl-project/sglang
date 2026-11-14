@@ -42,7 +42,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
@@ -62,6 +61,7 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
 
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
@@ -387,8 +387,14 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     ):
         parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
 
+    bf16_decode_grid = (
+        bf16_parts is not None
+        and get_platform().is_sm100
+        and get_platform().device_sm != 107
+        and x_flat.shape[0] <= 256
+    )
     use_bf16_projection = bf16_parts is not None and (
-        hopper_medium or 4096 <= x_flat.shape[0] <= 65536
+        hopper_medium or bf16_decode_grid or 4096 <= x_flat.shape[0] <= 65536
     )
     hopper_fused_stats = get_platform().is_sm90 and (
         x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
@@ -414,6 +420,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.sinkhorn_iters,
                 cfg.rms_eps,
                 cfg.eps,
+                decode_grid=bf16_decode_grid,
             )
         elif parts is not None:
             from sglang.kernels.ops.layernorm.mhc import (
@@ -584,16 +591,9 @@ def post(
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
 
     if _is_npu:
-        if not is_npu_arch35():
-            return torch.ops.custom.npu_hc_post(x, residual, post_mix, comb)
-        # The Ascend 950 build of npu_hc_post is batched -- it requires a leading
-        # batch axis on every operand.
-        return torch.ops.custom.npu_hc_post(
-            x.unsqueeze(0),
-            residual.unsqueeze(0),
-            post_mix.unsqueeze(0),
-            comb.unsqueeze(0),
-        ).squeeze(0)
+        from sgl_kernel_npu.operators.hyper_conn import mhc_post_dpskv4
+
+        return mhc_post_dpskv4(x, residual, post_mix, comb)
 
     if _is_xpu:
         from sglang.srt.models.deepseek_v4 import get_mhc_ops

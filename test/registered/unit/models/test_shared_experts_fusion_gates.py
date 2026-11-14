@@ -310,6 +310,30 @@ class TestGlmMoeLiteGate(_FusionGateCase):
             reason = self._reason(Glm4MoeLiteForCausalLM, self._config(), moe_ep_size=2)
         self.assertIn("under expert parallelism", reason)
 
+    def test_a_quant_config_that_cannot_fuse_blocks_fusion(self):
+        """GLM-4.7-Flash W4A16 keeps its shared experts in BF16 beside W4A16
+        routed experts; fusing them would load BF16 into the int4 buffers."""
+        import sglang.srt.models.glm4_moe_lite as glm4_moe_lite
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
+
+        self._seed()
+        mixed = SimpleNamespace(
+            get_name=lambda: "compressed_tensors",
+            can_fuse_shared_expert=lambda: False,
+        )
+        matched = SimpleNamespace(
+            get_name=lambda: "compressed_tensors",
+            can_fuse_shared_expert=lambda: True,
+        )
+        with self._on_cuda(glm4_moe_lite):
+            self.assertIn(
+                "higher precision",
+                self._reason(Glm4MoeLiteForCausalLM, self._config(), mixed),
+            )
+            self.assertIsNone(
+                self._reason(Glm4MoeLiteForCausalLM, self._config(), matched)
+            )
+
     def test_the_nextn_draft_declares_its_own_architecture(self):
         from sglang.srt.models.glm4_moe_lite_nextn import Glm4MoeLiteForCausalLMNextN
 

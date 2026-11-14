@@ -35,7 +35,7 @@ GT; repeated requests share one GT.
 
 ## Perf Baseline Generation Script
 
-`python/sglang/multimodal_gen/test/scripts/gen_perf_baselines.py` starts a local diffusion server, issues requests for selected test cases, aggregates stage/denoise-step/E2E timings from the perf log, and writes the results back to the `scenarios` section of `perf_baselines.json`.
+`python/sglang/multimodal_gen/test/scripts/gen_perf_baselines.py` starts a local diffusion server, issues requests for selected test cases, aggregates stage/denoise-step/E2E timings from the perf log, and writes the results back to the `scenarios` section of the platform baseline file (`python/sglang/multimodal_gen/test/server/perf_baselines/<platform>.json`, where `<platform>` is `h100`, `b200`, `5090` or `xpu_b60`; it is auto-detected or set with `SGLANG_DIFFUSION_PERF_BASELINE_PLATFORM`. NPU uses `server/ascend/perf_baselines_npu.json` and MUSA uses `server/musa/perf_baselines_musa.json`).
 
 ### Usage
 
@@ -60,7 +60,7 @@ python python/sglang/multimodal_gen/test/scripts/gen_perf_baselines.py --all-fro
 Specify input/output paths and timeout:
 
 ```bash
-python python/sglang/multimodal_gen/test/scripts/gen_perf_baselines.py --baseline python/sglang/multimodal_gen/test/server/perf_baselines.json --out /tmp/perf_baselines.json --timeout 600
+python python/sglang/multimodal_gen/test/scripts/gen_perf_baselines.py --baseline python/sglang/multimodal_gen/test/server/perf_baselines/h100.json --out /tmp/perf_baselines.json --timeout 600
 ```
 
 ## Nightly Comparison Telemetry

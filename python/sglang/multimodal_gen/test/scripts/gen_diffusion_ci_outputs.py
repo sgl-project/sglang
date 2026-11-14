@@ -7,7 +7,7 @@ ensuring that GT generation uses exactly the same code path as CI tests.
 
 Usage:
     python gen_diffusion_ci_outputs.py --suite 1-gpu --partition-id 0 --total-partitions 2 --out-dir ./output
-    python gen_diffusion_ci_outputs.py --suite 1-gpu --case-ids qwen_image_t2i flux_image_t2i --out-dir ./output
+    python gen_diffusion_ci_outputs.py --suite 1-gpu --case-ids qwen_image_t2i flux_2_klein_image_t2i --out-dir ./output
     python gen_diffusion_ci_outputs.py --suite 1-gpu-b200 --out-dir ./output
 """
 
