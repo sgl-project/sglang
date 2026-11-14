@@ -683,6 +683,8 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
     def get_index_k_state_buf_infos(self):
         pool = self.index_k_pool
+        if pool is None:  # a PP stage without K-only sparse layers
+            return [], [], []
         n = pool.layer_num
         data_ptrs = [pool.get_key_buffer(i).data_ptr() for i in range(n)]
         data_lens = [pool.get_key_buffer(i).nbytes for i in range(n)]

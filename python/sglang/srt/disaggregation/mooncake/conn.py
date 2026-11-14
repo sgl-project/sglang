@@ -280,6 +280,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+    # send_kvcache_page_row_slice / send_kvcache_slice and maybe_send_extra.
+    supports_minimax_heterogeneous_tp = True
 
     def __init__(
         self,
@@ -1934,10 +1936,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
+        src_data_ptrs: Optional[List[int]] = None,
+        src_layer_ids: Optional[List[int]] = None,
+        src_item_lens: Optional[List[int]] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
-        supporting generic M-to-N TP size configurations.
+        supporting generic M-to-N TP size configurations. The src_* overrides
+        slice another token-major, head-sharded buffer group instead of the KV.
 
         NOTE: This implementation calls the transfer engine for each token slot within
         each page to ensure correctness for any page_size and head-slicing configuration.
@@ -1947,8 +1953,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             compute_head_slice_params,
         )
 
+        if src_data_ptrs is None:
+            src_data_ptrs = self.kv_args.kv_data_ptrs
+            src_layer_ids = self.kv_args.kv_layer_ids
+            src_item_lens = self.kv_args.kv_item_lens
+        if not src_data_ptrs:  # e.g. a PP stage holding none of these layers
+            return 0
         # Extract configuration
-        src_kv_item_len = self.kv_args.kv_item_lens[0]
+        src_kv_item_len = src_item_lens[0]
         page_size = self.kv_args.page_size
 
         # Use total KV head count (not per-rank) for correct head distribution.
@@ -1975,17 +1987,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             total_kv_heads,
         )
 
-        src_data_ptrs = self.kv_args.kv_data_ptrs
-        src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
             # Draft buffers break the flat [K block, V block] layout, so pair by
             # layer ID instead of the half-split used by get_mha_kv_ptrs_with_pp.
-            if any(
-                item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
-            ):
+            if any(item_len != src_kv_item_len for item_len in src_item_lens):
                 logger.error(
                     f"[{mooncake_session_id}] head-sliced transfer assumes one item "
-                    f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
+                    f"length for every KV entry, got {set(src_item_lens)}"
                 )
                 return -1
             layer_ptr_pairs = [
@@ -2513,20 +2521,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if self.request_status.get(req.room, KVPoll.Failed) == KVPoll.Failed:
                     return rc
             elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
-                # Compacted layer lists require equal TP and PP=1 on both peers.
-                if self.pp_size is not None and self.pp_size > 1:
-                    raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax state yet."
-                    )
+                # Compacted layer lists: entries pair by global layer id, so any PP
+                # split works.
+                dst_attn_tp_size = (
+                    target_rank_registration_info.dst_attn_tp_size
+                    if target_rank_registration_info is not None
+                    else self.attn_tp_size
+                )
+                heterogeneous_tp = self.attn_tp_size != dst_attn_tp_size
+                # Index-K has one head, replicated on every attention-TP rank.
                 if (
-                    target_rank_registration_info is not None
-                    and self.attn_tp_size
-                    != target_rank_registration_info.dst_attn_tp_size
-                ):
-                    raise RuntimeError(
-                        "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "state yet."
+                    heterogeneous_tp
+                    and st == StateType.MINIMAX_INDEX_K
+                    and not should_send_replicated_state(
+                        src_attn_tp_size=self.attn_tp_size,
+                        dst_attn_tp_size=dst_attn_tp_size,
+                        local_tp_rank_in_group=(
+                            self.kv_args.engine_rank % self.attn_tp_size
+                        ),
                     )
+                ):
+                    continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if st == StateType.MINIMAX_DENSE_KV:
@@ -2539,6 +2554,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     src_indices = src_indices[: len(dst_indices_local)]
                 elif len(src_indices) < len(dst_indices_local):
                     dst_indices_local = dst_indices_local[: len(src_indices)]
+                if heterogeneous_tp and st == StateType.MINIMAX_DENSE_KV:
+                    # Dense-layer K/V is token-major and head-sharded like FP8 main KV.
+                    rc = (
+                        self.send_kvcache_slice(
+                            req.mooncake_session_id,
+                            np.array(src_indices, dtype=np.int32),
+                            dst_data_ptrs,
+                            np.array(dst_indices_local, dtype=np.int32),
+                            target_rank_registration_info.dst_tp_rank,
+                            dst_attn_tp_size,
+                            dst_item_lens[0],
+                            executor,
+                            dst_layer_ids=dst_state_layer_ids,
+                            src_data_ptrs=src_data_ptrs,
+                            src_layer_ids=src_state_layer_ids,
+                            src_item_lens=src_item_lens,
+                        )
+                        or rc
+                    )
+                    continue
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
@@ -2549,6 +2584,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         force_flat=True,
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
                     )
                     or rc
                 )

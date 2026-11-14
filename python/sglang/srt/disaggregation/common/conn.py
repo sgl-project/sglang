@@ -1473,12 +1473,14 @@ class CommonKVManager(BaseKVManager):
         if (
             StateType.MINIMAX_INDEX_K in getattr(self.kv_args, "state_types", ())
             and info.attn_tp_size != self.attn_tp_size
+            and not self.supports_minimax_heterogeneous_tp
         ):
-            # MiniMax main KV pages are head-major page rows and its index state
-            # is replicated per rank; neither can be resliced by attention head.
+            # NVFP4 main KV pages are head-major page rows and the index state is
+            # replicated per rank; only backends that opt in reslice both.
             raise RuntimeError(
-                "MiniMax sparse PD requires matching attention TP sizes: "
-                f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
+                "MiniMax sparse PD requires matching attention TP sizes on the "
+                f"{type(self).__name__} backend: prefill={info.attn_tp_size}, "
+                f"decode={self.attn_tp_size}."
             )
 
         if (

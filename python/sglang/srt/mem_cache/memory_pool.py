@@ -6173,6 +6173,13 @@ class MiniMaxSparseKVPool(KVCache):
         }
 
         self._dense_layer_ids = set(local_dense_layer_ids)
+        # PD registers its state components by the whole model, not by this PP
+        # stage, so every stage and a decode peer holding all layers list them
+        # in the same order.
+        self.model_has_dense_layers = bool(dense_layer_ids)
+        self.model_has_k_only_sparse_layers = any(
+            g in disable_set for g in sparse_layer_ids
+        )
         main_layer_num = len(local_dense_layer_ids) + len(local_sparse_layer_ids)
         if enable_hisparse:
             from sglang.srt.mem_cache.hisparse_memory_pool import (
@@ -6562,9 +6569,17 @@ class MiniMaxSparseKVPool(KVCache):
             layer_ids=sorted(self.sparse_layer_id_mapping)
         )
 
+    def get_kv_layer_ids(self):
+        """Global layer ids aligned with get_sparse_kv_buf_infos (K then V)."""
+        return sorted(self.sparse_layer_id_mapping) * 2
+
     def get_dense_kv_state_buf_infos(self):
         # Dense KV uses logical device slots, independently of sparse host slots.
         return self._get_layer_kv_buf_infos(layer_ids=sorted(self._dense_layer_ids))
+
+    def get_dense_kv_state_layer_ids(self):
+        """Global layer ids aligned with get_dense_kv_state_buf_infos (K then V)."""
+        return sorted(self._dense_layer_ids) * 2
 
     def _get_layer_kv_buf_infos(self, *, layer_ids):
         buffers = [self.get_key_buffer(layer_id) for layer_id in layer_ids] + [
@@ -6580,11 +6595,19 @@ class MiniMaxSparseKVPool(KVCache):
         # Per-page item_len (MHATokenToKVPool convention); index rows share the
         # main-KV `loc`, so the transfer reuses the same page-ids.
         pool = self.index_k_pool
+        if pool is None:  # a PP stage without K-only sparse layers
+            return [], [], []
         n = pool.layer_num
         data_ptrs = [pool.k_buffer[i].data_ptr() for i in range(n)]
         data_lens = [pool.k_buffer[i].nbytes for i in range(n)]
         item_lens = [pool.k_buffer[i][0].nbytes * pool.page_size for i in range(n)]
         return data_ptrs, data_lens, item_lens
+
+    def get_index_k_state_layer_ids(self):
+        """Global layer ids aligned with get_index_k_state_buf_infos."""
+        return sorted(
+            self.index_k_layer_id_mapping, key=self.index_k_layer_id_mapping.get
+        )
 
     def maybe_get_custom_mem_pool(self):
         return self.main_pool.maybe_get_custom_mem_pool()

@@ -181,6 +181,11 @@ class BaseKVManager(ABC):
     # (ABORT_ACK carrying the sender rank). Without it a hold only ends on timeout.
     supports_deferred_decode_kv_release: bool = False
 
+    # Opt-in per backend: set True once its sender head-slices MiniMax sparse KV
+    # (token-major FP8 and NVFP4 page rows) and broadcasts or elects the
+    # replicated index-K state across different attention TP sizes.
+    supports_minimax_heterogeneous_tp: bool = False
+
     def teardown(self) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} does not support PD role switch teardown"
