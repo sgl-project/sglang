@@ -16,7 +16,8 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, print_warning_once
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
+        self._flydsl_int4 = None
         if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -203,11 +205,68 @@ class QuickAllReduce:
                     "lead to error or degradation to custom allreduce or rccl."
                 )
             qr_max_size = qr_max_size * MB
+        if (
+            envs.SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE.get()
+            and self.qr_quant_level == QuickReduceRegime.INT4
+            and is_gfx95_supported()
+            and self._init_flydsl_int4(qr_max_size)
+        ):
+            return
         # If qr_max_size is None, then 2GB is used by default.
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
+        logger.info(
+            "QuickReduce %s uses the HIP kernel (max %d MiB)",
+            self.qr_quant_level.name,
+            self.qr_max_size // MB,
+        )
+
+    def _init_flydsl_int4(self, qr_max_size: int) -> bool:
+        # FlyDSL owns its IPC buffers, so the HIP QuickReduce is not created.
+        try:
+            from aiter.ops.flydsl import QuickAllReduceInt4
+        except ImportError as e:
+            print_warning_once(
+                "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter has no FlyDSL "
+                f"QuickAllReduceInt4 ({e}); QuickReduce INT4 uses the HIP kernel."
+            )
+            return False
+        # Since ROCm/aiter#5555 this name is the multi-codec FlyQuickAllReduce,
+        # which has preload() instead of compile().
+        if not hasattr(QuickAllReduceInt4, "compile"):
+            print_warning_once(
+                "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter's FlyDSL "
+                "QuickAllReduceInt4 has no compile(); QuickReduce INT4 uses the HIP kernel."
+            )
+            return False
+
+        self._flydsl_int4 = QuickAllReduceInt4(
+            group=self.group,
+            device=self.device,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
+        # The FlyDSL binaries take the payload size at run time, so the smallest
+        # payload this communicator admits builds every one of them.
+        compile_inp = torch.zeros(
+            self._min_size(torch.bfloat16) // 2,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._flydsl_int4.compile(compile_inp, torch.empty_like(compile_inp))
+        # QuickAllReduceInt4 rejects payloads above its 4 GiB window.
+        self.qr_max_size = min(
+            qr_max_size if qr_max_size > 0 else ops.qr_max_size(), 0xFFFFFFFF
+        )
+        self.disabled = False
+        logger.info(
+            "QuickReduce INT4 uses aiter FlyDSL QuickAllReduceInt4 "
+            "(max %d MiB, compiled at init)",
+            self.qr_max_size // MB,
+        )
+        return True
 
     def create_shared_buffer(self):
         """
@@ -226,10 +285,17 @@ class QuickAllReduce:
         """
         if self.disabled:
             return False
+        # The FlyDSL INT4 kernel takes only contiguous, 16-byte-aligned bf16 input.
+        if self._flydsl_int4 is not None and (
+            inp.dtype != torch.bfloat16
+            or not inp.is_contiguous()
+            or inp.data_ptr() % 16 != 0
+        ):
+            return False
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         # the JIT build behind SGLANG_ROCM_QUICK_ALL_REDUCE_JIT reduces bf16 only
-        if not ops.qr_supports(self._ptr, inp.dtype):
+        if self._flydsl_int4 is None and not ops.qr_supports(self._ptr, inp.dtype):
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom quick allreduce requires input byte size to be
@@ -238,14 +304,12 @@ class QuickAllReduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        dtype = inp.dtype
+        return self._min_size(inp.dtype) <= inp_size <= self.qr_max_size
+
+    def _min_size(self, dtype: torch.dtype) -> int:
         if self.use_fp16_kernels:
             dtype = torch.float16
-        return (
-            inp_size <= self.qr_max_size
-            and inp_size
-            >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
-        )
+        return self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""
@@ -253,12 +317,19 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+        if self._flydsl_int4 is not None:
+            self._flydsl_int4.allreduce(inp, out)
+            return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
         return out
 
     def close(self):
+        if self._flydsl_int4 is not None:
+            self._flydsl_int4.close()
+            self._flydsl_int4 = None
+            self.disabled = True
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
