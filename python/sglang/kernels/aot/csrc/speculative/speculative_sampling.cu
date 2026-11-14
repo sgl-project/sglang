@@ -15,7 +15,11 @@
  * limitations under the License.
  */
 #include "pytorch_extension_utils.h"
+#if defined(USE_MUSA)
+#include <musa/speculative_sampling.cuh>
+#else
 #include "speculative_sampling.cuh"
+#endif
 
 using namespace flashinfer;
 
