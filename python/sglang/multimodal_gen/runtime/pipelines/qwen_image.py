@@ -80,6 +80,16 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
+        text_encoder = self.get_module("text_encoder")
+        visual = getattr(getattr(text_encoder, "model", None), "visual", None)
+        # An offloaded encoder is built on CPU; rebuild the vision frequency
+        # table on the GPU so edits match the GPU-resident encoder. Edit-2509
+        # keeps the table its consistency reference was generated with.
+        if (
+            visual is not None
+            and type(server_args.pipeline_config) is not QwenImageEditPlusPipelineConfig
+        ):
+            visual.rotary_pos_emb.recompute_on_device_change = True
         vae_image_processor = VaeImageProcessor(
             vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
             * 2
