@@ -21,6 +21,8 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
 | `compress_ratio` | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `0` (SWA-only) | ✓ EXTEND no-prefix / prefix-within-window / nonzero `attn_sink` / above-window / seq_len==SWA_WINDOW / seq_len below-page / seq_len at-page / seq_len above-page / prefix-exact-page / total-exact-page + DECODE within-window / multi-request / above-window | ✓ DECODE within-window + multi-request | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(64,96)` | ✓ EAGLE chain CG `prefix_lens=(64,96)` | ✓ EAGLE ragged-accept | ✓ EAGLE uniform `extend_lens=(4,4)` | — | ✓ chain `prefix_lens=(32,64)`, `num_steps=3` (`DeepseekV4MultiStepBackend` capture/replay vs. per-step-init eager) | ✓ uniform `extend_lens=(4,4)`, `prefix_lens=(64,96)` (production `EAGLEDraftExtendCudaGraphRunner` through `_create_dsv4_prefill_backend`; uses loose `DSV4_GRAPH_ATOL=1e-1` and skips strict `topk_index` exact-match to absorb CG accumulation drift) | — |
+| `1` (packed C1) | ✓ EXTEND `prefix_lens=(33,)`, `extend_lens=(7,)`; SM90 mixed FlashMLA with the real low-ratio producer, no index seeding, page-index buffer + combined-reference assertions | — | — | — | — | — | — | — | — | — | — | — |
+| `2` (packed C2) | ✓ EXTEND `prefix_lens=(33,)`, `extend_lens=(7,)`; SM90 mixed FlashMLA with the real low-ratio producer, no index seeding, page-index buffer + combined-reference assertions | — | — | — | — | — | — | — | — | — | — | — |
 | `4` (C4) | ✓ EXTEND `prefix_lens=(64,)`, `extend_lens=(16,)` + DECODE `prefix_lens=(64,)` (extra K cache written directly via `set_extra_key_buffer`; `c4_sparse_page_indices` seeded manually because indexer is bypassed) | ✓ DECODE `prefix_lens=(64,)` | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(64,96)` | ✓ EAGLE chain CG `prefix_lens=(64,96)` | production-unreachable: draft layer is SWA-only | production-unreachable: draft layer is SWA-only | — | — | — | — |
 | `128` (C128) | ✓ EXTEND `prefix_lens=(128,)`, `extend_lens=(16,)` + DECODE `prefix_lens=(128,)` | ✓ DECODE `prefix_lens=(128,)` | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(128,160)` | ✓ EAGLE chain CG `prefix_lens=(128,160)` | production-unreachable: draft layer is SWA-only | production-unreachable: draft layer is SWA-only | — | — | — | — |
 
@@ -41,6 +43,8 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
   larger sequences so `req_to_token` has room.
 - Packed FP8 nope + BF16 rope SWA cache layout (584 bytes/token) comes from
   `DeepSeekV4TokenToKVPool`.
+- Packed C1/C2 Main KV uses the versioned E2M1/E4M3/BF16 layout and runs only
+  on SM90 with FlashMLA mixed-cache support.
 - SWA window = 128 (`SWA_WINDOW` constant in `deepseek_v4_backend.py:67`).
 - Tolerance is held loose (`DSV4_ATOL = DSV4_RTOL = 5e-2`) to absorb
   `flash_mla` FP8 GEMM accumulation variance against the dequantized reference.

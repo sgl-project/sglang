@@ -31,12 +31,19 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_c1_module(head_dim: int, rope_dim: int, page_size: int, layout: KVLayout):
+def _jit_c1_module(
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+    layout: KVLayout,
+    write_cache: bool,
+):
     args = make_cpp_args(
         head_dim,
         rope_dim,
         page_size,
         layout.cpp_name,
+        write_cache,
         is_arch_support_pdl(),
     )
     return load_jit(
@@ -56,10 +63,11 @@ def c1_decode_norm_rope_store(
     out_loc: torch.Tensor,
     eps: float,
     freqs_cis: torch.Tensor,
-    k_cache: torch.Tensor,
+    k_cache: Optional[torch.Tensor],
     *,
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
+    write_cache: bool = True,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """RMSNorm ``kv_input`` and write the main KV slot, in a single launch.
@@ -92,7 +100,9 @@ def c1_decode_norm_rope_store(
         out = kv_input.new_empty((num_tokens, head_dim))
 
     layout = KVLayout.parse(layout)
-    module = _jit_c1_module(head_dim, freqs_cis.shape[-1], page_size, layout)
+    module = _jit_c1_module(
+        head_dim, freqs_cis.shape[-1], page_size, layout, write_cache
+    )
     module.decode_fusion(
         kv_input,
         out,
@@ -101,7 +111,9 @@ def c1_decode_norm_rope_store(
         positions,
         out_loc,
         # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
-        k_cache.view(torch.uint8) if is_hip_runtime() else k_cache,
+        (k_cache.view(torch.uint8) if is_hip_runtime() else k_cache)
+        if write_cache
+        else out,
         float(eps),
     )
     return out
@@ -113,12 +125,14 @@ def _jit_c2_module(
     rope_dim: int,
     page_size: int,
     layout: KVLayout,
+    write_cache: bool,
 ) -> Module:
     args = make_cpp_args(
         head_dim,
         rope_dim,
         page_size,
         layout.cpp_name,
+        write_cache,
         is_arch_support_pdl(),
     )
     return load_jit(
@@ -141,12 +155,13 @@ def c2_decode_norm_rope_store(
     raw_out_loc: torch.Tensor,
     eps: float,
     freqs_cis: torch.Tensor,
-    k_cache: torch.Tensor,
+    k_cache: Optional[torch.Tensor],
     *,
     page_size: int,
     ring_size: int,
     draft_len: int = 1,
     layout: Union[KVLayout, str] = KVLayout.V4,
+    write_cache: bool = True,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pair-pool ``kv_input`` against ``kv_state``, RMSNorm, and write the main KV slot.
@@ -175,7 +190,9 @@ def c2_decode_norm_rope_store(
         out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
 
     layout = KVLayout.parse(layout)
-    module = _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size, layout)
+    module = _jit_c2_module(
+        head_dim, freqs_cis.shape[-1], page_size, layout, write_cache
+    )
     module.decode_fusion(
         kv_input,
         kv_state,
@@ -187,7 +204,9 @@ def c2_decode_norm_rope_store(
         eps,
         freqs_cis,
         # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
-        k_cache.view(torch.uint8) if is_hip_runtime() else k_cache,
+        (k_cache.view(torch.uint8) if is_hip_runtime() else k_cache)
+        if write_cache
+        else out,
         ring_size,
         draft_len,
     )
@@ -203,13 +222,14 @@ def c2_prefill_norm_rope_store(
     raw_out_loc: torch.Tensor,
     eps: float,
     freqs_cis: torch.Tensor,
-    k_cache: torch.Tensor,
+    k_cache: Optional[torch.Tensor],
     extend_start_loc: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     *,
     page_size: int,
     ring_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
+    write_cache: bool = True,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """:func:`c2_decode_norm_rope_store` for an extend batch, then the ring write-back.
@@ -231,7 +251,9 @@ def c2_prefill_norm_rope_store(
         out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
 
     layout = KVLayout.parse(layout)
-    module = _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size, layout)
+    module = _jit_c2_module(
+        head_dim, freqs_cis.shape[-1], page_size, layout, write_cache
+    )
     module.prefill_fusion(
         kv_input,
         kv_state,
@@ -243,7 +265,9 @@ def c2_prefill_norm_rope_store(
         eps,
         freqs_cis,
         # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
-        k_cache.view(torch.uint8) if is_hip_runtime() else k_cache,
+        (k_cache.view(torch.uint8) if is_hip_runtime() else k_cache)
+        if write_cache
+        else out,
         ring_size,
         extend_start_loc,
         extend_seq_lens,

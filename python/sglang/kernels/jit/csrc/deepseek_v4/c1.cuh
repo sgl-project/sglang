@@ -54,6 +54,7 @@ template <
     typename PosT,
     typename LocT,
     deepseek_v4::KVLayout kLayout,
+    bool kWriteCache,
     bool kUsePDL>
 __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
     const __grid_constant__ Compress1DecodeParams params) {
@@ -134,6 +135,7 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
 
   latent.store(params.kv_output + row * kHeadDim, tx);
   PDLTriggerSecondary<kUsePDL>();
+  if constexpr (!kWriteCache) return;
 
   // Match finish()'s bf16 rounding before the main-KV RoPE.
 #pragma unroll
@@ -226,7 +228,13 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
 }
 
 /// \brief Host side of `flash_c1_decode_kernel`.
-template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    uint32_t kPageSize,
+    deepseek_v4::KVLayout kLayout,
+    bool kWriteCache,
+    bool kUsePDL>
 struct FlashCompress1Kernel {
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
   static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
@@ -237,7 +245,8 @@ struct FlashCompress1Kernel {
   static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584ll * kPageSize, 576) * 576);
 
   template <typename PosT, typename LocT>
-  static constexpr auto kernel = flash_c1_decode_kernel<kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
+  static constexpr auto kernel =
+      flash_c1_decode_kernel<kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kWriteCache, kUsePDL>;
 
   /// \brief The (`positions`, `out_loc`) dtype pair, resolved at run time.
   static auto select(const bool pos_i32, const bool loc_i32) {
@@ -283,9 +292,14 @@ struct FlashCompress1Kernel {
     auto loc_dtype = SymbolicDType{};
     TensorMatcher({N}).with_dtype<int32_t, int64_t>(pos_dtype).with_device(device_).verify(positions);
     TensorMatcher({N}).with_dtype<int32_t, int64_t>(loc_dtype).with_device(device_).verify(out_loc);
-    // The pool allocates the buffer as uint8 and hands it out viewed as its fp8
-    // dtype (`get_extra_key_buffer`); both are one byte per element.
-    TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(kvcache);
+    if constexpr (kWriteCache) {
+      // The pool allocates the buffer as uint8 and hands it out viewed as its
+      // fp8 dtype (`get_extra_key_buffer`); both are one byte per element.
+      TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(kvcache);
+    } else {
+      // The Python wrapper aliases kv_output here; the kernel never dereferences it.
+      TensorMatcher({N, kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(kvcache);
+    }
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;
