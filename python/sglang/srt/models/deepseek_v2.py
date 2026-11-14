@@ -1248,8 +1248,12 @@ class DeepseekV2MoE(nn.Module):
                 )
                 ready = self.routed_quant_stream.record_event()
             routed_pre_quant_input = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
+        deterministic_inference = (
+            get_exec().deterministic.enable_deterministic_inference
+        )
         deferred_finalize = (
-            has_shared_output
+            not deterministic_inference
+            and has_shared_output
             and not self._shared_expert_tp1
             and (
                 self.experts.supports_deferred_finalize
@@ -1261,9 +1265,11 @@ class DeepseekV2MoE(nn.Module):
                 or hidden_states.shape[0] <= self._deferred_finalize_max_tokens
             )
         )
-        # NOTE: if `return_moe_output`, always try to defer finalize
+        # NOTE: if `return_moe_output`, always try to defer finalize unless
+        # deterministic inference is enabled (mHC post switches kernels by M).
         deferred_finalize = deferred_finalize or (
-            return_moe_output
+            not deterministic_inference
+            and return_moe_output
             and isinstance(self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
         )
         if deferred_finalize:
