@@ -6,6 +6,8 @@ import triton.language as tl
 
 _COUNT_BLOCK_SIZE = 1024
 _DISPATCH_BLOCK_SIZE = 32
+_SMALL_DISPATCH_BLOCK_SIZE = 16
+_SMALL_DISPATCH_MAX_ROUTES = 8192
 
 
 @triton.jit
@@ -340,8 +342,15 @@ def _dispatch_probability(
 def dispatch_probability(ids, probabilities, mapping):
     output = torch.empty_like(ids, memory_format=torch.contiguous_format)
     if ids.numel():
+        # Smaller CDF tiles reduce small-batch latency; larger batches benefit
+        # from amortizing each program's setup over more routes.
+        block = (
+            _SMALL_DISPATCH_BLOCK_SIZE
+            if ids.numel() <= _SMALL_DISPATCH_MAX_ROUTES
+            else _DISPATCH_BLOCK_SIZE
+        )
         random = torch.rand(ids.numel(), device=ids.device)
-        _dispatch_probability[(triton.cdiv(ids.numel(), _DISPATCH_BLOCK_SIZE),)](
+        _dispatch_probability[(triton.cdiv(ids.numel(), block),)](
             ids,
             mapping,
             probabilities,
@@ -351,7 +360,7 @@ def dispatch_probability(ids, probabilities, mapping):
             *ids.stride(),
             mapping.stride(0),
             probabilities.shape[1],
-            _DISPATCH_BLOCK_SIZE,
+            block,
             triton.next_power_of_2(probabilities.shape[1]),
         )
     return output

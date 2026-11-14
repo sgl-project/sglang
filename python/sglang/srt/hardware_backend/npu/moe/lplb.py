@@ -40,7 +40,7 @@ class NpuLPLBSolver:
         # Columns: M replica masses, rank slack, maximum load, and an auxiliary
         # variable that supplies a feasible starting point for the IPM solver.
         nc, nv = h + num_gpus, m + num_gpus + 2
-        device = phy2log.device
+        device = log2phy.device
 
         def zeros(*shape, dtype=torch.float32):
             return torch.zeros(shape, dtype=dtype, device=device)
@@ -204,7 +204,9 @@ def init_npu_lplb_solvers(model_config, update_layer_ids=None):
     )
     for layer_id in layer_ids:
         layout = dict(
-            phy2log=metadata.physical_to_logical_map[layer_id],
+            # EPLB updates the CPU mirror before refreshing these solvers.
+            # Build constraints from it without a per-layer device readback.
+            phy2log=metadata.physical_to_logical_map_cpu[layer_id],
             log2phy=metadata.logical_to_all_physical_map[layer_id],
         )
         solver = get_global_lplb_solver(layer_id)
