@@ -91,9 +91,11 @@ class TestRenderAndEncode(unittest.TestCase):
 
 
 class TestEnginePrompt(unittest.TestCase):
-    def _server(self, lossy):
+    def _server(self, lossy, auto_added_bos_id=None):
         return SimpleNamespace(
-            _prompt_text_round_trip_is_lossy=lossy, chat_encoding_spec=None
+            _prompt_text_round_trip_is_lossy=lossy,
+            _auto_added_bos_id=auto_added_bos_id,
+            chat_encoding_spec=None,
         )
 
     def test_lossy_text_only_sends_ids(self):
@@ -118,6 +120,19 @@ class TestEnginePrompt(unittest.TestCase):
         )
         self.assertEqual(key, "text")
         self.assertEqual(value, "rendered")
+
+    def test_auto_added_bos_keeps_text_for_media_or_a_prompt_without_bos(self):
+        server = self._server(False, auto_added_bos_id=1)
+
+        # With media, the MM processor tokenizes the text and adds no second BOS.
+        key, _ = engine_prompt(
+            server, _messages([1, 3, 4], image_data=["img"]), is_multimodal=True
+        )
+        self.assertEqual(key, "text")
+
+        # A template that writes no BOS relies on the one that the tokenizer adds.
+        key, value = engine_prompt(server, _messages([3, 4]), is_multimodal=True)
+        self.assertEqual((key, value), ("text", "rendered"))
 
     def test_lossy_without_ids_falls_back_to_text(self):
         key, _ = engine_prompt(self._server(True), _messages([]), is_multimodal=True)
