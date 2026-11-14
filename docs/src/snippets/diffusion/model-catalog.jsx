@@ -152,7 +152,11 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
     {
       name: "HiDream-O1-Image",
-      modelIds: ["HiDream-ai/HiDream-O1-Image"],
+      modelIds: [
+        "HiDream-ai/HiDream-O1-Image-Dev-2604",
+        "HiDream-ai/HiDream-O1-Image-Dev",
+        "HiDream-ai/HiDream-O1-Image",
+      ],
       cookbook: "/cookbook/diffusion/HiDream/HiDream-O1-Image",
       note: "Pixel-space unified transformer: no VAE, single monolithic role, sequence parallelism unsupported.",
     },

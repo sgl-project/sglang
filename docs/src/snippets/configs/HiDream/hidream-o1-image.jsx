@@ -1,6 +1,6 @@
 export const config = {
   modelName: "HiDream-O1-Image",
-  supportedHardware: ["h200"],
+  supportedHardware: ["h200", "a3"],
   groupHardware: false,
   matchDims: [],
   overlayDims: [
@@ -31,6 +31,8 @@ export const config = {
       verifiedRecipes: [
         { id: "h200-tp1", hw: "h200", nodes: 1, gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1, default: true },
         { id: "h200-tp2", hw: "h200", nodes: 1, gpus_per_node: 2, tp_size: 2, ulysses_degree: 1, ring_degree: 1 },
+        { id: "a3-tp1", hw: "a3", nodes: 1, gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1 },
+        { id: "a3-tp2", hw: "a3", nodes: 1, gpus_per_node: 2, tp_size: 2, ulysses_degree: 1, ring_degree: 1 },
       ],
       autoTopology: (s) => ({ tp_size: Number(s.gpus_per_node), ulysses_degree: 1, ring_degree: 1 }),
       validateTopology: (s, topology) => {
