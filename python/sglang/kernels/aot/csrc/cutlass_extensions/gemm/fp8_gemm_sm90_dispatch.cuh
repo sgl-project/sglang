@@ -148,6 +148,38 @@ struct sm90_fp8_config_default {
           EpilogueSchedule>>;
 };
 
+// M in (128, 1024] with 0 < M % 256 <= 192. The default config uses 128-row
+// tiles in 2x1x1 clusters, so here most of the last 256 rows are padding: with
+// an odd tile count (M % 256 <= 128) the partner CTA of the last cluster runs
+// the full mainloop on zero rows, otherwise the last tile is at least half
+// padding. 64-row tiles without clustering cap the padding at 63 rows.
+template <typename InType, typename OutType, bool EnableBias>
+struct sm90_fp8_config_M1024_tail {
+  static_assert(std::is_same<InType, cutlass::float_e4m3_t>());
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
+  using EpilogueSchedule = typename cutlass::epilogue::TmaWarpSpecialized;
+  using TileShape = Shape<_64, _256, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using Cutlass3xGemm = conditional_t<
+      EnableBias,
+      cutlass_3x_gemm_sm90_fp8<
+          InType,
+          OutType,
+          c3x::ScaledEpilogueBias,
+          TileShape,
+          ClusterShape,
+          KernelSchedule,
+          EpilogueSchedule>,
+      cutlass_3x_gemm_sm90_fp8<
+          InType,
+          OutType,
+          c3x::ScaledEpilogue,
+          TileShape,
+          ClusterShape,
+          KernelSchedule,
+          EpilogueSchedule>>;
+};
+
 template <typename Gemm, typename... EpilogueArgs>
 void cutlass_gemm_caller_sm90_fp8(
     torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b, EpilogueArgs&&... epilogue_params) {
@@ -438,6 +470,7 @@ inline void cutlass_gemm_sm90_fp8_dispatch(
   TORCH_CHECK(b.dtype() == torch::kFloat8_e4m3fn);
 
   using Cutlass3xGemmDefault = typename sm90_fp8_config_default<InType, OutType, EnableBias>::Cutlass3xGemm;
+  using Cutlass3xGemmM1024Tail = typename sm90_fp8_config_M1024_tail<InType, OutType, EnableBias>::Cutlass3xGemm;
   using Cutlass3xGemmM128_largeN = typename sm90_fp8_config_M128_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
   using Cutlass3xGemmM128_smallN = typename sm90_fp8_config_M128_smallN<InType, OutType, EnableBias>::Cutlass3xGemm;
 
@@ -513,6 +546,10 @@ inline void cutlass_gemm_sm90_fp8_dispatch(
           out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
     }
     return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmM128_largeN>(
+        out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
+  } else if (m <= 1024 && m % 256 != 0 && m % 256 <= 192) {
+    // m in (128, 1024], 0 < m % 256 <= 192
+    return cutlass_gemm_caller_sm90_fp8_scaled<Cutlass3xGemmM1024Tail>(
         out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
   } else {
     // m in (128, inf)
