@@ -14,6 +14,7 @@ from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.pp_draft_embedding import (
     load_draft_embedding_from_checkpoint,
+    resolve_draft_embed_and_head,
     resolve_target_embed_and_head,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -192,6 +193,58 @@ class TestLoadDraftEmbeddingFromCheckpoint(CustomTestCase):
     def test_draft_without_embedding_fails_loudly(self):
         with self.assertRaises(ValueError):
             self._load(_Draft(with_embedding=False), "/nonexistent")
+
+    def test_streamed_draft_embedding_is_reused_without_reopening_checkpoint(self):
+        for target_owns_embedding in (False, True):
+            with self.subTest(target_owns_embedding=target_owns_embedding):
+                target = _Target(owns_embedding=target_owns_embedding)
+                draft = _Draft()
+                draft.loaded_input_embedding = True
+                embed, head = resolve_draft_embed_and_head(
+                    target_model=target,
+                    draft_model=draft,
+                    model_path="/nonexistent",
+                    revision=None,
+                    load_config=LoadConfig(load_format=LoadFormat.RUNAI_STREAMER),
+                )
+                expected = target if target_owns_embedding else draft
+                self.assertIs(embed, expected.model.embed_tokens.weight)
+                self.assertIs(head, target.lm_head.weight)
+
+    def test_unloaded_draft_embedding_still_loads_from_checkpoint(self):
+        expected = torch.randn(VOCAB, HIDDEN)
+        target = _Target(owns_embedding=False)
+        draft = _Draft()
+        draft.loaded_input_embedding = False
+        with tempfile.TemporaryDirectory() as root:
+            _write_sharded_checkpoint(root, expected)
+            embed, head = resolve_draft_embed_and_head(
+                target_model=target,
+                draft_model=draft,
+                model_path=root,
+                revision=None,
+                load_config=AUTO,
+            )
+        self._assert_loaded(embed, expected)
+        self.assertIs(head, target.lm_head.weight)
+
+    def test_loaded_embedding_marker_requires_single_embedding(self):
+        for with_embedding in (False, True):
+            with self.subTest(with_embedding=with_embedding):
+                draft = _Draft(with_embedding=with_embedding)
+                if with_embedding:
+                    draft.extra_embedding = VocabParallelEmbedding(VOCAB, HIDDEN)
+                draft.loaded_input_embedding = True
+                with self.assertRaisesRegex(
+                    ValueError, "no single VocabParallelEmbedding"
+                ):
+                    resolve_draft_embed_and_head(
+                        target_model=_Target(owns_embedding=False),
+                        draft_model=draft,
+                        model_path="/nonexistent",
+                        revision=None,
+                        load_config=AUTO,
+                    )
 
 
 if __name__ == "__main__":
