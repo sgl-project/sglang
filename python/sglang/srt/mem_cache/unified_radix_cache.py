@@ -4027,6 +4027,9 @@ class UnifiedRadixCache(BasePrefixCache):
             collector.log_backuped_tokens(
                 min(operation.completed_tokens, agreed_tokens)
             )
+            collector.observe_backup_storage_duration(
+                time.perf_counter() - operation.enqueue_time
+            )
             if short:
                 collector.log_storage_backup_failed_tokens(
                     requested_tokens - agreed_tokens
