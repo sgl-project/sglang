@@ -1440,6 +1440,16 @@ class Fp8LinearMethod(LinearMethodBase):
             mxfp8_view = False
         if mxfp8_view:
             backend = self.mxfp8_dense_backend
+            if backend.is_gfx95_mxfp8_aiter_1x32():
+                input_value, input_scale = x if isinstance(x, tuple) else (x, None)
+                return self.w8a8_mxfp8_linear(
+                    input=input_value,
+                    weight=layer.weight,
+                    weight_scale_ue8m0=layer.weight_scale_inv,
+                    input_scale=input_scale,
+                    bias=bias,
+                    weight_preshuffled=getattr(layer, "mxfp8_aiter_preshuffled", False),
+                )
             extra_kwargs = {}
             if self.mxfp8_prefill_autotune_min_tokens is not None:
                 input_tensor = x[0] if isinstance(x, tuple) else x
