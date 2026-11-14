@@ -12,13 +12,12 @@ namespace sglang {
 
 namespace muse_ag_norm {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 
 struct Params {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
   uint8_t* ws_mc;         // multicast VA of the push workspace base (push)
-  Counter* counter;       // per-block phase counters
-  uint32_t num_counters;  // PushPlane::num_blocks
+  EpochCounter* counter;  // the push plane's phase word
   uint32_t half_bytes;    // world_size * slot_bytes
   uint32_t rank;
   uint32_t num_rows;
@@ -34,18 +33,6 @@ SGL_DEVICE fp32x2_t mul_pair(fp32x2_t a, fp32x2_t b) {
 
 SGL_DEVICE fp32x2_t fma_pair(fp32x2_t a, fp32x2_t b, fp32x2_t c) {
   return {fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y)};
-}
-
-// Reads this block's phase and advances the counters no block of this grid owns.
-template <int kNumThreads>
-SGL_DEVICE uint32_t begin_phase(const Params& params) {
-  const uint32_t phase = params.counter[blockIdx.x].get() & 1;
-  if (blockIdx.x == 0) {
-    for (uint32_t i = gridDim.x + threadIdx.x; i < params.num_counters; i += kNumThreads) {
-      params.counter[i].set(phase ^ 1);
-    }
-  }
-  return phase;
 }
 
 template <uint32_t kNLocal, int kNumThreads>
@@ -165,7 +152,7 @@ __global__ void __launch_bounds__(kNumThreads)
   ptx::cluster_arrive_relaxed();
 
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = muse_ag_norm::begin_phase<kNumThreads>(params);
+  const uint32_t phase = params.counter->load();
   const uint32_t half_off = phase * params.half_bytes;
   muse_ag_norm::push_local_slice<kNLocal, kNumThreads>(params, half_off);
   PDLTriggerSecondary<kUsePDL>();
@@ -300,7 +287,7 @@ __global__ void __launch_bounds__(kNumThreads)
 
   // Every slot this block consumed was reset above; publish the next phase.
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[blockIdx.x].set(phase ^ 1);
+  if (threadIdx.x == 0) params.counter->commit();
 }
 
 // C == 1: persistent kernels, each owning rows bx, bx + grid, ...
@@ -341,7 +328,7 @@ __global__ void __launch_bounds__(kNumThreads)
   const bool pre_bf16 = norm.pre_norm_bf16;
 
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = muse_ag_norm::begin_phase<kNumThreads>(params);
+  const uint32_t phase = params.counter->load();
   const uint32_t half_off = phase * params.half_bytes;
   muse_ag_norm::push_local_slice<kNLocal, kNumThreads>(params, half_off);
   PDLTriggerSecondary<kUsePDL>();
@@ -497,7 +484,7 @@ __global__ void __launch_bounds__(kNumThreads)
   }
 
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[blockIdx.x].set(phase ^ 1);
+  if (threadIdx.x == 0) params.counter->commit();
 }
 
 using host::distributed::CommunicatorRef;
@@ -570,18 +557,13 @@ struct MuseSparkAllGatherNormResidual {
         int64_t(num_rows) * kHidden * 2 <= int64_t(push.slot_bytes), "gathered rows exceed the push slot size");
     uint32_t grid = num_rows * kClusterSize;
     if constexpr (kClusterSize == 1) {
-      grid = std::min<uint32_t>(num_rows, push.num_blocks);
-    } else {
-      RuntimeCheck(
-          int64_t(num_rows) * kClusterSize <= int64_t(push.num_blocks),
-          "M * cluster_size exceeds the push plane's block counters");
+      grid = std::min<uint32_t>(num_rows, push.default_blocks);
     }
 
     const auto params = muse_ag_norm::Params{
         .ws_local = push.workspaces[push.rank],
         .ws_mc = push.mc_workspace,
         .counter = push.counter,
-        .num_counters = push.num_blocks,
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .rank = push.rank,
         .num_rows = num_rows,

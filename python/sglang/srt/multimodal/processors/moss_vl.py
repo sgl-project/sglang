@@ -10,7 +10,13 @@ import torch
 
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
-from sglang.srt.multimodal.media_io import download_remote_media
+from sglang.srt.multimodal.media_io import (
+    check_local_media_file,
+    download_remote_media,
+    get_video_bytes,
+    is_local_media_path,
+    media_url_timeout,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -423,13 +429,13 @@ class MossVLImageProcessor(SGLangBaseProcessor):
 
     def _normalize_video_string(self, value: str) -> Tuple[str, Optional[str]]:
         if value.startswith("file://"):
-            return self._resolve_file_url(value), None
+            return check_local_media_file(self._resolve_file_url(value)), None
 
-        if os.path.isfile(value):
-            return value, None
+        if is_local_media_path(value):
+            return check_local_media_file(value), None
 
         if value.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = media_url_timeout(10)
             content = download_remote_media(value, timeout=timeout)
             suffix = os.path.splitext(urlparse(value).path)[1] or ".mp4"
             temp_path = self._write_video_bytes_to_tempfile(content, suffix=suffix)
@@ -449,9 +455,8 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             return temp_path, temp_path
 
-        temp_path = self._write_video_bytes_to_tempfile(
-            pybase64.b64decode(value, validate=True)
-        )
+        # Bare base64; a missing local path gets the loaders' not-found error.
+        temp_path = self._write_video_bytes_to_tempfile(get_video_bytes(value))
         return temp_path, temp_path
 
     def _normalize_single_video_input(

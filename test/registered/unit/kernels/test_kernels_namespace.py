@@ -509,6 +509,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "kv_canary.scatter_req_token_ids",
         "mm.process.image",
         "speculative.row_argmax",
+        "sampling.topk",
     )
     for module in modules:
         tree = ast.parse(

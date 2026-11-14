@@ -15,6 +15,7 @@ from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -311,7 +312,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         hooks._reuse.sources[1] = object()
         self.assertTrue(hooks.blocks_flush(ignore_waiting=True))
         hooks._reuse.sources.clear()
-        hooks._prefetch._parked.join([FakeReq(rid="w1")])
+        move([FakeReq(rid="w1")], hooks._prefetch._parked)
         self.assertTrue(hooks.blocks_flush(ignore_waiting=False))
         self.assertFalse(hooks.blocks_flush(ignore_waiting=True))
 
@@ -320,7 +321,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         forgotten before the clear returns their KV to the pools."""
         hooks, _ = self._hooks()
         held = FakeReq(rid="w1")
-        hooks._prefetch._parked.join([held])
+        move([held], hooks._prefetch._parked)
         hooks._reuse.docs["doc"] = object()
         seen = []
         scheduler = object.__new__(Scheduler)
