@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization import modelopt_quant
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -151,6 +152,69 @@ class TestModelOptNvfp4(CustomTestCase):
         self.assertFalse(bf16_shared.can_fuse_shared_expert())
         # Only the gate is BF16 (Qwen3-Next NVFP4): the FP4 body still fuses.
         self.assertTrue(gate_only_bf16.can_fuse_shared_expert())
+
+
+class TestModelOptNvfp4FusedWeightScale2(CustomTestCase):
+    """The NVFP4 GEMMs take one weight_scale_2 per layer, the largest of the
+    fused projections'; the others get theirs back on the output."""
+
+    def _layer(self, method):
+        layer = nn.Module()
+        method.create_weights(
+            layer,
+            input_size_per_partition=16,
+            output_partition_sizes=[16, 16],
+            input_size=16,
+            output_size=32,
+            params_dtype=torch.bfloat16,
+            weight_loader=default_weight_loader,
+        )
+        layer.weight_scale_2.data.copy_(torch.tensor([0.25, 1.0]))
+        return layer
+
+    def test_nvfp4a16_linear_keeps_largest_and_a_ratio(self):
+        config = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16)
+        method = modelopt_quant.ModelOptNvFp4A16LinearMethod(config)
+        layer = self._layer(method)
+        with patch.object(modelopt_quant, "prepare_nvfp4_layer_for_marlin"):
+            method.process_weights_after_loading(layer)
+        self.assertEqual(layer.weight_global_scale.item(), 1.0)
+        torch.testing.assert_close(
+            layer.fused_global_scale_ratio,
+            torch.cat([torch.full((16,), 0.25), torch.ones(16)]),
+        )
+
+    def test_fp4_linear_post_load_computes_the_ratio(self):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            use_per_token_activation=False,
+        )
+        method = ModelOptFp4LinearMethod(config)
+        layer = self._layer(method)
+
+        class Checked(Exception):
+            pass
+
+        real = modelopt_quant.fused_global_scale_ratio
+        seen = {}
+
+        def record(*args, **kwargs):
+            seen["result"] = real(*args, **kwargs)
+            seen["divisor"] = kwargs["divisor"]
+            raise Checked
+
+        with patch.object(
+            modelopt_quant, "fused_global_scale_ratio", side_effect=record
+        ):
+            with self.assertRaises(Checked):
+                method.process_weights_after_loading(layer)
+        kept, ratio = seen["result"]
+        self.assertFalse(seen["divisor"])
+        self.assertEqual(kept.item(), 1.0)
+        torch.testing.assert_close(
+            ratio, torch.cat([torch.full((16,), 0.25), torch.ones(16)])
+        )
 
 
 if __name__ == "__main__":

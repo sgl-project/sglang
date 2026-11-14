@@ -15,7 +15,11 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (
     CompressedTensorsLinearScheme,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    apply_fused_global_scale_ratio,
+    fused_global_scale_ratio,
+    get_fp4_gemm_runner_backend,
+)
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     prepare_nvfp4_layer_for_marlin,
@@ -196,22 +200,15 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
         if self.has_input_global_scale:
             del layer.input_global_scale
 
-        # Both kernels take one global scale per layer. With fused projections
-        # (q/k/v, gate/up) that only matches the checkpoint if every projection
-        # shares it: substituting one scale while keeping the other projections'
-        # group scales would silently change their dequantized weights.
-        # llm-compressor fuses these global scales when exporting.
-        global_scale = layer.weight_global_scale.data
-        if torch.unique(global_scale).numel() != 1:
-            raise ValueError(
-                "NVFP4 weight-only linear requires all fused projections to share "
-                f"one weight_global_scale, got {global_scale.tolist()}. Re-export "
-                "the checkpoint with fused global scales."
-            )
+        # Both kernels take one global scale per layer; fused projections
+        # (q/k/v, gate/up) whose scales differ get theirs back on the output.
+        global_scale, layer.fused_global_scale_ratio = fused_global_scale_ratio(
+            layer.weight_global_scale.data, layer.logical_widths, divisor=True
+        )
         # compressed-tensors stores the global scale as a divisor (1/scale),
         # while both kernels expect the scale itself. Skipping the inversion
         # overflows the bf16 bias multiply to inf, zeroing all logits.
-        weight_scale_2 = (1 / global_scale[0]).to(torch.float32)
+        weight_scale_2 = (1 / global_scale).to(torch.float32)
 
         layer.use_flashinfer_bf16_fp4 = _use_flashinfer_bf16_fp4(layer.params_dtype)
         if layer.use_flashinfer_bf16_fp4:
@@ -262,11 +259,13 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
                 backend=layer.flashinfer_backend,
                 out_dtype=x.dtype,
             )
+            out = apply_fused_global_scale_ratio(out, layer.fused_global_scale_ratio)
             if bias is not None:
                 out = out + bias
             return out.view(*x.shape[:-1], layer.output_size_per_partition)
 
-        return apply_fp4_marlin_linear(
+        ratio = layer.fused_global_scale_ratio
+        out = apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
@@ -274,5 +273,9 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
             workspace=layer.workspace,
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
-            bias=bias,
+            bias=bias if ratio is None else None,
         )
+        if ratio is None:
+            return out
+        out = apply_fused_global_scale_ratio(out, ratio)
+        return out if bias is None else out + bias
