@@ -74,7 +74,7 @@ def extend(
         and A_log is not None
         and dt_bias is not None
         and all(x.dtype == torch.bfloat16 for x in (q, k, v, g, beta))
-        and ssm_states.dtype == torch.float32
+        and ssm_states.dtype in (torch.float32, torch.bfloat16)
         and ssm_states.is_contiguous()
         and q.shape == k.shape == v.shape == g.shape
         and q.ndim == 4
