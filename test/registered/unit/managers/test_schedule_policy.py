@@ -160,7 +160,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         older = self.make_req("z", 32, arrived=1)
         newer = self.make_req("a", 32, arrived=2)
         queue = [newer, older]
-        self.policy._sort_by_shortest_prefill(queue, set())
+        self.policy._sort_by_shortest_prefill(queue, set(), processed_tokens=0)
         self.assertEqual(queue, [older, newer])
 
     def test_duplicate_prefix_is_deprioritized(self):
@@ -178,14 +178,16 @@ class TestShortestPrefillFirst(CustomTestCase):
         replay.output_ids.extend([0] * 64)
         short = self.make_req("short", 32)
         queue = [replay, short]
-        self.policy._sort_by_shortest_prefill(queue, set())
+        self.policy._sort_by_shortest_prefill(queue, set(), processed_tokens=0)
         self.assertEqual(queue, [short, replay])
 
     def test_chunk_limit_reserves_complete_short_prefills(self):
         continuation = self.make_req("continuation", 16384)
         waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
         self.assertEqual(
-            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, processed_tokens=0
+            ),
             2560,
         )
 
@@ -193,13 +195,21 @@ class TestShortestPrefillFirst(CustomTestCase):
         continuation = self.make_req("continuation", 16384)
         self.assertEqual(
             self.policy.shortest_prefill_chunk_limit(
-                continuation, [self.make_req("short", 257)], 4096, 256
+                continuation,
+                [self.make_req("short", 257)],
+                4096,
+                256,
+                processed_tokens=0,
             ),
             3584,
         )
         self.assertEqual(
             self.policy.shortest_prefill_chunk_limit(
-                continuation, [self.make_req("short", 3840)], 4096, 256
+                continuation,
+                [self.make_req("short", 3840)],
+                4096,
+                256,
+                processed_tokens=0,
             ),
             256,
         )
@@ -215,7 +225,7 @@ class TestShortestPrefillFirst(CustomTestCase):
             with self.subTest(budget=budget, waiting=[req.rid for req in waiting]):
                 self.assertIsNone(
                     self.policy.shortest_prefill_chunk_limit(
-                        continuation, waiting, budget, 256
+                        continuation, waiting, budget, 256, processed_tokens=0
                     )
                 )
 
@@ -227,6 +237,7 @@ class TestShortestPrefillFirst(CustomTestCase):
                 [self.make_req("short", 512)],
                 4096,
                 256,
+                processed_tokens=0,
             )
         )
 
@@ -249,11 +260,15 @@ class TestShortestPrefillFirst(CustomTestCase):
         ):
             queue = [short, staged]
             self.policy.poll_storage_prefetches(queue)
-            self.policy._sort_by_shortest_prefill(queue, set())
+            self.policy._sort_by_shortest_prefill(queue, set(), processed_tokens=0)
             self.assertEqual(queue, [staged, short])
             self.assertEqual(
                 self.policy.shortest_prefill_chunk_limit(
-                    self.make_req("continuation", 16384), [staged], 4096, 256
+                    self.make_req("continuation", 16384),
+                    [staged],
+                    4096,
+                    256,
+                    processed_tokens=0,
                 ),
                 3840,
             )
@@ -267,6 +282,58 @@ class TestShortestPrefillFirst(CustomTestCase):
         poll.assert_called_once_with(
             [short.cache_request_handle, staged.cache_request_handle]
         )
+
+    def test_aging_promotes_waiting_long_requests(self):
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            shortest_prefill_aging_factor=0.5,
+        )
+        old_long = self.make_req("old_long", 1000)
+        new_short = self.make_req("new_short", 10)
+        new_short.arrival_processed_tokens = 3000
+        queue = [new_short, old_long]
+        # Rank = uncached work - 0.5 * prefill tokens processed while waiting.
+        policy._sort_by_shortest_prefill(queue, set(), processed_tokens=1000)
+        self.assertEqual(queue, [new_short, old_long])
+        policy._sort_by_shortest_prefill(queue, set(), processed_tokens=3000)
+        self.assertEqual(queue, [old_long, new_short])
+
+        continuation = self.make_req("continuation", 16384)
+        self.assertEqual(
+            policy.shortest_prefill_chunk_limit(
+                continuation, [new_short], 4096, 256, processed_tokens=3000
+            ),
+            3840,
+        )
+        fresh_short = self.make_req("fresh_short", 10)
+        fresh_short.arrival_processed_tokens = 40000
+        self.assertIsNone(
+            policy.shortest_prefill_chunk_limit(
+                continuation, [fresh_short], 4096, 256, processed_tokens=40000
+            )
+        )
+
+    def test_invalid_aging_factor_is_rejected(self):
+        for schedule_policy, factor in [
+            ("shortest-prefill-first", -0.5),
+            ("shortest-prefill-first", float("nan")),
+            ("shortest-prefill-first", float("inf")),
+            ("fcfs", 0.5),
+        ]:
+            with self.subTest(policy=schedule_policy, factor=factor):
+                with self.assertRaises(ValueError):
+                    SchedulePolicy(
+                        policy=schedule_policy,
+                        tree_cache=RadixCache.create_simulated(),
+                        enable_hierarchical_cache=True,
+                        enable_priority_scheduling=False,
+                        schedule_low_priority_values_first=False,
+                        shortest_prefill_aging_factor=factor,
+                    )
 
 
 if __name__ == "__main__":
