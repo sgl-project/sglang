@@ -162,10 +162,33 @@ class Spec(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    speculative_dspark_lm_head_dtype: A[
+        Optional[str],
+        Arg(
+            help="DSPARK only. Quantized dtype for the draft's projection through the "
+            "target lm_head; the weight is quantized once and cached (about one extra "
+            "byte per lm_head parameter). 'fp8' runs torch._scaled_mm and requires "
+            "gfx95x; 'mxfp8' runs FlashInfer's CuTe DSL mm_mxfp8 and requires "
+            "Blackwell. Target verify logits are unaffected. Default keeps the "
+            "lm_head's own dtype.",
+            choices=["fp8", "mxfp8"],
+            resolvable=True,
+        ),
+    ] = None
     speculative_draft_window_size: A[
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`), DFLASH, and the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). For the built-in EAGLE/MTP draft, each draft-decode step attends to a --speculative-draft-sink-size sink plus the most recent N tokens, leaving the target verify pass unchanged; it is ignored (with a warning) if the draft model has a native sliding window of its own. Default is full attention/context.",
     ] = None
+    speculative_dflash_draft_kv_ring: A[
+        bool,
+        Arg(
+            help="(Resolved) A DFLASH draft keeps its KV in a per-request ring of "
+            "window + verify-block rows. On for an all-sliding-window MLA draft on "
+            "trtllm_mla / cutedsl_mla unless SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     speculative_draft_sink_size: A[
         Optional[int],
         "Number of leading 'attention sink' tokens the draft always attends to, in addition to the --speculative-draft-window-size recent window (StreamingLLM-style). Honored only by the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; the Llama EAGLE-3 and DFLASH windows ignore it. 0/unset => pure recent window. Requires --speculative-draft-window-size.",

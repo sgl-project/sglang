@@ -381,7 +381,8 @@ impl Default for ObservabilityConfig {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub id: String,
-    /// Extra `model` values served as `id` (`--model-alias`); only `id` is advertised.
+    /// Extra `model` values rewritten to `id` in the forwarded body (`--model-alias`);
+    /// only `id` is advertised.
     pub aliases: Vec<String>,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
     /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
@@ -444,15 +445,6 @@ impl ModelConfig {
             })
             .max_by_key(|(name, _)| name.len())?;
         (name != &self.id).then(|| format!("{}:{adapter}", self.id))
-    }
-
-    /// `model` as served: a `--model-alias` names `id`.
-    pub fn served_name<'a>(&'a self, model: &'a str) -> &'a str {
-        if self.aliases.iter().any(|alias| alias == model) {
-            &self.id
-        } else {
-            model
-        }
     }
 }
 

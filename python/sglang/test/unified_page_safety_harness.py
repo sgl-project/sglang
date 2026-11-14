@@ -1323,7 +1323,9 @@ class Model:
                     )
                 )
             out.append(self.alloc.pricing_snapshot())
-            out.append(tuple(self.alloc.units_available(n) for n in self.bands))
+            out.append(
+                tuple(self.alloc.estimated_units_available(n) for n in self.bands)
+            )
             out.append(self.alloc.available_size())
             out.append(
                 tuple(band._pending_until_retire_pages for band in self.bands.values())

@@ -14,12 +14,13 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.model_override_base import register_model_override
+from sglang.srt.arg_groups.model_overrides import gemma4 as gemma4_module
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
 from sglang.srt.arg_groups.model_overrides import qwen3_vl as qwen3_vl_module
@@ -31,6 +32,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
@@ -234,6 +236,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_draft_attention_backend",
                     "speculative_draft_kv_cache_dtype",
                     "speculative_draft_model_quantization",
+                    "speculative_dspark_lm_head_dtype",
+                    "speculative_dflash_draft_kv_ring",
                     "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
@@ -628,6 +632,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         disaggregation_mode="null",
         attn_dp_size=1,
         enable_hierarchical_cache=False,
+        enable_unified_memory=False,
     ):
         args = SimpleNamespace(
             attention_backend=attention_backend,
@@ -637,6 +642,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             attn_dp_size=attn_dp_size,
             ep_join_mode=None,
             enable_hierarchical_cache=enable_hierarchical_cache,
+            enable_unified_memory=enable_unified_memory,
         )
         mixer_types = []
         if sparse_attention:
@@ -726,6 +732,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             attn_dp_size=1,
             ep_join_mode=None,
             enable_hierarchical_cache=False,
+            enable_unified_memory=False,
         )
         config = SimpleNamespace(
             has_minicpm_sparse_attention=True,
@@ -3126,8 +3133,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _dsa_kv_cache_dtype_default
 
-        def _view(**kw):
-            hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        def _view(learnable_sink=False, **kw):
+            hf = SimpleNamespace(
+                architectures=["DeepseekV32ForCausalLM"], learnable_sink=learnable_sink
+            )
             defaults = dict(
                 kv_cache_dtype="auto",
                 dsa_prefill_backend=None,
@@ -3142,6 +3151,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),
             override_platform(is_xpu=False),
+            override_platform(is_hip=False),
         ):
             with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
                 # Hopper: auto -> bfloat16
@@ -3166,6 +3176,53 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(
                     _dsa_kv_cache_dtype_default(_view()),
                     {"kv_cache_dtype": "fp8_e4m3"},
+                )
+        # gfx950 reports capability 9.5.
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 5)),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=True,
+            ),
+            envs.SGLANG_USE_AITER.override(True),
+        ):
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(_view()),
+                {"kv_cache_dtype": "fp8_e4m3"},
+            )
+            for backend in ("triton", "tilelang"):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(
+                        _view(dsa_prefill_backend=backend, dsa_decode_backend=backend)
+                    ),
+                    {"kv_cache_dtype": "fp8_e4m3"},
+                )
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(_view(learnable_sink=True)),
+                {"kv_cache_dtype": "bfloat16"},
+            )
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(
+                    _view(dsa_prefill_backend="aiter", dsa_decode_backend="aiter")
+                ),
+                {"kv_cache_dtype": "bfloat16"},
+            )
+            with envs.SGLANG_USE_AITER.override(False):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+            with patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=False,
+            ):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
                 )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):
@@ -3956,6 +4013,88 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 },
             )
 
+    def test_gemma4_uses_oot_platform_attention_backend(self):
+        from sglang.srt.arg_groups.model_overrides.gemma4 import (
+            _gemma4_overrides,
+            gemma4_attention_backends,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                moe_runner_backend="triton",
+                quantization=None,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = True
+        platform.get_default_attention_backend.return_value = "custom_attention"
+
+        with patch.object(gemma4_module, "current_platform", platform):
+            self.assertEqual(
+                _gemma4_overrides(_args(), None),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(_args(attention_backend="triton"), None), {}
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(prefill_attention_backend="custom_attention"), None
+                ),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(decode_attention_backend="custom_attention"), None
+                ),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(),
+                    SimpleNamespace(architectures=["DiffusionGemmaForBlockDiffusion"]),
+                ),
+                {"attention_backend": "triton"},
+            )
+            self.assertIn("custom_attention", gemma4_attention_backends())
+            self.assertIn("fa4", gemma4_attention_backends())
+
+    def test_gemma4_explicit_builtin_backend_does_not_require_oot_default(self):
+        from sglang.srt.arg_groups.model_overrides.gemma4 import (
+            _gemma4_overrides,
+            gemma4_attention_backends,
+        )
+
+        args = SimpleNamespace(
+            attention_backend="triton",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            moe_runner_backend="triton",
+            quantization=None,
+        )
+        split_args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend="triton",
+            decode_attention_backend="triton",
+            moe_runner_backend="triton",
+            quantization=None,
+        )
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = True
+        platform.get_default_attention_backend.side_effect = NotImplementedError
+
+        with patch.object(gemma4_module, "current_platform", platform):
+            self.assertEqual(_gemma4_overrides(args, None), {})
+            self.assertEqual(_gemma4_overrides(split_args, None), {})
+            platform.get_default_attention_backend.assert_not_called()
+            self.assertIn("triton", gemma4_attention_backends())
+            platform.get_default_attention_backend.assert_called_once()
+
     def test_deepseek_moe_quant_slot_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _deepseek_moe_quant_resolution
@@ -4448,6 +4587,46 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestKimiK31HiSparseDsaBackends(CustomTestCase):
+    @staticmethod
+    def _resolve(**fields):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
+
+        hf = SimpleNamespace(
+            architectures=["KimiK31ForConditionalGeneration"], index_topk=2048
+        )
+        args = dict(
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            enable_hisparse=True,
+            dcp_size=1,
+        )
+        args.update(fields)
+        view = ResolvedView(
+            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **args)
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            return _dsa_split_backend_resolution(view)
+
+    def test_hisparse_defaults_to_flashmla_kv(self):
+        self.assertEqual(
+            self._resolve(),
+            {"dsa_prefill_backend": "flashmla_kv", "dsa_decode_backend": "flashmla_kv"},
+        )
+
+    def test_hisparse_rejects_trtllm(self):
+        with self.assertRaisesRegex(ValueError, "HiSparse requires DSA backend"):
+            self._resolve(dsa_decode_backend="trtllm")
+
+
 class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
     """The deterministic fallback must not hand XPU a CUDA-only backend.
 
@@ -4482,6 +4661,58 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
                 self._view("triton")
             )
         self.assertEqual(updates, {})
+
+
+class TestGlm5NextAgenticMambaPool(CustomTestCase):
+    ARCH = "Glm5NextForConditionalGeneration"
+
+    def _declared(self, supports_extra_buffer=True, **fields):
+        from sglang.srt.arg_groups.model_overrides.glm5_next import (
+            _glm5_next_overrides,
+        )
+
+        args = dict(
+            mamba_full_memory_ratio=None,
+            mamba_radix_cache_strategy="auto",
+            disaggregation_mode="null",
+            disable_overlap_schedule=False,
+            pp_size=1,
+        )
+        args.update(fields)
+        with patch.object(
+            overrides_module,
+            "supports_mamba_cache_extra_buffer",
+            return_value=supports_extra_buffer,
+        ):
+            return _glm5_next_overrides(
+                SimpleNamespace(**args), SimpleNamespace(architectures=[self.ARCH])
+            )
+
+    def test_defaults_to_agentic_pool(self):
+        self.assertEqual(
+            self._declared(),
+            {
+                "mamba_full_memory_ratio": 0.25,
+                "mamba_radix_cache_strategy": "extra_buffer_lazy",
+            },
+        )
+
+    def test_explicit_values_and_unsupported_lazy_keep_their_strategy(self):
+        self.assertEqual(
+            self._declared(mamba_full_memory_ratio=0.9),
+            {"mamba_radix_cache_strategy": "extra_buffer_lazy"},
+        )
+        for fields in (
+            dict(mamba_radix_cache_strategy="extra_buffer"),
+            dict(supports_extra_buffer=False),
+            dict(disaggregation_mode="prefill"),
+            dict(disable_overlap_schedule=True),
+            dict(pp_size=2),
+        ):
+            with self.subTest(**fields):
+                self.assertEqual(
+                    self._declared(**fields), {"mamba_full_memory_ratio": 0.25}
+                )
 
 
 if __name__ == "__main__":

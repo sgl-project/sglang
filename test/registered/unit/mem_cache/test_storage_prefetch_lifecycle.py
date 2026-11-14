@@ -92,11 +92,12 @@ def _staged_fixture(full_match=2):
     cache.supports_swa = lambda: True
     cache.evict_for_alloc = Mock()
     cache.token_to_kv_pool_allocator = SimpleNamespace(
-        full_available_size=Mock(return_value=100)
+        full_available_size=Mock(return_value=100), pools_share_memory=False
     )
     cc = HybridCacheController.__new__(HybridCacheController)
     # Worker-thread state __init__ sets; read by the tick of #47617 (inert here, no workers started).
     cc.storage_stop_event = threading.Event()
+    cc._storage_worker_failures = {}
     cc.prefetch_thread = cc.prefetch_io_aux_thread = None
     cc.prefetch_sync_thread = cc.backup_thread = None
     cc.pp_prefetch_command_group = None

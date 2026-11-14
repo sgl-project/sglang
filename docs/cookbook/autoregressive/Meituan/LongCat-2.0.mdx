@@ -105,7 +105,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - **LongCat sparse attention.** Keep `--dsa-prefill-backend fa3` with `--chunked-prefill-size 2048` for the model-card-aligned prefill path.
 - **Memory.** The recipe uses `--kv-cache-dtype bfloat16` and starts at `--mem-fraction-static 0.92`. Tune memory only after the generated command launches cleanly on your cluster.
 - **Weight loading.** `--model-loader-extra-config '{"enable_multithread_load":true,"num_threads":12}'` loads checkpoint shards in parallel and reduces startup time.
-- **FP8 backend selection.** Do not pass `--fp8-gemm-runner-backend` manually. SGLang selects the correct backend for the LongCat FP8 scale layout.
+- **FP8 backend selection.** Do not pass `--fp8-gemm-backend` manually. SGLang selects the correct backend for the LongCat FP8 scale layout.
 - **Host, port, and ranks.** Use the command panel environment fields for `HOST_IP`, `PORT`, `NODE0_IP`, and `NODE_RANK` instead of hardcoding them in the recipe.
 
 ## 3. Advanced Usage

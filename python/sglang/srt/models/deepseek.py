@@ -65,6 +65,7 @@ if _is_npu:
     )
 else:
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from sglang.kernels.ops.moe.moe_mps import fused_experts_mps
 
 
 class DeepseekMLP(nn.Module):
@@ -211,6 +212,11 @@ class DeepseekMoE(nn.Module):
                 None,  # alpha
                 None,  # limit
                 True,  # is_vnni
+            )
+        elif hidden_states.device.type == "mps":
+            topk_weights, topk_ids, _ = topk_output
+            final_hidden_states = fused_experts_mps(
+                hidden_states, self.w1, self.w2, topk_weights, topk_ids
             )
         else:
             final_hidden_states = fused_moe(

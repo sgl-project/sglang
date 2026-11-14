@@ -29,6 +29,10 @@
 #   --env sets a variable inside the test container, as the `-e` flags the ARC
 #   workflows pass to amd_ci_exec.sh do (e.g. a benchmark's workload knobs).
 #
+#   Files the suite writes to $CI_ARTIFACT_DIR in the container are copied to
+#   $GITHUB_WORKSPACE/ci_artifacts once the job has finished, for the workflow
+#   to upload or summarize.
+#
 # Required environment (set in the runner's .env, like the DI nightly runner):
 #   SLURM_PARTITION, SLURM_ACCOUNT, SLURM_QOS
 #   CI_NODE_SCRATCH  node-local directory for the checkout copy and the
@@ -42,6 +46,8 @@
 #                    leave every node partly busy
 #   TIME_LIMIT       default 01:30:00
 #   CI_SHARED_DIR    shared-storage dir for job logs, default $HOME/.amd_ci_spur
+#   MATRIX_CONFIG_NAME
+#                    the matrix leg, added to the job name (as in launch_mi355x.sh)
 #   SUBMIT_ATTEMPTS  default 3
 
 set -euo pipefail
@@ -88,7 +94,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The workflow's cleanup step cancels by this prefix, so keep the two in sync.
 JOB_PREFIX="amd-ci-${RUNNER_NAME:-local}-${GITHUB_RUN_ID:-0}-"
-JOB_NAME="${JOB_PREFIX}${GITHUB_JOB:-job}"
+# The leg and the attempt keep a matrix leg that runs next on the same runner,
+# and a re-run, from deleting the run dir before it.
+JOB_NAME="${JOB_PREFIX}${GITHUB_JOB:-job}${MATRIX_CONFIG_NAME:+-$MATRIX_CONFIG_NAME}-${GITHUB_RUN_ATTEMPT:-1}"
 RUN_DIR="${CI_SHARED_DIR:-$HOME/.amd_ci_spur}/${JOB_NAME}"
 rm -rf "$RUN_DIR"
 mkdir -p "$RUN_DIR"
@@ -140,6 +148,8 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     LOG="$RUN_DIR/attempt${attempt}.log"
     : > "$LOG"
     rm -f "$CI_EXIT_FILE"
+    # Per attempt, so an abandoned attempt that starts late cannot supply them.
+    export CI_ARTIFACT_RUN_DIR="$RUN_DIR/attempt${attempt}.artifacts"
     SBATCH_ARGS=(-p "$SLURM_PARTITION" -A "$SLURM_ACCOUNT" -q "$SLURM_QOS"
                  -N1 -t "$TIME_LIMIT" -J "$JOB_NAME" --output "$LOG")
     # A whole node stays --exclusive: the job then clears every stale GPU
@@ -186,6 +196,11 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     stream_log           # also picks up the last lines of the log
 
     if [[ -s "$CI_EXIT_FILE" ]]; then
+        # The job copies its artifacts out before it writes the exit code.
+        if [[ -d "$CI_ARTIFACT_RUN_DIR" ]]; then
+            mkdir -p "$GITHUB_WORKSPACE/ci_artifacts"
+            cp -r "$CI_ARTIFACT_RUN_DIR/." "$GITHUB_WORKSPACE/ci_artifacts/" || true
+        fi
         rc="$(tr -dc 0-9 < "$CI_EXIT_FILE")"
         echo "Job $JOB_ID finished with exit code ${rc:-unknown}"
         exit "${rc:-1}"

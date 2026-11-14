@@ -1458,9 +1458,14 @@ export const Playground = ({ config }) => {
             if (item.transferBackend && item.transferBackend !== pdBackend) return false;
             return !item.when || h.matchConstraint(sel, item.when);
           });
-          const amdIo = roleOverride || (isAmd && fc.amdIo);
+          // Per-hardware io override: fc.ioByHw[hw] = { memLayout, ioBackend, ratio,
+          // writePolicy?, prefetchPolicy?, storage? } (storage: false = host tier only,
+          // no storage backend flags). fc.amdIo is the legacy AMD-only form.
+          const hwIo = sel && fc.ioByHw && fc.ioByHw[sel.hw];
+          const amdIo = roleOverride || hwIo || (isAmd && fc.amdIo);
           const ratio = (amdIo && amdIo.ratio) || 2;
-          const useAmdIo = isAmd && amdIo;
+          const useAmdIo = !!(amdIo && (isAmd || hwIo));
+          const storageAllowed = !(hwIo && hwIo.storage === false);
           const adds = [
             "--enable-hierarchical-cache",
             `--hicache-ratio ${ratio}`,
@@ -1482,7 +1487,7 @@ export const Playground = ({ config }) => {
             ? value.writePolicy : ((amdIo && amdIo.writePolicy) || "write_through");
           adds.push(`--hicache-write-policy ${writePolicy}`);
           // When amdStorageFileOnly is set, AMD emits storage flags only for "file".
-          if ((isAmd && fc.amdStorageFileOnly) ? backend === "file" : !!backend) {
+          if (storageAllowed && ((isAmd && fc.amdStorageFileOnly) ? backend === "file" : !!backend)) {
             adds.push(`--hicache-storage-backend ${backend}`,
                       `--hicache-storage-prefetch-policy ${(amdIo && amdIo.prefetchPolicy) || "wait_complete"}`);
           } else if (amdIo && amdIo.prefetchPolicy) {

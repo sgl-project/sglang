@@ -14,17 +14,19 @@ limitations under the License.
 """
 
 """
-Configure the logging settings of a server.
+Configure the logging settings of a server. Only the options passed are sent;
+the server keeps its current value for every other setting.
 
 Usage:
-python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000
+python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --log-level debug
 """
 
 import argparse
 
 import requests
 
-if __name__ == "__main__":
+
+def _parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", type=str, default="http://localhost:30000")
     parser.add_argument(
@@ -34,12 +36,12 @@ if __name__ == "__main__":
         choices=["debug", "info", "warning", "error", "critical"],
         help="Set runtime log level",
     )
-    parser.add_argument("--log-requests", action="store_true")
-    parser.add_argument("--log-requests-level", type=int, default=3)
     parser.add_argument(
-        "--dump-requests-folder", type=str, default="/tmp/sglang_request_dump"
+        "--log-requests", action=argparse.BooleanOptionalAction, default=None
     )
-    parser.add_argument("--dump-requests-threshold", type=int, default=1000)
+    parser.add_argument("--log-requests-level", type=int, default=None)
+    parser.add_argument("--dump-requests-folder", type=str, default=None)
+    parser.add_argument("--dump-requests-threshold", type=int, default=None)
     parser.add_argument(
         "--dump-requests-exclude-meta-keys",
         type=str,
@@ -50,11 +52,13 @@ if __name__ == "__main__":
             "keep all keys. If not set, the server default is used."
         ),
     )
-    args = parser.parse_args()
+    return parser.parse_args(argv)
 
+
+def _build_payload(args: argparse.Namespace) -> dict:
     payload = {
         "log_requests": args.log_requests,
-        "log_requests_level": args.log_requests_level,  # Log full requests
+        "log_requests_level": args.log_requests_level,
         "dump_requests_folder": args.dump_requests_folder,
         "dump_requests_threshold": args.dump_requests_threshold,
         "log_level": args.log_level,
@@ -65,6 +69,10 @@ if __name__ == "__main__":
             for k in args.dump_requests_exclude_meta_keys.split(",")
             if k.strip()
         ]
+    return {key: value for key, value in payload.items() if value is not None}
 
-    response = requests.post(args.url + "/configure_logging", json=payload)
+
+if __name__ == "__main__":
+    args = _parse_args()
+    response = requests.post(args.url + "/configure_logging", json=_build_payload(args))
     assert response.status_code == 200

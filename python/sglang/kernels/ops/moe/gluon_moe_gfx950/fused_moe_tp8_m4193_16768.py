@@ -298,8 +298,10 @@ def _store_w2_panel(acc, raw_low, raw_high, code_low, code_high, route_start, ro
         raw = raw_tile.load(ep)
         escape_rows = gl.convert_layout(escaped, gl.SliceLayout(1, ep))
         raw_mask = (rows[:, None] < valid_rows) & escape_rows[:, None]
-        gl.amd.cdna4.buffer_store(stored_value=raw, ptr=raw_low, offsets=global_rows[:, None] * N + columns[None, :], mask=raw_mask & (global_rows[:, None] < route_split), cache='.cs')
-        gl.amd.cdna4.buffer_store(stored_value=raw, ptr=raw_high, offsets=(global_rows[:, None] - route_split) * N + columns[None, :], mask=raw_mask & (global_rows[:, None] >= route_split), cache='.cs')
+        # Each raw half is 3 GiB at M=32768, beyond the 2-GiB window of buffer
+        # stores (bytes past 2^31 are dropped), so use 64-bit global stores.
+        gl.store(raw_low + global_rows[:, None] * N + columns[None, :], raw, raw_mask & (global_rows[:, None] < route_split), cache_modifier='.cs')
+        gl.store(raw_high + (global_rows[:, None] - route_split) * N + columns[None, :], raw, raw_mask & (global_rows[:, None] >= route_split), cache_modifier='.cs')
     gl.barrier()
 
 @gluon.jit
@@ -531,9 +533,8 @@ class _Workspace:
 
         def empty(shape, dtype=torch.bfloat16):
             return torch.empty(shape, dtype=dtype, device=x.device)
-        # gfx950 buffer operations have a 4-GiB addressing window.  Split the
-        # FP32 routed partials so each allocation stays below that limit at
-        # M=32768; dense route ids select the half in the kernels.
+        # Each codes half (1.5 GiB at M=32768) fits the 2-GiB Triton buffer-op window;
+        # the FP32 halves (3 GiB) exceed it, so they use global loads and stores.
         self.parts_low = empty((4 * storage_m, h), torch.float32)
         self.parts_high = empty((4 * storage_m, h), torch.float32)
         self.codes_low = empty((4 * storage_m, h + 64), torch.int16)
