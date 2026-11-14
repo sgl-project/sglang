@@ -252,7 +252,8 @@ class SGLDiffusionServerAPI:
 
         ``progress_callback`` gets the job's ``progress`` (0-100) on each poll.
         ``check_interrupt`` is called between polls and may raise to stop
-        waiting; the server has no abort yet, so the job itself keeps running.
+        waiting; the server job keeps running unless it is cancelled with
+        ``DELETE /v1/videos/{id}``.
 
         Args:
             prompt: Text prompt for video generation

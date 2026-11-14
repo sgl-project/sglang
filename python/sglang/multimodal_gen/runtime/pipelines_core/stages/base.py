@@ -158,7 +158,7 @@ class PipelineStage(StageDedupMixin, ABC):
         Verify the input for the stage.
 
         Example:
-            from sglang.multimodal_gen.runtime.pipelines.stages.validators import V, VerificationResult
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import V, VerificationResult
 
             def verify_input(self, batch, server_args):
                 result = VerificationResult()
@@ -402,7 +402,6 @@ class PipelineStage(StageDedupMixin, ABC):
             The updated batch information after this stage's processing.
         """
         stage_name = self._active_profile_stage_name()
-        # Check if verification is enabled (simple approach for prototype)
 
         # Pre-execution input verification
         try:

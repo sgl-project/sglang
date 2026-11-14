@@ -25,8 +25,6 @@
 # changing the environment variable `SGLANG_DIFFUSION_NCCL_SO_PATH`, or the `so_file`
 # variable in the code.
 
-# TODO(will): support SGLANG_DIFFUSION_NCCL_SO_PATH
-
 import ctypes
 import platform
 from dataclasses import dataclass

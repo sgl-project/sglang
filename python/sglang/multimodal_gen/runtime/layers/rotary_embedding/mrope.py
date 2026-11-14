@@ -1,4 +1,4 @@
-"""MRotaryEmbedding, YaRNScalingMRotaryEmbedding, NDRotaryEmbedding, OneDRotaryEmbedding."""
+"""Multi-axis RoPE: Qwen3VLTextRotaryEmbedding, OneDRotaryEmbedding, NDRotaryEmbedding, FluxPosEmbed."""
 
 import functools
 
