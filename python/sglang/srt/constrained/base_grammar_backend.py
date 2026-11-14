@@ -327,6 +327,20 @@ def register_grammar_backend(name, init_func):
     GRAMMAR_BACKEND_REGISTRY[name] = init_func
 
 
+def grammar_stop_token_ids(tokenizer, eos_token_ids=None) -> Optional[set]:
+    """Stop tokens known at startup: config EOS, tokenizer EOS and additional
+    stop tokens. A stop token missing here is ordinary text to the grammar, so a
+    constrained request could end on it before the grammar is complete."""
+    ids = set(eos_token_ids or ())
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        ids.add(eos_token_id)
+    additional_stop_token_ids = getattr(tokenizer, "additional_stop_token_ids", None)
+    if additional_stop_token_ids is not None:
+        ids.update(additional_stop_token_ids)
+    return ids or None
+
+
 def create_grammar_backend(
     server_args: ServerArgs,
     tokenizer,
@@ -335,6 +349,7 @@ def create_grammar_backend(
     think_end_ids: Optional[List[int]] = None,
 ) -> Optional[BaseGrammarBackend]:
     name = get_exec().kernel.grammar_backend
+    eos_token_ids = grammar_stop_token_ids(tokenizer, eos_token_ids)
 
     # Custom grammar backend has the highest priority
     if name in GRAMMAR_BACKEND_REGISTRY:
