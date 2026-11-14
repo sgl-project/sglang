@@ -167,6 +167,10 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 # (n, k) -> ((m_lo, m_hi, tactic), ...); tactic None = the ladder pick.
 _K3_TGV_M_RANGES = {
@@ -264,6 +268,8 @@ def _k3_bf16_gemm(
         out = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
         )
+    if out is None and _use_aiter:
+        return tgemm.mm(x, weight, None, otype=x.dtype)
     if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
