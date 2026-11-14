@@ -4,7 +4,11 @@ from typing import Optional, Sequence, Tuple
 
 import msgspec
 
-from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
+from sglang.srt.mem_cache.kv.decl import (
+    RequestLifetime,
+    StateLifetime,
+    WindowLifetime,
+)
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
 from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
 
@@ -106,10 +110,6 @@ def _fixed_terms(plan, inp, running, strategy):
         FixedAllocation(name=d.part.name, bytes=d.part.row_bytes * scratch_rows)
         for d in plan.scratch
     )
-    terms.extend(
-        FixedAllocation(name=d.part.name, bytes=d.part.row_bytes * request_rows)
-        for d in plan.request_parts
-    )
     return tuple(terms)
 
 
@@ -193,6 +193,8 @@ def _bs1_floor_terms(plan, context_len, floor_window, strategy):
                     strategy.slots_per_request() * sub_pool.spec.entry_bytes(),
                 )
             )
+        elif isinstance(sub_pool.lifetime, RequestLifetime):
+            terms.append((f"{sub_pool.name}_bs1_unit", sub_pool.spec.entry_bytes()))
     terms.append(("sink", plan.sink_bytes()))
     return tuple(terms)
 
@@ -217,6 +219,12 @@ def _state_targets(plan, inp, chain, running, states, frozen, strategy):
         if frozen is not None:
             count = min(count, frozen.units(sub_pool.name))
         units[sub_pool.name] = count
+    # A request sub-pool holds a unit per running request.
+    for sub_pool in plan.requests():
+        count = running
+        if frozen is not None:
+            count = min(count, frozen.units(sub_pool.name))
+        units[sub_pool.name] = count
     return units
 
 
@@ -224,7 +232,7 @@ def _token_targets(plan, inp, chain, running, states, windows, units, frozen):
     tokens_budget = (
         chain
         - plan.sink_bytes()
-        - sum(units[s.name] * s.spec.entry_bytes() for s in states)
+        - sum(units[s.name] * s.spec.entry_bytes() for s in (*states, *plan.requests()))
     )
     owner = plan.owner()
     page = plan.page_size
@@ -287,9 +295,10 @@ def size_plan(
 ) -> SizedKVStorage:
     """Solve all declared storage against one unsubtracted byte budget.
 
-    State units are boot targets. The arena may give state more slots at runtime,
-    and FULL may grow into the whole arena: ``max_total_tokens`` sizes the FULL
-    target, it does not cap allocation. Captured fixed extents never grow.
+    State and request units are boot targets. The arena may give state more
+    slots at runtime, and FULL may grow into the whole arena:
+    ``max_total_tokens`` sizes the FULL target, it does not cap allocation.
+    Captured fixed extents never grow.
     """
     if inp.alignment <= 0 or not 0 <= inp.state_share < 1:
         raise ValueError("invalid sizing alignment or state share")
@@ -306,6 +315,7 @@ def size_plan(
         chain = inp.full_tokens * plan.owner().spec.entry_bytes() + plan.sink_bytes()
         chain += sum((inp.window_tokens or 0) * s.spec.entry_bytes() for s in windows)
         chain += sum((inp.state_slots or 0) * s.spec.entry_bytes() for s in states)
+        chain += sum(running * s.spec.entry_bytes() for s in plan.requests())
         explicit_chain = chain // inp.alignment * inp.alignment
         budget = chain + sum(t.bytes for t in (*fixed, *_derived_terms(plan, chain)))
     terms = (
