@@ -156,18 +156,31 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 
+def _registered_data_ptrs(module: torch.nn.Module) -> set[int]:
+    return {
+        tensor.data_ptr()
+        for tensor in (*module.parameters(), *module.buffers())
+        if not tensor.is_meta and tensor.layout == torch.strided
+    }
+
+
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
         yield module
         return
 
+    data_ptrs_before = _registered_data_ptrs(module)
     with stage_module_for_post_load(
         module,
         target_device,
         pin_memory=target_device.type != "cpu" and is_pin_memory_available(),
     ):
         yield module
+    # The staging context held every tensor the hook dropped until this point;
+    # return their memory before the next module's tensors land in it and pin it.
+    if data_ptrs_before - _registered_data_ptrs(module):
+        current_platform.empty_cache()
 
 
 logger = logging.getLogger(__name__)
