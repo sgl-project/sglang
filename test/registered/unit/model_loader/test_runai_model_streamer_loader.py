@@ -17,7 +17,6 @@ import sglang.srt.model_loader.weight_utils as weight_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.models.deepseek_common import deepseek_weight_loader
 from sglang.srt.models.deepseek_v4 import (
     _dequant_fp8_wo_a,
     _dequant_fp8_wo_a_streaming,
@@ -173,23 +172,6 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
 
         self.assertEqual(weights[0][0], "weight")
         self.assertTrue(getattr(weights[0][1], weight_utils.RUNAI_STREAMER_TENSOR_ATTR))
-
-    def test_deepseek_clone_only_clones_marked_tensors(self):
-        unmarked = torch.tensor([1], dtype=torch.int32)
-
-        self.assertIs(
-            deepseek_weight_loader._clone_if_runai_streamed_tensor(unmarked),
-            unmarked,
-        )
-
-        marked = torch.tensor([1], dtype=torch.int32)
-        setattr(marked, weight_utils.RUNAI_STREAMER_TENSOR_ATTR, True)
-
-        cloned = deepseek_weight_loader._clone_if_runai_streamed_tensor(marked)
-
-        self.assertIsNot(cloned, marked)
-        marked.fill_(2)
-        self.assertEqual(cloned.item(), 1)
 
     def test_runai_streamed_tensor_is_consumed_before_buffer_reuse(self):
         def consume_view(mark_as_runai: bool):
