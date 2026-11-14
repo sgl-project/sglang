@@ -1060,6 +1060,42 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
   </tbody>
 </table>
 
+### Reading Configuration from a Plugin
+
+Plugins that inspect active runtime settings (for example to validate supported CUDA graph modes, LoRA, quantization, or parallel sizes) must read resolved configuration from `sglang.srt.runtime_context` rather than `ServerArgs`:
+
+- **`get_server_args()` holds raw input only**: `ServerArgs` preserves what the caller passed for diagnostics and provenance. Fields resolved during startup (for example `cuda_graph_config`, which starts as `None` or a `dict`, or `enable_lora` inferred from `--lora-paths`) are projected into namespace bags rather than written back onto `ServerArgs`.
+- **Namespace accessors return resolved values**:
+  - `get_exec()` — execution and kernel settings (e.g. `get_exec().graph.cuda_graph_config.decode.backend`, `get_exec().graph.enable_torch_compile`)
+  - `get_model()` — model, dtype, quantization, and load-format settings
+  - `get_memory()` — KV cache, HiCache, Mamba state, and memory sizing settings
+  - `get_schedule()` — batching and scheduler settings
+  - `get_spec()` — speculative decoding settings
+  - `get_lora()` — resolved LoRA settings (e.g. `get_lora().enable_lora`)
+  - `get_disagg()`, `get_mm()`, `get_serving()`, `get_observability()`, `get_device()` — domain-specific settings
+- **`get_parallel()` exposes topology widths and ranks**: `tp_size`, `pp_size`, `dp_size`, `dcp_size`, `dcp_enabled`, `attn_tp_size`, `attn_dp_size`, `moe_ep_size`, `moe_dp_size`, and per-process ranks (`tp_rank`, `pp_rank`, `dp_rank`, `dcp_rank`).
+- **Timing and process roles**: `load_plugins()` runs before `publish()` projects the config bags, so do not call `get_exec()` or other bag accessors at plugin import or registration time. Read them inside hooks or platform methods that run after process publication (such as `Scheduler`, `TpModelWorker`, or `ModelRunner` hooks; the `"scheduler"` role publishes the full namespace tree in `ROLE_NAMESPACE_SETS`).
+
+```python
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner.load_model",
+    type=HookType.BEFORE,
+)
+def validate_plugin_config(self, *args, **kwargs):
+    if get_lora().enable_lora:
+        raise ValueError("my_plugin does not support LoRA")
+
+    graph_cfg = get_exec().graph.cuda_graph_config
+    decode_backend = graph_cfg.decode.backend if graph_cfg is not None else Backend.DISABLED
+    tp_size = get_parallel().tp_size
+    ...
+```
+
 ---
 
 ## File Reference
@@ -1111,6 +1147,10 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
     <tr>
       <td><code>sglang/srt/plugins/hook_registry.py</code></td>
       <td><code>HookRegistry</code>, <code>HookType</code>, <code>plugin_hook</code> decorator</td>
+    </tr>
+    <tr>
+      <td><code>sglang/srt/runtime_context.py</code></td>
+      <td>Resolved configuration accessors (<code>get_exec()</code>, <code>get_parallel()</code>, etc.) and per-role publication</td>
     </tr>
   </tbody>
 </table>
