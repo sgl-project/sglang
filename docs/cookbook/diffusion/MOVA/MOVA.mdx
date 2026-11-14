@@ -56,10 +56,10 @@ Use the [command builder](#1-quick-start) above.
 See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
 - `--num-gpus`: Number of GPUs to use
-- `--tp`: Tensor parallelism size (should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--tp-size`: Tensor parallelism size. Text encoder offload does not require TP 1; see [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel) for encoder placement and sharding.
 - `--ring-degree`: The degree of ring attention-style SP in USP
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
-- `--adjust-frames`: Whether to adjust frames automatically (set to `false` for MOVA)
+- `--adjust-frames`: `sglang generate` / request sampling option that adjusts the frame count automatically; it already defaults to `false` for MOVA
 - `--enable-torch-compile`: Enable torch.compile for faster inference
 
 ## 4. API Usage
@@ -226,8 +226,8 @@ Test Environment:
 
 ```bash Command
 sglang serve --model-path OpenMOSS-Team/MOVA-720p --port 30002 \
-  --adjust-frames false --num-gpus 8 --ring-degree 2 --ulysses-degree 4 \
-  --tp 1 --enable-torch-compile
+  --num-gpus 8 --ring-degree 2 --ulysses-degree 4 \
+  --tp-size 1 --enable-torch-compile
 ```
 
 **Benchmark Command**:
@@ -267,8 +267,8 @@ Peak Memory Median (MB):                 74996.00
 
 ```bash Command
 sglang serve --model-path OpenMOSS-Team/MOVA-720p --port 30002 \
-  --adjust-frames false --num-gpus 8 --ring-degree 2 --ulysses-degree 4 \
-  --tp 1 --enable-torch-compile
+  --num-gpus 8 --ring-degree 2 --ulysses-degree 4 \
+  --tp-size 1 --enable-torch-compile
 ```
 
 **Benchmark Command**:

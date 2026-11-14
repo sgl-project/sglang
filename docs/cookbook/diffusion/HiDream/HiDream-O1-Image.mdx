@@ -15,7 +15,7 @@ import { config } from '/src/snippets/configs/HiDream/hidream-o1-image.jsx';
 ## 1. Quick start
 
 Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation),
-then choose a recipe below. TP 1 and TP 2 on a single H200 are the verified shapes.
+then choose a recipe below. TP 1 on one H200 and TP 2 on two H200s in a single node are the verified shapes.
 
 <Deployment config={config} />
 
