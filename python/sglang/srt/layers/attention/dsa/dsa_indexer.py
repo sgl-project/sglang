@@ -388,13 +388,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
         if self.use_dsa_indexer_fusion:
-            self.wk_weights_proj = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim + self.n_heads,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                prefix=add_prefix("wk_weights_proj", prefix),
-            )
+            self._init_wk_weights_proj(prefix)
         else:
             self.wk = ReplicatedLinear(
                 self.hidden_size,
@@ -603,6 +597,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     fp8_dtype=fp8_dtype,
                 )
 
+        # ROCm folds wk and weights_proj into one wk_weights_proj GEMM feeding the
+        # AITER fused writer, which drops the Hadamard (indexer scores are
+        # invariant to it). The gfx950 fused indexer reads wk and weights_proj
+        # separately and needs the Hadamard kept, so merge them only once that
+        # gate has declined this layer, which leaves the writer on.
+        if (
+            _is_hip
+            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            and not is_neox_style
+            and self.use_aiter_fused_fp8_writer
+        ):
+            self.use_dsa_indexer_fusion = True
+            del self.wk, self.weights_proj
+            self._init_wk_weights_proj(prefix)
+
         # After the gfx950 fused indexer's gate, which may turn the writer off.
         global _FUSED_FP8_WRITER_LOGGED
         if self.use_aiter_fused_fp8_writer and not _FUSED_FP8_WRITER_LOGGED:
@@ -615,6 +624,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and (not is_neox_style or getattr(config, "index_fused_neox_rope", False))
             and not self.skip_rope
+        )
+
+    def _init_wk_weights_proj(self, prefix: str) -> None:
+        self.wk_weights_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.head_dim + self.n_heads,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            prefix=add_prefix("wk_weights_proj", prefix),
         )
 
     @contextlib.contextmanager
@@ -705,7 +723,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights = weights_raw * self.n_heads**-0.5
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
-    def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _fused_k_weights(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # wk_weights_proj is a bf16 GEMM: take the bf16 passthrough of aiter's
+        # (fp8, scale, bf16) activation tuple.
+        if isinstance(x, tuple) and len(x) == 3:
+            x = x[2]
         kw, _ = self.wk_weights_proj(x)
         return kw.split([self.head_dim, self.n_heads], dim=-1)
 
@@ -745,8 +769,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         query, _ = self.wq_b(q_lora)
         query = query.view(-1, self.n_heads, self.head_dim)
-        key, _ = self.wk(x)
-        weights_raw = self._project_head_gates(x)
+        if self.use_dsa_indexer_fusion:
+            key, weights_raw = self._fused_k_weights(x)
+        else:
+            key, _ = self.wk(x)
+            weights_raw = self._project_head_gates(x)
 
         out_cache_loc = forward_batch.out_cache_loc
         if num_tokens is not None:
@@ -1092,8 +1119,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
-        *,
-        rotate: bool = True,
     ):
         # fused_rms_fp8_group_quant with output_unquantized_inp1=True produces a
         # (fp8, scale, bf16) 3-tuple; extract the bf16 for the unquantized wk layer.
@@ -1105,8 +1130,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     f"_get_k_bf16 received a {len(x)}-tuple; expected a plain tensor "
                     "or a 3-tuple (fp8, scale, bf16) from fused_rms_fp8_group_quant."
                 )
-        # Non-fusion path only; self.wk does not exist when fusion is on.
-        key, _ = self.wk(x)
+        if self.use_dsa_indexer_fusion:
+            key, _ = self._fused_k_weights(x)
+        else:
+            key, _ = self.wk(x)
         key = self.k_norm(key)
         if not self.skip_rope:
             k_rope, _ = torch.split(
@@ -1121,8 +1148,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dummy_q_rope = k_rope
             _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
             self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        if rotate and self.apply_hadamard:
-            key = rotate_activation(key)
+        key = self._maybe_rotate(key)
 
         return key
 
@@ -2043,19 +2069,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         elif not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
 
-        # Keep K in the same no-Hadamard space as the fused Q/K writer.
-        if self._aiter_fused_fp8_active(forward_batch):
-            key = self._get_k_bf16(x, positions, rotate=False)
-            if num_tokens is not None:
-                key = key[:num_tokens]
-            self._store_index_k_cache(
-                forward_batch=forward_batch,
-                layer_id=layer_id,
-                key=key,
-                act_quant=act_quant,
-                out_cache_loc=out_cache_loc,
-            )
-        elif self.use_dsa_indexer_fusion:
+        # Write the same K representation the decode path reads back: the CUDA
+        # fused writer when fusion is on, else the unfused path. ROCm has no
+        # k-only fused kernel, so it takes the branch below, where _maybe_rotate
+        # skips the Hadamard to match the AITER fused writer.
+        if _is_cuda and self.use_dsa_indexer_fusion:
             key_raw, _ = self._fused_k_weights(x)
             if num_tokens is not None:
                 assert num_tokens <= key_raw.shape[0]
@@ -2349,7 +2367,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 x, q_lora, positions, forward_batch, layer_id
             )
         elif (
-            self.use_dsa_indexer_fusion
+            _is_cuda
+            and self.use_dsa_indexer_fusion
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
         ):
@@ -2499,11 +2518,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             if in_piecewise_or_breakable_cuda_graph:
                 if self.use_dsa_indexer_fusion:
-                    weights = scale_head_gate_graph(
-                        weights_raw,
-                        self.n_heads**-0.5,
-                        self.softmax_scale,
-                        q_scale,
+                    weights = (
+                        scale_head_gate_graph(
+                            weights_raw,
+                            self.n_heads**-0.5,
+                            self.softmax_scale,
+                            q_scale,
+                        )
+                        if _is_cuda
+                        else self._scale_head_gates(weights_raw, q_scale)
                     )
                 else:
                     if weights_proj_lora:
