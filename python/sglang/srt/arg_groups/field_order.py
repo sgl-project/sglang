@@ -573,5 +573,7 @@ POSITIONAL_FIELD_ORDER = (
     "hybrid_cache_checkpoints_level",
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
+    "elastic_ep_retiree_lifecycle",
+    "elastic_ep_reuse_cuda_graph",
 )
 # fmt: on
