@@ -111,6 +111,17 @@ sglang generate \
 
 For more usage examples (e.g. OpenAI compatible API, server mode), check the [CLI reference](https://docs.sglang.io/docs/sglang-diffusion/api/cli).
 
+## SGLang-Diffusion Adoption & Integrations
+
+<p align="center">
+  <img src="../../../assets/sglang-diffusion-adoption.png" alt="Organizations adopting SGLang-Diffusion" width="680" align="middle">
+  <a href="https://blog.fal.ai/h3-max-built-with-fal-inference-and-training/">
+    <img src="../../../assets/fal.png" alt="fal (Falcon)" width="80" align="middle">
+  </a>
+</p>
+
+[fal](https://blog.fal.ai/h3-max-built-with-fal-inference-and-training/) ported SGLang-Diffusion's H3 implementation to its Falcon inference engine.
+
 ## Contributing
 
 All contributions are welcome. The contribution guide is available [here](https://docs.sglang.io/docs/sglang-diffusion/contributing).
