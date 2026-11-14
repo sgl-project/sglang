@@ -1235,6 +1235,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.commit_spec_accept_lens(
+                batch, accept.commit_lens
+            )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
                 features=proposal.acceptance_features,

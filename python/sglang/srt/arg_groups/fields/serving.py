@@ -34,8 +34,10 @@ class Serving(msgspec.Struct):
         str,
         Arg(
             help="Tokenizer mode. 'auto' will use the fast tokenizer if available, "
-            "and 'slow' will always use the slow tokenizer.",
-            choices=["auto", "slow"],
+            "'slow' will always use the slow tokenizer, and 'mistral' will always "
+            "use the mistral-common tokenizer (tekken.json). 'auto' also selects "
+            "mistral-common when a checkpoint ships tekken.json without tokenizer.json.",
+            choices=["auto", "slow", "mistral"],
         ),
     ] = "auto"
     tokenizer_backend: A[

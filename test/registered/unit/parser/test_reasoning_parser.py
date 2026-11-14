@@ -1,6 +1,7 @@
 """Unit tests for srt/parser/reasoning_parser.py"""
 
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
@@ -16,6 +17,7 @@ from sglang.srt.parser.reasoning_parser import (
     KimiDetector,
     KimiK2Detector,
     Ling3Detector,
+    MistralDetector,
     Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
@@ -1011,6 +1013,116 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertTrue(detector._in_reasoning)
         self.assertTrue(detector.stripped_think_start)
+
+
+class TestMistralDetector(CustomTestCase):
+    """[THINK] is opened by the model, so reasoning is never forced, and every
+    block is reasoning regardless of how the stream is chunked."""
+
+    def _assert_parse(self, text, expected, **kwargs):
+        one_shot = MistralDetector(**kwargs).detect_and_parse(text)
+        self.assertEqual((one_shot.reasoning_text, one_shot.normal_text), expected)
+        chunkings = {
+            f"size={size}": [text[i : i + size] for i in range(0, len(text), size)]
+            for size in (1, 3, 7, 1000)
+        }
+        chunkings.update({f"cut={i}": [text[:i], text[i:]] for i in range(len(text))})
+        for stream_reasoning in (True, False):
+            for name, chunks in chunkings.items():
+                with self.subTest(stream_reasoning=stream_reasoning, chunks=name):
+                    detector = MistralDetector(
+                        stream_reasoning=stream_reasoning, **kwargs
+                    )
+                    reasoning = normal = ""
+                    for chunk in chunks:
+                        ret = detector.parse_streaming_increment(chunk)
+                        reasoning += ret.reasoning_text
+                        normal += ret.normal_text
+                    ret = detector.finish()
+                    self.assertEqual(
+                        (reasoning + ret.reasoning_text, normal + ret.normal_text),
+                        expected,
+                    )
+
+    def test_multiple_blocks(self):
+        self._assert_parse(
+            "Sure. [THINK]r1[/THINK]a1[THINK]r2[/THINK]a2", ("r1r2", "Sure. a1a2")
+        )
+
+    def test_repeated_and_stray_markers_are_dropped(self):
+        self._assert_parse("[THINK][THINK]r[/THINK]a[/THINK]b", ("r", "ab"))
+
+    def test_unterminated_block_is_reasoning(self):
+        self._assert_parse("[THINK]still thinking [", ("still thinking [", ""))
+
+    def test_markers_in_tool_arguments_stay_arguments(self):
+        """Bug regression: [THINK]/[/THINK] inside a tool call's JSON strings were
+        parsed as reasoning, emptying the arguments; a block after the payload is
+        still reasoning."""
+        calls = (
+            '[TOOL_CALLS]echo[ARGS]{"text":"[THINK]literal[/THINK]"}',
+            '[TOOL_CALLS]a[ARGS]{"k[THINK]":"v\\"[/THINK]\\\\","n":[1,{"x":"}"}]}'
+            '[TOOL_CALLS]b[ARGS]{"t":"[THINK]"}',
+            '[TOOL_CALLS] [{"name":"echo","arguments":{"text":"a [THINK]b"}}]',
+            '[TOOL_CALLSecho[ARGS{"text":"[/THINK]"}',
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                self._assert_parse(f"[THINK]checking[/THINK]{call}", ("checking", call))
+                self._assert_parse(
+                    f"{call}[THINK]more[/THINK]done", ("more", f"{call}done")
+                )
+
+    def test_tool_marker_text_outside_a_call_keeps_reasoning(self):
+        self._assert_parse(
+            "use [TOOL_CALLS] then [THINK]r[/THINK]a", ("r", "use [TOOL_CALLS] then a")
+        )
+
+    def test_continued_message_resumes_after_its_last_marker(self):
+        for prefix, expected in (
+            ("[THINK]a[/THINK]b[THINK]c", (" more", "answer")),
+            ("[THINK]a[/THINK]b", ("", " moreanswer")),
+        ):
+            with self.subTest(prefix=prefix):
+                self._assert_parse(
+                    " more[/THINK]answer",
+                    expected,
+                    continue_final_message=True,
+                    previous_content=prefix,
+                )
+
+    def test_think_markers_resolve_to_control_tokens(self):
+        """Bug regression: markers must resolve to control-token IDs; encoding the
+        marker text yields plain pieces the model never emits, so grammars never ran."""
+        control = {"[THINK]": 34, "[/THINK]": 35}
+        tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: {
+                "[THINK]": [1091, 10339, 46300, 1093],
+                "[/THINK]": [40002, 10339, 46300, 1093],
+            }[text],
+            convert_tokens_to_ids=lambda token: control.get(token, 0),
+            convert_ids_to_tokens=lambda token_id: {
+                v: k for k, v in control.items()
+            }.get(token_id, "<unk>"),
+        )
+        detector = MistralDetector()
+        self.assertEqual(detector.get_think_end_token_ids(tokenizer), [35])
+        self.assertEqual(detector.get_optional_think_start_token_id(tokenizer), 34)
+
+        control.clear()
+        self.assertEqual(
+            detector.get_think_end_token_ids(tokenizer), [40002, 10339, 46300, 1093]
+        )
+        self.assertIsNone(detector.get_optional_think_start_token_id(tokenizer))
+
+    def test_reply_without_think_stays_content_when_forced(self):
+        """Bug regression: under forced reasoning, an answer that opens no [THINK]
+        block (e.g. a JSON response_format reply) must stay answer content."""
+        parser = ReasoningParser("mistral", force_reasoning=True)
+        self.assertEqual(
+            parser.parse_non_stream('{"a": [1, 2]}'), ("", '{"a": [1, 2]}')
+        )
+        self._assert_parse('{"a": [1, 2]}', ("", '{"a": [1, 2]}'), force_reasoning=True)
 
 
 class TestStreamingChunkSizeInvariance(CustomTestCase):

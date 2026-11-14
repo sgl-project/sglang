@@ -370,12 +370,28 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         self.sin_cached_total = None
         self.cos_cached = None
         self.sin_cached = None
+        self.lerope_alpha: Optional[torch.Tensor] = None
         self.device = device if device is not None else get_device()
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
         if _is_hip:
             self._forward_method = self.forward_native
+
+    def set_lerope_alpha(self, lerope_alpha: torch.Tensor) -> None:
+        """Update in place so existing cache references see the LeRoPE frequencies."""
+        assert lerope_alpha.shape == (self.rotary_dim // 2,), lerope_alpha.shape
+        assert not _is_npu, "LeRoPE does not rebuild the NPU cos/sin tables"
+        self.lerope_alpha = lerope_alpha.detach().to(
+            device=self.cos_sin_cache.device, dtype=torch.float32
+        )
+        with torch.no_grad():
+            cache = self._compute_cos_sin_cache()
+            assert cache.shape == self.cos_sin_cache.shape, (
+                cache.shape,
+                self.cos_sin_cache.shape,
+            )
+            self.cos_sin_cache.copy_(cache)
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
@@ -384,6 +400,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
+        if self.lerope_alpha is not None:
+            lerope_scale = torch.exp(self.lerope_alpha.to(pos_freqs))
+            inv_freq_extrapolation = inv_freq_extrapolation * lerope_scale
+            inv_freq_interpolation = inv_freq_interpolation * lerope_scale
         low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,

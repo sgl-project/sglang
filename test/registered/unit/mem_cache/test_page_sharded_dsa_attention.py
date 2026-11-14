@@ -718,6 +718,7 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.kv_cache_dim = getattr(pool, "kv_cache_dim", 576)
     backend.kv_cache_dtype = pool.dtype
     backend.dsa_kv_cache_store_fp8 = pool.dsa_kv_cache_store_fp8
+    backend.has_shared_kv_consumers = False
     backend.dsa_prefill_impl = prefill_impl
     backend.dsa_decode_impl = "flashmla_kv"
     backend.flashmla_kv_num_q_heads = 64
@@ -729,15 +730,20 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
         if torch.device(device).type == "cuda"
         else 0
     )
-    # Mirrors DeepseekSparseAttnBackend.__init__ so forward_extend sees the
-    # same small-heads FlashMLA prefill choice as a real backend.
+    backend.flashmla_sparse_head_padding = (
+        DeepseekSparseAttnBackend._flashmla_sparse_head_padding(
+            device_sm_major=backend.device_sm_major,
+            head_dim=backend.kv_lora_rank + backend.qk_rope_head_dim,
+            num_heads=backend.num_q_heads,
+        )
+    )
     backend.sparse_prefill_small_heads = _small_heads_prefill_enabled(
         backend.device_sm_major,
         backend.kv_cache_dtype,
         backend.num_q_heads,
         backend.kv_lora_rank,
         backend.qk_rope_head_dim,
-        prefill_impl,
+        backend.dsa_prefill_impl,
     )
     backend._arange_buf = torch.arange(1024, dtype=torch.int32, device=device)
     if prefill_impl == "trtllm":

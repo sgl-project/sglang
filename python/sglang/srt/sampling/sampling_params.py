@@ -142,6 +142,28 @@ def set_request_reasoning_in_grammar(sampling_params: Dict, enabled: bool) -> No
     sampling_params["custom_params"] = custom_params
 
 
+# Private transport: the prompt ends inside a reasoning block, as a continued
+# assistant message can, so output continues the reasoning rather than opening it.
+REQUEST_REASONING_OPEN_KEY = "__sglang_reasoning_open"
+
+
+def get_request_reasoning_open(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+) -> bool:
+    return (
+        isinstance(custom_params, dict)
+        and custom_params.get(REQUEST_REASONING_OPEN_KEY) is True
+    )
+
+
+def set_request_reasoning_open(sampling_params: Dict, enabled: bool) -> None:
+    if not enabled:
+        return
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_REASONING_OPEN_KEY] = True
+    sampling_params["custom_params"] = custom_params
+
+
 def validate_n(n: Any) -> int:
     # A negative limit disables the cap, matching the Rust server.
     max_n = envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.get()

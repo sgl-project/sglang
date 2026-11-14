@@ -5,10 +5,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.speculative_hook import _validate_draft_window_honored
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     resolve_sliding_layer_window_size,
     resolve_sliding_window_size,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -122,6 +124,94 @@ class TestDraftSlidingWindowRules(CustomTestCase):
             pass
 
         self._check(_Plain, SimpleNamespace(), 300, 300)
+
+
+class _PlainModel:
+    pass
+
+
+class _NativeWindowModel:
+    @staticmethod
+    def get_attention_sliding_window_size(self):
+        return 32
+
+    @staticmethod
+    def sliding_layer_window_size(config):
+        return 32
+
+
+class TestDraftWindowValidation(CustomTestCase):
+    def _validate(self, model_cls, **kwargs):
+        options = dict(
+            speculative_algorithm="EAGLE",
+            speculative_draft_model_path="draft",
+            speculative_draft_attention_backend="fa3",
+            speculative_num_steps=1,
+            speculative_draft_window_size=64,
+        )
+        options.update(kwargs)
+        args = ServerArgs(model_path="dummy", **options)
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(),
+            is_hybrid_swa=False,
+            sliding_window_size=None,
+            attention_chunk_size=None,
+        )
+        with (
+            patch(
+                "sglang.srt.configs.model_config.ModelConfig.from_server_args",
+                return_value=model_config,
+            ),
+            patch(
+                "sglang.srt.model_loader.utils.get_model_architecture",
+                return_value=(model_cls, None),
+            ),
+        ):
+            _validate_draft_window_honored(args)
+
+    def test_validation_uses_backend_steps_and_native_window(self):
+        from sglang.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
+
+        cases = (
+            (
+                "triton_window_and_sink",
+                _PlainModel,
+                {
+                    "speculative_draft_attention_backend": "triton",
+                    "speculative_num_steps": 2,
+                    "speculative_draft_sink_size": 16,
+                },
+                None,
+            ),
+            (
+                "unsupported_backend",
+                _PlainModel,
+                {"speculative_num_steps": 2},
+                "draft-window-size",
+            ),
+            (
+                "single_step",
+                _PlainModel,
+                {"speculative_draft_attention_backend": "triton"},
+                "draft-window-size",
+            ),
+            ("native_window", _NativeWindowModel, {}, None),
+            (
+                "native_window_sink",
+                _NativeWindowModel,
+                {"speculative_draft_sink_size": 8},
+                "draft-sink-size",
+            ),
+            ("eagle3_native_window", LlamaForCausalLMEagle3, {}, None),
+            ("dflash_window", _PlainModel, {"speculative_algorithm": "DFLASH"}, None),
+        )
+        for name, model_cls, options, error in cases:
+            with self.subTest(name=name):
+                if error is None:
+                    self._validate(model_cls, **options)
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        self._validate(model_cls, **options)
 
 
 if __name__ == "__main__":
