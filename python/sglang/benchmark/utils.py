@@ -1,6 +1,7 @@
 import json
 import os
 import resource
+import tempfile
 from json import JSONDecodeError
 from typing import Dict, List, Optional, Union
 
@@ -98,7 +99,7 @@ def download_and_cache_hf_file(
 def download_and_cache_file(url: str, filename: Optional[str] = None):
     """Read and cache a file from a url."""
     if filename is None:
-        filename = os.path.join("/tmp", url.split("/")[-1])
+        filename = os.path.join(tempfile.gettempdir(), url.split("/")[-1])
 
     # Check if the cache file already exists
     if is_file_valid_json(filename):
