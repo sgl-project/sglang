@@ -103,18 +103,38 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
+    def __init__(
+        self,
+        quant_config: Optional["QuantizationConfig"] = None,
+        *,
+        online_weights: bool = False,
+    ):
+        super().__init__(quant_config)
+        self.online_weights = online_weights
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        if self.online_weights:
+            weight = layer.weight.data
+            if weight.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"Online W8A8 requires FP16 or BF16 weights, got {weight.dtype}"
+                )
+            if not weight.is_npu:
+                weight = weight.to(f"npu:{torch.npu.current_device()}")
+            quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(weight)
+            layer.weight = Parameter(quantized_weight, requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+
         prepare_w8a8_int8_linear_weights(layer)
 
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         if isinstance(x, tuple):
-            """dynamic_scale is calculated in malprolog kernel"""
+            # MLAProlog supplies quantized activations with BF16 output.
             original_dtype = torch.bfloat16
             quant_out, dynamic_scale = x
         else:
