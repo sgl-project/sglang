@@ -1,3 +1,7 @@
+import functools
+import os
+from contextvars import ContextVar
+
 import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager
@@ -13,6 +17,64 @@ class _MockModel(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         return None
+
+
+def _cpu_payload_metadata(device):
+    return (
+        os.getenv("SGLANG_SIMULATOR_BOOTSTRAP") == "1"
+        and os.getenv("SGLANG_USE_CPU_ENGINE") == "1"
+        and device is not None
+        and torch.device(device).type == "cpu"
+    )
+
+
+class C_DSV4PayloadHook(BaseHook):
+    """Keep packed payload geometry without allocating unused model values.
+
+    Only payload allocation methods run on meta. Native integer allocators,
+    request/window state, pool device and logical capacities remain unchanged.
+    """
+
+    HOOK_CLASS_NAME = (
+        r"^DeepSeekV4(SingleKVPool|UniformFP8KVPool|IndexerPool|UnifiedKVPool)$"
+    )
+    HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\.deepseek_v4_memory_pool$"
+    REGEX = True
+    REQUIRED = False
+
+    @classmethod
+    def hook(cls, target):
+        if target.__name__ == "DeepSeekV4UnifiedKVPool":
+            original = target.__init__
+
+            @functools.wraps(original)
+            def initialize(self, *args, **kwargs):
+                if "device" in kwargs and _cpu_payload_metadata(kwargs["device"]):
+                    kwargs = {**kwargs, "device": "meta"}
+                return original(self, *args, **kwargs)
+
+            target.__init__ = initialize
+            return
+
+        name = (
+            "_create_buffer"
+            if target.__name__ == "DeepSeekV4IndexerPool"
+            else "create_buffer"
+        )
+        original = getattr(target, name)
+
+        @functools.wraps(original)
+        def allocate(self, *args, **kwargs):
+            device = self.device
+            if not _cpu_payload_metadata(device):
+                return original(self, *args, **kwargs)
+            self.device = "meta"
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                self.device = device
+
+        setattr(target, name, allocate)
 
 
 class _MockModelLoader:
@@ -132,7 +194,29 @@ class C_KVCacheConfiguratorHook(BaseHook):
     def hook(cls, target):
         original_configure = target.configure
         original_init_pools = target._init_pools
+        original_build_dsv4_pool = getattr(target, "_build_dsv4_kv_pool", None)
         supports_cpu_fp8_quant_method = hasattr(target, "_build_mha_quant_method")
+        logical_geometry = ContextVar("simulator_logical_pool_geometry", default=())
+
+        def packed_geometry_for(configurator):
+            for owner, attributes in reversed(logical_geometry.get()):
+                if owner is configurator:
+                    return attributes
+            return None
+
+        def wrapped_build_dsv4_pool(self, *args, **kwargs):
+            attributes = packed_geometry_for(self)
+            if attributes is None:
+                return original_build_dsv4_pool(self, *args, **kwargs)
+
+            compacted = {name: getattr(self.model_config, name) for name in attributes}
+            try:
+                for name, value in attributes.items():
+                    setattr(self.model_config, name, value)
+                return original_build_dsv4_pool(self, *args, **kwargs)
+            finally:
+                for name, value in compacted.items():
+                    setattr(self.model_config, name, value)
 
         def wrapped_configure(self, *args, **kwargs):
             if not (
@@ -175,15 +259,20 @@ class C_KVCacheConfiguratorHook(BaseHook):
                     except RuntimeError:
                         return 0
                     except ValueError as error:
-                        # New runtimes reject deliberately undersized SWA probes.
                         if "cannot hold even one request" not in str(error):
                             raise
                         return 0
                     return config.max_total_num_tokens
 
-                lower, upper = 0, 1
-                while resolved_tokens(upper) < target_tokens:
-                    lower, upper = upper, upper * 2
+                lower, upper = (0, 1)
+                for _ in range(64):
+                    if resolved_tokens(upper) >= target_tokens:
+                        break
+                    lower, upper = (upper, upper * 2)
+                else:
+                    raise ValueError(
+                        "Native KV pool cannot represent the requested capacity"
+                    )
                 while lower + 1 < upper:
                     middle = (lower + upper) // 2
                     if resolved_tokens(middle) < target_tokens:
@@ -220,9 +309,9 @@ class C_KVCacheConfiguratorHook(BaseHook):
             return available_bytes
 
         def wrapped_init_pools(self, *args, **kwargs):
-            # Pool payload is never read during simulation. Preserve the native
-            # pool classes and allocator wiring, but allocate minimal payload
-            # dimensions and restore their logical metadata afterwards.
+            # Keep legacy payload compaction for ordinary pools. Packed native
+            # factories need their original dimensions throughout construction,
+            # including nested pools and native layout validation.
             compact_attrs = (
                 "qk_nope_head_dim",
                 "qk_rope_head_dim",
@@ -234,18 +323,27 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 "linear_key_head_dim",
                 "linear_conv_kernel_dim",
             )
-            original_attrs = {
+            entry_attrs = {
                 name: getattr(self.model_config, name)
                 for name in compact_attrs
                 if hasattr(self.model_config, name)
             }
+            original_attrs = packed_geometry_for(self)
+            if original_attrs is None:
+                original_attrs = entry_attrs
+            token = logical_geometry.set(
+                (*logical_geometry.get(), (self, original_attrs))
+            )
             try:
-                for name in original_attrs:
+                for name in entry_attrs:
                     setattr(self.model_config, name, 1)
                 pools = original_init_pools(self, *args, **kwargs)
             finally:
-                for name, value in original_attrs.items():
-                    setattr(self.model_config, name, value)
+                try:
+                    for name, value in entry_attrs.items():
+                        setattr(self.model_config, name, value)
+                finally:
+                    logical_geometry.reset(token)
 
             token_pool = pools.token_to_kv_pool
             for name, value in original_attrs.items():
@@ -280,3 +378,5 @@ class C_KVCacheConfiguratorHook(BaseHook):
         target.configure = wrapped_configure
         target._profile_available_bytes = override_profile_available_bytes
         target._init_pools = wrapped_init_pools
+        if callable(original_build_dsv4_pool):
+            target._build_dsv4_kv_pool = wrapped_build_dsv4_pool

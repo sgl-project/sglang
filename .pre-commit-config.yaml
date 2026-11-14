@@ -9,6 +9,9 @@ repos:
       - id: destroyed-symlinks
       - id: trailing-whitespace
       - id: end-of-file-fixer
+        # These source-contract originals are addressed by their exact SHA256.
+        # Their byte guard is test_native_fixture_bytes.py; never append an EOL.
+        exclude: ^tools/sglang-simulator/test/fixtures/simopus-native-source/tp[24]/_meta/.*\.json$
       - id: check-yaml
         args: [--allow-multiple-documents]
       - id: check-toml
