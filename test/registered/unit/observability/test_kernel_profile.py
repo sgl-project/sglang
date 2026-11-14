@@ -60,6 +60,33 @@ class TestKernelProfile(unittest.TestCase):
         self.assertEqual(result["skipped_kernel_records"], 3)
         self.assertEqual(result["window_source"], "observed_kernel_envelope")
 
+    def test_inline_limit_uses_decompressed_bytes_and_preserves_offline_input(self):
+        from unittest.mock import patch
+
+        from sglang.srt.observability import kernel_profile
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "large.trace.json.gz"
+            raw = json.dumps(
+                {"traceEvents": [kernel(2, 5)], "padding": " " * 4096}
+            ).encode()
+            path.write_bytes(gzip.compress(raw))
+            self.assertLess(path.stat().st_size, 512)
+            with (
+                envs.SGLANG_PROFILE_KERNEL_SUMMARY.override(True),
+                patch.object(kernel_profile, "_INLINE_LIMIT", 512),
+                patch.object(kernel_profile.json, "loads", side_effect=AssertionError),
+                self.assertLogs(kernel_profile.logger, level="WARNING"),
+            ):
+                export_kernel_summary(path)
+            self.assertEqual(list(Path(tmp).iterdir()), [path])
+            self.assertEqual(
+                summarize_profile(kernel_profile.read_profile(path))["devices"][0][
+                    "kernel_busy_union_ns"
+                ],
+                5000,
+            )
+
     def test_cpu_trace_is_an_empty_observation(self):
         self.assertEqual(summarize_profile({"traceEvents": []})["devices"], [])
 

@@ -37,10 +37,24 @@ def interval_union_ns(intervals) -> int:
     return total
 
 
-def read_profile(path) -> dict:
+# Bound work on the synchronous profiler-stop path by decompressed size.
+# Larger captures remain available for offline analysis.
+_INLINE_LIMIT = 16 * 1024 * 1024
+
+
+def read_profile(path, *, max_bytes=None) -> dict:
     opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8") as stream:
-        payload = json.load(stream, parse_float=Decimal)
+    with opener(path, "rb") as stream:
+        if max_bytes is None:
+            payload = json.load(stream, parse_float=Decimal)
+        else:
+            data = stream.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise ValueError(
+                    "capture exceeds the inline analysis limit; analyze offline with "
+                    f"python -m sglang.srt.observability.kernel_profile {path!s}"
+                )
+            payload = json.loads(data, parse_float=Decimal)
     if not isinstance(payload, dict) or not isinstance(
         payload.get("traceEvents"), list
     ):
@@ -162,7 +176,7 @@ def export_kernel_summary(trace_path):
         path.name.removesuffix(".gz").removesuffix(".json") + ".kernel-summary.json"
     )
     try:
-        summary = summarize_profile(read_profile(path))
+        summary = summarize_profile(read_profile(path, max_bytes=_INLINE_LIMIT))
         temporary = output.with_name(output.name + ".tmp")
         temporary.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         temporary.replace(output)
@@ -170,3 +184,15 @@ def export_kernel_summary(trace_path):
         logger.warning("Could not summarize profiler trace %s", path, exc_info=True)
     else:
         logger.info("Kernel window summary saved to %s", output)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("trace_path")
+    print(
+        json.dumps(
+            summarize_profile(read_profile(parser.parse_args().trace_path)), indent=2
+        )
+    )
