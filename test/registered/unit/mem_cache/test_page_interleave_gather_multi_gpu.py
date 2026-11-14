@@ -176,8 +176,9 @@ def _check(rank, name, got, expect, atol=0.0):
     assert ok, f"[rank {rank}] {name} mismatch (max_err={max_err})"
 
 
-def _run_mla(rank, world, port, multicast=None):
-    _dist_init(rank, world, port, attn_cp_size=1)
+def _run_mla(rank, world, port, multicast=None, *, dist_init=True):
+    if dist_init:
+        _dist_init(rank, world, port, attn_cp_size=1)
 
     group = get_parallel().attn_tp_group
     assert group.world_size == world
@@ -806,6 +807,9 @@ def _run_unmapped_rank_mla(rank, world, port, unmapped_call):
     still pick NCCL with rank 1, without waiting for it in a barrier."""
     from torch.distributed import _symmetric_memory as symm_mem
 
+    # Group setup rendezvouses too (custom all-reduce's multicast probe), so it
+    # runs before the patch and the calls counted are the pool's.
+    _dist_init(rank, world, port, attn_cp_size=1)
     rendezvous, calls = symm_mem.rendezvous, []
 
     def rendezvous_on_rank_1_without_multicast(tensor, group):
@@ -819,7 +823,7 @@ def _run_unmapped_rank_mla(rank, world, port, unmapped_call):
         symm_mem, "rendezvous", rendezvous_on_rank_1_without_multicast
     ):
         pool, req_to_token, prefix_len, seq_len = _run_mla(
-            rank, world, port, multicast=False
+            rank, world, port, multicast=False, dist_init=False
         )
     assert len(calls) == 2
     activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
