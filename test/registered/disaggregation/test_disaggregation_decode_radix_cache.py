@@ -144,7 +144,12 @@ class TestDisaggregationDecodeRadixCacheMooncake(
     "Mooncake is required for decode radix cache disaggregation coverage.",
 )
 class TestDisaggregationDecodeRadixHiCacheFileBackend(PDDisaggregationServerBase):
+    # POST /hicache/storage-backend/clear (and /flush_cache) require the admin
+    # API key (see issue #44191); generate/health stay unauthenticated.
+    _admin_api_key = "test-admin-key"
     extra_prefill_args = [
+        "--admin-api-key",
+        "test-admin-key",
         "--enable-hierarchical-cache",
         "--hicache-ratio",
         "1.2",
@@ -186,13 +191,14 @@ class TestDisaggregationDecodeRadixHiCacheFileBackend(PDDisaggregationServerBase
         os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", None)
         shutil.rmtree(cls.hicache_dir, ignore_errors=True)
 
-    def _post_ok(self, url):
-        response = requests.post(url, timeout=60)
+    def _post_ok(self, url, admin=False):
+        headers = {"Authorization": f"Bearer {self._admin_api_key}"} if admin else None
+        response = requests.post(url, timeout=60, headers=headers)
         response.raise_for_status()
 
     def _flush_memory_cache(self):
-        self._post_ok(f"{self.prefill_url}/flush_cache?timeout=30")
-        self._post_ok(f"{self.decode_url}/flush_cache?timeout=30")
+        self._post_ok(f"{self.prefill_url}/flush_cache?timeout=30", admin=True)
+        self._post_ok(f"{self.decode_url}/flush_cache?timeout=30", admin=True)
 
     def _generate(self, input_ids, output_len):
         output = asyncio.run(
@@ -220,7 +226,7 @@ class TestDisaggregationDecodeRadixHiCacheFileBackend(PDDisaggregationServerBase
         ]
 
     def test_decode_hicache_file_backend_l3_reuses_decode_output_after_flush(self):
-        self._post_ok(f"{self.decode_url}/hicache/storage-backend/clear")
+        self._post_ok(f"{self.decode_url}/hicache/storage-backend/clear", admin=True)
         self._flush_memory_cache()
 
         num_rounds = 5
