@@ -4492,7 +4492,13 @@ class Scheduler(
         # and take a state slot a session does not own.
         req.kv.mamba_cow_src_index = None
         req.kv.mamba_needs_clear = False
-        if req.kv.holds_mamba and req.session is None:
+        if not req.kv.holds_mamba:
+            return
+        # req.session is set for every session turn. Only a streaming turn
+        # that runs on a lent record already owned the slot before this match.
+        session = getattr(self.tree_cache, "session", None)
+        borrowed = session.borrowed_slot(req) if session is not None else None
+        if borrowed is None:
             kv_storage_of(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).release_state_slot(req)
