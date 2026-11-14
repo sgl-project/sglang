@@ -480,7 +480,12 @@ class Glm4MoeDetector(BaseFormatDetector):
         if not has_tool_call:
             # Check if buffer could be the start of a tool call
             # Keep buffer if it could be a partial match of bot_token
-            is_potential_start = any(
+            # After a completed tool call, also hold whitespace-only text: the
+            # separator before the next call (or the end of the stream) is not
+            # content, while real text that follows is still flushed intact.
+            is_potential_start = (
+                self.current_tool_id > 0 and not current_text.strip()
+            ) or any(
                 self.bot_token.startswith(current_text[-i:])
                 for i in range(1, min(len(current_text), len(self.bot_token)) + 1)
             )
