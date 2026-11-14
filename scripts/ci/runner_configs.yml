@@ -28,7 +28,8 @@ runner_configs:
   2-gpu-gb300:       { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 2-gpu-gb300 }
   4-gpu-gb300:       { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 4-gpu-gb300 }
   4-gpu-h100:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 4-gpu-h100 }
-  8-gpu-h200:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 8-gpu-h200 }
+  # Runs the MSCCL++ tests; a fresh runner builds MSCCL++ from source once per pinned tag.
+  8-gpu-h200:        { install: scripts/ci/cuda/ci_install_dependency_mscclpp.sh, artifact_version: v4, install_timeout: "40", runs_on: 8-gpu-h200 }
   8-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 8-gpu-b200 }
   8-gpu-b300:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 8-gpu-b300 }
   8-gpu-h20:         { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 8-gpu-h20, rdma_devices: "mlx5_1,mlx5_2,mlx5_3,mlx5_4" }

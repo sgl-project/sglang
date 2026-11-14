@@ -901,6 +901,41 @@ install_msa() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_mscclpp() {
+    # Opt-in: only runner configs whose `install` is ci_install_dependency_mscclpp.sh
+    # set this, so pools that never run MSCCL++ tests skip the source build.
+    if [ "${INSTALL_MSCCLPP:-0}" != "1" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    # Pinned to the tag the Docker image builds, so CI tests what users run.
+    MSCCLPP_VERSION=$(sed -n 's/^ARG MSCCLPP_VERSION=//p' "${REPO_ROOT}/docker/Dockerfile")
+    if [ -z "$MSCCLPP_VERSION" ]; then
+        echo "FATAL: could not read MSCCLPP_VERSION from docker/Dockerfile"
+        exit 1
+    fi
+    # No PyPI wheel exists, so the build is from source; it is cached in the
+    # persistent venv and only repeats when the pinned tag changes.
+    MSCCLPP_STAMP="$UV_VENV/.mscclpp-${MSCCLPP_VERSION}"
+    if [ -f "$MSCCLPP_STAMP" ] && python3 -c "import mscclpp.ext, mscclpp.default_algos" 2>/dev/null; then
+        echo "mscclpp ${MSCCLPP_VERSION} already installed, keeping it"
+    else
+        rm -f "$UV_VENV"/.mscclpp-*
+        MSCCLPP_SRC="$(mktemp -d)/mscclpp"
+        git_clone_with_retry https://github.com/microsoft/mscclpp.git "$MSCCLPP_SRC" "--branch ${MSCCLPP_VERSION}"
+        # Same arch list as docker/Dockerfile; the GPU check is bypassed because
+        # the build host may not expose every target arch.
+        CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+            $PIP_CMD install "${MSCCLPP_SRC}[cuda13]" $PIP_INSTALL_SUFFIX
+        rm -rf "$(dirname "$MSCCLPP_SRC")"
+        python3 -c "import mscclpp.ext, mscclpp.default_algos"
+        touch "$MSCCLPP_STAMP"
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 prepare_runner() {
     bash "${SCRIPT_DIR}/prepare_runner.sh"
 
@@ -1013,6 +1048,7 @@ main() {
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_msa
+    install_mscclpp
     install_nccl
     prepare_runner
     setup_ld_library_path
