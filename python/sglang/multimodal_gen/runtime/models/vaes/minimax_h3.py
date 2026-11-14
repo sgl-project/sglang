@@ -21,6 +21,10 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae import (
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fp8 import (
+    inspect_fp8_scope,
+    use_fp8_decoder,
+)
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
     get_tile_parallel_state,
 )
@@ -89,6 +93,21 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
 
     def prepare_decoder_autocast_weights(self, dtype) -> int:
         return self.decoder.prepare_autocast_linear_weights(dtype)
+
+    def validate_decoder_fp8(self) -> int:
+        return len(inspect_fp8_scope(self.decoder))
+
+    def use_decoder_fp8(self, enabled: bool):
+        return use_fp8_decoder(self.decoder, enabled)
+
+    def validate_weight_update_source(self, *, weights_path: str | None) -> None:
+        """Weight updates must not overlap a temporary FP8 decode."""
+        del weights_path
+        if self.decoder.fp8_installed:
+            raise ValueError(
+                "MiniMax-H3 video_vae has an active FP8 decode; "
+                "retry the weight update after the request finishes"
+            )
 
 
 class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):

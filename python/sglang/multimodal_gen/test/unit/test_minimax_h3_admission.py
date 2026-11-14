@@ -505,6 +505,7 @@ def _quality_server_args():
         num_gpus=4,
         backend=Backend.AUTO,
         component_attention_backends={},
+        component_quantizations={},
         enable_breakable_cuda_graph=False,
         enable_torch_compile=False,
         is_dit_layerwise_offload_selected=False,
@@ -542,7 +543,9 @@ def test_high_quality_deployment_rejects_transformer_weight_override():
 
 def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
-    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+    stage.server_args = SimpleNamespace(
+        enable_breakable_cuda_graph=True, component_quantizations={}
+    )
     stage._cache_dit_enabled = False
     batch = SimpleNamespace(
         sampling_params=SimpleNamespace(
@@ -611,15 +614,28 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
         assert stage.forward(batch, server_args) is batch
 
 
-def test_lossless_quality_does_not_enable_h3_cache_dit():
+@pytest.mark.parametrize(
+    ("quality", "fp8"),
+    [
+        ("exact", False),
+        ("lossless", False),
+        ("exact", True),
+        ("lossless", True),
+        ("high", True),
+    ],
+)
+def test_non_cache_quality_does_not_enable_h3_cache_dit(quality, fp8):
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
-    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
+    stage.server_args = SimpleNamespace(
+        enable_breakable_cuda_graph=False,
+        component_quantizations={"video_vae": "fp8"} if fp8 else {},
+    )
     stage._cache_dit_enabled = False
     stage._minimax_h3_cache_mode = None
     stage._minimax_h3_quality = "exact"
     batch = SimpleNamespace(
         sampling_params=SimpleNamespace(
-            quality="lossless",
+            quality=quality,
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
@@ -632,9 +648,50 @@ def test_lossless_quality_does_not_enable_h3_cache_dit():
     with patch.object(DenoisingStage, "_cache_dit_requested", return_value=True):
         stage._maybe_enable_cache_dit(50, batch)
 
-    assert stage._minimax_h3_quality == "lossless"
+    assert stage._minimax_h3_quality == quality
     assert stage._minimax_h3_cache_mode is None
     assert not stage._cache_dit_enabled
+
+
+def test_high_fp8_admission_keeps_the_denoise_schedule():
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    args = _quality_server_args()
+    args.pipeline_config = MiniMaxH3PipelineConfig()
+    args.component_quantizations = {"video_vae": "fp8"}
+    args.component_quantization_ignored_layers = {}
+    args.component_precisions = {}
+    args.disable_autocast = False
+    args.residency_mode = lambda component: "resident"
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            task="t2va", quality="high", enable_cache_dit=None
+        ),
+        num_inference_steps=5,
+        is_warmup=False,
+    )
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.current_arch",
+            return_value=SimpleNamespace(is_sm_at_least=lambda major: True),
+        ),
+    ):
+        assert stage.forward(batch, args) is batch
+        assert batch.num_inference_steps == 5
+        batch.sampling_params.enable_cache_dit = True
+        with pytest.raises(ValueError, match="cannot combine with Cache-DiT"):
+            stage.forward(batch, args)
 
 
 def test_high_quality_cache_schedule_is_the_audited_static_mask():
@@ -744,6 +801,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
         component_attention_backends={},
+        component_quantizations={},
         attention_backend="sage_attn",
         ring_degree=1,
         performance_mode="speed",
@@ -796,6 +854,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
         component_attention_backends={"transformer": "subblock_sparse_attn"},
+        component_quantizations={},
         attention_backend="fa",
         attention_backend_config={},
         ring_degree=1,
@@ -859,6 +918,7 @@ def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
     }
     server_args = SimpleNamespace(
         component_attention_backends={},
+        component_quantizations={},
         attention_backend=None,
         enable_torch_compile=False,
         ring_degree=1,
