@@ -58,6 +58,15 @@ def test_native_lim_suffix_enables_the_updated_operator(adapter):
     assert torch.all(args[-2] == 3)
 
 
-def test_suffix_contract_requires_full_visible(adapter):
-    with pytest.raises(ValueError, match="requires full_visible=True"):
-        adapter(*inputs(), operator=lambda *args: None, resident_refresh_tail=True)
+def test_native_suffix_contract_requires_full_visible(adapter):
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("NPU is required for native validation")
+
+    args = [
+        value.npu() if isinstance(value, torch.Tensor) else value for value in inputs()
+    ]
+    with pytest.raises(
+        RuntimeError, match="resident_refresh_tail requires full_visible"
+    ):
+        adapter(*args, resident_refresh_tail=True)

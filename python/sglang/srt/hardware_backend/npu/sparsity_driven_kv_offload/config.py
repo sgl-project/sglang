@@ -207,8 +207,6 @@ def get_sparse_kv_budget(
         raise ValueError("Sparse KV budgeting requires fused LIM and CopySFA.")
     if copy_sfa_query_heads is None:
         query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
-        if query_heads <= 0:
-            raise ValueError("CopySFA requires a positive per-rank query head count.")
         # Native SFA accepts 1..64 or 128 query heads per KV head.
         copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
     disagg = get_disagg()
@@ -253,14 +251,6 @@ def get_sparse_kv_budget(
 
 
 def get_sparse_kv_max_query_width() -> int:
-    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
-        MAX_QUERY_WIDTH,
-    )
-
     spec = get_spec()
-    width = int(spec.speculative_num_draft_tokens or 1)
-    if not 1 <= width <= MAX_QUERY_WIDTH:
-        raise ValueError(
-            f"Native LIM supports chain query widths 1..{MAX_QUERY_WIDTH}."
-        )
-    return width
+    # The budget resolver validates the resulting native query geometry.
+    return int(spec.speculative_num_draft_tokens or 1)

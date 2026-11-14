@@ -114,6 +114,7 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
         copy_sfa_query_heads=heads,
         max_query_width=Q,
     )
+    budget.bind_native_pool(index_pool)
     index_pool.sparse_kv_budget_plan = budget
     inputs = SimpleNamespace(
         batch_size=batch,

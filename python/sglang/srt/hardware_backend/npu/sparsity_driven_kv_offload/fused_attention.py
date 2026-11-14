@@ -48,8 +48,7 @@ def forward_fused_sparse_kv_offload(
         )
     k_nope = k.view(-1, layer.tp_k_head_num, backend.kv_lora_rank).contiguous()
     k_pe = k_rope.view(-1, layer.tp_k_head_num, backend.qk_rope_head_dim).contiguous()
-    stream = torch.npu.current_stream(backend.device)
-    current_inputs = manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
+    current_inputs = manager.offload_v2(k_nope, k_pe, layer, forward_batch)
     if not is_prefill:
         rows = forward_batch.batch_size * plan.query_width
         result = manager.copy_sfa_attention(
@@ -78,11 +77,11 @@ def forward_fused_sparse_kv_offload(
         gather_plan = backend.forward_metadata.sparse_kv_fused_prefill_plan
         if gather_plan is None:
             gather_plan = manager.prepare_forward_kv_plan(
-                forward_batch, stream, current=current_inputs
+                forward_batch, current=current_inputs
             )
             backend.forward_metadata.sparse_kv_fused_prefill_plan = gather_plan
     k_nope, k_pe = manager.get_forward_kv(
-        layer, forward_batch, stream, plan=gather_plan, current=current_inputs
+        layer, forward_batch, plan=gather_plan, current=current_inputs
     )
     if topk_indices.ndim == 2:
         topk_indices = topk_indices.unsqueeze(-2)

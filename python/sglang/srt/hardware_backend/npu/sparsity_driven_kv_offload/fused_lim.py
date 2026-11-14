@@ -62,7 +62,6 @@ class LIMDecodeAdapter:
             else:
                 value = spec.allocate(device)
             setattr(self, name, value)
-        manager.budget.validate_buffers(self, manager.budget.adapter_buffers)
 
     def reset_requests(self, request_slots):
         self.last_prefix[:, request_slots] = -1

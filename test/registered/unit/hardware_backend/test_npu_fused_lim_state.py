@@ -257,6 +257,11 @@ class TestLIMState(CustomTestCase):
                 if isinstance(t, torch.Tensor)
             )
             self.assertEqual(manager.budget.adapter_bytes, allocated)
+            manager.budget.validate_buffers(adapter, manager.budget.adapter_buffers)
+            self.assertEqual(
+                adapter.query_ends.tolist(),
+                [[i * j for j in range(1, 9)] for i in range(1, width + 1)],
+            )
             self.assertFalse(hasattr(adapter, "query_scale"))
             self.assertFalse(hasattr(adapter, "key_scale"))
             for indices in (adapter.source_ids, adapter.device_slots):
@@ -338,6 +343,7 @@ class TestLIMState(CustomTestCase):
         pool.sparse_kv_budget_plan = plan
         pool.indexer_layer_ids = (1,)
         pool.get_index_k_buffer = Mock(return_value=pool.get_index_k_buffer(0))
+        plan.bind_native_pool(pool)
         req_pool = ReqToTokenPool(2, 4097, "cpu", False)
         req_pool.req_to_token[2, 4096] = 73
         pre, post = ModuleType("pre"), ModuleType("post")
@@ -375,6 +381,8 @@ class TestLIMState(CustomTestCase):
                 req_pool, None, 2048, paged_kv_cache=pool
             )
         self.assertIs(manager.budget, plan)
+        plan.validate_buffers(manager, plan.manager_buffers)
+        plan.validate_buffers(manager.lim_adapter, plan.adapter_buffers)
         self.assertEqual(
             [tuple(component[0].shape) for component in manager.host_pool.buffers],
             [
@@ -403,7 +411,7 @@ class TestLIMState(CustomTestCase):
             plan.managed_hbm_bytes,
         )
         self.assertFalse(hasattr(manager.lim_adapter, "key_scale"))
-        self.assertIs(plan.bind_native_pool(pool), plan)
+
         self.assertEqual(
             manager.host_source_indices(
                 torch.tensor([3, 99]), torch.tensor([4096, 9999])
@@ -484,14 +492,9 @@ class TestLIMState(CustomTestCase):
         # Use the allocated index pages, including their dummy page, rather
         # than reconstructing the physical capacity from a logical size.
         pool.size = 3968
-        self.assertIs(plan.bind_native_pool(pool), plan)
+
         self.assertEqual(plan.host_token_capacity, 4096 + 128)
         self.assertEqual(plan.host_kv_bytes, (4096 + 128) * 576 * 2 * 2)
-        pool.get_index_k_buffer.return_value = torch.empty(
-            (34, 128, 1, 128), dtype=torch.bfloat16
-        )
-        with self.assertRaisesRegex(ValueError, "already bound"):
-            plan.bind_native_pool(pool)
 
     def test_host_bytes_are_unavailable_before_physical_pool_binding(self):
         plan = resolve_sparse_kv_budget(**self.options())

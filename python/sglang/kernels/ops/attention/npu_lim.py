@@ -55,19 +55,9 @@ def fused_lightning_indexer_manage(
 
     ``source_ids`` and ``device_slots`` are preallocated ``[T, 2048]`` tables.
     The experimental full-visible mode requires a matching kernel wheel.
+    Native host code validates tensor inputs; an injected operator must honor
+    the same contract.
     """
-    if query.ndim != 3 or query.shape[1] not in (32, 64) or query.shape[2] != 128:
-        raise ValueError("LIM requires query [T, 32|64, 128].")
-    if query.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("LIM requires FP16/BF16 query, index keys and weights.")
-    if key.ndim != 4 or key.shape[1:] != (128, 1, 128):
-        raise ValueError("LIM requires paged index keys [pages, 128, 1, 128].")
-    if key.dtype != query.dtype or weights.dtype != query.dtype:
-        raise ValueError("LIM query/key/weights dtypes must match.")
-    if slot_pool.shape[1] != block_table.shape[1] * 128:
-        raise ValueError(
-            "LIM source-map width must equal index block-table width * 128."
-        )
     inputs = (
         weights,
         query,
@@ -87,10 +77,6 @@ def fused_lightning_indexer_manage(
         miss_slots,
         miss_counts,
     )
-    if any(not tensor.is_contiguous() for tensor in inputs):
-        raise ValueError("LIM inputs and preallocated outputs must be contiguous.")
-    if any(tensor.device != query.device for tensor in inputs):
-        raise ValueError("LIM inputs and outputs must be on one device.")
     if operator is None:
         operator = load_fused_lim_operator()
     operator(*inputs, full_visible=full_visible)

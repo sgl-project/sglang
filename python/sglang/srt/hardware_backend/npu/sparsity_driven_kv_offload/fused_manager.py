@@ -30,8 +30,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
-    import torch.npu
-
     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
         MemFabricKVPool,
     )
@@ -141,14 +139,12 @@ class FusedSparseKVCacheManager:
         )
         if self.budget is None:
             raise ValueError("Native KV pool has no sparse KV budget plan.")
-        self.budget.bind_native_pool(paged_kv_cache)
         self.size = self.budget.request_rows
         self.batch_capacity = self.budget.batch_capacity
         self.max_context_len = self.budget.context_len
         self.max_query_width = self.budget.max_query_width
         self.host_token_capacity = self.budget.host_token_capacity
         self.device_cache_size = self.budget.cache_tokens
-        self._prefill_workspace_stream = None
         logger.info(
             "Sparse KV per rank: K=%d C=%d, managed HBM=%.2f MiB, host KV=%.2f MiB, host_layout=paged_split",
             self.sparse_context_len,
@@ -304,7 +300,6 @@ class FusedSparseKVCacheManager:
             LIMDecodeAdapter,
         )
 
-        self.budget.validate_buffers(self, self.budget.manager_buffers)
         self.lim_adapter = LIMDecodeAdapter(self)
 
         self._install_req_alloc_hook(req_to_token_pool)
@@ -454,7 +449,6 @@ class FusedSparseKVCacheManager:
         k_rope: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        stream: torch.npu.Stream,
     ):
         """Publish KV to paged host storage and return decode rows for CopySFA."""
         layer_idx = layer.layer_id - self.start_layer
@@ -602,33 +596,27 @@ class FusedSparseKVCacheManager:
             )
         assert src_index.shape == dst_index.shape == valid_mask.shape
 
-        actual_stream = stream if stream is not None else torch.npu.current_stream()
-        with torch.npu.stream(actual_stream):
-            if self.host_pool.rank == 0:
-                self.host_pool.copy_rows(
-                    (k.contiguous(), k_rope.contiguous()),
-                    (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
-                    src_index,
-                    dst_index,
-                    valid_mask,
-                )
-            self.host_pool.publish()
+        if self.host_pool.rank == 0:
+            self.host_pool.copy_rows(
+                (k.contiguous(), k_rope.contiguous()),
+                (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
+                src_index,
+                dst_index,
+                valid_mask,
+            )
+        self.host_pool.publish()
 
-            if forward_batch.forward_mode.is_extend_without_speculative():
-                # A prefill can rewrite an existing request's host prefix.
-                # Invalidate only this layer's resident extent.
-                requests = forward_batch.req_pool_indices.to(torch.long)
-                self.resident_begin[layer_idx].index_fill_(0, requests, -1)
-                self.resident_end[layer_idx].index_fill_(0, requests, -1)
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            # A prefill can rewrite an existing request's host prefix.
+            # Invalidate only this layer's resident extent.
+            requests = forward_batch.req_pool_indices.to(torch.long)
+            self.resident_begin[layer_idx].index_fill_(0, requests, -1)
+            self.resident_end[layer_idx].index_fill_(0, requests, -1)
 
-            return src_tensor, token_positions, valid_mask
+        return src_tensor, token_positions, valid_mask
 
-    def prepare_forward_kv_plan(self, forward_batch, stream, current=None):
-        """Use a fixed budgeted workspace on one compute stream only."""
-        current_stream = torch.npu.current_stream()
-        actual_stream = current_stream if stream is None else stream
-        if actual_stream != current_stream:
-            return None
+    def prepare_forward_kv_plan(self, forward_batch, current=None):
+        """Use a fixed budgeted workspace on the current compute stream."""
         capacity = getattr(self.budget, "prefill_workspace_tokens", 0)
         if not capacity:
             return None
@@ -641,15 +629,10 @@ class FusedSparseKVCacheManager:
         _, total = prepared
         if not total or total > capacity:
             return None
-        if self._prefill_workspace_stream is None:
-            self._prefill_workspace_stream = actual_stream
-        if self._prefill_workspace_stream != actual_stream:
-            return None
         current_valid = None if current is None else current[2]
         return make_fused_prefill_plan(
             forward_batch,
             self,
-            actual_stream,
             prepared=prepared,
             current_valid=current_valid,
         )
@@ -658,7 +641,6 @@ class FusedSparseKVCacheManager:
         self,
         layer: Union[RadixAttention, int],
         forward_batch: ForwardBatch,
-        stream: Optional[torch.npu.Stream] = None,
         plan=None,
         current=None,
     ):
@@ -694,12 +676,7 @@ class FusedSparseKVCacheManager:
             if forward_batch.req_pool_indices.device.type == "npu"
             else self.device
         )
-        actual_stream = stream if stream is not None else torch.npu.current_stream()
-        if (
-            plan is not None
-            and plan.stream == actual_stream
-            and actual_stream == torch.npu.current_stream()
-        ):
+        if plan is not None:
             total = plan.total_tokens
             nope = self.prefill_nope[:total]
             rope = self.prefill_rope[:total]
@@ -708,33 +685,32 @@ class FusedSparseKVCacheManager:
                 current_payload, _, _ = current
                 mapping = plan.current_mapping
             host_mask = plan.valid if mapping is None else mapping[3]
-            with torch.npu.stream(actual_stream):
-                self.host_pool.copy_rows(
-                    (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
+            self.host_pool.copy_rows(
+                (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
+                (nope, rope),
+                plan.source,
+                plan.destination,
+                host_mask,
+            )
+            if mapping is not None:
+                src, dst, valid, _ = mapping
+                for component, output in zip(
+                    current_payload.split(
+                        (self.kv_lora_rank, self.qk_rope_head_dim), dim=-1
+                    ),
                     (nope, rope),
-                    plan.source,
-                    plan.destination,
-                    host_mask,
-                )
-                if mapping is not None:
-                    src, dst, valid, _ = mapping
-                    for component, output in zip(
-                        current_payload.split(
-                            (self.kv_lora_rank, self.qk_rope_head_dim), dim=-1
-                        ),
-                        (nope, rope),
-                    ):
-                        unidex_copy_inplace(
-                            component.contiguous(),
-                            output,
-                            src,
-                            dst,
-                            valid,
-                            1,
-                            1,
-                            block_dim=48,
-                        )
-                return nope, rope
+                ):
+                    unidex_copy_inplace(
+                        component.contiguous(),
+                        output,
+                        src,
+                        dst,
+                        valid,
+                        1,
+                        1,
+                        block_dim=48,
+                    )
+            return nope, rope
 
         req_ids = forward_batch.req_pool_indices.to(device=device, dtype=torch.long)
         seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.long)
@@ -788,21 +764,19 @@ class FusedSparseKVCacheManager:
         dst_index = torch.arange(total_tokens, device=device, dtype=torch.long)
         valid_mask = torch.ones(total_tokens, device=device, dtype=torch.bool)
 
-        actual_stream = stream if stream is not None else torch.npu.current_stream()
-        with torch.npu.stream(actual_stream):
-            outputs = [
-                torch.empty(
-                    (total_tokens, self.head_num, width),
-                    dtype=self.store_dtype,
-                    device=device,
-                )
-                for width in (self.kv_lora_rank, self.qk_rope_head_dim)
-            ]
-            self.host_pool.copy_rows(
-                (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
-                outputs,
-                src_index,
-                dst_index,
-                valid_mask,
+        outputs = [
+            torch.empty(
+                (total_tokens, self.head_num, width),
+                dtype=self.store_dtype,
+                device=device,
             )
-            return tuple(outputs)
+            for width in (self.kv_lora_rank, self.qk_rope_head_dim)
+        ]
+        self.host_pool.copy_rows(
+            (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
+            outputs,
+            src_index,
+            dst_index,
+            valid_mask,
+        )
+        return tuple(outputs)

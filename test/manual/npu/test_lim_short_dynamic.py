@@ -85,6 +85,7 @@ def test_prefill_attention_and_short_residency():
         cache_tokens=capacity,
         copy_sfa_query_heads=heads,
     )
+    budget.bind_native_pool(index_pool)
     index_pool.sparse_kv_budget_plan = budget
     manager = None
     with get_parallel().override(attn_cp_size=1):
@@ -235,6 +236,7 @@ def test_short_sparse_graph_lifecycle(
         copy_sfa_query_heads=heads,
         max_query_width=width,
     )
+    budget.bind_native_pool(index_pool)
     index_pool.sparse_kv_budget_plan = budget
     manager = None
     with get_parallel().override(attn_cp_size=1):
@@ -488,7 +490,6 @@ def test_short_sparse_graph_lifecycle(
                         values[..., 512:].contiguous(),
                         layer,
                         prefill,
-                        None,
                     )
 
             def check_chunk(ends):

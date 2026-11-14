@@ -62,16 +62,9 @@ def fused_scatter_copy_sparse_flash_attention(
     ``resident_refresh_tail=True`` enables source-aware overlap for native LIM
     plans whose rewritten-resident entries form a suffix of at most Q items.
     It requires full-visible mode; other plans retain the complete-copy path.
-    Buffer ownership stays with the runtime manager.
+    Buffer ownership stays with the runtime manager. An injected operator must
+    honor the same validation contract as the native host implementation.
     """
-    if resident_refresh_tail and not full_visible:
-        raise ValueError("Resident-refresh overlap requires full_visible=True.")
-    if query.ndim != 3 or query.shape[2] != 512:
-        raise ValueError("Copy-SFA query must be [T,H,512].")
-    if query_rope.shape != (*query.shape[:2], 64):
-        raise ValueError("Copy-SFA query rope must be [T,H,64].")
-    if query.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("Copy-SFA requires FP16/BF16 query and KV storage.")
     if operator is None:
         operator = load_copy_sfa_operator(split_hbm=split_hbm_rope is not None)
     inputs = (

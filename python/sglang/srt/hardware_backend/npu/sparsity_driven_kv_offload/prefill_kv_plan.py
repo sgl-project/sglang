@@ -45,7 +45,6 @@ def prepare_prefill_gather_rows(
 class FusedPrefillPlan:
     """Forward-local physical mapping and borrowed same-stream workspace."""
 
-    stream: object
     total_tokens: int
     source: torch.Tensor
     destination: torch.Tensor
@@ -53,9 +52,7 @@ class FusedPrefillPlan:
     current_mapping: object = None
 
 
-def make_fused_prefill_plan(
-    batch, manager, stream, *, prepared=None, current_valid=None
-):
+def make_fused_prefill_plan(batch, manager, *, prepared=None, current_valid=None):
     _, total = (
         prepare_prefill_gather_rows(
             batch.req_pool_indices_cpu,
@@ -89,7 +86,7 @@ def make_fused_prefill_plan(
         current_metadata=current_metadata,
         max_current_width=max_current_width,
     )
-    return FusedPrefillPlan(stream, total, source, destination, valid, current_mapping)
+    return FusedPrefillPlan(total, source, destination, valid, current_mapping)
 
 
 def _current_metadata(batch, current_valid):

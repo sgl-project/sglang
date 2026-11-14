@@ -205,7 +205,7 @@ class BudgetPlan:
         self.prefill_workspace_bytes = 0
 
     def bind_native_pool(self, pool) -> BudgetPlan:
-        """Bind the native physical layout once, checking subsequent bindings."""
+        """Bind the physical layout once after native pool creation."""
         indexer_layer_ids = getattr(pool, "indexer_layer_ids", (pool.start_layer,))
         if not indexer_layer_ids:
             raise ValueError("Native LIM requires at least one indexer K layer.")
@@ -219,12 +219,6 @@ class BudgetPlan:
         # get_index_k_buffer returns one layer: [pages, page_size, 1, head_dim].
         # Its pages already include the native allocator's dummy page.
         host_token_capacity = key.shape[0] * self.page_size
-        if self.host_token_capacity is not None:
-            if self.host_token_capacity != host_token_capacity:
-                raise ValueError(
-                    "Native KV pool differs from the already bound layout."
-                )
-            return self
         self.host_token_capacity = host_token_capacity
         self.host_kv_spec = BufferSpec(
             (1, self.host_token_capacity, 1, self.kv_cache_dim),

@@ -1,5 +1,4 @@
 import ast
-import contextlib
 import importlib.util
 import sys
 import unittest
@@ -150,7 +149,7 @@ class TestLogicalPrefillPlan(PrefillReferenceTest):
             current_row += width
             output_offset += length
         plan = module.make_fused_prefill_plan(
-            batch, Manager(), "stream", current_valid=torch.tensor(valid)
+            batch, Manager(), current_valid=torch.tensor(valid)
         )
         mapping = plan.current_mapping
         if mapping is None:
@@ -258,7 +257,7 @@ class TestLogicalPrefillPlan(PrefillReferenceTest):
             extend_seq_lens_cpu=[1, 1],
         )
         plan = module.make_fused_prefill_plan(
-            batch, Manager(), "stream", current_valid=torch.ones(3, dtype=torch.bool)
+            batch, Manager(), current_valid=torch.ones(3, dtype=torch.bool)
         )
         self.assertIsNone(plan.current_mapping)
 
@@ -316,18 +315,7 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
         exec(compile(code, str(manager_path), "exec"), namespace)
         cls.manager_type = namespace["Manager"]
 
-    def test_reuse_capacity_and_other_stream_fallback(self):
-        old_npu = getattr(torch, "npu", None)
-        torch.npu = SimpleNamespace(
-            stream=lambda _: contextlib.nullcontext(), current_stream=lambda: "A"
-        )
-        self.addCleanup(
-            lambda: (
-                setattr(torch, "npu", old_npu)
-                if old_npu is not None
-                else delattr(torch, "npu")
-            )
-        )
+    def test_reuse_capacity_and_host_fallback(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             m = self.manager_type()
 
@@ -341,7 +329,6 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
 
             m.host_pool = SplitPool()
             m.budget = SimpleNamespace(prefill_workspace_tokens=8)
-            m._prefill_workspace_stream = None
             m.size, m.max_context_len, m.start_layer, m.layer_num = 4, 4, 0, 2
             m.device, m.head_num, m.kv_lora_rank, m.qk_rope_head_dim = (
                 torch.device("cpu"),
@@ -375,15 +362,13 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
                 )
 
             first, second = batch([1, 2], [3, 2]), batch([2, 1], [2, 3])
-            self.assertIsNone(m.prepare_forward_kv_plan(first, "B"))
-            first_plan = m.prepare_forward_kv_plan(first, None)
-            self.assertEqual(first_plan.stream, "A")
-            a, b = m.get_forward_kv(0, first, "A", plan=first_plan)
+            first_plan = m.prepare_forward_kv_plan(first)
+            a, b = m.get_forward_kv(0, first, plan=first_plan)
             saved = torch.cat((a.clone(), b.clone()), -1)
             reference = torch.cat([host[0, table[r, :n]] for r, n in ([1, 3], [2, 2])])
             torch.testing.assert_close(saved, reference, rtol=0, atol=0)
-            second_plan = m.prepare_forward_kv_plan(second, "A")
-            c, d = m.get_forward_kv(1, second, "A", plan=second_plan)
+            second_plan = m.prepare_forward_kv_plan(second)
+            c, d = m.get_forward_kv(1, second, plan=second_plan)
             self.assertEqual(a.data_ptr(), c.data_ptr())
             reference2 = torch.cat(
                 [(host + 1)[0, table[r, :n]] for r, n in ([2, 2], [1, 3])]
@@ -391,12 +376,9 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
             torch.testing.assert_close(
                 torch.cat((c, d), -1), reference2, rtol=0, atol=0
             )
-            self.assertIsNone(m.prepare_forward_kv_plan(batch([1], [0]), "A"))
-            self.assertIsNone(m.prepare_forward_kv_plan(first, "B"))
-            self.assertIsNone(
-                m.prepare_forward_kv_plan(batch([1, 2, 3], [4, 4, 4]), "A")
-            )
-            e, f = m.get_forward_kv(0, first, "B", plan=first_plan)
+            self.assertIsNone(m.prepare_forward_kv_plan(batch([1], [0])))
+            self.assertIsNone(m.prepare_forward_kv_plan(batch([1, 2, 3], [4, 4, 4])))
+            e, f = m.get_forward_kv(0, first)
             self.assertNotEqual(e.data_ptr(), a.data_ptr())
             torch.testing.assert_close(torch.cat((e, f), -1), reference, rtol=0, atol=0)
             current_batch = batch([1, 2], [3, 2])
@@ -405,11 +387,10 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
             current_batch.out_cache_loc = torch.tensor([12, 7])
             current = torch.full((2, 1, 576), 3, dtype=dtype)
             current_inputs = (current, None, torch.tensor([True, True]))
-            plan = m.prepare_forward_kv_plan(current_batch, "A", current=current_inputs)
+            plan = m.prepare_forward_kv_plan(current_batch, current=current_inputs)
             n, r = m.get_forward_kv(
                 0,
                 current_batch,
-                "A",
                 plan=plan,
                 current=current_inputs,
             )
@@ -427,7 +408,7 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
             # while a later layer omits current payload. That call must gather
             # the complete logical sequence from Host.
             host_only, rope_only = m.get_forward_kv(
-                1, current_batch, "A", plan=plan, current=None
+                1, current_batch, plan=plan, current=None
             )
             layer_host = hosts[1]
             host_reference = torch.cat(

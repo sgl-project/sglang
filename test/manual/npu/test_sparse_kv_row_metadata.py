@@ -523,7 +523,7 @@ def large_prefill_cases(args, kernels, results):
                 new_module = load(
                     "candidate_prefill_kv_plan", SOURCE / "prefill_kv_plan.py"
                 )
-                new = lambda: new_module.make_fused_prefill_plan(batch, manager, None)
+                new = lambda: new_module.make_fused_prefill_plan(batch, manager)
                 results["benchmarks"][f"make_prefill_plan/B{b}L{length}"] = measure(
                     old, new, d, 30
                 )
