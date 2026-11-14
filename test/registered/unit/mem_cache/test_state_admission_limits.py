@@ -86,6 +86,7 @@ def _cache():
         sliding_window_size=16,
         window_retain_size=lambda component: 16,
         full_evictable_size=lambda: 0,
+        full_unreclaimable_size=lambda: 0,
         window_evictable_size=lambda component: 0,
         mamba_evictable_size=lambda: 0,
         supports_mamba=lambda: True,

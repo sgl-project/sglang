@@ -742,6 +742,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def full_evictable_size(self):
         return 0
 
+    def full_unreclaimable_size(self) -> int:
+        """Evictable FULL tokens that eviction cannot free right now."""
+        return 0
+
     def window_evictable_size(self, sub_pool: str) -> int:
         """Evictable tokens of one window sub-pool."""
         return 0

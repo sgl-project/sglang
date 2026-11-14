@@ -97,6 +97,7 @@ def _cache():
         # The target's window slot retains its own window; a draft window more.
         window_retain_size=lambda name: 8 if name == "window" else 32,
         full_evictable_size=lambda: 0,
+        full_unreclaimable_size=lambda: 0,
         window_evictable_size=lambda component: 0,
         supports_prefix_sharing=lambda: True,
         window_checkpoint_interval=lambda: 0,
@@ -572,6 +573,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             window_retain_size=lambda component: page_size,
             disable=True,
             full_evictable_size=lambda: 0,
+            full_unreclaimable_size=lambda: 0,
             window_evictable_size=lambda component: 0,
             supports_prefix_sharing=lambda: False,
             window_checkpoint_interval=lambda: 0,
