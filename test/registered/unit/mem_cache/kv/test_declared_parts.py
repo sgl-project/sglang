@@ -693,7 +693,11 @@ class TestDeclaredParts(CustomTestCase):
         )
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = True
-        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=8)
+        cfg.model_config = SimpleNamespace(
+            kv_lora_rank=8,
+            qk_rope_head_dim=8,
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"]),
+        )
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
         cfg.hybrid_gdn_config = None
@@ -884,7 +888,11 @@ class TestDeclaredParts(CustomTestCase):
         )
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = True
-        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=4)
+        cfg.model_config = SimpleNamespace(
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"]),
+        )
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
         cfg.hybrid_gdn_config = cfg.hybrid_kda_config = None
@@ -1714,7 +1722,11 @@ class TestDeclaredParts(CustomTestCase):
         cfg.mambaish_config = cfg.hybrid_gdn_config = hf
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = True
-        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=4)
+        cfg.model_config = SimpleNamespace(
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"]),
+        )
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
         for algorithm in ("DFLASH", "DSPARK", "EAGLE"):

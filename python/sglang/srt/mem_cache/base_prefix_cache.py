@@ -805,6 +805,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(handle), None
 
+    def staged_storage_prefix_end(self, handle: CacheRequestHandle) -> int:
+        """Absolute end of a completed storage prefetch held outside the tree
+        until admission, or 0 when nothing is staged."""
+        return 0
+
+    def can_poll_prefetch_progress(self) -> bool:
+        """Whether poll_prefetch_progress may run before admission without
+        cutting a storage prefetch short."""
+        return False
+
     def ready_to_load_host_cache(self) -> Any:
         """
         Notify the cache controller to start the KV cache loading
