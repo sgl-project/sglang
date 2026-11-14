@@ -1589,9 +1589,11 @@ class TestDeclaredParts(CustomTestCase):
                 self.assertFalse(torch.equal(live, resolved))
                 ring_keyword = {
                     "gdn_circular": "replay_indices",
+                    "gdn_fold": "ring_indices",
                     "kda_fold": "ring_indices",
                 }
                 outputs, conv_destinations, ring_rows = [], [], []
+                accept_index = torch.tensor([[0, 1, 2, 3]])
 
                 def commit(**kw):
                     outputs.append(
@@ -1599,6 +1601,10 @@ class TestDeclaredParts(CustomTestCase):
                     )
                     if mode in ring_keyword:
                         ring_rows.append(kw[ring_keyword[mode]])
+                    if mode == "gdn_fold":
+                        # The fold replays the accepted path, not a prefix.
+                        self.assertIs(kw["accept_index"], accept_index)
+                        self.assertEqual(kw["draft_token_num"], 4)
 
                 def scatter(*args):
                     conv_destinations.append(args[2])
@@ -1625,7 +1631,7 @@ class TestDeclaredParts(CustomTestCase):
                         SimpleNamespace(model_runner=runner),
                         batch,
                         torch.tensor([2]),
-                        torch.tensor([[0, 1, 2, 3]]),
+                        accept_index,
                         4,
                         prepared_step_indices=(torch.tensor([1]), torch.tensor([0])),
                     )

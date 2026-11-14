@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """GDN ReplaySSM fold-every-commit: replay the ring-written raw inputs of the
-accepted draft prefix into the fp32 checkpoint on commit (replaces the
+accepted draft prefix (or tree path) into the fp32 checkpoint on commit (replaces the
 per-draft ``intermediate_ssm`` snapshots).
 
 The fold is a BITWISE CLONE of ``fused_sigmoid_gating_delta_rule_update_kernel``'s
@@ -26,6 +26,9 @@ def gdn_replayssm_exact_fold_kernel(
     accept_lens,  # [B] int  committed prefix length per request (incl. bonus)
     mamba_track_indices,  # [B] int  extra_buffer track slot (or NULL) per request
     mamba_steps_to_track,  # [B] int  crossing step (or -1) per request
+    ring_indices,  # [B] int  ring row per request
+    accept_index,  # [B, >= accept_lens] int  accepted verify rows (tree path)
+    draft_token_num,  # verify rows per request, for accept_index
     stride_state_slot: tl.constexpr,
     stride_rawv_slot: tl.constexpr,
     stride_rawk_slot: tl.constexpr,
@@ -40,6 +43,8 @@ def gdn_replayssm_exact_fold_kernel(
     stride_accept: tl.constexpr,
     stride_track: tl.constexpr,
     stride_steps: tl.constexpr,
+    stride_ring: tl.constexpr,
+    stride_accept_row: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -50,6 +55,7 @@ def gdn_replayssm_exact_fold_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
+    HAS_PATH: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -70,6 +76,7 @@ def gdn_replayssm_exact_fold_kernel(
     n_commit = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
     if n_commit <= 0:
         return
+    ring_idx = tl.load(ring_indices + i_n * stride_ring).to(tl.int64)
 
     if HAS_TRACK:
         track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
@@ -96,10 +103,19 @@ def gdn_replayssm_exact_fold_kernel(
     b_h = tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
 
     for t in range(0, n_commit):
-        phys = t.to(tl.int64)
+        if HAS_PATH:
+            # Tree verify wrote node j of request i_n at ring position j;
+            # accept_index holds the accepted path as verify rows
+            # i_n * draft_token_num + j.
+            phys = (
+                tl.load(accept_index + i_n * stride_accept_row + t).to(tl.int64)
+                - i_n * draft_token_num
+            )
+        else:
+            phys = t.to(tl.int64)
         b_k = tl.load(
             rawk_cache
-            + state_idx * stride_rawk_slot
+            + ring_idx * stride_rawk_slot
             + (i_h * MAX_CACHE_LEN + phys) * K
             + o_k,
             mask=mask_k,
@@ -107,17 +123,17 @@ def gdn_replayssm_exact_fold_kernel(
         ).to(tl.float32)
         b_v = tl.load(
             rawv_cache
-            + state_idx * stride_rawv_slot
+            + ring_idx * stride_rawv_slot
             + (i_hv * MAX_CACHE_LEN + phys) * V
             + o_v,
             mask=mask_v,
             other=0.0,
         ).to(tl.float32)
         b_g = tl.load(
-            g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
+            g_cache + ring_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
         ).to(tl.float32)
         b_beta = tl.load(
-            beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
+            beta_cache + ring_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
         ).to(tl.float32)
 
         if USE_QK_L2NORM_IN_KERNEL:
@@ -128,7 +144,7 @@ def gdn_replayssm_exact_fold_kernel(
         b_h += b_k[:, None] * b_v[None, :]
 
         if HAS_TRACK:
-            if (t == track_step) and (track_idx > NULL_BLOCK_ID):
+            if (phys == track_step) and (track_idx > NULL_BLOCK_ID):
                 tl.store(
                     h0
                     + track_idx * stride_state_slot
@@ -154,6 +170,9 @@ def commit_gdn_replayssm_fold_all_layers(
     num_k_heads: int,
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
+    ring_indices: torch.Tensor | None = None,  # [B] ring row; default: the slot
+    accept_index: torch.Tensor | None = None,  # [B, >= accept_lens] tree path
+    draft_token_num: int = 0,  # verify rows per request, with accept_index
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = -1,
 ) -> None:
@@ -178,6 +197,15 @@ def commit_gdn_replayssm_fold_all_layers(
         steps_t = accept_lens
         stride_track = 0
         stride_steps = 0
+    if ring_indices is None:
+        ring_indices = ssm_state_indices
+    has_path = accept_index is not None
+    if has_path:
+        assert accept_index.shape[0] >= B
+        assert 0 < draft_token_num <= max_cache_len, (
+            f"{draft_token_num=} must be in (0, {max_cache_len}]"
+        )
+        accept_index = accept_index.contiguous()
     gdn_replayssm_exact_fold_kernel[grid](
         checkpoint_state,
         rawv_cache,
@@ -188,6 +216,9 @@ def commit_gdn_replayssm_fold_all_layers(
         accept_lens,
         track_idx_t,
         steps_t,
+        ring_indices,
+        accept_index if has_path else accept_lens,
+        draft_token_num,
         checkpoint_state.stride(1),
         rawv_cache.stride(1),
         rawk_cache.stride(1),
@@ -202,6 +233,8 @@ def commit_gdn_replayssm_fold_all_layers(
         accept_lens.stride(0),
         stride_track,
         stride_steps,
+        ring_indices.stride(0),
+        accept_index.stride(0) if has_path else 0,
         H=num_k_heads,
         HV=HV,
         K=K,
@@ -212,6 +245,7 @@ def commit_gdn_replayssm_fold_all_layers(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
+        HAS_PATH=has_path,
         num_warps=1,
         num_stages=3,
     )
@@ -226,6 +260,9 @@ def commit_gdn_replayssm_fold_after_verify(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     src_indices_raw: torch.Tensor | None = None,
+    ring_indices: torch.Tensor | None = None,
+    accept_index: torch.Tensor | None = None,
+    draft_token_num: int = 0,
     null_block_id: int = -1,
 ) -> None:
     """Fold each layer's accepted window into ``temporal``, then do the usual
@@ -248,6 +285,9 @@ def commit_gdn_replayssm_fold_after_verify(
         num_k_heads=num_k_heads,
         mamba_track_indices=mamba_track_indices,
         mamba_steps_to_track=mamba_steps_to_track,
+        ring_indices=ring_indices,
+        accept_index=accept_index,
+        draft_token_num=draft_token_num,
         null_block_id=null_block_id,
     )
     for conv_states, interm_conv in zip(

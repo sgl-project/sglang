@@ -1499,7 +1499,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
                 # the pool gates OFF under --enable-linear-replayssm-spec (the
-                # same flag that makes `use_replayssm_spec` true above), so
+                # same flag that selects one of the branches above), so
                 # this branch is unreachable with a None buffer by
                 # construction -- keep it loud rather than silently frozen.
                 assert intermediate_state_cache is not None, (
@@ -1755,21 +1755,44 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Ring-writing verify; the commit fold replays the accepted prefix
-        into ``temporal``. Uses the vendored CuTe DSL MTP kernel when the
-        dispatcher selected the FlashInfer bf16-state verify, else the Triton
-        recurrent kernel (both store the same raw window)."""
+        (or tree path) into ``temporal``. A draft tree uses
+        ``gdn_tree_verify``. A chain uses the vendored CuTe DSL MTP kernel when the
+        dispatcher selected the FlashInfer bf16-state verify and the rings are
+        indexed by state slot, else the Triton recurrent kernel (both store the
+        same raw window)."""
+        if retrieve_parent_token is not None:
+            from sglang.kernels.ops.attention.linear.gdn_tree_verify import (
+                gdn_tree_verify,
+            )
+
+            return gdn_tree_verify(
+                A_log=layer.A_log,
+                a=a,
+                dt_bias=layer.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                ring_indices=self.forward_metadata.replayssm_ring_indices,
+                retrieve_parent_token=retrieve_parent_token,
+                replayssm_rawv=layer_cache.replayssm_rawv,
+                replayssm_rawk=layer_cache.replayssm_rawk,
+                replayssm_g=layer_cache.replayssm_g,
+                replayssm_beta=layer_cache.replayssm_beta,
+            )
         from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )
 
-        assert retrieve_parent_token is None, (
-            "ReplaySSM fold-every-commit supports a linear draft chain only "
-            "(topk <= 1); EAGLE tree verify must use the recurrent verify."
-        )
         seq_len = query.shape[1]
         batch_size = query_start_loc.shape[0] - 1
         draft_token_num = seq_len // batch_size
-        if self._replayssm_fold_uses_cutedsl(ssm_states.dtype, draft_token_num):
+        # The CuTe DSL kernel indexes the rings by state slot, not request row.
+        if not self.state_pool.replayssm_request_ring and (
+            self._replayssm_fold_uses_cutedsl(ssm_states.dtype, draft_token_num)
+        ):
             from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import (
                 gated_delta_rule_mtp,
             )
@@ -1816,6 +1839,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             replayssm_rawk=layer_cache.replayssm_rawk,
             replayssm_g=layer_cache.replayssm_g,
             replayssm_beta=layer_cache.replayssm_beta,
+            ring_indices=self.forward_metadata.replayssm_ring_indices,
         )
 
     def _replayssm_target_verify(

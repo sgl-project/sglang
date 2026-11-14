@@ -456,21 +456,14 @@ def handle_linear_attn_backend(server_args: Any):
     # and fp32 log-decays; accepted BF16 windows are materialized with
     # compensated hi/lo accumulation. The intra-window interaction
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
-    # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
-    # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
-    # GDN keeps a --linear-replayssm-cache-len ring that must hold the draft
-    # window (MambaPool checks it); KDA (kda_backend) keeps a window of the
+    # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP).
+    # A GDN tree verify (topk > 1) uses the ancestor mask instead and folds the
+    # accepted path from a raw-input ring on commit (gdn_tree_verify).
+    # A GDN chain keeps a --linear-replayssm-cache-len ring that must hold the
+    # draft window (MambaPool checks it); KDA (kda_backend) keeps a window of the
     # same length and folds via its own fused verify ring-write +
     # commit_kda_replayssm_after_verify.
     if cfg.enable_linear_replayssm_spec:
-        if cfg.speculative_eagle_topk not in (None, 1):
-            raise ValueError(
-                "--enable-linear-replayssm-spec requires a linear draft chain "
-                "(--speculative-eagle-topk in {None, 1}); the chunked verify "
-                "kernel uses a strictly-lower causal mask and is invalid for "
-                "EAGLE tree verify. Got "
-                f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-            )
         if decode not in ("triton", "flashinfer"):
             raise ValueError(
                 "--enable-linear-replayssm-spec requires the triton or "

@@ -31,8 +31,8 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 # temporal = (hv=4, v_dim=8, k_dim=8), num_k_heads_per_tp = 4, record_len = 8,
 # 2 layers. conv bf16 (2B), fp32 gate/beta (4B). Ring tensors (per slot, per
 # layer):
-# GDN stores compact d/k plus scalar g. KDA stores raw v/k, vector g, beta,
-# and its existing d/k rings.
+# GDN stores compact d/k plus scalar g, or for a tree raw v/k, scalar g and
+# beta. KDA stores raw v/k, vector g, beta, and its existing d/k rings.
 DTYPE = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
 RL = 8
 LAYERS = [0, 1]
@@ -74,6 +74,13 @@ class TestReplaySSMRingAccounting(CustomTestCase):
         self.assertEqual(
             _gdn_params(torch.bfloat16).replayssm_ring_bytes_per_req(record_len=RL),
             2176 * len(LAYERS),
+        )
+
+    def test_gdn_tree_fold(self):
+        # rawv 512 + rawk 512 + scalar g 128 + beta 128 = 1280
+        self.assertEqual(
+            _gdn_params().replayssm_ring_bytes_per_req(record_len=RL, gdn_tree=True),
+            1280 * len(LAYERS),
         )
 
     def test_kda_fold(self):

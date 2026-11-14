@@ -1250,7 +1250,7 @@ def commit_mamba_states_after_verify(
         if batch.mamba_track_indices is not None:
             replay_track_indices = state_slots.track[:bs]
 
-    # Fold-every-commit: replay the accepted prefix from the ring into
+    # Fold-every-commit: replay the accepted prefix or path from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
     # track slot, so no SSM scatter or force-flush is needed here.
     if (
@@ -1263,6 +1263,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
+        assert state_slots.ring is not None, "the GDN ring is indexed per request"
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
             state_batch_indices=replay_state_indices,
@@ -1271,6 +1272,9 @@ def commit_mamba_states_after_verify(
             mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
+            ring_indices=state_slots.ring[:bs],
+            accept_index=accept_index,
+            draft_token_num=draft_token_num,
             null_block_id=-1,
         )
         commit_ple_states_after_verify(

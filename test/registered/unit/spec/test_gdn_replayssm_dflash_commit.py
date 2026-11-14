@@ -2,7 +2,8 @@
 
 Under ``--enable-linear-replayssm-spec`` a GDN verify appends the draft window
 to a compact request ring of ``--linear-replayssm-cache-len`` positions and the
-commit folds the accepted prefix into the checkpoint. DSPARK and DFLASH commit
+commit folds the accepted prefix into the checkpoint; a tree verify keeps one
+raw record per draft token instead. DSPARK and DFLASH commit
 through ``HybridLinearAttnBackend.update_mamba_state_after_mtp_verify``, which
 goes through the same ring commit as the generic spec commit.
 """
@@ -14,6 +15,8 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.configs.mamba_utils import (
+    KimiLinearCacheParams,
+    KimiLinearStateShape,
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
@@ -105,7 +108,7 @@ def _hybrid_backend(mamba_pool, spec_state, cache_indices, track_slots=None):
 
 class TestGDNReplaySSMRingLength(CustomTestCase):
     @staticmethod
-    def _pool(ring_len, draft_tokens=DRAFT_TOKENS):
+    def _pool(ring_len, draft_tokens=DRAFT_TOKENS, topk=None):
         return MambaPool(
             size=4,
             spec_state_size=3,
@@ -113,10 +116,56 @@ class TestGDNReplaySSMRingLength(CustomTestCase):
             mamba_layer_ids=[0, 1],
             device="cpu",
             speculative_num_draft_tokens=draft_tokens,
-            speculative_eagle_topk=None,
+            speculative_eagle_topk=topk,
             linear_replayssm_cache_len=ring_len,
             enable_linear_replayssm_spec=True,
         )
+
+    def test_tree_keeps_one_raw_record_per_draft_token(self):
+        pool = self._pool(ring_len=16, topk=4)
+        state = pool.get_speculative_mamba2_params_all_layers()
+        hv, v_dim, _ = state.temporal.shape[2:]
+        self.assertIsNone(state.intermediate_ssm)
+        self.assertIsNone(state.replayssm_d)
+        self.assertEqual(
+            tuple(state.replayssm_rawv.shape), (2, 4, hv, DRAFT_TOKENS, v_dim)
+        )
+        self.assertEqual(tuple(state.replayssm_beta.shape), (2, 4, hv, DRAFT_TOKENS))
+        rings = (
+            state.replayssm_rawv,
+            state.replayssm_rawk,
+            state.replayssm_g,
+            state.replayssm_beta,
+        )
+        # The memory planner reserves exactly what the pool allocates per row.
+        self.assertEqual(
+            sum(ring[:, 0].numel() * ring.element_size() for ring in rings),
+            _gdn_cache_params().replayssm_ring_bytes_per_req(
+                record_len=DRAFT_TOKENS, gdn_tree=True
+            ),
+        )
+
+    def test_tree_is_rejected_for_kda(self):
+        shape = KimiLinearStateShape.create(
+            tp_world_size=1, num_heads=4, head_dim=8, num_k_heads=4, head_k_dim=8
+        )
+        cache_params = KimiLinearCacheParams(
+            shape=shape,
+            dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
+            layers=[0, 1],
+        )
+        with self.assertRaisesRegex(ValueError, "GDN layers only"):
+            MambaPool(
+                size=4,
+                spec_state_size=3,
+                cache_params=cache_params,
+                mamba_layer_ids=[0, 1],
+                device="cpu",
+                speculative_num_draft_tokens=DRAFT_TOKENS,
+                speculative_eagle_topk=4,
+                linear_replayssm_cache_len=16,
+                enable_linear_replayssm_spec=True,
+            )
 
     def test_ring_must_hold_the_draft_window(self):
         with self.assertRaisesRegex(ValueError, "ring too small"):
