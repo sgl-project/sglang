@@ -841,6 +841,8 @@ class TboForwardBatchPreparer:
                 # Children publish no per-rank list of their own; the parent
                 # published the gather sizes before it was split.
                 global_num_tokens_padded_cpu=None,
+                global_late_layer_num_tokens_cpu=None,
+                global_late_layer_tail_graph_compatible=False,
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
