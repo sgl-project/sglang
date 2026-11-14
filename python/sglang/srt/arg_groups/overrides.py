@@ -572,9 +572,25 @@ def _check_dsa_backend_constraints(
     *,
     hip: bool,
     dcp_size: int = 1,
+    disaggregation_mode: str = "null",
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
+
+    # A TRTLLM consumer makes the shared pool store raw FP8 rows, which the
+    # other backend's scaled-FP8 / BF16 kernels cannot read.
+    if (
+        not hip
+        and kv_cache_dtype == "fp8_e4m3"
+        and disaggregation_mode == "null"
+        and (prefill_backend == "trtllm") != (decode_backend == "trtllm")
+    ):
+        raise ValueError(
+            f"FP8 KV with --dsa-prefill-backend {prefill_backend!r} and "
+            f"--dsa-decode-backend {decode_backend!r} is unsupported: trtllm "
+            "stores raw FP8 rows that the other backend cannot read. Use trtllm "
+            "for both, or --kv-cache-dtype bfloat16."
+        )
 
     # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
     if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
@@ -732,6 +748,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             decode,
             hip=get_platform().is_hip,
             dcp_size=getattr(view, "dcp_size", 1) or 1,
+            disaggregation_mode=getattr(view, "disaggregation_mode", "null"),
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -766,6 +783,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         decode,
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
+        disaggregation_mode=getattr(view, "disaggregation_mode", "null"),
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
