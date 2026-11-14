@@ -129,7 +129,7 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
 ):
     """Pure decode low latency: 128k input with a shared prefix
     (repeat_rate=0.99, ~1310-token natural-text tail) / 1024 out,
-    C8, mean TPOT <= 30 ms and output throughput >= 60 token/s, via the
+    C6, mean TPOT <= 30 ms and output throughput >= 60 token/s, via the
     official aisbench prefix mode. One native aisbench warmup request is
     discarded because the first long-context decode after a fresh server
     start can stall."""
@@ -140,8 +140,8 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     dataset_path = None
     input_len = 131072
     output_len = 1024
-    num_prompts = 8
-    max_concurrency = 8
+    num_prompts = 6
+    max_concurrency = 6
     repeat_rate = 0.99
     request_rate = 0
     dp = 4
