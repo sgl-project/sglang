@@ -25,7 +25,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.cuda_vmm_utils import exchange_posix_fds
+from sglang.srt.utils.vmm_common import exchange_posix_fds
 
 logger = logging.getLogger(__name__)
 
