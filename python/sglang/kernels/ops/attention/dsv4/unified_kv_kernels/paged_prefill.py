@@ -61,6 +61,16 @@ except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
 
+# gfx1250 aiter Gluon paged-prefill kernel; shares this module's signature and
+# reads q/kv strides directly, so it needs none of the OPUS fixups below.
+try:
+    from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+
+    _HAS_AITER_GFX1250 = is_gfx1250_supported()
+except ImportError:
+    pa_prefill_sparse = None
+    _HAS_AITER_GFX1250 = False
+
 
 @triton.jit
 def _sparse_attn_v4_paged_prefill_kernel(
@@ -336,6 +346,18 @@ def sparse_attn_v4_paged_prefill(
         ):
             kv = kv.as_strided(kv.shape, (kv.shape[1], 1))
         return pa_sparse_prefill_opus(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+        )
+    if _HAS_AITER_GFX1250:
+        return pa_prefill_sparse(
             q,
             unified_kv,
             kv_indices_prefix,
