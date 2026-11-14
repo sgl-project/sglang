@@ -99,17 +99,48 @@ def _estimate_hicache_bytes(
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
 
 
+def _world_cpu_group():
+    """None when this process has no sglang world group to synchronize with."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    try:
+        return get_parallel().world_group.cpu_group
+    except (RuntimeError, ValueError):
+        return None
+
+
+@contextmanager
+def _explicit_size_budget(params: CacheInitParams):
+    """Book explicitly sized host pools against a snapshot taken before any rank
+    allocates; re-sampling per pool charges a late rank for its peers' pools."""
+    kvcache_device = getattr(
+        params.token_to_kv_pool_allocator.get_kvcache(), "device", None
+    )
+    allocator = get_allocator_class_from_storage(get_allocator_type())
+    budget = host_memory_budget_plain_hugetlb(allocator, kvcache_device)
+    group = _world_cpu_group()
+    if group is not None:
+        torch.distributed.barrier(group=group)
+    with host_memory_budget_scope(budget):
+        yield
+
+
 @contextmanager
 def auto_size_hicache(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, enabled: bool
 ):
     """Reduce the default HiCache ratio until this machine's host pools fit.
 
-    Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
+    Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size;
+    those pools keep their size but still book one host memory snapshot.
     """
-    fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    if not enabled:
         yield
+        return
+    fraction = get_memory().hicache_host_memory_fraction
+    if fraction is None:
+        with _explicit_size_budget(params):
+            yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
@@ -129,12 +160,11 @@ def auto_size_hicache(
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
-    if torch.distributed.is_initialized():
+    group = _world_cpu_group()
+    if group is not None:
         value = torch.tensor([ratio], dtype=torch.float64)
         torch.distributed.all_reduce(
-            value,
-            op=torch.distributed.ReduceOp.MIN,
-            group=get_parallel().world_group.cpu_group,
+            value, op=torch.distributed.ReduceOp.MIN, group=group
         )
         ratio = value.item()
     if ratio <= 0:

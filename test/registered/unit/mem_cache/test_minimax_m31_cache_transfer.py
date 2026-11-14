@@ -582,6 +582,12 @@ def test_dspark_hicache_shares_capacity_and_total_budget(
             hicache_io_backend="direct" if layout == "page_first_direct" else "kernel",
             hicache_mem_layout=layout,
         ),
+        # Host memory free now caps the snapshot; pin it so it never binds.
+        patch.object(
+            base,
+            "available_host_memory_bytes",
+            return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + budget,
+        ),
         host_memory_budget_scope(budget),
     ):
         group, controller = build_stack(params, target)
