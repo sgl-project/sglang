@@ -1153,6 +1153,20 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+def _stop_checkpoint_prefetch(
+    handle: Optional[CheckpointFilePrefetchHandle], *, unwinding: bool
+) -> None:
+    if handle is None:
+        return
+    try:
+        handle.stop()
+    except TimeoutError:
+        if not unwinding:
+            raise
+        # Preserve the load error (or GeneratorExit) if storage is still stuck.
+        logger.warning("Checkpoint prefetch cleanup timed out", exc_info=True)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
@@ -1171,26 +1185,29 @@ def safetensors_weights_iterator(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
 
-    for st_file in tqdm(
-        hf_weights_files,
-        desc="Loading safetensors checkpoint shards",
-        disable=not enable_tqdm,
-        bar_format=BAR_FORMAT,
-        position=tqdm._get_free_pos(),
-    ):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-                for name in sorted(result.keys()):
-                    yield name, result[name]
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                for name in f.keys():
-                    yield name, f.get_tensor(name)
-        if drop_cache_after_load:
-            _drop_file_cache_after_load(st_file)
-    if prefetch_handle is not None:
-        prefetch_handle.stop()
+    completed = False
+    try:
+        for st_file in tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        ):
+            if disable_mmap:
+                with open(st_file, "rb") as f:
+                    result = safetensors.torch.load(f.read())
+                    for name in sorted(result.keys()):
+                        yield name, result[name]
+            else:
+                with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                    for name in f.keys():
+                        yield name, f.get_tensor(name)
+            if drop_cache_after_load:
+                _drop_file_cache_after_load(st_file)
+        completed = True
+    finally:
+        _stop_checkpoint_prefetch(prefetch_handle, unwinding=not completed)
 
 
 def get_pp_stage_load_group() -> LoadGroup:
@@ -1401,57 +1418,62 @@ def buffered_multi_thread_safetensors_weights_iterator(
         prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
+    completed = False
+    try:
+        enable_tqdm = (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        )
 
-    def _load_file(st_file: str):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-        return result
+        def _load_file(st_file: str):
+            if disable_mmap:
+                with open(st_file, "rb") as f:
+                    result = safetensors.torch.load(f.read())
+            else:
+                with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                    result = {k: f.get_tensor(k) for k in f.keys()}
+            return result
 
-    # Sliding window: max_workers loading + 1 prefetched.
-    buffer_size = max_workers + 1
+        # Sliding window: max_workers loading + 1 prefetched.
+        buffer_size = max_workers + 1
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        file_iter = iter(hf_weights_files)
-        pending: collections.deque = collections.deque()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            file_iter = iter(hf_weights_files)
+            pending: collections.deque = collections.deque()
 
-        # Seed the buffer.
-        for st_file in itertools.islice(file_iter, buffer_size):
-            pending.append((st_file, executor.submit(_load_file, st_file)))
+            # Seed the buffer.
+            for st_file in itertools.islice(file_iter, buffer_size):
+                pending.append((st_file, executor.submit(_load_file, st_file)))
 
-        with tqdm(
-            total=len(hf_weights_files),
-            desc="Multi-thread loading shards",
-            disable=not enable_tqdm,
-            bar_format=BAR_FORMAT,
-            position=tqdm._get_free_pos(),
-        ) as pbar:
-            while pending:
-                st_file, future = pending.popleft()
-                state_dict = future.result()
-                del future  # let GC reclaim the Future's internal result
+            with tqdm(
+                total=len(hf_weights_files),
+                desc="Multi-thread loading shards",
+                disable=not enable_tqdm,
+                bar_format=BAR_FORMAT,
+                position=tqdm._get_free_pos(),
+            ) as pbar:
+                while pending:
+                    st_file, future = pending.popleft()
+                    state_dict = future.result()
+                    del future  # let GC reclaim the Future's internal result
 
-                # Replenish: submit the next file to keep the buffer full.
-                next_file = next(file_iter, None)
-                if next_file is not None:
-                    pending.append((next_file, executor.submit(_load_file, next_file)))
+                    # Replenish: submit the next file to keep the buffer full.
+                    next_file = next(file_iter, None)
+                    if next_file is not None:
+                        pending.append(
+                            (next_file, executor.submit(_load_file, next_file))
+                        )
 
-                for name in sorted(state_dict.keys()):
-                    yield name, state_dict[name]
-                del state_dict
-                if drop_cache_after_load:
-                    # DONTNEED reduces page-cache pressure after copying weights,
-                    # but later mmap-backed tensor access may fault pages again.
-                    _drop_file_cache_after_load(st_file)
-                pbar.update(1)
-    if prefetch_handle is not None:
-        prefetch_handle.stop()
+                    for name in sorted(state_dict.keys()):
+                        yield name, state_dict[name]
+                    del state_dict
+                    if drop_cache_after_load:
+                        # DONTNEED reduces page-cache pressure after copying weights,
+                        # but later mmap-backed tensor access may fault pages again.
+                        _drop_file_cache_after_load(st_file)
+                    pbar.update(1)
+        completed = True
+    finally:
+        _stop_checkpoint_prefetch(prefetch_handle, unwinding=not completed)
 
 
 def _load_pt_file(bin_file: str) -> dict:
