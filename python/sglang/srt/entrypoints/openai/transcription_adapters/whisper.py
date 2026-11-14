@@ -59,9 +59,15 @@ WHISPER_AUTODETECT_REGEX = (
 WHISPER_AUTODETECT_TS_REGEX = (
     _LANG_PREFIX + r"<\|transcribe\|>" + r"<\|0\.00\|>" + r"[\s\S]*"
 )
+WHISPER_TRANSLATE_AUTODETECT_REGEX = (
+    _LANG_PREFIX + r"<\|translate\|>" + r"<\|notimestamps\|>" + r"[\s\S]*"
+)
+WHISPER_TRANSLATE_AUTODETECT_TS_REGEX = (
+    _LANG_PREFIX + r"<\|translate\|>" + r"<\|0\.00\|>" + r"[\s\S]*"
+)
 
 # Forced-prefix patterns, one per FSM variant. Each is anchored at start
-# and rejects anything missing ``<|transcribe|>`` so a bypassed FSM or a
+# and requires the requested task token so a bypassed FSM or a
 # mid-stream snapshot can't slip through as a valid detection. The two
 # patterns differ in what the third forced token is decoded *as*:
 #
@@ -84,6 +90,10 @@ _FUSED_PREFIX_RE_NOTS = re.compile(
     r"^" + _LANG_PREFIX + r"<\|transcribe\|><\|notimestamps\|>"
 )
 _FUSED_PREFIX_RE_TS = re.compile(r"^" + _LANG_PREFIX + r"<\|transcribe\|>")
+_FUSED_TRANSLATE_PREFIX_RE_NOTS = re.compile(
+    r"^" + _LANG_PREFIX + r"<\|translate\|><\|notimestamps\|>"
+)
+_FUSED_TRANSLATE_PREFIX_RE_TS = re.compile(r"^" + _LANG_PREFIX + r"<\|translate\|>")
 
 # Fixed Whisper control tokens (see transformers.models.whisper vocab).
 # <|startoftranscript|> / <|startofprev|> / <|startoflm|> only appear at
@@ -127,6 +137,10 @@ class WhisperAdapter(TranscriptionAdapter):
     TIMESTAMP_BASE_OFFSET = 0.02  # each token step = 0.02 s
 
     @property
+    def supports_translation(self) -> bool:
+        return True
+
+    @property
     def max_audio_clip_s(self) -> Optional[float]:
         # Whisper's encoder ingests a fixed 30 s window (3000 mel frames);
         # the feature extractor truncates anything longer, so longer audio
@@ -138,6 +152,7 @@ class WhisperAdapter(TranscriptionAdapter):
             "temperature": request.temperature,
             "max_new_tokens": 448,  # Whisper default max tokens
             "language": request.language,
+            "task": request.task,
         }
         if request.timestamp_granularities:
             params["timestamp_granularities"] = request.timestamp_granularities
@@ -166,6 +181,18 @@ class WhisperAdapter(TranscriptionAdapter):
         pass with no extra HTTP round-trip.
         """
         ts_variant = bool(request.timestamp_granularities)
+        # Translation uses the same source-language detection and timestamp
+        # controls, replacing only the task token in the forced prefix.
+        if request.task == "translate":
+            regex = (
+                WHISPER_TRANSLATE_AUTODETECT_TS_REGEX
+                if ts_variant
+                else WHISPER_TRANSLATE_AUTODETECT_REGEX
+            )
+        else:
+            regex = (
+                WHISPER_AUTODETECT_TS_REGEX if ts_variant else WHISPER_AUTODETECT_REGEX
+            )
         params: dict = {
             "temperature": request.temperature,
             # Fused auto-detect decoder prompt is just <|startoftranscript|>
@@ -173,9 +200,8 @@ class WhisperAdapter(TranscriptionAdapter):
             # max_target_positions is 448, so max_new_tokens caps at 447:
             # 1 prompt + 3 forced prefix + up to 444 free transcription = 448.
             "max_new_tokens": 447,
-            "regex": (
-                WHISPER_AUTODETECT_TS_REGEX if ts_variant else WHISPER_AUTODETECT_REGEX
-            ),
+            "regex": regex,
+            "task": request.task,
             "skip_special_tokens": False,
             # parse_fused_output matches a zero-space forced prefix
             # (``<|en|><|transcribe|><|notimestamps|>`` glued together).
@@ -192,7 +218,11 @@ class WhisperAdapter(TranscriptionAdapter):
 
     @staticmethod
     def parse_fused_output(
-        text: str, *, ts_variant: bool = False, strip: bool = True
+        text: str,
+        *,
+        ts_variant: bool = False,
+        strip: bool = True,
+        task: str = "transcribe",
     ) -> tuple[Optional[str], Optional[str]]:
         """Parse fused output into ``(language_code, user_visible_text)``.
 
@@ -227,7 +257,14 @@ class WhisperAdapter(TranscriptionAdapter):
         correct separator at the chunk seam, so an artificial one must not
         be invented after stripping.
         """
-        pattern = _FUSED_PREFIX_RE_TS if ts_variant else _FUSED_PREFIX_RE_NOTS
+        if task == "translate":
+            pattern = (
+                _FUSED_TRANSLATE_PREFIX_RE_TS
+                if ts_variant
+                else _FUSED_TRANSLATE_PREFIX_RE_NOTS
+            )
+        else:
+            pattern = _FUSED_PREFIX_RE_TS if ts_variant else _FUSED_PREFIX_RE_NOTS
         m = pattern.match(text)
         if not m:
             return None, None
@@ -263,6 +300,7 @@ class WhisperAdapter(TranscriptionAdapter):
         output_ids = ret.get("output_ids", [])
         parsed_text, segments = self._parse_segments(output_ids, tokenizer)
         return TranscriptionVerboseResponse(
+            task=request.task,
             # Pass None through when fused auto-detect failed to parse a
             # language — the client should see detection-failed, not a silent
             # English default. For explicit-language requests request.language
@@ -293,6 +331,7 @@ class WhisperAdapter(TranscriptionAdapter):
             )
             segments.extend(part_segments)
         return TranscriptionVerboseResponse(
+            task=request.task,
             language=request.language,
             duration=round(request.audio_duration_s, 2),
             # The serving layer already stitched model text using each

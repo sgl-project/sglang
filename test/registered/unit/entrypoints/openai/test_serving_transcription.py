@@ -115,12 +115,16 @@ class TestStreamingFusedAutodetect(CustomTestCase):
         )
 
     def _run_stream(
-        self, chunks: List[dict], fused: bool = True, ts_variant: bool = False
+        self,
+        chunks: List[dict],
+        fused: bool = True,
+        ts_variant: bool = False,
+        task: str = "transcribe",
     ):
         tm = _MockTokenizerManager(chunks)
         serving = OpenAIServingTranscription(tm)
 
-        kwargs = {"model": "whisper", "stream": True}
+        kwargs = {"model": "whisper", "stream": True, "task": task}
         if ts_variant:
             kwargs["timestamp_granularities"] = ["segment"]
         request = TranscriptionRequest(**kwargs)
@@ -166,6 +170,56 @@ class TestStreamingFusedAutodetect(CustomTestCase):
         request, frames = self._run_stream(chunks)
         self.assertEqual(request.language, "zh")
         self.assertEqual(_deltas_from_sse(frames), ["你好", "世界"])
+
+    def test_translation_stream_strips_task_prefix(self):
+        """A translate prefix must produce text deltas instead of an FSM error."""
+        for timestamps in (False, True):
+            with self.subTest(timestamps=timestamps):
+                prefix = "<|es|><|translate|>"
+                if not timestamps:
+                    prefix += "<|notimestamps|>"
+                chunks = [
+                    _chunk("<|es|>"),
+                    _chunk(prefix + " Hello"),
+                    _chunk(prefix + " Hello world<|endoftext|>", finish="stop"),
+                ]
+                request, frames = self._run_stream(
+                    chunks, ts_variant=timestamps, task="translate"
+                )
+                self.assertEqual(request.language, "es")
+                self.assertEqual(_deltas_from_sse(frames), ["Hello", " world"])
+                self.assertFalse(any('"error"' in frame for frame in frames))
+
+    def test_translation_non_streaming_strips_prefix(self):
+        serving = OpenAIServingTranscription(_MockTokenizerManager([]))
+        request = TranscriptionRequest(model="whisper", task="translate")
+        request._fused_autodetect = True
+        text = serving._finalize_text(
+            request, "<|es|><|translate|><|notimestamps|> Hello<|endoftext|>"
+        )
+        self.assertEqual(text, "Hello")
+        self.assertEqual(request.language, "es")
+
+    def test_invalid_or_unsupported_task_rejected_before_audio_decode(self):
+        for task, supports_translation in (("invalid", True), ("translate", False)):
+            with self.subTest(task=task):
+                serving = OpenAIServingTranscription(_MockTokenizerManager([]))
+                serving._adapter = Mock(supports_translation=supports_translation)
+                with patch.object(serving, "_get_audio_duration") as decode:
+                    result = get_or_create_event_loop().run_until_complete(
+                        serving.create_transcription(
+                            audio_data=b"invalid audio",
+                            model="asr",
+                            language=None,
+                            response_format="json",
+                            temperature=0.0,
+                            stream=False,
+                            raw_request=Mock(),
+                            task=task,
+                        )
+                    )
+                self.assertEqual(result.status_code, 400)
+                decode.assert_not_called()
 
     def test_fsm_abort_before_sentinel_emits_error_frame(self):
         # Sentinel never arrives; stream terminates on finish_reason. The
@@ -542,10 +596,12 @@ class TestLongAudioChunkedStreaming(CustomTestCase):
             role="tokenizer",
         )
 
-    def _run_stream(self, results_per_request, fused=False, n_chunks=2):
+    def _run_stream(
+        self, results_per_request, fused=False, n_chunks=2, task="transcribe"
+    ):
         tm = _MockChunkTokenizerManager(results_per_request)
         serving = OpenAIServingTranscription(tm)
-        request = TranscriptionRequest(model="whisper", stream=True)
+        request = TranscriptionRequest(model="whisper", stream=True, task=task)
         if fused:
             request._fused_autodetect = True
             request._fused_ts_variant = False
@@ -683,6 +739,19 @@ class TestLongAudioChunkedStreaming(CustomTestCase):
         )
         self.assertEqual("".join(_deltas_from_sse(frames)), "你好世界")
         self.assertEqual(request.language, "zh")
+
+    def test_translation_chunks_strip_prefix_and_keep_source_language(self):
+        _, request, frames = self._run_stream(
+            [
+                [_chunk("<|es|><|translate|><|notimestamps|> Hello", finish="stop")],
+                [_chunk("<|es|><|translate|><|notimestamps|> world", finish="stop")],
+            ],
+            fused=True,
+            task="translate",
+        )
+        self.assertEqual("".join(_deltas_from_sse(frames)), "Hello world")
+        self.assertEqual(request.language, "es")
+        self.assertEqual(self._finish_reasons(frames), ["stop"])
 
     def test_fused_leading_silence_uses_first_nonempty_chunk_language(self):
         _, request, frames = self._run_stream(
