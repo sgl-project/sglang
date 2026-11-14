@@ -2,6 +2,7 @@
 """Protocol definitions for the weight cache daemon.
 
 Defines CacheConfig for validation and socket message protocol helpers.
+See README.md in this directory for the protocol compatibility policy.
 """
 
 import hashlib
@@ -25,7 +26,7 @@ class CacheConfig(msgspec.Struct):
     """Fingerprint of the cached weights. Used to validate compatibility
     between a daemon's cached state and a requesting engine process.
 
-    Any mismatch triggers a fallback to disk loading.
+    Any mismatch rejects the cache request.
     """
 
     model_path: str
@@ -205,6 +206,35 @@ def check_ipc_quant_support(
 
 
 MAX_MSG_SIZE = 256 * 1024 * 1024  # 256 MiB
+PROTOCOL_VERSION = 1
+
+
+class ProtocolVersionError(RuntimeError):
+    """The peer does not use a compatible weight cache protocol."""
+
+
+def check_protocol_version(version: Any) -> None:
+    """Require an explicit, equal protocol version from the peer."""
+    if type(version) is int and version == PROTOCOL_VERSION:
+        return
+    raise ProtocolVersionError(
+        f"Weight cache protocol version mismatch: local={PROTOCOL_VERSION}, "
+        f"peer={version!r}. Use compatible SGLang versions for the engine and "
+        "daemon. Stop attached engines before you restart the daemon."
+    )
+
+
+def handshake_with_daemon(sock) -> None:
+    """Check the daemon's protocol before any config or weight request."""
+    send_msg(sock, {"type": "handshake", "protocol_version": PROTOCOL_VERSION})
+    response = recv_msg(sock)
+    if not isinstance(response, dict):
+        raise RuntimeError("Invalid weight cache handshake response: expected a dict.")
+    check_protocol_version(response.get("protocol_version"))
+    if response.get("status") != "ok":
+        raise RuntimeError(
+            f"Weight cache handshake failed: {response.get('message', response)}"
+        )
 
 
 def send_msg(sock, obj: Any) -> None:
