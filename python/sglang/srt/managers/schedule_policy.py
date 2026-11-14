@@ -245,9 +245,7 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-                SchedulePolicy._sort_by_shortest_prefill(
-                    waiting_queue, temporary_deprioritized
-                )
+                self._sort_by_shortest_prefill(waiting_queue, temporary_deprioritized)
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
                     logger.info(
@@ -402,22 +400,34 @@ class SchedulePolicy:
                     )
         return temporary_deprioritized
 
-    @staticmethod
-    def _shortest_prefill_work(r: Req) -> int:
-        return max(
-            1,
-            len(r.origin_input_ids) + len(r.output_ids) - r.num_matched_prefix_tokens,
+    def poll_storage_prefetches(self, waiting_queue: Iterable[Req]) -> None:
+        """Observe finished storage prefetches before ranking. Completion is
+        otherwise observed only when admission reaches a request, which a
+        request still ranked by its unloaded prefix may never do."""
+        if (
+            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            or not self.tree_cache.can_poll_prefetch_progress()
+        ):
+            return
+        self.tree_cache.poll_prefetch_progress(
+            [req.cache_request_handle for req in waiting_queue]
         )
 
-    @staticmethod
+    def _shortest_prefill_work(self, r: Req) -> int:
+        cached = max(
+            r.num_matched_prefix_tokens,
+            self.tree_cache.staged_storage_prefix_end(r.cache_request_handle),
+        )
+        return max(1, len(r.origin_input_ids) + len(r.output_ids) - cached)
+
     def _sort_by_shortest_prefill(
-        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+        self, waiting_queue: List[Req], temporary_deprioritized: Set[int]
     ) -> None:
         # Prioritize short uncached prefills while deferring duplicate prefixes.
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
-                SchedulePolicy._shortest_prefill_work(r),
+                self._shortest_prefill_work(r),
                 r.time_stats.wait_queue_entry_time,
             )
         )
