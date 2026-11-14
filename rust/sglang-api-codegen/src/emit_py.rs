@@ -934,15 +934,27 @@ fn py_message_shapes(ctx: &Ctx, name: &str) -> (Vec<PyShape>, Vec<String>) {
 }
 
 /// Whether a bare-list message's elements are themselves arrays.
-fn py_elements_are_lists(ctx: &Ctx, name: &str) -> bool {
+/// Whether a bare list's elements are themselves lists of lists.
+fn py_nested_elements(ctx: &Ctx, name: &str) -> bool {
+    let MessageKind::BareList { item } = &ctx.model(name).kind else {
+        return false;
+    };
+    let FieldKind::RepeatedMessage { rust_path } = &item.kind else {
+        return false;
+    };
+    matches!(&ctx.model(rust_path).kind, MessageKind::BareList { .. })
+        && py_element_shapes(ctx, rust_path).0.contains(&PyShape::List)
+}
+
+/// The shapes and Struct classes of a bare list's elements.
+fn py_element_shapes(ctx: &Ctx, name: &str) -> (Vec<PyShape>, Vec<String>) {
     match &ctx.model(name).kind {
         MessageKind::BareList { item } => match &item.kind {
-            FieldKind::RepeatedMessage { rust_path } => {
-                py_message_shapes(ctx, rust_path).0.contains(&PyShape::List)
-            }
-            _ => false,
+            FieldKind::RepeatedScalar { ty } => (py_scalar_shapes(ty), vec![]),
+            FieldKind::RepeatedMessage { rust_path } => py_message_shapes(ctx, rust_path),
+            other => panic!("{name}: bare_list item must be repeated, got {other:?}"),
         },
-        _ => false,
+        other => panic!("{name}: not a bare list ({other:?})"),
     }
 }
 
@@ -973,28 +985,42 @@ fn emit_untagged_codec(out: &mut String, ctx: &Ctx, m: &MessageModel, variants: 
         FieldKind::Message { rust_path, .. } => format!("encode_{rust_path}(v)"),
         _ => unreachable!(),
     };
-    // Two list-shaped arms: the one whose elements are lists is the nested
-    // form, told apart by the first element (`[]` is the flat form).
+    // Several list-shaped arms: the first element's shape (or Struct class)
+    // picks the arm, `[]` is the first declared arm, and a shape two arms
+    // take goes to the first declared.
     let list_arms: Vec<&Arm> = arms
         .iter()
         .filter(|a| a.shapes.contains(&PyShape::List))
         .collect();
-    let nested_arm: Option<String> = match list_arms.len() {
-        0 | 1 => None,
-        2 => {
-            let is_nested = |a: &Arm| match &a.v.kind {
-                FieldKind::Message { rust_path, .. } => py_elements_are_lists(ctx, rust_path),
-                _ => false,
-            };
-            match (is_nested(list_arms[0]), is_nested(list_arms[1])) {
-                (true, false) => Some(list_arms[0].v.json_name.clone()),
-                (false, true) => Some(list_arms[1].v.json_name.clone()),
-                _ => panic!("{name}: two list-shaped arms cannot be told apart"),
-            }
+    let element_check = |a: &Arm, subject: &str| -> String {
+        let FieldKind::Message { rust_path, .. } = &a.v.kind else {
+            panic!(
+                "{name}: list-shaped arm {} must be a message",
+                a.v.json_name
+            );
+        };
+        let (shapes, classes) = py_element_shapes(ctx, rust_path);
+        let mut checks: Vec<String> = Vec::new();
+        for shape in &shapes {
+            checks.push(match shape {
+                PyShape::NoneT => format!("{subject} is None"),
+                PyShape::Bool => format!("isinstance({subject}, bool)"),
+                PyShape::Str => format!("isinstance({subject}, str)"),
+                PyShape::Int => format!("_is_int({subject})"),
+                PyShape::Float => format!("_is_number({subject})"),
+                PyShape::Dict => format!("isinstance({subject}, dict)"),
+                // A matrix list is told from a nested list one level deeper.
+                PyShape::List if py_nested_elements(ctx, rust_path) => format!(
+                    "(isinstance({subject}, list) and bool({subject}) and isinstance({subject}[0], list))"
+                ),
+                PyShape::List => format!("isinstance({subject}, list)"),
+            });
         }
-        _ => panic!("{name}: more than two list-shaped untagged arms"),
+        if !classes.is_empty() {
+            checks.push(format!("isinstance({subject}, ({},))", classes.join(", ")));
+        }
+        checks.join(" or ")
     };
-
     // Decode: one test per shape, bool before int (a Python bool is an int).
     for shape in [
         PyShape::NoneT,
@@ -1015,17 +1041,34 @@ fn emit_untagged_codec(out: &mut String, ctx: &Ctx, m: &MessageModel, variants: 
                 claimants.iter().map(|a| &a.v.json_name).collect::<Vec<_>>()
             );
         }
-        if shape == PyShape::List && claimants.len() == 2 {
-            let nested = nested_arm.as_deref().expect("nested arm");
-            let (n, f) = if claimants[0].v.json_name == nested {
-                (claimants[0], claimants[1])
-            } else {
-                (claimants[1], claimants[0])
-            };
+        if shape == PyShape::List && claimants.len() > 1 {
             de.push_str(&format!(
-                "    if isinstance(value, list):\n        if value and isinstance(value[0], list):\n            return {}\n        return {}\n",
-                decode_expr(n),
-                decode_expr(f)
+                "    if isinstance(value, list):\n        if not value:\n            return {}\n",
+                decode_expr(claimants[0])
+            ));
+            // Bool before int (a Python bool is an int) and a matrix list
+            // before a plain nested list; declaration order otherwise.
+            let mut ordered: Vec<&Arm> = claimants.clone();
+            ordered.sort_by_key(|a| {
+                let FieldKind::Message { rust_path, .. } = &a.v.kind else {
+                    unreachable!()
+                };
+                let shapes = py_element_shapes(ctx, rust_path).0;
+                if shapes.contains(&PyShape::Bool) || py_nested_elements(ctx, rust_path) {
+                    0
+                } else {
+                    1
+                }
+            });
+            for a in ordered {
+                de.push_str(&format!(
+                    "        if {}:\n            return {}\n",
+                    element_check(a, "value[0]"),
+                    decode_expr(a)
+                ));
+            }
+            de.push_str(&format!(
+                "        raise _invalid_type(value, expected=\"one of the {name} list shapes\")\n"
             ));
             continue;
         }
@@ -1048,8 +1091,17 @@ fn emit_untagged_codec(out: &mut String, ctx: &Ctx, m: &MessageModel, variants: 
     ));
 
     // Encode: the runtime value's type picks the arm (a decoded object is its
-    // Struct class); list arms by first element.
-    for a in &arms {
+    // Struct class); list arms by first element, a matrix list first.
+    let mut encode_order: Vec<&Arm> = arms.iter().collect();
+    encode_order.sort_by_key(|a| match &a.v.kind {
+        FieldKind::Message { rust_path, .. }
+            if a.shapes.contains(&PyShape::List) && py_nested_elements(ctx, rust_path) =>
+        {
+            0
+        }
+        _ => 1,
+    });
+    for a in encode_order {
         let mut types: Vec<String> = Vec::new();
         for s in &a.shapes {
             let t = match s {
@@ -1073,13 +1125,13 @@ fn emit_untagged_codec(out: &mut String, ctx: &Ctx, m: &MessageModel, variants: 
         if a.shapes.contains(&PyShape::NoneT) {
             check = format!("v is None or {check}");
         }
-        if a.shapes.contains(&PyShape::List) && list_arms.len() == 2 {
-            let elem = if nested_arm.as_deref() == Some(a.v.json_name.as_str()) {
-                "(v and isinstance(v[0], list))"
+        if a.shapes.contains(&PyShape::List) && list_arms.len() > 1 {
+            let elem = element_check(a, "v[0]");
+            check = if list_arms[0].v.json_name == a.v.json_name {
+                format!("isinstance(v, list) and (not v or {elem})")
             } else {
-                "not (v and isinstance(v[0], list))"
+                format!("isinstance(v, list) and bool(v) and ({elem})")
             };
-            check = format!("isinstance(v, list) and {elem}");
         }
         en.push_str(&format!(
             "    if {check}:\n        return {}\n",
@@ -1122,17 +1174,20 @@ fn emit_tagged_codec(
         ));
         for f in &v.payload_fields {
             let key = &f.json_name;
+            // A required scalar takes its type default when the key is absent;
+            // an explicit null is a contract error, as in the struct codec.
             let read = match &f.kind {
-                FieldKind::OptScalar { ty, .. } => expect_call(ty, &format!("raw[{key:?}]"), None),
-                FieldKind::Message { rust_path, .. } => {
-                    format!("decode_{rust_path}(raw[{key:?}])")
-                }
-                other => panic!("{name}: tagged payload field kind {other:?} unsupported"),
+                FieldKind::Scalar {
+                    ty,
+                    null_default: None,
+                } => format!(
+                    "{} if {key:?} not in raw else {}",
+                    type_default(ty),
+                    expect_call(ty, &format!("raw[{key:?}]"), None)
+                ),
+                kind => de_expr(kind, &format!("raw.get({key:?})")),
             };
-            de.push_str(&format!(
-                "                {}=None if raw.get({key:?}) is None else {read},\n",
-                py_ident(key)
-            ));
+            de.push_str(&format!("                {}={read},\n", py_ident(key)));
         }
         let on_error = if passthrough.is_some() {
             "return dict(raw)"
@@ -1157,7 +1212,7 @@ fn emit_tagged_codec(
             v.json_name
         ));
         for f in &v.payload_fields {
-            en.push_str(&ser_stmts(f, "v.", true, "        "));
+            en.push_str(&ser_stmts(f, "v.", false, "        "));
         }
         en.push_str("        return d\n");
     }
