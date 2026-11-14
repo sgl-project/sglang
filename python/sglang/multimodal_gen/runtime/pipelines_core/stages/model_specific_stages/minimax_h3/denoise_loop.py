@@ -583,7 +583,7 @@ def minimax_h3_denoise_loop(
                     None if adaln_plan_slots is None else adaln_plan_slots[step]
                 ),
             )
-            if attn_metadata is not None:
+            if attn_metadata is not None and hasattr(attn_metadata, "current_timestep"):
                 attn_metadata.current_timestep = step
             if model_forward is None and attn_metadata is not None:
                 forward_cm: AbstractContextManager = set_forward_context(

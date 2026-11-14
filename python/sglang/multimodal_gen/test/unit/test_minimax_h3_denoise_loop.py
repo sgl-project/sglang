@@ -363,6 +363,61 @@ def test_cube_metadata_is_updated_per_step():
     assert seen == [(0, 0), (1, 1)]
 
 
+@pytest.mark.parametrize("precision", ["bf16", "fp8"])
+@pytest.mark.parametrize("use_model_forward", [False, True])
+def test_frozen_fa_metadata_preserves_step_context(precision, use_model_forward):
+    from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+        AscendFAMetadataBuilder,
+    )
+
+    branch = _branch("t2va")
+    config = {"precision": precision, "head_chunk_size": 4, "qk_rotation": True}
+    if precision == "fp8":
+        config["fp8_fa_mode"] = "C8V16_TILING512"
+    metadata = AscendFAMetadataBuilder().build(attention_backend_config=config)
+    seen = []
+
+    class Model:
+        def prepare_adaln_plans(self, _):
+            return None
+
+        def __call__(self, **_kwargs):
+            context = get_forward_context()
+            seen.append((context.current_timestep, context.attn_metadata))
+            return (
+                torch.zeros(int(branch.update_mask.sum()), 96),
+                torch.zeros(branch.audio_pos.numel(), 32),
+            )
+
+    batch = SimpleNamespace()
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+
+    def model_forward(model, kwargs, step):
+        return stage._forward_dit(
+            model, kwargs, step, batch=batch, attn_metadata=metadata
+        )
+
+    with patch.object(
+        MiniMaxH3DenoisingStage, "_maybe_get_bcg_runner", return_value=None
+    ):
+        minimax_h3_denoise_loop(
+            model=Model(),
+            model_forward=model_forward if use_model_forward else None,
+            positive=branch,
+            initial_video_rows=torch.zeros(branch.img_pos.numel(), 96),
+            initial_audio_rows=torch.zeros(branch.audio_pos.numel(), 32),
+            keyframe_cond_rows=None,
+            sigmas_video=[1.0, 0.5, 0.0],
+            sigmas_audio=[1.0, 0.5, 0.0],
+            device=torch.device("cpu"),
+            attn_metadata=metadata,
+        )
+
+    assert [step for step, _ in seen] == [0, 1]
+    assert all(actual is metadata for _, actual in seen)
+    assert metadata == AscendFAMetadataBuilder().build(attention_backend_config=config)
+
+
 def test_native_dit_forward_publishes_cube_metadata_in_forward_context():
     metadata = SimpleNamespace(current_timestep=0, topk_ratio_list=[0.5])
     batch = SimpleNamespace()
