@@ -10,6 +10,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -43,6 +44,28 @@ class TestSenderWrapper(CustomTestCase):
         router.socket_mapping.send_output.assert_called_once_with(
             worker_ipc, routed_output
         )
+
+
+class TestOutputSink(CustomTestCase):
+    @patch("sglang.srt.managers.scheduler_components.ipc_channels.get_zmq_socket")
+    def test_output_sink_replaces_both_senders_on_every_rank(self, _):
+        for is_rank_zero in (True, False):
+            outputs = []
+            channels = SchedulerIpcChannels.create(
+                port_args=MagicMock(),
+                is_rank_zero=is_rank_zero,
+                skip_tokenizer_init=True,
+                metrics_enabled=False,
+                enable_scripted_runtime=False,
+                output_sink=outputs.append,
+            )
+            token_output = MagicMock()
+            abort = AbortReq(rid="request")
+            channels.send_to_detokenizer.send_output(token_output)
+            channels.send_to_tokenizer.send_output(
+                abort, _make_scheduler_req("ipc:///unused")
+            )
+            self.assertEqual(outputs, [token_output, abort])
 
 
 if __name__ == "__main__":

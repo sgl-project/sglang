@@ -306,6 +306,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.managers.scheduler_components.output_sender import OutputSink
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
@@ -531,7 +532,15 @@ class Scheduler(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        *,
+        output_sink: Optional[OutputSink] = None,
     ):
+        """
+        Args:
+            output_sink: If given, called with each scheduler output (token outputs,
+                aborts, control replies) instead of sending it to the tokenizer or
+                detokenizer over ZMQ, on every rank it is passed to.
+        """
         # NOTE: KEEP THE FOLLOWING CODE STYLE for this function:
         # Keep __init__ as an orchestrator: sequence init_* and maybe_init_* calls
         # with minimal glue. Move substantial component-specific logic into
@@ -610,7 +619,7 @@ class Scheduler(
         self.init_metrics_collector()
 
         # Init inter-process communication
-        self.init_ipc_channels(port_args)
+        self.init_ipc_channels(port_args, output_sink)
         self.init_idle_sleeper()
 
         # Init tokenizer
@@ -883,7 +892,9 @@ class Scheduler(
         )
         self.metrics_collector = self.metrics_collector_context.collector
 
-    def init_ipc_channels(self, port_args: PortArgs):
+    def init_ipc_channels(
+        self, port_args: PortArgs, output_sink: Optional[OutputSink] = None
+    ):
         is_rank_zero = is_scheduler_io_rank()
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
@@ -898,6 +909,7 @@ class Scheduler(
                 or get_observability().enable_metrics_for_all_schedulers
             ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
+            output_sink=output_sink,
         )
 
         self.load_snapshot_writer = None

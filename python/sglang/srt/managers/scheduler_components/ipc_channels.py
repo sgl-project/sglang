@@ -3,7 +3,11 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import zmq
 
-from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+from sglang.srt.managers.scheduler_components.output_sender import (
+    CallbackSender,
+    OutputSink,
+    SenderWrapper,
+)
 from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import get_zmq_socket
 
@@ -17,8 +21,8 @@ if TYPE_CHECKING:
 class SchedulerIpcChannels:
     recv_from_tokenizer: Union[zmq.Socket, "ScriptedTokenizerRecvProxy"]
     recv_from_rpc: Optional[zmq.Socket]
-    send_to_tokenizer: SenderWrapper
-    send_to_detokenizer: SenderWrapper
+    send_to_tokenizer: Union[SenderWrapper, CallbackSender]
+    send_to_detokenizer: Union[SenderWrapper, CallbackSender]
     send_metrics_from_scheduler: Optional[zmq.Socket]
 
     @classmethod
@@ -30,6 +34,7 @@ class SchedulerIpcChannels:
         skip_tokenizer_init: bool,
         metrics_enabled: bool,
         enable_scripted_runtime: bool,
+        output_sink: Optional[OutputSink] = None,
     ) -> "SchedulerIpcChannels":
         context = zmq.Context(2)
 
@@ -71,6 +76,11 @@ class SchedulerIpcChannels:
             recv_from_rpc = None
             send_to_tokenizer = SenderWrapper(None)
             send_to_detokenizer = SenderWrapper(None)
+
+        if output_sink is not None:
+            # An in-process consumer takes this rank's outputs instead of the
+            # tokenizer and detokenizer processes.
+            send_to_tokenizer = send_to_detokenizer = CallbackSender(output_sink)
 
         if metrics_enabled:
             send_metrics_from_scheduler = get_zmq_socket(
