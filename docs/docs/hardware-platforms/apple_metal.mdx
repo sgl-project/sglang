@@ -109,13 +109,14 @@ sglang serve \
   --chat-template unlimited-ocr \
   --uocr-doc-split \
   --enable-streaming-session \
-  --uocr-max-page-tokens 8000 \
-  --max-total-tokens 32768
+  --uocr-max-page-tokens 8000
 ```
 
-- `--max-total-tokens` caps the KV pool. On a 16 GB Mac the default pool leaves too little memory for the vision encoder and the system starts swapping.
+- With `--uocr-doc-split` and `--uocr-max-page-tokens`, SGLang sizes the KV pool in document windows. One window is `--uocr-doc-page-window` * `--uocr-max-page-tokens` plus prompt and lookahead slack and one `--chunked-prefill-size` chunk: 15,168 tokens for one page and 8000 tokens on a 16 GB Mac. The pool holds two windows on a 16 GB Mac (a Metal working-set limit of 10 GiB or more), one more for each 2 GiB above 12,124 MiB (the measured 16 GB M5) up to eight, and one window below 10 GiB. Only that M5 has been measured. Pass `--max-total-tokens` to size the pool yourself.
+- Without `--uocr-doc-split` and `--uocr-max-page-tokens` the pool is not capped and takes most of the free memory, which on a 16 GB Mac can leave the vision encoder short and make the system swap. Pass `--max-total-tokens` there, for example `--max-total-tokens 32768` as in the cookbook recipe.
 - Requests that send `DeepseekOCRNoRepeatNGramLogitProcessor` as `custom_logit_processor` need `--enable-custom-logit-processor`.
-- Overlap scheduling and CUDA graphs are not available on MPS. The first request of each new image geometry also pays for compiling the PyTorch MPS graphs of the vision encoder.
+- `--warmups unlimited_ocr_v2` sends one drawn page through the model before the server starts listening. On an M5 the warmup takes 3.6 s with a warm Metal cache and 12.7 s with an empty one, and cuts the first request's TTFT from 2.4 s to 1.6 s (warm) and from 7.5 s to 1.7 s (empty), so it helps a server that is idle for a while before its first request.
+- Overlap scheduling and CUDA graphs are not available on MPS.
 
 On an M5 MacBook Pro with 16 GB of memory, one document decodes at about 70 tokens/s.
 
