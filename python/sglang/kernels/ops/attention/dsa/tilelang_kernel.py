@@ -8,6 +8,10 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.attention.dsa.utils import (
+    INDEXER_K_CACHE_PRESHUFFLE_TILE,
+    aiter_can_use_preshuffle_paged_mqa,
+)
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
@@ -1264,6 +1268,7 @@ def fp8_paged_mqa_logits_kernel(
     block_size: int = 64,
     clear_accum: bool = True,
     split_kv: int = 1,
+    preshuffle: bool = False,
 ) -> Any:
     N = T.symbolic("batch_size")
     L = T.symbolic("max_table_length")
@@ -1275,6 +1280,7 @@ def fp8_paged_mqa_logits_kernel(
     SK = int(split_kv)
     BLOCK_BYTES = B * (D + 4)
     SCALE_OFFSET = B * D
+    PS = INDEXER_K_CACHE_PRESHUFFLE_TILE
 
     assert D % 4 == 0
     assert H % 4 == 0
@@ -1314,7 +1320,18 @@ def fp8_paged_mqa_logits_kernel(
                 i = i_start + j
                 page = page_table[bx, i]
                 k_smem_u8 = T.alloc_shared((1, B * D), UINT8)
-                T.copy(kvcache_u8[page : page + 1, 0:SCALE_OFFSET], k_smem_u8)
+                if preshuffle:
+                    # Match the 16x16 tiles written by the indexer cache stores.
+                    for token, dim in T.Parallel(B, D):
+                        offset = (
+                            (token // PS) * (PS * D)
+                            + (dim // PS) * (PS * PS)
+                            + (token % PS) * PS
+                            + dim % PS
+                        )
+                        k_smem_u8[0, token * D + dim] = kvcache_u8[page, offset]
+                else:
+                    T.copy(kvcache_u8[page : page + 1, 0:SCALE_OFFSET], k_smem_u8)
                 k_smem = T.view(k_smem_u8, (B, D), FP8)
                 k_s_smem_u8 = T.alloc_shared((1, B * 4), UINT8)
                 T.copy(
@@ -1381,6 +1398,7 @@ def tilelang_fp8_paged_mqa_logits(
         block_size=block_size,
         clear_accum=clean_logits,
         split_kv=split_kv,
+        preshuffle=aiter_can_use_preshuffle_paged_mqa(),
     )
     q_fp8 = q_fp8.view(batch_size, num_heads, head_dim)
     kvcache_u8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
