@@ -203,7 +203,6 @@ def benchmark_config(
     latencies: List[float] = []
     for _ in range(num_iters):
         torch.get_device_module().synchronize()
-        # Enqueue eviction before the start event so its cost is not measured.
         driver.clear_cache(cache)
         start_event.record()
         run()
