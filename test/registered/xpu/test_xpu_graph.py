@@ -209,6 +209,11 @@ class TestXPUGraph(CustomTestCase):
                     [2] * (output_len - 1),
                     "Expected decode graph replay on batch size 2 for each decode step",
                 )
+                self.assertEqual(
+                    [getattr(k, "attention_variant", None) for k in decode_replays],
+                    ["short"] * (output_len - 1),
+                    "Expected decode graph replay to select context-aware 'short' variant",
+                )
                 self.assertEqual(eager_prefill_replays, [])
                 self.assertEqual(eager_decode_replays, [])
 

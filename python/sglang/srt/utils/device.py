@@ -501,9 +501,30 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated(gpu_id)
-        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        try:
+            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
+            used_memory = float(torch.xpu.memory_allocated(gpu_id))
+            if free_gpu_memory <= 0:
+                # Fallback if driver reports 0 free memory (e.g. Sysman not enabled)
+                props_total = float(
+                    torch.xpu.get_device_properties(gpu_id).total_memory
+                )
+                total_gpu_memory = (
+                    float(total_gpu_memory) if total_gpu_memory > 0 else props_total
+                )
+                free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+            else:
+                free_gpu_memory = min(
+                    float(free_gpu_memory),
+                    max(0.0, float(total_gpu_memory) - used_memory),
+                )
+        except Exception:
+            # Fallback for devices/drivers that do not support querying free memory
+            used_memory = float(torch.xpu.memory_allocated(gpu_id))
+            total_gpu_memory = float(
+                torch.xpu.get_device_properties(gpu_id).total_memory
+            )
+            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
