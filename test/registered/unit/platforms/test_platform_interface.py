@@ -257,6 +257,51 @@ class TestSailDeviceMixin(CustomTestCase):
         self.assertTrue(base.capabilities.graph_capture)
         self.assertTrue(base.capabilities.piecewise_graph)
 
+    def test_sail_memory_capacity_skips_nvidia_smi(self):
+        """SAIL capacity queries must not use the NVIDIA-specific system tool."""
+        from sglang.srt.utils import device as device_utils
+
+        properties = [
+            MagicMock(total_memory=192 << 30),
+            MagicMock(total_memory=128 << 30),
+        ]
+        with (
+            patch.object(
+                device_utils.current_platform, "is_out_of_tree", return_value=False
+            ),
+            patch.object(device_utils, "is_cuda", return_value=True),
+            patch.object(device_utils, "is_sail", return_value=True),
+            patch.object(
+                device_utils,
+                "get_nvgpu_memory_capacity",
+                side_effect=AssertionError("NVIDIA query must not be used"),
+            ) as nvidia_query,
+            patch.object(device_utils.torch.cuda, "device_count", return_value=2),
+            patch.object(
+                device_utils.torch.cuda, "get_device_properties", side_effect=properties
+            ),
+        ):
+            self.assertEqual(device_utils.get_device_memory_capacity(), 128 << 10)
+
+        nvidia_query.assert_not_called()
+
+    def test_cuda_memory_capacity_keeps_nvidia_smi(self):
+        from sglang.srt.utils import device as device_utils
+
+        with (
+            patch.object(
+                device_utils.current_platform, "is_out_of_tree", return_value=False
+            ),
+            patch.object(device_utils, "is_cuda", return_value=True),
+            patch.object(device_utils, "is_sail", return_value=False),
+            patch.object(
+                device_utils, "get_nvgpu_memory_capacity", return_value=128 << 10
+            ) as nvidia_query,
+        ):
+            self.assertEqual(device_utils.get_device_memory_capacity(), 128 << 10)
+
+        nvidia_query.assert_called_once_with()
+
     def test_sail_arch_suffix_below_sm89(self):
         # SAIL devices below the SM89 capability require the arch-specific
         # target variant for JIT compilation.
