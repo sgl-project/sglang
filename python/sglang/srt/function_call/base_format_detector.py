@@ -168,6 +168,20 @@ class BaseFormatDetector(ABC):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # Text before the first bot_token must reach the client even when it
+        # arrives in the same delta as the tool call: a larger --stream-interval
+        # or speculative decoding batches several tokens per delta. Only the
+        # first call's prefix is drained (it is user-visible prose); markup
+        # between later calls stays suppressed. Whitespace-only prefixes keep
+        # the old drop behavior so constrained pure-JSON output is unaffected.
+        if self.current_tool_id == -1:
+            bot_pos = current_text.find(self.bot_token)
+            if bot_pos > 0 and current_text[:bot_pos].strip():
+                prefix, self._buffer = current_text[:bot_pos], current_text[bot_pos:]
+                result = self.parse_streaming_increment("", tools)
+                result.normal_text = prefix + result.normal_text
+                return result
+
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
         try:
