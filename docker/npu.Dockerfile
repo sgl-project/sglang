@@ -138,15 +138,13 @@ RUN set -eux; \
     mkdir /tmp/sgl-kernel-npu; \
     cd /tmp/sgl-kernel-npu; \
     wget \
-      "https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py312-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip"; \
+        "https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py312-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip"; \
     unzip ./*.zip; \
-    ${PIP_INSTALL} \
-        ./sgl_kernel_npu*.whl \
-        ./deep_ep*.whl \
-        ./torch_memory_saver*.whl \
-    cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')"; \
-    ln -sf deep_ep/deep_ep_cpp*.so; \
-    cd /; \
+    ${PIP_INSTALL} --no-deps ./sgl_kernel_npu*.whl && \
+    ${PIP_INSTALL} ./deep_ep*.whl ./torch_memory_saver*.whl && \
+    cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && \
+    ln -sf deep_ep/deep_ep_cpp*.so && \
+    cd / && \
     rm -rf /tmp/sgl-kernel-npu
 
 CMD ["/bin/bash"]
