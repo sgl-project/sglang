@@ -134,8 +134,10 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   DType u = coin * sum_relu_q_minus_p;
 
   DType aggregate_relu_q_minus_p(0);
+#ifndef USE_MUSA
   // Each thread's fallback candidate; FlashInfer reduces it only if the scan selects nothing.
   int last_valid_index = -1;
+#endif
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(DType(0));
     p_vec.fill(DType(0));
@@ -153,6 +155,17 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], DType(0));
     }
 
+#ifdef USE_MUSA
+    // The MUSA-compatible FlashInfer revision stores the fallback index in temp_storage.
+    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
+        i,
+        d,
+        [&](DType x) { return x > 0; },
+        u,
+        relu_q_minus_p_vec,
+        aggregate_relu_q_minus_p,
+        &temp_storage);
+#else
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
         i,
         d,
@@ -162,6 +175,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
         aggregate_relu_q_minus_p,
         last_valid_index,
         &temp_storage);
+#endif
     if (aggregate_relu_q_minus_p > u) {
       break;
     }
