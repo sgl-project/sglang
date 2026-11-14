@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from sglang.kernels.jit.benchmark.kv_canary.utils import (
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kernels.kv_canary.bench_cases import (
     MAX_EXTEND_TOKENS_PER_FORWARD,
     build_fast_matrix_cases,
     build_full_matrix_cases,
     cases_to_x_vals,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, stage="base-a", runner_config="cpu")
 

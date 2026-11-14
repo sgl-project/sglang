@@ -288,7 +288,9 @@ class TestUnifiedWindowLengths(CustomTestCase):
             patch.object(assembler, "build_pool_entry", return_value="entry"),
         ):
             specs, entries = assembler.build_swa_draft_pools(
-                draft_kv_pool=SimpleNamespace(swa_kv_pool=draft_window),
+                draft_kv_pool=SimpleNamespace(
+                    swa_kv_pool=draft_window, follows_target_swa_ids=False
+                ),
                 tree_cache=cache,
                 target_window_host=host,
             )
