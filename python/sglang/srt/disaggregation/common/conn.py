@@ -495,6 +495,10 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            # Same deadline as the decode's, applied once the last chunk has been
+            # handed to the transfer worker: a decode that died mid-transfer can
+            # never send the completion or the abort that would conclude the room.
+            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self._staging_handler = None
@@ -2300,6 +2304,10 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx = 0
         self.init_time: Optional[float] = None
         self._prefill_complete_time: Optional[float] = None
+        # Transfer deadline: armed by the first poll that sees the room past
+        # Bootstrapping with the last chunk already handed to the transfer worker.
+        self._last_chunk_sent = False
+        self._transfer_wait_start: Optional[float] = None
         self._owns_bootstrap_room = True
         if mgr.deferred_bootstrap is not None:
             room_state = mgr.deferred_bootstrap.open(bootstrap_room, self)
@@ -2500,6 +2508,8 @@ class CommonKVSender(BaseKVSender):
             trace_ctx=self.trace_ctx.copy_for_thread(),
         )
         self._record_transfer_indices(kv_indices, state_indices)
+        if is_last_chunk:
+            self._last_chunk_sent = True
 
     def poll(self) -> KVPoll:
         return self._poll_with_status(self.kv_mgr.check_status)
@@ -2528,6 +2538,10 @@ class CommonKVSender(BaseKVSender):
             return KVPoll.Transferring
         if status == KVPoll.Bootstrapping:
             timeout_status = self._check_bootstrap_timeout()
+            if timeout_status is not None:
+                status = timeout_status
+        elif status in (KVPoll.WaitingForInput, KVPoll.Transferring):
+            timeout_status = self._check_transfer_timeout(status, check_status)
             if timeout_status is not None:
                 status = timeout_status
         if status in (KVPoll.Success, KVPoll.Failed):
@@ -2563,6 +2577,58 @@ class CommonKVSender(BaseKVSender):
             self.bootstrap_room,
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
             f"in KVPoll.Bootstrapping",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        return KVPoll.Failed
+
+    def _check_transfer_timeout(
+        self, status: KVPoll, check_status=None
+    ) -> Optional[KVPoll]:
+        """Fail a transfer the decode never completed after the last chunk was
+        handed over.
+
+        Once the room is past Bootstrapping, the only thing that normally
+        concludes it is the decode: a completion, or the abort it sends when its
+        own ``waiting_timeout`` fires. A decode that crashed mid-transfer sends
+        neither, and a transport error that does not surface as an exception in
+        the transfer worker leaves the room Transferring, so the request stays in
+        the inflight queue, pinning its KV and a metadata slot, until the prefill
+        is restarted. The clock starts when the room is first seen past
+        Bootstrapping with the last chunk sent (not at bootstrap, so a long
+        prompt still being prefilled, or a request parked for a busy decode
+        under ``prefill_complete``, is never failed here), and runs on the same
+        ``SGLANG_DISAGGREGATION_WAITING_TIMEOUT`` as the decode's: a live decode
+        that is merely slow started its deadline earlier and aborts us first.
+        ``check_status`` is the function the caller polled with, so that under
+        pipeline parallelism the re-read below sees the PP consensus.
+        """
+        if not self._last_chunk_sent:
+            return None
+        now = time.time()
+        if self._transfer_wait_start is None:
+            self._transfer_wait_start = now
+            return None
+        elapsed = now - self._transfer_wait_start
+        if elapsed < self.kv_mgr.waiting_timeout:
+            return None
+        # The transfer worker may have concluded the room between the caller's
+        # status read and this point: leave a Success alone (as
+        # _handle_bootstrap_message does), and a Failed too, so the worker's
+        # own failure reason is not overwritten by the deadline's.
+        if check_status is None:
+            check_status = self.kv_mgr.check_status
+        if check_status(self.bootstrap_room) in (KVPoll.Success, KVPoll.Failed):
+            return None
+        logger.warning_once(
+            "Some requests fail to receive the KV Cache transfer done signal after sending their last chunk, "
+            "which means the decode instance of this request went away mid-transfer. "
+            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+        )
+        state = "Transferring" if status == KVPoll.Transferring else "WaitingForInput"
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+            f"in KVPoll.{state} waiting for the decode to complete the transfer",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
