@@ -55,6 +55,23 @@ def _iter_tool_names(tools: Sequence[Tool]) -> List[str]:
     return sorted(names, key=len, reverse=True)
 
 
+def _schema_allows_string(schema: Any) -> bool:
+    if not isinstance(schema, Mapping):
+        return False
+    arg_type = schema.get("type")
+    if isinstance(arg_type, str):
+        return arg_type == "string"
+    if isinstance(arg_type, Sequence):
+        return "string" in arg_type
+    # Pydantic writes Optional[str] as anyOf: [{"type": "string"}, {"type": "null"}].
+    return any(
+        _schema_allows_string(branch)
+        for keyword in ("anyOf", "oneOf")
+        if isinstance(schema.get(keyword), list)
+        for branch in schema[keyword]
+    )
+
+
 def _is_string_type(tool_name: str, arg_name: str, tools: Sequence[Tool]) -> bool:
     for tool in tools:
         if tool.function.name != tool_name:
@@ -62,15 +79,7 @@ def _is_string_type(tool_name: str, arg_name: str, tools: Sequence[Tool]) -> boo
         properties = _tool_parameters(tool).get("properties", {})
         if not isinstance(properties, Mapping):
             return False
-        arg_schema = properties.get(arg_name, {})
-        if not isinstance(arg_schema, Mapping):
-            return False
-        arg_type = arg_schema.get("type")
-        if isinstance(arg_type, str):
-            return arg_type == "string"
-        if isinstance(arg_type, Sequence):
-            return "string" in arg_type
-        return False
+        return _schema_allows_string(properties.get(arg_name, {}))
     return False
 
 
@@ -234,7 +243,17 @@ class Xing4_0Detector(BaseFormatDetector):
             if not extracted.calls:
                 content += tool_text
             else:
-                calls.extend(extracted.calls)
+                # Streaming deltas are keyed by call ordinal, not by the tool's
+                # position in the request.
+                for call in extracted.calls:
+                    self.current_tool_id += 1
+                    self.prev_tool_call_arr.append(
+                        {"name": call.name, "arguments": json.loads(call.parameters)}
+                    )
+                    self.streamed_args_for_tool.append(call.parameters)
+                    calls.append(
+                        call.model_copy(update={"tool_index": self.current_tool_id})
+                    )
 
             self._buffer = self._buffer[end_pos:]
 
