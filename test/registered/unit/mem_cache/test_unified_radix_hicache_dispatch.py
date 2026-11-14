@@ -8,10 +8,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackStrategy,
     _apply_stack_result,
     _DeepSeekV4Strategy,
-    _DsaStrategy,
+    _KvStrategy,
     _MambaStrategy,
     _MiniMaxSparseStrategy,
-    _PlainKvStrategy,
     _select_strategy,
     _SwaStrategy,
     register_stack_strategy,
@@ -67,7 +66,7 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
 
         kvcache = _mock_kvcache(DSATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
-        self.assertIsInstance(strategy, _DsaStrategy)
+        self.assertIsInstance(strategy, _KvStrategy)
 
     def test_minimax_sparse(self):
         from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -120,14 +119,14 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
 
         kvcache = _mock_kvcache(MHATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
-        self.assertIsInstance(strategy, _PlainKvStrategy)
+        self.assertIsInstance(strategy, _KvStrategy)
 
     def test_mla_routes_to_plain(self):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
         kvcache = _mock_kvcache(MLATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
-        self.assertIsInstance(strategy, _PlainKvStrategy)
+        self.assertIsInstance(strategy, _KvStrategy)
 
     def test_unknown_combo_raises(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (

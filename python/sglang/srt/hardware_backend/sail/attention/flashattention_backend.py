@@ -24,8 +24,9 @@ class SailFlashAttentionBackend(FlashAttentionBackend):
             raise NotImplementedError(
                 f"FA{self.fa_impl_ver} is not supported on SAIL; use fa3."
             )
-        self.flash_attn_varlen_func = flash_attn_varlen_func
-        self.flash_attn_with_kvcache = flash_attn_with_kvcache
+        if self.fa3_upgrades_to_fa4:
+            raise NotImplementedError("FA4 layers are not supported on SAIL.")
+        self._fa_kernels = {3: (flash_attn_varlen_func, flash_attn_with_kvcache)}
         self._get_scheduler_metadata = get_scheduler_metadata
         self._get_fa_runtime_policy = None
 

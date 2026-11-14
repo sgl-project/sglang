@@ -1295,6 +1295,9 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
         from fastapi.exceptions import RequestValidationError
 
         from sglang.srt.entrypoints.http_server import validation_exception_handler
+        from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+            OPENAI_CHAT_WIRE,
+        )
 
         # The input echo is left out, since JSON encoding can fail on it.
         nested = []
@@ -1316,6 +1319,11 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(
                 url=SimpleNamespace(path=root_path + path),
                 scope={"root_path": root_path},
+                app=SimpleNamespace(
+                    state=SimpleNamespace(
+                        openai_serving_chat=SimpleNamespace(chat_wire=OPENAI_CHAT_WIRE)
+                    )
+                ),
             )
 
         for root_path in ["", "/prefix"]:
@@ -1334,10 +1342,11 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
                         }
                     ],
                 )
-                decisions = await validation_exception_handler(
-                    request(root_path, "/v1/decisions"), error
-                )
-                self.assertEqual(decisions.status_code, 400)
+                for path in ["/v1/decisions", "/v1/chat/completions"]:
+                    response = await validation_exception_handler(
+                        request(root_path, path), error
+                    )
+                    self.assertEqual(response.status_code, 400)
 
     async def test_levels_the_legend_cannot_return_are_refused_before_scoring(self):
         def nested(depth):

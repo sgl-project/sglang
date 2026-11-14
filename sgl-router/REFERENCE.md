@@ -11,7 +11,7 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 - [OpenAI over /generate](#openai-over-generate)
 - [Embeddings](#embeddings), [Classify](#classify), [Completions](#completions), [Rerank](#rerank)
 - [Anthropic Messages](#anthropic-messages)
-- Per-model rendering: [DeepSeek V4 and V4.1](#deepseek-v4-and-v41), [GLM-5.3](#glm-53), [Qwen3.8](#qwen38), [Kimi-K3](#kimi-k3)
+- Per-model rendering: [DeepSeek V4 and V4.1](#deepseek-v4-and-v41), [GLM-5.3](#glm-53), [Qwen3.8](#qwen38), [Kimi-K3](#kimi-k3), [MiniMax-M3](#minimax-m3), [StepFun](#stepfun)
 - [HTTP/2](#http2)
 - [Native gRPC](#native-grpc)
 - [Upgrading from `cache_aware_zmq`](#upgrading-from-cache_aware_zmq)
@@ -269,16 +269,39 @@ consecutive failures the worker is taken out of routing until a request already
 sent to it succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a
 probe request does. Under `--worker-urls` it is the only thing that takes a
 dead or hung worker out of routing, since there is no active health check.
-`--disable-circuit-breaker` turns it off, for example when one worker serves a
-role and an open breaker would reject all of that role's requests; a worker
-that stops answering then keeps its share of traffic.
+A failure is a transport error, a timeout, or a 5xx other than 500 and 503: a
+500 (an exception raised for that one request) and backpressure (503, 429) mean
+the worker answered, so they never open the breaker. When every eligible
+worker's breaker is open the router fails open: it closes them all and routes
+to the whole pool rather than rejecting every request, and failures reopen
+them. `--disable-circuit-breaker` turns it off; a worker that stops answering
+then keeps its share of traffic.
+
+### Request body size
+
+The router buffers each inference request body in full before routing it, so
+it caps the body: `/v1/chat/completions`, `/v1/completions`, `/generate`,
+`/v1/embeddings`, `/v1/classify`, `/v1/rerank` and `/v1/messages` (with
+`count_tokens`) answer `413` past it. The cap is 32 MiB by default; set
+`SGLANG_ROUTER_MAX_BODY_BYTES` to a positive byte count (for example
+`268435456` for 256 MiB) to accept larger multimodal requests carrying several
+base64 images or audio clips. Raising it raises the router's worst-case memory
+too: the body is held in full and parsed (and often rebuilt) while the request
+is prepared, so peak memory per in-flight request is a few times its size. The
+value is bytes, so `256` is a 256-byte cap, not 256 MiB. An empty value keeps
+the default; zero or a value that is not a plain decimal integer (no unit
+suffix) keeps the default and logs a warning. The router logs the effective cap
+at startup. The cap does not change the native gRPC server's inbound message
+limit (half of the 64 MiB engine channel), or the 32 MiB cap on a buffered
+non-streaming Anthropic Messages reply.
 
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its
 model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
 `--api-key` rejects those requests without the key, so pass the same key as
-`--worker-api-key`. Chat requests and `/flush_cache` forward the caller's
+`--worker-api-key`. Chat requests, `/flush_cache`, and the forwarded
+`/server_info`, `/model_info`, and `/health_generate` pass the caller's
 `Authorization` header instead, so callers still need the engine key.
 
 ### Fleet-wide sampling contract
@@ -395,15 +418,17 @@ text, as does any model whose template fails to load or render.
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
 re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's, V4.1's
-and Kimi-K3's native encoders and GLM-5.3's and Qwen3.8's templates are
-fixture-verified against SGLang's request normalization, so they forward every
+and Kimi-K3's native encoders and GLM-5.3's, MiniMax-M3's, Qwen3.8's and StepFun's
+templates are fixture-verified against SGLang's request normalization, so they forward every
 chat except multimodal ones and those with caller-provided `input_ids`. Renderers
 without that verification (HF Jinja templates)
 forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
 `UNVERIFIED` at startup; every other request shape is rendered for routing
-only.
+only. A `continue_final_message` prefix is tokenized on its own with the special
+tokens the tokenizer adds around a text, less one leading BOS, as SGLang's
+`_append_assistant_prefix_to_prompt_ids` does.
 
 Use matching model files on the router and workers, and set
 the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
@@ -482,6 +507,11 @@ a single prompt that has none, and `--override-sampling-params` defaults. Under
 batch or `n > 1` request leaves the prefill rank to the engine, which gives item
 `i` the bootstrap room `room + i`.
 
+Under PD, a buffered request with `return_logprob: true` waits for prefill as
+well, and its response carries prefill's `meta_info.input_token_logprobs` ahead
+of decode's, since only prefill computed the prompt. A streamed, batch, or
+`n > 1` request returns decode's logprobs alone.
+
 ## OpenAI over /generate
 
 `/v1/completions` and `/v1/chat/completions` behave as the engine's own routes,
@@ -496,7 +526,7 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 today), router `--default-chat-template-kwargs`
+`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
 (`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`, `qwen3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
@@ -514,8 +544,9 @@ unset. `sgl_router_openai_route_total` counts each outcome.
 ## Embeddings
 
 `/v1/embeddings` has the engine's interface: the same OpenAI `EmbeddingRequest`
-body and response. As for chat completions, `model` must name the served model.
-A PD fleet answers 400, since prefill and decode engines serve no embeddings.
+body and response. As for chat completions, any `model` name is served as
+`--model-id`. A PD fleet answers 400, since prefill and decode engines serve no
+embeddings.
 
 Text `input` (a string or a list) is tokenized and forwarded as token IDs, as for
 [`/generate`](#native-generate), plus the EOS SGLang appends for EmbeddingGemma.
@@ -608,6 +639,36 @@ local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
 and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
 With the cookbook's `kimi_k3` parsers, text chats are served through `/generate`.
 
+## MiniMax-M3
+
+MiniMax-M3 and M3.1 render with the checkpoint's `chat_template.jinja` through
+`rust/sglang-processor`, which picks them by `config.json`'s `model_type`
+(`minimax_m3_vl`), or by the template when there is no `config.json`, and applies
+SGLang's M3 request rules: the `thinking` type, the `reasoning_effort` enum (low, medium,
+high, xhigh, max) and the `root` message are validated, every tool call must be answered,
+`thinking` maps onto `thinking_mode`, and tool results render in tool-call order. Every text chat
+forwards `input_ids`. Media, `tool_reference` content in tool results, floats in tool
+schemas, `-0` in tool arguments, and a `chat_template` key in `chat_template_kwargs`
+render on the worker. The processor does not reproduce the `minimax-m3` reasoning and
+tool parsers yet, so chats keep the engine's route.
+
+MiniMax-M3.1, whose template has no `thinking_mode` switch, always thinks
+adaptively, and the router enforces that at ingress: `thinking: {"type":
+"disabled"}`, `chat_template_kwargs.thinking_mode: "disabled"` and a
+`reasoning_effort` of `none` are rejected with 400, and `minimal` is sent as `low`.
+MiniMax-M3 can disable thinking, so its requests pass through unchanged.
+
+## StepFun
+
+Step-3.5-Flash, Step-3.7-Flash and Step-5-Preview render with the checkpoint's
+`chat_template.jinja` through `rust/sglang-processor`, which picks them by the template
+(its `tool_response` turn, `<im_patch>` and Qwen3-Coder tool-call tags) and hands it the
+messages, tools and kwargs SGLang's Jinja path builds. Every text chat forwards
+`input_ids`. Media, `-0` in tool arguments or schemas, and a `chat_template`,
+`bos_token`, `eos_token` or `unk_token` key in `chat_template_kwargs` render on the
+worker. With the cookbook's `step3p5` parsers, which the processor does not reproduce
+yet, chats keep the engine's route.
+
 ## HTTP/2
 
 There is nothing to configure. The router negotiates per connection inbound and
@@ -638,6 +699,8 @@ A worker whose `/server_info` does not answer has no readable protocol and
 forwards over HTTP/1.1 for as long as it stays registered — a throughput cost,
 never a correctness one. Admin fan-out (`/flush_cache`) always uses the default
 client, because it addresses every worker at once rather than a selected one.
+The forwarded `/server_info`, `/model_info`, and `/health_generate` use it too:
+they are low-volume GETs, and every engine serves HTTP/1.1.
 
 Two things worth knowing when debugging. h2c is prior-knowledge only — there is
 no negotiation and no fallback — which is why the router requires the engine's

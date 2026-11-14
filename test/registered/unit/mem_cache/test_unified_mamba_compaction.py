@@ -8,16 +8,23 @@ import torch
 from test_unified_mamba_views import _make_pool
 
 from sglang.srt.mem_cache.kv.alloc.band import Band
+from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
 from sglang.srt.mem_cache.kv.layout.state import StateView
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import (
+    UnifiedGeometry,
+    build_unified_bundle,
+    hold_band,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestMambaCompaction(CustomTestCase):
-    def _fixture(self, device, direction="up", lazy=True, count=32):
+    def _fixture(self, device, direction="up", count=32):
         pool, spec = _make_pool(
             mamba_layer_num=2,
             conv_state_shapes=[(8, 3), (4, 2)],
@@ -31,7 +38,6 @@ class TestMambaCompaction(CustomTestCase):
         kv = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
-            spec_state_size=0,
             mamba_layer_ids=[1, 3],
         )
         alloc = Band(
@@ -39,14 +45,12 @@ class TestMambaCompaction(CustomTestCase):
             sub_pool_name="mamba",
             device=device,
             is_id_owner=True,
-            lazy_compaction=lazy,
         )
         full = Band(
             arena=pool,
             sub_pool_name="full",
             device=device,
             is_id_owner=True,
-            lazy_compaction=lazy,
         )
         alloc.bind_peer(full)
         full.bind_peer(alloc)
@@ -121,7 +125,7 @@ class TestMambaCompaction(CustomTestCase):
         self.assertTrue(expected_pairs)
 
     def _exercise(self, device, direction, mode, count=32):
-        f = self._fixture(device, direction, mode != "eager", count=count)
+        f = self._fixture(device, direction, count=count)
         holes = f.count // 4
         if device == "cuda":
             torch.cuda.synchronize()
@@ -158,13 +162,13 @@ class TestMambaCompaction(CustomTestCase):
         self.assertTrue(torch.equal(f.pool.raw, before_empty))
 
     def test_side_states_beside_the_entry_are_refused(self):
-        f = self._fixture("cpu", "down", False, count=4)
+        f = self._fixture("cpu", "down", count=4)
         with self.assertRaisesRegex(ValueError, "whole state in its entry"):
             f.kv.register_slot_state(object())
 
     def test_cpu_directions_and_move_paths(self):
         for direction in ("up", "down"):
-            for mode in ("eager", "urgent", "opportunistic"):
+            for mode in ("urgent", "opportunistic"):
                 for count in (4, 32):
                     with self.subTest(direction=direction, mode=mode, count=count):
                         self._exercise("cpu", direction, mode, count=count)
@@ -172,7 +176,7 @@ class TestMambaCompaction(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_cuda_directions_and_move_paths(self):
         for direction in ("up", "down"):
-            for mode in ("eager", "urgent", "opportunistic"):
+            for mode in ("urgent", "opportunistic"):
                 for count in (4, 32):
                     with self.subTest(direction=direction, mode=mode, count=count):
                         self._exercise("cuda", direction, mode, count=count)
@@ -183,6 +187,10 @@ class TestMambaCompaction(CustomTestCase):
             with self.subTest(writer=writer):
                 f = self._fixture("cuda")
                 f.alloc.free(f.ids[8:16])
+                n = f.spec.entry_bytes()
+                # The slots the flush moves: a backup reads them, and must see
+                # their bytes after the move.
+                moved = [f.original_pages[i] for i in range(f.count - 8, f.count)]
                 stream = torch.cuda.Stream()
                 done = torch.cuda.Event()
                 host = torch.empty(f.raw.shape, dtype=torch.uint8, pin_memory=True)
@@ -194,23 +202,177 @@ class TestMambaCompaction(CustomTestCase):
                     # pending before entry; don't count already-fired coverage.
                     torch.cuda._sleep(1_000_000_000)
                     if writer == "write":
-                        host.copy_(f.pool.raw, non_blocking=True)
+                        for page in moved:
+                            host[page * n : (page + 1) * n].copy_(
+                                f.pool.raw[page * n : (page + 1) * n],
+                                non_blocking=True,
+                            )
                     else:
                         f.pool.raw.copy_(host, non_blocking=True)
                     done.record()
                 self.assertFalse(done.query())
                 if writer == "forward":
+                    # The forward rewrites every slot: a move waits for the
+                    # writers its sources were recorded with.
                     f.alloc.set_latest_forward_done_event(done)
+                    f.alloc.set_inflight_forward(done, f.ids)
                 else:
-                    f.alloc.set_hicache_transfer_done_event(writer, done)
+                    # A load writes every slot; a backup reads the moved ones.
+                    if writer == "load":
+                        f.alloc.end_load_reservation()
+                    f.alloc.record_transfer(done, f.ids, writes=writer == "load")
                 self.assertEqual(f.alloc.flush_for_allocation(), 8)
+                if writer == "write":
+                    # The vacated slots, retaken and overwritten after the
+                    # backup's fence.
+                    retaken = f.alloc.take_physical(8)
+                    self.assertEqual(sorted(retaken.tolist()), sorted(moved))
+                    f.pool.raw[min(moved) * n : (max(moved) + 1) * n].fill_(7)
                 torch.cuda.synchronize()
                 self.assertTrue(done.query())
                 if writer == "write":
-                    self.assertTrue(torch.equal(host, expected))
+                    for page in moved:
+                        self.assertTrue(
+                            torch.equal(
+                                host[page * n : (page + 1) * n],
+                                expected[page * n : (page + 1) * n],
+                            ),
+                            f"the backup read slot {page} after it was reused",
+                        )
+                    f.pool.raw[min(moved) * n : (max(moved) + 1) * n].copy_(
+                        f.raw[min(moved) * n : (max(moved) + 1) * n]
+                    )
                 else:
                     f.raw = expected
                 self._verify(f, set(range(8, 16)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cuda_every_unfinished_forward_guards_its_state_writes(self):
+        # A pipeline stage keeps several microbatch forwards in flight, each
+        # writing its own requests' state slots in place. A non-urgent flush must
+        # not move a slot any of them writes; an urgent one orders its copies
+        # after all of them on the GPU, and returns to the host while they run.
+        f = self._fixture("cuda")
+        f.alloc.free(f.ids[8:16])
+        n = f.spec.entry_bytes()
+        # The oldest forward writes the topmost survivor, the first one moved.
+        writers = (f.count - 1, f.count - 2)
+        expected = f.raw.clone()
+        payloads = {}
+        for k, i in enumerate(writers):
+            page = f.original_pages[i]
+            expected[page * n : (page + 1) * n] = 100 + k
+            payloads[i] = torch.full((n,), 100 + k, dtype=torch.uint8, device="cuda")
+        schedule = torch.cuda.Stream()
+        forward = torch.cuda.Stream()
+        with torch.cuda.stream(schedule):
+            # Loading a kernel module and growing the caching allocator both wait
+            # for every stream; warm both first, as a running scheduler has.
+            f.alloc.prewarm_compaction()
+            # Both pointer alignments the write-set translation is launched with.
+            f.alloc.ids.translate(f.ids[:1])
+            f.alloc.ids.translate(f.ids[1:2])
+            f.alloc._to_device([0])
+            torch.empty(1, device="cuda")
+            torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        f.move.reset_mock()  # the warm-up copies the sink onto itself
+        events = []
+        for i in writers:
+            page = f.original_pages[i]
+            done = torch.cuda.Event()
+            with torch.cuda.stream(forward):
+                torch.cuda._sleep(500_000_000)
+                f.pool.raw[page * n : (page + 1) * n].copy_(payloads[i])
+                done.record()
+            f.alloc.set_latest_forward_done_event(done)
+            f.alloc.set_inflight_forward(done, f.ids[i : i + 1])
+            events.append(done)
+        with torch.cuda.stream(schedule):
+            self.assertFalse(events[0].query())
+            early = f.alloc.flush_opportunistic()
+            self.assertFalse(events[0].query(), "the forwards ended before the flush")
+            late = f.alloc.flush_for_allocation()
+            self.assertFalse(
+                events[0].query(), "the urgent relief blocked the host on the forward"
+            )
+        torch.cuda.synchronize()
+        f.raw = expected
+        self._verify(f, set(range(8, 16)))
+        self.assertEqual((early, late), (0, 8))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cuda_urgent_flush_waits_only_for_writers_of_its_sources(self):
+        # A running forward writes one slot that stays put and reads the slots
+        # the urgent flush moves. The copies must not wait for it; the slots the
+        # frontier retreats past stay readable until it ends, so taking that
+        # space back and overwriting it waits for the forward on the GPU.
+        f = self._fixture("cuda")
+        f.alloc.free(f.ids[8:16])
+        n = f.spec.entry_bytes()
+        moved = list(range(f.count - 8, f.count))
+        vacated = [f.original_pages[i] for i in moved]
+        kept = f.original_pages[0]
+        expected = f.raw.clone()
+        expected[kept * n : (kept + 1) * n] = 100
+        payload = torch.full((n,), 100, dtype=torch.uint8, device="cuda")
+        seen = torch.empty((len(vacated), n), dtype=torch.uint8, device="cuda")
+        schedule = torch.cuda.Stream()
+        forward = torch.cuda.Stream()
+        with torch.cuda.stream(schedule):
+            # Loading a kernel module and growing the caching allocator both wait
+            # for every stream; warm both first, as a running scheduler has.
+            f.alloc.prewarm_compaction()
+            f.alloc.ids.translate(f.ids[:1])
+            f.alloc.ids.translate(f.ids[1:2])
+            f.alloc._to_device([0])
+            torch.empty(1, device="cuda")
+            torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        f.move.reset_mock()  # the warm-up copies the sink onto itself
+        done = torch.cuda.Event()
+        with torch.cuda.stream(forward):
+            torch.cuda._sleep(500_000_000)
+            f.pool.raw[kept * n : (kept + 1) * n].copy_(payload)
+            for k, page in enumerate(vacated):
+                seen[k].copy_(f.pool.raw[page * n : (page + 1) * n])
+            done.record()
+        f.alloc.set_latest_forward_done_event(done)
+        f.alloc.set_inflight_forward(done, f.ids[:1])
+        with torch.cuda.stream(schedule):
+            self.assertEqual(f.alloc.flush_for_allocation(), 8)
+            copied = torch.cuda.Event()
+            copied.record()
+            # The frontier retreated past the vacated slots; take them back
+            # for a write on this stream.
+            retaken = f.alloc.acquire(8, Consumer.SCHEDULE_COPY)
+            f.pool.raw[min(vacated) * n : (max(vacated) + 1) * n].fill_(7)
+        copied.synchronize()
+        self.assertFalse(
+            done.query(), "the copies waited for a forward that wrote none"
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(sorted(retaken.tolist()), sorted(vacated))
+        self.assertEqual(max(vacated) - min(vacated) + 1, len(vacated))
+        reads = torch.stack([f.raw[p * n : (p + 1) * n] for p in vacated])
+        self.assertTrue(
+            torch.equal(seen.cpu(), reads), "a vacated slot was overwritten"
+        )
+        raw = f.pool.raw.cpu()
+        self.assertTrue(
+            torch.equal(
+                raw[kept * n : (kept + 1) * n], expected[kept * n : (kept + 1) * n]
+            )
+        )
+        for i in moved:
+            page = int(f.alloc.ids.virtual_to_physical[f.ids[i]])
+            old = f.original_pages[i]
+            self.assertTrue(
+                torch.equal(
+                    raw[page * n : (page + 1) * n], f.raw[old * n : (old + 1) * n]
+                ),
+                f"slot {i} lost its bytes",
+            )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_cuda_pending_read_sources_drain_with_closed_gate(self):
@@ -231,9 +393,15 @@ class TestMambaCompaction(CustomTestCase):
         # an actual delayed reader validates the CUDA completion/drain boundary.
         sources = f.alloc._free_phys_pages
         self.assertEqual(set(sources.cpu().tolist()), set(old_sources))
+        f.alloc.set_latest_forward_done_event(done)
         f.alloc._free_phys_pages = sources[:0]
-        f.alloc._pending_reuse[done] = (list(old_sources), [sources])
-        f.alloc._pending_reuse_pages_cpu.update(old_sources)
+        f.alloc.usage.vacate(
+            done,
+            (),
+            page_bytes=f.alloc.entry_bytes_per_page,
+            pages=list(old_sources),
+            batch=sources,
+        )
         torch.cuda.synchronize()
         with torch.cuda.stream(stream):
             torch.cuda._sleep(1_000_000_000)
@@ -241,20 +409,28 @@ class TestMambaCompaction(CustomTestCase):
                 observed[i].copy_(f.pool.raw[p * n : (p + 1) * n])
             done.record()
         self.assertFalse(done.query())
-        f.alloc.pin_sources = (lambda: True,)
+        hold_band(f.alloc)
         calls = f.move.call_count
         self.assertEqual(f.alloc.flush_opportunistic(), 0)
         self.assertFalse(done.query(), "pending retention was not observed")
-        self.assertEqual(f.alloc._pending_reuse_pages_cpu, set(old_sources))
+        self.assertEqual(f.alloc.usage.pending_pages, set(old_sources))
         self.assertEqual(f.alloc._free_phys_pages.numel(), 0)
         done.synchronize()
         self.assertTrue(torch.equal(observed.cpu(), expected))
+        # The reader's result is processed: its forward retires.
+        held_free = f.alloc.available_size()
+        f.alloc.retire_forward(done)
         self.assertEqual(f.alloc.flush_opportunistic(), 0)
-        self.assertFalse(f.alloc._pending_reuse)
-        self.assertFalse(f.alloc._pending_reuse_pages_cpu)
-        self.assertEqual(set(f.alloc._free_phys_pages.cpu().tolist()), set(old_sources))
+        self.assertFalse(f.alloc.usage.pending_by_key())
+        self.assertFalse(f.alloc.usage.pending_pages)
+        # Every source is free again, as a hole or past the end's frontier
+        # (absorbed without a copy); none moved.
+        first, end = f.alloc._span_range()
+        holes = set(f.alloc._free_phys_pages.cpu().tolist())
+        for p in old_sources:
+            self.assertTrue(p in holes or not first <= p < end, p)
         self.assertEqual(f.alloc.flush_opportunistic(), 0)
-        self.assertEqual(f.alloc._free_phys_pages.numel(), 8)
+        self.assertEqual(f.alloc.available_size(), held_free + 8)
         self.assertEqual(f.move.call_count, calls)
         self._verify(f, set(range(8, 16)))
         reused = f.alloc.alloc(1).clone()
@@ -295,6 +471,112 @@ class TestMambaCompaction(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(observed, expected))
+
+
+class _Event:
+    """A forward's done event, fired by the test."""
+
+    def __init__(self):
+        self.fired = False
+
+    def query(self):
+        return self.fired
+
+
+class TestForwardWriteSets(CustomTestCase):
+    def _allocator(self):
+        setup_allocator_context()
+        bundle = build_unified_bundle(
+            UnifiedGeometry(chain="mamba", full_layer_ids=(0,), state_layer_ids=(1,))
+        )
+        return bundle.token_to_kv_pool_allocator
+
+    def test_state_band_records_every_slot_the_forward_writes(self):
+        # State kernels write the working slots of the batch's rows in place,
+        # plus its tracking and copy-on-write slots; compaction must see them.
+        allocator = self._allocator()
+        storage = allocator.storage
+        storage.requests.req_index_to_mamba_index_mapping[torch.tensor([1, 2])] = (
+            torch.tensor([5, 6], dtype=torch.int32)
+        )
+        tokens = torch.tensor([10, 11])
+        storage.record_forward(
+            _Event(),
+            written_tokens=tokens,
+            token_writes_unknown=False,
+            req_pool_indices=torch.tensor([1, 2]),
+            state_slots=(torch.tensor([7, -1]), None),
+        )
+        state = allocator.mamba_allocator.usage.forwards()
+        self.assertEqual(state[-1].ids.tolist(), [5, 6, 7, -1])
+        owner = allocator.full_attn_allocator.usage.forwards()
+        # The ledger keeps its own copy of the ids it is handed.
+        self.assertEqual(owner[-1].ids.tolist(), tokens.tolist())
+        self.assertIsNot(owner[-1].ids, tokens)
+
+    def test_host_copies_are_recorded_on_the_members_they_touch(self):
+        # A submitted host copy names its rows per sub-pool view; a move then
+        # waits it, or releases what it reads, only for those rows.
+        allocator = self._allocator()
+        storage = allocator.storage
+        owner_ids, state_slots = torch.tensor([3, 4]), torch.tensor([1])
+        # A host pool without DCP: controller ids are the pool's own.
+        host_pool = SimpleNamespace(dcp_size=1)
+        transfers = [
+            SimpleNamespace(
+                device_pool=storage.view(name), device_indices=ids, host_pool=host_pool
+            )
+            for name, ids in (
+                (allocator.roles.owner, owner_ids),
+                (allocator.roles.state, state_slots),
+            )
+        ]
+        # A fused draft's view is not a sub-pool: its rows ride in the target's.
+        transfers.append(
+            SimpleNamespace(
+                device_pool=object(),
+                device_indices=torch.tensor([9]),
+                host_pool=host_pool,
+            )
+        )
+        done = _Event()
+        storage.record_host_transfer(done, transfers, writes=True)
+        for band, ids in (
+            (allocator.full_attn_allocator, owner_ids),
+            (allocator.mamba_allocator, state_slots),
+        ):
+            (use,) = band.usage.transfers()
+            self.assertIs(use.signal.events, done)
+            self.assertEqual(use.ids.tolist(), ids.tolist())
+            self.assertIsNot(use.ids, ids)
+            self.assertTrue(use.writes)
+            self.assertIsNone(use.release)
+            self.assertIsNone(use.unit_tokens)  # controller ids, translated when read
+        done.fired = True
+        allocator.full_attn_allocator.usage.prune()
+        self.assertEqual(allocator.full_attn_allocator.usage.transfers(), [])
+
+    def test_unknown_token_writes_hold_non_urgent_moves(self):
+        # A pipeline stage's verify forward produces its own write slots, so
+        # nothing may move until it ends, even with a newer forward recorded.
+        allocator = self._allocator()
+        owner = allocator.full_attn_allocator
+        ids = owner.alloc(4)
+        owner.free(ids[1:3])
+        unknown, known = _Event(), _Event()
+        for event, tokens in ((unknown, None), (known, ids[3:])):
+            allocator.storage.record_forward(
+                event,
+                written_tokens=tokens,
+                token_writes_unknown=tokens is None,
+                req_pool_indices=torch.tensor([0]),
+                state_slots=(),
+            )
+        self.assertEqual(owner.flush_opportunistic(), 0)
+        # Retiring the newer forward retires the older one with it.
+        unknown.fired = known.fired = True
+        allocator.storage.retire_forward(known)
+        self.assertGreater(owner.flush_opportunistic(), 0)
 
 
 if __name__ == "__main__":

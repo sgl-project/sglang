@@ -37,8 +37,6 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.srt.environ import envs
-
 try:
     from triton.language.extra.intel import libdevice  # type: ignore
 except ImportError:  # non-XPU Triton build
@@ -356,7 +354,8 @@ def _launch(x, update, gate, scale, shift, out, residual_out, eps, *, gated):
         WG=_WG,
         SIMD=_SIMD,
         GATED=gated,
-        num_warps=envs.SGLANG_XPU_LN_MOD_NUM_WARPS.get(),
+        # layout only, the result does not depend on it; fastest on Arc Pro B70
+        num_warps=4,
     )
 
 

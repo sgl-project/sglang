@@ -26,6 +26,7 @@ from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.layer_boundary import is_dense_ffn_fully_dp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -33,6 +34,8 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -42,8 +45,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cpu, is_npu, make_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils import is_cpu, is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()

@@ -5,6 +5,8 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    assert_metrics,
+    run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -38,7 +40,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
@@ -226,12 +227,39 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
+    # A single attempt: gsm8k's 3-retry budget would exceed the step timeout.
+    max_retries = 1
+    # Weekday nightly overrides this to gsm8k (baseline is provisional).
+    dataset_baselines = {
+        "gsm8k": 0.90,
+    }
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
+    min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
         self.run_accuracy()
+
+    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
+        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
+        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
+        metrics = run_bench_serving(
+            host=self.host,
+            port=self.port,
+            model_path=self.model_config.get("model_path"),
+            dataset_name="generated-shared-prefix",
+            input_len=32000,
+            output_len=1024,
+            max_concurrency=32,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=32,
+            seed=100,
+            warmup_requests=16,
+            cache_report=True,
+        )
+        assert_metrics(self, metrics)
 
 
 if __name__ == "__main__":

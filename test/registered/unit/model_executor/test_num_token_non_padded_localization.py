@@ -33,7 +33,6 @@ from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
-    ForwardMode,
     compute_local_num_token_non_padded,
     compute_local_num_token_non_padded_cpu,
     enable_num_token_non_padded,
@@ -44,6 +43,7 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
     RowBucketGraphRunner,
 )

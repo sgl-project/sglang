@@ -40,7 +40,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -690,7 +690,9 @@ class TestV41KVPoolLayouts(CustomTestCase):
             patch.object(assembler, "DeepSeekV4PagedHostPool", UnpinnedHostPool),
         ):
             _, entries = assembler.build_swa_draft_pools(
-                draft_kv_pool=draft, tree_cache=tree_cache
+                draft_kv_pool=draft,
+                tree_cache=tree_cache,
+                target_window_host=PoolName.SWA,
             )
         host = entries[0].host_pool
         self.assertTrue(host.page_aligned_only)

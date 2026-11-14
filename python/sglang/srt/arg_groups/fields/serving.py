@@ -15,8 +15,8 @@ import msgspec
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    json_list_type,
 )
-from sglang.srt.utils.common import json_list_type
 
 
 class Serving(msgspec.Struct):
@@ -120,7 +120,7 @@ class Serving(msgspec.Struct):
     ] = None
     enable_http2: A[
         bool,
-        "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
+        "Serve HTTP/2 alongside HTTP/1.1 on the same port: clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. The Python frontend switches from Uvicorn to Granian and requires 'pip install sglang[http2]'; the Rust frontend (SGLANG_RUST_SERVER=1) serves it natively.",
     ] = False
     http2_max_concurrent_streams: A[
         int,

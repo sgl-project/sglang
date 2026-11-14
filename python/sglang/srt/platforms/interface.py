@@ -22,7 +22,9 @@ from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.managers.io_struct import ProfileReq
 
 # Re-export for convenience
 __all__ = [
@@ -100,6 +102,16 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    def apply_profile_request_defaults(self, req: ProfileReq) -> None:
+        """Fill platform defaults for fields a profile request leaves unset.
+
+        Called in the tokenizer process at the start of ``start_profile``,
+        before core fills unset ``with_stack`` and ``record_shapes`` from
+        ``SGLANG_PROFILE_WITH_STACK`` and ``SGLANG_PROFILE_RECORD_SHAPES``.
+        Mutate ``req`` in place and leave explicitly set fields unchanged.
+        """
+        pass
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
@@ -126,6 +138,43 @@ class SRTPlatform(DeviceMixin):
     def get_full_graph_backend_cls(self) -> type[Any]:
         """Return the full device-graph backend class for this platform."""
         return None
+
+    def get_moe_expert_executor_cls(
+        self, context: MoeExpertExecutorContext
+    ) -> Optional[type[torch.nn.Module]]:
+        """Return a platform-specific MoE expert executor class.
+
+        Returning ``None`` keeps SGLang's built-in MoE implementation. The
+        returned class must accept the model's standard expert constructor
+        arguments, expose a ``runner_backend`` attribute compatible with
+        ``MoeRunnerBackendLike`` (or ``None``), and support the
+        ``forward(hidden_states, topk_output)`` call. The model binds that
+        backend to its ``TopK`` instance and remains responsible for producing
+        ``topk_output``. Existing model loaders remain responsible for
+        checkpoint loading, so the class must preserve the ``FusedMoE`` expert
+        parameter ABI (``w13_*``/``w2_*`` names and their ``weight_loader``
+        callbacks).
+
+        Models opt into this hook individually; Gemma4 is currently the only
+        caller that supplies ``MoeExpertExecutorContext``.
+        """
+        return None
+
+    def get_weight_update_handlers(self) -> dict[str, Callable[..., Any]]:
+        """Weight transports this platform serves through /plugin_weight_update, by name.
+
+        A handler is the receive half of a weight update, like
+        ``receive_weights_from_distributed``: ``handler(context=PluginWeightUpdateContext,
+        payload=dict)`` runs on every TP rank inside a begin/end_weight_update session and
+        returns the ``(name, tensor)`` pairs it received. The core loads them into the
+        selected runners exactly as /update_weights_from_distributed does. A handler that
+        writes parameters itself (through ``context.runners``) returns ``[]``, so
+        end_weight_update runs post_load_weights, as after peer (p2p) writes. An exception
+        on any rank fails the request on all ranks, after the ranks that succeeded have
+        loaded their share, so the caller redoes the bucket or retires the engine; the
+        transport owns its timeouts.
+        """
+        return {}
 
     def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
         """Return this platform's KV pool class for ``kind``, or None.

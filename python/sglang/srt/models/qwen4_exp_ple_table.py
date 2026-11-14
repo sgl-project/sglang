@@ -14,7 +14,8 @@ rows straight from a host pointer. Two backends provide that pointer:
     model weights and ``pinned`` therefore frees nothing: Qwen3.8-Flash-Next is
     126.0 GiB of weights on a 121.63 GiB box and does not boot with ``pinned``.
     The kernel dereferences the pageable pointer directly, which only works on
-    devices that report ``cudaDevAttrPageableMemoryAccessUsesHostPageTables``;
+    devices that report ``cudaDevAttrPageableMemoryAccess`` (GB10 through the
+    host page tables, a discrete GPU on the open kernel modules through HMM);
     rows are paged in from storage on demand, the file is sparse, deterministic
     in name and reused across restarts, and gathers of prefill size hint the
     page cache (``posix_fadvise(WILLNEED)``) so page faults are served
@@ -45,12 +46,14 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 _LIBC: Optional[ctypes.CDLL] = None
+_WILLNEED_FAILED = False
 _SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 _SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 
 PLE_OFFLOAD_BACKENDS = ("pinned", "file")
 
 # cudaDeviceAttr enum values (cuda_runtime_api.h).
+_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS = 88
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
@@ -326,19 +329,19 @@ def check_file_backend_supported(device_index: int = 0) -> None:
             "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK"
         )
         return
-    supported = device_uses_host_page_tables(device_index)
+    supported = device_reads_pageable_memory(device_index)
     if supported is None:
         raise RuntimeError(
             "--ple-offload-backend file: could not query "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables. Set "
+            "cudaDevAttrPageableMemoryAccess. Set "
             "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 only if you know the "
-            "device reads pageable host memory through the host page tables."
+            "device reads pageable host memory."
         )
     if not supported:
         raise ValueError(
-            "--ple-offload-backend file needs a device whose pageable host "
-            "memory accesses go through the host page tables (unified-memory "
-            "parts such as GB10). This device reports it does not; use "
+            "--ple-offload-backend file needs a device that reads pageable "
+            "host memory (GB10, or a discrete GPU with HMM on the open kernel "
+            "modules). This device reports it does not; use "
             "--ple-offload-backend pinned."
         )
 
@@ -366,11 +369,29 @@ def ple_table_file_name(
     return f"ple_table_{dims}_{str(dtype).replace('torch.', '')}_{numel * elem}B{suffix}.bin"
 
 
-def device_uses_host_page_tables(device_index: int = 0) -> Optional[bool]:
+def device_reads_pageable_memory(device_index: int = 0) -> Optional[bool]:
     """Whether pageable host memory is directly addressable by the GPU.
 
     Returns None when the CUDA runtime library cannot be queried.
     """
+    value = _device_attribute(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS, device_index)
+    return None if value is None else bool(value)
+
+
+def device_faults_pageable_pages(device_index: int = 0) -> bool:
+    """Whether the GPU reaches pageable host memory through page faults the driver
+    serves (HMM on a discrete GPU), rather than through the host's page tables (ATS, as
+    on GB10). False when either attribute cannot be queried."""
+    reads = _device_attribute(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS, device_index)
+    host_tables = _device_attribute(
+        _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES, device_index
+    )
+    return reads == 1 and host_tables == 0
+
+
+def _device_attribute(attribute: int, device_index: int) -> Optional[int]:
+    """``cudaDeviceGetAttribute`` through the CUDA runtime library; None when it
+    cannot be queried."""
     candidates = [ctypes.util.find_library("cudart")]
     torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
     if os.path.isdir(torch_lib):
@@ -397,16 +418,55 @@ def device_uses_host_page_tables(device_index: int = 0) -> Optional[bool]:
             value = ctypes.c_int()
             rc = cudart.cudaDeviceGetAttribute(
                 ctypes.byref(value),
-                ctypes.c_int(
-                    _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
-                ),
+                ctypes.c_int(attribute),
                 ctypes.c_int(device_index),
             )
             if rc == 0:
-                return bool(value.value)
+                return value.value
         except OSError:
             continue
     return None
+
+
+def advise_rows_willneed(fd: int, rows: torch.Tensor, row_bytes: int) -> int:
+    """Queue the page-cache reads of ``rows`` of the file-backed table open as ``fd``
+    and return once they are queued: ``posix_fadvise(WILLNEED)``, one call per run
+    of adjacent pages.
+
+    The host gather copies its rows on one thread (the server runs torch with one
+    thread) from a ``MADV_RANDOM`` mapping, so without this each cold row is its own
+    4 KiB read from storage, one after another. Advised first, the reads are in flight
+    together and the copy finds the rows in the page cache. Advisory: returns the number
+    of pages advised, and stops at the first call that fails.
+    """
+    global _WILLNEED_FAILED
+    if rows.numel() == 0:
+        return 0
+    first = rows.to(torch.int64) * row_bytes
+    pages = torch.cat(
+        [first >> _PAGE_SHIFT, (first + row_bytes - 1) >> _PAGE_SHIFT]
+    ).unique(sorted=True)
+    run_starts = torch.ones_like(pages, dtype=torch.bool)
+    run_starts[1:] = pages[1:] != pages[:-1] + 1
+    starts = torch.nonzero(run_starts).flatten()
+    lengths = torch.diff(starts, append=starts.new_tensor([pages.numel()]))
+    advised = 0
+    for page, count in zip(pages[starts].tolist(), lengths.tolist()):
+        try:
+            os.posix_fadvise(
+                fd, page << _PAGE_SHIFT, count << _PAGE_SHIFT, os.POSIX_FADV_WILLNEED
+            )
+        except OSError as exc:
+            if not _WILLNEED_FAILED:
+                _WILLNEED_FAILED = True
+                logger.warning(
+                    "PLE table: posix_fadvise(WILLNEED) failed (%s); host gathers "
+                    "read cold rows one at a time",
+                    exc,
+                )
+            break
+        advised += count
+    return advised
 
 
 def _madvise_random(storage: torch.Tensor, nbytes: int) -> None:

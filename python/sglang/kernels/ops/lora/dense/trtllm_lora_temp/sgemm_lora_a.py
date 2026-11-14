@@ -3,8 +3,8 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.lora.dense.kernel_utils import _resolve_token_positions
 from sglang.kernels.ops.lora.dense.trtllm_lora_temp.kernel_utils import (
-    _resolve_token_positions,
     get_pdl_launch_metadata,
 )
 from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs

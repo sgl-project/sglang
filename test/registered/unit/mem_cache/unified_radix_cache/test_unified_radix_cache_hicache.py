@@ -15,9 +15,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -586,7 +584,13 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self._init_hicache(cache, write_policy="write_back")
         cache.evict(EvictParams(mamba_num=3))
         cache.evict_host(page, ComponentType.FULL)
-        cache.evict(EvictParams(swa_num_tokens=3 * page))
+        cache.evict(
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): 3 * page
+                }
+            )
+        )
         cache.evict_host(3 * page, ComponentType.SWA)
 
         # The backed parent stops the Full backup chain, while the SWA window
@@ -642,8 +646,19 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
         self.assertEqual(cache._tree_core_backend, selected_tree_core_test_backend())
 
-        result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
-        self.assertGreaterEqual(result.swa_num_tokens_evicted, len(seq_a))
+        result = cache.evict(
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): len(seq_b)
+                }
+            )
+        )
+        self.assertGreaterEqual(
+            result.window_num_tokens_evicted.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            len(seq_a),
+        )
 
         m = match_prefix(cache, seq_a)
         node = m.best_match_node
@@ -666,7 +681,11 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             "the full prefix stays servable",
         )
         self.assertGreaterEqual(
-            m.swa_host_hit_length, 1, "load-back armed for the host SWA KV"
+            m.window_host_hit_lengths.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            1,
+            "load-back armed for the host SWA KV",
         )
 
         # Scheduler-side serve path: init_load_back revives the SWA KV and
@@ -776,7 +795,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             result.device_prefix_len, len(tokens) - node_key_length(cache, leaf)
         )
         self.assertEqual(result.host_hit_length, node_key_length(cache, leaf))
-        self.assertEqual(result.swa_host_hit_length, node_key_length(cache, leaf))
+        self.assertEqual(
+            result.window_host_hit_lengths.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            node_key_length(cache, leaf),
+        )
 
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
@@ -796,7 +820,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             result.device_prefix_len, len(tokens) - node_key_length(cache, leaf)
         )
         self.assertEqual(result.host_hit_length, 0)
-        self.assertEqual(result.swa_host_hit_length, node_key_length(cache, leaf))
+        self.assertEqual(
+            result.window_host_hit_lengths.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            node_key_length(cache, leaf),
+        )
 
     @requires_full_swa_ps1_window4
     def test_hicache_swa_backup_window_stops_at_pending_ancestor(self):
@@ -844,7 +873,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         """A host-backed SWA tombstone inside the trailing sliding window stops
         the device match before it: the Full-backed tail from the tombstone on
         is a host hit, and the tombstone's own SWA counts in
-        ``swa_host_hit_length``."""
+        its window's ``window_host_hit_lengths`` entry."""
         ps = self.cfg.page_size
         window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
         for name, victim in (
@@ -872,7 +901,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
                 result = match_prefix(cache, tokens)
                 self.assertEqual(result.device_prefix_len, len(tokens) - host_tail)
                 self.assertEqual(result.host_hit_length, host_tail)
-                self.assertEqual(result.swa_host_hit_length, swa_host)
+                self.assertEqual(
+                    result.window_host_hit_lengths.get(
+                        cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+                    ),
+                    swa_host,
+                )
 
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         cache, _, _, y, x, _ = self._swa_anchor_setup()
@@ -892,9 +926,13 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             value_chunks=[],
             best_value_len=0,
         )
-        # SWA host hit goes to swa_host_hit_length; host_hit_length stays at 0.
+        # SWA host hit goes to its window's entry; host_hit_length stays at 0.
+        # The tree core files it by tree slot; the cache names it afterwards.
         self.assertEqual(result.host_hit_length, 0)
-        self.assertEqual(result.swa_host_hit_length, ps)
+        self.assertEqual(
+            result.window_host_hit_lengths.get(ComponentType.SWA, 0),
+            ps,
+        )
 
     @requires_swa
     @requires(
@@ -1043,6 +1081,90 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             "parent must NOT be backed up under write_back",
         )
 
+        cache.sanity_check()
+
+    def _count_blocking_waits(self, cache):
+        """Record how many queued copies each blocking write-back wait drains."""
+        waits = []
+        writing_check = cache.writing_check
+
+        def count_waits(write_back=False, finish_count=None):
+            if write_back and cache.ongoing_write_through:
+                waits.append(len(cache.ongoing_write_through))
+            return writing_check(write_back=write_back, finish_count=finish_count)
+
+        return waits, mock.patch.object(cache, "writing_check", side_effect=count_waits)
+
+    @requires_hicache
+    def test_hicache_write_back_evict_waits_once_per_batch(self):
+        """Write-back eviction copies a batch of unbacked leaves to host behind
+        one blocking wait, then demotes them together; once the leaves cover
+        the request, the parent they expose stays on device."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        parent_seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, parent_seq)
+        leaf_seqs = [parent_seq + self._make_seq(1000 * (i + 1), 1) for i in range(3)]
+        for seq in leaf_seqs:
+            self._insert(cache, allocator, req_to_token_pool, seq)
+        leaves = [match_prefix(cache, seq).last_device_node for seq in leaf_seqs]
+        parent = node_parent(cache, leaves[0])
+        leaf_tokens = sum(node_key_length(cache, leaf) for leaf in leaves)
+
+        waits, patch = self._count_blocking_waits(cache)
+        with patch:
+            result = cache.evict(EvictParams(num_tokens=leaf_tokens))
+            self.assertGreaterEqual(result.num_tokens_evicted, leaf_tokens)
+            self.assertEqual(waits, [3])
+            for leaf in leaves:
+                self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
+                self.assertTrue(cache.tree_core.is_backuped(leaf))
+            self.assertFalse(cache.tree_core.is_full_device_evicted(parent))
+
+            # Leaves first in one batch, then the parent they exposed.
+            for leaf_seq in leaf_seqs:
+                match_prefix(cache, leaf_seq)
+            waits.clear()
+            parent_tokens = node_key_length(cache, parent)
+            result = cache.evict(EvictParams(num_tokens=parent_tokens))
+            self.assertGreaterEqual(result.num_tokens_evicted, parent_tokens)
+            self.assertEqual(waits[0], 1)
+        self.assertTrue(cache.tree_core.is_full_device_evicted(parent))
+        self.assertTrue(cache.tree_core.is_backuped(parent))
+        cache.sanity_check()
+
+    @requires_hicache
+    def test_hicache_write_back_evict_chain_shares_the_leaves_wait(self):
+        """A device-only chain evicted in one call follows the per-victim
+        order, leaves then their parent, and the parent joins its leaves'
+        wait, also when a leaf's SWA window backup covers it."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        parent_seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, parent_seq)
+        leaf_seqs = [parent_seq + self._make_seq(1000 * (i + 1), 1) for i in range(2)]
+        for seq in leaf_seqs:
+            self._insert(cache, allocator, req_to_token_pool, seq)
+        leaves = [match_prefix(cache, seq).last_device_node for seq in leaf_seqs]
+        # An SWA boundary split can turn the parent into several nodes.
+        chain = list(leaves)
+        node = node_parent(cache, leaves[0])
+        while node != cache.root_node_handle():
+            chain.append(node)
+            node = node_parent(cache, node)
+        total = len(parent_seq) + sum(len(seq) - len(parent_seq) for seq in leaf_seqs)
+
+        waits, patch = self._count_blocking_waits(cache)
+        with patch:
+            result = cache.evict(EvictParams(num_tokens=total))
+        self.assertGreaterEqual(result.num_tokens_evicted, total)
+        # An SWA stack may add later waits for its own walk.
+        self.assertEqual(waits[0], len(chain))
+        for node in chain:
+            self.assertTrue(cache.tree_core.is_full_device_evicted(node))
+            self.assertTrue(cache.tree_core.is_backuped(node))
         cache.sanity_check()
 
     @requires(

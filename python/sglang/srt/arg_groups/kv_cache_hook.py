@@ -6,15 +6,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Optional
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
-    resolution_result,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -461,6 +460,14 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "_handle_cache_compatibility",
             _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
         )
+    if cfg._max_running_requests_explicitly_set is None:
+        # The record, not the view: a model's default (DeepSeek-V4's) is declared earlier.
+        declare_resolution(
+            server_args,
+            "_handle_cache_compatibility",
+            _max_running_requests_explicitly_set=server_args.max_running_requests
+            is not None,
+        )
 
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
@@ -522,6 +529,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
         return
+    # The pool's ends compact lazily, behind the forwards and transfers that
+    # may still touch the pages they move; there is no eager compaction.
+    assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+        "--enable-unified-memory requires lazy compaction; unset "
+        "SGLANG_DISABLE_LAZY_COMPACTION."
+    )
     if cfg.disaggregation_mode != "null":
         # Constraints of the whole-envelope transfer; see the unified MHA and
         # MLA pool get_contiguous_buf_infos implementations.
@@ -543,9 +556,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "--enable-unified-memory with PD disaggregation does not support "
             "speculative decoding with the Mooncake transfer backend."
         )
-        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
-            "--enable-unified-memory with PD disaggregation requires lazy "
-            "compaction; unset SGLANG_DISABLE_LAZY_COMPACTION."
+        # This flag also selects decode's non-blocking metadata readback, which
+        # records a receive as in flight before its destination is published.
+        assert not envs.SGLANG_DISAGG_STAGING_BUFFER.get(), (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "SGLANG_DISAGG_STAGING_BUFFER: heterogeneous-TP staging is not "
+            "supported with unified memory; unset SGLANG_DISAGG_STAGING_BUFFER."
         )
         assert not cfg.enable_hisparse, (
             "--enable-unified-memory with PD disaggregation is not compatible "
@@ -639,6 +655,25 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "--enable-hierarchical-cache: HiCache keeps the draft on a private "
         "pool, and would pack an MTP head's KV into the target's "
         "page-envelope host pool, which refuses per-layer draft loads."
+    )
+    assert not (
+        cfg.pp_size > 1
+        and cfg.enable_hierarchical_cache
+        and cfg.hicache_host_memory_mode == "buffer_only"
+    ), (
+        "--enable-unified-memory with --pp-size > 1 does not support "
+        "--hicache-host-memory-mode buffer_only: each pipeline stage drains its "
+        "own backup completions, so the stages' eviction credit, and with it "
+        "their capacity decisions, can differ."
+    )
+    assert not (
+        cfg.pp_size > 1
+        and (cfg.enable_streaming_session or cfg.enable_session_radix_cache)
+    ), (
+        "--enable-unified-memory with --pp-size > 1 does not support "
+        "--enable-streaming-session or --enable-session-radix-cache: each "
+        "pipeline stage closes timed-out sessions on its own clock, so the "
+        "memory the stages hold, and with it their capacity decisions, can differ."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
@@ -755,12 +790,56 @@ def draft_rows_refusal(
     )
 
 
+def _validate_unified_sparse_attention(cfg, model_config) -> bool:
+    """Whether the model attends sparsely (DSA); refuses what the unified pool
+    does not serve for it yet."""
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if not is_deepseek_dsa(model_config.hf_config):
+        return False
+    # The unified pages hold FP8 latent rows with block scales, which the
+    # flashmla_kv kernels read; the trtllm kernels read raw rows.
+    backends = {cfg.dsa_prefill_backend, cfg.dsa_decode_backend}
+    if backends != {"flashmla_kv"}:
+        raise ValueError(
+            "--enable-unified-memory serves sparse attention with the flashmla_kv "
+            f"DSA backends only; got prefill {cfg.dsa_prefill_backend!r} and "
+            f"decode {cfg.dsa_decode_backend!r}."
+        )
+    unsupported = [
+        flag
+        for flag, on in (
+            ("speculative decoding", cfg.speculative_algorithm is not None),
+            ("--dcp-size > 1", cfg.dcp_size > 1),
+            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            ("--enable-return-indexer-topk", cfg.enable_return_indexer_topk),
+        )
+        if on
+    ]
+    if unsupported:
+        raise ValueError(
+            "--enable-unified-memory does not serve sparse attention with "
+            f"{', '.join(unsupported)} yet; drop it or --enable-unified-memory."
+        )
+    return True
+
+
 def handle_page_major_kv_layout(server_args: Any):
     # --enable-unified-memory implies --enable-page-major-kv-layout, so the
     # unified pool goes through this one gate (declared before the guard).
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
+        # Unified memory relies on the scheduler's write-after-read barrier, a device
+        # stream wait; on MPS (MLX included) the scheduler has no device streams.
+        if cfg.device == "mps":
+            raise ValueError(
+                "--enable-unified-memory is not supported on MPS: it orders the "
+                "scheduler's writes after the running forward's reads with "
+                "device stream waits, and the scheduler has no device streams "
+                "on MPS or MLX."
+            )
         declare_resolution(
             server_args,
             "_handle_page_major_kv_layout",
@@ -795,6 +874,8 @@ def handle_page_major_kv_layout(server_args: Any):
             "cutedsl_mla",
             "flashmla",
         }
+        if _validate_unified_sparse_attention(cfg, model_config):
+            allowed_full.add("dsa")
     elif model_config.has_asymmetric_kv:
         allowed_full = set(ASYMMETRIC_KV_BACKENDS)
     else:

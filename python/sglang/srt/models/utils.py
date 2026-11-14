@@ -41,8 +41,15 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import get_current_device_stream_fast, is_cpu, is_cuda, is_hip
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
+from sglang.srt.utils import (
+    get_current_device_stream_fast,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    print_info_once,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -54,6 +61,21 @@ _is_cpu = is_cpu()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
+
+
+def keeps_no_quant_config(hf_config, quant_config) -> None:
+    """``own_quant_config`` of a model class that keeps no ``quant_config``:
+    its layers may still take the loader's config, but its runner reads none
+    off the model, so an ``auto`` KV cache dtype resolves to the model dtype."""
+    return None
+
+
+def npu_draft_quant_config(hf_config, quant_config):
+    """``own_quant_config`` of a draft that runs unquantized on NPU unless a
+    draft quantization is named."""
+    if is_npu() and get_spec().speculative_draft_model_quantization is None:
+        return None
+    return quant_config
 
 
 @dataclass
@@ -296,6 +318,9 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `.view(-> 4D NHD)` reshape, and let the rotary forward pass
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
+    # The fused RoPE writer cannot localize DCP slots or filter token owners.
+    if get_parallel().dcp_enabled:
+        return False
     pool = get_token_to_kv_pool()
     return (
         _is_cuda
@@ -380,6 +405,108 @@ def create_fused_set_kv_buffer_arg(
             "slot_mapping": forward_batch.out_cache_loc,
             "swa_slot_mapping": slot_mapping_swa,
         }
+
+
+def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
+    """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
+
+    Replaces the separate act_and_mul and per-token FP4 quantize kernels with
+    one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
+    tuple. For ModelOpt and compressed-tensors W4A4 NVFP4 projections.
+    Kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
+    """
+    if envs.SGLANG_DISABLE_SILU_FP4_QUANT_FUSION.get():
+        return
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A4Fp4,
+    )
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
+
+    gate_up, down = mlp.gate_up_proj, mlp.down_proj
+    if (
+        isinstance(gate_up.quant_method, ModelOptFp4LinearMethod)
+        and gate_up.quant_method.quant_mode == "w4a4"
+        and isinstance(down.quant_method, ModelOptFp4LinearMethod)
+    ):
+        # The fused producer does not apply AWQ's per-input-channel scale.
+        if down.quant_method.quant_config.is_awq:
+            return
+    elif not (
+        isinstance(gate_up.scheme, CompressedTensorsW4A4Fp4)
+        and isinstance(down.scheme, CompressedTensorsW4A4Fp4)
+    ):
+        return
+    # Marlin, the SM80-SM90 default, takes a floating-point input, not the tuple.
+    if get_fp4_gemm_runner_backend().is_marlin():
+        return
+    # The fused kernel never writes the scale padding, which exists when K % 64 != 0.
+    if mlp.down_proj.input_size_per_partition % 64 != 0:
+        return
+    try:
+        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
+    except ImportError:
+        return
+    mlp._enable_silu_fp4_quant_fusion = True
+    mlp.down_proj._accepts_prequantized_fp4 = True
+    print_info_once("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
+
+
+def can_run_silu_fp4_quant_fusion(
+    mlp: torch.nn.Module, gate_up: torch.Tensor | tuple
+) -> bool:
+    """Whether this forward can hand down_proj the fused (fp4, scale) tuple."""
+    return (
+        mlp._enable_silu_fp4_quant_fusion
+        and not isinstance(gate_up, tuple)
+        and gate_up.dim() == 2
+        and not get_forward().sp_active  # the SP g-bar matmul needs a tensor
+        and not hasattr(mlp.down_proj, "base_layer")  # LoRA reads the activation
+        # down_proj outputs its params_dtype for the tuple, and gate_up's dtype
+        # for an activation; fuse only where the two agree. After the LoRA check:
+        # the LoRA wrapper has no params_dtype.
+        and gate_up.dtype == mlp.down_proj.params_dtype
+    )
+
+
+def silu_and_mul_fp4_quant(
+    mlp: torch.nn.Module, gate_up: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SiLU(gate) * up of a dense MLP, quantized to NVFP4 for its down_proj."""
+    from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
+
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A4Fp4,
+    )
+
+    # The global scale is final only after weight loading, so derive it lazily;
+    # the fused kernel requires a 1-D global scale.
+    if mlp._down_input_scale_inv_1d is None:
+        down = mlp.down_proj
+        # The scale each format's own input quant multiplies by.
+        if isinstance(down.scheme, CompressedTensorsW4A4Fp4):
+            scale = down.input_global_scale
+        else:
+            scale = down.input_scale_inv
+        mlp._down_input_scale_inv_1d = scale.reshape(1)
+    num_tokens = gate_up.shape[0]
+    masked_m = mlp._masked_m_cache.get(num_tokens)
+    if masked_m is None:
+        masked_m = torch.tensor([num_tokens], dtype=torch.int32, device=gate_up.device)
+        mlp._masked_m_cache[num_tokens] = masked_m
+    y_fp4, y_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
+        gate_up.unsqueeze(0),
+        masked_m,
+        mlp._down_input_scale_inv_1d,
+    )
+    # [M, K/2, 1] -> [M, K/2]; scale: expert-grouped 6-D swizzle
+    # (32, 4, m_blocks, 4, K/64, 1) -> the dense swizzled layout
+    # fp4_gemm expects (verified bit-exact vs fp4_quantize up to FP4
+    # rounding ties for M in 64..8192).
+    y_fp4 = y_fp4.squeeze(-1).view(torch.uint8)
+    m_padded = y_sf.shape[2] * y_sf.shape[0] * y_sf.shape[3]  # m_blocks*32*4
+    y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
+    return y_fp4, y_sf
 
 
 def permute_inv(perm: torch.Tensor) -> torch.Tensor:
@@ -788,3 +915,19 @@ def fused_qk_gemma_rmsnorm_with_gate(
 
 # Register the inplace op
 fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
+
+
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
+
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source

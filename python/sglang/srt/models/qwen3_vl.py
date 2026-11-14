@@ -29,6 +29,7 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
     FLASHINFER_MAX_SEQLEN_BUCKETS,
@@ -55,6 +56,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -63,11 +65,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
@@ -80,6 +78,7 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
     CUDA_IPC_FEATURE_COPY_EVENT_KEY,
@@ -88,14 +87,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
-from sglang.srt.utils import (
-    add_prefix,
-    cpu_has_amx_support,
-    is_cpu,
-    is_npu,
-    round_up,
-)
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu, round_up
 
 _is_npu = is_npu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
@@ -237,7 +229,7 @@ class Qwen3_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            head_size=head_size,
+            head_dim=head_size,
             projection_size=num_heads * head_size,
             use_qkv_parallel=True,
             proj_bias=True,
@@ -585,22 +577,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return torch.cat(result_parts, dim=0)
 
-    def _torch_interp_indices(
-        self, dim_size: int, device: torch.device
-    ) -> torch.Tensor:
-        side = self.num_grid_per_side
-        if self.align_corners:
-            # align_corners=True
-            return torch.linspace(
-                0, side - 1, dim_size, dtype=torch.float32, device=device
-            )
-        else:
-            # align_corners=False  (match _get_interpolation_indices)
-            idx = (torch.arange(dim_size, dtype=torch.float32, device=device) + 0.5) * (
-                side / dim_size
-            ) - 0.5
-            return idx.clamp_(0, side - 1)
-
     def fast_pos_embed_interpolate_from_list(self, grid_thw):
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
@@ -785,26 +761,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         merged = torch.empty_like(patch)
         merged[out_within + thw_off[out_image_id]] = patch
         return merged
-
-    def add_padding_to_fi_seqlens(
-        self, seq: np.ndarray, batch_size: int, padding_value: int
-    ) -> np.ndarray:
-        batch_size_padded = next(
-            (b for b in BATCH_BUCKETS if b >= batch_size),
-            # For large batches (> max bucket), round up to a multiple of
-            # the base bucket size to avoid negative pad length.
-            round_up(batch_size, BATCH_BUCKETS[0]),
-        )
-        if batch_size_padded == batch_size:
-            return seq
-        return np.concatenate(
-            [
-                seq,
-                np.full(
-                    (batch_size_padded - batch_size,), padding_value, dtype=seq.dtype
-                ),
-            ]
-        )
 
     def bucket_flashinfer_max_seqlen(self, real_max_seqlen: int) -> int:
         if real_max_seqlen <= 0:

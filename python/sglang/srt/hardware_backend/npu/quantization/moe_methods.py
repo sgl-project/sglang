@@ -35,7 +35,7 @@ _DEFAULT_DYNAMIC_QUANT = object()
 
 
 def _pair_pack_mxfp_act_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Pack MXFP activation scales from ``[M, K/32]`` to A5 GMM layout."""
+    """Pack MXFP activation scales from ``[M, K/32]`` to Ascend 950 GMM layout."""
     if scale.ndim != 2:
         return scale
     if scale.shape[-1] % 2 != 0:
@@ -55,7 +55,7 @@ def w4a8_mxfp_gmm(
     scale_alg=None,
     dynamic_quant_kwargs: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
-    """Run the shared A5 FP4-weight × FP8-activation grouped matmul."""
+    """Run the shared Ascend 950 FP4-weight × FP8-activation grouped matmul."""
     group_list = group_list.to(torch.int64)
     if input_scale is None:
         if dynamic_quant_kwargs is None:
@@ -222,27 +222,32 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 #  NPUW4A8MXFP4MoEMethod
 # ---------------------------------------------------------------------------
 class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
-    """ModelSlim W4A8 MoE with packed MXFP4 weights and MXFP8 activations."""
+    """Shared W4A8 MXFP kernels for online and ModelSlim MoE weights."""
 
     # Dispatch wire format required by the W4A8 MXFP GMMs: low-latency
     # dispatch quantizes activations to MXFP8 (E8M0 block scales); normal
-    # dispatch stays BF16 because A5 MXFP8 normal dispatch is intranode-only,
+    # dispatch stays BF16 because Ascend 950 MXFP8 normal dispatch is intranode-only,
     # which also preserves multi-node prefill when ``deepep-mode=auto``.
     DISPATCHER_QUANT_CONFIG = {
         "normal_dispatcher_output_dtype": "bf16",
         "low_latency_dispatcher_output_dtype": "mxfp8",
     }
 
-    def __init__(self, dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT):
+    def __init__(
+        self,
+        dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT,
+        *,
+        weight_prefix: Optional[str] = None,
+    ):
         super().__init__(quant_config=None)
         self.dynamic_quant_kwargs = dynamic_quant_kwargs
         # Fused gmm1 (matmul + swiglu + requant in one aclnn kernel). The v2 op
-        # accepts FP4 weights via weight_scale/weight_dtype — verified on A5
+        # accepts FP4 weights via weight_scale/weight_dtype — verified on Ascend 950
         # (llm/probe_mxfp4_gmm_swiglu_quant.py: same numerics as the unfused
         # chain modulo the output fp8 requant, which the unfused chain also
         # applies before gmm2).
-        self.use_fused_gmm1 = True
-        self.fused_matmul = GroupedMatmulSwigluQuant()
+        self.use_fused_gmm1 = weight_prefix != "w2"
+        self.fused_matmul = GroupedMatmulSwigluQuant() if self.use_fused_gmm1 else None
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
             quant_dtype=torch.float8_e4m3fn
         )
@@ -253,11 +258,35 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight = getattr(layer, f"{weight_prefix}_weight")
+        if weight.dtype in (torch.float16, torch.bfloat16):
+            fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+            if fp4_dtype is None:
+                raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+            source = weight.data
+            if not source.is_npu:
+                source = source.to(f"npu:{torch.npu.current_device()}")
+            packed, block_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                source,
+                dst_type=fp4_dtype,
+                round_mode="rint",
+                scale_alg=2,
+                dst_type_max=7.25,
+            )
+            del source
+            # Normalize online [E, N, K/64, 2] scales to the checkpoint layout.
+            if block_scale.dim() == 4:
+                block_scale = block_scale.flatten(-2)
+            weight = Parameter(packed, requires_grad=False)
+            layer.register_parameter(f"{weight_prefix}_weight", weight)
+            layer.register_parameter(
+                f"{weight_prefix}_weight_scale",
+                Parameter(block_scale, requires_grad=False),
+            )
+
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
         weight.data, weight_scale.data = prepare_w4a8_mxfp_weight(
             weight.data, weight_scale.data
         )
-
         if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(dict(self.DISPATCHER_QUANT_CONFIG))
 
@@ -1002,7 +1031,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 #  NPUMXFP8MoEMethod
 # ---------------------------------------------------------------------------
 class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
-    """MXFP8 MoE on A5 NPU – float8_e4m3fn weights with e8m0 block scales.
+    """MXFP8 MoE on Ascend 950 NPU – float8_e4m3fn weights with e8m0 block scales.
 
     Serves both the online config path (``--quantization mxfp8``, weights
     quantised at load time) and the offline ModelSlim ``W8A8_MXFP8`` scheme
@@ -1078,7 +1107,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         # MoE methods above (they transpose first, but carry no MX scale to keep
         # in sync). Same order as the dense W4A8 path in linear_method_npu.py.
         #
-        # A5 measurement, Qwen3-30B-A3B shapes, 128 experts (see
+        # Ascend 950 measurement, Qwen3-30B-A3B shapes, 128 experts (see
         # llm/probe_mxfp8_moe_nz.py): +1.4% decode, +3.8% prefill against a 0.2-
         # 0.3% noise floor, bit-identical outputs. Set
         # SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT to fall back to plain ND.

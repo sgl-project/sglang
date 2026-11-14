@@ -277,7 +277,7 @@ The machine cannot directly access the HuggingFace server due to network restric
 - **Download the dataset manually** — use a machine with network access to download the file, then transfer it to the target machine. Use `--dataset-path` to specify the local file path:
 
   ```bash
-  python -m sglang.bench_serving \
+  python -m sglang.benchmark.serving \
     --dataset-name random \
     --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
     ...

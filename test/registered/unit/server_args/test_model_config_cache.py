@@ -23,7 +23,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.arg_groups.overrides import declare_resolution, model_config_of
+from sglang.srt.arg_groups.model_override_base import model_config_of
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs

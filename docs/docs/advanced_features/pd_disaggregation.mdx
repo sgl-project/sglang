@@ -120,7 +120,6 @@ Each published CUDA 13 image has an EFA variant for EFA-enabled AWS EC2 instance
 | Base image | EFA image |
 |---|---|
 | `latest`, `v<version>` | `latest-efa`, `v<version>-efa` |
-| `latest-runtime`, `v<version>-runtime` | `latest-runtime-efa`, `v<version>-runtime-efa` |
 | `nightly-dev-<date>-<sha>` | `nightly-dev-efa-<date>-<sha>`, plus the moving `dev-efa` |
 
 Each EFA image matches its base and adds:
@@ -134,7 +133,7 @@ To add EFA to another CUDA 13 SGLang image, build `docker/efa.Dockerfile` on top
 
 ```bash
 docker build -f docker/efa.Dockerfile \
-  --build-arg BASE_IMAGE=lmsysorg/sglang:latest-runtime \
+  --build-arg BASE_IMAGE=lmsysorg/sglang:latest \
   -t sglang:efa docker/
 ```
 
@@ -149,7 +148,7 @@ docker run -it --gpus all \
   --ulimit memlock=-1 \
   -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
   --env HF_TOKEN \
-  lmsysorg/sglang:latest-runtime-efa bash
+  lmsysorg/sglang:latest-efa bash
 ```
 
 Inside the container, `fi_info -p efa -t FI_EP_RDM` lists the EFA devices.

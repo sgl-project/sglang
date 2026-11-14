@@ -20,7 +20,8 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttn
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
@@ -671,10 +672,8 @@ class FlashMLAMultiStepDraftBackend:
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardMode,
-            build_inner_fb_view,
-        )
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         inner_fb = build_inner_fb_view(
             forward_batch,

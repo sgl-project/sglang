@@ -17,9 +17,9 @@ from typing import Optional
 import numpy as np
 import requests
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -42,6 +42,7 @@ class TestSRTEndpoint(CustomTestCase):
     # against a different server flavor (e.g. SGLANG_RUST_SERVER=1).
     env = {}
     expect_startup_observability = True
+    custom_logit_processor_args = ("--enable-custom-logit-processor",)
 
     @classmethod
     def setUpClass(cls):
@@ -56,7 +57,7 @@ class TestSRTEndpoint(CustomTestCase):
             # rows still cover the non-chunked path).
             env={**cls.env, **SERVER_ENV, "SGLANG_LOGPROB_CHUNK_SIZE": "64"},
             other_args=(
-                "--enable-custom-logit-processor",
+                *cls.custom_logit_processor_args,
                 "--mem-fraction-static",
                 "0.7",
                 "--cuda-graph-max-bs-decode",
@@ -108,6 +109,22 @@ class TestSRTEndpoint(CustomTestCase):
 
         print(json.dumps(response_json, indent=2))
         print("=" * 100)
+
+    def test_stream_declares_utf8(self):
+        # Without a charset, `requests` decodes a text/event-stream as Latin-1.
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 4},
+                "stream": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.headers["content-type"], "text/event-stream; charset=utf-8"
+        )
+        self.assertEqual(response.encoding, "utf-8")
 
     def test_logprob(self):
         self.run_decode(
@@ -411,76 +428,6 @@ class TestSRTEndpoint(CustomTestCase):
                 f"{target_token_id=}\n{sampled_tokens=}\n{custom_response=}",
             )
 
-    def run_stateful_custom_logit_processor(
-        self, first_token_id: int | None, delay: int = 2
-    ):
-        """Test custom logit processor with custom params and state.
-
-        Should sample the first `delay` tokens normally, then output first_token_id and consecutive tokens after that.
-        If first_token_id is None, the custom logit processor won't be passed in.
-        """
-        custom_params = {"token_id": first_token_id, "delay": 2}
-
-        class DeterministicStatefulLogitProcessor(CustomLogitProcessor):
-            """A dummy logit processor that changes the logits to always
-            sample the given token id.
-            """
-
-            def __call__(self, logits, custom_param_list):
-                assert logits.shape[0] == len(custom_param_list)
-
-                for i, param_dict in enumerate(custom_param_list):
-                    if param_dict["delay"] > 0:
-                        param_dict["delay"] -= 1
-                        continue
-                    if param_dict["delay"] == 0:
-                        param_dict["delay"] -= 1
-                        force_token = param_dict["token_id"]
-                    else:
-                        output_ids = param_dict["__req__"].output_ids
-                        force_token = output_ids[-1] + 1
-                    # Mask all other tokens
-                    logits[i, :] = -float("inf")
-                    # Assign highest probability to the specified token
-                    logits[i, force_token] = 0.0
-                return logits
-
-        prompts = "Question: Is Paris the Capital of France? Answer:"
-
-        # Base case json data to be posted to the server.
-        base_json = {
-            "text": prompts,
-            "sampling_params": {"temperature": 0.0},
-            "return_logprob": True,
-        }
-
-        # Custom json data with custom logit processor and params.
-        custom_json = base_json.copy()
-        # Only set the custom logit processor if target_token_id is not None.
-        if first_token_id is not None:
-            custom_json["custom_logit_processor"] = (
-                DeterministicStatefulLogitProcessor().to_str()
-            )
-            custom_json["sampling_params"]["custom_params"] = custom_params
-
-        custom_response = requests.post(
-            self.base_url + "/generate",
-            json=custom_json,
-        ).json()
-
-        output_token_logprobs = custom_response["meta_info"]["output_token_logprobs"]
-        sampled_tokens = [x[1] for x in output_token_logprobs]
-        # The logit processor should always sample the given token as the logits is deterministic.
-        if first_token_id is not None:
-            self.assertTrue(
-                all(
-                    x == custom_params["token_id"] + k
-                    for k, x in enumerate(sampled_tokens[custom_params["delay"] :])
-                ),
-                # Print the detailed test case info if the test fails.
-                f"{first_token_id=}\n{sampled_tokens=}\n{custom_response=}",
-            )
-
     def test_custom_logit_processor(self):
         """Test custom logit processor with a single request."""
         self.run_custom_logit_processor(target_token_id=5)
@@ -491,31 +438,6 @@ class TestSRTEndpoint(CustomTestCase):
         random.shuffle(target_token_ids)
         with ThreadPoolExecutor(len(target_token_ids)) as executor:
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
-
-    @unittest.skip("Skip this test because this feature has a bug. See comments below.")
-    def test_stateful_custom_logit_processor(self):
-        """Test custom logit processor with a single request."""
-
-        """
-        NOTE: This feature has a race condition bug.
-        This line https://github.com/sgl-project/sglang/blob/ef8ec07b2ce4c70c2a33ec5acda4ce529bc3cda4/test/srt/test_srt_endpoint.py#L395-L396 can be accessed by two concurrent threads at the same time. The access order is not guaranteed.
-        In sglang, we use two python threads to overlap the GPU computation and CPU scheduling.
-        Thread 1 (the CPU scheduling thread) will update the `param_dict["__req__"].output_ids`.
-        Thread 2 (the GPU computation thread) will call `DeterministicStatefulLogitProcessor` because sampling is considered as GPU computation.
-        We can fix this by moving the call of DeterministicStatefulLogitProcessor to the CPU scheduling thread.
-        """
-
-        self.run_stateful_custom_logit_processor(first_token_id=5)
-
-    @unittest.skip("Skip this test because this feature has a bug. See comments above.")
-    def test_stateful_custom_logit_processor_batch_mixed(self):
-        """Test a batch of requests mixed of requests with and without custom logit processor."""
-        target_token_ids = list(range(32)) + [None] * 16
-        random.shuffle(target_token_ids)
-        with ThreadPoolExecutor(len(target_token_ids)) as executor:
-            list(
-                executor.map(self.run_stateful_custom_logit_processor, target_token_ids)
-            )
 
     def test_cache_tokens(self):
         for _ in range(2):
@@ -594,6 +516,7 @@ class TestSRTEndpoint(CustomTestCase):
         self.assertIsInstance(memory_usage["kvcache"], float)
         self.assertEqual(memory_usage["token_capacity"], max_total_num_tokens)
         self.assertIsNone(memory_usage["token_capacity_swa"])
+        self.assertEqual(memory_usage["token_capacity_window"], {})
         self.assertIsInstance(memory_usage["startup_available"], float)
         self.assertGreater(memory_usage["startup_available"], 0)
         self.assertTrue(graph_phases.issubset(memory_usage["graph"]))
@@ -904,6 +827,8 @@ class TestTokenizeDetokenize(CustomTestCase):
 class TestRustServerEndpoint(TestSRTEndpoint):
     env = {"SGLANG_RUST_SERVER": "1"}
     expect_startup_observability = False
+    # Refused at startup in Rust-server mode; its tests are skipped below.
+    custom_logit_processor_args = ()
 
     _RUST_TODO = "not implemented by the embedded Rust server yet"
 
@@ -913,14 +838,6 @@ class TestRustServerEndpoint(TestSRTEndpoint):
 
     @unittest.skip(f"custom_logit_processor request field {_RUST_TODO}")
     def test_custom_logit_processor_batch_mixed(self):
-        pass
-
-    @unittest.skip(f"custom_logit_processor request field {_RUST_TODO}")
-    def test_stateful_custom_logit_processor(self):
-        pass
-
-    @unittest.skip(f"custom_logit_processor request field {_RUST_TODO}")
-    def test_stateful_custom_logit_processor_batch_mixed(self):
         pass
 
     @unittest.skip(f"/flush_cache endpoint + cached_tokens meta {_RUST_TODO}")

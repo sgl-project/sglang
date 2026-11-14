@@ -18,6 +18,7 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_VL_PP,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     is_in_amd_ci,
     popen_launch_server,
 )
@@ -34,7 +35,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_VL_PP
-        cls.base_url = "http://127.0.0.1:23333"
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             DEFAULT_MODEL_NAME_FOR_TEST_VL_PP,
             cls.base_url,
@@ -76,7 +77,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
 class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base_url = "http://127.0.0.1:23335"  # different ports to avoid conflicts
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.model_name = (
             "Qwen/Qwen3-0.6B"  # qwen3 < 8B all have tie_word_embeddings = True
         )
@@ -130,7 +131,7 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
 class TestQwenMoePPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base_url = "http://127.0.0.1:23336"  # different ports to avoid conflicts
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.model_name = "Qwen/Qwen3-30B-A3B"  # replace with your Qwen Model if needed
 
     def run_gsm8k_test(self, pp_size):

@@ -19,6 +19,7 @@ classifiers = [
 dependencies = [
   "aiohttp",
   "anthropic>=0.20.0",
+  "blake3>=1.0.0",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -43,7 +44,8 @@ dependencies = [
   "outlines",
   "packaging",
   "partial_json_parser",
-  "pillow",
+  # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
+  "pillow<13",
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",

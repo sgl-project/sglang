@@ -36,12 +36,9 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -75,7 +72,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_topk,
     get_plan_stream,
     select_top_k_tokens,
     spec_stage_span,
@@ -86,6 +82,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
+from sglang.srt.utils.common import fast_topk
 
 logger = logging.getLogger(__name__)
 

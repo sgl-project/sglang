@@ -40,7 +40,9 @@ import torch.distributed
 
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.eplb.expert_location import get_eplb_group
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     ExpertDispatchCollector,
@@ -170,6 +172,11 @@ class ExpertDistributionRecorder(ABC):
     def get_current_pass_count_buffer(self):
         return None
 
+    def get_current_pass_local_count_buffer(
+        self, *, num_experts: int, ep_rank: int, ep_size: int
+    ) -> Optional[torch.Tensor]:
+        return None
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -242,6 +249,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        # A disabled pass must not reset, collect, or publish target statistics.
+        if self._disable_all:
+            yield {}
+            return
+
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
@@ -290,6 +302,19 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
             return None
         return gatherer._data[self._current_layer_idx.value]
+
+    def get_current_pass_local_count_buffer(
+        self, *, num_experts: int, ep_rank: int, ep_size: int
+    ) -> Optional[torch.Tensor]:
+        # Physical experts are rank-major, so this rank's experts are one slice of
+        # the layer's row. None without a current layer or on a width mismatch.
+        if self._current_layer_idx.value is None:
+            return None
+        counts = self.get_current_pass_count_buffer()
+        if counts is None or counts.numel() != num_experts:
+            return None
+        num_local = num_experts // ep_size
+        return counts[ep_rank * num_local : (ep_rank + 1) * num_local]
 
     def on_deepep_dispatch_normal(
         self,
@@ -756,6 +781,7 @@ class _Accumulator(ABC):
     ):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        self._communication_group = get_eplb_group()
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -830,7 +856,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            gpu_physical_count,
+            dst=0,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         if self._rank == 0:
@@ -998,7 +1027,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         output = dict(
@@ -1041,7 +1072,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 dtype=torch.float32,
                 device=get_device_namespace().device,
             )
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+        torch.distributed.broadcast(
+            avg_rate_tensor, src=0, group=self._communication_group
+        )
         return avg_rate_tensor.item()
 
 

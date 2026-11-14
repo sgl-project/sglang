@@ -44,7 +44,7 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
     jinja2.TemplateError,
     TypeError,
 ) + _MISTRAL_COMMON_ERRORS
-from fastapi.responses import ORJSONResponse, StreamingResponse
+from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import (
@@ -104,10 +104,12 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
     strip_structural_tag_excludes,
+    without_schema_identifiers,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
@@ -141,6 +143,7 @@ from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
 )
+from sglang.srt.utils.json_response import model_json_response
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -151,6 +154,21 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close the body iterator however streaming ends.
+
+    Starlette leaves the iterator suspended when a send fails, and on ASGI
+    spec >= 2.4 it also skips the background task, so nothing would abort the
+    request until the generator is garbage collected.
+    """
+
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self.body_iterator.aclose()
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -242,27 +260,6 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_max_dynamic_patch = min(img_vals) if img_vals else None
     vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
     return img_max_dynamic_patch, vid_max_dynamic_patch
-
-
-KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
-KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
-
-
-def neutralize_kimi_k3_image_placeholder(text: str) -> str:
-    return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
-
-
-def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
-    if isinstance(value, str):
-        return neutralize_kimi_k3_image_placeholder(value)
-    if isinstance(value, list):
-        return [neutralize_kimi_k3_image_placeholder_value(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: neutralize_kimi_k3_image_placeholder_value(item)
-            for key, item in value.items()
-        }
-    return value
 
 
 _M3_THINKING_TYPES = ("adaptive", "enabled", "disabled")
@@ -390,7 +387,6 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     _default_sampling_params_logged = False
-    _KIMI_K3_GENERATION_STUB_TOKENS = 3
 
     async def handle_request(self, request, raw_request):
         if self._doc_splitter is not None:
@@ -636,6 +632,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_call_parsing_active=self._tool_call_parsing_active,
                     history_tool_calls_count=self._get_history_tool_calls_cnt,
                     tool_call_id=self._process_tool_call_id,
+                    effective_tools=self._effective_tools,
+                    split_assistant_prefix=self._handle_last_assistant_message,
+                    append_assistant_prefix=self._append_assistant_prefix_to_prompt_ids,
                 ),
                 hf_config=self.tokenizer_manager.model_config.hf_config,
                 model_path=self.tokenizer_manager.model_path,
@@ -651,6 +650,12 @@ class OpenAIServingChat(OpenAIServingBase):
             return None
         return self._encoding_adapter.output
 
+    @property
+    def chat_wire(self) -> chat_encoding_adapters.ChatWire:
+        if self._encoding_adapter is None:
+            return chat_encoding_adapters.OPENAI_CHAT_WIRE
+        return self._encoding_adapter.wire
+
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
@@ -664,80 +669,6 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 tools.extend(message.tools)
         return tools
-
-    def _prepare_kimi_k3_messages(
-        self,
-        messages: list[dict[str, Any]],
-        request: ChatCompletionRequest,
-    ) -> tuple[list[dict[str, Any]], int, str | None]:
-        image_count = 0
-        for index, message in enumerate(messages):
-            content = message.get("content")
-            if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    part_type = part.get("type")
-                    if part_type in ("text", "input_text"):
-                        parts.append(
-                            {
-                                "type": "text",
-                                "text": neutralize_kimi_k3_image_placeholder(
-                                    part["text"]
-                                ),
-                            }
-                        )
-                    elif part_type in ("image_url", "input_image"):
-                        image = part.get("image_url") or {}
-                        if isinstance(image, str):
-                            image = {"url": image, "detail": part.get("detail")}
-                        parts.append({"type": "image_url", "image_url": image})
-                        image_count += 1
-                message["content"] = parts
-            elif isinstance(content, str):
-                message["content"] = neutralize_kimi_k3_image_placeholder(content)
-            elif content is None:
-                message["content"] = ""
-
-            if message.get("role") == "assistant":
-                for key in ("reasoning_content", "reasoning"):
-                    if key in message:
-                        message[key] = neutralize_kimi_k3_image_placeholder_value(
-                            message[key]
-                        )
-                for tool_call in message.get("tool_calls") or []:
-                    function = (
-                        tool_call.get("function")
-                        if isinstance(tool_call, dict)
-                        else None
-                    )
-                    if isinstance(function, dict) and "arguments" in function:
-                        function["arguments"] = (
-                            neutralize_kimi_k3_image_placeholder_value(
-                                function["arguments"]
-                            )
-                        )
-
-            source = request.messages[index]
-            if (
-                isinstance(source, ChatCompletionMessageGenericParam)
-                and source.role in ("system", "developer")
-                and source.tools
-            ):
-                message["tools"] = [
-                    tool.model_dump(exclude_unset=True, by_alias=True)
-                    for tool in source.tools
-                ]
-            if message.get("role") == "developer":
-                message["role"] = "system"
-
-        assistant_prefix = None
-        if request.continue_final_message:
-            messages, assistant_prefix = self._handle_last_assistant_message(
-                messages, request
-            )
-        return messages, image_count, assistant_prefix
 
     def _encode_messages(
         self,
@@ -760,71 +691,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 thinking=thinking_mode == ThinkingMode.THINKING,
                 image_data=image_data,
             )
-        if self.chat_encoding_spec == "kimi_k3":
-            messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
-                messages, request
-            )
-            template_kwargs = dict(request.chat_template_kwargs or {})
-            template_kwargs.pop("tokenize", None)
-            template_kwargs.pop("return_dict", None)
-            template_kwargs.pop("image_prompts", None)
-            if image_count:
-                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
-
-            if (
-                request.reasoning_effort in ("low", "high", "max")
-                and "thinking_effort" not in template_kwargs
-            ):
-                template_kwargs["thinking_effort"] = request.reasoning_effort
-            elif request.reasoning_effort not in (
-                None,
-                "none",
-                "low",
-                "high",
-                "max",
-            ):
-                logger.warning(
-                    "Kimi K3 does not support reasoning_effort=%r; using the "
-                    "encoder default.",
-                    request.reasoning_effort,
-                )
-
-            effective_tools = self._effective_tools(request)
-            if (
-                effective_tools
-                and isinstance(request.tool_choice, str)
-                and request.tool_choice in ("required", "none")
-            ):
-                template_kwargs.setdefault("tool_choice", request.tool_choice)
-            if request.response_format is not None:
-                template_kwargs.setdefault(
-                    "response_format",
-                    request.response_format.model_dump(
-                        exclude_unset=True, by_alias=True
-                    ),
-                )
-
-            request_tools = (
-                [
-                    tool.model_dump(exclude_unset=True, by_alias=True)
-                    for tool in request.tools
-                ]
-                if request.tools
-                else None
-            )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=request_tools,
-                return_dict=False,
-                **template_kwargs,
-            )
-            if assistant_prefix:
-                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
-                )
-            return prompt_ids
         return None
 
     def _decode_response(self, ret_item: dict[str, Any]) -> str | ErrorResponse:
@@ -856,13 +722,15 @@ class OpenAIServingChat(OpenAIServingBase):
             cached_tokens=content["meta_info"].get("cached_tokens", 0)
         )
 
+    def _uncounted_prompt_tokens(self) -> int:
+        if self._encoding_adapter is None:
+            return 0
+        return self._encoding_adapter.uncounted_prompt_tokens
+
     def _reported_prompt_tokens(self, meta_info: dict[str, Any]) -> int:
-        prompt_tokens = meta_info.get("prompt_tokens", 0)
-        if self.chat_encoding_spec == "kimi_k3":
-            # K3's three-token assistant generation stub is model input, but the
-            # reference API excludes it from billed/reported prompt tokens.
-            prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
-        return prompt_tokens
+        return chat_encoding_adapters.reported_prompt_tokens(
+            meta_info, self._uncounted_prompt_tokens()
+        )
 
     @staticmethod
     def _sort_tool_message_run(
@@ -948,6 +816,9 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens: dict[int, int],
         reasoning_tokens: dict[int, int],
         completion_tokens: dict[int, int],
+        wire: chat_encoding_adapters.ChatWireResponse = (
+            chat_encoding_adapters.OPENAI_CHAT_WIRE
+        ),
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         encoding_output = self._encoding_output()
@@ -986,6 +857,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # nor duplicated across chunks; flush any leftover at the end.
         remaining_logprobs = choice_logprobs
 
+        finishing = finish_reason_type is not None and finish_reason_type != "abort"
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
@@ -1007,15 +879,35 @@ class OpenAIServingChat(OpenAIServingBase):
                     ).model_dump()
 
                 yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
+                    omit_null_reasoning=wire.omit_null_delta,
+                    chunk_id=wire.response_id(content["meta_info"]["id"]),
                     created=created,
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
                     logprobs=remaining_logprobs,
                     usage=usage,
+                    internal_content=wire.internal_content(
+                        index, reasoning_text, kind="reasoning"
+                    ),
                 )
                 remaining_logprobs = None
+
+            reasoning_parser = reasoning_parser_dict.get(index)
+            if reasoning_parser is not None and wire.ends_reasoning(
+                index,
+                reasoning_parser.detector,
+                reasoning_text,
+                finishing=finishing,
+            ):
+                yield build_sse_content(
+                    omit_null_reasoning=wire.omit_null_delta,
+                    chunk_id=wire.response_id(content["meta_info"]["id"]),
+                    created=created,
+                    model=request.model,
+                    index=index,
+                    reasoning_content="",
+                )
 
         # Handle tool calls
         if self._tool_call_parsing_active(request) and not self._answer_started(
@@ -1030,7 +922,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 has_tool_calls,
                 created=created,
                 continuous_usage_stats=continuous_usage_stats,
-                flush=finish_reason_type is not None and finish_reason_type != "abort",
+                flush=finishing,
+                wire=wire,
             ):
                 if chunk:
                     yield chunk
@@ -1039,7 +932,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if finish_reason_type is not None and index in parser_dict:
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index, created=created
+                    parser, content, request, index, created=created, wire=wire
                 )
                 if remaining_chunk:
                     yield remaining_chunk
@@ -1057,13 +950,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     ).model_dump()
 
                 yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
+                    omit_null_reasoning=wire.omit_null_delta,
+                    chunk_id=wire.response_id(content["meta_info"]["id"]),
                     created=created,
                     model=request.model,
                     index=index,
                     content=delta,
                     logprobs=remaining_logprobs,
                     usage=usage,
+                    internal_content=wire.internal_content(
+                        index, delta, kind="content"
+                    ),
                 )
                 remaining_logprobs = None
 
@@ -1085,7 +982,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 ).model_dump()
 
             yield build_sse_content(
-                chunk_id=content["meta_info"]["id"],
+                omit_null_reasoning=wire.omit_null_delta,
+                chunk_id=wire.response_id(content["meta_info"]["id"]),
                 created=created,
                 model=request.model,
                 index=index,
@@ -1139,10 +1037,20 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        top_logprobs_error = self._top_logprobs_error(
+            "top_logprobs", request.top_logprobs
+        )
+        if top_logprobs_error:
+            return top_logprobs_error
+
         if self.is_minimax_m3:
             m3_error = _validate_minimax_m3_request(request)
             if m3_error:
                 return m3_error
+        if self._encoding_adapter is not None:
+            encoding_error = self._encoding_adapter.validate_request(request)
+            if encoding_error:
+                return encoding_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
             return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
 
@@ -1189,7 +1097,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                Draft202012Validator.check_schema(
+                    without_schema_identifiers(tool.function.parameters)
+                )
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
@@ -1198,7 +1108,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     "or contains a cycle."
                 )
 
-        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        max_output_tokens = request.effective_max_tokens
         server_context_length = get_model().context_length
         if (
             validate_max_output_tokens
@@ -1355,7 +1265,10 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
-            renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
+            renderer_handles_response_format=(
+                self._encoding_adapter is not None
+                and self._encoding_adapter.renders_response_format
+            ),
         )
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
@@ -1872,15 +1785,18 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=(
+                    True if enable_thinking is None else bool(enable_thinking)
+                ),
             )
 
         # Apply chat template and its stop strings
         tools = None
         tool_call_stop = None
         required_parsed_natively = glm_constraint
+        kimi_k3_tool_grammar = (
+            self.chat_encoding_spec == "kimi_k3" and self.tool_call_parser == "kimi_k3"
+        )
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
@@ -1929,10 +1845,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if (
                 tool_call_constraint is None
                 and not required_parsed_natively
-                and not (
-                    self.chat_encoding_spec == "kimi_k3"
-                    and self.tool_call_parser == "kimi_k3"
-                )
+                and not kimi_k3_tool_grammar
                 and (
                     request.tool_choice == "required"
                     or isinstance(request.tool_choice, ToolChoice)
@@ -1944,6 +1857,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+        elif effective_tools and kimi_k3_tool_grammar:
+            tool_call_constraint = (
+                "structural_tag",
+                KimiK3Detector().get_structural_tag(
+                    effective_tools,
+                    tool_choice="none",
+                    thinking_mode=xgrammar_reasoning,
+                ),
+            )
 
         if tool_call_constraint is None and self._takes_turn_grammar(
             request, output_constrained=output_constrained
@@ -2056,15 +1978,16 @@ class OpenAIServingChat(OpenAIServingBase):
             else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
-        strict_tool_call_arguments = (
-            self._encoding_adapter.strict_tool_call_arguments
+        history_tool_call_arguments = (
+            self._encoding_adapter.history_tool_call_arguments
             if self._encoding_adapter is not None
-            else self.chat_encoding_spec != "kimi_k3"
+            else "strict"
         )
-        for message in messages:
-            normalize_assistant_tool_call_arguments(
-                message, strict=strict_tool_call_arguments
-            )
+        if history_tool_call_arguments != "as_sent":
+            for message in messages:
+                normalize_assistant_tool_call_arguments(
+                    message, strict=history_tool_call_arguments == "strict"
+                )
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
@@ -2077,12 +2000,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if prompt_ids is not None:
             if image_data and not is_multimodal:
                 raise ValueError("image input is not supported for this model")
-            collects_openai_media = (
-                self._encoding_adapter.collects_openai_media
-                if self._encoding_adapter is not None
-                else self.chat_encoding_spec == "kimi_k3"
-            )
-            if collects_openai_media:
+            if (
+                self._encoding_adapter is not None
+                and self._encoding_adapter.collects_openai_media
+            ):
                 for message in request.messages:
                     msg_dict = message.model_dump()
                     if msg_dict.get("content") is None:
@@ -2445,7 +2366,10 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse | ErrorResponse:
         """Handle streaming chat completion request"""
-        generator = self._generate_chat_stream(adapted_request, request, raw_request)
+        wire_response = self.chat_wire.new_response(request, created=int(time.time()))
+        generator = self._generate_chat_stream(
+            adapted_request, request, raw_request, wire=wire_response
+        )
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
         # If validation fails (e.g., context length exceeded), we can still return
@@ -2456,13 +2380,18 @@ class OpenAIServingChat(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         async def prepend_first_chunk():
-            yield first_chunk
-            async for chunk in generator:
-                yield chunk
+            try:
+                yield first_chunk
+                async for chunk in generator:
+                    yield chunk
+            finally:
+                await generator.aclose()
 
-        return StreamingResponse(
+        return _ClosingStreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
+            # The first chunk is out, so the wire has seen the first engine event.
+            headers=wire_response.headers() or None,
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
@@ -2471,6 +2400,9 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
+        wire: chat_encoding_adapters.ChatWireResponse = (
+            chat_encoding_adapters.OPENAI_CHAT_WIRE
+        ),
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         created = int(time.time())
@@ -2504,11 +2436,53 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         error_aborted = False
+        interrupted = False
+        ended_choices: set[int] = set()
+
+        def end_frames(close_open_choices: bool):
+            finishes = dict(finish_reasons)
+            if close_open_choices:
+                for idx in range(request.n):
+                    finishes.setdefault(idx, {"type": "abort"})
+            for idx, finish_reason_data in finishes.items():
+                if idx in ended_choices:
+                    continue
+                ended_choices.add(idx)
+                finish_reason_type = finish_reason_data["type"]
+
+                # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
+                final_finish_reason = finish_reason_type
+                if (
+                    has_tool_calls.get(idx, False)
+                    and finish_reason_type == "stop"
+                    and not _incomplete_tool_call_indices(parser_dict.get(idx))
+                ):
+                    final_finish_reason = "tool_calls"
+
+                matched_stop = finish_reason_data.get("matched")
+                yield build_sse_content(
+                    omit_null_reasoning=wire.omit_null_delta,
+                    chunk_id=wire.response_id(content["meta_info"]["id"]),
+                    created=created,
+                    model=request.model,
+                    index=idx,
+                    finish_reason=wire.finish_reason(final_finish_reason),
+                    matched_stop=matched_stop,
+                    choice_usage=wire.choice_usage(
+                        prompt_tokens=prompt_tokens.get(idx, 0),
+                        completion_tokens=completion_tokens.get(idx, 0),
+                        reasoning_tokens=reasoning_tokens.get(idx, 0) or 0,
+                        cached_tokens=cached_tokens.get(idx, 0) or 0,
+                    ),
+                )
+
+        stream = self.tokenizer_manager.generate_request(adapted_request, raw_request)
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 get_serving().stream_response_default_include_usage,
             )
+            continuous_usage_stats &= wire.continuous_usage
 
             return_input_ids = self._should_return_input_ids(request)
             return_output_ids = self._should_return_output_ids(request)
@@ -2518,9 +2492,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 and raw_request.headers.get("x-sglext-ids-framed") == "1"
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in stream:
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
@@ -2596,6 +2568,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     if finish_reason_type == "abort" and isinstance(
                         finish_reason.get("status_code"), HTTPStatus
                     ):
+                        wire.check_abort(finish_reason, stream_started=stream_started)
+                        if wire.errors_end_choices:
+                            finish_reasons[index] = finish_reason
+                            interrupted = True
+                            break
                         code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
@@ -2607,12 +2584,15 @@ class OpenAIServingChat(OpenAIServingBase):
                         break
                     finish_reasons[index] = finish_reason
 
+                wire.observe(index, content)
+
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
                     # K2 templates require preserved thinking, including empty reasoning.
                     yield build_sse_content(
-                        chunk_id=content["meta_info"]["id"],
+                        omit_null_reasoning=wire.omit_null_delta,
+                        chunk_id=wire.response_id(content["meta_info"]["id"]),
                         created=created,
                         model=request.model,
                         index=index,
@@ -2663,31 +2643,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
+                    wire=wire,
                 ):
                     yield chunk
 
             # Send finish_reason chunks for each index that completed
-            for idx, finish_reason_data in finish_reasons.items():
-                finish_reason_type = finish_reason_data["type"]
-
-                # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
-                final_finish_reason = finish_reason_type
-                if (
-                    has_tool_calls.get(idx, False)
-                    and finish_reason_type == "stop"
-                    and not _incomplete_tool_call_indices(parser_dict.get(idx))
-                ):
-                    final_finish_reason = "tool_calls"
-
-                matched_stop = finish_reason_data.get("matched")
-                yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
-                    created=created,
-                    model=request.model,
-                    index=idx,
-                    finish_reason=final_finish_reason,
-                    matched_stop=matched_stop,
-                )
+            for chunk in end_frames(close_open_choices=interrupted):
+                yield chunk
 
             # Send hidden states if requested
             if request.return_hidden_states and hidden_states:
@@ -2697,7 +2659,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             choice_hidden_states, request.return_hidden_states
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
+                            id=wire.response_id(content["meta_info"]["id"]),
                             created=created,
                             choices=[
                                 ChatCompletionResponseStreamChoice(
@@ -2710,7 +2672,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             ],
                             model=request.model,
                         )
-                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+                        yield f"data: {hidden_states_chunk.model_dump_json(context=wire.serialization_context)}\n\n"
 
             sglext_routed = None
             if request.return_routed_experts and routed_experts:
@@ -2765,31 +2727,31 @@ class OpenAIServingChat(OpenAIServingBase):
                 # the other sglext fields keep the plain data-chunk shape.
                 if sglext_non_ids is not None:
                     sglext_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
+                        id=wire.response_id(content["meta_info"]["id"]),
                         created=created,
                         choices=[],
                         model=request.model,
                         sglext=sglext_non_ids,
                     )
-                    yield f"data: {sglext_chunk.model_dump_json()}\n\n"
+                    yield f"data: {sglext_chunk.model_dump_json(context=wire.serialization_context)}\n\n"
                 if sglext_ids is not None:
                     sglext_ids_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
+                        id=wire.response_id(content["meta_info"]["id"]),
                         created=created,
                         choices=[],
                         model=request.model,
                         sglext=sglext_ids,
                     )
-                    yield f"event: sglext_ids\ndata: {sglext_ids_chunk.model_dump_json()}\n\n"
+                    yield f"event: sglext_ids\ndata: {sglext_ids_chunk.model_dump_json(context=wire.serialization_context)}\n\n"
             elif sglext_non_ids is not None or sglext_ids is not None:
                 sglext_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=wire.response_id(content["meta_info"]["id"]),
                     created=created,
                     choices=[],  # sglext is at response level
                     model=request.model,
                     sglext=sglext_full,
                 )
-                yield f"data: {sglext_chunk.model_dump_json()}\n\n"
+                yield f"data: {sglext_chunk.model_dump_json(context=wire.serialization_context)}\n\n"
 
             # Additional usage chunk
             if include_usage:
@@ -2815,20 +2777,43 @@ class OpenAIServingChat(OpenAIServingBase):
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
                 )
+                usage = wire.finalize_usage(
+                    usage,
+                    cached_tokens=sum(
+                        tok or 0
+                        for idx, tok in cached_tokens.items()
+                        if idx % request.n == 0
+                    ),
+                )
                 usage_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=wire.response_id(content["meta_info"]["id"]),
                     created=created,
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
                 )
-                yield f"data: {usage_chunk.model_dump_json()}\n\n"
+                yield f"data: {usage_chunk.model_dump_json(context=wire.serialization_context)}\n\n"
 
-        except ValueError as e:
-            if not stream_started:
+        except Exception as e:
+            if not stream_started or not (
+                wire.errors_end_choices or isinstance(e, ValueError)
+            ):
                 raise
-            error = self.create_streaming_error_response(str(e))
-            yield f"data: {error}\n\n"
+            if wire.errors_end_choices:
+                logger.warning(
+                    "Stream failed mid-response, ending its open choices: %s",
+                    e,
+                    exc_info=not isinstance(e, ValueError),
+                )
+                for chunk in end_frames(close_open_choices=True):
+                    yield chunk
+            else:
+                error = self.create_streaming_error_response(str(e))
+                yield f"data: {error}\n\n"
+        finally:
+            # Closing generate_request runs its cleanup, which aborts the
+            # request only while this request still owns its rid.
+            await stream.aclose()
 
         yield "data: [DONE]\n\n"
 
@@ -2837,8 +2822,29 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> ChatCompletionResponse | ErrorResponse | ORJSONResponse:
+    ) -> ChatCompletionResponse | ErrorResponse | Response:
         """Handle non-streaming chat completion request"""
+        wire = self.chat_wire.new_response(request, created=int(time.time()))
+        response = await self._chat_completion_response(
+            adapted_request, request, raw_request, wire=wire
+        )
+        headers = wire.headers()
+        if headers and isinstance(response, ChatCompletionResponse):
+            # The body the route sends when there are no headers.
+            json_response = model_json_response(response)
+            json_response.headers.update(headers)
+            return json_response
+        return response
+
+    async def _chat_completion_response(
+        self,
+        adapted_request: GenerateReqInput,
+        request: ChatCompletionRequest,
+        raw_request: Request,
+        wire: chat_encoding_adapters.ChatWireResponse = (
+            chat_encoding_adapters.OPENAI_CHAT_WIRE
+        ),
+    ) -> ChatCompletionResponse | ErrorResponse | ORJSONResponse:
         try:
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -2848,11 +2854,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if not isinstance(ret, list):
             ret = [ret]
+        for index, ret_item in enumerate(ret):
+            wire.observe(index, ret_item)
 
         response = self._build_chat_response(
             request,
             ret,
             int(time.time()),
+            wire=wire,
         )
 
         return response
@@ -2862,9 +2871,12 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         ret: list[dict[str, Any]],
         created: int,
+        wire: chat_encoding_adapters.ChatWireResponse = (
+            chat_encoding_adapters.OPENAI_CHAT_WIRE
+        ),
     ) -> ChatCompletionResponse | ORJSONResponse:
         """Build chat completion response from generation results"""
-        if self.chat_encoding_spec == "kimi_k3":
+        if self._uncounted_prompt_tokens():
             ret = [
                 {
                     **item,
@@ -3032,7 +3044,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     ),
                 ),
                 logprobs=choice_logprobs,
-                finish_reason=finish_reason["type"] if finish_reason else None,
+                finish_reason=(
+                    wire.finish_reason(finish_reason["type"]) if finish_reason else None
+                ),
                 matched_stop=(
                     finish_reason["matched"]
                     if finish_reason and "matched" in finish_reason
@@ -3067,9 +3081,16 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
         )
+        usage = wire.finalize_usage(
+            usage,
+            cached_tokens=sum(
+                ret[i]["meta_info"].get("cached_tokens", 0) or 0
+                for i in range(0, len(ret), request.n)
+            ),
+        )
 
         return ChatCompletionResponse(
-            id=ret[0]["meta_info"]["id"],
+            id=wire.response_id(ret[0]["meta_info"]["id"]),
             created=created,
             model=request.model,
             choices=choices,
@@ -3153,6 +3174,26 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         return token_logprobs
+
+    def create_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+        param: Optional[str] = None,
+    ) -> ORJSONResponse:
+        """An error in the shape of this handler's wire."""
+        error = ErrorResponse(
+            object="error",
+            message=message,
+            type=err_type,
+            param=param,
+            code=status_code,
+        )
+        body = self.chat_wire.error_body(error)
+        if body is None:
+            return super().create_error_response(message, err_type, status_code, param)
+        return ORJSONResponse(content=body, status_code=status_code)
 
     def _process_tool_call_id(
         self,
@@ -3390,6 +3431,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.reasoning_parser == "apertus2509":
             request.skip_special_tokens = False
         if self.reasoning_parser == "kimi_k3" or self.chat_encoding_spec == "kimi_k3":
+            request.skip_special_tokens = False
+        if self.reasoning_parser == "xing4_0":
             request.skip_special_tokens = False
 
         if (
@@ -3647,6 +3690,9 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
         continuous_usage_stats: bool = False,
         flush: bool = False,
+        wire: chat_encoding_adapters.ChatWireResponse = (
+            chat_encoding_adapters.OPENAI_CHAT_WIRE
+        ),
     ):
         """Process tool calls in streaming response.
 
@@ -3714,10 +3760,13 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
+                internal_content=wire.internal_content(
+                    index, normal_text, kind="content"
+                ),
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
+                id=wire.response_id(content["meta_info"]["id"]),
                 created=created,
                 choices=[choice_data],
                 model=request.model,
@@ -3735,13 +3784,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
+
+            call_internal = wire.internal_content(
+                index, call_item.source_text, kind="tool"
+            )
 
             # Tool call ID should be generated only once per tool call
             if call_item.name:
@@ -3763,32 +3816,51 @@ class OpenAIServingChat(OpenAIServingBase):
                     arguments=call_item.parameters,
                 ),
             )
+            tool_call_deltas = [tool_call]
+            if wire.split_tool_call_opening and function_name is not None:
+                tool_call_deltas = [
+                    ToolCall(
+                        id=tool_call_id,
+                        index=call_item.tool_index,
+                        function=FunctionResponse(name=function_name, arguments=""),
+                    )
+                ]
+                if call_item.parameters:
+                    tool_call_deltas.append(
+                        ToolCall(
+                            index=call_item.tool_index,
+                            function=FunctionResponse(arguments=call_item.parameters),
+                        )
+                    )
 
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(tool_calls=[tool_call]),
-                finish_reason=None,
-            )
-            chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=created,
-                choices=[choice_data],
-                model=request.model,
-            )
-
-            # Add usage stats if continuous_usage_stats is enabled
-            if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
-                chunk.usage = UsageProcessor.calculate_token_usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
+            for position, tool_call in enumerate(tool_call_deltas):
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=DeltaMessage(tool_calls=[tool_call]),
+                    # The tokens behind this call delta go out once.
+                    internal_content=call_internal if position == 0 else None,
+                    finish_reason=None,
+                )
+                chunk = ChatCompletionStreamResponse(
+                    id=wire.response_id(content["meta_info"]["id"]),
+                    created=created,
+                    choices=[choice_data],
+                    model=request.model,
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+                # Add usage stats if continuous_usage_stats is enabled
+                if continuous_usage_stats:
+                    prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                    completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                    reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
+                    chunk.usage = UsageProcessor.calculate_token_usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        cached_tokens=self._continuous_usage_cached_details(content),
+                    )
+
+                yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
 
     def _check_for_unstreamed_tool_args(
         self,
@@ -3797,6 +3869,9 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         index: int,
         created: int,
+        wire: chat_encoding_adapters.ChatWireResponse = (
+            chat_encoding_adapters.OPENAI_CHAT_WIRE
+        ),
     ) -> str | None:
         """
         Check for any remaining tool call arguments that need to be streamed
@@ -3822,6 +3897,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # Get the last tool call that was being processed
         tool_index = len(detector.prev_tool_call_arr) - 1
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
+            return None
+        if tool_index in _incomplete_tool_call_indices(parser):
             return None
 
         # Get expected vs actual arguments
@@ -3853,16 +3930,20 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(tool_calls=[tool_call]),
+                # A flush has no generated source of its own.
+                internal_content=wire.internal_content(index, None, kind="tool"),
                 finish_reason=None,  # Don't send finish_reason with this chunk
             )
 
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
+                id=wire.response_id(content["meta_info"]["id"]),
                 created=created,
                 choices=[choice_data],
                 model=request.model,
             )
 
-            return f"data: {chunk.model_dump_json()}\n\n"
+            return (
+                f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
+            )
 
         return None

@@ -79,7 +79,6 @@ def torch_ref_rms_norm_rope(
         base=10000,
         is_neox_style=is_neox,
         rope_scaling=None,
-        dual_chunk_attention_config=None,
         partial_rotary_factor=partial_rotary_factor,
     )
     rotary_emb = rotary_emb.to(qkv.device)

@@ -21,16 +21,20 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv.plan import TREE_STATE
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     MambaEvictExcessPathStates,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
+from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.components.base import (
     BufferLoadBackContext,
     CacheTransferPhase,
-    ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
     InternalStateBackup,
@@ -44,7 +48,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -54,15 +58,23 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedRadixCache,
-        UnifiedTreeNode,
-    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+
+def branching_checkpoint_depth(
+    full_kv_hit_length: int, mamba_boundary_len: int, checkpoint_grid: int
+) -> Optional[int]:
+    """The branch checkpoint depth: the last ``checkpoint_grid`` multiple
+    within the full-KV hit, when past ``mamba_boundary_len``; else None."""
+    aligned = full_kv_hit_length // checkpoint_grid * checkpoint_grid
+    return aligned if aligned > mamba_boundary_len else None
 
 
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
+    family = TREE_STATE
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -85,7 +97,8 @@ class MambaComponent(TreeComponent):
         self.mamba_checkpoint_grid = math.lcm(
             slot.checkpoint_interval, params.page_size
         )
-        self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
+        self.mamba_max_states_per_path = get_exec().mamba.mamba_path_state_cap
+        self.checkpoints_level = get_exec().mamba.hybrid_cache_checkpoints_level
         from sglang.srt.mem_cache.kv_cache_configurator import (
             host_only_mamba_checkpoint,
         )
@@ -187,11 +200,8 @@ class MambaComponent(TreeComponent):
         # that lies beyond the current Mamba boundary. With HiCache, incremental
         # persistence of a new branching state is currently write-through only;
         # write-back eviction may discard the device-only state.
-        aligned_seqlen = (
-            result.full_kv_hit_length // self.mamba_checkpoint_grid
-        ) * self.mamba_checkpoint_grid
-        branching_seqlen = (
-            aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
+        branching_seqlen = branching_checkpoint_depth(
+            result.full_kv_hit_length, mamba_boundary_len, self.mamba_checkpoint_grid
         )
 
         # HiCache: if mamba was evicted from device but has host backup,
@@ -213,10 +223,16 @@ class MambaComponent(TreeComponent):
             result.best_match_node, self.component_type
         )
         if src_index is None:
+            # A source from an earlier match of an unadmitted request may have
+            # been evicted and its slot reused since; never carry it over.
+            if params.req is not None:
+                params.req.kv.mamba_cow_src_index = None
             return result
         req = params.req
         assert req is not None
-        if not req.kv.holds_mamba:
+        # A deferred slot is bound with the row (`StateStorage.acquire`); the
+        # staged copy still runs, as it does into a slot taken here.
+        if not req.kv.holds_mamba and not params.defer_cow_slot:
             storage, sub_pool = self._state()
             dst_index = storage.take_state_slots(sub_pool, 1)
             if dst_index is None:
@@ -224,7 +240,7 @@ class MambaComponent(TreeComponent):
                 # stops at this request's window boundary instead of walking to
                 # root and over-decrementing locks held by other requests.
                 lock_result = self.cache.inc_lock_ref(result.best_match_node)
-                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                self.cache.evict_for_alloc(KVDemand(state_slots=1))
                 dst_index = storage.take_state_slots(sub_pool, 1)
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
@@ -702,7 +718,7 @@ class MambaComponent(TreeComponent):
                         ),
                     )
                     lock.receipt.skipped_lock_components += (ct,)
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            self.cache.evict_for_alloc(KVDemand(state_slots=1))
             slot = storage.take_state_slots(sub_pool, 1)
         return slot
 
@@ -716,7 +732,9 @@ class MambaComponent(TreeComponent):
         """The storage whose state this component's values are, and the
         sub-pool they are slots of."""
         storage = self.cache.kv_storage()
-        return storage, storage.tree_sub_pool(self.component_type.name)
+        return storage, storage.tree_sub_pool(
+            self.component_type.name, family=self.family
+        )
 
     @property
     def quantizes_checkpoints(self) -> bool:
@@ -727,7 +745,9 @@ class MambaComponent(TreeComponent):
         storage, sub_pool = self._state()
         slot = storage.take_checkpoint_slot(sub_pool)
         if slot is None:
-            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            # The tree's states live in the checkpoint pool, which no
+            # allocation demand reads: free one cached state outright.
+            self.cache.evict(EvictParams(mamba_num=1))
             slot = storage.take_checkpoint_slot(sub_pool)
             assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
         return slot
@@ -766,6 +786,26 @@ class MambaComponent(TreeComponent):
         ):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
+
+    def _defers_checkpoint(
+        self, req: Req, token_ids_len: int, checkpoint_len: int
+    ) -> bool:
+        """Below checkpoint level 3 a running request publishes a state only at
+        its branching point or, on a PD prefill worker, once its prompt is complete.
+        A sliding-window tree keeps every chunk: prefill frees window rows only
+        behind a checkpoint the tree takes."""
+        if self.checkpoints_level >= 3 or self.cache.is_swa_enabled:
+            return False
+        # TODO: Publish streaming sessions' first-prompt FULL KV when KV-only
+        # checkpoints are supported. Session handoff bypasses final insertion,
+        # so deferred prompts currently remain private to their session.
+        branching_seqlen = req.mamba_branching_seqlen
+        if branching_seqlen is not None and checkpoint_len == branching_seqlen:
+            return False
+        return not (
+            get_disagg().disaggregation_mode == "prefill"
+            and token_ids_len >= len(req.origin_input_ids)
+        )
 
     def prepare_for_caching_req(
         self,
@@ -812,6 +852,9 @@ class MambaComponent(TreeComponent):
             return cache_len
         else:
             if cache_len is None:
+                return 0
+            if self._defers_checkpoint(req, token_ids_len, cache_len):
+                insert_params.mamba_checkpoint_deferred = True
                 return 0
             if self._mamba_host_only_checkpoint():
                 if self.cache.enable_mamba_extra_buffer:
@@ -903,6 +946,8 @@ class MambaComponent(TreeComponent):
                 storage, sub_pool = self._state()
                 storage.release_state(sub_pool, req)
         else:
+            if insert_params.mamba_checkpoint_deferred:
+                return
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
             ):
@@ -994,7 +1039,7 @@ class MambaComponent(TreeComponent):
         storage, sub_pool = self._state()
         dst = storage.take_state_slots(sub_pool, 1)
         if dst is None:
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            self.cache.evict_for_alloc(KVDemand(state_slots=1))
             dst = storage.take_state_slots(sub_pool, 1)
         if dst is not None:
             req.kv.mamba_pool_idx = dst[0]

@@ -1,7 +1,7 @@
 """Unit tests for detailed profiling annotations (#24911) — no server, no model loading.
 
 The detailed-annotation aggregates are folded into SGLang's existing per-forward ``step[...]``
-span (see ``sglang.srt.utils.profile_utils.build_step_span_name``): the
+span (see ``sglang.srt.observability.profile_utils.build_step_span_name``): the
 per-phase ``sq``/``sqsq``/``sqsk``/``sk`` terms (with the context/generation split
 for MIXED) are appended and are self-contained, so ``sq`` is emitted even where it
 duplicates the base label's ``bs``/``toks``.
@@ -15,12 +15,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
     detailed_annotations_enabled,
     set_detailed_annotations_enabled,
 )
-from sglang.srt.utils.profile_utils import build_step_span_name
+from sglang.srt.observability.profile_utils import build_step_span_name
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

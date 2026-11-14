@@ -152,16 +152,15 @@ def _qem_vertex_quadrics(v: np.ndarray, f: np.ndarray) -> np.ndarray:
     n = np.cross(v[f[:, 1]] - p0, v[f[:, 2]] - p0)
     n /= np.maximum(np.linalg.norm(n, axis=1), 1e-20)[:, None]
     plane = np.concatenate([n, -(n * p0).sum(1, keepdims=True)], axis=1)
-    face_q = (plane[:, :, None] * plane[:, None, :]).reshape(len(f), 16)
     idx = f.T.ravel()
-    q = np.stack(
-        [
-            np.bincount(idx, weights=np.tile(face_q[:, c], 3), minlength=len(v))
-            for c in range(16)
-        ],
-        axis=1,
-    )
-    return q.reshape(-1, 4, 4)
+    q = np.empty((len(v), 4, 4), dtype=np.float64)
+    for i in range(4):
+        for j in range(i, 4):
+            weights = np.tile(plane[:, i] * plane[:, j], 3)
+            total = np.bincount(idx, weights=weights, minlength=len(v))
+            q[:, i, j] = total
+            q[:, j, i] = total
+    return q
 
 
 def _qem_collapse_targets(

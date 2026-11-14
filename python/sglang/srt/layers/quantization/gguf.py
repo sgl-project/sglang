@@ -29,7 +29,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (

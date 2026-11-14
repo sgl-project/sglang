@@ -183,7 +183,7 @@ class TestFlashInferWindowForward(CustomTestCase):
                     torch.full_like(q, suffix._window_left),
                     None,
                 )
-                backend.prefill_wrapper_ragged = suffix
+                backend.prefill_wrappers_ragged = [suffix, suffix]
                 q = torch.zeros(num_queries, HEADS, DIM)
                 kv = torch.zeros(num_queries, KV_HEADS, DIM)
                 layer_windows = (

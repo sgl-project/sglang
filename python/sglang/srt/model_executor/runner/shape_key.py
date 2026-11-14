@@ -26,3 +26,5 @@ class ShapeKey:
     variant_label: Optional[str] = None
     # Independent attention variant (DSA dense/sparse, candidate_*); None is default.
     attention_variant: Optional[str] = None
+    # Target-verify logits format (vocab shards or full logits); None is the only one.
+    logits_variant: Optional[str] = None
