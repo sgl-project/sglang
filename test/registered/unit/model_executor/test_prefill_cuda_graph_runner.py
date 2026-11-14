@@ -381,7 +381,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
-    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+    def _load_static_batch(self, **batch_fields):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
@@ -405,7 +405,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner._prefill_logits_buffer_rows = lambda _batch: 1
         runner._prepare_forward_metadata_for_replay = lambda *_args: None
 
-        mm_input_embeds = torch.randn(3, 8)
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=1,
@@ -422,15 +421,27 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             extend_seq_lens_cpu=[3],
             extend_prefix_lens_cpu=[0],
             mm_inputs=None,
-            mm_input_embeds=mm_input_embeds,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_forward_mode=ForwardMode.EXTEND,
+            **batch_fields,
         )
         runner_ids.bind_own_plan(forward_batch)
 
         static_batch, _ = runner.load_batch(forward_batch)
+        return static_batch
+
+    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+        mm_input_embeds = torch.randn(3, 8)
+
+        static_batch = self._load_static_batch(mm_input_embeds=mm_input_embeds)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+
+    def test_static_batch_preserves_idle_rank_original_forward_mode(self):
+        static_batch = self._load_static_batch(_original_forward_mode=ForwardMode.IDLE)
+
+        self.assertEqual(static_batch.forward_mode, ForwardMode.EXTEND)
+        self.assertEqual(static_batch._original_forward_mode, ForwardMode.IDLE)
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
