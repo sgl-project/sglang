@@ -100,13 +100,16 @@ def handle_ssl_validation(server_args: Any):
                 "1024 and 2147483647."
             )
 
-        try:
-            import granian  # noqa: F401
-        except ImportError:
-            raise ValueError(
-                "--enable-http2 requires the 'granian' package. "
-                'Install it with: pip install "sglang[http2]"'
-            )
+        # The Rust listener serves HTTP/2 itself; only the Python frontend
+        # runs on Granian.
+        if not envs.SGLANG_RUST_SERVER.get():
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
 
         if cfg.enable_ssl_refresh:
             raise ValueError(

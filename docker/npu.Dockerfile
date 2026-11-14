@@ -20,7 +20,7 @@ ARG TORCH_NPU_VERSION="2.10.0.post6"
 ARG TORCH_NPU_INDEX_URL="https://ascend.devcloud.huaweicloud.com/pypi/simple/"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
-ARG SGLANG_KERNEL_NPU_TAG=2026.11.0.post3
+ARG SGLANG_KERNEL_NPU_TAG=2026.11.0.post5
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
 ARG MODELSCOPE_VERSION=""
@@ -133,32 +133,18 @@ ENV ASCEND_HOME_PATH=/usr/local/Ascend/cann-${CANN_VERSION}
 ENV LD_LIBRARY_PATH=/usr/local/Ascend/cann-${CANN_VERSION}/lib64:/usr/local/Ascend/cann-${CANN_VERSION}/lib:/usr/local/Ascend/cann-${CANN_VERSION}/x86_64-linux/devlib/device:/usr/local/Ascend/driver/lib64:/usr/local/lib:${LD_LIBRARY_PATH}
 
 
-RUN mkdir cann-custom-ops && \
-    cd cann-custom-ops && \
-    source /usr/local/Ascend/cann-${CANN_VERSION}/set_env.sh && \
-    wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/custom-ops-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
-    wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/ops-transformer-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
-    unzip custom-ops-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
-    unzip ops-transformer-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
-    chmod +x *.run && \
-    ./CANN-custom_ops-none-linux.$(arch).run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
-    ./cann-ops-transformer-custom_linux-$(arch).run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
-    source /usr/local/Ascend/cann-${CANN_VERSION}/opp/vendors/customize/bin/set_env.bash && \
-    source /usr/local/Ascend/cann-${CANN_VERSION}/opp/vendors/custom_transformer/bin/set_env.bash && \
-    source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh && \
-    source /usr/local/Ascend/nnal/atb/set_env.sh && \
-    ${PIP_INSTALL} custom_ops-1.0-cp312-cp312-linux_$(arch).whl && \
-    cd .. && rm -rf cann-custom-ops
-
-# Install Deep-ep
-# pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
-RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
-    && mkdir sgl-kernel-npu \
-    && cd sgl-kernel-npu \
-    && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py312-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
-    && unzip sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py312-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
-    && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl torch_memory_saver*.whl \
-    && cd .. && rm -rf sgl-kernel-npu \
-    && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
+RUN set -eux; \
+    ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil; \
+    mkdir /tmp/sgl-kernel-npu; \
+    cd /tmp/sgl-kernel-npu; \
+    wget \
+        "https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py312-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip"; \
+    unzip ./*.zip; \
+    ${PIP_INSTALL} --no-deps ./sgl_kernel_npu*.whl && \
+    ${PIP_INSTALL} ./deep_ep*.whl ./torch_memory_saver*.whl && \
+    cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && \
+    ln -sf deep_ep/deep_ep_cpp*.so && \
+    cd / && \
+    rm -rf /tmp/sgl-kernel-npu
 
 CMD ["/bin/bash"]
