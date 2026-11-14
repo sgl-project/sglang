@@ -51,6 +51,11 @@ from sglang.srt.distributed.utils import (
     reduce_scatter_single,
     set_global_tcp_store,
 )
+from sglang.srt.distributed.device_communicators.allreduce_tune_table import (
+    TUNE_TABLE_GROUPS,
+    load_allreduce_tune_table,
+    parse_tune_backend,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -315,6 +320,7 @@ class GroupCoordinator:
     ):
         # Set group info
         group_name = group_name or "anonymous"
+        self.group_name = group_name
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
@@ -482,7 +488,18 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[Any] = None
+        self.ca_v2_comm: Optional[Any] = None
+        self.ca_sglang_comm: Optional[Any] = None
+        self.ca_aiter_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+        self.qr_by_quant: Dict[str, QuickAllReduce] = {}
+        self.allreduce_tune = None
+        self._tune_fallback_logged = False
+        if self.group_name in TUNE_TABLE_GROUPS and self.world_size > 1:
+            self.allreduce_tune = load_allreduce_tune_table(
+                envs.SGLANG_ALLREDUCE_TUNE_CONFIG.get(),
+                self.world_size,
+            )
 
         self.pcie_ipc_comm: Optional[Any] = None
         from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
@@ -522,6 +539,88 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
+            if (
+                self.allreduce_tune is not None
+                and self.allreduce_tune.has_backend("custom_allreduce_v2")
+            ):
+                try:
+                    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+                        CustomAllReduceV2,
+                    )
+
+                    self.ca_v2_comm = CustomAllReduceV2(
+                        group=self.cpu_group,
+                        device=self.device,
+                    )
+                    if self.ca_v2_comm.disabled:
+                        logger.info(
+                            "[AR] Tune table selects custom_allreduce_v2, "
+                            "but CustomAllReduceV2 is disabled on this group."
+                        )
+                        self.ca_v2_comm = None
+                    else:
+                        logger.info(
+                            "[AR] CustomAllReduceV2 opened for tune-table rows"
+                        )
+                except Exception as e:
+                    logger.warning(f"Setup CustomAllReduceV2 failed with {e}.")
+
+            if (
+                self.allreduce_tune is not None
+                and self.allreduce_tune.has_backend("sglang_custom_allreduce")
+            ):
+                try:
+                    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                        CustomAllreduce,
+                    )
+
+                    self.ca_sglang_comm = CustomAllreduce(
+                        group=self.cpu_group, device=self.device
+                    )
+                    if self.ca_sglang_comm.disabled:
+                        self.ca_sglang_comm = None
+                        logger.info(
+                            "[AR] Tune table selects sglang_custom_allreduce, "
+                            "but it is disabled on this group."
+                        )
+                    else:
+                        logger.info(
+                            "[AR] SGLang CustomAllreduce opened for tune-table rows"
+                        )
+                except Exception as e:
+                    logger.warning(f"Setup SGLang CustomAllreduce failed with {e}.")
+
+            if (
+                self.allreduce_tune is not None
+                and self.allreduce_tune.has_backend("aiter_custom_allreduce")
+            ):
+                aiter_comm = self.ca_comm
+                aiter_module = getattr(type(aiter_comm), "__module__", "") if aiter_comm else ""
+                if "aiter" in aiter_module and not getattr(aiter_comm, "disabled", True):
+                    self.ca_aiter_comm = aiter_comm
+                else:
+                    try:
+                        from aiter.dist.device_communicators.custom_all_reduce import (
+                            CustomAllreduce as AiterCustomAllreduce,
+                        )
+
+                        # Same graph-capture choice dispatch_custom_allreduce
+                        # makes. The table opens this class on its own, so
+                        # SGLANG_USE_AITER_AR does not have to be set.
+                        tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        self.ca_aiter_comm = AiterCustomAllreduce(
+                            group=self.cpu_group,
+                            device=self.device,
+                            enable_register_for_capturing=not tms_cudagraph,
+                        )
+                        if getattr(self.ca_aiter_comm, "disabled", True):
+                            self.ca_aiter_comm = None
+                    except Exception as e:
+                        logger.warning(f"Setup AITER CustomAllreduce failed with {e}.")
+                        self.ca_aiter_comm = None
+                if self.ca_aiter_comm is not None:
+                    logger.info("[AR] AITER custom all-reduce opened for tune-table rows")
+
             if self.use_quick_allreduce and is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD
@@ -529,9 +628,28 @@ class GroupCoordinator:
                     # complement to custom allreduce.
                     # Based on quickreduce (https://github.com/mk1-project/quickreduce).
                     if qr_rocm_arch_available():
-                        self.qr_comm = QuickAllReduce(
-                            group=self.cpu_group, device=self.device
+                        codecs = (
+                            self.allreduce_tune.qr_codecs
+                            if self.allreduce_tune is not None
+                            else ()
                         )
+                        if codecs:
+                            for quant in codecs:
+                                comm = _quick_allreduce_with_quant(
+                                    self.cpu_group, self.device, quant
+                                )
+                                if not comm.disabled:
+                                    self.qr_by_quant[quant] = comm
+                            if self.qr_by_quant:
+                                self.qr_comm = next(iter(self.qr_by_quant.values()))
+                                logger.info(
+                                    "[AR] QuickReduce codecs from the tune table: %s",
+                                    ", ".join(self.qr_by_quant),
+                                )
+                        else:
+                            self.qr_comm = QuickAllReduce(
+                                group=self.cpu_group, device=self.device
+                            )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
         elif self.world_size > 1 and is_hip():
@@ -968,11 +1086,79 @@ class GroupCoordinator:
         except Exception:
             return None
 
+    def _tuned_outplace_method(self, input_: torch.Tensor):
+        """Method chosen by the tune table, or ``_TUNE_NO_DECISION``."""
+        table = self.allreduce_tune
+        if table is None:
+            return _TUNE_NO_DECISION
+        nbytes = input_.numel() * input_.element_size()
+        backend = table.backend_for(nbytes, str(input_.dtype))
+        method = parse_tune_backend(backend)
+        if method is None:
+            return _TUNE_NO_DECISION
+        if method == "nccl":
+            # The tuner's "nccl" row is the process-group all-reduce. PyTorch
+            # keeps that backend name on ROCm, where the library is RCCL.
+            return "nccl"
+        if method == "ca":
+            comm = self.ca_comm
+            if (
+                comm is not None
+                and not comm.disabled
+                and comm.should_custom_ar(input_)
+            ):
+                return "ca"
+        # The tuner already dropped kernels that cannot run this size.
+        # These rows name a class. SGLANG_USE_AITER_AR and
+        # SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 choose only the default
+        # communicator, used when the table has no row.
+        if method == "sglang_ca":
+            comm = self.ca_sglang_comm
+            if comm is not None and not comm.disabled:
+                return "sglang_ca"
+        if method == "aiter_ca":
+            comm = self.ca_aiter_comm
+            if comm is not None and not comm.disabled:
+                return "aiter_ca"
+        if method == "car_v2":
+            comm = self.ca_v2_comm
+            if comm is not None and not comm.disabled:
+                return "car_v2"
+        elif method == "torch_symm_mem":
+            comm = self.torch_symm_mem_comm
+            if (
+                comm is not None
+                and not comm.disabled
+                and comm.should_torch_symm_mem_allreduce(input_)
+            ):
+                return "torch_symm_mem"
+        elif method.startswith("qr:"):
+            quant = method.split(":", 1)[1]
+            comm = self.qr_by_quant.get(quant)
+            if (
+                comm is not None
+                and not comm.disabled
+                and comm.should_quick_allreduce(input_)
+            ):
+                return method
+        if not self._tune_fallback_logged:
+            logger.info(
+                "[AR] Tune table chose %s for %d bytes, which this group cannot "
+                "run. Using the built-in all-reduce order for that size.",
+                backend,
+                nbytes,
+            )
+            self._tune_fallback_logged = True
+        return _TUNE_NO_DECISION
+
     def _resolve_outplace_all_reduce_method(
         self,
         input_: torch.Tensor,
         should_use_pymscclpp_allreduce: Optional[bool] = None,
     ) -> Optional[str]:
+        tuned = self._tuned_outplace_method(input_)
+        if tuned is not _TUNE_NO_DECISION:
+            return tuned
         if should_use_pymscclpp_allreduce is None:
             should_use_pymscclpp_allreduce = (
                 self.pymscclpp_comm is not None
@@ -1040,6 +1226,20 @@ class GroupCoordinator:
             input_, use_attn_tp_group=(self._fi_workspace_hint == "attn_tp")
         )
 
+    def _tuned_custom_all_reduce(self, comm, method: str, input_: torch.Tensor):
+        """Run the custom all-reduce class the tune table named.
+
+        ``custom_all_reduce`` returns None when its own size cap says no, and
+        that would drop a row the tuner measured with the cap lifted. Call the
+        implementation instead. v2 has no such side door: its ``custom_all_reduce``
+        is the kernel, and it rejects a size with no plan.
+        """
+        if method == "aiter_ca" and hasattr(comm, "all_reduce"):
+            return comm.all_reduce(input_)
+        if method == "sglang_ca" and hasattr(comm, "_all_reduce_impl"):
+            return comm._all_reduce_impl(input_, registered=False)
+        return comm.custom_all_reduce(input_)
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
@@ -1062,16 +1262,46 @@ class GroupCoordinator:
                     out = input_.clone()
                     self._all_reduce_in_place(out)
                     return out
+        if outplace_all_reduce_method == "nccl":
+            out = input_.clone()
+            torch.distributed.all_reduce(out, group=self.device_group)
+            return out
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
+        assert any(
+            [
+                qr_comm,
+                ca_comm,
+                self.ca_v2_comm,
+                self.ca_sglang_comm,
+                self.ca_aiter_comm,
+                pymscclpp_comm,
+                torch_symm_mem_comm,
+                pynccl_comm,
+            ]
+        )
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
-        elif outplace_all_reduce_method == "qr":
-            assert not qr_comm.disabled
+        elif outplace_all_reduce_method == "sglang_ca":
+            assert self.ca_sglang_comm is not None and not self.ca_sglang_comm.disabled
+            out = self._tuned_custom_all_reduce(self.ca_sglang_comm, "sglang_ca", input_)
+        elif outplace_all_reduce_method == "aiter_ca":
+            assert self.ca_aiter_comm is not None and not self.ca_aiter_comm.disabled
+            out = self._tuned_custom_all_reduce(self.ca_aiter_comm, "aiter_ca", input_)
+        elif outplace_all_reduce_method == "car_v2":
+            assert self.ca_v2_comm is not None and not self.ca_v2_comm.disabled
+            out = self._tuned_custom_all_reduce(self.ca_v2_comm, "car_v2", input_)
+        elif outplace_all_reduce_method == "qr" or (
+            isinstance(outplace_all_reduce_method, str)
+            and outplace_all_reduce_method.startswith("qr:")
+        ):
+            if outplace_all_reduce_method.startswith("qr:"):
+                quant = outplace_all_reduce_method.split(":", 1)[1]
+                qr_comm = self.qr_by_quant.get(quant)
+            assert qr_comm is not None and not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
@@ -2343,6 +2573,32 @@ def graph_capture(stream=None):
 
 
 logger = logging.getLogger(__name__)
+
+# Returned by the tune-table lookup when the table does not choose a method.
+_TUNE_NO_DECISION = object()
+_QR_QUANT_ENVS = (
+    "ROCM_QUICK_REDUCE_QUANTIZATION",
+    "AITER_QUICK_REDUCE_QUANTIZATION",
+)
+
+def _quick_allreduce_with_quant(group, device, quant: str):
+    """Build QuickAllReduce at one codec. Init reads the quant from the env."""
+    from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+        QuickAllReduce,
+    )
+
+    previous = {name: os.environ.get(name) for name in _QR_QUANT_ENVS}
+    for name in _QR_QUANT_ENVS:
+        os.environ[name] = quant
+    try:
+        return QuickAllReduce(group, device)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP = False
