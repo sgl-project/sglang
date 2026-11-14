@@ -7,6 +7,7 @@ use super::{EligibilityFilter, ScoringPolicy};
 use crate::policies::SelectionContext;
 use crate::state::kv_events::{BlockSizeOracle, HashTree};
 use crate::workers::Worker;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Score for a miss or unavailable prefix signal.
@@ -14,6 +15,9 @@ const NO_HOLDING: f32 = 0.0;
 
 /// Default fused-term weight.
 pub const DEFAULT_WEIGHT: f32 = 1.0;
+
+// Building an index costs more than scanning a small worker or depth set.
+const URL_INDEX_MIN_ENTRIES: usize = 16;
 
 pub struct PrefixCachePolicy {
     tree: Arc<HashTree>,
@@ -68,15 +72,33 @@ impl PrefixCachePolicy {
 
         let depths = self.tree.prefix_depths(None, &hashes);
         let total = hashes.len() as f32;
+        if depths.len() <= URL_INDEX_MIN_ENTRIES || workers.len() <= URL_INDEX_MIN_ENTRIES {
+            return workers
+                .iter()
+                .map(|w| {
+                    depths
+                        .iter()
+                        .filter(|(worker, _)| worker.url == w.url)
+                        .map(|(_, &depth)| depth)
+                        .max()
+                        .map_or(NO_HOLDING, |depth| depth as f32 / total)
+                })
+                .collect();
+        }
+
+        let mut depth_by_url: HashMap<String, usize> = HashMap::with_capacity(depths.len());
+        for (worker, depth) in depths {
+            depth_by_url
+                .entry(worker.url)
+                .and_modify(|current| *current = (*current).max(depth))
+                .or_insert(depth);
+        }
         workers
             .iter()
             .map(|w| {
-                depths
-                    .iter()
-                    .filter(|(kw, _)| kw.url == w.url)
-                    .map(|(_, &d)| d)
-                    .max()
-                    .map_or(NO_HOLDING, |d| d as f32 / total)
+                depth_by_url
+                    .get(w.url.as_str())
+                    .map_or(NO_HOLDING, |&depth| depth as f32 / total)
             })
             .collect()
     }
@@ -195,6 +217,32 @@ mod tests {
             vec![0.75],
             "3 of 4, not 1"
         );
+    }
+
+    #[test]
+    fn indexed_scores_stay_aligned_with_worker_order_after_rank_collapse() {
+        let tree = Arc::new(HashTree::new());
+        let urls: Vec<_> = (0..20).map(|i| format!("worker-{i}")).collect();
+        for (i, url) in urls.iter().enumerate() {
+            insert(&tree, url, 0, 0, i % 4 + 1);
+        }
+        insert(&tree, &urls[18], 1, 0, 4);
+        let ws: Vec<_> = urls.iter().rev().map(|url| worker(url)).collect();
+
+        let model = ModelId("tiny".into());
+        let ids = tokens();
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let expected: Vec<_> = (0..20)
+            .rev()
+            .map(|i| {
+                if i == 18 {
+                    1.0
+                } else {
+                    (i % 4 + 1) as f32 / 4.0
+                }
+            })
+            .collect();
+        assert_eq!(shares(&policy(tree), &ws, &ctx), expected);
     }
 
     #[test]
