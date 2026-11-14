@@ -318,17 +318,15 @@ increase startup compilation time.
 --cuda-graph-config '{"decode":{"backend":"disabled"},"prefill":{"backend":"full"}}'
 ```
 
-Unsupported phase backends such as `breakable` and `tc_piecewise` are rejected
-on CPU. Set a phase backend to `disabled` to keep that phase on the eager path.
+Unsupported phase backends such as `breakable` are rejected on CPU. Set a phase
+backend to `disabled` to keep that phase on the eager path.
 
 Legacy convenience parameters remain supported:
 
 - `--torch-compile-max-bs`: decode-only maximum batch size. It is used only
     when explicit `decode.max_bs` and `decode.bs` are not provided.
 - `--cuda-graph-bs-decode`: explicit decode batch-size buckets.
-- `--cuda-graph-bs`: deprecated alias for `--cuda-graph-bs-decode`.
 - `--cuda-graph-max-bs-decode`: maximum decode batch size.
-- `--cuda-graph-max-bs`: deprecated alias for `--cuda-graph-max-bs-decode`.
 - `--cuda-graph-bs-prefill`: explicit prefill total-token buckets.
 - `--cuda-graph-max-bs-prefill`: maximum prefill total-token count on the CPU
     graph path. The name is shared with other devices for compatibility.

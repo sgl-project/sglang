@@ -105,6 +105,7 @@ def _build_peak(pool_size: int, lock_prefixes: bool):
     component.tree_core = cache
     component.component_type = ComponentType.MAMBA
     component.host_only_checkpoint = False
+    component.checkpoints_level = 3
 
     owned = [cache.allocator.alloc(1) for _ in range(N)]
     assert all(s is not None for s in owned)
