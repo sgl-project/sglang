@@ -756,6 +756,12 @@ class FP8MQALogitsKernel:
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=tmem_alloc_num_threads
         )
+        # All math warps (256 threads) rendezvous on this barrier before
+        # math warp 0 deallocates TMEM, so no math warp can still have a
+        # tcgen05.ld in flight on the freed columns.
+        tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=2, num_threads=self.num_math_threads
+        )
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -1810,7 +1816,14 @@ class FP8MQALogitsKernel:
             if cutlass.const_expr(self.enable_pdl):
                 cute.arch.griddepcontrol_launch_dependents()
 
-            # TMEM dealloc: math warps are allocator + last consumer
+            # TMEM dealloc: math warps are allocator + last consumer.
+            # Every math thread has already waited for its own LDTMs
+            # (fence_view_async_tmem_load after each tcgen05.ld); the barrier
+            # orders the last loads of warps 1-7 before warp 0's
+            # tcgen05.dealloc, like the DSL dense_gemm example (barrier, then
+            # dealloc in the allocator warp).
+            cute.arch.fence_view_async_tmem_load()
+            tmem_dealloc_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
