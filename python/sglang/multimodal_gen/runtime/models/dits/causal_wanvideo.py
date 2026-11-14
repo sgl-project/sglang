@@ -577,8 +577,6 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             torch.randn(1, 2, inner_dim) / inner_dim**0.5
         )
 
-        self.gradient_checkpointing = False
-
         # Causal-specific
         self.block_mask = None
         self.num_frame_per_block = self.config.num_frames_per_block
@@ -709,37 +707,21 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         # 4. Transformer blocks
         for block_index, block in enumerate(self.blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                causal_kwargs = {
-                    "kv_cache": kv_cache[block_index],
-                    "current_start": current_start,
-                    "cache_start": cache_start,
-                    "block_mask": self.block_mask,
-                }
-                hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    timestep_proj,
-                    freqs_cis,
-                    **causal_kwargs,
-                )
-            else:
-                causal_kwargs = {
-                    "kv_cache": kv_cache[block_index],
-                    "crossattn_cache": crossattn_cache[block_index],
-                    "current_start": current_start,
-                    "cache_start": cache_start,
-                    "block_mask": self.block_mask,
-                }
-                hidden_states = block(
-                    hidden_states,
-                    encoder_hidden_states,
-                    timestep_proj,
-                    freqs_cis,
-                    complex_freqs=complex_freqs,
-                    **causal_kwargs,
-                )
+            causal_kwargs = {
+                "kv_cache": kv_cache[block_index],
+                "crossattn_cache": crossattn_cache[block_index],
+                "current_start": current_start,
+                "cache_start": cache_start,
+                "block_mask": self.block_mask,
+            }
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                freqs_cis,
+                complex_freqs=complex_freqs,
+                **causal_kwargs,
+            )
 
         # 5. Output norm, projection & unpatchify
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)

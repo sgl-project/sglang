@@ -3862,13 +3862,6 @@ class ServerArgs(DisaggServerArgsMixin):
             with open(config_file, "r") as f:
                 return json.load(f)
         elif config_file.endswith((".yaml", ".yml")):
-            try:
-                import yaml
-            except ImportError:
-                raise ImportError(
-                    "Please install PyYAML to use YAML config files. "
-                    "`pip install pyyaml`"
-                )
             with open(config_file, "r") as f:
                 return yaml.safe_load(f)
         else:

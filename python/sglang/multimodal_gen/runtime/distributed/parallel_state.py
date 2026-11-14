@@ -500,31 +500,18 @@ def initialize_model_parallel(
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
 
-    try:
-        from .parallel_groups import PROCESS_GROUP as _YC_PROCESS_GROUP
-        from .parallel_groups import (
-            set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
-        )
-    except ImportError:
-        _set_seq_parallel_pg_by_sp_groups = None
+    from .parallel_groups import PROCESS_GROUP, set_seq_parallel_pg_by_sp_groups
 
-        class _DummyProcessGroup:
-            ULYSSES_PG = torch.distributed.group.WORLD
-            RING_PG = torch.distributed.group.WORLD
-
-        PROCESS_GROUP = _DummyProcessGroup()
-    else:
-        # Build SGLang Diffusion SP sub-groups based on the true SP groups. This is
-        # critical when TP>1, because SP groups may be strided in global ranks
-        # (e.g., tp-sp order).
-        sp_groups = rank_generator.get_ranks("sp")
-        _set_seq_parallel_pg_by_sp_groups(
-            sp_ulysses_degree=ulysses_degree,
-            sp_ring_degree=ring_degree,
-            rank=get_world_group().rank,
-            sp_groups=sp_groups,
-        )
-        PROCESS_GROUP = _YC_PROCESS_GROUP
+    # Build SGLang Diffusion SP sub-groups based on the true SP groups. This is
+    # critical when TP>1, because SP groups may be strided in global ranks
+    # (e.g., tp-sp order).
+    sp_groups = rank_generator.get_ranks("sp")
+    set_seq_parallel_pg_by_sp_groups(
+        sp_ulysses_degree=ulysses_degree,
+        sp_ring_degree=ring_degree,
+        rank=get_world_group().rank,
+        sp_groups=sp_groups,
+    )
 
     _SP = init_parallel_group_coordinator(
         group_ranks=rank_generator.get_ranks("sp"),

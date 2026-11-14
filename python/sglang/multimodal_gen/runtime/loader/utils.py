@@ -751,11 +751,6 @@ class MappedRegions:
     def __init__(self) -> None:
         self._maps = _read_process_mappings()
 
-    @property
-    def available(self) -> bool:
-        """False where /proc is absent, in which case nothing is classified."""
-        return self._maps is not None
-
     def holds_pointer(self, pointer: int) -> bool:
         if self._maps is None or pointer == 0:
             return False

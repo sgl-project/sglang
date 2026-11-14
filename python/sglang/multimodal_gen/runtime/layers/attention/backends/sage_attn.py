@@ -241,8 +241,6 @@ class SageAttentionImpl(AttentionImpl):
                 value[:used].unsqueeze(0),
                 None,
             )[0]
-            if used == query.shape[0]:
-                return live_out
             # Keep padded tail at zero so downstream masked rows stay inactive.
             output = torch.zeros_like(query)
             output[:used] = live_out

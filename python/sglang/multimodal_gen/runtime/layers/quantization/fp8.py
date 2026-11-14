@@ -77,7 +77,6 @@ if TYPE_CHECKING:
 
 _is_hip = current_platform.is_hip()
 _is_cuda = current_platform.is_cuda()
-_is_npu = current_platform.is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = current_platform.is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()

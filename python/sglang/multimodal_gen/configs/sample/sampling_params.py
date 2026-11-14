@@ -934,7 +934,6 @@ class SamplingParams:
             except ImportError:
                 self.guidance_scale = 1.0
         self.return_frames = False
-        self.return_video = False
         self.num_frames = 1
         self.adjust_frames = False
         if self.save_output and not server_args.comfyui_mode:

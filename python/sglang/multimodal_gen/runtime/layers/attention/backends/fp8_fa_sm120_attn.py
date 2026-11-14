@@ -158,8 +158,6 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
         try:
             if used is not None:
                 live_output = self._run(query[:used], key[:used], value[:used])
-                if used == query.shape[0]:
-                    return live_output
                 output = torch.zeros_like(query)
                 output[:used].copy_(live_output)
                 return output
