@@ -74,6 +74,40 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         )
         return o, pool
 
+    def test_short_sequence_output_independent_of_batchmates(self):
+        """A short sequence must give bitwise the same output alone and packed with
+        other sequences: the output kernel's tile must not shrink with the batch's
+        total length (it did, which made deterministic inference batch-variant)."""
+        device = get_device()
+        Hk, Hv, K, V = 16, 48, 128, 128
+        for L in range(10, 17):
+            for seed in range(6):
+                torch.manual_seed(seed * 1000 + L)
+                q = torch.randn(1, L, Hk, K, dtype=torch.bfloat16, device=device)
+                k = torch.randn(1, L, Hk, K, dtype=torch.bfloat16, device=device)
+                v = torch.randn(1, L, Hv, V, dtype=torch.bfloat16, device=device)
+                g = -torch.rand(1, L, Hv, dtype=torch.float32, device=device) * 0.5
+                beta = torch.rand(1, L, Hv, dtype=torch.bfloat16, device=device)
+                outs = []
+                for n in (1, 2):
+                    cu_seqlens = torch.arange(
+                        0, (n + 1) * L, L, dtype=torch.long, device=device
+                    )
+                    o = chunk_gated_delta_rule(
+                        *(torch.cat([t] * n, dim=1) for t in (q, k, v, g, beta)),
+                        initial_state=torch.zeros(
+                            n, Hv, V, K, dtype=torch.float32, device=device
+                        ),
+                        initial_state_indices=torch.arange(
+                            n, dtype=torch.int32, device=device
+                        ),
+                        cu_seqlens=cu_seqlens,
+                        head_first=False,
+                        use_qk_l2norm_in_kernel=True,
+                    )[0]
+                    outs.append(o[:, :L])
+                self.assertTrue(torch.equal(outs[0], outs[1]), f"L={L} seed={seed}")
+
     def _check_shape(
         self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42
     ):
