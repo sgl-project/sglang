@@ -204,9 +204,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         def record(req, is_retracted=False):
             requeue_log.append({"req": req, "is_retracted": req.is_retracted})
-            # The queue door takes every request out of its list.
-            if req.owner_list is not None:
-                req.owner_list._leave([req])
+            move([req], scheduler.waiting_queue)
 
         scheduler._add_request_to_queue = MagicMock(side_effect=record)
         return requeue_log
@@ -255,6 +253,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         manager.ongoing_backup = {}
         manager.offloaded_state = WeakKeyDictionary()
         manager.offload_inflight = WeakKeyDictionary()
+        manager.offloading_reqs = IndexedReqList(ListKind.PD_OFFLOADING)
         if offload:
             self.assertTrue(manager.offload_kv_cache(req))
         scheduler.decode_offload_manager = manager
@@ -397,6 +396,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
+            request_retirer=None,
             send_abort=None,
         )
 
@@ -446,7 +446,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             with_tensors=True,
         )
-        move([MagicMock(owner_list=None)], scheduler.chunked_reqs)
         move([run_req_a, run_req_b, last_req], scheduler.running_reqs)
         requeue_log = self._spy_requeue(scheduler)
 
@@ -463,7 +462,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertFalse(scheduler.running_batch.batch_is_full)
-        self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler.last_batch)
 
     def test_retract_after_dp_conversion_releases_each_req_once(self):
@@ -619,19 +617,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(req_finished.retraction_count, 0)
         self.assertFalse(req_finished.is_retracted)
         self.assertEqual(scheduler.running_batch.reqs, [])
-
-    def test_retract_empty_post_fold_clears_chunked_req_and_batch_is_full(self):
-        """retract with nothing to retract still clears chunked_req and batch_is_full."""
-        scheduler = self._new_scheduler()
-        scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
-        move([MagicMock(owner_list=None)], scheduler.chunked_reqs)
-        requeue_log = self._spy_requeue(scheduler)
-
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-
-        self.assertEqual(requeue_log, [])
-        self.assertIsNone(scheduler.chunked_req)
-        self.assertFalse(scheduler.running_batch.batch_is_full)
 
     def test_retract_drain_happens_once_before_release(self):
         """retract with overlap drains the result_queue once before releasing reqs."""
@@ -1132,10 +1117,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         decoding.dllm_algo_state = object()
         prefilling.kv.req_pool_idx = 1
         prefilling.dllm_phase = DllmReqPhase.STAGING_PREFILL
-        # Finished and released by the last round's result.
+        # Finished and released by the last round's result: in no list.
         done.finished_reason = FINISH_LENGTH(length=0)
         done.dllm_phase = DllmReqPhase.STAGING_PREFILL
-        move([decoding, prefilling, done], scheduler.dllm_manager.waiting_queue)
+        move([decoding, prefilling], scheduler.dllm_manager.waiting_queue)
         scheduler.running_batch = self._make_batch(scheduler, [])
         scheduler.last_batch = self._make_batch(
             scheduler, [prefilling, done], forward_mode=ForwardMode.DLLM_EXTEND

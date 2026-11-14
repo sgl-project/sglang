@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import logging
 import os
 
@@ -227,6 +228,12 @@ def _fmha_fp8_prefill_attention(
     )
 
 
+@functools.lru_cache(maxsize=64)
+def _cu_seqlens(bounds: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    # one upload per bounds and device; callers must not mutate the result
+    return torch.tensor(bounds, dtype=torch.int32, device=device)
+
+
 class AITerBackend(AttentionBackend):
     """
     Backend for AITemplate attention implementation.
@@ -248,6 +255,10 @@ class AITerBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError("AITer backend does not have a metadata builder.")
+
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
 
 
 class AITerImpl(AttentionImpl):
@@ -341,7 +352,8 @@ class AITerImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Performs attention using one of:
           - _fmha_fp8_prefill_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1 when eligible)
@@ -354,8 +366,12 @@ class AITerImpl(AttentionImpl):
             attn_metadata: Metadata for the attention operation (unused).
 
         Returns:
-            Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            Output tensor of shape [batch_size, seq_len, num_heads, head_dim],
+            plus the [batch_size, num_heads, seq_len] softmax LSE when
+            return_softmax_lse (always the BF16 kernel, for ring merging).
         """
+        if return_softmax_lse:
+            return self._forward_bf16(query, key, value, return_lse=True)
         if _use_fp8_attn:
             output = self._forward_fp8(query, key, value)
             if output is not None:
@@ -370,17 +386,19 @@ class AITerImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-    ) -> torch.Tensor:
-        return aiter.flash_attn_func(
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        output = aiter.flash_attn_func(
             query,
             key,
             value,
             dropout_p=self.dropout_p,
             causal=self.causal,
             return_attn_probs=False,
-            return_lse=False,
+            return_lse=return_lse,
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
+        return tuple(output[:2]) if return_lse else output
 
     @torch.compiler.disable
     def _forward_bf16_eager(
@@ -419,3 +437,27 @@ class AITerImpl(AttentionImpl):
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
         return output[0] if isinstance(output, tuple) else output
+
+    @torch.compiler.disable
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend packed [T, H, D] queries to one rotated KV chunk; returns
+        the output and the [H, Tq] softmax LSE."""
+        output, lse = aiter.flash_attn_varlen_func(
+            q=query.contiguous(),
+            k=key.contiguous(),
+            v=value.contiguous(),
+            cu_seqlens_q=_cu_seqlens((0, query.shape[0]), query.device),
+            cu_seqlens_k=_cu_seqlens((0, key.shape[0]), key.device),
+            max_seqlen_q=query.shape[0],
+            max_seqlen_k=key.shape[0],
+            softmax_scale=self.softmax_scale,
+            causal=False,
+            how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
+            return_lse=True,
+        )[:2]
+        return output, lse

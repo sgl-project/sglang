@@ -55,6 +55,8 @@ const GET_LOADS_BUCKETS: &[f64] = &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.
 const CACHE_SOURCES: [&str; 3] = ["device", "host", "storage"];
 
 type Labels = Vec<(String, String)>;
+/// One family's series: each label set observed so far and its values.
+type Series<T> = RwLock<Vec<(Labels, Arc<T>)>>;
 /// What tells one request's label set from another's: the priority (when it
 /// is a label) and whether it streams.
 type LabelSetKey = (Option<i64>, bool);
@@ -108,7 +110,7 @@ impl Histogram {
 struct CounterFamily {
     name: &'static str,
     help: &'static str,
-    series: Mutex<Vec<(Labels, Arc<Counter>)>>,
+    series: Series<Counter>,
 }
 
 /// One histogram family, its bucket bounds and the label sets observed so far.
@@ -116,7 +118,7 @@ struct HistogramFamily {
     name: &'static str,
     help: &'static str,
     bounds: Arc<[f64]>,
-    series: Mutex<Vec<(Labels, Arc<Histogram>)>>,
+    series: Series<Histogram>,
 }
 
 impl CounterFamily {
@@ -124,25 +126,34 @@ impl CounterFamily {
         Self {
             name,
             help,
-            series: Mutex::new(Vec::new()),
+            series: RwLock::default(),
         }
     }
 
     fn series(&self, labels: &Labels) -> Arc<Counter> {
-        let mut series = self.series.lock().unwrap();
-        if let Some((_, counter)) = series.iter().find(|(l, _)| l == labels) {
-            return counter.clone();
-        }
-        let counter = Arc::new(Counter::default());
-        series.push((labels.clone(), counter.clone()));
-        counter
+        series_or_insert(
+            &self.series,
+            |l| l == labels,
+            || labels.clone(),
+            Counter::default,
+        )
+    }
+
+    /// [`Self::series`] for an extension's labels, in any order.
+    fn extension_series(&self, labels: &[(&str, &str)]) -> Arc<Counter> {
+        series_or_insert(
+            &self.series,
+            |l| same_labels(l, labels),
+            || owned_labels(labels),
+            Counter::default,
+        )
     }
 
     /// prometheus_client's entries: the family name loses its `_total`, the
     /// sample keeps it.
     fn entries(&self, out: &mut Vec<Entry>) {
         let metric_name = self.name.strip_suffix("_total").unwrap_or(self.name);
-        for (labels, counter) in self.series.lock().unwrap().iter() {
+        for (labels, counter) in self.series.read().unwrap().iter() {
             out.push(Entry {
                 key: prometheus::mmap_key(metric_name, self.name, labels, self.help),
                 value: counter.0.load(Ordering::Relaxed) as f64,
@@ -153,10 +164,10 @@ impl CounterFamily {
 }
 
 /// Every [`ExtensionCounter`] registered in this process.
-static EXTENSION_COUNTERS: Mutex<Vec<&'static ExtensionCounter>> = Mutex::new(Vec::new());
+static EXTENSION_COUNTERS: RwLock<Vec<&'static ExtensionCounter>> = RwLock::new(Vec::new());
 
 /// Every [`ExtensionHistogram`] registered in this process.
-static EXTENSION_HISTOGRAMS: Mutex<Vec<&'static ExtensionHistogram>> = Mutex::new(Vec::new());
+static EXTENSION_HISTOGRAMS: RwLock<Vec<&'static ExtensionHistogram>> = RwLock::new(Vec::new());
 
 /// A counter family recorded by code built on this frontend, such as an
 /// external multimodal processor. With metrics enabled, it is written with
@@ -168,8 +179,17 @@ impl ExtensionCounter {
     /// registered again returns the first registration (and its help). The
     /// family lives for the rest of the process.
     pub fn register(name: &'static str, help: &'static str) -> &'static Self {
-        let mut counters = EXTENSION_COUNTERS.lock().unwrap();
-        if let Some(counter) = counters.iter().find(|counter| counter.0.name == name) {
+        let find = |counters: &[&'static Self]| {
+            counters
+                .iter()
+                .find(|counter| counter.0.name == name)
+                .copied()
+        };
+        if let Some(counter) = find(&EXTENSION_COUNTERS.read().unwrap()) {
+            return counter;
+        }
+        let mut counters = EXTENSION_COUNTERS.write().unwrap();
+        if let Some(counter) = find(&counters) {
             return counter;
         }
         let counter: &'static Self = Box::leak(Box::new(Self(CounterFamily::new(name, help))));
@@ -179,14 +199,14 @@ impl ExtensionCounter {
 
     /// Add one to the series with these labels.
     pub fn inc(&self, labels: &[(&str, &str)]) {
-        self.0.series(&owned_labels(labels)).inc(1);
+        self.0.extension_series(labels).inc(1);
     }
 
     /// Create the series with these labels at zero, as prometheus_client's
     /// `labels()` does: a rate over it then starts from a zero series, not a
     /// missing one.
     pub fn init_series(&self, labels: &[(&str, &str)]) {
-        self.0.series(&owned_labels(labels));
+        self.0.extension_series(labels);
     }
 
     /// The count of the series with these labels; `None` when there is no
@@ -210,8 +230,17 @@ impl ExtensionHistogram {
         help: &'static str,
         buckets: &[f64],
     ) -> Result<&'static Self, String> {
-        let mut histograms = EXTENSION_HISTOGRAMS.lock().unwrap();
-        if let Some(histogram) = histograms.iter().find(|histogram| histogram.0.name == name) {
+        let find = |histograms: &[&'static Self]| {
+            histograms
+                .iter()
+                .find(|histogram| histogram.0.name == name)
+                .copied()
+        };
+        if let Some(histogram) = find(&EXTENSION_HISTOGRAMS.read().unwrap()) {
+            return Ok(histogram);
+        }
+        let mut histograms = EXTENSION_HISTOGRAMS.write().unwrap();
+        if let Some(histogram) = find(&histograms) {
             return Ok(histogram);
         }
         let histogram: &'static Self =
@@ -222,7 +251,7 @@ impl ExtensionHistogram {
 
     /// Observe `value` in the series with these labels.
     pub fn observe(&self, labels: &[(&str, &str)], value: f64) {
-        self.0.series(&owned_labels(labels)).observe(value);
+        self.0.extension_series(labels).observe(value);
     }
 
     /// The number of observations in the series with these labels; `None`
@@ -256,18 +285,51 @@ fn owned_labels(labels: &[(&str, &str)]) -> Labels {
     labels
 }
 
+/// Whether `stored` (sorted, as [`owned_labels`] makes it) is `labels` in any
+/// order: the same pairs, each as often. Compares in place, so looking up an
+/// existing series allocates nothing.
+fn same_labels(stored: &Labels, labels: &[(&str, &str)]) -> bool {
+    stored.len() == labels.len()
+        && labels.iter().all(|&pair| {
+            let in_stored = stored
+                .iter()
+                .filter(|(name, value)| (name.as_str(), value.as_str()) == pair)
+                .count();
+            in_stored == labels.iter().filter(|&&other| other == pair).count()
+        })
+}
+
 /// The series with these labels, if there is one.
-fn existing_series<T>(
-    series: &Mutex<Vec<(Labels, Arc<T>)>>,
-    labels: &[(&str, &str)],
-) -> Option<Arc<T>> {
-    let labels = owned_labels(labels);
+fn existing_series<T>(series: &Series<T>, labels: &[(&str, &str)]) -> Option<Arc<T>> {
     series
-        .lock()
+        .read()
         .unwrap()
         .iter()
-        .find(|(l, _)| *l == labels)
+        .find(|(l, _)| same_labels(l, labels))
         .map(|(_, series)| series.clone())
+}
+
+/// The series whose labels `matches`, created with `labels()` and `new()` if
+/// there is none. An existing series is found under the read lock, so
+/// observations never wait on each other or on a flush; only a new label set
+/// takes the write lock.
+fn series_or_insert<T>(
+    series: &Series<T>,
+    matches: impl Fn(&Labels) -> bool,
+    labels: impl FnOnce() -> Labels,
+    new: impl FnOnce() -> T,
+) -> Arc<T> {
+    if let Some((_, found)) = series.read().unwrap().iter().find(|(l, _)| matches(l)) {
+        return found.clone();
+    }
+    let mut series = series.write().unwrap();
+    // Another thread may have created it between the two locks.
+    if let Some((_, found)) = series.iter().find(|(l, _)| matches(l)) {
+        return found.clone();
+    }
+    let created = Arc::new(new());
+    series.push((labels(), created.clone()));
+    created
 }
 
 impl HistogramFamily {
@@ -288,24 +350,33 @@ impl HistogramFamily {
             name,
             help,
             bounds: bounds.into(),
-            series: Mutex::new(Vec::new()),
+            series: RwLock::default(),
         })
     }
 
     fn series(&self, labels: &Labels) -> Arc<Histogram> {
-        let mut series = self.series.lock().unwrap();
-        if let Some((_, histogram)) = series.iter().find(|(l, _)| l == labels) {
-            return histogram.clone();
-        }
-        let histogram = Arc::new(Histogram::new(self.bounds.clone()));
-        series.push((labels.clone(), histogram.clone()));
-        histogram
+        series_or_insert(
+            &self.series,
+            |l| l == labels,
+            || labels.clone(),
+            || Histogram::new(self.bounds.clone()),
+        )
+    }
+
+    /// [`Self::series`] for an extension's labels, in any order.
+    fn extension_series(&self, labels: &[(&str, &str)]) -> Arc<Histogram> {
+        series_or_insert(
+            &self.series,
+            |l| same_labels(l, labels),
+            || owned_labels(labels),
+            || Histogram::new(self.bounds.clone()),
+        )
     }
 
     /// prometheus_client's entries, in its creation order: `_sum`, then one
     /// `_bucket` per bound.
     fn entries(&self, out: &mut Vec<Entry>) {
-        for (labels, histogram) in self.series.lock().unwrap().iter() {
+        for (labels, histogram) in self.series.read().unwrap().iter() {
             let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
             out.push(Entry {
                 key: prometheus::mmap_key(
@@ -601,14 +672,14 @@ impl FrontendMetrics {
         for family in self.counters() {
             family.entries(&mut counters);
         }
-        for counter in EXTENSION_COUNTERS.lock().unwrap().iter() {
+        for counter in EXTENSION_COUNTERS.read().unwrap().iter() {
             counter.0.entries(&mut counters);
         }
         let mut histograms = Vec::new();
         for family in self.histograms() {
             family.entries(&mut histograms);
         }
-        for histogram in EXTENSION_HISTOGRAMS.lock().unwrap().iter() {
+        for histogram in EXTENSION_HISTOGRAMS.read().unwrap().iter() {
             histogram.0.entries(&mut histograms);
         }
         for (file, entries) in [
@@ -1191,7 +1262,7 @@ mod tests {
                 let counted: serde_json::Map<String, serde_json::Value> = metrics
                     .cached_tokens
                     .series
-                    .lock()
+                    .read()
                     .unwrap()
                     .iter()
                     .map(|(labels, counter)| {

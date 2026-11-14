@@ -2682,14 +2682,18 @@ def hc_mix_stats_sinkhorn_bf16x3(
     rms_eps: float,
     hc_eps: float,
     hc_mult: int = 4,
+    decode_grid: bool = False,
 ):
     m, k = x.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
-    block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+    if decode_grid:
+        slices, block_m = 64, 64
+    else:
+        slices = _HC_MIX_COMPENSATED_SLICES
+        block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
     assert x.is_contiguous() and x.dtype == torch.bfloat16
-    assert hopper_medium or 4096 <= m <= 65536
+    assert decode_grid or hopper_medium or 4096 <= m <= 65536
     assert k % (slices * _HC_MIX_BF16X3_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(

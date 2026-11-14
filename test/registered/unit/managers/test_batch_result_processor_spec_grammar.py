@@ -397,7 +397,8 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
                 _make_processor(),
                 tree_cache=tree,
                 decode_offload_manager=SimpleNamespace(
-                    offload_kv_cache=lambda req: True
+                    offload_kv_cache=lambda req: True,
+                    finalize_release_on_finish=lambda req: None,
                 ),
             )
             tokens = processor._resolve_spec_v2_tokens(result, batch, [True])[0]
