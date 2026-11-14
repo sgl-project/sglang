@@ -510,10 +510,11 @@ def test_follower_node_relays_sigterm_to_its_listeners(restore_sigterm, monkeypa
     assert sidecar_stops == [True]
 
 
-def test_main_process_bounds_a_wedged_scheduler(restore_sigterm, monkeypatch):
+def test_main_process_bounds_a_wedged_scheduler(restore_sigterm, monkeypatch, caplog):
     """A wedged scheduler never exits; Python's exit bound starts once its
     listener reports the (forced) drain ended, not before, and the scheduler
-    is killed and reaped when the bound expires."""
+    is killed and reaped when the bound expires. The kill is logged at info,
+    as it is routine for schedulers still in the kernel's exit teardown."""
     monkeypatch.setattr(rust_shutdown, "_SCHEDULER_EXIT_TIMEOUT_SECS", 1)
     ctx = mp.get_context("fork")
     name = _name()
@@ -523,6 +524,7 @@ def test_main_process_bounds_a_wedged_scheduler(restore_sigterm, monkeypatch):
     assert ready.wait(30)
     drain = rust_shutdown.RustServerSigtermDrain([wedged], [wedged], None, name)
     drain.install()
+    caplog.set_level("INFO", logger=rust_shutdown.logger.name)
     try:
         os.kill(os.getpid(), signal.SIGTERM)
         start = time.monotonic()
@@ -531,9 +533,52 @@ def test_main_process_bounds_a_wedged_scheduler(restore_sigterm, monkeypatch):
         elapsed = time.monotonic() - start
         assert 2 + 1 <= elapsed < 2 + 1 + 3, elapsed
         assert wedged.exitcode == -signal.SIGKILL
+        [kill_log] = [r for r in caplog.records if "SIGKILL" in r.message]
+        assert kill_log.levelname == "INFO"
+        assert f"[{wedged.pid}]" in kill_log.message
     finally:
         wedged.kill()
         wedged.join()
+
+
+def _closes_sentinel_then_exits(ready, release, seconds):
+    # Closes every inherited fd, the sentinel's write end too, as a process
+    # does in the kernel's exit teardown before it can be reaped; it exits
+    # ``seconds`` after ``release``.
+    os.closerange(3, 1 << 16)
+    ready.set()
+    release.wait(60)
+    time.sleep(seconds)
+    os._exit(0)
+
+
+def test_main_process_reaps_a_scheduler_slow_to_exit_after_sigkill(
+    restore_sigterm, monkeypatch
+):
+    """A scheduler that stays unreapable for a while after the SIGKILL (the
+    kernel freeing a large HiCache host pool) is reaped without error."""
+    monkeypatch.setattr(rust_shutdown, "_SCHEDULER_EXIT_TIMEOUT_SECS", 0)
+    ctx = mp.get_context("fork")
+    name = _name()
+    ready, release = ctx.Event(), ctx.Event()
+    exiting = ctx.Process(target=_closes_sentinel_then_exits, args=(ready, release, 2))
+    exiting.start()
+    assert ready.wait(30)
+    # Stands in for the teardown, which the SIGKILL does not cut short.
+    monkeypatch.setattr(exiting, "kill", release.set)
+    drain = rust_shutdown.RustServerSigtermDrain([exiting], [], None, name)
+    drain.install()
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        _notify(name)
+        start = time.monotonic()
+        drain.wait()
+        assert time.monotonic() - start >= 2
+        assert exiting.exitcode == 0
+    finally:
+        if exiting.exitcode is None:
+            os.kill(exiting.pid, signal.SIGKILL)
+        exiting.join()
 
 
 def _exits_soon():
@@ -618,20 +663,24 @@ def test_a_crash_without_sigterm_bounds_the_others_and_still_reports(monkeypatch
             proc.join()
 
 
-def test_main_process_raises_on_an_unreaped_scheduler(restore_sigterm, monkeypatch):
-    """A killed scheduler not reaped within the bound raises, as Python's
-    ``kill_process_tree`` does, instead of blocking the main process."""
+def test_main_process_raises_on_an_unreaped_scheduler(
+    restore_sigterm, monkeypatch, caplog
+):
+    """A killed scheduler not reaped within the bound logs an error and
+    raises, as Python's ``kill_process_tree`` does, instead of blocking the
+    main process, also when its sentinel closed early, where
+    ``join(timeout)`` would block in waitpid."""
     monkeypatch.setattr(rust_shutdown, "_SCHEDULER_EXIT_TIMEOUT_SECS", 0)
     monkeypatch.setattr(rust_shutdown, "_REAP_TIMEOUT_SECS", 1)
     ctx = mp.get_context("fork")
     name = _name()
-    ready = ctx.Event()
-    wedged = ctx.Process(target=_wedged_child, args=(ready,))
+    ready, release = ctx.Event(), ctx.Event()
+    wedged = ctx.Process(target=_closes_sentinel_then_exits, args=(ready, release, 6))
     wedged.start()
     assert ready.wait(30)
-    # Stands in for a scheduler that SIGKILL cannot end (stuck in the kernel).
-    monkeypatch.setattr(wedged, "kill", lambda: None)
-    drain = rust_shutdown.RustServerSigtermDrain([wedged], [wedged], None, name)
+    # Stands in for a scheduler whose exit teardown outlasts the reap bound.
+    monkeypatch.setattr(wedged, "kill", release.set)
+    drain = rust_shutdown.RustServerSigtermDrain([wedged], [], None, name)
     drain.install()
     try:
         os.kill(os.getpid(), signal.SIGTERM)
@@ -640,6 +689,7 @@ def test_main_process_raises_on_an_unreaped_scheduler(restore_sigterm, monkeypat
         with pytest.raises(RuntimeError, match=f"pids=\\[{wedged.pid}\\]"):
             drain.wait()
         assert time.monotonic() - start < 1 + 3
+        assert any(r.levelname == "ERROR" for r in caplog.records)
     finally:
         if wedged.exitcode is None:
             os.kill(wedged.pid, signal.SIGKILL)
