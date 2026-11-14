@@ -21,9 +21,14 @@ logger = logging.getLogger(__name__)
 # detokenized display string (that loses fragmentary bytes as U+FFFD).
 _BYTE_DECODER: dict[str, int] = {}
 
-# Tokenizer-level cache: once verified, we know whether *all* tokens from a
-# given tokenizer can safely use the byte decoder. Avoids per-token checks.
-_BYTE_LEVEL_TOKENIZERS: set = set()
+# Tokenizer-level cache of the byte-level verdict, True OR False, keyed by
+# id(tokenizer). The verdict is a property of the tokenizer, so it is decided
+# once: the slow path calls get_vocab(), which rebuilds the full vocab dict
+# (~10-20 ms for a 100K+ vocab), and this check runs once per streamed chunk
+# and again per logprob token (token_id_to_bytes). Caching only True verdicts
+# re-ran that probe on every call for non-byte-level tokenizers, which on a
+# long logprobs stream saturates the event loop and stalls every other response.
+_BYTE_LEVEL_VERDICT: dict[int, bool] = {}
 
 
 def _build_byte_decoder() -> dict[str, int]:
@@ -58,14 +63,17 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
     the full character ``é`` whose UTF-8 is [195, 169].
     """
     tid = id(tokenizer)
-    if tid in _BYTE_LEVEL_TOKENIZERS:
-        return True
+    verdict = _BYTE_LEVEL_VERDICT.get(tid)
+    if verdict is None:
+        verdict = _BYTE_LEVEL_VERDICT[tid] = _probe_byte_level(tokenizer)
+    return verdict
 
+
+def _probe_byte_level(tokenizer) -> bool:
+    """Uncached byte-level check; see _is_byte_level_tokenizer."""
     # Fast path: HuggingFace fast tokenizers expose is_byte_level.
     is_bl = getattr(tokenizer, "is_byte_level", None)
     if isinstance(is_bl, bool):
-        if is_bl:
-            _BYTE_LEVEL_TOKENIZERS.add(tid)
         return is_bl
 
     # Slow path: probe with a known é token.
@@ -87,7 +95,6 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
             if any(ch not in _BYTE_DECODER for ch in piece):
                 return False
         # All sampled tokens are byte-decodable → likely byte-level BPE.
-        _BYTE_LEVEL_TOKENIZERS.add(tid)
         return True
     except Exception:
         return False
