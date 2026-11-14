@@ -5,6 +5,7 @@ import pickle
 import shutil
 import signal
 import socket
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -2648,7 +2649,17 @@ class TestPortArgs(unittest.TestCase):
         with self.assertRaises(ValueError):
             PortArgs.init_new(server_args)
 
-    def test_init_new_with_single_node_dp_attention(self):
+    def _assert_endpoint_ports_checked(self, port_args, wait_port_available):
+        checked = [args[0] for args, _ in wait_port_available.call_args_list]
+        for ipc_name in (
+            port_args.tokenizer_ipc_name,
+            port_args.scheduler_input_ipc_name,
+            port_args.detokenizer_ipc_name,
+        ):
+            self.assertIn(int(ipc_name.rsplit(":", 1)[1]), checked)
+
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_init_new_with_single_node_dp_attention(self, wait_port_available):
 
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
@@ -2665,6 +2676,7 @@ class TestPortArgs(unittest.TestCase):
         )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
+        self._assert_endpoint_ports_checked(port_args, wait_port_available)
 
     @patch("sglang.srt.server_args.wait_port_available")
     def test_init_new_with_dp_rank(self, wait_port_available):
@@ -2712,7 +2724,8 @@ class TestPortArgs(unittest.TestCase):
                 )
                 self.assertIsInstance(port_args.nccl_port, int)
 
-    def test_init_new_with_ipv4_address(self):
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_init_new_with_ipv4_address(self, wait_port_available):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -2729,6 +2742,7 @@ class TestPortArgs(unittest.TestCase):
         )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
+        self._assert_endpoint_ports_checked(port_args, wait_port_available)
 
     def test_init_new_with_malformed_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
@@ -2862,6 +2876,28 @@ class TestSSLArgs(unittest.TestCase):
                 self._validate_ssl(enable_http_worker_reuseport=True, **kwargs)
             self.assertIn("--enable-http-worker-reuseport", str(context.exception))
         self._validate_ssl(enable_http_worker_reuseport=True, tokenizer_worker_num=2)
+
+    def test_enable_http2_needs_granian_only_on_the_python_frontend(self):
+        # Real models run this validation; the Rust listener serves HTTP/2
+        # itself, so only the Python frontend needs Granian. Both frontends
+        # check the HTTP/2 settings.
+        with patch.dict(sys.modules, {"granian": None}):
+            for rust_server in (False, True):
+                with (
+                    self.subTest(rust_server=rust_server),
+                    envs.SGLANG_RUST_SERVER.override(rust_server),
+                ):
+                    if rust_server:
+                        self._validate_ssl(enable_http2=True)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "'granian' package"):
+                            self._validate_ssl(enable_http2=True)
+                    with self.assertRaisesRegex(
+                        ValueError, "--http2-max-concurrent-streams"
+                    ):
+                        self._validate_ssl(
+                            enable_http2=True, http2_max_concurrent_streams=0
+                        )
 
     @patch("os.path.isfile", return_value=True)
     def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):
@@ -5713,7 +5749,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
         "enable_trace": ["--enable-trace"],
-        "warmups": ["--warmups", "voice_chat"],
         "completion_template": ["--completion-template", "deepseek_coder"],
         "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
         "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
@@ -5722,12 +5757,10 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "lora_paths": ["--lora-paths", "adapter=/adapters/a"],
         "tokenizer_mode": ["--tokenizer-mode", "slow"],
         "tokenizer_backend": ["--tokenizer-backend", "fastokens"],
-        "gc_warning_threshold_secs": ["--gc-warning-threshold-secs", "1"],
         "tokenizer_metrics_allowed_custom_labels": [
             "--tokenizer-metrics-allowed-custom-labels",
             "tenant",
         ],
-        "enable_http2": ["--enable-http2"],
         "mm_preprocess_cache_size_mb": ["--mm-preprocess-cache-size-mb", "512"],
         "language_only": ["--language-only"],
         "checkpoint_engine_wait_weights_before_ready": [
@@ -5780,14 +5813,14 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "dummy",
                 "--mm-preprocess-cache-size-mb",
                 "512",
-                "--enable-http2",
+                "--return-output-ids",
             ]
         )
         self.assertEqual(
             validation_hook.rust_server_unsupported_args(
                 args, honored={"mm_preprocess_cache_size_mb"}
             ),
-            ["--enable-http2"],
+            ["--return-output-ids"],
         )
 
     def test_supported_and_default_valued_args_pass(self):
@@ -5807,10 +5840,18 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "--default-chat-template-kwargs",
                 '{"enable_thinking": false}',
                 "--enable-strict-thinking",
+                "--enable-http2",
+                "--http2-max-concurrent-streams",
+                "64",
                 "--api-key",
                 "sk-test",
                 "--admin-api-key",
                 "sk-admin",
+                # Run by the Rust server's startup work.
+                "--warmups",
+                "voice_chat",
+                "--gc-warning-threshold-secs",
+                "1",
                 # Refused arguments at their default values.
                 "--media-url-max-file-size-mb",
                 "64",
@@ -5818,9 +5859,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "auto",
                 "--tokenizer-backend",
                 "huggingface",
-                # Python disables the GC warning when this is not positive.
-                "--gc-warning-threshold-secs",
-                "-1",
                 # The preprocessing cache off, as in the Rust pipelines.
                 "--mm-preprocess-cache-size-mb",
                 "0",
