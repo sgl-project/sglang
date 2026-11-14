@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     spill_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    AbortReq,
     ListLorasReq,
     MergeLoraWeightsReq,
     ReleaseRealtimeSessionReq,
@@ -54,6 +55,8 @@ logger = init_logger(__name__)
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
 # DP they reach every replica unless a fatal device error aborts the fan-out.
 _CONTROL_REQ_TYPES = (
+    # the request to abort may be queued on any replica
+    AbortReq,
     SetLoraReq,
     MergeLoraWeightsReq,
     UnmergeLoraWeightsReq,
@@ -147,8 +150,9 @@ def _is_fatal_reply(result: Any) -> bool:
     )
 
 
-def _merge_fanout_results(results: list[Any]) -> Any:
-    """Prefer fatal device errors, then the first error, over successful replies."""
+def _merge_fanout_results(batch: Any, results: list[Any]) -> Any:
+    """One reply for a control op sent to every replica. Fatal device errors
+    win, then the first error, because "succeeded" must mean succeeded everywhere."""
     first_error = None
     for result in results:
         if _is_fatal_reply(result):
@@ -156,7 +160,13 @@ def _merge_fanout_results(results: list[Any]) -> Any:
         if isinstance(result, OutputBatch) and result.error:
             if first_error is None:
                 first_error = result
-    return first_error if first_error is not None else results[0]
+    if first_error is not None:
+        return first_error
+    if isinstance(batch, AbortReq):
+        # each replica only counts what it dropped from its own queue
+        num_aborted = sum(r.output.get("num_aborted", 0) for r in results)
+        return OutputBatch(output={**results[0].output, "num_aborted": num_aborted})
+    return results[0]
 
 
 class SchedulerClient:
@@ -271,7 +281,7 @@ class SchedulerClient:
                 results.append(reply)
                 if _is_fatal_reply(reply):
                     break
-            output_batch = _merge_fanout_results(results)
+            output_batch = _merge_fanout_results(batch, results)
         else:
             if replica is None:
                 replica = _select_replica(batch, len(endpoints), self._replica_counter)
@@ -364,13 +374,14 @@ class AsyncSchedulerClient:
 
         endpoints = self.server_args.scheduler_endpoints
         if isinstance(batch, _CONTROL_REQ_TYPES):
+            # replica state (weights, LoRA, memory) must change everywhere
             results = []
             for ep in endpoints:
                 reply = await self._forward_one(ep, batch, timeout_ms)
                 results.append(reply)
                 if _is_fatal_reply(reply):
                     break
-            output_batch = _merge_fanout_results(results)
+            output_batch = _merge_fanout_results(batch, results)
         else:
             if replica is None:
                 replica = _select_replica(batch, len(endpoints), self._replica_counter)
