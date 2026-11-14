@@ -586,8 +586,14 @@ class AnthropicServing:
                     "equivalent hard-cap knob — the budget is not enforced",
                     anthropic_request.thinking.budget_tokens,
                 )
-            # The backend has no adaptive throttle, so ``adaptive`` runs as ``enabled``.
+            # ``adaptive`` runs as ``enabled`` (the backend has no adaptive throttle),
+            # except without a reasoning parser, where the model cannot think.
             enabled = anthropic_request.thinking.type != "disabled"
+            if (
+                anthropic_request.thinking.type == "adaptive"
+                and not self.openai_serving_chat.reasoning_parser
+            ):
+                enabled = False
             display = anthropic_request.thinking.display
             if display in ("omitted", "updates"):
                 logger.warning(
