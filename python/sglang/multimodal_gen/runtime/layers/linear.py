@@ -54,6 +54,15 @@ USE_CPU_AMX = current_platform.is_cpu() and cpu_has_amx_support()
 _USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGEMM
 if _USE_AITER_TGEMM:
     from aiter.tuned_gemm import tgemm
+# gfx1151 has no bf16 tuned config for tgemm, and rocBLAS stays at ~25 TFLOPS on
+# the large DiT projections where a tuned Triton matmul reaches ~29 (see
+# triton_mm.py). Opt-in because the reduction order differs from rocBLAS.
+_USE_TRITON_MM = current_platform.is_gfx1151() and envs.SGLANG_USE_ROCM_TRITON_MM
+if _USE_TRITON_MM:
+    from sglang.multimodal_gen.runtime.layers.triton_mm import (
+        can_use_triton_mm,
+        triton_mm,
+    )
 # gfx1250 has no tuned hipBLASLt bf16 kernels. For FLUX.2 shapes FlyDSL's a16w16
 # runs 930-960 TFLOPS vs 650-700 for Inductor's templates and ~880 for tgemm.
 if USE_AITER_GFX1250:
@@ -259,6 +268,9 @@ def apply_unquantized_linear(
 
     if _use_flydsl_linear(x, weight, bias):
         return _flydsl_linear(x, weight, bias)
+
+    if _USE_TRITON_MM and can_use_triton_mm(x, weight, bias):
+        return triton_mm(x, weight, bias)
 
     if (
         _USE_AITER_TGEMM
