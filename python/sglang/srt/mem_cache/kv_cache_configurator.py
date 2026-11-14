@@ -75,6 +75,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
+    MambaPool,
     MHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
@@ -1751,7 +1752,45 @@ class KVCacheConfigurator:
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
+        self._configure_gdn_replayssm_commit(req_to_token_pool)
         return req_to_token_pool
+
+    def _configure_gdn_replayssm_commit(self, req_to_token_pool) -> None:
+        deferred = get_exec().mamba.linear_replayssm_spec_commit_policy == "deferred"
+        statistics = envs.SGLANG_GDN_REPLAYSSM_COMMIT_STATS.get()
+        if not deferred and not statistics:
+            return
+        pool = req_to_token_pool.mamba_pool
+        if deferred and not isinstance(pool, MambaPool):
+            raise ValueError("Deferred GDN commit requires a static MambaPool")
+        supported = (
+            self.hybrid_gdn_config is not None
+            and (get_spec().speculative_algorithm or "").upper() == "DFLASH"
+            and pool.replayssm_spec_write_pos is not None
+        )
+        if not supported:
+            if deferred:
+                raise ValueError("Deferred ReplaySSM commit requires a GDN DFLASH ring")
+            return
+        if statistics:
+            pool.replayssm_commit_stats = torch.zeros(
+                (pool.replayssm_spec_write_pos.numel(), 9),
+                dtype=torch.int64,
+                device=pool.replayssm_spec_write_pos.device,
+            )
+        if deferred:
+            from sglang.srt.mem_cache.gdn_replayssm_commit import DeferredGDNState
+
+            if pool.mamba_cache.temporal.dtype != torch.bfloat16:
+                raise ValueError("Deferred GDN commit requires a BF16 checkpoint")
+            if not pool.mamba_cache.temporal.is_contiguous():
+                raise ValueError("Deferred GDN commit requires contiguous checkpoints")
+            pool.replayssm_deferred_state = DeferredGDNState(pool)
+        logger.info(
+            "GDN ReplaySSM commit policy: %s; diagnostic counters: %s",
+            "deferred" if deferred else "eager",
+            statistics,
+        )
 
     def _build_default_req_pool(
         self,

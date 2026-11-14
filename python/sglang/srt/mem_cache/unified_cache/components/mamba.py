@@ -814,6 +814,17 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if (
+            getattr(
+                self.cache.req_to_token_pool.mamba_pool,
+                "replayssm_deferred_state",
+                None,
+            )
+            is not None
+        ):
+            assert self.cache.enable_mamba_extra_buffer, (
+                "Deferred GDN commit publishes only full tracking checkpoints"
+            )
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:

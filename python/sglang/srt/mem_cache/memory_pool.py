@@ -1189,6 +1189,9 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        deferred = getattr(self, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.reset(indices)
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
         idx64 = indices.to(torch.int64)
@@ -1238,6 +1241,10 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
+        deferred = getattr(self, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.materialize(src_indices, reason="copy")
+            deferred.reset(dst_indices)
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -1270,6 +1277,9 @@ class MambaPool:
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
+        deferred = getattr(self, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.materialize(indices, reason="cpu_export")
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
             for conv in self.mamba_cache.conv
@@ -1297,6 +1307,9 @@ class MambaPool:
         else:
             conv_cpu, temporal_cpu = mamba_cache_cpu
         current_platform.synchronize()
+        deferred = getattr(self, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.reset(indices)
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(

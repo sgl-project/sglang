@@ -120,6 +120,11 @@ class SchedulerInternalStateController:
 
     def _add_speculative(self, state: Dict[str, Any]) -> None:
         scheduler = self.scheduler
+        pool = getattr(scheduler.req_to_token_pool, "mamba_pool", None)
+        if getattr(pool, "replayssm_commit_stats", None) is not None:
+            from sglang.srt.mem_cache.gdn_replayssm_commit import read_gdn_commit_stats
+
+            state["gdn_replayssm_commit_stats"] = read_gdn_commit_stats(pool)
         if scheduler.spec_algorithm.is_none():
             return
         accept_length = self._average_accept_length()

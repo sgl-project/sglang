@@ -462,6 +462,27 @@ def handle_linear_attn_backend(server_args: Any):
     # window (MambaPool checks it); KDA (kda_backend) keeps a window of the
     # same length and folds via its own fused verify ring-write +
     # commit_kda_replayssm_after_verify.
+    if cfg.linear_replayssm_spec_commit_policy == "deferred":
+        allowed = (
+            cfg.enable_linear_replayssm_spec
+            and (cfg.speculative_algorithm or "").upper() == "DFLASH"
+            and cfg.mamba_ssm_dtype == "bfloat16"
+            and cfg.disaggregation_mode == "null"
+            and not cfg.enable_pd_role_switch
+            and cfg.pp_size == 1
+            and not cfg.enable_unified_memory
+            and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
+            and not cfg.enable_int8_mamba_checkpoint
+            and not cfg.enable_streaming_session
+            and not cfg.enable_session_radix_cache
+            and os.environ.get("SGLANG_RAGGED_VERIFY_MODE", "static") == "static"
+        )
+        if not allowed:
+            raise ValueError(
+                "Deferred GDN commit requires explicit BF16 DFLASH ReplaySSM, "
+                "a static pool/verify, PP1, no PD/role switch, extra_buffer_lazy, "
+                "no int8 checkpoints and no streaming/session radix cache"
+            )
     if cfg.enable_linear_replayssm_spec:
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
@@ -528,6 +549,13 @@ def handle_linear_attn_backend(server_args: Any):
                 server_args,
                 "_handle_linear_attn_backend",
                 mamba_ssm_dtype="float32",
+            )
+        elif cfg.linear_replayssm_spec_commit_policy == "deferred":
+            logger.warning(
+                "Experimental deferred GDN commit retains accepted history; "
+                "BF16 checkpoint rounding occurs at capacity folds and "
+                "checkpoint-only reads; eager token equivalence is not guaranteed. "
+                "Validate long-generation accuracy and throughput."
             )
         elif cfg.mamba_ssm_dtype != "float32":
             logger.warning(

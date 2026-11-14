@@ -1691,9 +1691,10 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         # ReplaySSM-GDN (the request cursors exist only there): the verify
         # appended this window's drafts to the compact request ring and wrote
-        # no snapshots. Fold every accepted window, so `temporal` is the
-        # committed state after each step as with the KDA fold above; radix
-        # donation and state copies read the slot directly. Chain layout only.
+        # no snapshots. Eager commit materializes each accepted window.
+        # Deferred commit retains accepted history; the state pool drains owned
+        # active slots before copy/export, while tracking slots stay complete.
+        # Chain layout only.
         if getattr(mamba_pool, "replayssm_cache_base", None) is not None:
             if request_number == 0:
                 return
@@ -1713,7 +1714,11 @@ class HybridLinearAttnBackend(AttentionBackend):
                 replay_indices=state_slots.ring[:request_number],
                 accept_lens=last_correct_step_indices + 1,
                 last_correct_step_indices=last_correct_step_indices,
-                fold_every_commit=True,
+                fold_every_commit=(
+                    getattr(mamba_pool, "replayssm_deferred_state", None) is None
+                ),
+                max_spec_len=mamba_caches.intermediate_conv_window[0].shape[2],
+                stats=getattr(mamba_pool, "replayssm_commit_stats", None),
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 src_indices_raw=src_indices_raw,

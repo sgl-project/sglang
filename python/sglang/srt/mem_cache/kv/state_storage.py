@@ -182,6 +182,9 @@ class StateStorage:
         row_ids = async_h2d(rows, dtype=torch.int64, device=table.device)
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         table.req_index_to_mamba_index_mapping[row_ids] = mamba_index_tensor
+        deferred = getattr(self.pool, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.bind(row_ids, mamba_index_tensor)
         if table.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
             table.req_index_to_mamba_ping_pong_track_buffer_mapping[row_ids] = (
@@ -196,6 +199,9 @@ class StateStorage:
         if write_pos is None:
             return
         indices = async_h2d(rows, dtype=torch.int64, device=device)
+        deferred = getattr(self.pool, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.reset_rows(indices)
         write_pos.index_fill_(0, indices, 0)
         self.pool.replayssm_cache_base.index_fill_(0, indices, 0)
         self.pool.replayssm_is_flush.index_fill_(0, indices, 0)
@@ -255,6 +261,9 @@ class StateStorage:
         the one kept for the radix cache."""
         mamba_index = req.kv.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
+        deferred = getattr(self.pool, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.reset(mamba_index.unsqueeze(0), forget=True)
         self.slots.free(mamba_index.unsqueeze(0))
         req.kv.mamba_pool_idx = None
 
@@ -285,6 +294,9 @@ class StateStorage:
             req.kv.mamba_needs_clear = False
 
     def clear(self) -> None:
+        deferred = getattr(self.pool, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.clear()
         self.slots.clear()
         self.short_conv_pool.clear()
         self.ngram_pool.clear()

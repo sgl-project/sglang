@@ -356,6 +356,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_linear_replayssm",
     "linear_replayssm_cache_len",
     "enable_linear_replayssm_spec",
+    "linear_replayssm_spec_commit_policy",
     "enable_hierarchical_cache",
     "hicache_host_memory_mode",
     "hicache_ratio",

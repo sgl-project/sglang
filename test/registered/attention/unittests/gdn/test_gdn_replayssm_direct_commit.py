@@ -17,6 +17,7 @@ for rows with a state slot, and CUDA graph replay must match eager.
 import math
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -317,6 +318,10 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
     def _replayssm(self, template):
         return _Arm(template, replayssm=True, dispatcher=self.dispatcher)
 
+    def test_bf16_dflash_deferred_chain_matches_reference(self):
+        with mock.patch.dict(globals(), WIDTH=4):
+            self._check_chain(torch.bfloat16, 256, lazy=True, direct_deferred=True)
+
     def test_chain_matches_reference(self):
         """Chained verify/commit steps with random accepted lengths: outputs
         and committed states track the float64 reference no worse than the
@@ -332,7 +337,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         the outputs stay as close to the reference as the snapshot path's."""
         self._check_chain(torch.float32, num_steps=128, lazy=True)
 
-    def _check_chain(self, ssm_dtype, num_steps, lazy=False):
+    def _check_chain(self, ssm_dtype, num_steps, lazy=False, direct_deferred=False):
         torch.manual_seed(7)
         layers = _make_layers()
         template = _template(ssm_dtype)
@@ -347,12 +352,14 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                 replayssm=True,
                 dispatcher=self.dispatcher,
                 ring_len=4 * WIDTH if lazy else RING,
-                lazy=lazy,
+                lazy=lazy and not direct_deferred,
             ),
             # The Triton recurrent verify writes a snapshot per draft on every
             # GPU.
             "snapshot": _Arm(template, replayssm=False, dispatcher=self.dispatcher),
         }
+        if direct_deferred:
+            arms["replayssm"].pool.replayssm_deferred_state = object()
         backends = {name: arm.backend(qsl, cache_indices) for name, arm in arms.items()}
         replayssm = arms["replayssm"]
         untouched_rows = [

@@ -632,7 +632,9 @@ class KVStorage:
     def release_state_slot(self, req) -> None:
         """Give back the state slot ``req`` took before its KV (a request that
         does not run after all)."""
-        self._allocator.state_slots.free(req.kv.mamba_pool_idx.unsqueeze(-1))
+        self.free_state_slots(
+            self.requests.state_sub_pool, req.kv.mamba_pool_idx.unsqueeze(-1)
+        )
         req.kv.mamba_pool_idx = None
 
     # -- the prefix tree's state effects: the tree decides, the storage executes --
@@ -642,6 +644,9 @@ class KVStorage:
         return self._allocator.state_slots.alloc(count)
 
     def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
+        deferred = getattr(self._allocator.state.pool, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.reset(self._allocator.state_ids(sub_pool).ids(slots), forget=True)
         self._allocator.state_slots.free(slots)
 
     def copy_state(self, sub_pool: str, src: torch.Tensor, dst: torch.Tensor) -> None:
@@ -697,7 +702,11 @@ class KVStorage:
 
     def restart_replay(self, sub_pool: str, slots: torch.Tensor) -> None:
         """A loaded state is current: its replay lag restarts at zero."""
-        write_pos = self._allocator.state.pool.replayssm_write_pos
+        pool = self._allocator.state.pool
+        deferred = getattr(pool, "replayssm_deferred_state", None)
+        if deferred is not None:
+            deferred.reset(self._allocator.state_ids(sub_pool).ids(slots))
+        write_pos = pool.replayssm_write_pos
         if write_pos is not None:
             write_pos[self._allocator.state_ids(sub_pool).ids(slots)] = 0
 

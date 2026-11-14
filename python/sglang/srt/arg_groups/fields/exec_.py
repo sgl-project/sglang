@@ -661,6 +661,13 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
+    linear_replayssm_spec_commit_policy: A[
+        str,
+        Arg(
+            help="GDN DFLASH ReplaySSM commit policy. eager materializes every accepted window (default); deferred retains accepted factors across rounds, flushing at capacity or checkpoint-only reads. BF16 rounding and generated tokens may differ from eager. Experimental: BF16, static pool/verify, PP1, no PD, extra_buffer_lazy only.",
+            choices=["eager", "deferred"],
+        ),
+    ] = "eager"
 
 
 class ExecGraph(msgspec.Struct):
