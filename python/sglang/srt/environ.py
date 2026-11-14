@@ -2488,6 +2488,9 @@ class Envs:
     # bank write run on the local shard, then only the normalized attention
     # input is all-gathered. Works with NCCL or SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # Prefill SP tail: from the first MoE layer, each TP rank keeps 1/tp of the rows.
+    SGLANG_K31_PREFILL_SP_TAIL = EnvBool(True)
+    SGLANG_K31_PREFILL_SP_TAIL_MIN_TOKENS = EnvInt(4097)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
