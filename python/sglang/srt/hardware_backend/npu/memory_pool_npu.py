@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -742,7 +742,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+            and not (
+                envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+                and (is_draft_worker or get_disagg().disaggregation_mode == "prefill")
+            )
         )
+        if (
+            self.enable_sparsity_driven_kv_offload
+            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+            and get_disagg().disaggregation_mode == "decode"
+            and (
+                (kv_lora_rank, qk_rope_head_dim, page_size) != (512, 64, 128)
+                or dtype != torch.bfloat16
+                or modelslim_cache_layout is not None
+                or self.use_fia_nz
+            )
+        ):
+            raise ValueError(
+                "Ascend PD split KV requires row-major BF16 MLA with "
+                "512/64 features and page size 128."
+            )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
         if index_head_dim is None:
@@ -1044,13 +1063,23 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
-        self._raise_if_native_kv_cache_disabled()
-        global_kv = self.is_draft_worker
-        if self.use_combined_kv_buffer:
-            return [(buffer, global_kv) for buffer in self.kv_buffer]
-        entries = [(buffer, global_kv) for buffer in self.k_buffer]
-        if not getattr(self, "dsa_kv_cache_store_fp8", False):
-            entries += [(buffer, global_kv) for buffer in self.v_buffer]
+        host_pool = getattr(getattr(self, "sparse_kv_manager", None), "host_pool", None)
+        if host_pool is not None and not host_pool.supports_pd_export:
+            # Colocated SHM device mappings are not MF PD registrations.
+            host_pool = None
+        if host_pool is not None:
+            # Match native prefill's CKV layers, then KPE layers, then indexer.
+            entries = [
+                (buf, True) for component in host_pool.buffers for buf in component
+            ]
+        else:
+            self._raise_if_native_kv_cache_disabled()
+            global_kv = self.is_draft_worker
+            if self.use_combined_kv_buffer:
+                return [(buffer, global_kv) for buffer in self.kv_buffer]
+            entries = [(buffer, global_kv) for buffer in self.k_buffer]
+            if not getattr(self, "dsa_kv_cache_store_fp8", False):
+                entries += [(buffer, global_kv) for buffer in self.v_buffer]
         if self.index_head_dim is not None:
             entries += [(buffer, True) for buffer in self.index_k_buffer]
             if self.index_k_scale_buffer is not None:

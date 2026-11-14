@@ -1281,6 +1281,13 @@ class Envs:
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    # Per-request resident token capacity; 0 defaults to model TopK or auto-sizes
+    # from the manager HBM budget. Legacy uses LRU when C > K;
+    # native LIM maintains its own resident mapping.
+    SGLANG_NPU_SPARSE_KV_CACHE_SIZE = EnvInt(0)
+    # Per-rank persistent manager allocations, in MiB; 0 leaves the cap unset.
+    SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB = EnvInt(0)
+    SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
@@ -2633,6 +2640,9 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_NPU_LIM_LIBRARY": _DeprecatedEnv(
+        note="LIM is loaded from sgl-kernel-npu; external library paths are ignored."
+    ),
     "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": _DeprecatedEnv(
         note=(
             "Pass --flashinfer-allreduce-fusion-backend cutedsl instead. "
