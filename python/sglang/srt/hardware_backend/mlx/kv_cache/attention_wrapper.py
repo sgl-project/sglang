@@ -179,6 +179,42 @@ def clear_context() -> None:
     _thread_local.batched_ctx = None
 
 
+class BatchedPoolCache:
+    """mlx-lm cache adapter for one attention layer in one batched decode step.
+
+    ``offset`` carries per-request RoPE positions; ``update_and_fetch`` writes
+    each new K/V to its pool slot and returns the right-padded batched K/V.
+    """
+
+    def __init__(self, layer_caches, ctx: BatchedDecodeContext, window: int | None):
+        self._layer_caches = layer_caches
+        self._ctx = ctx
+        self._window = window
+        self.offset = ctx.offsets
+
+    @property
+    def state(self):
+        return ()
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        B, n_kv_heads, _, head_dim = keys.shape
+        pad_sizes, _ = self._ctx.decode_padding(self._window)
+        all_k = []
+        all_v = []
+        for i in range(B):
+            self._layer_caches[i].write_token(keys[i : i + 1], values[i : i + 1])
+            k_all, v_all = self._layer_caches[i].get_kv(self._window)
+            pad = pad_sizes[i]
+            if pad > 0:
+                k_pad = mx.zeros((1, n_kv_heads, pad, head_dim), dtype=k_all.dtype)
+                v_pad = mx.zeros((1, n_kv_heads, pad, head_dim), dtype=v_all.dtype)
+                k_all = mx.concatenate([k_all, k_pad], axis=2)
+                v_all = mx.concatenate([v_all, v_pad], axis=2)
+            all_k.append(k_all)
+            all_v.append(v_all)
+        return mx.concatenate(all_k, axis=0), mx.concatenate(all_v, axis=0)
+
+
 class MLXAttentionWrapper(nn.Module):
     """Wraps an mlx-lm Attention for batched decode (BS>1).
 
@@ -229,11 +265,31 @@ class MLXAttentionWrapper(nn.Module):
             self, "_sink_kwargs", {} if sinks is None else {"sinks": sinks}
         )
 
-    def __call__(self, x: mx.array, mask: Any = None, cache: Any = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, mask: Any = None, cache: Any = None, *args, **kwargs
+    ):
+        # Forward extra args the inner module takes (Hunyuan passes a shared-KV
+        # state positionally) so delegation matches its contract.
         ctx = get_context()
         if ctx is None:
-            return self._inner(x, mask=mask, cache=cache)
-        return self._batched_decode(x, ctx)
+            return self._inner(x, mask, cache, *args, **kwargs)
+        if ctx.aot.rope is not None and self._window_size is None:
+            # The fused AOT RoPE+scatter kernel owns the RoPE step, so it needs
+            # the hand-rolled path.
+            return self._batched_decode(x, ctx)
+        return self._delegated_decode(x, ctx, *args, **kwargs)
+
+    def _delegated_decode(
+        self, x: mx.array, ctx: BatchedDecodeContext, *args, **kwargs
+    ):
+        # The module runs its own q/k/v, norms, RoPE and SDPA; we own only the
+        # KV pool and batching, handed to it as a BatchedPoolCache.
+        window = self._window_size
+        cache_idx = ctx.attention_pool_index_by_layer[self._layer_idx]
+        layer_caches = ctx.attention_layer_caches[cache_idx]
+        _, attn_mask = ctx.decode_padding(window)
+        cache = BatchedPoolCache(layer_caches, ctx, window)
+        return self._inner(x, attn_mask, cache, *args, **kwargs)
 
     def _batched_decode(self, x: mx.array, ctx: BatchedDecodeContext) -> mx.array:
         inner = self._inner
