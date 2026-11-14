@@ -409,6 +409,7 @@ pub struct TreeCoreInitParamsBinding {
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
     pub mamba_host_only_checkpoint: bool,
+    pub joint_lru: bool,
 }
 
 impl TreeCoreInitParamsBinding {
@@ -434,6 +435,7 @@ impl TreeCoreInitParamsBinding {
             mamba_cache_chunk_size: self.mamba_cache_chunk_size,
             mamba_max_states_per_path: self.mamba_max_states_per_path,
             mamba_host_only_checkpoint: self.mamba_host_only_checkpoint,
+            joint_lru: self.joint_lru,
         })
     }
 }
@@ -441,7 +443,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, gds_cost = None))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, joint_lru = false, gds_cost = None))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -459,6 +461,7 @@ impl TreeCoreInitParamsBinding {
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
         mamba_host_only_checkpoint: bool,
+        joint_lru: bool,
         gds_cost: Option<(f64, f64)>,
     ) -> Self {
         TreeCoreInitParamsBinding {
@@ -479,6 +482,7 @@ impl TreeCoreInitParamsBinding {
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
             mamba_host_only_checkpoint,
+            joint_lru,
         }
     }
 }
@@ -3976,8 +3980,59 @@ macro_rules! tree_core_binding {
     };
 }
 
-tree_core_binding! {
-    core = UnifiedTreeCore;
+// Only UnifiedTreeCore has the joint Full/SWA eviction walk.
+impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<UnifiedTreeCore<K>> {
+    fn start_joint_eviction(&self, py: Python<'_>) {
+        py.detach(|| self.core().start_joint_eviction());
+    }
+
+    fn next_joint_eviction_victim(&self, py: Python<'_>) -> Option<(u8, NodeId)> {
+        py.detach(|| self.core().next_joint_eviction_victim())
+            .map(|(ct, node_id)| (ct as u8, node_id))
+    }
+
+    fn end_joint_eviction(&self, py: Python<'_>) {
+        py.detach(|| self.core().end_joint_eviction());
+    }
+}
+
+// Stamps the UnifiedTreeCore pyclasses, each with the joint-eviction forwarders.
+macro_rules! unified_tree_core_bindings {
+    ($($(#[$doc:meta])* $name:ident, $key:ty;)+) => {
+        tree_core_binding! {
+            core = UnifiedTreeCore;
+            $(
+            $(#[$doc])*
+            $name,
+            $key,
+            {
+                fn start_joint_eviction(&self, py: Python<'_>) -> PyResult<()> {
+                    catch_native_panic(|| {
+                        self.inner.start_joint_eviction(py);
+                        Ok(())
+                    })
+                }
+
+                fn next_joint_eviction_victim(
+                    &self,
+                    py: Python<'_>,
+                ) -> PyResult<Option<(u8, NodeId)>> {
+                    catch_native_panic(|| Ok(self.inner.next_joint_eviction_victim(py)))
+                }
+
+                fn end_joint_eviction(&self, py: Python<'_>) -> PyResult<()> {
+                    catch_native_panic(|| {
+                        self.inner.end_joint_eviction(py);
+                        Ok(())
+                    })
+                }
+            };
+            )+
+        }
+    };
+}
+
+unified_tree_core_bindings! {
     /// The UnifiedTreeCore Python adapter over single-token (unigram) child keys.
     RustUnifiedTreeCoreBinding,
     Vec<i64>;

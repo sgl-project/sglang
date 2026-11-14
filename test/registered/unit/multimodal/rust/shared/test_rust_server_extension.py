@@ -668,7 +668,20 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module,
             "get_serving",
-            return_value=SimpleNamespace(host="::", port=30000),
+            return_value=SimpleNamespace(
+                host="::", port=30000, warmups=None, api_key=None
+            ),
+        ),
+        # No GC warning, no `--warmups`.
+        patch.object(
+            server_module,
+            "get_observability",
+            return_value=SimpleNamespace(gc_warning_threshold_secs=0.0),
+        ),
+        patch.object(
+            server_module,
+            "get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="null"),
         ),
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args

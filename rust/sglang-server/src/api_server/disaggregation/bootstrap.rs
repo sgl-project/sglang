@@ -581,6 +581,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         (
