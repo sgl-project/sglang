@@ -439,7 +439,7 @@ class SWAComponent(TreeComponent):
             return
         result.record_adopted_range(BASE_COMPONENT_TYPE, start, end)
         full_cd.value = incoming_full.clone()
-        cache_actions.append(FreeDeviceKVFullOnly([old_full]))
+        cache_actions.append(FreeDeviceKVFullOnly([old_full], tree_owned=True))
         self._publish_window(node=node, cache_actions=cache_actions)
 
     def update_component_on_insert_overlap(

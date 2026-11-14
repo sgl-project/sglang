@@ -33,7 +33,7 @@ v0.5.16 or a later version.
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
@@ -177,7 +177,7 @@ sglang serve \
     --chunked-prefill-size -1 --max-prefill-tokens 16384 \
     --trust-remote-code \
     --host 127.0.0.1 --port 6688 \
-    --mem-fraction-static 0.75 \
+    --mem-fraction-static 0.85 \
     --max-running-requests 64 \
     --dtype bfloat16 --mamba-ssm-dtype bfloat16 \
     --enable-multimodal --mm-attention-backend ascend_attn \
@@ -231,7 +231,7 @@ sglang serve \
     --chunked-prefill-size -1 --max-prefill-tokens 16384 \
     --trust-remote-code \
     --host 127.0.0.1 --port 6688 \
-    --mem-fraction-static 0.75 \
+    --mem-fraction-static 0.85 \
     --max-running-requests 64 \
     --dtype bfloat16 --mamba-ssm-dtype bfloat16 \
     --enable-multimodal --mm-attention-backend ascend_attn \

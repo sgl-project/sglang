@@ -63,6 +63,7 @@ pub(super) fn core_handle() -> CoreHandle {
             metrics: None,
             request_log: None,
             generate_validator: None,
+            abort_hook: None,
         },
     )
 }
@@ -175,6 +176,7 @@ pub(super) fn frontend_closed() -> CoreHandle {
             metrics: None,
             request_log: None,
             generate_validator: None,
+            abort_hook: None,
         },
     )
 }
@@ -254,6 +256,7 @@ fn answering_app_state_built(
             metrics: None,
             request_log,
             generate_validator: None,
+            abort_hook: None,
         },
     );
     // The test tokenizers add no specials, so one handle serves both modes.

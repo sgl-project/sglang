@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
 use crate::message::response::ResponseItem;
+use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission};
 use crate::utils::error::Error;
 
@@ -271,8 +272,15 @@ impl CoreHandle {
     /// Cancel active generations by public ID, or all active generations,
     /// ending each call as `ending` says. The admission gate and internal IDs
     /// keep cancellation safe across preprocessing, queueing, duplicate public
-    /// IDs, and ID reuse.
+    /// IDs, and ID reuse. Every entry's abort comes here, and one by a
+    /// non-empty `rid` tells the package's [`crate::AbortHook`] before anything
+    /// ends.
     pub(crate) fn abort(&self, rid: Option<&str>, ending: AbortEnding) -> bool {
+        if let (Some(hook), Some(rid)) = (&self.inner.abort_hook, rid)
+            && !rid.is_empty()
+        {
+            hook.named_abort(rid);
+        }
         self.inner
             .generations
             .abort(rid, ending, &self.inner.abort_tx)
@@ -326,16 +334,21 @@ impl CoreHandle {
     /// names ([`Self::check_routed_dp_rank`]), then the launch's
     /// [`crate::GenerateValidator`]; the first refusal is the error.
     fn validate(&self, requests: &[GenerateRequest]) -> Result<(), CoreError> {
-        requests
-            .iter()
-            .try_for_each(|request| self.check_routed_dp_rank(request.routed_dp_rank))?;
+        requests.iter().try_for_each(|request| {
+            self.check_routed_dp_rank(request.routed_dp_rank)
+                .inspect_err(|error| {
+                    tracing::warn!(rid = %request.rid, %error, "rejected request");
+                })
+        })?;
         let Some(validator) = &self.inner.generate_validator else {
             return Ok(());
         };
-        requests
-            .iter()
-            .try_for_each(|request| validator.validate(request))
-            .map_err(CoreError::InvalidArgument)
+        requests.iter().try_for_each(|request| {
+            validator.validate(request).map_err(|message| {
+                tracing::warn!(rid = %request.rid, error = %message, "rejected request");
+                CoreError::InvalidArgument(message)
+            })
+        })
     }
 
     /// Python `TokenizerManager.generate_request`'s `routed_dp_rank` check:
@@ -381,7 +394,12 @@ impl CoreHandle {
         };
         prefetch::prefetch_all(requests, &self.inner.mm_limits, processor)
             .await
-            .map_err(CoreError::from)
+            .map_err(|error| {
+                if let (MediaError::Client(message), Some(request)) = (&error, requests.first()) {
+                    tracing::warn!(rid = %request.rid, error = %message, "rejected request");
+                }
+                CoreError::from(error)
+            })
     }
 }
 
@@ -892,7 +910,6 @@ mod tests {
     use crate::message::multimodal::MmItem;
     use crate::message::request::MmData;
     use crate::message::response::{CachedTokensDetails, ChunkEvent, ChunkExtras};
-    use crate::multi_modality::worker::MediaError;
     use crate::tokenizer_manager::wiring::TmEvent;
     use bytes::Bytes;
     use std::time::Duration;
@@ -1003,6 +1020,7 @@ mod tests {
                 metrics: Some(metrics.clone()),
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let mut call = handle
@@ -1244,6 +1262,7 @@ mod tests {
                 metrics: None,
                 request_log: Some(crate::api_server::core::RequestLog::for_test(None, true)),
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let call = handle
@@ -1703,6 +1722,7 @@ mod tests {
                 metrics: Some(metrics.clone()),
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let mut submit =
@@ -1888,7 +1908,8 @@ mod tests {
     }
 
     /// A processor's media failures reach adapters as Python's loader classes:
-    /// a client fault is a 400, a server fault a 500. Neither is admitted.
+    /// a client fault is a 400, logged with its reason, a server fault a 500.
+    /// Neither is admitted.
     #[tokio::test]
     async fn processor_media_failures_keep_their_status_class() {
         use crate::message::types::TokenIds;
@@ -1921,6 +1942,7 @@ mod tests {
         let harness = Harness::unbounded(8);
         assert!(harness.handle.set_mm_processor(Arc::new(FailingFetch)));
         assert!(!harness.handle.set_mm_processor(Arc::new(FailingFetch)));
+        let logs = crate::utils::logging::capture_logs();
         for (source, status, message) in [
             ("custom://client", 400, "bad media"),
             ("custom://server", 500, "backend down"),
@@ -1941,6 +1963,11 @@ mod tests {
             assert_eq!(error.http_status().as_u16(), status, "{source}");
             assert_eq!(error.to_string(), message);
         }
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains("bad media")),
+            "{rejections:?}"
+        );
         assert!(harness.intake_rx.try_recv().is_err());
         assert!(harness.abort_rx.try_recv().is_err());
     }
@@ -1974,6 +2001,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             (handle, intake_rx)

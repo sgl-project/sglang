@@ -91,6 +91,7 @@ from sglang.srt.mem_cache.page_interleave import (
     get_kv_shard_group,
     get_shared_kv_shard_pool,
     make_page_shard_spec,
+    page_shard_row_bytes,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveDSATokenToKVPool,
@@ -543,6 +544,14 @@ class KVCacheConfigurator:
         self.kv_shard_size = self.kv_shard_spec.shard_size
         self.kv_shard_group = get_kv_shard_group(self.use_mla_backend)
 
+    def page_shard_scratch_row_bytes(self) -> int:
+        """Bytes per token row of the logical-page KV sharding scratch.
+
+        Override when the sharded pool stores wider rows than the standard
+        K/V or MLA layout (for example grouped rows or embedded scales).
+        """
+        return page_shard_row_bytes(self)
+
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
             return None
@@ -985,6 +994,62 @@ class KVCacheConfigurator:
         )
         return has_window, has_state
 
+    def _unified_sparse_attention(self, full_layer_ids):
+        """How an MLA model's full layers store sparse attention on the unified
+        pool: their latent rows' format (layer-major FP8 rows with block scales)
+        and the indexer keys the layers that select top-k keep beside them; None
+        when its layers attend densely."""
+        hf_config = self.model_config.hf_config
+        if not is_deepseek_dsa(hf_config):
+            return None
+        from sglang.srt.mem_cache.kv.decl import (
+            FP8_DS_MLA,
+            FullLayerParts,
+            IndexKeyGeometry,
+            MLARowFormat,
+        )
+
+        if get_dsa_index_kpool(hf_config) != 1:
+            raise ValueError(
+                "--enable-unified-memory does not support pooled indexer keys yet; "
+                "drop --enable-unified-memory for this model."
+            )
+        if get_parallel().attn_dcp_size > 1:
+            raise ValueError(
+                "--enable-unified-memory does not support sparse attention with "
+                "decode context parallelism yet; drop --dcp-size or "
+                "--enable-unified-memory."
+            )
+        row_bytes = calculate_mla_kv_cache_dim(
+            model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+        )
+        if (
+            self.kv_cache_dtype != torch.float8_e4m3fn
+            or row_bytes
+            == self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim
+        ):
+            raise ValueError(
+                "--enable-unified-memory serves sparse attention from FP8 latent "
+                "rows with block scales, which the flashmla_kv DSA backends read; "
+                f"this configuration stores {row_bytes}-byte "
+                f"{self.kv_cache_dtype} rows."
+            )
+        row_format = MLARowFormat(
+            name=FP8_DS_MLA, row_bytes=row_bytes, scale_ue8m0=is_kimi_k31(hf_config)
+        )
+        index_keys = FullLayerParts(
+            layer_ids=tuple(
+                layer_id
+                for layer_id in full_layer_ids
+                if not dsa_layer_skips_topk(hf_config, layer_id)
+            ),
+            geometry=IndexKeyGeometry(
+                index_head_dim=get_dsa_index_head_dim(hf_config),
+                use_fp4=get_exec().kernel.enable_fp4_indexer,
+            ),
+        )
+        return row_format, index_keys
+
     def _kv_layer_decls(self) -> tuple:
         """This runner's per-layer KV and state declarations for the unified pool."""
         from sglang.srt.mem_cache.kv.decl import (
@@ -1020,12 +1085,24 @@ class KVCacheConfigurator:
                 for i in self.mambaish_config.full_attention_layer_ids
                 if start <= i < end
             ]
+        full_layer_parts = ()
         if self.use_mla_backend:
+            sparse = self._unified_sparse_attention(full_layer_ids)
             full_geometry = MLAGeometry(
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 kv_cache_dtype=self.kv_cache_dtype,
             )
+            if sparse is not None:
+                row_format, index_keys = sparse
+                full_geometry = MLAGeometry(
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    row_format=row_format,
+                    layer_major=True,
+                )
+                full_layer_parts = (index_keys,)
         elif has_window:
             geometry = self._unified_swa_head_geometry()
             full_geometry = MHAGeometry(
@@ -1118,6 +1195,7 @@ class KVCacheConfigurator:
         return kv_layer_decls(
             full_layer_ids=full_layer_ids,
             full_geometry=full_geometry,
+            full_layer_parts=full_layer_parts,
             **window,
             **state,
         )

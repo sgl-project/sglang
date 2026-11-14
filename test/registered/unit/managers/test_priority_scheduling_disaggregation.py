@@ -269,6 +269,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             cache_salt=None,
             kv_rotation_base=None,
             last_node=object(),
+            swa_branching_seqlen=None,
         )
         return cache, component, req
 

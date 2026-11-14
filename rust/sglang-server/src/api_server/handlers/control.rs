@@ -404,6 +404,7 @@ mod tests {
                 })],
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
 
@@ -528,6 +529,7 @@ mod tests {
                     peer_endpoints,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             (handle, intake_rx, abort_rx)

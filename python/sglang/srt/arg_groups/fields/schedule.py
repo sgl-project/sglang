@@ -106,6 +106,10 @@ class Schedule(msgspec.Struct):
             ],
         ),
     ] = "fcfs"
+    shortest_prefill_aging_factor: A[
+        float,
+        "With --schedule-policy shortest-prefill-first, each prefill token processed while a request waits lowers its rank by this many tokens, bounding its wait to about its uncached length divided by the factor, in processed tokens. 0 disables aging.",
+    ] = 0.0
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

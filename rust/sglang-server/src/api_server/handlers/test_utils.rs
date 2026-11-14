@@ -64,6 +64,7 @@ pub(super) fn configured_handle(
             metadata: CoreMetadata::default(),
             request_log: None,
             generate_validator: None,
+            abort_hook: None,
         },
     )
 }

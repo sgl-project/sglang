@@ -949,12 +949,18 @@ class HybridCacheController(BaseHiCacheController):
         return super().prefetch_rate_limited()
 
     def alloc_prefetch_host_buffers(
-        self, operation: StorageOperation, need_size: int
+        self,
+        operation: StorageOperation,
+        need_size: int,
+        *,
+        start_owner: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Atomically allocate every prefetch slice from a shared arena."""
         anchor = self.mem_pool_host.anchor_entry
         if not uses_shared_host_layout(anchor.host_pool):
-            host_indices = super().alloc_prefetch_host_buffers(operation, need_size)
+            host_indices = super().alloc_prefetch_host_buffers(
+                operation, need_size, start_owner=start_owner
+            )
             if host_indices is not None:
                 self._sync_prefetch_trailing_keys(operation, need_size)
             return host_indices
@@ -994,12 +1000,19 @@ class HybridCacheController(BaseHiCacheController):
         allow_partial: bool,
         min_tokens: int,
         evict_host: Callable[[int], int],
+        start_owner: Optional[int] = None,
     ) -> tuple[Optional[torch.Tensor], int]:
-        host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
+        # Logical-page KV sharding: the owner class of the first page's slot.
+        shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
+        host_indices = self.alloc_prefetch_host_buffers(
+            operation, hit_tokens, **shard_kwargs
+        )
         shared = uses_shared_host_layout(self.mem_pool_host.anchor_entry.host_pool)
         if host_indices is None and not shared:
             evict_host(hit_tokens)
-            host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
+            host_indices = self.alloc_prefetch_host_buffers(
+                operation, hit_tokens, **shard_kwargs
+            )
         if host_indices is not None or not allow_partial:
             return host_indices, hit_tokens
 
@@ -1018,7 +1031,9 @@ class HybridCacheController(BaseHiCacheController):
             available = self.mem_pool_host.available_size()
             alloc_len = min(hit_tokens, available - available % self.page_size)
         if alloc_len >= min_tokens:
-            host_indices = self.alloc_prefetch_host_buffers(operation, alloc_len)
+            host_indices = self.alloc_prefetch_host_buffers(
+                operation, alloc_len, **shard_kwargs
+            )
         return host_indices, alloc_len
 
     def free_prefetch_host_buffers(
