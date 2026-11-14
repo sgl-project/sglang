@@ -1195,6 +1195,7 @@ class SchedulerMetricsReporter:
             wall_time=0.0,
             scheduled_requests=self._build_scheduled_request_metrics(batch, result),
             queued_requests=self._build_queued_request_metrics(),
+            iteration_id=batch.dp_step_id,
         )
         timing.publish_when_ready(fpm, self.scheduler._fpm_publisher)
 
