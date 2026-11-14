@@ -457,35 +457,50 @@ def _dcp_pack_a2a_send_kernel(
     dst_lse_stride_B,
     dst_lse_stride_H,
     H_PER_RANK: tl.constexpr,
+    HEADS_PER_CHUNK: tl.constexpr,
+    HEAD_CHUNKS: tl.constexpr,
     WORDS: tl.constexpr,
-    BLOCK: tl.constexpr,
+    WORDS_PAD: tl.constexpr,
 ):
-    """Scatter one (batch, head) partial into its peer's send slot."""
+    """Scatter one batch row's partials to every peer from a single program.
+
+    The per-(batch, head) grid launched B*H programs that each moved one 1 KB
+    row; on K3 TP8/DCP8 that is 24k tiny programs and measures ~14 us per layer
+    independent of the row width (D=512 and D=128 cost the same), i.e. it is
+    occupancy/launch bound, not bandwidth bound. One program per (batch, peer)
+    moves the peer's whole H_PER_RANK x WORDS block (~5.5 us at D=512).
+    """
     b = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1).to(tl.int64)
-    peer = h // H_PER_RANK
-    h_local = h % H_PER_RANK
+    peer = tl.program_id(1).to(tl.int64)
+    ww = tl.arange(0, WORDS_PAD)
+    wmask = ww < WORDS
+    lane = tl.arange(0, HEADS_PER_CHUNK)
 
-    src = out_ptr + b * out_stride_B + h * out_stride_H
-    dst = (
-        dst_o_ptr
-        + peer * dst_o_stride_N
-        + b * dst_o_stride_B
-        + h_local * dst_o_stride_H
-    )
+    for chunk in tl.static_range(HEAD_CHUNKS):
+        hh = chunk * HEADS_PER_CHUNK + lane
+        hmask = hh < H_PER_RANK
+        h = peer * H_PER_RANK + hh
+        mask = hmask[:, None] & wmask[None, :]
 
-    for start in tl.range(0, WORDS, BLOCK):
-        offs = start + tl.arange(0, BLOCK)
-        mask = offs < WORDS
-        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+        src = out_ptr + b * out_stride_B + h[:, None] * out_stride_H + ww[None, :]
+        dst = (
+            dst_o_ptr
+            + peer * dst_o_stride_N
+            + b * dst_o_stride_B
+            + hh[:, None] * dst_o_stride_H
+            + ww[None, :]
+        )
+        tl.store(dst, tl.load(src, mask=mask), mask=mask)
 
-    tl.store(
-        dst_lse_ptr
-        + peer * dst_lse_stride_N
-        + b * dst_lse_stride_B
-        + h_local * dst_lse_stride_H,
-        tl.load(lse_ptr + b * lse_stride_B + h * lse_stride_H),
-    )
+        lv = tl.load(lse_ptr + b * lse_stride_B + h * lse_stride_H, mask=hmask)
+        tl.store(
+            dst_lse_ptr
+            + peer * dst_lse_stride_N
+            + b * dst_lse_stride_B
+            + hh * dst_lse_stride_H,
+            lv,
+            mask=hmask,
+        )
 
 
 def dcp_pack_a2a_send(
@@ -517,7 +532,12 @@ def dcp_pack_a2a_send(
     dst_o_words = dst_o.view(torch.float32)
     words = D // lpd
 
-    _dcp_pack_a2a_send_kernel[(B, H)](
+    # Cap one program's tile at 4096 words so large H_per_rank (fewer ranks)
+    # stays register-resident; H_per_rank<=16 (K3 TP8/DCP8) is a single chunk.
+    # Both factors are powers of two because tl.arange requires it.
+    words_pad = triton.next_power_of_2(words)
+    heads_per_chunk = min(triton.next_power_of_2(H_per_rank), max(1, 4096 // words_pad))
+    _dcp_pack_a2a_send_kernel[(B, N)](
         out_words,
         cp_attn_lse,
         dst_o_words,
@@ -533,8 +553,11 @@ def dcp_pack_a2a_send(
         dst_lse.stride(1),
         dst_lse.stride(2),
         H_PER_RANK=H_per_rank,
+        HEADS_PER_CHUNK=heads_per_chunk,
+        HEAD_CHUNKS=(H_per_rank + heads_per_chunk - 1) // heads_per_chunk,
         WORDS=words,
-        BLOCK=min(1024, triton.next_power_of_2(words)),
+        WORDS_PAD=words_pad,
+        num_warps=8,
     )
 
 
