@@ -14,6 +14,7 @@ from sglang_simulator.simulation.sglang.dspark import (
     _DECODE_PHASES,
     _PREFILL_PHASES,
     DSparkPhaseCost,
+    DSparkStep,
     DSparkStepTiming,
 )
 from sglang_simulator.time_predictor.base import PredictorError
@@ -125,6 +126,12 @@ class SimOpusNativeCostAdapter:
                 "metrics CPU detail off requires public SDK factory initialization",
             )
         self._numeric_forward = _numeric_forward
+        self._runtime_profile_json = assets.runtime_profile_json
+        self._runtime_profile_sha256 = hashlib.sha256(
+            self._runtime_profile_json.encode()
+        ).hexdigest()
+        self._prepared_step = None
+        self._prepared_inputs = None
         self._last_metrics_phases = []
         self._requested_sink_path = (
             str(Path(cost_evidence_path).absolute())
@@ -179,9 +186,14 @@ class SimOpusNativeCostAdapter:
                 "invalid_execution_profile",
                 "native ordered requests, sampling, mode or runtime changed",
             )
+        profile = (
+            {"runtime_profile_sha256": self._runtime_profile_sha256}
+            if self._omit_cpu_detail
+            else {"runtime_profile_json": runtime_profile_json}
+        )
         return {
             "native_region_stage_inputs": {
-                "runtime_profile_json": runtime_profile_json,
+                **profile,
                 "normalized_sampling": [
                     json.loads(r.sampling_params_json) for r in group.requests
                 ],
@@ -203,9 +215,8 @@ class SimOpusNativeCostAdapter:
             }
         }
 
-    def query_phase(self, phase, step):
-        from simopus.sdk import ExtendRequestShape, PredictionResult
-        from simopus.sdk.perf_database.database import PerfDataNotAvailableError
+    def _phase_inputs(self, phase, step):
+        from simopus.sdk import ExtendRequestShape
 
         if (
             step.topology.tp_size != self.native_source_policy.tp_size
@@ -213,7 +224,7 @@ class SimOpusNativeCostAdapter:
             or step.topology.attention_dp_size != 1
             or step.topology.pp_size != 1
             or len(step.groups) != 1
-            or step.runtime_profile_json != self.assets.runtime_profile_json
+            or step.runtime_profile_json != self._runtime_profile_json
             or phase not in step.required_phases
         ):
             raise PredictorError(
@@ -221,32 +232,60 @@ class SimOpusNativeCostAdapter:
             )
         group = step.groups[0]
         mode = "EXTEND" if group.forward_mode == "EXTEND" else "DECODE"
+        # Only the public numeric model accepts this cache. A step and all its
+        # groups/requests are immutable, and at most the current step is held.
+        if (
+            self._omit_cpu_detail
+            and type(step) is DSparkStep
+            and self._prepared_step is step
+        ):
+            return mode, *self._prepared_inputs
+        inputs = json.loads(group.execution_json)["native_region_stage_inputs"]
+        if self._omit_cpu_detail and "runtime_profile_sha256" in inputs:
+            inputs = dict(inputs)
+            if "runtime_profile_json" in inputs:
+                raise ValueError("stage declares both full and compact runtime profile")
+            if inputs.pop("runtime_profile_sha256") != self._runtime_profile_sha256:
+                raise ValueError("stage runtime profile identity differs")
+            inputs["runtime_profile_json"] = self._runtime_profile_json
+        if (
+            set(inputs)
+            != {
+                "runtime_profile_json",
+                "normalized_sampling",
+                "request_metadata",
+                "seq_lens_cpu",
+                "nxt_kv_lens_cpu",
+                "buffer_capacity",
+                "buffer_device_matches",
+            }
+            or inputs["runtime_profile_json"] != step.runtime_profile_json
+            or inputs["normalized_sampling"]
+            != [json.loads(r.sampling_params_json) for r in group.requests]
+        ):
+            raise ValueError("stage runtime differs from before-work step")
+        requests = tuple(
+            ExtendRequestShape(prefix_len=r.target_prefix_len, extend_len=r.extend_len)
+            for r in group.requests
+        )
+        # Restore the verified immutable instance instead of a fresh 600-KiB
+        # string from JSON. SDK-owned profile validation/cache remains intact.
+        inputs["runtime_profile_json"] = self._runtime_profile_json
+        if self._omit_cpu_detail and type(step) is DSparkStep:
+            self._prepared_step = step
+            self._prepared_inputs = inputs, requests
+        return mode, inputs, requests
+
+    def query_phase(self, phase, step):
+        from simopus.sdk import PredictionResult
+        from simopus.sdk.perf_database.database import PerfDataNotAvailableError
+
         try:
-            inputs = json.loads(group.execution_json)["native_region_stage_inputs"]
-            if (
-                set(inputs)
-                != {
-                    "runtime_profile_json",
-                    "normalized_sampling",
-                    "request_metadata",
-                    "seq_lens_cpu",
-                    "nxt_kv_lens_cpu",
-                    "buffer_capacity",
-                    "buffer_device_matches",
-                }
-                or inputs["runtime_profile_json"] != step.runtime_profile_json
-                or inputs["normalized_sampling"]
-                != [json.loads(r.sampling_params_json) for r in group.requests]
-            ):
-                raise ValueError("stage runtime differs from before-work step")
+            mode, inputs, requests = self._phase_inputs(phase, step)
+            group = step.groups[0]
             arguments = {
                 "forward_mode": mode,
-                "requests": tuple(
-                    ExtendRequestShape(
-                        prefix_len=r.target_prefix_len, extend_len=r.extend_len
-                    )
-                    for r in group.requests
-                ),
+                "requests": requests,
                 "execution_profile": self.assets.capture_profile,
                 "runtime": {"native_region_stage": {"phase": phase, **inputs}},
             }

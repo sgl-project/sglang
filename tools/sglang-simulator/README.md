@@ -471,6 +471,16 @@ Prediction, request progress, scheduling, and validation of each SDK result
 still run normally. Client-side raw request/response and protocol recording
 are controlled separately by the selected client configuration.
 
+To also avoid constructing verbose CPU evidence, set
+`SGLANG_SIMULATOR_METRICS_CPU_DETAIL=off` together with metrics retention. Its
+default is `on`. The native public-SDK adapter then uses the same family-prepared
+numeric cost API and preserves phase costs and causal progress. It passes the
+initialization-verified runtime profile by digest inside each step, restores the
+exact original profile at the SDK boundary, and parses only the current immutable
+step once. Detailed query records, source classifications and full cost digests
+are unavailable in this mode; it is intended for final-metric runs rather than
+per-stage audits. Token-event and retirement recording remain separately opt-in.
+
 Select the retention level before starting a new process. Record it in the run
 identity and provision storage for the artifacts actually requested. Do not
 change a running process's policy or delete its originals to adopt a new mode.

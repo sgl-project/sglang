@@ -19,8 +19,12 @@ from sglang_simulator.simulation.sglang.dspark import (
 from sglang_simulator.time_predictor.base import PredictorError
 from sglang_simulator.time_predictor.simopus_native import SimOpusNativeCostAdapter
 from sglang_simulator.utils.evidence import metrics_cpu_detail_enabled
-from test_native_public_sdk import leaves as leaves
-from test_native_public_sdk import public_adapter as public_adapter
+from test_native_public_sdk import (
+    leaves as leaves,  # noqa: PLC0414 -- pytest fixture export
+)
+from test_native_public_sdk import (
+    public_adapter as public_adapter,  # noqa: PLC0414 -- pytest fixture export
+)
 from test_native_public_sdk import step_for
 
 
@@ -202,6 +206,93 @@ def test_numeric_late_failure_does_not_draw_progress_or_commit(
     assert not draws and session._history == history and session._last_forward_id == -1
     with pytest.raises(PredictorError, match="coverage is incomplete"):
         adapter.evaluated_evidence_for(step)
+
+
+def compact_step(adapter, step):
+    """The compact transport refers only to this factory's verified profile."""
+    group = step.groups[0]
+    value = json.loads(group.execution_json)
+    inputs = value["native_region_stage_inputs"]
+    inputs.pop("runtime_profile_json")
+    inputs["runtime_profile_sha256"] = adapter._runtime_profile_sha256
+    return replace(
+        step,
+        groups=(
+            replace(
+                group,
+                execution_json=json.dumps(value, sort_keys=True, separators=(",", ":")),
+            ),
+        ),
+    )
+
+
+def test_execution_resolver_emits_compact_profile_only_for_numeric_mode(
+    public_adapter, leaves, monkeypatch
+):
+    full, _, _ = public_adapter
+    original = step_for(full)
+    adapter = numeric_adapter(public_adapter, monkeypatch)
+    compact = step_for(adapter)
+    inputs = json.loads(compact.groups[0].execution_json)["native_region_stage_inputs"]
+    assert inputs["runtime_profile_sha256"] == adapter._runtime_profile_sha256
+    assert "runtime_profile_json" not in inputs
+    assert (
+        adapter.predict_step(compact).seconds.hex()
+        == full.predict_step(original).seconds.hex()
+    )
+
+
+@pytest.mark.parametrize("mode", ["EXTEND", "DECODE"])
+def test_compact_profile_preserves_every_phase_and_current_step_only(
+    public_adapter, leaves, monkeypatch, mode
+):
+    full, _, _ = public_adapter
+    original = step_for(full, mode)
+    expected = full.predict_step(original)
+    adapter = numeric_adapter(public_adapter, monkeypatch)
+    step = compact_step(adapter, original)
+    actual = adapter.predict_step(step)
+    assert [p.seconds.hex() for p in actual.phases] == [
+        p.seconds.hex() for p in expected.phases
+    ]
+    assert adapter._prepared_step is step
+    assert (
+        adapter._prepared_inputs[0]["runtime_profile_json"]
+        is adapter._runtime_profile_json
+    )
+    following = replace(step, forward_id=step.forward_id + 1)
+    adapter.predict_step(following)
+    assert adapter._prepared_step is following
+    assert len(adapter._prepared_inputs) == 2
+
+
+@pytest.mark.parametrize("mutation", ["digest", "both", "extra"])
+def test_compact_profile_rejects_changed_or_ambiguous_inputs(
+    public_adapter, monkeypatch, mutation
+):
+    full, _, _ = public_adapter
+    adapter = numeric_adapter(public_adapter, monkeypatch)
+    step = compact_step(adapter, step_for(full))
+    value = json.loads(step.groups[0].execution_json)
+    inputs = value["native_region_stage_inputs"]
+    if mutation == "digest":
+        inputs["runtime_profile_sha256"] = "0" * 64
+    elif mutation == "both":
+        inputs["runtime_profile_json"] = adapter._runtime_profile_json
+    else:
+        inputs["unknown"] = True
+    changed = replace(
+        step,
+        groups=(
+            replace(
+                step.groups[0],
+                execution_json=json.dumps(value, sort_keys=True, separators=(",", ":")),
+            ),
+        ),
+    )
+    with pytest.raises(PredictorError, match="prepared stage refused"):
+        adapter.predict_step(changed)
+    assert adapter._prepared_step is None
 
 
 @pytest.mark.parametrize("mode", ["full", "metrics", "off"])
