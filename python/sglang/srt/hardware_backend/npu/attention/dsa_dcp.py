@@ -23,8 +23,8 @@ def forward_dcp_sparse_attention(
     forward_batch: ForwardBatch,
     speculative_num_draft_tokens: int | None,
     scaling: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute one rank's sparse partial attention and natural-log LSE."""
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Compute sparse partial attention and return its local softmax stats."""
 
     is_target_verify = forward_batch.forward_mode.is_target_verify()
     if is_target_verify:
@@ -80,5 +80,66 @@ def forward_dcp_sparse_attention(
         attention_mode=2,
         return_softmax_lse=True,
     )
-    lse = softmax_max.float() + torch.log(softmax_sum.float())
-    return attn_out, lse.permute(1, 0, 2).reshape(lse.shape[1], -1)
+    return attn_out, (softmax_max, softmax_sum)
+
+
+def pinned_dcp_verify_lens(
+    total_kv_lens: torch.Tensor,
+    query_len: int,
+    dcp_size: int,
+    dcp_rank: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Build request-major local KV frontiers directly in pinned CPU memory."""
+    cycle = dcp_size * page_size
+    rank_offset = dcp_rank * page_size
+    values = []
+    for length in total_kv_lens.tolist():
+        if length < query_len:
+            values.extend([0] * query_len)
+            continue
+        for frontier in range(length - query_len + 1, length + 1):
+            whole, tail = divmod(frontier, cycle)
+            values.append(
+                whole * page_size + min(page_size, max(0, tail - rank_offset))
+            )
+    return torch.tensor(values, dtype=torch.int32, pin_memory=True)
+
+
+def try_write_dcp_verify_page_tables(
+    slots: torch.Tensor,
+    requests: torch.Tensor,
+    ordinary: torch.Tensor,
+    local: torch.Tensor | None,
+    active_pages: int,
+    query_len: int,
+    page_size: int,
+    dcp_size: int,
+) -> bool:
+    """Fill both captured page tables when the native kernel is available."""
+    # Enable the validated GLM-5.2 Verify shape first.
+    if (dcp_size, page_size, query_len) != (4, 128, 4):
+        return False
+    op = getattr(torch.ops.npu, "sgl_dcp_verify_page_tables", None)
+    if (
+        op is None
+        or local is None
+        or slots.device.type != "npu"
+        or slots.device != requests.device
+        or slots.device != ordinary.device
+        or slots.device != local.device
+        or slots.dtype != torch.int32
+        or ordinary.dtype != torch.int32
+        or local.dtype != torch.int32
+        or requests.dtype not in (torch.int32, torch.int64)
+        or not all(t.is_contiguous() for t in (slots, requests, ordinary, local))
+        or ordinary.size(0) != requests.numel()
+        or local.size(0) != requests.numel() * query_len
+        or not 0
+        <= active_pages
+        <= min(ordinary.size(1), (slots.size(1) + page_size - 1) // page_size)
+        or (active_pages + dcp_size - 1) // dcp_size > local.size(1)
+    ):
+        return False
+    op(slots, requests, ordinary, local, active_pages, query_len, page_size, dcp_size)
+    return True
