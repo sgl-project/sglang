@@ -259,6 +259,9 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         cache_actions: &mut CacheActions,
     ) {
         let ct = FULL;
+        if tracker[&ct] >= num_tokens {
+            return;
+        }
         let arena = &tree_core.arena;
         let strategy = &tree_core.eviction_strategy;
         let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = tree_core

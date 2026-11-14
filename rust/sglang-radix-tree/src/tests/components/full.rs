@@ -728,6 +728,17 @@ fn host_drive_reclaims_coexisting_host_values_while_sparing_the_device_leaf() {
         tc.finish_write_through(vec![handle], handle).unwrap();
     }
     assert!(tc.evictable_host_leaves.is_empty());
+    let host_only = tc
+        .insert_host(
+            tc.arena.node(tc.arena.root()).id,
+            None,
+            vec![9],
+            Tensor::from_slice(&[90i64]),
+            vec!["09".repeat(32)],
+        )
+        .unwrap()
+        .inserted_host_node
+        .unwrap();
 
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
@@ -741,6 +752,9 @@ fn host_drive_reclaims_coexisting_host_values_while_sparing_the_device_leaf() {
     assert!(tc.arena.node(parent).has_device_value(FULL));
     assert!(tc.arena.node(leaf).has_host_value(FULL));
     assert_ne!(tc.write_back_coexist_reclaim_digest, 0);
+    let host_only = tc.arena.resolve(host_only).unwrap();
+    assert!(tc.evictable_host_leaves.contains(host_only));
+    assert_eq!(hf[&FULL][0].numel(), 2);
     tc.sanity_check(&[], &[]);
 }
 
