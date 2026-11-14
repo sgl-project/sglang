@@ -399,6 +399,7 @@ export const Qwen35Deployment = () => {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     } else if (hardware === 'arc_b') {
       cmd += ` \\\n  --device xpu`;
+      cmd += ` \\\n  --attention-backend intel_xpu`;
       cmd += ` \\\n  --linear-attn-backend intel_xpu`;
     }
     if (tpValue > 1) {

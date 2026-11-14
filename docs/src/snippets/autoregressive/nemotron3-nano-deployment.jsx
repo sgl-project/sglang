@@ -79,6 +79,7 @@ export const Nemotron3NanoDeployment = () => {
 
     if (hardware === 'arc_b') {
       cmd += `  --device xpu \\\n`;
+      cmd += `  --attention-backend intel_xpu \\\n`;
     }
 
     // Add thinking parser and tool call parser if enabled

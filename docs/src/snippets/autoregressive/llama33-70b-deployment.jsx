@@ -100,6 +100,7 @@ export const Llama33Deployment = () => {
       cmd += `  --tp 6`;
     } else if (hardware === 'arc_b') {
       cmd += `  --device xpu \\\n`;
+      cmd += `  --attention-backend intel_xpu \\\n`;
       cmd += `  --tp 8`;
     } else {
       cmd += `  --tp 1`;

@@ -44,6 +44,7 @@ export const DeepSeekOCR2Deployment = () => {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule \\\n  --trust-remote-code`;
     } else if (hardware === 'arc_b') {
       cmd += ` \\\n  --device xpu`;
+      cmd += ` \\\n  --attention-backend intel_xpu`;
     }
     cmd += ` \\\n  --enable-multimodal`;
 

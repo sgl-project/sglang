@@ -14,7 +14,9 @@ export const config = {
   // TTFT/TPOT were recorded as Mean (no percentile restated in the source runs).
   latencyPercentile: "Mean",
 
-  supportedHardware: ["h100", "h200", "b200"],
+  supportedHardware: ["h100", "h200", "b200", "arc_b"],
+  hardware: [{ id: "arc_b", label: "BMG", vram: "", vendor: "intel" }],
+  runModes: (selection) => selection.hw === "arc_b" ? ["python"] : ["python", "docker"],
 
   variants: [
     { id: "8b-a1b",   label: "8B-A1B",        subtitle: "8.3B MoE · reasoning" },
@@ -157,6 +159,27 @@ sgl-eval run aime25 \\
   },
 
   cells: [
+    ...[
+      { variant: "vl", mem: "--mem-fraction-static 0.8" },
+      { variant: "8b-a1b", mem: "--mem-fraction-static 0.8" },
+      { variant: "350m" },
+      { variant: "230m" },
+      { variant: "thinking" },
+      { variant: "jp" },
+      { variant: "instruct" },
+    ].map(({ variant, mem }) => ({
+      match: { hw: "arc_b", variant, quant: "bf16", strategy: "default", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model {{MODEL_NAME}}",
+        "--device xpu",
+        "--attention-backend intel_xpu",
+        ...(mem ? [mem] : []),
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    })),
     // ====================================================================
     // H100 (sm90) — default attention backend; parsers per variant
     // ====================================================================
