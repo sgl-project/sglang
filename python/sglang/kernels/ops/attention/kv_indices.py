@@ -176,6 +176,40 @@ def create_chunked_prefix_cache_kv_indices(
         )
 
 
+@triton.jit
+def create_chunked_prefix_cache_kv_indices_2d(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    chunk_start_idx_ptr,
+    chunk_seq_lens_ptr,
+    chunk_cu_seq_lens_ptr,
+    chunk_kv_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy one BLOCK_SIZE slice per (request, token block) program."""
+    pid = tl.program_id(axis=0)
+    blk = tl.program_id(axis=1)
+
+    chunk_seq_len = tl.load(chunk_seq_lens_ptr + pid).to(tl.int32)
+    if blk * BLOCK_SIZE >= chunk_seq_len:
+        return
+
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    output_start = tl.load(chunk_cu_seq_lens_ptr + pid)
+    chunk_start = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
+    offset = tl.arange(0, BLOCK_SIZE) + blk * BLOCK_SIZE
+    mask = offset < chunk_seq_len
+    data = tl.load(
+        req_to_token_ptr
+        + req_pool_index * req_to_token_ptr_stride
+        + chunk_start
+        + offset,
+        mask=mask,
+    )
+    tl.store(chunk_kv_indices_ptr + output_start + offset, data, mask=mask)
+
+
 def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
     num_page_per_block = _FLASHMLA_CREATE_KV_BLOCK_SIZE // page_size
     return num_page_per_block
