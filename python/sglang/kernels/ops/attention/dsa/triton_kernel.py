@@ -8,7 +8,6 @@ def _get_valid_kv_indices_kernel(
     page_table_ptr,  # [bs, topk]
     kv_indptr_ptr,  # [bs + 1]
     kv_indices_ptr,  # [bs * topk] output buffer
-    bs: tl.constexpr,
     topk: tl.constexpr,
 ):
     """
@@ -58,6 +57,5 @@ def get_valid_kv_indices(
         page_table_1,
         kv_indptr,
         kv_indices,
-        bs,
         topk,
     )
