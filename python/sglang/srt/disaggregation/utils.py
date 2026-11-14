@@ -1922,12 +1922,14 @@ def setup_state_kv_args(
     )
     # Per-token bytes of a hybrid DSA pool's index-K page: the fp8 keys of
     # every token, then their scales. A PD DCP relayout moves the two parts
-    # separately.
+    # separately; FP4 keys keep their exponents in other buffers, so they move
+    # only between peers of the same DCP size (page by page).
     if (
         kv_args.is_hybrid_mla_backend
         and StateType.DSA in kv_args.state_types
         and isinstance(owner_view, DSATokenToKVPool)
         and owner_view.index_kpool == 1
+        and not owner_view.index_k_fp4
     ):
         value_bytes = owner_view.index_head_dim
         scale_bytes = owner_view.index_head_dim // owner_view.quant_block_size * 4

@@ -23,9 +23,12 @@ from sglang.srt.layers.layer_boundary import ops
 from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
 from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
+from sglang.srt.layers.layer_boundary.residual import LayerResidualOps, attn_bank_hip
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 
 class AttnBank:
@@ -63,6 +66,8 @@ def _bank_rows(bank: AttnResidual, hidden_states) -> Optional[slice]:
     if rows == total:
         return None
     parallel = get_parallel()
+    if _is_hip and (shard := attn_bank_hip.stream_rows(rows, total, parallel)):
+        return shard
     if rows * parallel.attn_tp_size != total:
         raise RuntimeError(
             f"{rows} rows are neither the bank's {total} rows nor an "
@@ -100,6 +105,8 @@ class AttnBankState:
     # The bank stays on each rank's attention-TP slice across layers;
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
+    # K3's row-sharded FFN read on gfx950, or None.
+    ffn_row_shard: Optional[attn_bank_hip.RowShardRead] = None
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -132,6 +139,8 @@ class AttnBankState:
             score_norm=self.attn_score_norm,
             write=self.writes_block,
         )
+        if _is_hip and not self.reads_slices:
+            normed = attn_bank_hip.gather_stream_read(self.bank.require(), normed)
         return normed, None if self.writes_block else residual
 
     def update_and_read_ffn_input(self, contribution, residual, norm):
@@ -274,6 +283,8 @@ class _FfnReadout(_BankReadout):
     @property
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
         state = self.state
+        if state.ffn_row_shard is not None:
+            return (attn_bank_hip.row_sharded_ffn_read(state), *state.ffn_input_fusions)
         if not state.fuses_slice_collectives:
             return state.ffn_input_fusions
         reads = ReadoutFusion(
@@ -337,6 +348,8 @@ class AttnBankOutputRead:
         )
         if read is None:
             read = bank.forward(*read_args, self.norm, rows=rows)
+            if _is_hip and not self.reads_attn_tp_slices:
+                read, rows = attn_bank_hip.gather_stream_output(bank, read, rows)
             if rows is not None:
                 read = (self._gather(read[0]), read[1])
         normed, head = read

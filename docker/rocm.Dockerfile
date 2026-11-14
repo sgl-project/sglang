@@ -337,7 +337,9 @@ ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+# ROCm/aiter#7620 (unmerged): Kimi-K3.1 a8w4 MoE BM16 adaptive presort, which sgl-amd-mono#116 feeds;
+# the AITER clone below fetches the commit when no branch carries it yet.
+ENV AITER_COMMIT_DEFAULT="5405ee00264ee1591a5419b1f6651f0655e2b353"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -684,6 +686,7 @@ RUN pip uninstall -y aiter
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
+ && (git cat-file -e "${AITER_COMMIT}^{commit}" 2>/dev/null || git fetch --no-tags origin "${AITER_COMMIT}") \
  && git checkout -f ${AITER_COMMIT} \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
@@ -842,6 +845,16 @@ RUN cd sglang \
        else \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install $CONS -e "python[${all_extras}]"; \
        fi
+
+# Build against the installed ROCm torch; isolation would pull CUDA torch.
+# Bundle TreeCore so ranks cannot mix Rust/Python implementations and diverge on HiCache reclaim.
+RUN cd sglang/python \
+    && python -m pip --no-cache-dir install "setuptools-rust>=1.11" \
+    && sed -i -E 's/^rust-extensions = \["multimodal"\]$/rust-extensions = ["multimodal", "rust_tree_core"]/' pyproject.toml \
+    && SGLANG_BUILD_RUST_EXTS=rust_tree_core python setup.py build_rust --inplace \
+    && rm -rf ../rust/sglang-radix-tree/target \
+    && SGLANG_RUST_BUILD_MODE=never python -c "from sglang.srt.mem_cache.rust_tree_core import extension"
+ENV SGLANG_RUST_BUILD_MODE=never
 
 RUN python -m pip cache purge
 

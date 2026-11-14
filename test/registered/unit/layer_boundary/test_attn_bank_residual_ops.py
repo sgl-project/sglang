@@ -22,7 +22,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary import ops as comm_moves
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.ops import update_attn_tp_gather_output
-from sglang.srt.layers.layer_boundary.residual import attn_bank
+from sglang.srt.layers.layer_boundary.residual import attn_bank, attn_bank_hip
 from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
@@ -180,6 +180,13 @@ def _staged(
     )
     torch.testing.assert_close(head, contribution + residual, rtol=0, atol=0)
     return hidden
+
+
+class TestRowShard(CustomTestCase):
+    def test_shards_past_the_last_token_are_empty(self):
+        """9 tokens over 8 ranks: the last rank owns no real row; a negative count
+        would slice the wrong rows off the reduced shard."""
+        self.assertEqual(attn_bank_hip.row_shard(9, 8, 7), (14, 0))
 
 
 class TestAttnBankResidualOps(CustomTestCase):

@@ -56,6 +56,7 @@ def kda_prefill_gfx950(
     scale: float,
     track_state: torch.Tensor | None = None,
     track_chunk_idx: torch.Tensor | None = None,
+    path_seqs: int = 0,
 ) -> torch.Tensor:
     """Returns the output; ssm_states[cache_indices] is updated in place."""
     empty = q.new_empty(0, dtype=torch.float32)
@@ -74,7 +75,13 @@ def kda_prefill_gfx950(
         empty if track_state is None else track_state,
         empty.long() if track_chunk_idx is None else track_chunk_idx,
         scale,
+        path_seqs,
     )
 
 
-__all__ = ["kda_prefill_gfx950"]
+def ensure_loaded() -> None:
+    """Build or load the extension now, so the first call is not inside graph capture."""
+    _load()
+
+
+__all__ = ["ensure_loaded", "kda_prefill_gfx950"]

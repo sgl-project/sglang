@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,11 +13,13 @@ from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.linear.kda_backend_hip import kda_chain_verify_gfx950
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: the gfx950 product-rounding boundary must stay bit-exact.
-register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=52, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
 
@@ -180,13 +183,13 @@ def _run_reference(inp, B, T, H, HV, K, V, lower_bound, rings=None):
     return o, conv, win, ic
 
 
-def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
+def _fused_args(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
     conv = inp["conv_pool"].clone()
     ssm = inp["ssm"].clone()
     win = inp["win_pool"].clone()
     ic = inp["inter_ssm"].clone() if rings is None else None
 
-    o = fused_kda_conv_gating_verify(
+    return dict(
         mixed_qkv=inp["mixed"],
         conv_weight=inp["w"],
         conv_bias=inp["bias"],
@@ -215,7 +218,17 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
         replayssm_g=rings["g"] if rings is not None else None,
         replayssm_beta=rings["beta"] if rings is not None else None,
     )
-    return o, conv, win, ic
+
+
+def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
+    args = _fused_args(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings)
+    o = fused_kda_conv_gating_verify(**args)
+    return (
+        o,
+        args["conv_state"].transpose(-1, -2),
+        args["intermediate_conv_window"].transpose(-1, -2),
+        args["intermediate_states_buffer"],
+    )
 
 
 def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloat16):
@@ -308,6 +321,107 @@ def test_output_does_not_depend_on_cta_scheduling():
 @pytest.mark.parametrize("case", _RING_CASES)
 def test_replayssm_ring_matches_unfused(case):
     _compare_case(case, num_warps=4, use_ring=True)
+
+
+def _gfx950_case(slots, seed, H=12, T=8):
+    """Kimi-K3.1's TP8 KDA shard (12 heads) with the -5 gate bound and the ReplaySSM
+    ring: state at slots, conv window and outputs at batch rows."""
+    B = len(slots)
+    inp = _make_inputs(B, T, H, H, 128, 128, 4, False, False, seed, torch.float32)
+    inp["cache_indices"] = torch.tensor(slots, device=_DEVICE, dtype=torch.int32)
+    inp["win_pool"].normal_()  # untouched window rows must keep their sentinel values
+    rings = _make_ring_buffers(H, H, 128, 128)
+    args = _fused_args(inp, B, T, H, H, 128, 128, -5.0, None, rings)
+    del args["conv_bias"], args["conv_state_indices"]
+    return args
+
+
+def _gfx950_srt(args):
+    layer = SimpleNamespace(
+        bias=None,
+        conv_weights=args["conv_weight"],
+        **{
+            key: args[key]
+            for key in (
+                "A_log",
+                "dt_bias",
+                "num_q_heads",
+                "num_v_heads",
+                "head_k_dim",
+                "head_v_dim",
+                "lower_bound",
+            )
+        },
+    )
+    return kda_chain_verify_gfx950(
+        layer,
+        mixed_qkv=args["mixed_qkv"],
+        a=args["a"],
+        b=args["b"],
+        draft_token_num=args["T"],
+        conv_states=args["conv_state"].transpose(-1, -2),
+        conv_state_indices=args["cache_indices"],
+        ssm_states=args["ssm_states"],
+        intermediate_state_cache=args["intermediate_states_buffer"],
+        intermediate_conv_window_cache=args["intermediate_conv_window"].transpose(
+            -1, -2
+        ),
+        intermediate_state_indices=args["intermediate_state_indices"],
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
+        retrieve_parent_token=None,
+        ring_kwargs={
+            key: args[key]
+            for key in (
+                "cache_ring",
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_g",
+                "replayssm_beta",
+            )
+        },
+    )
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+@pytest.mark.parametrize(
+    "slots", [[5], [7, -1, 4, 0, 6, 1]], ids=["bv4-one-request", "bv8-padded-batch"]
+)
+def test_gfx950_srt_verify_matches_triton_chain_verify(slots):
+    """kda_chain_verify_gfx950 as the KDA backend calls it, against the Triton chain
+    verify: no slot equals its batch row, a -1 row writes nothing, and mixed_qkv
+    and b are views of the TP8 [q, k, v, g | f_a | b | pad] in-projection."""
+    ref, new = (_gfx950_case(slots, seed=11) for _ in range(2))
+    B, H, T = len(slots), new["num_q_heads"], new["T"]
+    sizes = [3 * H * 128, H * 128, 128, H]
+    sizes.append(-sum(sizes) % 8)  # the in-projection's rows pad to 6288 columns
+    front = torch.randn(B * T, sum(sizes), device=_DEVICE, dtype=torch.bfloat16)
+    mixed_qkv, _, _, b, _ = torch.split(front, sizes, dim=-1)
+    new["mixed_qkv"] = mixed_qkv.copy_(new["mixed_qkv"])
+    new["b"] = b.copy_(new["b"])
+    o_new = _gfx950_srt(new)
+    assert o_new is not None
+    o_ref = fused_kda_conv_gating_verify(
+        conv_bias=None, conv_state_indices=ref["cache_indices"], **ref
+    )
+    for name in (
+        "conv_state",
+        "intermediate_conv_window",
+        "ssm_states",
+        "replayssm_rawv",
+        "replayssm_beta",
+    ):
+        assert torch.equal(ref[name], new[name]), name
+    torch.testing.assert_close(
+        new["replayssm_rawk"], ref["replayssm_rawk"], rtol=8e-3, atol=1e-5
+    )
+    torch.testing.assert_close(
+        new["replayssm_g"], ref["replayssm_g"], rtol=1e-5, atol=1e-6
+    )
+    rows = (ref["cache_indices"] >= 0).repeat_interleave(T)
+    torch.testing.assert_close(
+        o_new[0][rows].float(), o_ref[0][rows].float(), rtol=2e-2, atol=2e-3
+    )
 
 
 if __name__ == "__main__":

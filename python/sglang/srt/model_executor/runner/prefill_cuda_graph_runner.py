@@ -52,9 +52,10 @@ import tqdm
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.configs.model_config import is_qwen4_exp
+from sglang.srt.configs.model_config import is_kimi_k31, is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.dsa import capture_slots_hip
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 from sglang.srt.layers.cp.bcg.bcg import (
@@ -177,7 +178,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
 
 if TYPE_CHECKING:
@@ -336,6 +337,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
+    _kimi_k31_rocm_bcg = False
     dllm_attention = None
 
     @property
@@ -344,6 +346,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
         # companion never runs there and any prefix goes through sparse MLA.
+        if self._kimi_k31_rocm_bcg:  # KDA + DSA: the hybrid backend wraps DSA
+            backend = self.model_runner.attn_backend.full_attn_backend
+            return isinstance(backend, DeepseekSparseAttnBackend)
         return isinstance(self.model_runner.attn_backend, DeepseekSparseAttnBackend)
 
     def __init__(self, model_runner: ModelRunner):
@@ -737,6 +742,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
+        if is_hip() and is_kimi_k31(model_runner.model_config.hf_config):
+            self._kimi_k31_rocm_bcg = True
+            # Kimi-K3.1's DSA layers never read that gather buffer.
+            self._dcp_extend_active = False
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -1650,6 +1659,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_start_locs = [0]
         for seq_len in capture_seq_lens[:-1]:
             capture_start_locs.append(capture_start_locs[-1] + seq_len)
+        if self._kimi_k31_rocm_bcg:
+            capture_slots_hip.fill_by_dcp_owner(self.model_runner, capture_seq_lens)
 
         with torch.device(self.device):
             shape_inputs = {

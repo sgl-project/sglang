@@ -455,6 +455,10 @@ class AttnResidual:
     One instance lives for one model forward pass.
     """
 
+    # ROCm: a read attn_residual_hip.gather_tail_read staged for the next
+    # forward() of its prefix (a StagedRead).
+    staged = None
+
     def __init__(
         self,
         hidden_states: torch.Tensor,
@@ -508,6 +512,12 @@ class AttnResidual:
                 "a read of every row after a write of this rank's slice of "
                 "them would aggregate stale snapshots"
             )
+        if is_hip() and self.staged is not None:
+            read = self.staged.take(
+                self, hidden_states, prefix_sum, score_proj, rows, write
+            )
+            if read is not None:
+                return read
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:

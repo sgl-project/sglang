@@ -86,7 +86,7 @@ from sglang.srt.mem_cache.layout.token_major import (
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
+from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
     ceil_align,
     cpu_has_amx_support,
@@ -4752,6 +4752,13 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id)
 
+    def get_index_k_fp4_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_index_k_fp4_buffers(layer_id)
+
     def get_broadcastable_index_k_with_scale_buffer(
         self, layer_id: int
     ) -> torch.Tensor:
@@ -5472,6 +5479,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
     # The fp8 index-K layout; __init__ sets the instance value.
     use_fp4_indexer = False
+    index_k_fp4 = False
 
     @staticmethod
     def index_bytes_per_token_for(
@@ -5577,6 +5585,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         assert len(self.skip_topk_layers) == layer_num
 
         physical_page_size = self.index_page_size
+        self.index_k_fp4 = get_exec().kernel.enable_dsa_fp4_indexer
+        if self.index_k_fp4:
+            from sglang.kernels.ops.attention.dsa.fp4_index_hip import check_pool
+
+            check_pool(dcp_replicated, index_kpool, physical_page_size)
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert physical_page_size % 16 == 0, (
@@ -5609,6 +5622,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self._finalize_allocation_log(size)
 
     def _create_index_key_cache(self) -> IndexKeyCache:
+        if self.index_k_fp4:
+            from sglang.srt.mem_cache.index_key_cache_hip import Fp4IndexKeyCache
+
+            return Fp4IndexKeyCache(self, self.index_buf_size)
         return IndexKeyCache(self, self.index_buf_size)
 
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
@@ -5651,12 +5668,21 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     self.index_key_cache.buffer[i] for i in index_buffer_layer_ids
                 ),
                 key_layout=(
-                    IndexKeyLayout.PAGED_FP4_KEYS_WITH_SCALES
+                    IndexKeyLayout.PAGED_FP4_KEYS
+                    if self.index_k_fp4
+                    else IndexKeyLayout.PAGED_FP4_KEYS_WITH_SCALES
                     if self.use_fp4_indexer
                     else IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
                 ),
             ),
         )
+        if self.index_k_fp4:
+            from sglang.kernels.ops.attention.dsa.fp4_index_hip import scale_pool_info
+
+            scales = [
+                self.index_key_cache.scale_buffer[i] for i in index_buffer_layer_ids
+            ]
+            return (*kv_infos, index_info, scale_pool_info(index_info, scales))
         return (*kv_infos, index_info)
 
     @property
@@ -5817,6 +5843,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_local_buffer(layer_id)
 
+    def get_index_k_fp4_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.index_key_cache.get_fp4_buffers(layer_id)
+
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -5927,6 +5958,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         kv_size_bytes = super().get_kv_size_bytes()
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if self.index_k_fp4:  # the FP4 keys' exponents
+            for scales in self.index_key_cache.scale_buffer:
+                kv_size_bytes += get_tensor_size_bytes(scales)
         return kv_size_bytes
 
 

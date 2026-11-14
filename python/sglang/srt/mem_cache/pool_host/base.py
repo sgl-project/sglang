@@ -229,6 +229,10 @@ def host_memory_budget_plain_hugetlb(
             else free_hugetlb_bytes
         )
     ranks = ranks_per_host()
+    if torch.version.hip:
+        from sglang.srt.mem_cache.pool_host.rocm_budget import clamp_plain_budget
+
+        return clamp_plain_budget(plain // ranks), pool // ranks
     return plain // ranks, pool // ranks
 
 

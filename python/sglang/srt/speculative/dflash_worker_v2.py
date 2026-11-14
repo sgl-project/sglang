@@ -154,6 +154,7 @@ _is_npu = is_npu()
 
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.speculative.dflash_mla_ctx import MlaContextKV
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -1053,7 +1054,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "Disable DFLASH draft cuda graph because dp attention "
                         "is enabled (draft runs eager)."
                     )
-            if is_cuda() and capture_decode_cuda_graph:
+            if (is_cuda() or is_hip()) and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
                     self.device,
@@ -1137,9 +1138,10 @@ class DFlashWorkerV2(BaseSpecWorker):
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Rehearse the non-greedy verify path so an undersized graph-pool
         borrow surfaces at startup rather than under traffic."""
+        # ROCm prewarms the sampler without graph-pool borrowing; KV is sized before capture.
         if (
             not self._hosts_draft
-            or not is_cuda()
+            or not (is_cuda() or is_hip())
             or not is_dflash_sampling_verify_available()
         ):
             return self.model_runner.prewarm_sampling()
@@ -2300,6 +2302,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         physical ids for a fused draft, the virtual ids for a private one."""
         return plan.write_ids(self.draft_model_runner.runner_ids, kind=kind)
 
+    def _mla_context_kv(self) -> Optional["MlaContextKV"]:
+        """The ROCm monokernel's stacked context-KV writer, or None."""
+        if "_mla_ctx" not in self.__dict__:
+            from sglang.kernels.ops.speculative.dflash_mla_ctx import MlaContextKV
+
+            self._mla_ctx = MlaContextKV.for_worker(self)
+        return self._mla_ctx
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -2462,6 +2472,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
+                if is_hip() and (ctx := self._mla_context_kv()) is not None:
+                    pool = self.draft_model_runner.token_to_kv_pool
+                    ctx.write(pool, positions, ctx_hidden, cache_loc_2d, commit_lens)
+                    return
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(

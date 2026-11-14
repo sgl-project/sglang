@@ -360,6 +360,7 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
             lilicorr=None,
             _use_fused_kv_materialize=False,
             _fused_kv_helper=None,
+            _mla_context_kv=lambda: None,
         )
         worker._append_target_hidden_sequential = lambda **kw: (
             DFlashWorkerV2._append_target_hidden_sequential(worker, **kw)

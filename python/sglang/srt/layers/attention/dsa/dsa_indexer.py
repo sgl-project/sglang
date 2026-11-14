@@ -173,6 +173,9 @@ if _is_xpu:
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
+    from sglang.kernels.ops.attention.dsa import fp4_index_hip
+    from sglang.srt.layers.attention.dsa import dsa_indexer_hip
+
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.base import get_cp_strategy
@@ -309,6 +312,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_MAX_BYTES_ROCM = MQA_LOGITS_MAX_BYTES_ROCM
     # Index-K bytes per token: 128 FP8 values and one FP32 scale.
     _HEAD_DIM_WITH_SF = 132
+    # ROCm (AITER) parts, set by dsa_indexer_hip.init_indexer_hip
+    _hist_topk = None
+    fp4_index_k = False
+    rocm_nope_prologue = None
     # One measured budget per device for the process lifetime.
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
@@ -434,7 +441,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if index_k_uses_rmsnorm:
             self.k_norm = RMSNorm(self.head_dim, **k_norm_eps_kwargs)
         else:
-            self.k_norm = LayerNorm(
+            k_norm_cls = LayerNorm
+            if _is_hip and getattr(config, "index_k_norm_fp32", False):
+                # Kimi-K3.1's fp32 index k_norm runs in one launch on gfx950
+                from sglang.srt.layers.attention.dsa.dsa_indexer_hip import (
+                    Fp32LayerNormHip as k_norm_cls,
+                )
+            self.k_norm = k_norm_cls(
                 self.head_dim,
                 dtype=(
                     torch.float32
@@ -617,6 +630,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     fp8_dtype=fp8_dtype,
                 )
 
+        if _use_aiter:
+            dsa_indexer_hip.init_indexer_hip(self, config)
+
         # After the gfx950 fused indexer's gate, which may turn the writer off.
         global _FUSED_FP8_WRITER_LOGGED
         if self.use_aiter_fused_fp8_writer and not _FUSED_FP8_WRITER_LOGGED:
@@ -653,6 +669,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def prepare_merged_k_gate(self) -> None:
         # Post-load, before graph capture: the bf16-head-gate decode reads x once
         # through [wk | weights_proj], whose weights become views of it.
+        if self.rocm_nope_prologue is not None:
+            self.rocm_nope_prologue.merge_k_gate(self)
+            return
         if not (
             _is_cuda
             and self.bf16_head_gate
@@ -1450,6 +1469,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
+        if self.fp4_index_k:
+            return dsa_indexer_hip.fp4_topk_paged(
+                self, forward_batch, layer_id, q_fp8, weights, metadata
+            )
 
         page_size = get_token_to_kv_pool().index_page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
@@ -1562,6 +1585,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
+        if self._hist_topk is not None and dcp_size == 1:
+            topk_result = dsa_indexer_hip.hist_topk_paged(
+                self, self._hist_topk, forward_batch, layer_id, q_fp8, weights,
+                seqlens_32, metadata,
+            )  # fmt: skip
+            if topk_result is not None:
+                return topk_result
+
         # Full batches need the newer DeepGEMM scheduler. Keep chunking as the
         # default for older libraries and for layouts outside the tested bound
         # (DeepGEMM 0.2.3 on GB300: up to 1024 requests x 8 query rows, logits
@@ -1616,7 +1647,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             return torch.cat(logits_chunks, dim=0)
 
-        if self.paged_mqa_logits_backend.is_aiter():
+        # verify_shares_index_k's 64-key pages imply AITER's preshuffled layout
+        if _use_aiter and dsa_indexer_hip.verify_shares_index_k(
+            forward_batch, q_fp8, block_tables, page_size, q_offset, B, next_n, dcp_size
+        ):
+            logits = dsa_indexer_hip.verify_paged_mqa_logits(
+                forward_batch, layer_id, q_fp8, kv_cache_fp8, weights, seqlens_32_2d,
+                block_tables, max_seq_len, q_offset, B, next_n, block_kv,
+            )  # fmt: skip
+        elif self.paged_mqa_logits_backend.is_aiter():
             if q_offset == 0:
                 # Aiter's SplitKV scheduling divides by the query count.
                 # An empty rank needs only invalid top-k indices, no kernels.
@@ -1633,7 +1672,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32,
+                # under DCP, block_tables cover only this rank's index-K shard
+                seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32,
                 block_tables,
                 max_seq_len,
                 preshuffle=_use_aiter_preshuffle,
@@ -1731,7 +1771,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Graph capture cannot sync the host; use the static guard and do not
         # cache it, so the first eager prefill still measures the real budget.
-        if get_is_capture_mode():
+        # ROCm breakable-graph replay keeps the capture mode on while this runs eagerly.
+        if (
+            torch.cuda.is_current_stream_capturing()
+            if _is_hip
+            else get_is_capture_mode()
+        ):
             return mqa_logits_static_budget_bytes(device_index=device_index)
 
         budget_bytes = mqa_logits_budget_bytes(
@@ -1809,7 +1854,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        if dsa_shards_index_k():
+        if self.fp4_index_k:
+            # MXFP4 keys of every DCP rank, staged into pages, in kv_fp8's place
+            kv_fp8 = dsa_indexer_hip.fp4_dcp_gather_index_k(
+                layer_id, metadata, block_tables, indexer_seq_lens_cpu
+            )
+        elif dsa_shards_index_k():
             k_fp8, k_scale = self._dcp_gather_index_k(
                 layer_id, metadata, block_tables, indexer_seq_lens_cpu
             )
@@ -1821,20 +1871,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 seq_len_sum,
                 max_seq_len,
             )
-        if _is_fp8_fnuz:
-            k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
-        else:
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+        if not self.fp4_index_k:
+            if _is_fp8_fnuz:
+                k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
+            else:
+                k_fp8 = k_fp8.view(torch.float8_e4m3fn)
 
-        k_scale = k_scale.view(torch.float32).squeeze(-1)
-        kv_fp8 = (k_fp8, k_scale)
+            k_scale = k_scale.view(torch.float32).squeeze(-1)
+            kv_fp8 = (k_fp8, k_scale)
         bf16_logits = use_bf16_indexer_logits()
 
         # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
-        k_offset = k_fp8.shape[0]
+        k_offset = kv_fp8.num_keys if self.fp4_index_k else k_fp8.shape[0]
         # Short contexts keep the dense path: with fewer than ~8 x topk keys the sampled filter keeps most keys
         # and loses to DeepGEMM logits + top-k (measured on B200 / B300).
         if (
@@ -1888,7 +1939,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if not need_chunk and not split and tp_split is None:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                if _is_hip:
+                if self.fp4_index_k:
+                    logits = fp4_index_hip.fp4_ragged_mqa_logits(
+                        q_fp8[:q_offset],
+                        weights[:q_offset],
+                        self.softmax_scale,
+                        kv_fp8,
+                        ks,
+                        ke,
+                    )
+                elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1960,7 +2020,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             end = min(start + max_rows, row_hi)
 
             with self._with_real_sm_count():
-                if _is_hip:
+                if self.fp4_index_k:
+                    logits_chunk = fp4_index_hip.fp4_ragged_mqa_logits(
+                        q_fp8[start:end],
+                        weights[start:end],
+                        self.softmax_scale,
+                        kv_fp8,
+                        ks[start:end],
+                        ke[start:end],
+                        dsa_indexer_hip.fp4_logits_plans(metadata),
+                    )
+                elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -2098,11 +2168,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # (attn-TP group, lo, hi, rows per rank), or None for the replicated path.
         # Every input here is identical on all ranks of the group (same batch and
         # mode), so all ranks take the same branch and the all-gather cannot diverge.
-        if not _is_cuda or self.tp_split_min_rows is None:
+        if not (_is_cuda or _is_hip) or self.tp_split_min_rows is None:
             return None
         if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
             return None
-        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+        # ROCm breakable-graph replay keeps the capture mode on while this runs eagerly.
+        if (get_is_capture_mode() and not _is_hip) or (
+            torch.cuda.is_current_stream_capturing()
+        ):
             return None
         group = get_parallel().attn_tp_group
         tp = group.world_size
@@ -2324,7 +2397,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
             return
 
-        assert dcp_size == 1, "DSA index-K writes under DCP need the CUDA fused store"
+        assert dcp_size == 1 or _use_aiter, (
+            "DSA index-K writes under DCP need the CUDA fused store"
+        )
 
         # Fast path: AITER fused quant + cache store
         # When _use_aiter_preshuffle is True we use the new MFMA 16x16 preshuffle
@@ -2332,10 +2407,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
+            if self.fp4_index_k:
+                dsa_indexer_hip.store_fp4_index_k(
+                    forward_batch, pool, layer_id, key, dcp_size, dcp_rank
+                )
+                return
             page_size = pool.index_page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
+            if dcp_size > 1:
+                out_loc = dsa_indexer_hip.dcp_local_store_loc(
+                    forward_batch, layer_id, out_loc, dcp_size, dcp_rank
+                )
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             indexer_k_quant_and_cache(
@@ -2515,6 +2599,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_fp8, weights = self._fused_q_prepare_and_store(
                 x, q_lora, positions, forward_batch, layer_id, act_quant
             )
+        elif self.rocm_nope_prologue is not None and self.rocm_nope_prologue.applies(
+            x, forward_batch, in_piecewise_or_breakable_cuda_graph, weights_proj_lora
+        ):
+            q_fp8, weights = self.rocm_nope_prologue.forward(
+                self, x, q_lora, forward_batch, layer_id, act_quant
+            )
         elif is_graph_dsa_split_op_surface(forward_batch):
             # Prefill under PCG/BCG (including CP): run the whole indexer
             # (q/k proj, head gate, k-cache store, topk) as a single eager split op
@@ -2554,6 +2644,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             return maybe_capture_indexer_topk(layer_id, result)
 
+        elif (
+            self.fp4_index_k
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            q_fp8, weights = dsa_indexer_hip.fp4_prefill(
+                self,
+                x,
+                q_lora,
+                positions,
+                enable_dual_stream,
+                forward_batch,
+                layer_id,
+                act_quant,
+            )
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)

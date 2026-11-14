@@ -79,6 +79,9 @@ from sglang.srt.utils import (
 from sglang.srt.utils.device import get_compiler_backend
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+if _is_hip:
+    from sglang.srt.models import dflash_hip
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -1284,6 +1287,8 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
+        if _is_hip and dflash_hip.projects_row_sharded(self, target_hidden):
+            return dflash_hip.project_row_sharded(self, target_hidden)
         projected = self.fc(target_hidden)
         if self.quantizable:
             projected = projected[0]

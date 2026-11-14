@@ -3,6 +3,7 @@
 # --- merged from sglang.kernels.ops.attention.dsa (RFC #29630 Phase 4) ---
 from .paged_mqa_logits import (
     aiter_paged_mqa_logits,
+    aiter_paged_mqa_logits_verify,
     cutedsl_paged_mqa_logits,
     deepgemm_paged_mqa_logits_native,
     deepgemm_paged_mqa_logits_split,
@@ -27,6 +28,7 @@ __all__ = [
     "CuteDSLPagedMQALogitsRunner",
     "pick_dsl_expand",
     "aiter_paged_mqa_logits",
+    "aiter_paged_mqa_logits_verify",
     "cutedsl_paged_mqa_logits",
     "deepgemm_paged_mqa_logits_native",
     "deepgemm_paged_mqa_logits_split",

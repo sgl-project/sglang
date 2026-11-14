@@ -118,7 +118,7 @@ fastokens = [
 
 # Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
 monokernels_hip = [
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@7113024f8b2e4612b891d330a525a9a7d57de371",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@b9f40eb562f449ce08c030df200f97c7ea716511",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD

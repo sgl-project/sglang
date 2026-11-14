@@ -13,14 +13,18 @@ from unittest.mock import Mock, patch
 import torch
 from transformers import Qwen3Config
 
+from sglang.srt.arg_groups.speculative_hook import (
+    _resolve_dflash_draft_attention_backend,
+)
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.models.dspark import DSparkDraftModel
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import override_platform, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import (
     dflash_draft_cell_size_per_token,
@@ -376,6 +380,36 @@ class TestDFlashMLA(CustomTestCase):
         self.assertIs(got_lens, commit_lens)
         for got, want in zip(rows, expected):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+class TestTritonDcpMlaDraft(CustomTestCase):
+    def test_rocm_without_aiter_refuses(self):
+        """Under --dcp-size > 1, ROCm's triton draft backend takes a sliding-window
+        MLA draft only where the ROCm MLA forward (SGLANG_USE_AITER) merges its
+        partials."""
+        draft_config = {
+            "num_hidden_layers": 2,
+            "dflash_config": {"attention_modes": ["mla"] * 2},
+            "layer_types": ["sliding_attention"] * 2,
+            "sliding_window": 256,
+        }
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="draft",
+            speculative_draft_attention_backend="triton",
+            dcp_size=8,
+        )
+        hook = "sglang.srt.arg_groups.speculative_hook"
+        with (
+            override_platform(is_hip=True),
+            envs.SGLANG_USE_AITER.override(False),
+            patch(f"{hook}.current_platform.is_out_of_tree", return_value=False),
+            patch(f"{hook}._load_draft_hf_config", return_value=draft_config),
+            self.assertRaisesRegex(ValueError, "only with SGLANG_USE_AITER=1"),
+        ):
+            _resolve_dflash_draft_attention_backend(args)
 
 
 if __name__ == "__main__":

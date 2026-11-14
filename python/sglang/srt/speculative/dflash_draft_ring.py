@@ -27,7 +27,6 @@ import numpy as np
 import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
-from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 from sglang.srt.runtime_context import get_parallel, get_spec
 
 
@@ -53,7 +52,11 @@ def draft_kv_ring_unsupported_reason(
         return "decode host KV buffering receives only SWA state"
     if enable_unified_memory:
         return "--enable-unified-memory places the draft KV in the target's pool"
-    if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    from sglang.srt.speculative.draft_worker_common import (
+        dflash_draft_reads_rows_by_position,
+    )
+
+    if not dflash_draft_reads_rows_by_position(draft_backend, dcp_size):
         return f"draft backend {draft_backend!r} has no window index path"
     if draft_window_size is not None:
         return "--speculative-draft-window-size keeps the compact draft table"

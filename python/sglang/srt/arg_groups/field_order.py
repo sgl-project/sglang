@@ -572,5 +572,6 @@ POSITIONAL_FIELD_ORDER = (
     "_max_running_requests_explicitly_set",
     # Kimi-K3.1 additions, appended to keep existing positional slots
     "enable_flashmla_prefill_token_packing",
+    "enable_dsa_fp4_indexer",
 )
 # fmt: on

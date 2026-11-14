@@ -906,6 +906,9 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Override --hicache-ratio for Mamba states in ratio mode: a cached KV prefix
+    # cannot be reused after its host state is evicted.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -1071,6 +1074,22 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # ROCm: 16..512-row triton_sparse_mla_fwd calls (target verify) run the HIP split-K kernel
+    SGLANG_ROCM_SPARSE_MLA_DECODE_HIP = EnvBool(True)
+    # Kimi-K3 gfx950 prefill: the MoE front on row shards, full shared experts (+264 MB a layer)
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT = EnvBool(False)
+    # The same front, shared experts TP-sharded (no extra memory); FRONT takes precedence
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
+    # Kimi-K3 gfx950 prefill: o_proj on row shards, full weight (+176 MB a layer), eager only
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ = EnvBool(False)
+    # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    # Kimi-K3 gfx950 TP8: the column-split latent-MoE tail's row cap (at most 384)
+    SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS = EnvInt(64)
+    # Use the gfx950 MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode.
+    SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE = EnvBool(True)
+    # GiB of ROCm memory kept out of torch's allocator for HSA queue scratch (0: none)
+    SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)

@@ -194,9 +194,9 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         if (
             cfg.disaggregation_mode != "null"
-            and cfg.disaggregation_transfer_backend != "mooncake"
+            and cfg.disaggregation_transfer_backend not in ("mooncake", "mori")
         ):
-            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
+            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake or MoRI.")
         if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
@@ -208,12 +208,17 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                     "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.speculative_algorithm == "DFLASH":
-            if cfg.speculative_draft_attention_backend not in (None, "cutedsl_mla"):
+            from sglang.srt.speculative.draft_worker_common import (
+                dflash_dcp_mla_draft_backend,
+            )
+
+            draft_backend = dflash_dcp_mla_draft_backend()
+            if cfg.speculative_draft_attention_backend not in (None, draft_backend):
                 raise ValueError(
                     "Kimi-K3.1 DCP + DFLASH needs "
-                    "--speculative-draft-attention-backend cutedsl_mla."
+                    f"--speculative-draft-attention-backend {draft_backend}."
                 )
-            overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
+            overrides["speculative_draft_attention_backend"] = draft_backend
         if cfg.speculative_algorithm is not None:
             # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
             # rank attends over its KV shard and the (o, lse) partials are merged.

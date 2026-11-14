@@ -939,7 +939,8 @@ class DeepseekSparseAttnBackend(
             assert not get_exec().features.enable_return_indexer_topk
             if not init_dcp_topk_merge(max_rows, self.dsa_index_topk):
                 init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
-            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get():
+            # ROCm's DCP top-k takes the fused top-k's place
+            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get() or _is_hip:
                 init_dcp_fused_topk(
                     max_rows,
                     self.dsa_index_topk,
@@ -1377,6 +1378,12 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
+        if _is_hip:
+            from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
+                dcp_gather_kv_cache,
+            )
+
+            return dcp_gather_kv_cache(self, kv_cache, forward_batch, metadata)
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
         gathered = dcp_gather_request_rows(
             rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
@@ -1712,6 +1719,17 @@ class DeepseekSparseAttnBackend(
             # require SPLIT_KV = 256; this is independent of the cache page size.
             paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
+            )
+        elif self.dsa_shards_index_k and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # ROCm: this rank's index-K lengths, without the DeepGEMM schedule
+            paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                forward_batch.forward_mode,
+                cache_seqlens_int32,
+                seqlens_expanded,
+                forward_batch.batch_size,
             )
 
         metadata = DSAMetadata(
@@ -2120,6 +2138,12 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
+        elif self.dsa_shards_index_k and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
+            paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                forward_mode, cache_seqlens_int32, seqlens_expanded, bs
+            )
 
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
@@ -2420,6 +2444,14 @@ class DeepseekSparseAttnBackend(
                     object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
                 else:
                     metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+        elif self.dsa_shards_index_k and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
+            metadata.paged_mqa_ctx_lens_2d.copy_(
+                self._build_paged_mqa_schedule_2d_ctx_lens(
+                    forward_mode, metadata.cache_seqlens_int32, seqlens_expanded, bs
+                )
+            )
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
@@ -2510,6 +2542,15 @@ class DeepseekSparseAttnBackend(
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+        elif self.dsa_shards_index_k:
+            metadata.paged_mqa_ctx_lens_2d.copy_(
+                self._build_paged_mqa_schedule_2d_ctx_lens(
+                    forward_mode,
+                    metadata.cache_seqlens_int32,
+                    metadata.dsa_seqlens_expanded,
+                    bs,
+                )
+            )
 
         self._update_kpool_metadata_from_precomputed(
             metadata, precomputed, forward_mode
@@ -2732,6 +2773,18 @@ class DeepseekSparseAttnBackend(
                     sm_scale=layer.scaling,
                     layer=layer,
                     topk_indices=shared_topk_indices,
+                )
+            # the dcp_partial of _forward_flashmla_kv on ROCm's sharded index-K
+            if (
+                self.dsa_shards_index_k
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
+                    forward_triton_dcp_partial,
+                )
+
+                return forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
                 )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
@@ -3110,6 +3163,14 @@ class DeepseekSparseAttnBackend(
                     sm_scale=layer.scaling,
                     layer=layer,
                     topk_indices=shared_topk_indices,
+                )
+            if self.dsa_shards_index_k:
+                from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
+                    forward_triton_dcp_partial,
+                )
+
+                return forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
                 )
             return self._forward_triton_decode(
                 q_nope=q_nope,
@@ -4059,6 +4120,7 @@ class DeepseekSparseAttnBackend(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend the owned slots of the global top-k; one query row per token."""
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            lse_base2_for_dcp_merge,
             triton_sparse_mla_decode_splitk,
         )
 
@@ -4088,9 +4150,9 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
             workspace=workspace,
             return_lse=True,
-            lengths=owned_counts,
+            topk_length=owned_counts,
         )
-        return out.view(rows, heads, v_head_dim), lse
+        return out.view(rows, heads, v_head_dim), lse_base2_for_dcp_merge(lse)
 
     def _forward_intel_xpu_sparse_decode(
         self,

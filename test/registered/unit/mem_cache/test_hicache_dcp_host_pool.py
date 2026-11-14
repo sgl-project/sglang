@@ -636,6 +636,7 @@ class TestDcpL3PoolCheck(CustomTestCase):
             (PoolName.KV, anchor),
             (PoolName.MAMBA, MambaPoolHost.__new__(MambaPoolHost)),
             (PoolName.INDEXER, _make_indexer_host(anchor)),
+            (PoolName.INDEXER_SCALE, _make_indexer_host(anchor)),
             (PoolName.DRAFT, _make_host_pool(1, dcp_size=2, layout="page_first")),
         ):
             with self.subTest(name=name, pool=type(pool).__name__):

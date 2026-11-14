@@ -691,7 +691,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = ceil_div(
             DSATokenToKVPool.index_bytes_per_token_for(
-                index_head_dim, get_exec().kernel.enable_fp4_indexer
+                index_head_dim,
+                get_exec().kernel.enable_fp4_indexer
+                or get_exec().kernel.enable_dsa_fp4_indexer,
             ),
             get_dsa_index_kpool(kvc.model_config.hf_config),
         )
