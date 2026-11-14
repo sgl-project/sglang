@@ -2341,7 +2341,11 @@ class FlashAttentionBackend(AttentionBackend):
             q_rope,
             k_rope,
             layer,
-            logical_batch_size=forward_batch.batch_size,
+            # DP padding can grow forward_batch.batch_size past the segments in
+            # metadata.cu_seqlens_q, which is what FA validates the descale against.
+            logical_batch_size=fa_descale_batch_size(
+                metadata.cu_seqlens_q, forward_batch.batch_size
+            ),
             kv_head_num=layer.tp_k_head_num,
             is_prefill=False,
             ver=ver,

@@ -18,10 +18,15 @@ attention metadata was already built.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.layers.attention.flashattention_backend import fa_descale_batch_size
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionBackend,
+    fa_descale_batch_size,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-large")
@@ -45,6 +50,8 @@ class TestFaDescaleBatchSize(unittest.TestCase):
             ([4, 4], 3),
             ([4, 4, 4], 4),
             ([1, 3, 2], 5),
+            # DP-padded draft decode: one query token per request, one padded row.
+            ([1] * 24, 25),
         ]:
             with self.subTest(segments=segments, batch_size=logical_batch_size):
                 cu_seqlens_q = _cu_seqlens_q_from_segments(segments)
@@ -81,6 +88,82 @@ class TestFaDescaleBatchSize(unittest.TestCase):
     def test_falls_back_when_cu_seqlens_q_is_absent(self):
         """Non-varlen paths keep the logical batch size."""
         self.assertEqual(fa_descale_batch_size(None, 7), 7)
+
+    def test_decode_passes_segment_sized_descales_to_fa(self):
+        """Exercise the decode call site, including DP padding and the fallback."""
+        for segments, logical_batch_size in [(24, 25), (24, 24), (None, 25)]:
+            with self.subTest(segments=segments, batch_size=logical_batch_size):
+                cu_seqlens_q = (
+                    _cu_seqlens_q_from_segments([1] * segments)
+                    if segments is not None
+                    else None
+                )
+                metadata = SimpleNamespace(
+                    local_attn_metadata=None,
+                    cu_seqlens_q=cu_seqlens_q,
+                    page_table=None,
+                    cache_seqlens_int32=None,
+                    max_seq_len_q=1,
+                    scheduler_metadata=None,
+                )
+                backend = SimpleNamespace(
+                    forward_metadata=metadata,
+                    local_attn_builder=None,
+                    has_local_attention=False,
+                    attention_chunk_size=None,
+                    topk=1,
+                    use_mla=False,
+                    kv_cache_dtype_str="fp8_e4m3",
+                    kv_cache_dtype=torch.float16,
+                    kv_cache_is_mxfp8=False,
+                    fa_impl_ver=3,
+                    _ver_for=Mock(return_value=3),
+                    fa4_casts_fp8_kv=False,
+                    use_sliding_window_kv_pool=False,
+                    is_prefill_aware_swa=False,
+                    _decode_uses_static_max_seqlen_k=False,
+                    decode_num_splits=1,
+                    num_splits=1,
+                    _mxfp8_sf_kwargs=Mock(return_value={}),
+                    get_paged_mha_kv_cache=Mock(return_value=(None, None)),
+                )
+                backend.prepare_paged_mha_query = lambda *args, **kwargs: (
+                    FlashAttentionBackend.prepare_paged_mha_query(
+                        backend, *args, **kwargs
+                    )
+                )
+                layer = SimpleNamespace(
+                    is_cross_attention=False,
+                    attn_type=None,
+                    sliding_window_size=None,
+                    tp_q_head_num=2,
+                    tp_k_head_num=2,
+                    head_dim=16,
+                    v_head_dim=16,
+                    scaling=1.0,
+                    logit_cap=0.0,
+                    k_scale=torch.tensor(0.5),
+                    v_scale=torch.tensor(0.25),
+                )
+                forward_batch = SimpleNamespace(
+                    batch_size=logical_batch_size, spec_info=object()
+                )
+                q = torch.zeros(logical_batch_size, 2, 16)
+                attention = Mock(return_value=q)
+                backend.flash_attn_with_kvcache = attention
+                FlashAttentionBackend.forward_decode(
+                    backend, q, None, None, layer, forward_batch, save_kv_cache=False
+                )
+                attention.assert_called_once()
+                kwargs = attention.call_args.kwargs
+                expected_batch_size = (
+                    segments if segments is not None else logical_batch_size
+                )
+                self.assertIs(kwargs["cu_seqlens_q"], cu_seqlens_q)
+                self.assertEqual(kwargs["k_descale"].shape, (expected_batch_size, 2))
+                self.assertEqual(kwargs["v_descale"].shape, (expected_batch_size, 2))
+                self.assertTrue(torch.all(kwargs["k_descale"] == layer.k_scale))
+                self.assertTrue(torch.all(kwargs["v_descale"] == layer.v_scale))
 
     def test_agrees_when_segments_match_batch_rows(self):
         """The uniform case is unchanged: one segment per batch row."""
