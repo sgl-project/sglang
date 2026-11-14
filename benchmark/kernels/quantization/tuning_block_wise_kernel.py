@@ -181,27 +181,35 @@ def get_configs_compute_bound():
 def benchmark_config(
     A, B, As, Bs, block_size, config, out_dtype=torch.float16, num_iters=10
 ):
+    """Return mean latency in microseconds, evicting L2 before each sample."""
+    if num_iters <= 0:
+        raise ValueError("num_iters must be positive")
+
     def run():
         w8a8_block_matmul(A, B, As, Bs, block_size, config, out_dtype)
 
     torch.get_device_module().synchronize()
-    # JIT complication & warmup
+    # JIT compilation & warmup
     for _ in range(5):
         run()
     torch.get_device_module().synchronize()
 
     start_event = torch.get_device_module().Event(enable_timing=True)
     end_event = torch.get_device_module().Event(enable_timing=True)
+    # Use the same backend-specific eviction buffer as triton.testing.do_bench.
+    driver = triton.runtime.driver.active
+    cache = driver.get_empty_cache_for_benchmark()
 
     latencies: List[float] = []
     for _ in range(num_iters):
         torch.get_device_module().synchronize()
+        driver.clear_cache(cache)
         start_event.record()
         run()
         end_event.record()
         end_event.synchronize()
         latencies.append(start_event.elapsed_time(end_event))
-    avg = sum(latencies) / (num_iters * 10) * 1000  # us
+    avg = sum(latencies) / num_iters * 1000
     return avg
 
 
