@@ -50,6 +50,8 @@ def sana_ln_modulate(
     x: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
+    *,
+    allow_eager: bool = False,
 ) -> torch.Tensor:
     """Single-kernel ``LN(x) * (1 + scale) + shift``, bit-exact vs eager.
 
@@ -58,12 +60,13 @@ def sana_ln_modulate(
     chain (bit-exactness depends on which LayerNorm kernel aten dispatches
     to); any mismatch disables the fast path permanently.
 
-    The fusion only engages in CUDA-graph contexts (stream capture, or the
+    The fusion defaults to CUDA-graph contexts (stream capture, or the
     non-default stream the breakable-CUDA-graph runner warms up and captures
     on, #33989), where replay pays no Python launch cost.  Sana's eager mode
     is CPU-launch bound and one Triton launch costs more Python than the
     whole aten chain it replaces (+14% forward wall), so default-stream
-    serving keeps the eager chain.
+    serving keeps the eager chain. SANA-Video opts into eager inference for
+    its larger activations.
 
     ``x`` reaches every site transposed (patch-embed / GLUMBConv permute
     layout); aten's LayerNorm contiguizes internally, and the fast path
@@ -71,13 +74,10 @@ def sana_ln_modulate(
     """
     global _SANA_LN_MOD_DISABLED
 
-    if _SANA_LN_MOD_DISABLED or torch.compiler.is_compiling() or not x.is_cuda:
+    if _SANA_LN_MOD_DISABLED or not _use_sana_bcg_fast_path(x, allow_eager=allow_eager):
         return _eager_ln_modulate(norm, x, scale, shift)
 
     capturing = torch.cuda.is_current_stream_capturing()
-    if not capturing and torch.cuda.current_stream() == torch.cuda.default_stream():
-        return _eager_ln_modulate(norm, x, scale, shift)
-
     sig = (
         x.shape,
         x.stride(),
@@ -117,10 +117,6 @@ def sana_ln_modulate(
                 _eager_ln_modulate(norm, x, scale, shift),
                 sig=sig,
                 logger=logger,
-                mismatch_msg=(
-                    "Sana fused LN+modulate fast path is not bit-exact against "
-                    "this platform's LayerNorm dispatch; falling back to eager"
-                ),
             )
             _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
             return result
@@ -199,10 +195,6 @@ def sana_conv_bias_silu(
         out,
         F.silu(raw + conv.bias[None, :, None, None]),
         logger=logger,
-        mismatch_msg=(
-            "Sana fused conv bias-SiLU path is not bit-exact on this "
-            "platform; falling back to eager"
-        ),
     )
 
 
@@ -240,10 +232,6 @@ def sana_conv_bias_glu(
         out,
         hidden_states * F.silu(gate),
         logger=logger,
-        mismatch_msg=(
-            "Sana fused conv bias-GLU path is not bit-exact on this "
-            "platform; falling back to eager"
-        ),
     )
 
 
@@ -623,6 +611,9 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             encoder_attention_mask = encoder_attention_mask.expand(
                 batch_size, -1
             ).contiguous()
+        if encoder_attention_mask is not None:
+            # every block's cross-attention reads the mask as bool: cast it once
+            encoder_attention_mask = encoder_attention_mask.bool()
 
         for block in self.transformer_blocks:
             hidden_states = block(

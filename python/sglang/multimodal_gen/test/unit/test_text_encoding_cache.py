@@ -15,7 +15,11 @@ from transformers import BatchEncoding
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.configs.pipeline_configs.moss_image import (
+    MOSSImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
+from sglang.multimodal_gen.configs.sample.moss_image import MOSSImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.cache import conditioning
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
@@ -32,6 +36,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentOffloadStrategy,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.schedulers.moss_image import (
+    MOSSImageScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
     SyncExecutor,
 )
@@ -49,6 +56,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ming_image import (
     MingImageEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.moss_image import (
+    MOSSImageBeforeDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
@@ -245,11 +255,17 @@ def make_group_executor(
     encoder = (
         (FullHiddenStateEncoder() if native else LibraryEncoder()).to(device).eval()
     )
-    config = make_text_config()
+    config = (
+        MOSSImagePipelineConfig()
+        if stage_type is MOSSImageBeforeDenoisingStage
+        else make_text_config()
+    )
     config.supports_auto_residency = False
     config.vae_config = SimpleNamespace(use_temporal_scaling_frames=False)
     config.dit_config = SimpleNamespace(
-        arch_config=SimpleNamespace(num_frames_per_block=1)
+        arch_config=SimpleNamespace(
+            num_frames_per_block=1, num_layers=42, latent_channels=128
+        )
     )
     args = make_server_args(
         pipeline_config=config,
@@ -262,11 +278,15 @@ def make_group_executor(
         should_cpu_offload_component=lambda _: False,
     )
     with patch(_GLOBAL_ARGS_PATCH, return_value=args):
-        stage = stage_type(
-            [encoder], [tokenizer if tokenizer is not None else object()]
-        )
+        if stage_type is MOSSImageBeforeDenoisingStage:
+            stage = stage_type(encoder, tokenizer, MOSSImageScheduler())
+        else:
+            stage = stage_type(
+                [encoder], [tokenizer if tokenizer is not None else object()]
+            )
     stage._text_encode_dp_group = Mock(return_value=None)
-    stage.encode_text = partial(stage.encode_text, device=device)
+    if stage_type is not MOSSImageBeforeDenoisingStage:
+        stage.encode_text = partial(stage.encode_text, device=device)
     pipeline = SimpleNamespace(
         modules={"text_encoder": encoder},
         _stage_name_mapping={"text": stage},
@@ -504,7 +524,12 @@ def test_grouped_longlive_conditioning_keeps_per_request_shot_metadata():
 
 @pytest.mark.parametrize("fsdp", [False, True])
 @pytest.mark.parametrize(
-    "stage_type", [MingImageEncodingStage, LingBotVideoTextEncodingStage]
+    "stage_type",
+    [
+        MingImageEncodingStage,
+        LingBotVideoTextEncodingStage,
+        MOSSImageBeforeDenoisingStage,
+    ],
 )
 @torch.no_grad()
 def test_custom_text_stages_preserve_group_reuse_and_request_metadata(fsdp, stage_type):
@@ -533,6 +558,17 @@ def test_custom_text_stages_preserve_group_reuse_and_request_metadata(fsdp, stag
 
         tokenizer.side_effect = tokenize
 
+    if stage_type is MOSSImageBeforeDenoisingStage:
+        tokenizer.apply_chat_template.side_effect = lambda messages, **kwargs: messages[
+            0
+        ]["content"]
+        tokenizer.side_effect = lambda text, **kwargs: BatchEncoding(
+            {
+                "input_ids": torch.tensor([[len(text), 2]]),
+                "attention_mask": torch.ones(1, 2, dtype=torch.long),
+            }
+        )
+
     with patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
         "ming_image.Qwen2VLImageProcessorPil.from_pretrained"
@@ -543,14 +579,26 @@ def test_custom_text_stages_preserve_group_reuse_and_request_metadata(fsdp, stag
     encoder.dtype = torch.bfloat16
     encoder.config = SimpleNamespace(projection_config={"img_gen_scales": [1]})
     encoder.image_token = 99
+    args.pipeline_config.dit_config.arch_config.num_layers = 42
+    args.pipeline_config.dit_config.arch_config.in_channels = 128
     args.pipeline_config.dit_config.arch_config.alignment_padding_mode = "zero_masked"
     args.pipeline_config.dit_config.arch_config.multi_frame_output = False
 
     def requests():
         return [
             Req(
-                sampling_params=SamplingParams(
-                    prompt=prompt, negative_prompt="", height=64, width=64
+                sampling_params=(
+                    MOSSImageSamplingParams
+                    if stage_type is MOSSImageBeforeDenoisingStage
+                    else SamplingParams
+                )(
+                    prompt=prompt,
+                    negative_prompt="",
+                    height=64,
+                    width=64,
+                    generator_device="cpu",
+                    guidance_scale=1.0,
+                    flow_shift=3.0,
                 ),
                 do_classifier_free_guidance=False,
             )
@@ -564,7 +612,12 @@ def test_custom_text_stages_preserve_group_reuse_and_request_metadata(fsdp, stag
         for run in range(2):
             outputs = executor.execute_group([stage], requests(), args)
             assert encoder.calls == 2 * (run + 1)
-            assert outputs[0].prompt_embeds[0] is outputs[2].prompt_embeds[0]
+            torch.testing.assert_close(
+                outputs[0].prompt_embeds[0], outputs[2].prompt_embeds[0], rtol=0, atol=0
+            )
+            if stage_type is MOSSImageBeforeDenoisingStage:
+                assert outputs[0].latents.data_ptr() != outputs[2].latents.data_ptr()
+                assert outputs[0].scheduler is not outputs[2].scheduler
             assert outputs[0].prompt_embeds is not outputs[2].prompt_embeds
             if stage_type is MingImageEncodingStage:
                 assert all(output.extra["ming_frames"] == 1 for output in outputs)
@@ -583,8 +636,13 @@ def get_negative_embedding_twice(stage, server_args, first_req, second_req=None)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("capacity", [0, 1, 4096])
+@pytest.mark.parametrize(
+    "stage_type", [LingBotVideoTextEncodingStage, MOSSImageBeforeDenoisingStage]
+)
 @torch.no_grad()
-def test_lingbot_cache_miss_prepares_offloaded_encoder(capacity, monkeypatch):
+def test_custom_stage_cache_miss_prepares_offloaded_encoder(
+    capacity, stage_type, monkeypatch
+):
     device = torch.device("cuda", torch.cuda.current_device())
     monkeypatch.setattr(
         "sglang.multimodal_gen.runtime.managers.memory_managers."
@@ -592,7 +650,9 @@ def test_lingbot_cache_miss_prepares_offloaded_encoder(capacity, monkeypatch):
         lambda: device,
     )
     executor, stage, encoder, args = make_group_executor(
-        partial(LingBotVideoTextEncodingStage, transformer=torch.nn.Linear(1, 1)),
+        partial(LingBotVideoTextEncodingStage, transformer=torch.nn.Linear(1, 1))
+        if stage_type is LingBotVideoTextEncodingStage
+        else stage_type,
         "cpu",
         capacity,
     )
@@ -621,13 +681,31 @@ def test_lingbot_cache_miss_prepares_offloaded_encoder(capacity, monkeypatch):
         manager.before_stage(stage, 0, batch, args)
         manager.begin_stage()
         with cache.scope():
-            results.append(stage._encode_prompt("hello", device, torch.float32))
+            if stage_type is MOSSImageBeforeDenoisingStage:
+                stage.tokenizer = Mock()
+                stage.tokenizer.apply_chat_template.side_effect = (
+                    lambda messages, **kwargs: messages[0]["content"]
+                )
+                stage.tokenizer.side_effect = lambda text, **kwargs: BatchEncoding(
+                    {"input_ids": torch.tensor([[1 if text == "hello" else 3, 2]])}
+                )
+                batch.do_classifier_free_guidance = False
+                batch.num_outputs_per_prompt = 1
+                stage._prepare_prompt_embeddings(
+                    batch, ["hello", "different"], device, 4096
+                )
+                results.append((batch.prompt_embeds[0], batch.prompt_attention_mask))
+            else:
+                results.append(stage._encode_prompt("hello", device, torch.float32))
         manager.end_stage()
         manager.finish_request()
         assert encoder.embedding.weight.device.type == "cpu"
         assert results[-1][0].device == device
     expected_calls = 1 if capacity == 4096 else 2
-    assert encoder.calls == strategy.prepare_for_use.call_count == expected_calls
+    assert strategy.prepare_for_use.call_count == expected_calls
+    assert encoder.calls == expected_calls * (
+        2 if stage_type is MOSSImageBeforeDenoisingStage else 1
+    )
     torch.testing.assert_close(results[0][0], results[1][0], rtol=0, atol=0)
 
 

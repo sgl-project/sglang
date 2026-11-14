@@ -15,7 +15,7 @@ from sglang.srt.layers.attention import aiter_mla_gluon as mod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _GLUON_FN = "sglang.srt.layers.attention.aiter_mla_gluon._gluon_fn"
 
@@ -254,6 +254,7 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
             reduce_final_map=None,
             reduce_partial_map=None,
             num_kv_splits=None,
+            triton_mla_block_tables=None,
         )
         be.token_to_kv_pool = mock.Mock(
             get_key_buffer=lambda _lid: torch.zeros(8, 576, dtype=fp8_dtype)

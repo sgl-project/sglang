@@ -1,8 +1,10 @@
 //! SGLang P/D extensions to Dynamo's standard OpenAI request types.
 
+use axum::http::HeaderMap;
 use serde::Deserialize;
 use sglang_api_types::api::v1::{Int64OrList, OptionalInt64OrList, StringOrList};
 
+use super::super::dp_relay::{HintRoute, lax_rank};
 use crate::message::request::{
     BootstrapColumns, check_broadcast_budget, normalize_bootstrap_columns,
 };
@@ -17,7 +19,11 @@ pub(super) struct PDRoutingFields {
     bootstrap_host: Option<StringOrList>,
     bootstrap_port: Option<OptionalInt64OrList>,
     bootstrap_room: Option<Int64OrList>,
+    #[serde(default, deserialize_with = "lax_rank")]
     routed_dp_rank: Option<i64>,
+    /// Python's deprecated spelling of `routed_dp_rank`, read when it is unset.
+    #[serde(default, deserialize_with = "lax_rank")]
+    data_parallel_rank: Option<i64>,
     disagg_prefill_dp_rank: Option<i64>,
 }
 
@@ -70,9 +76,25 @@ impl PDRoutingFields {
         }
         Ok(NormalizedPDRouting {
             bootstrap,
-            routed_dp_rank: self.routed_dp_rank,
+            routed_dp_rank: self.routed_dp_rank.or(self.data_parallel_rank),
             disagg_prefill_dp_rank: self.disagg_prefill_dp_rank,
         })
+    }
+}
+
+impl NormalizedPDRouting {
+    /// A DP rank `route`'s headers name wins over the body's, as in Python
+    /// ([`HintRoute::header_rank`]); an unparsable header is a 400.
+    pub(super) fn apply_header_rank(
+        &mut self,
+        route: HintRoute,
+        headers: &HeaderMap,
+        overrides: bool,
+    ) -> Result<(), String> {
+        if let Some(rank) = route.header_rank(headers, overrides)? {
+            self.routed_dp_rank = Some(rank);
+        }
+        Ok(())
     }
 }
 
@@ -105,6 +127,42 @@ mod tests {
         );
         assert_eq!(routing.routed_dp_rank, Some(1));
         assert_eq!(routing.disagg_prefill_dp_rank, Some(3));
+    }
+
+    /// The deprecated `data_parallel_rank` names the rank when
+    /// `routed_dp_rank` does not, and a header the route reads wins over both.
+    #[test]
+    fn dp_rank_reads_the_deprecated_field_then_the_route_headers() {
+        use super::HintRoute;
+        let routing = |body| {
+            serde_json::from_value::<PDRoutingFields>(body)
+                .unwrap()
+                .normalize(1, 1)
+                .unwrap()
+        };
+        assert_eq!(
+            routing(json!({"data_parallel_rank": 1})).routed_dp_rank,
+            Some(1)
+        );
+        assert_eq!(
+            routing(json!({"routed_dp_rank": 0, "data_parallel_rank": 1})).routed_dp_rank,
+            Some(0)
+        );
+        // Pydantic reads a string of an integer.
+        assert_eq!(
+            routing(json!({"routed_dp_rank": "1", "data_parallel_rank": "0"})).routed_dp_rank,
+            Some(1)
+        );
+        assert!(serde_json::from_value::<PDRoutingFields>(json!({"routed_dp_rank": "x"})).is_err());
+        let mut normalized = routing(json!({"routed_dp_rank": 0}));
+        let headers = [("x-data-parallel-rank", "1")]
+            .into_iter()
+            .map(|(name, value)| (name.parse().unwrap(), value.parse().unwrap()))
+            .collect();
+        normalized
+            .apply_header_rank(HintRoute::Completions, &headers, false)
+            .unwrap();
+        assert_eq!(normalized.routed_dp_rank, Some(1));
     }
 
     #[test]

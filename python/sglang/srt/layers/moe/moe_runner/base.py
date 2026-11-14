@@ -47,12 +47,18 @@ class MoeRunnerConfig:
     params_dtype: Optional[torch.dtype] = None
     routing_method_type: Optional[RoutingMethodType] = None
 
+    # None denotes a direct kernel with standard TopK and local expert IDs.
+    runner_backend: Optional[MoeRunnerBackendLike] = None
+
     # Runner configuration
     activation: str = "silu"
     is_gated: bool = True
     apply_router_weight_on_input: bool = False
     inplace: bool = True
     no_combine: bool = False
+    # With no_combine: still apply the router weight, leaving only the top-k sum to
+    # the caller (triton and marlin runners).
+    no_combine_keep_router_weight: bool = False
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_beta: Optional[float] = None
@@ -173,6 +179,9 @@ class FusedOpPool:
     def register_fused_func(
         cls, a2a_backend_name: str, runner_backend_name: str, fused_func: Callable
     ):
+        # Key by the canonical value, which is what lookups pass, so a
+        # deprecated alias such as "flashinfer" still registers correctly.
+        a2a_backend_name = MoeA2ABackend(a2a_backend_name).value
         key = (a2a_backend_name, runner_backend_name)
         if key in cls._fused_funcs:
             raise ValueError(

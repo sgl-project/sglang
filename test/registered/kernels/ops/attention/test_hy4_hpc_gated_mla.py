@@ -10,17 +10,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=60,
-    nightly=False,
-    disabled=None,
     stage="base-b-kernel-unit",
     runner_config="4-gpu-b200",
-)
-register_cuda_ci(
-    est_time=120,
-    nightly=True,
-    disabled=None,
-    stage="nightly",
-    runner_config="4-gpu-b200",
+    disabled="needs HPC-Ops with hpc.gemm.gated_mla_gemm; not installed in CI",
 )
 
 # Guards attention-TP shards from silently reverting to the global N=16384 shape.

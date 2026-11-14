@@ -28,13 +28,16 @@ class TestCaptureStatus(unittest.TestCase):
             finally:
                 current[0] = previous
 
-        for npu, xpu, hip in (
-            (True, False, False),
-            (False, True, False),
-            (False, False, True),
+        for npu, xpu, hip, musa in (
+            (True, False, False, False),
+            (False, True, False, False),
+            (False, False, True, False),
+            (False, False, False, True),
         ):
             for capturing in (True, False):
-                with self.subTest(npu=npu, xpu=xpu, hip=hip, capturing=capturing):
+                with self.subTest(
+                    npu=npu, xpu=xpu, hip=hip, musa=musa, capturing=capturing
+                ):
                     device = SimpleNamespace(
                         stream=stream_context,
                         is_current_stream_capturing=Mock(
@@ -47,6 +50,7 @@ class TestCaptureStatus(unittest.TestCase):
                         patch.object(bcg, "_is_npu", npu),
                         patch.object(bcg, "_is_xpu", xpu),
                         patch.object(bcg, "is_hip", return_value=hip),
+                        patch.object(bcg, "is_musa", return_value=musa),
                         patch.object(bcg, "get_device_module", return_value=device),
                         patch.object(bcg, "_capture_status") as cuda_status,
                     ):
@@ -67,6 +71,7 @@ class TestCaptureStatus(unittest.TestCase):
             patch.object(bcg, "_is_npu", False),
             patch.object(bcg, "_is_xpu", False),
             patch.object(bcg, "is_hip", return_value=False),
+            patch.object(bcg, "is_musa", return_value=False),
             patch.object(bcg, "rt", runtime),
             patch.object(bcg, "get_device_module") as device,
             patch.object(bcg, "_capture_status") as status,

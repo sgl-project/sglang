@@ -569,7 +569,7 @@ sglang serve \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \
@@ -641,7 +641,7 @@ sglang serve \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \
@@ -885,7 +885,7 @@ sglang "${sglang_args[@]}" 2>&1 | tee $LOG_DIR/$RANK.log
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host $MASTER_ADDR \
   --port 30000 \
@@ -944,7 +944,7 @@ Max ITL (ms):                            36.84
 We simply use the same deployment method and vary the throughput by maximizing concurrencies:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host $MASTER_ADDR \
   --port 30000 \

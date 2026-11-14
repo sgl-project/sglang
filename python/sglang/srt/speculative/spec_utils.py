@@ -10,30 +10,17 @@ from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    get_target_cache_loc as get_target_cache_loc,
+    fill_front_out_cache_loc_func,
+    generate_draft_decode_window_kv_indices,
 )
 from sglang.kernels.ops.speculative.eagle import (
-    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+    fill_accept_out_cache_loc_func,
 )
-from sglang.kernels.ops.speculative.row_argmax import row_argmax
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
@@ -43,14 +30,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.managers.utils import _async_d2h
-from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -59,35 +42,35 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
-    is_cpu,
     is_cuda,
     is_hip,
-    is_musa,
     is_npu,
     is_xpu,
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.device import async_d2h as _async_d2h
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_musa = is_musa()
 _is_xpu = is_xpu()
-_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 
-if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
+if _is_cuda:
+    from sglang.kernels.ops.sampling.argmax_jit import can_argmax
+    from sglang.kernels.ops.speculative.row_argmax import div_argmax
+    from sglang.kernels.ops.speculative.simulated_accept import simulated_accept
 
 
 logger = logging.getLogger(__name__)
@@ -123,24 +106,106 @@ def resolve_num_tokens_per_req(
     raise ValueError(f"Unknown speculative phase: {phase}")
 
 
-def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    """Draw from `probs` via the Gumbel-max trick: argmax(probs / Exp(1)).
+# Domain-separate draft proposal draws from target sampling and verify coins.
+# The per-step offset also separates successive draft draws if their absolute
+# position inputs overlap.
+_DRAFT_GUMBEL_SEED_SALT = 0x44524146545F0000
 
-    Distributionally equivalent to torch.multinomial, but avoids multinomial's
-    device-side distribution-validity assert, which the draft CUDA graph would
-    otherwise capture and replay every step. q is clamped off zero so a zero
-    draw can't yield inf/NaN scores that argmax would wrongly select; fp32
-    avoids bf16 argmax ties biasing the draw. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0
-    to fall back to torch.multinomial.
+
+def fast_sample(
+    probs: torch.Tensor,
+    num_samples: int = 1,
+    *,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+    draft_step: int = 0,
+):
+    """Draw from ``probs`` with the exponential-race form of Gumbel-max.
+
+    When ``sampling_seed`` is provided, derive one exponential variate per
+    request, position, draft step, and vocabulary entry with ``murmur_hash32``.
+    This makes draft proposals reproducible under batch reordering and CUDA
+    graph replay. The midpoint uint32 mapping stays strictly inside ``(0, 1)``,
+    avoiding infinite exponential/Gumbel values at either hash endpoint.
+
+    The unseeded path keeps using PyTorch's fast RNG-backed implementation.
+    Set ``SGLANG_OPT_USE_GUMBEL_SAMPLE=0`` to make that path fall back to
+    ``torch.multinomial``.
     """
-    if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
-        sample_index = torch.multinomial(probs, num_samples=num_samples)
-        return probs.gather(1, sample_index), sample_index
-    q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
-    q.clamp_min_(torch.finfo(torch.float32).tiny)
-    scores = probs.float() / q
+    if sampling_seed is not None:
+        if positions is None:
+            raise ValueError("positions are required for deterministic fast_sample")
+        if sampling_seed.shape != positions.shape:
+            raise ValueError(
+                "sampling_seed and positions must have matching shapes, got "
+                f"{sampling_seed.shape} and {positions.shape}"
+            )
+        if sampling_seed.numel() != probs.shape[0]:
+            raise ValueError(
+                "sampling_seed must have one value per probability row, got "
+                f"{sampling_seed.numel()} seeds for {probs.shape[0]} rows"
+            )
+
+        from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+
+        if draft_step < 0:
+            raise ValueError(f"draft_step must be non-negative, got {draft_step}")
+        vocab_size = probs.shape[1]
+        col_offset = draft_step * vocab_size
+        if col_offset + vocab_size > 2**32:
+            raise ValueError(
+                "draft_step and vocabulary size exceed the uint32 hash-key range: "
+                f"draft_step={draft_step}, vocab_size={vocab_size}"
+            )
+
+        # Encode (draft_step, token_id) in the uint32 column block instead of
+        # altering the request seed; step zero retains its established stream.
+        salted_seed = sampling_seed + _DRAFT_GUMBEL_SEED_SALT
+        col_indices = torch.arange(
+            col_offset,
+            col_offset + vocab_size,
+            dtype=torch.int64,
+            device=probs.device,
+        )
+        hashed = murmur_hash32(
+            salted_seed.to(torch.uint64), positions.to(torch.uint64), col_indices
+        )
+
+        # If U ~ Uniform(0, 1), then -log(U) ~ Exp(1), and
+        # argmax_i probs[i] / Exp_i samples from the categorical distribution.
+        # Keep float64 for this first implementation, matching the established
+        # deterministic sampler's numerical-conservatism policy.
+        scores = hashed.to(torch.float64)
+        del hashed
+        scores.add_(0.5).div_(2.0**32).log_().neg_().reciprocal_()
+        scores.mul_(probs)
+    else:
+        if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+            sample_index = torch.multinomial(probs, num_samples=num_samples)
+            return probs.gather(1, sample_index), sample_index
+        q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+        if (
+            num_samples == 1
+            and _is_cuda
+            and probs.dtype == torch.float32
+            # Unit column stride is enough: the multi-layer EAGLE single-graph
+            # draft passes a [bs, step] view of a [max_bs, steps, vocab] buffer.
+            and probs.stride(-1) == 1
+            # Size gate measured on RTX PRO 6000, H100 and GB300; re-tune for others.
+            and probs.numel() >= 1 << 23
+            and can_argmax(q)
+        ):
+            # Same index as the clamp_min_ / division / sampling_argmax below.
+            sample_index = div_argmax(
+                probs, q, divisor_min=torch.finfo(torch.float32).tiny, ignore_nan=True
+            ).unsqueeze(-1)
+            return probs.gather(1, sample_index), sample_index
+        q.clamp_min_(torch.finfo(torch.float32).tiny)
+        scores = probs.float() / q
+
     if num_samples == 1:
-        sample_index = row_argmax(scores).unsqueeze(-1)
+        # The seeded path's float64 scores fall back to torch.argmax.
+        sample_index = sampling_argmax(scores).unsqueeze(-1)
     else:
         sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
@@ -167,6 +232,10 @@ def sample_draft_proposal(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: Optional[torch.Tensor] = None,
+    *,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+    draft_step: int = 0,
 ):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
@@ -189,7 +258,13 @@ def sample_draft_proposal(
     which is what greedy means. Drop that renorm and this stops holding.
     """
     probs = sampling_softmax(next_token_logits, temperatures=temperatures)
-    topk_p, topk_index = fast_sample(probs, num_samples=1)
+    topk_p, topk_index = fast_sample(
+        probs,
+        num_samples=1,
+        sampling_seed=sampling_seed,
+        positions=positions,
+        draft_step=draft_step,
+    )
     if top_ks is not None:
         # Assert rather than skip on a device mismatch: a host-side top_ks would
         # make this correction silently vanish, and the symptom -- draft accept
@@ -211,10 +286,30 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
+# XORed into the server seed so these draws differ from other samplers'.
+_SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
+
+
+def simulated_acc_len_generator(seed: int) -> torch.Generator:
+    """The generator of the SGLANG_SIMULATE_ACC_LEN draws (forced lengths, and
+    DSpark's bonus seed), seeded alike on every rank from the server seed."""
+    return torch.Generator().manual_seed(
+        (int(seed) ^ _SIM_ACC_LEN_DOMAIN) & 0x7FFFFFFFFFFFFFFF
+    )
+
+
+def check_simulate_acc_token_mode() -> None:
+    if SIMULATE_ACC_LEN > 0 and SIMULATE_ACC_TOKEN_MODE not in (
+        "fixed",
+        "real-draft-token",
+    ):
+        raise ValueError(
+            "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+            f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or 'real-draft-token'."
+        )
+
+
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = (
-    _is_cuda or _is_musa
-)  # This kernel is only available for CUDA and MUSA now
 
 
 def draft_kv_indices_buffer_width(
@@ -277,6 +372,61 @@ def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
     return window_size, int(cfg.speculative_draft_sink_size or 0)
 
 
+def fill_draft_window_rail(
+    runner_ids,
+    forward_batch,
+    window_kv_indices: torch.Tensor,
+    window_kv_indptr: torch.Tensor,
+    *,
+    topk: int,
+    num_steps: int,
+    page_size: int,
+    window: int,
+) -> None:
+    """Emit every draft step's window-clipped read ids into the per-step rows
+    of ``window_kv_indices`` and their indptr into ``window_kv_indptr``: step
+    i of a branch reads the last ``min(seq_len + i + 1, window)`` of its
+    tokens, from the storage window layers use (``runner_ids.window_storage``).
+    ``window`` is the number of tokens the backend's window layers attend."""
+    num_seqs = forward_batch.batch_size
+    width = num_seqs * topk * window
+    assert window_kv_indices.shape[1] >= width, (
+        f"window rail row {window_kv_indices.shape[1]} < "
+        f"{num_seqs * topk} branch(es) x window {window}"
+    )
+    src = runner_ids.read_source(
+        forward_batch.iteration_ids,
+        req_pool_indices=forward_batch.req_pool_indices,
+        bs=num_seqs,
+        kind=runner_ids.window_storage,
+    )
+    generate_draft_decode_window_kv_indices[(num_steps, num_seqs, topk)](
+        src.row_ids,
+        src.ids,
+        forward_batch.seq_lens,
+        window_kv_indices,
+        window_kv_indptr,
+        forward_batch.positions,
+        src.row_stride,
+        window_kv_indices.shape[1],
+        window_kv_indptr.shape[1],
+        next_power_of_2(num_seqs),
+        next_power_of_2(num_steps),
+        next_power_of_2(num_seqs * topk),
+        page_size,
+        window,
+        ENTRY_PAGE_SIZE=src.entry_page_size,
+        v2p=src.v2p,
+        TRANSLATE=src.v2p is not None,
+    )
+    if not src.is_translated and runner_ids.window_storage != IdSpaceKind.FULL:
+        # Static pool: the legacy full->swa translate, as the target's window
+        # reads apply it.
+        for i in range(num_steps):
+            row = window_kv_indices[i][:width]
+            row.copy_(runner_ids.ids_in(runner_ids.window_storage, row))
+
+
 def record_stream_each(tensors, stream):
     """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
     non-tensor / non-cuda entries. Tells the caching allocator that the
@@ -334,20 +484,6 @@ def spec_need_hidden_states() -> bool:
     if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
     return not spec.enable_multi_layer_eagle
-
-
-@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
-def create_num_accept_tokens_filter(
-    num_correct_drafts: torch.Tensor,
-    unfinished_index_device: torch.Tensor,
-    seq_lens: torch.Tensor,
-):
-    num_accept_tokens_filter = torch.zeros_like(num_correct_drafts)
-    num_accept_tokens_filter[unfinished_index_device] = (
-        num_correct_drafts[unfinished_index_device] + 1
-    )
-    seq_lens.add_(num_correct_drafts + 1)
-    return num_accept_tokens_filter
 
 
 def _select_top_k_tokens_first(
@@ -426,6 +562,7 @@ def sample_simulated_acc_len(
     simulate_acc_len: float,
     simulate_acc_method: str,
     max_len: int,
+    generator: Optional[torch.Generator] = None,
 ) -> int:
     """Sample a simulated acceptance length in [1, max_len]."""
     if simulate_acc_method == "multinomial":
@@ -433,6 +570,7 @@ def sample_simulated_acc_len(
             mean=simulate_acc_len,
             std=1.0,
             size=(1,),
+            generator=generator,
             device="cpu",
         )
         # clamp simulated values to be between 1 and max_len
@@ -453,7 +591,7 @@ def sample_simulated_acc_len(
             weight_upper = simulate_acc_len - lower
             weight_lower = 1.0 - weight_upper
             probs = torch.tensor([weight_lower, weight_upper], device="cpu")
-            sampled_index = torch.multinomial(probs, num_samples=1)
+            sampled_index = torch.multinomial(probs, num_samples=1, generator=generator)
             simulate_acc_len = lower if sampled_index == 0 else upper
     else:
         raise ValueError(f"Invalid simulate_acc_method: {simulate_acc_method}")
@@ -471,13 +609,26 @@ def generate_simulated_accept_index(
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
     simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
+    generator: Optional[torch.Generator] = None,
 ):
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
     simulate_acc_len = sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, spec_steps + 1
+        simulate_acc_len, simulate_acc_method, spec_steps + 1, generator=generator
     )
+
+    if _is_cuda and accept_index.is_cuda:
+        return simulated_accept(
+            accept_indices=accept_index,
+            predict_tokens=predict,
+            num_correct_drafts=num_correct_drafts,
+            candidate_tokens=candidates,
+            target_tokens=target_predict,
+            width=spec_steps + 1,
+            num_accept_tokens=simulate_acc_len,
+            real_tokens=use_real_draft_tokens,
+        )
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
@@ -501,6 +652,47 @@ def generate_simulated_accept_index(
     bonus_node_indices = sim_accept_index[:, simulate_acc_len - 1].long()
     predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
         dtype=predict.dtype
+    )
+    return sim_accept_index
+
+
+def generate_simulated_accept_index_device(
+    accept_index: torch.Tensor,
+    predict: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    bs: int,
+    spec_steps: int,
+    simulate_acc_len: torch.Tensor,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
+) -> torch.Tensor:
+    """generate_simulated_accept_index with the drawn length already on the device
+    (int64 [1]); static shapes, so a CUDA graph can replay it. Writes the same values
+    as the host-length version for the same length."""
+    width = spec_steps + 1
+    steps = torch.arange(width, device=accept_index.device, dtype=accept_index.dtype)
+    accepted = steps.view(1, width) < simulate_acc_len
+    sim_accept_index = torch.where(
+        accepted,
+        accept_index[:, :1] + steps.view(1, width),
+        torch.full_like(steps, -1).view(1, width),
+    )
+    num_correct_drafts.copy_((simulate_acc_len - 1).expand(bs))
+    if simulate_acc_token_mode != "real-draft-token":
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+    # Chain drafts (topk=1): node b*width + j sits at row b, column j of predict.
+    rows = predict.view(bs, width)
+    drafted = torch.cat([candidates[:, 1:], candidates[:, -1:]], dim=1).to(rows.dtype)
+    rows.copy_(
+        torch.where(
+            steps < simulate_acc_len - 1,
+            drafted,
+            torch.where(
+                steps == simulate_acc_len - 1, target_predict.to(rows.dtype), rows
+            ),
+        )
     )
     return sim_accept_index
 
@@ -544,22 +736,35 @@ def traverse_tree(
         if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(int(draft_tokens[curr]))
-            if not grammar.is_terminated():
-                # Generate the bitmask for the current token
-                grammar.fill_vocab_mask(allocate_token_bitmask, curr)
-                if retrieve_next_token[curr] != -1:
-                    # Visit the child node
-                    dfs(
-                        int(retrieve_next_token[curr]),
-                        retrieve_next_token,
-                        retrieve_next_sibling,
-                        curr,
+                try:
+                    grammar.accept_token(int(draft_tokens[curr]))
+                except ValueError:
+                    # The matcher can reject a draft token that passed the parent
+                    # mask row (mask/matcher desync, e.g. a disagg retracted-request
+                    # double-accept). Clear it in the parent row so verify won't
+                    # accept it, and prune this branch rather than raising to -- and
+                    # killing -- the scheduler. The accept failed, so the grammar is
+                    # still at the parent state; no rollback is owed for this node.
+                    parent_bitmask[int(current_token) // 32] &= ~(
+                        1 << (int(current_token) % 32)
                     )
+                    is_accepted = False
+            if is_accepted:
+                if not grammar.is_terminated():
+                    # Generate the bitmask for the current token
+                    grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                    if retrieve_next_token[curr] != -1:
+                        # Visit the child node
+                        dfs(
+                            int(retrieve_next_token[curr]),
+                            retrieve_next_token,
+                            retrieve_next_sibling,
+                            curr,
+                        )
 
-            if curr != 0:
-                # Rollback the current token
-                grammar.rollback(1)
+                if curr != 0:
+                    # Rollback the current token
+                    grammar.rollback(1)
 
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
@@ -751,19 +956,26 @@ def draft_pp_context():
         yield
 
 
-def draft_tp_context(owns_attention: bool):
-    """Enter the TP placement that draft work runs under.
-
-    Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
-    sync) runs on the target's attention-TP group; other draft work keeps the
-    target's TP placement. Enter it from outside any draft scope, where
-    ``attn_tp_group`` is still the target's.
-    """
-    if not owns_attention:
+def draft_tp_context(layout: DraftParallelLayout):
+    """Enter an already-resolved draft placement from outside any draft scope."""
+    if layout.tp_group is None:
         return contextlib.nullcontext()
-    return patch_tensor_parallel_group(
-        get_parallel().attn_tp_group, owns_attention=True
-    )
+    tp_context = patch_tensor_parallel_group(layout.tp_group, owns_attention=True)
+    if layout.disable_cp:
+        return _draft_without_cp(tp_context)
+    return tp_context
+
+
+@contextmanager
+def _draft_without_cp(tp_context):
+    with (
+        tp_context,
+        get_parallel().override(
+            enable_prefill_cp=False, enable_cp_tp_group_sharing=False
+        ),
+        disable_cp_strategy(),
+    ):
+        yield
 
 
 def spec_stage_span(name: str):
@@ -808,25 +1020,14 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    if _is_cpu:
-        assign_extend_cache_locs_cpu(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-        )
-    else:
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
+    # The targets lead each request's verify window. Read them from that window,
+    # not req_to_token: after verify's read-done the scheduler may hand a finished
+    # request's row to a new request.
+    fill_front_out_cache_loc_func(
+        num_correct_drafts + 1,
+        batch.out_cache_loc,
+        tgt_cache_loc,
+    )
     fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
@@ -836,6 +1037,59 @@ def move_accept_tokens_to_target_kvcache(
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
     )
+
+
+class VerifyTrackIndices:
+    """The last verify's mamba track indices, for prepare_mamba_track_for_verify to
+    reuse while everything they are built from is unchanged."""
+
+    def __init__(self):
+        # the tensors themselves: a freed tensor's id can go to a new one
+        self._req_pool_indices = self._mapping = self._indices = None
+        self._positions = self._versions = None
+
+    def set_from_reqs(self, batch: ScheduleBatch) -> None:
+        """set_mamba_track_indices_from_reqs, without its gathers and host-to-device
+        copy when the request slots and the ping-pong mapping are the same tensors at
+        the same versions, no track position moved and the last indices are unwritten.
+        """
+        req_pool_indices = batch.req_pool_indices
+        mapping = (
+            batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+        )
+        positions = tuple(req.kv.mamba_next_track_idx for req in batch.reqs)
+        if (
+            req_pool_indices is self._req_pool_indices
+            and mapping is self._mapping
+            and positions == self._positions
+            and self._versions is not None
+            and _versions(req_pool_indices, mapping, self._indices) == self._versions
+        ):
+            batch.mamba_track_buffer_indices = [
+                0 if p is None else p for p in positions
+            ]
+            batch.mamba_track_indices = self._indices
+            return
+        set_mamba_track_indices_from_reqs(batch)
+        self._req_pool_indices, self._mapping = req_pool_indices, mapping
+        self._indices, self._positions = batch.mamba_track_indices, positions
+        self._versions = _versions(req_pool_indices, mapping, self._indices)
+
+
+def _versions(*tensors: torch.Tensor) -> Optional[tuple[int, ...]]:
+    # PyTorch bumps a tensor's version on every in-place write it makes; inference
+    # tensors (SGLANG_ENABLE_TORCH_INFERENCE_MODE) have none, so they never match
+    if any(t.is_inference() for t in tensors):
+        return None
+    return tuple(t._version for t in tensors)
+
+
+# SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS: the verify rounds of this process reuse the last indices.
+_VERIFY_TRACK_INDICES: Optional[VerifyTrackIndices] = (
+    VerifyTrackIndices()
+    if envs.SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS.get()
+    else None
+)
 
 
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
@@ -861,7 +1115,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
             "must run in prepare_for_decode for every spec decode iteration"
         )
-    set_mamba_track_indices_from_reqs(batch, track_positions)
+    if track_positions is None and _VERIFY_TRACK_INDICES is not None:
+        _VERIFY_TRACK_INDICES.set_from_reqs(batch)
+    else:
+        set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
     batch.mamba_prefill_track_mask_cpu = None
@@ -937,6 +1194,7 @@ def commit_mamba_states_after_verify(
     accept_index: torch.Tensor,
     draft_token_num: int,
     prepared_step_indices: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
+    state_slots: Optional[ForwardStateSlots] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -946,144 +1204,124 @@ def commit_mamba_states_after_verify(
     accepted step is committed back, plus the interval-crossing state used
     for prefix-cache tracking (mamba extra_buffer mode).
 
+    Writes ``state_slots``, the verify forward's resolved slots by default, and
+    looks up no table: it may run after the scheduler reused a finished row.
+
     No-op for models without mamba-style state or backends without the
     commit hook.
     """
     model_runner = target_worker.model_runner
     if mambaish_config(model_runner.model_config) is None:
         return
+    if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+        return
 
-    # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
-    # live in the per-slot circular ring (written during verify). Instead of
-    # scattering an intermediate full SSM state into `temporal`, advance the
-    # block-keyed cursors by the accepted count (the ring owns the SSM state; the
-    # verify/flush kernel folds it into `temporal` periodically). The CONV state
-    # still needs its usual accept-rollback, so we keep the conv-window scatter and
-    # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
-    # ring is allocated only then; KDA never allocates the cursors.
-    req_pool = model_runner.req_to_token_pool
-    mamba_pool = getattr(req_pool, "mamba_pool", None)
+    mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
     bs = accept_lens.shape[0]
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
+    # `accept_lens` already includes the bonus token (drafts + 1 per req).
+    if prepared_step_indices is None:
+        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
+    else:
+        last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
+
+    replay_state_indices = replay_track_indices = None
+    if mamba_pool is not None and (
+        mamba_pool.replayssm_spec_fold or mamba_pool.replayssm_cache_base is not None
+    ):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            commit_ple_states_after_verify,
+        )
+
+        # Persistent destinations are state slots; a request-scoped ring is
+        # indexed by the rows the forward resolved (`ForwardStateSlots.ring`).
+        if state_slots is None:
+            state_slots = model_runner.attn_backend.forward_state_slots(
+                bs, batch.mamba_track_indices
+            )
+        replay_state_indices = state_slots.working[:bs]
+        if batch.mamba_track_indices is not None:
+            replay_track_indices = state_slots.track[:bs]
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
     # track slot, so no SSM scatter or force-flush is needed here.
     if (
         mamba_pool is not None
-        and getattr(mamba_pool, "replayssm_spec_fold", False)
-        and not getattr(mamba_pool, "replayssm_is_kda", False)
+        and mamba_pool.replayssm_spec_fold
+        and not mamba_pool.replayssm_is_kda
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
-            return
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
         )
 
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        if prepared_step_indices is None:
-            last_correct_step_indices, mamba_steps_to_track = (
-                _verify_commit_step_indices(
-                    batch=batch,
-                    accept_index=accept_index,
-                    accept_lens=accept_lens,
-                    draft_token_num=draft_token_num,
-                )
-            )
-        else:
-            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
+        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
-            state_batch_indices=state_batch_indices,
+            state_batch_indices=replay_state_indices,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,
         )
-        return
-
-    if (
-        mamba_pool is not None
-        and getattr(mamba_pool, "replayssm_cache_base", None) is not None
-        and not getattr(mamba_pool, "replayssm_is_kda", False)
-    ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
-            return
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
-            commit_gdn_replayssm_circular,
-            commit_gdn_replayssm_spec,
-        )
-        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-            fused_conv_window_scatter_with_mask,
-        )
-
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        replay_indices = batch.req_pool_indices
-        if prepared_step_indices is None:
-            last_correct_step_indices, mamba_steps_to_track = (
-                _verify_commit_step_indices(
-                    batch=batch,
-                    accept_index=accept_index,
-                    accept_lens=accept_lens,
-                    draft_token_num=draft_token_num,
-                )
-            )
-        else:
-            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
-        # Advance the per-request circular cursors by the accepted count (incl. the
-        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
-        commit_gdn_replayssm_spec(
-            write_pos=mamba_pool.replayssm_spec_write_pos,
-            cache_base=mamba_pool.replayssm_cache_base,
-            is_flush=mamba_pool.replayssm_is_flush,
-            num_accepted=accept_lens,  # [bs], includes the bonus token
-            replay_indices=replay_indices,
-            max_cache_len=spec_state.replayssm_d.shape[-2],
-            max_spec_len=draft_token_num,
-            fold_every_commit=spec_state.temporal.dtype != torch.float32,
-            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
-        )
-        # Capacity rows fold all layers in one launch; track rows snapshot the
-        # exact crossing state without disturbing the active circular history.
-        commit_gdn_replayssm_circular(
-            checkpoint_state=spec_state.temporal,
-            d_cache=spec_state.replayssm_d,
-            k_cache=spec_state.replayssm_k,
-            g_cache=spec_state.replayssm_g,
-            d_residual_cache=spec_state.replayssm_rawv,
-            k_residual_cache=spec_state.replayssm_rawk,
-            state_batch_indices=state_batch_indices,
-            replay_indices=replay_indices,
-            write_pos=mamba_pool.replayssm_spec_write_pos,
-            cache_base=mamba_pool.replayssm_cache_base,
-            is_flush=mamba_pool.replayssm_is_flush,
-            accept_lens=accept_lens,
-            mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
-            null_block_id=-1,
-        )
-        # Roll back active conv state and snapshot its interval-crossing window.
-        fused_conv_window_scatter_with_mask(
-            spec_state.conv[0],
-            spec_state.intermediate_conv_window[0],
-            state_batch_indices,
+        commit_ple_states_after_verify(
+            model_runner.token_to_kv_pool.layer_router,
+            replay_state_indices,
             last_correct_step_indices,
+            replay_track_indices,
+            mamba_steps_to_track,
             src_indices_raw,
         )
-        if batch.mamba_track_indices is not None:
-            fused_conv_window_scatter_with_mask(
-                spec_state.conv[0],
-                spec_state.intermediate_conv_window[0],
-                batch.mamba_track_indices,
-                mamba_steps_to_track,
-                src_indices_raw,
-            )
+        return
+
+    # Circular ReplaySSM (GDN, topk <= 1): the ring owns the SSM state.
+    if (
+        mamba_pool is not None
+        and mamba_pool.replayssm_cache_base is not None
+        and not mamba_pool.replayssm_is_kda
+    ):
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_after_verify,
+        )
+
+        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
+        assert state_slots.ring is not None, "the GDN ring is indexed per request"
+        replay_indices = state_slots.ring[:bs]
+        # Advance the request cursors by the accepted count (incl. the bonus
+        # token), fold capacity rows into `temporal`, and roll back conv.
+        commit_gdn_replayssm_after_verify(
+            spec_state=spec_state,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            state_batch_indices=replay_state_indices,
+            replay_indices=replay_indices,
+            accept_lens=accept_lens,
+            last_correct_step_indices=last_correct_step_indices,
+            max_spec_len=draft_token_num,
+            fold_every_commit=spec_state.temporal.dtype != torch.float32,
+            mamba_track_indices=replay_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+        )
+        commit_ple_states_after_verify(
+            model_runner.token_to_kv_pool.layer_router,
+            replay_state_indices,
+            last_correct_step_indices,
+            replay_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw,
+        )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
@@ -1094,84 +1332,64 @@ def commit_mamba_states_after_verify(
     # never allocated under fold, so they cannot serve as the signal).
     if (
         mamba_pool is not None
-        and getattr(mamba_pool, "replayssm_spec_fold", False)
-        and getattr(mamba_pool, "replayssm_is_kda", False)
+        and mamba_pool.replayssm_spec_fold
+        and mamba_pool.replayssm_is_kda
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
-            return
-        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
         )
 
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        accept_indices_offset = torch.arange(
-            0,
-            bs * draft_token_num,
-            step=draft_token_num,
-            dtype=accept_lens.dtype,
-            device=accept_lens.device,
-        )
-        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        last_correct_step_indices = (
-            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
-            - accept_indices_offset
-        )
-        # extra_buffer: the interval-crossing step whose state must snapshot into
-        # the track ping-pong slot (mirrors the regular commit's
-        # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
-        # `temporal` stays current and no device-side force-flush is needed.
-        mamba_track_indices = batch.mamba_track_indices
-        mamba_steps_to_track = None
-        if mamba_track_indices is not None:
-            ti = mamba_track_grid(batch.tree_cache.page_size)
-            seq_pre = batch.seq_lens
-            seq_post = batch.seq_lens + accept_lens
-            to_track_mask = seq_pre // ti != seq_post // ti
-            tracking_point = seq_post // ti * ti
-            to_track_ith = torch.clamp(tracking_point - seq_pre - 1, min=0).to(
-                torch.int64
-            )
-            candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
-            mamba_steps_to_track = torch.where(
-                to_track_mask, candidate, torch.full_like(candidate, -1)
-            )
+        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
+        ring_indices = None
+        if mamba_pool.replayssm_request_ring:
+            # The ring rows the forward resolved, never the live request table.
+            assert state_slots.ring is not None, "request-scoped ring without rows"
+            ring_indices = state_slots.ring[: replay_state_indices.shape[0]]
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
-            state_batch_indices=state_batch_indices,
+            state_batch_indices=replay_state_indices,
             accept_lens=accept_lens,  # incl. bonus token
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=mamba_track_indices,
+            mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            ring_indices=ring_indices,
         )
         return
 
     attn_backend = model_runner.attn_backend
+    if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+        attn_backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=model_runner.model,
+            req_pool_indices=batch.req_pool_indices[:bs],
+            state_slots=state_slots,
+        )
 
-    # `accept_lens` already includes the bonus token (drafts + 1 per req).
-    if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        if prepared_step_indices is None:
-            last_correct_step_indices, mamba_steps_to_track = (
-                _verify_commit_step_indices(
-                    batch=batch,
-                    accept_index=accept_index,
-                    accept_lens=accept_lens,
-                    draft_token_num=draft_token_num,
-                )
-            )
-        else:
-            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
 
-        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
-            attn_backend.update_mamba_state_after_mtp_verify(
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-                model=model_runner.model,
-                req_pool_indices=batch.req_pool_indices[:bs],
-            )
+def relayed_commit_state_slots(
+    target_worker: TpModelWorker, batch: ScheduleBatch
+) -> Optional[ForwardStateSlots]:
+    """The slots a PP stage's relayed verify commit writes, resolved when it runs:
+    the rows still belong to the batch, but a compaction may have moved the slots."""
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+        ForwardStateSlots,
+    )
+
+    model_runner = target_worker.model_runner
+    if mambaish_config(model_runner.model_config) is None:
+        return None
+    req_pool = model_runner.req_to_token_pool
+    state_ids = model_runner.runner_ids.state_ids(req_pool.state_sub_pool)
+    track = batch.mamba_track_indices
+    return ForwardStateSlots(
+        state_ids.ids(req_pool.get_mamba_indices(batch.req_pool_indices)),
+        None if track is None else state_ids.ids(track),
+        model_runner.runner_ids.request_ids().ids(batch.req_pool_indices),
+    )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:

@@ -8,6 +8,9 @@ suite so the ROCm/HIP build and execution of those kernels are validated on AMD
 hardware, not just CUDA.
 """
 
+import os
+import shutil
+import subprocess
 import sys
 
 import pytest
@@ -18,10 +21,10 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_page_unified,
     transfer_hicache_all_layer_staged_lf_page_unified,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import get_hip_version, is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
@@ -60,6 +63,17 @@ def _token_indices_for_pages(
 
 
 def _pinned_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
     from sglang.srt.mem_cache.pool_host.common import (
         ALLOC_MEMORY_FUNCS,
         alloc_with_pin_memory,
@@ -81,6 +95,17 @@ def _pinned_host_pool(host_pool_cls, **kwargs):
 
 
 def _registered_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
     return host_pool_cls(
         host_to_device_ratio=2.0,
         host_size=0,
@@ -125,7 +150,15 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         enable_memory_saver=False,
     )
     host_pool = _pinned_host_pool(
-        MHATokenToKVPoolHost, device_pool=device_pool, layout="page_first"
+        MHATokenToKVPoolHost,
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+        device_capacity_tokens=device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        write_back_staging=device_pool.hicache_write_back_staging,
+        layout="page_first",
     )
     assert can_use_write_back_jit_kernel(
         element_size=element_dim * host_pool.dtype.itemsize,
@@ -275,11 +308,96 @@ def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> 
     _run_mla(element_dim, page_count)
 
 
+@pytest.mark.skipif(not is_hip(), reason="PAGE_SIZE is already 16 on CUDA.")
+def test_page_first_staged_write_back_page_size_16_hip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "PAGE_SIZE", 16)
+    _run_mha(128, 65)
+    _run_mla(576, 65)
+
+
+_HIP_BATCH_SHIM = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#define HIP_ERROR_NOT_SUPPORTED 801
+
+typedef int (*batch_fn)(void**, void**, size_t*, size_t, void*, size_t*, size_t, size_t*, void*);
+
+int hipMemcpyBatchAsync(void** dsts, void** srcs, size_t* sizes, size_t count, void* attrs,
+                        size_t* attrs_idxs, size_t num_attrs, size_t* fail_idx, void* stream) {
+  batch_fn real = (batch_fn)dlsym(RTLD_NEXT, "hipMemcpyBatchAsync");
+  const char* err = getenv("SHIM_BATCH_ERROR");
+  if (err == NULL) {
+    return real(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, fail_idx, stream);
+  }
+  if (atoi(err) == HIP_ERROR_NOT_SUPPORTED) {
+    /* count 0 sets HIP's last error, as the ROCm 7.1/7.2 rejection does. */
+    real(dsts, srcs, sizes, 0, attrs, attrs_idxs, num_attrs, fail_idx, stream);
+  }
+  const char* idx = getenv("SHIM_BATCH_FAIL_IDX");
+  *fail_idx = idx == NULL ? SIZE_MAX : strtoull(idx, NULL, 10);
+  return atoi(err);
+}
+"""
+
+_HIP_BATCH_SHIM_DRIVER = """
+import os, sys
+import pytest
+sys.path.insert(0, {test_dir!r})
+import test_hicache_page_first_write_back as t
+
+HIP_ERROR_INVALID_VALUE = "1"
+HIP_ERROR_NOT_SUPPORTED = "801"
+
+t.PAGE_SIZE = 16
+os.environ["SHIM_BATCH_ERROR"] = HIP_ERROR_NOT_SUPPORTED
+t._run_mha(128, 65)
+os.environ["SHIM_BATCH_ERROR"] = HIP_ERROR_INVALID_VALUE
+with pytest.raises(Exception, match="hipMemcpyBatchAsync failed"):
+    t._run_mha(128, 65)
+os.environ["SHIM_BATCH_ERROR"] = HIP_ERROR_NOT_SUPPORTED
+os.environ["SHIM_BATCH_FAIL_IDX"] = "3"
+with pytest.raises(Exception, match="failIdx=3 error="):
+    t._run_mha(128, 65)
+"""
+
+
+@pytest.mark.skipif(
+    get_hip_version() < (7, 1) or shutil.which("cc") is None,
+    reason="Injects hipMemcpyBatchAsync results; needs ROCm >= 7.1 and a C compiler.",
+)
+def test_hip_batch_copy_runtime_rejection(tmp_path) -> None:
+    src = tmp_path / "hip_batch_shim.c"
+    shim = tmp_path / "libhip_batch_shim.so"
+    src.write_text(_HIP_BATCH_SHIM)
+    subprocess.run(
+        ["cc", "-shared", "-fPIC", "-o", str(shim), str(src), "-ldl"], check=True
+    )
+    driver = _HIP_BATCH_SHIM_DRIVER.format(test_dir=os.path.dirname(__file__))
+    preload = f"{shim} {os.environ.get('LD_PRELOAD', '')}".strip()
+    result = subprocess.run(
+        [sys.executable, "-c", driver],
+        # With -c, a sglang/ dir in the cwd would be imported as a namespace package.
+        cwd=tmp_path,
+        env={**os.environ, "LD_PRELOAD": preload},
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
 @pytest.mark.parametrize(
     "groups,layers,page_size,heads_per_group,dim",
     [(1, 1, 1, 1, 16), (3, 5, 3, 2, 24), (8, 3, 64, 1, 128)],
 )
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("page_count", [0, 1, 2, 5])
 def test_page_unified_staged_write_back(
@@ -387,7 +505,8 @@ def test_page_unified_write_back_invalid_input(invalid, match):
 @pytest.mark.parametrize(
     "layers,page_size,dim", [(1, 1, 16), (5, 3, 512), (3, 64, 576)]
 )
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("page_count", [0, 1, 2, 5])
 def test_page_unified_mla_staged_write_back(
@@ -589,7 +708,13 @@ def test_registered_mmap_page_first_kernel_operands_and_graph(
         )
         host_pool = _registered_host_pool(
             MHATokenToKVPoolHost,
-            device_pool=device_pool,
+            buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=device_pool.size
+            if device_pool.host_capacity_tokens is None
+            else device_pool.host_capacity_tokens,
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            write_back_staging=device_pool.hicache_write_back_staging,
             layout="page_first",
         )
         host_refs = [host_pool.k_data_refs[0], host_pool.v_data_refs[0]]

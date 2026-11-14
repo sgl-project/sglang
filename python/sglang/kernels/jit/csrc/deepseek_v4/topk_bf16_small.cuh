@@ -85,12 +85,6 @@ struct TopKBF16Params {
   uint32_t page_bits;
 };
 
-SGL_DEVICE uint32_t get_ptx_lane_id() {
-  uint32_t lane_id;
-  asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-  return lane_id;
-}
-
 /// \brief Exclusive suffix scan: lane `L` gets the sum over lanes `> L`.
 SGL_DEVICE uint32_t warp_exclusive_suffix_sum(uint32_t x, uint32_t lane_id) {
   uint32_t inc = x;
@@ -183,7 +177,7 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
 
   const auto bx = blockIdx.x;
   const auto tx = threadIdx.x;
-  const auto lane_id = get_ptx_lane_id();
+  const auto lane_id = warp::get_lane_id();
   const auto warp_id = tx / kWarpThreads;
   const auto topk = params.topk;
   // a selected index i maps through this row's table to slot

@@ -181,7 +181,6 @@ def npu_wrapper_minimax_m3_video_preprocess(func):
     def _preprocess(
         self,
         videos: List[torch.Tensor],
-        do_convert_rgb: bool,
         do_resize: bool,
         size: SizeDict,
         resample: PILImageResampling | InterpolationMode | int | None,

@@ -33,7 +33,7 @@ v0.5.16 or a later version.
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
@@ -59,16 +59,17 @@ Before following this tutorial, complete the environment setup in the documents 
 Before downloading model weights, check the model size to reserve enough disk space.
 For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
+- [Qwen/Qwen3.6-27B](https://www.modelscope.cn/models/Qwen/Qwen3.6-27B) (BF16, 51.77GB)
 - [Eco-Tech/Qwen3.6-27B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8) (W8A8 quantized version, 36.45GB)
 
 <Info>
-The W8A8 variant (36.45GB) fits within a single 64GB die. For single-node deployment, `--tp-size 1` is sufficient on either A2 Series or A3 Series.
+The W8A8 variant (36.45GB) fits within a single 64GB die. For single-node deployment, `--tp-size 1` is sufficient on A3 Series.
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
+For the hardware specifications (memory per die and dies per card),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -80,14 +81,13 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-Both **stable releases** and **daily builds** are available. The following command is based on the stable release tag.
+Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable release yet, so the following
+command uses the validated build tag `cann9.1.0-a3-B105`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-<Tabs>
-  <Tab title="Ascend A3 Series">
-
+{/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tag below to the stable release once it is published. */}
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -115,38 +115,8 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 ```
-
-  </Tab>
-  <Tab title="Ascend A2 Series">
-
-```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-
-docker run -itd --shm-size=16g --name ${NAME} \
---privileged=true --net=host \
--v /var/queue_schedule:/var/queue_schedule \
--v /etc/ascend_install.info:/etc/ascend_install.info \
--v /usr/local/sbin:/usr/local/sbin \
--v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
--v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
---device=/dev/davinci0:/dev/davinci0  \
---device=/dev/davinci1:/dev/davinci1  \
---device=/dev/davinci2:/dev/davinci2  \
---device=/dev/davinci3:/dev/davinci3  \
---device=/dev/davinci4:/dev/davinci4  \
---device=/dev/davinci5:/dev/davinci5  \
---device=/dev/davinci6:/dev/davinci6  \
---device=/dev/davinci7:/dev/davinci7  \
---device=/dev/davinci_manager:/dev/davinci_manager \
---device=/dev/hisi_hdc:/dev/hisi_hdc \
---entrypoint=bash \
-quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-```
-
-  </Tab>
-</Tabs>
 
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
@@ -159,8 +129,122 @@ quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
-deployment commands and benchmark data, see
+with limited hardware resources. Select the tab for the weights you downloaded, then run the script inside the
+container. The two variants differ only in `--quantization modelslim`, which selects the W8A8 checkpoint.
+
+<Tabs>
+  <Tab title="BF16">
+
+Use the `Qwen/Qwen3.6-27B` checkpoint on two A3 Series cards (4 dies), with TP4 and DP attention.
+
+```shell
+# ============================================================
+# Before running, update the following variable:
+#   MODEL_PATH: path to the model weights directory
+# ============================================================
+
+# high performance cpu
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+# cann
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export STREAMS_PER_DEVICE=32
+export HCCL_BUFFSIZE=500
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+
+MODEL_PATH=/path/to/model-weights
+
+sglang serve \
+    --model-path ${MODEL_PATH} \
+    --attention-backend ascend --device npu \
+    --tp-size 4 \
+    --chunked-prefill-size -1 --max-prefill-tokens 16384 \
+    --trust-remote-code \
+    --host 127.0.0.1 --port 6688 \
+    --mem-fraction-static 0.85 \
+    --max-running-requests 64 \
+    --dtype bfloat16 --mamba-ssm-dtype bfloat16 \
+    --enable-multimodal --mm-attention-backend ascend_attn \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --cuda-graph-bs-decode 8 12 16 20 24 32
+```
+
+  </Tab>
+  <Tab title="W8A8">
+
+Use the `Eco-Tech/Qwen3.6-27B-w8a8` checkpoint on two A3 Series cards (4 dies), with TP4 and DP attention.
+
+```shell
+# ============================================================
+# Before running, update the following variable:
+#   MODEL_PATH: path to the model weights directory
+# ============================================================
+
+# high performance cpu
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+# cann
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export STREAMS_PER_DEVICE=32
+export HCCL_BUFFSIZE=500
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+
+MODEL_PATH=/path/to/model-weights
+
+sglang serve \
+    --model-path ${MODEL_PATH} \
+    --attention-backend ascend --device npu \
+    --tp-size 4 \
+    --chunked-prefill-size -1 --max-prefill-tokens 16384 \
+    --trust-remote-code \
+    --host 127.0.0.1 --port 6688 \
+    --mem-fraction-static 0.85 \
+    --max-running-requests 64 \
+    --dtype bfloat16 --mamba-ssm-dtype bfloat16 \
+    --enable-multimodal --mm-attention-backend ascend_attn \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --cuda-graph-bs-decode 8 12 16 20 24 32 \
+    --quantization modelslim
+```
+
+  </Tab>
+</Tabs>
+
+For the complete benchmark data and additional single-node configurations, see
 [Qwen3.6-27B Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#single-node-pd-mixed).
 
 ## Functional verification
@@ -187,7 +271,8 @@ curl http://${HOST}:${PORT}/generate \
 
 Expected result: an HTTP 200 response with the generated text containing "Paris".
 
-For multimodal requests (text + image):
+For multimodal requests (text + image). The example image URL is fetched by the server at request time, so the server
+needs internet access; otherwise, replace it with a local image path or any URL reachable from the server:
 
 ```shell
 # ============================================================

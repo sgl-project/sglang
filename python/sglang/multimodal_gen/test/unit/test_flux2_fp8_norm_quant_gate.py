@@ -3,30 +3,14 @@
 import unittest
 from types import SimpleNamespace
 
-import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
-    ModelOptFp8LinearMethod,
-)
 from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
     Flux2SingleTransformerBlock,
     Flux2TransformerBlock,
 )
+from sglang.multimodal_gen.test.unit.modelopt_fp8_stub import fp8_linear
 from sglang.test.test_utils import CustomTestCase
-
-
-def _fp8_linear(input_scale: float) -> nn.Module:
-    linear = nn.Module()
-    linear.quant_method = object.__new__(ModelOptFp8LinearMethod)
-    linear.register_parameter(
-        "input_scale",
-        nn.Parameter(
-            torch.tensor(input_scale, dtype=torch.float32, device="cuda"),
-            requires_grad=False,
-        ),
-    )
-    return linear
 
 
 def _double_block(scales: tuple[float, float, float]) -> Flux2TransformerBlock:
@@ -35,15 +19,15 @@ def _double_block(scales: tuple[float, float, float]) -> Flux2TransformerBlock:
     block.attn = SimpleNamespace(
         use_fused_qkv=False,
         use_fused_added_qkv=False,
-        to_q=_fp8_linear(scales[0]),
-        to_k=_fp8_linear(scales[1]),
-        to_v=_fp8_linear(scales[2]),
-        add_q_proj=_fp8_linear(scales[0]),
-        add_k_proj=_fp8_linear(scales[1]),
-        add_v_proj=_fp8_linear(scales[2]),
+        to_q=fp8_linear(scales[0]),
+        to_k=fp8_linear(scales[1]),
+        to_v=fp8_linear(scales[2]),
+        add_q_proj=fp8_linear(scales[0]),
+        add_k_proj=fp8_linear(scales[1]),
+        add_v_proj=fp8_linear(scales[2]),
     )
-    block.ff = SimpleNamespace(linear_in=_fp8_linear(scales[0]))
-    block.ff_context = SimpleNamespace(linear_in=_fp8_linear(scales[0]))
+    block.ff = SimpleNamespace(linear_in=fp8_linear(scales[0]))
+    block.ff_context = SimpleNamespace(linear_in=fp8_linear(scales[0]))
     block._fp8_img_attn_norm_quant = False
     block._fp8_txt_attn_norm_quant = False
     block._fp8_img_ff_norm_quant = False
@@ -67,7 +51,7 @@ class TestFlux2Fp8NormQuantGate(CustomTestCase):
     def test_single_block_uses_merged_projection_scale(self) -> None:
         block = object.__new__(Flux2SingleTransformerBlock)
         nn.Module.__init__(block)
-        block.attn = SimpleNamespace(to_qkv_mlp_proj=_fp8_linear(0.25))
+        block.attn = SimpleNamespace(to_qkv_mlp_proj=fp8_linear(0.25))
         block._fp8_norm_quant = False
 
         block.configure_fp8_norm_quant()

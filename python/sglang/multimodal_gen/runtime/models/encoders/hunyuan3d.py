@@ -33,7 +33,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return np.concatenate([emb_sin, emb_cos], axis=1)
 
 
-# transformers 5.19 renamed Dinov2's attention projections and split its SwiGLU input
+# transformers 5.18 renamed Dinov2's attention projections and split its SwiGLU input
 # projection into gate/up. from_pretrained remaps legacy checkpoints on its own, but
 # Hunyuan3D builds Dinov2Model from a config and loads its own state dict, where a
 # non-strict load would silently leave these weights randomly initialized.
@@ -48,7 +48,7 @@ _DINOV2_LEGACY_RENAMES = (
 
 def _remap_legacy_dinov2_keys(module, state_dict, prefix, *args):
     if not hasattr(module.encoder.layer[0].attention, "q_proj"):
-        return  # transformers < 5.19 still uses the checkpoint's layout
+        return  # transformers < 5.18 still uses the checkpoint's layout
     layer_prefix = prefix + "encoder.layer."
     for key in [k for k in state_dict if k.startswith(layer_prefix)]:
         for old, new in _DINOV2_LEGACY_RENAMES:

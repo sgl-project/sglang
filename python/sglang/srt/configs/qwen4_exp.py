@@ -85,7 +85,8 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
             return [
                 (
                     "attention"
-                    if layer_type in ("full_attention", "qwen_sparse_attention")
+                    if layer_type
+                    in ("full_attention", "qwen_sparse_attention", "indexed_attention")
                     else layer_type
                 )
                 for layer_type in self.layer_types

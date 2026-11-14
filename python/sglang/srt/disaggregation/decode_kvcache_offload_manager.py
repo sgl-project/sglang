@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict
 from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
@@ -12,6 +12,12 @@ import torch
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    ReqList,
+    move,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -21,15 +27,15 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    build_hybrid_swa_stack,
     build_kv_host_pool,
+    build_unified_host_stack,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
@@ -39,6 +45,9 @@ from sglang.srt.runtime_context import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +61,14 @@ class DecodeKVCacheOffloadManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
+        request_retirer: RequestRetirer,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = get_schedule().page_size
         self.request_counter = 0
         self.tree_cache = tree_cache
+        self.request_retirer = request_retirer
         env_stride = envs.SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE.get()
         if env_stride is None or env_stride <= 0:
             self.offload_stride = self.page_size
@@ -80,17 +91,13 @@ class DecodeKVCacheOffloadManager:
                 )
 
         self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(self.kv_cache, UnifiedSWAKVPool):
-            full_mapping = {
-                gid: lid
-                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
-                if not is_swa
-            }
-            swa_mapping = {
-                gid: lid
-                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
-                if is_swa
-            }
+        router = self.kv_cache.layer_router
+        # A unified pool's window sub-pool: its pages are bound per virtual page.
+        self._unified_window = (
+            self.token_to_kv_pool_allocator.hands_out_virtual_ids
+            and router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        )
+        if self._unified_window:
             params = CacheInitParams(
                 disable=False,
                 req_to_token_pool=self.req_to_token_pool,
@@ -98,25 +105,23 @@ class DecodeKVCacheOffloadManager:
                 page_size=self.page_size,
                 tp_cache_group=tp_group,
             )
-            self.decode_host_mem_pool, self.cache_controller = build_hybrid_swa_stack(
+            stack = build_unified_host_stack(
+                storage=self.token_to_kv_pool_allocator.storage,
                 params=params,
-                full_kv_pool=self.kv_cache.full_kv_pool,
-                swa_kv_pool=self.kv_cache.swa_kv_pool,
-                full_layer_mapping=full_mapping,
-                swa_layer_mapping=swa_mapping,
+                cache=None,
                 load_cache_event=threading.Event(),
                 storage_backend=get_memory().hicache_storage_backend,
-                use_mla=False,
                 model_name=get_serving().served_model_name,
                 storage_backend_extra_config=hicache_storage_backend_extra_config,
             )
+            self.decode_host_mem_pool = stack.host_pool_group
+            self.cache_controller = stack.cache_controller
         else:
             if not isinstance(self.kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
                 raise ValueError("Unsupported KV cache type for decode offload")
             self.decode_host_mem_pool = build_kv_host_pool(
                 kv_pool=self.kv_cache,
                 page_size=self.page_size,
-                use_mla=isinstance(self.kv_cache, MLATokenToKVPool),
             )
             self.cache_controller = HiCacheController(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -136,7 +141,12 @@ class DecodeKVCacheOffloadManager:
         # in flight); weak keys so a dropped Req is never pinned here.
         self.offloaded_state: WeakKeyDict[Req, OffloadedState] = WeakKeyDict()
         self.offload_inflight: WeakKeyDict[Req, int] = WeakKeyDict()
+        # Finished requests whose release waits for their offloads in flight.
+        self.offloading_reqs = IndexedReqList(ListKind.PD_OFFLOADING)
         logger.info("Enable offload kv cache for decode side")
+
+    def request_lists(self) -> Dict[ListKind, ReqList]:
+        return {ListKind.PD_OFFLOADING: self.offloading_reqs}
 
     def release_host_resources(self) -> None:
         self.decode_host_mem_pool.destroy()
@@ -158,28 +168,26 @@ class DecodeKVCacheOffloadManager:
         # Page-aligned prompt length; the prefill instance offloaded this part.
         return len(req.origin_input_ids) // self.page_size * self.page_size
 
-    def has_inflight_device_transfer(self) -> bool:
-        """Whether a device-to-host copy may still read unified KV pages."""
-        return bool(self.ongoing_offload)
-
     def _resolve_offload_transfers(
         self, virtual_indices: torch.Tensor
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
         full_indices = virtual_indices
-        if not isinstance(self.kv_cache, UnifiedSWAKVPool):
+        if not self._unified_window:
             return full_indices, []
 
-        swa_indices = self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+        window = self.kv_cache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name
+        swa_indices = self.token_to_kv_pool_allocator.id_spaces()[window].ids(
             virtual_indices
         )
         # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
-        live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
-        if live_swa_indices.numel() == 0:
+        # Window rows go by the owner's ids; the copy translates them.
+        live_indices = virtual_indices[swa_indices > 0].to(torch.int64)
+        if live_indices.numel() == 0:
             return full_indices, []
         return full_indices, [
             PoolTransfer(
                 name=PoolName.SWA,
-                device_indices=live_swa_indices,
+                device_indices=live_indices,
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]
@@ -330,27 +338,14 @@ class DecodeKVCacheOffloadManager:
                 if req in self.offloaded_state:
                     self.offloaded_state[req].last_hash = last_hash
 
-                if req.finished() and not self._has_inflight_offload(req):
+                if req in self.offloading_reqs and not self._has_inflight_offload(req):
                     self._release_finished_req(req)
             finish_count -= 1
 
     def _release_finished_req(self, req: Req):
-        # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
-        # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (double free, double unlock).
-        if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
-            return
-
-        # Released only at request finish; a mid-decode free races with
-        # concurrent admission over live slots. The prefix the prealloc match
-        # took from the tree stays with the tree: not freed, only unlocked.
-        self.tree_cache.free_kv_row(
-            req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
-        )
-        self.tree_cache.unlock(req.lock)
-        req.lock = None
-        self.req_to_token_pool.free(req)
-        req.kv.mark_kv_released()
+        # Only at finish: a mid-decode free races with admission over live slots.
+        # No checkpoint: the offloaded host copy keeps this KV, not the tree.
+        self.request_retirer.release(req, checkpoint=False)
         self.offloaded_state.pop(req, None)
 
     def _check_backup_progress(self, finish_count):
@@ -412,7 +407,7 @@ class DecodeKVCacheOffloadManager:
         return page_hashes
 
     def finalize_release_on_finish(self, req: Req):
-        """Free any remaining tail KV that was not offloaded due to non-aligned length."""
         if self._has_inflight_offload(req):
+            move([req], self.offloading_reqs)
             return
         self._release_finished_req(req)

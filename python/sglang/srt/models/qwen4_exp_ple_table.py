@@ -14,7 +14,8 @@ rows straight from a host pointer. Two backends provide that pointer:
     model weights and ``pinned`` therefore frees nothing: Qwen3.8-Flash-Next is
     126.0 GiB of weights on a 121.63 GiB box and does not boot with ``pinned``.
     The kernel dereferences the pageable pointer directly, which only works on
-    devices that report ``cudaDevAttrPageableMemoryAccessUsesHostPageTables``;
+    devices that report ``cudaDevAttrPageableMemoryAccess`` (GB10 through the
+    host page tables, a discrete GPU on the open kernel modules through HMM);
     rows are paged in from storage on demand, the file is sparse, deterministic
     in name and reused across restarts, and gathers of prefill size hint the
     page cache (``posix_fadvise(WILLNEED)``) so page faults are served
@@ -51,7 +52,7 @@ _SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 PLE_OFFLOAD_BACKENDS = ("pinned", "file")
 
 # cudaDeviceAttr enum values (cuda_runtime_api.h).
-_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
+_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS = 88
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
 _PAGE_SHIFT = 12
@@ -326,19 +327,19 @@ def check_file_backend_supported(device_index: int = 0) -> None:
             "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK"
         )
         return
-    supported = device_uses_host_page_tables(device_index)
+    supported = device_reads_pageable_memory(device_index)
     if supported is None:
         raise RuntimeError(
             "--ple-offload-backend file: could not query "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables. Set "
+            "cudaDevAttrPageableMemoryAccess. Set "
             "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 only if you know the "
-            "device reads pageable host memory through the host page tables."
+            "device reads pageable host memory."
         )
     if not supported:
         raise ValueError(
-            "--ple-offload-backend file needs a device whose pageable host "
-            "memory accesses go through the host page tables (unified-memory "
-            "parts such as GB10). This device reports it does not; use "
+            "--ple-offload-backend file needs a device that reads pageable "
+            "host memory (GB10, or a discrete GPU with HMM on the open kernel "
+            "modules). This device reports it does not; use "
             "--ple-offload-backend pinned."
         )
 
@@ -366,7 +367,7 @@ def ple_table_file_name(
     return f"ple_table_{dims}_{str(dtype).replace('torch.', '')}_{numel * elem}B{suffix}.bin"
 
 
-def device_uses_host_page_tables(device_index: int = 0) -> Optional[bool]:
+def device_reads_pageable_memory(device_index: int = 0) -> Optional[bool]:
     """Whether pageable host memory is directly addressable by the GPU.
 
     Returns None when the CUDA runtime library cannot be queried.
@@ -397,9 +398,7 @@ def device_uses_host_page_tables(device_index: int = 0) -> Optional[bool]:
             value = ctypes.c_int()
             rc = cudart.cudaDeviceGetAttribute(
                 ctypes.byref(value),
-                ctypes.c_int(
-                    _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
-                ),
+                ctypes.c_int(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS),
                 ctypes.c_int(device_index),
             )
             if rc == 0:

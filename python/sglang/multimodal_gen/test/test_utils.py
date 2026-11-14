@@ -37,12 +37,17 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "75992dbf1d6eaeacbc1c2cd6beb48f77dd7ae4f7"
+SGL_TEST_FILES_CI_DATA_REVISION = "62f587d8f3321a1b8a679a2339df8eeb20319b54"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
-# when it's regenerated on its own cadence.
+# when it's regenerated on its own cadence. 2173af2f re-generated the MiniMax-H3
+# frames after #38671 made num_inference_steps=50 run 50 denoising updates
+# (previously 49). The regeneration must run on a branch where
+# pin_consistency_quality=False for this case (npu_diffusion_ci_fixes_2): generating
+# on main pins quality='exact', which disables MiniMax-H3's env-selected Cache-DiT
+# and produces a golden from a different code path than the test runs.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "609c4cef31864d75dbd11fe3c26b8ae09469204d"
+    SGL_TEST_FILES_CI_DATA_REVISION = "09d116eac094de57eaac167210271e88cd981a01"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
@@ -181,7 +186,6 @@ DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Layered"
 DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST = "jdopensource/JoyAI-Image-Edit-Diffusers"
 
 # FLUX image generation models
-DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.1-dev"
 DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.2-dev"
 DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.2-klein-4B"
 DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST = (
@@ -202,6 +206,9 @@ DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-T2V-A14B-Diffusers
 DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
 DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST = (
     "Wan-AI/Wan2.2-Animate-2-14B-Diffusers"
+)
+DEFAULT_WAN_2_2_ANIMATE_2_14B_DISTILLED_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers"
 )
 
 # MOVA video generation models

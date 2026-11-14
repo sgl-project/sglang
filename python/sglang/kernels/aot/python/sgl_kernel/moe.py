@@ -94,6 +94,22 @@ def moe_sum_reduce(
     )
 
 
+def apply_gguf_moe_weights(
+    outputs: torch.Tensor,
+    weights: torch.Tensor,
+    ids: torch.Tensor,
+) -> None:
+    """Weight contiguous [tokens * topk, hidden_size] expert outputs in place.
+
+    Weights and IDs are strided [tokens, topk] tensors on the same device.
+    Outputs and weights independently support float16, bfloat16, and float32;
+    IDs support int32 or int64. Negative IDs write zero without reading the
+    corresponding output or weight. Valid products round to the output dtype.
+    Outputs must not overlap weights or IDs.
+    """
+    torch.ops.sgl_kernel.apply_gguf_moe_weights.default(outputs, weights, ids)
+
+
 def moe_sum(
     input_tensor: torch.Tensor,
     output_tensor: torch.Tensor,

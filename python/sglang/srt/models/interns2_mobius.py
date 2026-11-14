@@ -10,6 +10,7 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusConfig,
     InternS2MobiusTextConfig,
 )
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -40,6 +41,8 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -53,8 +56,7 @@ from sglang.srt.models.qwen3_5 import (
     _linear_accepts_fp8_tuple,
 )
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -339,6 +341,10 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
             # The layer-local shared path consumes the same post-attention input.
             inplace=False,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
@@ -559,6 +565,11 @@ class InternS2MobiusAttentionDecoderLayer(
         self.rope_theta, rope_scaling = get_rope_config(config)
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
+        # Inherited forward_prepare_npu reads this. Mobius is never PP-split and its
+        # schedule is layer_types, not full_attention_interval.
+        self.refreshes_rope_cos_sin = layer_id == config.layer_types.index(
+            "full_attention"
+        )
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
             rope_scaling = None
         self.attn_output_gate = getattr(config, "attn_output_gate", True)

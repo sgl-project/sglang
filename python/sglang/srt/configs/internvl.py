@@ -1,4 +1,5 @@
 import copy
+import logging
 import os
 from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -15,7 +16,7 @@ from transformers import (
     Qwen3MoeConfig,
 )
 
-from sglang.utils import logger
+logger = logging.getLogger(__name__)
 
 # Copied from: https://github.com/OpenGVLab/InternVL/blob/34a81000402bf8f716bab8c9b57aff1f6b436bd0/internvl_chat/internvl/model/internvl_chat/configuration_internvl_chat.py#L21
 

@@ -42,6 +42,12 @@ from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     jinja_template_may_reorder_tool_results,
 )
+from sglang.srt.parser.python_chat_template import (
+    PythonChatTemplate,
+    get_python_chat_template,
+    install_python_chat_template,
+    resolve_python_chat_template,
+)
 from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
@@ -73,11 +79,17 @@ class TemplateManager:
         self._suggested_reasoning_parser: Optional[str] = None
         self._suggested_tool_call_parser: Optional[str] = None
         self._jinja_template_may_reorder_tool_results: bool = False
+        self._python_chat_template: Optional[PythonChatTemplate] = None
 
     @property
     def chat_template_name(self) -> Optional[str]:
         """Get the current chat template name."""
         return self._chat_template_name
+
+    @property
+    def python_chat_template(self) -> Optional[PythonChatTemplate]:
+        """The Python chat template rendering prompts in place of Jinja, if any."""
+        return self._python_chat_template
 
     @property
     def completion_template_name(self) -> Optional[str]:
@@ -140,6 +152,16 @@ class TemplateManager:
             ctx, TOOL_CALL_PARSER_RULES, "tool-call parser"
         )
 
+    def _use_python_template_features(self, template: PythonChatTemplate) -> None:
+        """Take the features detection derives from a Jinja source from ``template``."""
+        self._jinja_template_may_reorder_tool_results = (
+            template.may_reorder_tool_results
+        )
+        self._force_reasoning = template.force_reasoning
+        self._reasoning_config = template.reasoning_config
+        self._suggested_reasoning_parser = template.reasoning_parser
+        self._suggested_tool_call_parser = template.tool_call_parser
+
     def load_chat_template(
         self,
         tokenizer_manager: TokenizerManager,
@@ -164,10 +186,15 @@ class TemplateManager:
             if self._chat_template_name is None:
                 # Try HuggingFace template first
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
-                if hf_template:
+                if hf_template and tokenizer_manager.tokenizer:
                     # override the chat template
-                    if tokenizer_manager.tokenizer:
-                        tokenizer_manager.tokenizer.chat_template = hf_template
+                    tokenizer_manager.tokenizer.chat_template = hf_template
+                python_template = resolve_python_chat_template(
+                    tokenizer_manager.model_config.hf_config, hf_template
+                )
+                if python_template is not None:
+                    self._load_python_chat_template(tokenizer_manager, python_template)
+                elif hf_template:
                     self._jinja_template_content_format = (
                         detect_jinja_template_content_format(hf_template)
                     )
@@ -183,8 +210,11 @@ class TemplateManager:
 
         # Detect reasoning pattern and suggest parser from chat template
         if tokenizer_manager.tokenizer:
-            template = tokenizer_manager.tokenizer.chat_template
-            self._run_template_detection(template, tokenizer_manager.tokenizer)
+            if self._python_chat_template is not None:
+                self._use_python_template_features(self._python_chat_template)
+            else:
+                template = tokenizer_manager.tokenizer.chat_template
+                self._run_template_detection(template, tokenizer_manager.tokenizer)
             parts = []
             if self._reasoning_config:
                 parts.append(f"reasoning_config={self._reasoning_config}")
@@ -203,6 +233,11 @@ class TemplateManager:
 
         if chat_template_exists(chat_template_arg):
             self._chat_template_name = chat_template_arg
+            return
+
+        python_template = get_python_chat_template(chat_template_arg)
+        if python_template is not None:
+            self._load_python_chat_template(tokenizer_manager, python_template)
             return
 
         if not os.path.exists(chat_template_arg):
@@ -272,6 +307,20 @@ class TemplateManager:
         # Load completion template
         if completion_template:
             self.load_completion_template(completion_template)
+
+    def _load_python_chat_template(
+        self, tokenizer_manager: TokenizerManager, template: PythonChatTemplate
+    ) -> None:
+        """Render chat prompts with a built-in Python chat template."""
+        if tokenizer_manager.tokenizer is not None:
+            install_python_chat_template(tokenizer_manager.tokenizer, template)
+        self._python_chat_template = template
+        self._chat_template_name = None
+        self._jinja_template_content_format = template.content_format
+        logger.info(
+            f"Using Python chat template '{template.name}' in place of the Jinja "
+            f"chat template, content format: {template.content_format}"
+        )
 
     def _load_jinja_template(
         self, tokenizer_manager: TokenizerManager, template_path: str

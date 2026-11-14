@@ -122,7 +122,7 @@ backend.
       <td>MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to <code>fp8</code> / <code>mxfp4</code> dynamically.</td>
     </tr>
     <tr>
-      <td><code>convrot_int8</code> (online quantization; <code>kitchen_int8</code> is a deprecated alias)</td>
+      <td><code>convrot_int8</code> (online quantization)</td>
       <td>Unquantized BF16/FP16 checkpoint</td>
       <td><code>--component-quantizations.&lt;component&gt; convrot_int8</code></td>
       <td>MiniMax-H3, Qwen-Image, Qwen-Image-Edit (quality-validated); other BF16 DiTs load but are not quality-validated</td>
@@ -391,7 +391,7 @@ sglang generate \
 
 ### ConvRot INT8
 
-`convrot_int8` (formerly `kitchen_int8`, still accepted as a deprecated alias)
+`convrot_int8`
 is online W8A8 INT8 for DiTs and compatible native encoders:
 every linear whose input dim is divisible by the Hadamard group size (256) is
 rotated and quantized per output channel after loading a stock BF16 checkpoint
@@ -498,10 +498,12 @@ for the 24 GB offload recipe, including why `vae` must stay out of
 `--layerwise-offload-components`.
 </Warning>
 
-With the `comfy_kitchen` backend, large-M GEMMs (`rows > 8192` and
-`out_features >= 8192`) are split by rows so the fused kernel stays on the
-data-parallel CUTLASS config. Override the thresholds with
-`SGLANG_KITCHEN_INT8_MAX_ROWS` and `SGLANG_KITCHEN_INT8_MIN_SPLIT_N`.
+With the `comfy_kitchen` backend, each GEMM is one fused call by default.
+`SGLANG_KITCHEN_INT8_MAX_ROWS=N` splits large-M GEMMs (`rows > N` and
+`out_features >= SGLANG_KITCHEN_INT8_MIN_SPLIT_N`, default 8192) into N-row
+calls, which keeps them on comfy_kitchen's data-parallel CUTLASS config; on
+MiniMax-H3 with comfy-kitchen 0.2.37 the extra calls and output copies cost more
+than they save.
 
 ### Skipping Layers
 

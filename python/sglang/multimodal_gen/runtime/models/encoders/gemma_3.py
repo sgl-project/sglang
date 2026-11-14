@@ -282,17 +282,6 @@ class Gemma3Attention(nn.Module):
             is_neox_style=True,
         )
 
-        # Local Attention not support attention mask, we use global attention instead.
-        # self.attn = LocalAttention(
-        #     self.num_heads,
-        #     self.head_dim,
-        #     self.num_kv_heads,
-        #     softmax_scale=self.scaling,
-        #     causal=True,
-        #     supported_attention_backends=config._supported_attention_backends,
-        #     window_size=self.window_size,
-        # )
-
         # Gemma3 adds normalization for q and k
         self.q_norm = Gemma3RMSNorm(
             dim=self.head_dim, eps=config.text_config.rms_norm_eps
@@ -482,21 +471,6 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = residual_mlp + hidden_states
 
         return hidden_states, None
-
-
-class Gemma3TextScaledWordEmbedding(nn.Embedding):
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: int,
-        embed_scale: Optional[float] = 1.0,
-    ):
-        super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.embed_scale = embed_scale
-
-    def forward(self, input_ids: torch.Tensor):
-        return super().forward(input_ids) * self.embed_scale
 
 
 class Gemma3MultiModalProjector(nn.Module):

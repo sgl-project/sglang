@@ -107,17 +107,3 @@ def test_rotary_cast_preserves_rounding_and_autograd(device, dtype, strided):
         torch.testing.assert_close(
             kandinsky6._apply_rotary(x, rope, dtype), expected, rtol=0, atol=0
         )
-
-
-@torch.no_grad()
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None,
-    reason="CUDA required",
-)
-def test_gate_sum_preserves_fp32_intermediates():
-    x = torch.randn(2, 257, 128, dtype=torch.bfloat16, device="cuda")
-    update = torch.randn_like(x)
-    gate = torch.randn(2, 1, 1152, dtype=x.dtype, device=x.device)[..., 256:384]
-    expected = (x.float() + gate.float() * update.float()).to(x.dtype)
-    assert not torch.equal(expected, x + gate * update)
-    assert torch.equal(kandinsky6.residual_gate_fp32(x, update, gate), expected)

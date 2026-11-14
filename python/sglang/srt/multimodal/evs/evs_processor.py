@@ -13,14 +13,18 @@
 # ==============================================================================
 
 
+import logging
+
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.utils import logger
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.modality import Modality
 
 from .evs_core import tokens_per_frame
 from .evs_module import EVS, EVSConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _non_evs_data_items(

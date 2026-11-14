@@ -9,6 +9,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnB
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendAttnBackend,
 )
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -44,8 +45,14 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
         backend.is_hybrid_swa = True
         backend.use_sliding_window_kv_pool = False
         backend.use_mla = False
+        backend.use_quant_flash_attn = False
+        backend.use_flash_mla = False
+        backend.use_paged_mtp = False
+        backend.dense_mla_dcp_target = False
+        backend.dsa_dcp_target = False
         backend._dsv4_unique_compress_ratios = [4, 128]
         backend._dsv4_compress_ratios = [4, 128]
+        backend._is_dspark_algorithm = False
 
     def batch(self, seq_len, max_context=None, mode=ForwardMode.EXTEND):
         lengths = [seq_len] if isinstance(seq_len, int) else list(seq_len)
@@ -144,6 +151,7 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
     def test_prefix_replay_metadata_keeps_live_query_and_history_lengths(self):
         runner = SimpleNamespace(
             _is_full_backend=False,
+            _dcp_extend_active=False,
             use_captured_attn_metadata=False,
             model_runner=SimpleNamespace(attn_backend=self.backend),
         )
@@ -152,7 +160,7 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
             patch.object(
                 self.backend, "init_forward_metadata", side_effect=self.init_metadata
             ) as init_metadata,
-            patch.object(self.backend, "prepare_prefill_shared_read_snapshot"),
+            patch.object(self.backend, "resolve_prefill_shared_read_ends"),
         ):
             PrefillCudaGraphRunner._prepare_forward_metadata_for_replay(
                 runner,
@@ -237,6 +245,7 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
     def test_replay_metadata_keeps_graph_limit_off_serving_batch(self):
         runner = SimpleNamespace(
             _is_full_backend=False,
+            _dcp_extend_active=False,
             use_captured_attn_metadata=False,
             model_runner=SimpleNamespace(attn_backend=self.backend),
         )
@@ -251,18 +260,23 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
                         side_effect=self.init_metadata,
                     ) as init_metadata,
                     patch.object(
-                        self.backend, "prepare_prefill_shared_read_snapshot"
+                        self.backend,
+                        "resolve_prefill_shared_read_ends",
+                        return_value=SharedReadEnds.PRE_REPLAY,
                     ) as snapshot,
                 ):
-                    PrefillCudaGraphRunner._prepare_forward_metadata_for_replay(
-                        runner, batch, static_batch, SimpleNamespace(size=512)
+                    read_ends = (
+                        PrefillCudaGraphRunner._prepare_forward_metadata_for_replay(
+                            runner, batch, static_batch, SimpleNamespace(size=512)
+                        )
                     )
                 metadata_batch = init_metadata.call_args.args[0]
                 self.assertIsNot(metadata_batch, batch)
                 self.assertIs(metadata_batch.seq_lens, batch.seq_lens)
                 self.assertEqual(metadata_batch.max_seq_len_override, 384)
                 self.assertIsNone(batch.max_seq_len_override)
-                snapshot.assert_called_once_with(metadata_batch, num_qo_tokens=512)
+                snapshot.assert_called_once_with(metadata_batch, build_snapshot=True)
+                self.assertIs(read_ends, SharedReadEnds.PRE_REPLAY)
                 metadata = self.backend.forward_metadata
                 self.assertEqual(metadata.block_tables.shape, (len(lengths), 3))
                 self.assertEqual(metadata.c4_page_table.shape, (len(lengths), 3))
@@ -272,6 +286,7 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
         batch = self.batch(256)
         runner = SimpleNamespace(
             _is_full_backend=False,
+            _dcp_extend_active=False,
             use_captured_attn_metadata=False,
             model_runner=SimpleNamespace(attn_backend=self.backend),
         )
@@ -290,11 +305,13 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
     def test_context_limit_is_per_request_including_prefix(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner._captured_attn_metadata_max_bs = None
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = Backend.BREAKABLE
         runner.has_mha_companion_layers = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.max_context_size = 384
+        runner.max_seq_len = None
         runner.max_num_tokens = 512
         runner.capture_num_tokens = [128, 256, 384, 512]
         for lengths, prefix_lengths, num_tokens, expected in (

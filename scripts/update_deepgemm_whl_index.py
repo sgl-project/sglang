@@ -26,7 +26,7 @@ def update_wheel_index(cuda_version, wheel_dir):
         if not match:
             continue
         ver = match.group(1)
-        full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
+        full_url = f"{base_url}/sgl-deep-gemm-v{ver}/{path.name}#sha256={sha256}"
         with (index_dir / "index.html").open("a") as f:
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
 

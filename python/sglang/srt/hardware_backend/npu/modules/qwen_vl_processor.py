@@ -1,5 +1,6 @@
 import torch
 import torchvision.transforms.v2.functional as tvF
+from transformers.image_processing_backends import TorchvisionBackend
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_transforms import group_images_by_shape, reorder_images
 from transformers.image_utils import (
@@ -8,7 +9,9 @@ from transformers.image_utils import (
     SizeDict,
     get_image_size,
 )
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
+    smart_resize as smart_resize_image,
+)
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
     smart_resize as smart_resize_video,
 )
@@ -86,16 +89,19 @@ def npu_wrapper_preprocess(func):
         )
         resized_images_grouped = {}
         for shape, stacked_images in grouped_images.items():
-            height, width = stacked_images.shape[-2:]
             if do_resize:
-                resized_height, resized_width = smart_resize(
+                height, width = stacked_images.shape[-2:]
+                resized_height, resized_width = smart_resize_image(
                     height,
                     width,
                     factor=patch_size * merge_size,
                     min_pixels=size.shortest_edge,
                     max_pixels=size.longest_edge,
                 )
-                stacked_images = self.resize(
+                # Qwen-specific resize overrides differ across Transformers
+                # versions. Pass explicit dimensions to the common backend.
+                stacked_images = TorchvisionBackend.resize(
+                    self,
                     image=stacked_images,
                     size=SizeDict(height=resized_height, width=resized_width),
                     resample=resample,
@@ -193,26 +199,24 @@ def npu_wrapper_video_preprocess(func):
         resized_videos_grouped = {}
 
         for shape, stacked_videos in grouped_videos.items():
-            B, T, C, H, W = stacked_videos.shape
-            num_frames, height, width = T, H, W
             if do_resize:
+                batch_size, num_frames, channels, height, width = stacked_videos.shape
                 resized_height, resized_width = smart_resize_video(
                     num_frames=num_frames,
                     height=height,
                     width=width,
-                    temporal_factor=temporal_patch_size,
                     factor=patch_size * merge_size,
+                    temporal_factor=temporal_patch_size,
                     min_pixels=size.shortest_edge,
                     max_pixels=size.longest_edge,
                 )
-                stacked_videos = stacked_videos.view(B * T, C, H, W)
-                stacked_videos = self.resize(
-                    stacked_videos,
+                stacked_videos = TorchvisionBackend.resize(
+                    self,
+                    image=stacked_videos.reshape(-1, channels, height, width),
                     size=SizeDict(height=resized_height, width=resized_width),
                     resample=resample,
-                )
-                stacked_videos = stacked_videos.view(
-                    B, T, C, resized_height, resized_width
+                ).reshape(
+                    batch_size, num_frames, channels, resized_height, resized_width
                 )
             resized_videos_grouped[shape] = stacked_videos
         resized_videos = reorder_videos(resized_videos_grouped, grouped_videos_index)

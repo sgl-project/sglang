@@ -121,9 +121,14 @@ def _kernel_views(workspace):
 
 def fp8_attention(q, k, v, softmax_scale=None):
     """Attention over strided [S, H, 128] BF16 views; returns (output [S, H, 128], lse [H, S])."""
+    return _fp8_attention(q, k, v, softmax_scale, block_scaled_mma=True)
+
+
+def _fp8_attention(q, k, v, softmax_scale, block_scaled_mma):
+    # block_scaled_mma is not a user option: the output is bit-equal either way.
     scale = validate_inputs(q, k, v, softmax_scale)
     kernel_scale = cutlass.Float32(scale)
-    key = kernel_key(q)
+    key = (*kernel_key(q), block_scaled_mma)
 
     with torch.cuda.device(q.device):
         workspace = _allocate_workspace(q)
@@ -137,7 +142,13 @@ def fp8_attention(q, k, v, softmax_scale=None):
                 q.shape[0],
                 q.shape[1],
             )
-            compiled = cute.compile(fp8_attention_host, *views, kernel_scale, stream)
+            compiled = cute.compile(
+                fp8_attention_host,
+                *views,
+                kernel_scale,
+                stream,
+                block_scaled_mma=block_scaled_mma,
+            )
             _KERNEL_CACHE[key] = compiled
 
         fused_prepare(

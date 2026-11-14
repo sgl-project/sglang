@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
+from torch import nn
 
+from sglang.kernels.ops import diffusion as diffusion_ops
+from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
     apply_convrot_int8_shared_input,
     convrot_int8_shares_input,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def modulate(
@@ -26,6 +32,39 @@ def modulate(
     if scale is None:
         return x + shift.unsqueeze(1)  # type: ignore[union-attr]
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def layernorm_modulate_bitexact(
+    gate: BitExactFusionGate,
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    reference: Callable[[], torch.Tensor],
+    *,
+    sig: Any = None,
+) -> torch.Tensor:
+    """Single-kernel ``LN(x) * (1 + scale) + shift`` for an affine-free LayerNorm.
+
+    ``scale`` / ``shift`` are the ``(B, D)`` modulation rows and ``reference``
+    is the model's eager chain. The kernel replicates the BF16 aten LayerNorm
+    reduction, so ``gate`` verifies it against ``reference`` per its mode.
+    """
+    if not (
+        x.is_cuda
+        and diffusion_ops.is_plain_layer_norm(norm, x.shape[-1])
+        and diffusion_ops.can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
+    ):
+        return reference()
+    # The raw launch skips the custom-op dispatch, which compile tracing needs.
+    kernel = (
+        diffusion_ops.fused_layernorm_modulate
+        if torch.compiler.is_compiling()
+        else diffusion_ops.fused_layernorm_modulate_raw
+    )
+    return gate.run(
+        lambda: kernel(x, scale, shift, norm.eps), reference, sig=sig, logger=logger
+    )
 
 
 def _project_shared_input(
