@@ -317,6 +317,33 @@ class SRTPlatform(DeviceMixin):
         pass
 
     # ------------------------------------------------------------------
+    # Tensor IPC
+    # ------------------------------------------------------------------
+
+    def register_tensor_ipc_reducers(self) -> bool:
+        """Register this process's tensor IPC reducers, if provided by the backend.
+
+        Called before weight serialization, including in standalone senders that
+        never initialize an Engine or load general plugins. Implementations must
+        be idempotent and must not load models or allocate device tensors.
+        Return True if this platform handles registration, including repeated
+        calls when its reducers are already registered. This skips the built-in
+        CUDA/NPU path; return False to preserve that default path.
+        """
+        return False
+
+    def get_tensor_ipc_rebuild_fn(
+        self, module: str, name: str
+    ) -> Callable[..., torch.Tensor] | None:
+        """Resolve an exact backend-owned tensor rebuild global for safe unpickling.
+
+        Return None for unsupported (module, name) pairs. Implementations must
+        use an explicit allowlist, never dynamically import the requested module.
+        The core unpickler retains precedence for its built-in safe globals.
+        """
+        return None
+
+    # ------------------------------------------------------------------
     # BaseFusedOp integration
     # ------------------------------------------------------------------
 
