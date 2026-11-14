@@ -275,6 +275,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 "--radix-eviction-policy joint_lru does not support "
                 "--enable-session-radix-cache"
             )
+        if (
+            params.eviction_policy.lower() == "state_cost"
+            and TREE_STATE in families
+            and params.enable_session_radix_cache
+        ):
+            raise ValueError(
+                "--radix-eviction-policy state_cost does not support "
+                "--enable-session-radix-cache on a model with recurrent states"
+            )
         # Whether a slot keeps a prefix's recurrent state checkpoints.
         self.is_mamba_enabled = TREE_STATE in families
         # Whether the mamba extra (ping-pong) buffer is enabled.

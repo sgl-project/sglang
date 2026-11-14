@@ -309,7 +309,8 @@ class SchedulePolicy:
             or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
-            or get_memory().radix_eviction_policy.lower() not in ("lru", "joint_lru")
+            or get_memory().radix_eviction_policy.lower()
+            not in ("lru", "joint_lru", "state_cost")
             or self.tree_cache.supports_fast_match_prefix()
             or not self.tree_cache.supports_prefix_sharing()
         ):

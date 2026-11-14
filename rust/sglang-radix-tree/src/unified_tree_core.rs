@@ -23,6 +23,7 @@ use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
 use crate::node::{
     NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
 };
+use crate::unified_lru_list::CostPriority;
 use crate::unified_lru_list::{
     EvictionStrategy, PriorityKey, TlruFloatConfig, get_eviction_strategy,
 };
@@ -535,6 +536,8 @@ pub struct CacheInitParams {
     pub tlru_tail_budget: usize,
     /// Original arithmetic for floating-point T-LRU parameters, when configured.
     pub tlru_float_config: Option<TlruFloatConfig>,
+    /// state_cost prefill cost coefficients (d, e); set selects state_cost for Mamba states.
+    pub state_cost: Option<(f64, f64)>,
     /// Atoms per radix page; children are keyed by their key's first page.
     pub page_size: usize,
     /// Whether the cache runs the write-back (vs write-through) policy.
@@ -574,6 +577,7 @@ impl Default for CacheInitParams {
             slru_protected_threshold: 2,
             tlru_tail_budget: 0,
             tlru_float_config: None,
+            state_cost: None,
             page_size: 1,
             is_write_back: false,
             enable_hicache: false,
@@ -640,6 +644,10 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) lru_lists: [UnifiedLRUList; NUM_VALUE_SLOTS],
     /// Device-eviction candidates; the lowest priority is popped first.
     pub(crate) full_evict_device_heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>>,
+    /// Mamba states of the running state_cost walk; the lowest priority is popped first.
+    pub(crate) mamba_cost_heap: BinaryHeap<Reverse<(CostPriority, NodeIdx_)>>,
+    /// The state_cost watermark: the highest priority evicted so far.
+    pub(crate) mamba_cost_watermark: f64,
     /// Eviction-priority strategy; lower priority evicts first.
     pub(crate) eviction_strategy: Box<dyn EvictionStrategy<K> + Send>,
     /// Keep path depths and branch high-water marks only for T-LRU.
@@ -956,12 +964,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let eviction_policy = params.eviction_policy.to_lowercase();
         if !matches!(
             eviction_policy.as_str(),
-            "lru" | "lfu" | "fifo" | "mru" | "filo" | "priority" | "slru" | "tlru" | "joint_lru"
+            "lru"
+                | "lfu"
+                | "fifo"
+                | "mru"
+                | "filo"
+                | "priority"
+                | "slru"
+                | "tlru"
+                | "joint_lru"
+                | "state_cost"
         ) {
             return Err(format!(
                 "Unknown eviction policy: {eviction_policy}. Supported policies: \
-                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru', 'joint_lru'."
+                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru', 'joint_lru', 'state_cost'."
             ));
+        }
+        if eviction_policy == "state_cost" && params.state_cost.is_none() {
+            return Err("eviction policy 'state_cost' requires state_cost".to_owned());
         }
         Ok(())
     }
@@ -1023,6 +1043,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
             full_evict_device_heap: BinaryHeap::new(),
+            mamba_cost_heap: BinaryHeap::new(),
+            mamba_cost_watermark: 0.0,
             eviction_strategy: get_eviction_strategy(
                 &params.eviction_policy,
                 params.slru_protected_threshold,
@@ -1071,6 +1093,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
         self.full_evict_device_heap.clear();
+        self.mamba_cost_heap.clear();
+        self.mamba_cost_watermark = 0.0;
         self.namespaced_event_hashes.clear();
         self.ongoing_insert_walk_state = None;
         // Like the component walks above, a suspended joint walk ends here.
