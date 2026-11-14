@@ -122,6 +122,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_spec,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -1878,6 +1879,23 @@ class MiniMaxM3Model(nn.Module):
     ) -> None:
         super().__init__()
 
+        # One rank per node builds; the others load from the shared JIT cache.
+        if get_parallel().world_group.local_rank == 0 and (
+            uses_minimax_m3_nvfp4_native_stack(
+                quant_config.get_name() if quant_config is not None else None
+            )
+        ):
+            from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
+                start_msa_v1_prebuild,
+            )
+
+            attn_tp_size = get_parallel().attn_tp_size
+            start_msa_v1_prebuild(
+                num_q_heads=config.num_attention_heads // attn_tp_size,
+                num_kv_heads=max(1, config.num_key_value_heads // attn_tp_size),
+                query_lengths=(1, get_spec().speculative_num_draft_tokens or 1),
+            )
+
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
         self.pp_group = get_parallel().pp_group
@@ -2115,6 +2133,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def precompile_kernels_after_loading(self) -> None:
+        from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
+            wait_msa_v1_prebuild,
+        )
+
+        wait_msa_v1_prebuild()
         if _uses_push_plane_fusion():
             from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                 register_fused_all_reduce_comm,
