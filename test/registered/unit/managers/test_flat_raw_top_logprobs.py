@@ -31,6 +31,7 @@ from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
     _build_flat_top_logprobs_fields,
     _build_flat_top_logprobs_fields_from_arrays,
+    _slice_streaming_output_meta_info,
 )
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -136,12 +137,12 @@ class TestFlatRawTopLogprobsValidation(CustomTestCase):
             self.assertTrue(req[i].return_flat_raw_output_top_logprobs)
             self.assertTrue(req[i].return_flat_raw_top_logprobs_b64)
 
-    def test_output_flag_rejects_stream(self):
+    def test_output_flag_allows_stream(self):
         req = GenerateReqInput(
             text="hello", stream=True, return_flat_raw_output_top_logprobs=True
         )
-        with self.assertRaisesRegex(ValueError, "stream"):
-            req.normalize_batch_and_arguments()
+        req.normalize_batch_and_arguments()
+        self.assertTrue(req.return_flat_raw_output_top_logprobs)
 
 
 class TestFlatAssembly(CustomTestCase):
@@ -428,6 +429,17 @@ class TestFlatOutputTopLogprobs(CustomTestCase):
 
         self.assertNotIn("output_top_logprobs_shape", meta_info)
         self.assertEqual(len(meta_info["output_top_logprobs"]), 3)
+
+    def test_incremental_stream_keeps_final_nested_fallback_whole(self):
+        meta_info = {
+            "output_token_logprobs": [1, 2, 3],
+            "output_top_logprobs": [[1], [2], [3]],
+        }
+
+        _slice_streaming_output_meta_info(meta_info, 2, flat_output_top_logprobs=True)
+
+        self.assertEqual(meta_info["output_token_logprobs"], [3])
+        self.assertEqual(meta_info["output_top_logprobs"], [[1], [2], [3]])
 
 
 def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
