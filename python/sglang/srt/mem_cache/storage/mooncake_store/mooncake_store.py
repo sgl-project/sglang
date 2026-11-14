@@ -1076,6 +1076,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
             if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
                 suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+            # Include side states in both I/O and per-page completeness checks.
+            # Preserve buffer indices when skipping empty states.
+            suffixes.extend(
+                f"_{self.mha_suffix}_slot_state_v1_{i}"
+                for i, buf in enumerate(getattr(host_pool, "slot_state_buffers", ()))
+                if buf.numel() > 0
+            )
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the

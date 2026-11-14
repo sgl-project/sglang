@@ -906,11 +906,6 @@ class MambaPoolHost(HostKVCache):
         Only page-first layouts are supported for mamba storage zero-copy because
         each page slot in temporal/conv buffers is directly addressable.
         """
-        if self.slot_state_device_tensors:
-            raise NotImplementedError(
-                "Mamba storage zero-copy does not carry registered slot side "
-                "states; use a whole-page storage backend."
-            )
         assert len(indices) % self.page_size == 0
         if self.layout not in ["page_first", "page_first_direct"]:
             raise ValueError(
@@ -965,6 +960,18 @@ class MambaPoolHost(HostKVCache):
                 )
                 ptr_list.append(conv_ptr)
                 element_size_list.append(conv_element_sizes[j])
+            # Side states use their own dtype and slot axis. Keep this order
+            # aligned with Mooncake's slot_state_v1 component keys.
+            for state_buf in self.slot_state_buffers:
+                if state_buf.numel() == 0:
+                    continue
+                page = state_buf[indices[i] : indices[i] + self.page_size]
+                if page.shape[0] != self.page_size or not page.is_contiguous():
+                    raise ValueError(
+                        "Slot side-state page must be complete and contiguous"
+                    )
+                ptr_list.append(page.data_ptr())
+                element_size_list.append(page.numel() * page.element_size())
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
