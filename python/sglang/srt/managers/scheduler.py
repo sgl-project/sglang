@@ -1896,6 +1896,18 @@ class Scheduler(
                 self.truncation_align_size, dsa_index_kpool
             )
 
+        # Deterministic mode: a prompt's prefill depends on where it is split, so
+        # chunk ends go on the chunked-prefill grid (a multiple of the alignment above).
+        chunk = self.chunked_prefill_size
+        if (
+            get_exec().deterministic.enable_deterministic_inference
+            and chunk is not None
+            and chunk >= self.truncation_align_size
+        ):
+            self.truncation_align_size = (
+                chunk // self.truncation_align_size * self.truncation_align_size
+            )
+
     def init_mamba_truncation_align(self):
         """Under DCP a mamba checkpoint may only be donated where the cached
         prefix sits on the kernel chunk grid, so a chunk that stops anywhere
