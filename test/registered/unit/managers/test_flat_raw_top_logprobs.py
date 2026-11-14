@@ -433,7 +433,9 @@ class TestFlatOutputTopLogprobs(CustomTestCase):
 def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
     # enable_mis comes from the published exec bag, not from here; see setUp.
     return SchedulerLogprobResultProcessor(
-        model_config=SimpleNamespace(vocab_size=1_000_000),
+        model_config=SimpleNamespace(
+            vocab_size=1_000_000, token_id_vocab_size=1_000_000
+        ),
     )
 
 

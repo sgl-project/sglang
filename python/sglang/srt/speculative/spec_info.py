@@ -333,6 +333,14 @@ class SpeculativeAlgorithm(Enum):
             return UnoWorkerV2
 
         if self.is_dspark():
+            from sglang.srt.arg_groups.model_override_base import model_config_of
+
+            if model_config_of(server_args).hf_config.architectures == [
+                "Inkling2ForConditionalGeneration"
+            ]:
+                from sglang.srt.speculative.inkling2_mtp_worker import Inkling2MTPWorker
+
+                return Inkling2MTPWorker
             from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
                 DSparkWorkerV2,
             )

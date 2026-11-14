@@ -239,7 +239,7 @@ def _resolve_backend(*, device: str) -> str:
 
 
 def _resolve_dist_init_method(*, dist_port: int) -> str:
-    # Allow external orchestrators (e.g. trainpi) to override the distributed
+    # Allow external orchestrators to override the distributed
     # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
     # env-vars and an externally-created TCPStore, completely avoiding port
     # conflicts with intra-host collocation.

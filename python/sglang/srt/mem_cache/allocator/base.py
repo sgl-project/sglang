@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # alloc_decode accepts req_to_token_write (one-launch alloc + req_to_token write).
+    supports_fused_decode_write = False
     # Whether every pool takes its rows from one shared memory, so the prefix
     # cache reclaims an allocation's demand as one; else each pool is its own.
     pools_share_memory = False

@@ -1665,7 +1665,7 @@ class InklingForConditionalGeneration(nn.Module):
 
 
 class InklingMTPLayer(nn.Module):
-    """Single MTP layer following torchtitan's MultiTokenPredictorModule structure."""
+    """Single prediction-depth layer of the MTP draft."""
 
     def __init__(
         self,

@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 @_register_for(
     "InklingForConditionalGeneration",
+    "Inkling2ForConditionalGeneration",
     "InklingForConditionalGenerationMTP",
 )
 def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
@@ -33,6 +34,20 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
 
     overrides: Dict[str, Any] = {}
+    if "Inkling2ForConditionalGeneration" in hf_config.architectures:
+        if cfg.tool_call_parser is None:
+            overrides["tool_call_parser"] = "inkling2"
+        if cfg.reasoning_parser is None:
+            overrides["reasoning_parser"] = "inkling"
+        # Inkling2's MegaMoE path slices the replicated attention-TP tokens itself;
+        # the scheduler-side attn-TP gather would only pad batches to attn_tp_size.
+        if cfg.moe_a2a_backend == "megamoe" and not cfg.enable_dp_attention:
+            overrides["disable_attn_tp_gather"] = True
+        # NVFP4 experts need expert parallelism. ep_size == 1 is the field
+        # default; any other value is the user's and wins.
+        moe_ranks = cfg.tp_size // cfg.moe_dp_size
+        if cfg.ep_size == 1 and moe_ranks > 1:
+            overrides["ep_size"] = moe_ranks
     # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is
     # resolved in __post_init__ before declarations are materialized, so a
     # cuda_graph_backend_prefill declared here lands too late (the breakable

@@ -84,6 +84,7 @@ class MHAGeometry(msgspec.Struct, frozen=True, kw_only=True):
     head_dim: int
     v_head_dim: int
     kv_cache_dtype: torch.dtype
+    is_mxfp8: bool = False
 
 
 # The stored latent row format of FP8 MLA with per-block scales: the FP8 NoPE

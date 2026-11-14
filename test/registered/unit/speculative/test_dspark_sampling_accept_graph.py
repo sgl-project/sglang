@@ -244,6 +244,8 @@ def test_region_stages_the_deferred_draft_kv_from_the_joined_projection():
         stage=lambda **k: calls.append(("stage", int(k["commit_lens"].sum()))),
     )
     epi = dspark_verify.DsparkVerifyEpilogue.__new__(dspark_verify.DsparkVerifyEpilogue)
+    epi._draft_folds_static_commit_cache = False
+    epi._folds_static_commit_cache = None
     epi.stride = STRIDE
     epi.verify_lens_buf = torch.full((2,), STRIDE, dtype=torch.int64)
     epi.commit_lens_buf = torch.tensor([3, 4], dtype=torch.int32)

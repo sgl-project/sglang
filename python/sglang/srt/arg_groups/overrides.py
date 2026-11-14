@@ -434,6 +434,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
+        "Inkling2ForConditionalGeneration",
     }
 )
 

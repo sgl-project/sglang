@@ -2237,6 +2237,19 @@ class Envs:
     # directive is always emitted.
     SGLANG_INKLING_DEFAULT_REASONING_EFFORT = EnvStr("0.9")
     SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
+    # MTP verify attention up to 64 tokens through the split-KV relative-bias
+    # decode kernel, all draft tokens of a sequence in one launch; changes the
+    # softmax reduction order.
+    SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL = EnvBool(False)
+    # Decode and MTP verify attention all-reduce through the push all-reduce
+    # (rank-order FP32 sum) instead of the multimem one-shot.
+    SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE = EnvBool(True)
+    # EP MoE combine sums each rank's own top-k rows per token, then all-reduces
+    # the FP32 token sums.
+    SGLANG_OPT_INKLING2_EP_PARTIAL_COMBINE = EnvBool(True)
+    # With --moe-a2a-backend megamoe, Inkling2 forwards with fewer tokens (all
+    # ranks) keep the routed expert kernels instead of DeepGEMM MegaMoE.
+    SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS = EnvInt(64)
 
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)

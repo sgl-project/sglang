@@ -3354,7 +3354,7 @@ class Scheduler(
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 kv_hints=recv_req.kv_hints,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
                     self.metrics_collector
@@ -3409,7 +3409,7 @@ class Scheduler(
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
-                self.model_config.vocab_size,
+                self.model_config.token_id_vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
                 req_factory=partial(self._create_generation_req, recv_req),
@@ -3440,7 +3440,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer

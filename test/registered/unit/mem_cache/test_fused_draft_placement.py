@@ -576,6 +576,7 @@ class TestMambaHostPricing(CustomTestCase):
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = False
         cfg.kv_cache_dtype = _DTYPE
+        cfg.kv_cache_dtype_str = None
         cfg.page_size = 1
         cfg.layer_info = SimpleNamespace(start_layer=2, end_layer=5)
         cfg.model_config = SimpleNamespace(
@@ -630,6 +631,7 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
         cfg.mambaish_config = None
         cfg.use_mla_backend = False
         cfg.kv_cache_dtype = _DTYPE
+        cfg.kv_cache_dtype_str = None
         cfg.page_size = 1
         cfg.layer_info = SimpleNamespace(
             start_layer=0,
@@ -787,6 +789,7 @@ class TestFusedDraftDecision(CustomTestCase):
             swa_v_head_dim=64,
         )
         cfg.kv_cache_dtype = host_kv_dtype
+        cfg.kv_cache_dtype_str = kv_cache_dtype_flag
         cfg.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=1,
             draft_kv_num_layers=1,

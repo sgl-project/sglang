@@ -925,6 +925,99 @@ class TestRoutedDraftPool(CustomTestCase):
                     )
                 self.assertTrue(torch.equal(arena.raw, expected))
 
+    def test_inkling2_mtp_injector_routes_full_and_window_context(self):
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.models.inkling2_mtp import Inkling2ForConditionalGenerationMTP
+        from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+            TargetHiddenKvInjector,
+        )
+
+        arena, pool, full, swa, values = self._write_fixture(symmetric=True)
+        spaces = {
+            kind: IdSpace(key=kind, write=lambda ids, loc=loc: loc.flatten()[ids])
+            for kind, loc in (
+                (IdSpaceKind.FULL, full),
+                (IdSpaceKind.SLIDING_WINDOW, swa),
+            )
+        }
+        runner_ids = SimpleNamespace(space=spaces.get)
+        plan = IterationIds(
+            source=runner_ids,
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([3, 3]),
+            seq_lens_cpu=torch.tensor([3, 3]),
+            write_virtual=torch.arange(6),
+        )
+        layers = self._draft_layers(values)
+        for layer, (k, v) in zip(layers, values):
+            attn = layer.self_attn
+            attn.kv_size = 8
+            attn.kv_proj_ctx = lambda hidden, k=k, v=v: (
+                torch.cat((k.flatten(1), v.flatten(1)), dim=1),
+                None,
+            )
+            attn.kv_proj_ctx.weight = torch.empty(0, dtype=_DTYPE)
+            attn.k_norm_ctx = lambda k: k
+            layer.dflare_norm = None
+        model = SimpleNamespace(
+            layers=layers,
+            num_context_features=1,
+            config=SimpleNamespace(hidden_size=8),
+            _mix_norm=lambda targets, layer_id, norm: targets[:, 0],
+        )
+        model.write_target_hidden_kv = MethodType(
+            Inkling2ForConditionalGenerationMTP.write_target_hidden_kv, model
+        )
+        injector = TargetHiddenKvInjector(
+            draft_model=model,
+            draft_model_runner=SimpleNamespace(
+                token_to_kv_pool=pool, runner_ids=runner_ids
+            ),
+            model_runner=SimpleNamespace(device=torch.device("cpu")),
+            device=torch.device("cpu"),
+            verify_num_draft_tokens=3,
+            block_pos_offsets=torch.arange(3),
+        )
+        for mode in ("routed", "static_mapped", "static_explicit"):
+            if mode == "routed":
+                write_pool = pool
+            else:
+                write_pool = SWAKVPool.__new__(SWAKVPool)
+                write_pool.layer_router = pool.layer_router
+                write_pool.full_to_swa_index_mapping = torch.zeros(
+                    32, dtype=torch.int64
+                )
+                if mode == "static_mapped":
+                    write_pool.full_to_swa_index_mapping[full.flatten()] = swa.flatten()
+            injector.draft_model_runner.token_to_kv_pool = write_pool
+            for lengths in (None, (2, 0), (0, 0)):
+                with self.subTest(mode=mode, commit_lens=lengths):
+                    commit_lens = (
+                        None
+                        if lengths is None
+                        else torch.tensor(lengths, dtype=torch.int32)
+                    )
+                    expected = self._expected_writes(
+                        arena, full, swa, values, commit_lens
+                    )
+                    with patch.multiple(
+                        mem_pool,
+                        _is_cuda=False,
+                        _is_hip=False,
+                        _cpu_has_amx_support=False,
+                    ):
+                        injector.inject_target_hidden(
+                            target_hidden=torch.ones((6, 8), dtype=_DTYPE),
+                            cache_loc=plan.write_ids(runner_ids),
+                            positions=torch.arange(6),
+                            cache_loc_2d=full if commit_lens is not None else None,
+                            commit_lens=commit_lens,
+                            iteration_ids=plan if mode != "static_mapped" else None,
+                        )
+                    self.assertTrue(torch.equal(arena.raw, expected))
+
     def test_dspark_single_location_fusion_declines_window_layers(self):
         """A shared-location kernel cannot address full and SWA hosts with different IDs."""
         from sglang.srt.models.dspark import DSparkDraftMixin

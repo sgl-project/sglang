@@ -15,7 +15,7 @@ from pathlib import Path
 
 from tml_renderers import chat, tokenizers, v0
 
-TOKENIZER = tokenizers.o200k_base_chat()
+TOKENIZER = tokenizers.O200kBaseChatTokenizer()
 RENDERER = v0.Renderer(TOKENIZER)
 IMAGE_PLACEHOLDER = -101
 
@@ -31,8 +31,31 @@ def flatten(spans):
     return ids
 
 
-def reference_prompt(messages, tools, effort):
+def tool_choice_instruction(tool_choice, parallel_tool_calls):
+    if isinstance(tool_choice, dict):
+        name = json.dumps(tool_choice["function"]["name"])
+        once = "" if parallel_tool_calls else " exactly once"
+        return f"Call the function named {name}{once} in your next response."
+    if tool_choice == "required":
+        quantity = "at least one" if parallel_tool_calls else "exactly one"
+        return f"Call {quantity} of the provided functions in your next response."
+    if parallel_tool_calls:
+        return None
+    return "If you call a function, call at most one function in your next response."
+
+
+def reference_prompt(
+    messages, tools, effort, tool_choice="auto", parallel_tool_calls=True
+):
     messages = copy.deepcopy(messages)
+    if tool_choice == "none":
+        tools = None
+    elif isinstance(tool_choice, dict):
+        name = tool_choice["function"]["name"]
+        tools = [tool for tool in tools if tool["function"]["name"] == name]
+    instruction = (
+        tool_choice_instruction(tool_choice, parallel_tool_calls) if tools else None
+    )
     call_names = {}
     for message in messages:
         reasoning = message.pop("reasoning_content", None)
@@ -46,15 +69,23 @@ def reference_prompt(messages, tools, effort):
         name = call_names.get(message.get("tool_call_id"))
         if message["role"] == "tool" and not message.get("name") and name:
             message["name"] = name
-    if tools:
+    if instruction is not None:
+        # The instruction can join the effort directive, so splice the directive
+        # in as text rather than through render_for_completion_with_effort.
         index = 0
         while index < len(messages) and messages[index]["role"] == "system":
             index += 1
+        directive = f"Thinking effort level: {round(effort, 2):g}"
+        messages.insert(index, {"role": "system", "content": directive})
+        messages[0]["content"] += f"\n\n{instruction}"
+    if tools:
         declare = json.dumps(tools, separators=(",", ":"))
-        messages.insert(index, {"role": "tool_declare", "content": declare})
-    spans, _ = RENDERER.render_for_completion_with_effort(
-        chat.OpenAIMessage.from_oss_messages(messages), effort
-    )
+        messages.insert(0, {"role": "tool_declare", "content": declare})
+    native = chat.OpenAIMessage.from_oss_messages(messages)
+    if instruction is not None:
+        spans, _ = RENDERER.render_for_completion(native)
+    else:
+        spans, _ = RENDERER.render_for_completion_with_effort(native, effort)
     return flatten(spans)
 
 
@@ -102,14 +133,20 @@ def prompt(
     effort=0.9,
     server_messages=None,
     server_tools=None,
+    tool_choice="auto",
+    parallel_tool_calls=True,
 ):
     prompts.append(
         {
             "name": name,
             "messages": server_messages or messages,
             "tools": server_tools or tools,
+            "tool_choice": tool_choice,
+            "parallel_tool_calls": parallel_tool_calls,
             "reasoning_effort": effort,
-            "input_ids": reference_prompt(messages, tools, effort),
+            "input_ids": reference_prompt(
+                messages, tools, effort, tool_choice, parallel_tool_calls
+            ),
         }
     )
 
@@ -208,6 +245,34 @@ prompt(
         },
     ],
 )
+prompt(
+    "tool_choice_required_joins_the_system_prompt",
+    [
+        {"role": "system", "content": "Use tools when needed."},
+        {"role": "user", "content": "Weather in Tokyo?"},
+    ],
+    tools=TOOLS,
+    tool_choice="required",
+)
+prompt(
+    "tool_choice_named_joins_the_effort_directive",
+    [{"role": "user", "content": "Look it up."}],
+    tools=TOOLS,
+    tool_choice={"type": "function", "function": {"name": "search"}},
+    parallel_tool_calls=False,
+)
+prompt(
+    "parallel_tool_calls_false",
+    [{"role": "user", "content": "Weather in Tokyo and Paris?"}],
+    tools=TOOLS,
+    parallel_tool_calls=False,
+)
+prompt(
+    "tool_choice_none_declares_no_tools",
+    [{"role": "user", "content": "hi"}],
+    tools=TOOLS,
+    tool_choice="none",
+)
 prompt("effort_zero", [{"role": "user", "content": "hi"}], effort=0.0)
 prompt(
     "effort_quantized",
@@ -236,6 +301,8 @@ def image_prompt():
         {
             "name": "image_parts_become_single_placeholders",
             "tools": None,
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
             "reasoning_effort": 0.9,
             "messages": [
                 {
@@ -348,7 +415,9 @@ def output(name, text):
             re.sub(r"\[\[ORD:.*?\]\]", "", text),
         )
     )
-    for message in parser.parse_tokens(ids) + parser.flush():
+    # The scheduler stops on the renderer's stop token before parsing.
+    sampled = ids[:-1] if ids[-1] in RENDERER.stop() else ids
+    for message in parser.parse_tokens(sampled).messages:
         part = message.content
         if isinstance(part, chat.Text):
             content.append(part.text)
@@ -387,11 +456,6 @@ output(
     ' "name": "search" }<|end_message|><|content_model_end_sampling|>',
 )
 output(
-    "payload_name_wins_over_header",
-    "<|message_model|>search<|content_invoke_tool_json|>"
-    '{"name":"get_weather","args":{}}<|end_message|><|content_model_end_sampling|>',
-)
-output(
     "marker_spellings_in_text_stay_text",
     "<|message_model|><|content_thinking|>use [[ORD:<|content_text|>]] here"
     "<|end_message|><|message_model|><|content_text|>see "
@@ -428,7 +492,9 @@ def _dump_golden(golden: dict) -> str:
 
 golden = {
     "source": f"tml-renderers=={version} v0.Renderer/v0.Parser via OpenAIMessage "
-    "bridge; tool_declare inserted after leading system messages; unnamed tool results "
+    "bridge; tool_declare inserted first; tool_choice and parallel_tool_calls=false "
+    "as an instruction appended to the first system message (the effort directive when "
+    "there is no system prompt); unnamed tool results "
     "named from their tool_call_id; assistant reasoning_content as a leading thinking part; call arguments re-dumped from the sampled payload "
     "with json.dumps(ensure_ascii=False); image spans mapped to one -101 placeholder; "
     "generated by "

@@ -2355,10 +2355,6 @@ class ResponsesRequest(PDRoutingFields):
         else:
             max_tokens = default_max_tokens
 
-        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        if max_tokens is not None:
-            max_tokens -= 2
-
         temperature = self.temperature
         if temperature is None:
             temperature = default_params.get(

@@ -364,6 +364,7 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     if arch in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
+        "Inkling2ForConditionalGeneration",
     ):
         declare_resolution(
             server_args,

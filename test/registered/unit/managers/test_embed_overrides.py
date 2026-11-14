@@ -90,6 +90,7 @@ class TestCreateTokenizedObjectEmbedOverrideValidation(CustomTestCase):
         manager.model_config = SimpleNamespace(
             hidden_size=HIDDEN_DIM,
             vocab_size=128,
+            token_id_vocab_size=128,
         )
         manager.fake_bootstrap_room_counter = 0
         manager.rid_to_state = {

@@ -330,6 +330,18 @@ def _get_processor(
         return get_tokenizer(
             tokenizer_name, trust_remote_code=trust_remote_code, revision=revision
         )
+    if config.model_type == "inkling2":
+        from sglang.srt.multimodal.inkling2.processor import Inkling2Processor
+
+        return Inkling2Processor.from_pretrained(
+            model_name or tokenizer_name,
+            tokenizer_path=tokenizer_name,
+            revision=revision,
+            tokenizer_mode=tokenizer_mode,
+            trust_remote_code=trust_remote_code,
+            tokenizer_backend=tokenizer_backend,
+            **kwargs,
+        )
     is_ocr2 = _is_deepseek_ocr2_model(config)
     if _is_deepseek_ocr_model(config) or is_ocr2:
         config.model_type = "deepseek-ocr"

@@ -43,6 +43,7 @@ from sglang.srt.managers.overlap_utils import (
     offer_future_relay_buffers,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -625,6 +626,8 @@ class DsparkVerifyEpilogue:
         self.stride = int(verify_num_draft_tokens)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
+        self._draft_folds_static_commit_cache: Optional[bool] = None
+        self._folds_static_commit_cache: Optional[bool] = None
         self._tp_sync = tp_sync
         self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self.verify_lens_buf = torch.zeros(
@@ -761,7 +764,7 @@ class DsparkVerifyEpilogue:
         returns whether the engram history was committed."""
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
-        folds = self.folds_commit
+        folds = self.folds_static_commit
         gated_commit_lens = accept(io, verify_lens=verify_lens, gate=gate, gated=folds)
         # Both accept branches leave the ungated commit lengths in commit_lens_buf.
         committed_engram = self._commit_engram_history(
@@ -775,6 +778,14 @@ class DsparkVerifyEpilogue:
             self._scatter_future_relay(io.req_pool_indices, bs)
         if not folds:
             return committed_engram
+        if self._draft_folds_static_commit:
+            self.commit_ctx.draft_model.store_verify_commit(
+                req_pool_indices=io.req_pool_indices,
+                verify_hidden=io.hidden,
+                commit_lens=self.commit_lens_buf[:bs],
+                stride=self.stride,
+                valid=gated_commit_lens > 0,
+            )
         cache_loc = io.out_cache_loc
         state_slot = None
         if self.commit_ctx.kv_injector.swa_ring_size is not None:
@@ -967,6 +978,36 @@ class DsparkVerifyEpilogue:
             return False
         pool = self.commit_ctx.resolve_pool()
         return hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+
+    @property
+    def _draft_folds_static_commit(self) -> bool:
+        if self._draft_folds_static_commit_cache is None:
+            self._draft_folds_static_commit_cache = (
+                self._resolve_draft_folds_static_commit()
+            )
+        return self._draft_folds_static_commit_cache
+
+    def _resolve_draft_folds_static_commit(self) -> bool:
+        if (
+            self.commit_ctx is None
+            or self.commit_ctx.kv_injector is None
+            or not getattr(
+                self.commit_ctx.draft_model, "folds_static_verify_commit", False
+            )
+        ):
+            return False
+        injector = self.commit_ctx.kv_injector
+        target = injector.model_runner.runner_ids.space(IdSpaceKind.FULL)
+        draft = injector.draft_model_runner.runner_ids.space(IdSpaceKind.FULL)
+        return draft.key == target.key and target.write is None
+
+    @property
+    def folds_static_commit(self) -> bool:
+        if self._folds_static_commit_cache is None:
+            self._folds_static_commit_cache = (
+                self.folds_commit or self._draft_folds_static_commit
+            )
+        return self._folds_static_commit_cache
 
     def _ensure_out(
         self, buf: Optional[torch.Tensor], compact: torch.Tensor

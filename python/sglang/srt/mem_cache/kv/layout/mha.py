@@ -72,6 +72,7 @@ class MHASubPoolSpec(SubPoolSpec):
     store_dtype: torch.dtype
     kv_cache_dtype: Optional[torch.dtype] = None
     v_head_dim: Optional[int] = None
+    is_mxfp8: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -90,6 +91,12 @@ class MHASubPoolSpec(SubPoolSpec):
         assert self.v_head_dim > 0, (
             f"v_head_dim must be positive; got {self.v_head_dim}"
         )
+        if self.is_mxfp8 and (
+            self.kv_cache_dtype != torch.float8_e4m3fn
+            or self.head_dim != 128
+            or self.v_head_dim != 128
+        ):
+            raise ValueError("Unified MXFP8 requires E4M3 K/V with head_dim=128.")
         if self.draft_region is not None:
             assert isinstance(self.draft_region, (DenseDraftRegion, MLADraftRegion)), (
                 "dense entries carry dense draft K/V rows, never a state region"
@@ -104,7 +111,16 @@ class MHASubPoolSpec(SubPoolSpec):
 
     def host_entry_bytes(self) -> int:
         """Host (target-only) bytes for one slot, before any draft parts."""
-        return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+        return self.layer_num * self.layer_entry_bytes()
+
+    def scale_row_bytes(self) -> int:
+        return self.head_num * (self.head_dim // 32)
+
+    def layer_entry_bytes(self) -> int:
+        payload = self.k_row_bytes() + self.v_row_bytes()
+        if self.is_mxfp8:
+            payload += 2 * align_part_offset(self.scale_row_bytes())
+        return payload
 
     def draft_offset_in_entry(self) -> int:
         """Byte offset of the fused draft parts inside one slot's entry."""
@@ -130,7 +146,7 @@ class MHASubPoolSpec(SubPoolSpec):
         is ``page_size`` such entries back to back."""
         if self.layer_num:
             _check_row_alignment(self.name, K=self.k_row_bytes(), V=self.v_row_bytes())
-        layer_stride = self.k_row_bytes() + self.v_row_bytes()
+        layer_stride = self.layer_entry_bytes()
         parts = (
             DensePart(
                 name="k",
@@ -149,6 +165,20 @@ class MHASubPoolSpec(SubPoolSpec):
                 dtype=self.store_dtype,
             ),
         )
+        if self.is_mxfp8:
+            scale_offset = self.k_row_bytes() + self.v_row_bytes()
+            parts += tuple(
+                DensePart(
+                    name=name,
+                    offset_bytes=scale_offset
+                    + i * align_part_offset(self.scale_row_bytes()),
+                    layer_stride_bytes=layer_stride,
+                    layer_num=self.layer_num,
+                    row_shape=(self.head_num, self.head_dim // 32),
+                    dtype=torch.uint8,
+                )
+                for i, name in enumerate(("k_scale", "v_scale"))
+            )
         if not self.layer_num:
             parts = ()
         return parts
@@ -218,6 +248,7 @@ class MHAView(MHAKVView):
 
     # Writes take physical ids only (`KVWriteLoc` marked physical).
     requires_physical_write_loc = True
+    is_mxfp8 = False
     # The view's quantization method; unified memory stores BF16 or FP8 rows.
     is_quantized_kv_cache = False
     k_scale_buffer = None
@@ -250,6 +281,16 @@ class MHAView(MHAKVView):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
     ):
+        self.is_mxfp8 = spec.is_mxfp8
+        if self.is_mxfp8:
+            rows = dense_rows(arena, spec.name)
+            self.k_scale_buffer, self.v_scale_buffer = (
+                [
+                    x.view(torch.float8_e8m0fnu)
+                    for x in spec._part_views(arena, rows, name)
+                ]
+                for name in ("k_scale", "v_scale")
+            )
         self._has_draft_parts = spec.draft_region is not None
         k_buffer, v_buffer = spec.views(arena)
         self._bind(
@@ -334,13 +375,19 @@ class MHAView(MHAKVView):
             dtype=torch.uint64,
             device=self.device,
         )
-        buffers = [*self.k_buffer, *self.v_buffer]
+        buffers = [x for family in self._row_buffers() for x in family]
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in buffers], dtype=torch.uint64, device=self.device
         )
         self.data_strides = torch.tensor(
             [x.stride(0) * x.dtype.itemsize for x in buffers], device=self.device
         )
+
+    def _row_buffers(self):
+        buffers = (self.k_buffer, self.v_buffer)
+        if self.is_mxfp8:
+            buffers += (self.k_scale_buffer, self.v_scale_buffer)
+        return buffers
 
     # -- what the view is --
 
@@ -392,6 +439,17 @@ class MHAView(MHAKVView):
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def get_kv_scale_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_mxfp8:
+            raise ValueError("This MHA view does not store MXFP8 scales.")
+        idx = layer_id - self.start_layer
+        from sglang.srt.mem_cache.layout.paged_view import paged_view
+
+        return tuple(
+            paged_view(family[idx], self.page_size)
+            for family in (self.k_scale_buffer, self.v_scale_buffer)
+        )
+
     def _typed(self, buffer: torch.Tensor) -> torch.Tensor:
         # FP8 rows are stored as bytes; readers see the cache dtype.
         if self.store_dtype != self.dtype:
@@ -423,6 +481,57 @@ class MHAView(MHAKVView):
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
+        if self.is_mxfp8:
+            if dcp_kv_mask is not None:
+                raise NotImplementedError(
+                    "MXFP8 KV cache does not support DCP KV masks."
+                )
+            from sglang.kernels.ops.kvcache.mxfp8_quant_store_kv import (
+                quant_store_kv_mxfp8,
+            )
+
+            idx = layer_id - self.start_layer
+            if k_scale is None and v_scale is None and cache_k.dtype != self.dtype:
+                quant_store_kv_mxfp8(
+                    cache_k,
+                    cache_v,
+                    loc,
+                    self.k_buffer[idx].view(self.dtype),
+                    self.v_buffer[idx].view(self.dtype),
+                    self.k_scale_buffer[idx],
+                    self.v_scale_buffer[idx],
+                    page_size=self.page_size,
+                )
+            else:
+                if (
+                    k_scale is None
+                    or v_scale is None
+                    or cache_k.dtype != self.dtype
+                    or cache_v.dtype != self.dtype
+                ):
+                    raise ValueError(
+                        "Prequantized MXFP8 writes require E4M3 K/V and both scale tensors."
+                    )
+                from sglang.kernels.ops.kvcache.mxfp8_interleave_sf import (
+                    store_sf_token_major,
+                )
+
+                _set_kv_buffer_impl(
+                    cache_k.view(self.store_dtype),
+                    cache_v.view(self.store_dtype),
+                    self.k_buffer[idx],
+                    self.v_buffer[idx],
+                    loc,
+                    row_dim=self.row_dim,
+                    v_row_dim=self.v_row_dim,
+                    store_dtype=self.store_dtype,
+                    device_module=self.device_module,
+                    size_limit=self.size + self.page_size,
+                    alt_stream=self.alt_stream,
+                )
+                store_sf_token_major(k_scale, self.k_scale_buffer[idx], loc)
+                store_sf_token_major(v_scale, self.v_scale_buffer[idx], loc)
+            return
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -483,6 +592,30 @@ class MHAView(MHAKVView):
         layer_id_override: Optional[int] = None,
     ):
         """Commit each request's live prefix at physical slot ids."""
+        if self.is_mxfp8:
+            from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+            if loc_2d.ndim != 2 or commit_lens.shape != (loc_2d.shape[0],):
+                raise ValueError(
+                    "Prefix commit lengths must match the physical row table."
+                )
+            if cache_k.shape[0] != loc_2d.numel() or cache_v.shape[0] != loc_2d.numel():
+                raise ValueError("KV rows must match the physical row table.")
+            valid = (
+                torch.arange(loc_2d.shape[1], device=loc_2d.device)[None, :]
+                < commit_lens[:, None]
+            )
+            loc = torch.where(valid, loc_2d, 0).reshape(-1)
+            self.set_kv_buffer(
+                layer,
+                KVWriteLoc(loc, physical=True),
+                cache_k,
+                cache_v,
+                k_scale,
+                v_scale,
+                layer_id_override=layer_id_override,
+            )
+            return
         _set_mha_kv_buffer_prefix_valid(
             self,
             layer,
@@ -506,7 +639,7 @@ class MHAView(MHAKVView):
     def host_layout(self):
         from sglang.srt.mem_cache.kv.layout.page import page_envelope_host_layout
 
-        if self._has_draft_parts:
+        if self._has_draft_parts or self.is_mxfp8:
             return page_envelope_host_layout(
                 self._arena,
                 self._sub_pool_name,
@@ -532,6 +665,8 @@ class MHAView(MHAKVView):
             DevicePoolInfo,
             KVBufferLayout,
             KVBuffers,
+            KVScaleBuffers,
+            KVScaleLayout,
             MHABufferInfo,
         )
         from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -560,7 +695,13 @@ class MHAView(MHAKVView):
                         if len(buffers.k)
                         else torch.device(self.device)
                     ),
-                    scales=None,
+                    scales=KVScaleBuffers(
+                        k=tuple(self.k_scale_buffer),
+                        v=tuple(self.v_scale_buffer),
+                        layout=KVScaleLayout.TOKEN,
+                    )
+                    if self.is_mxfp8
+                    else None,
                     page_envelope=self._page_envelope_info(),
                 ),
             ),
@@ -604,9 +745,16 @@ class MHAView(MHAKVView):
             kv_cache_cpu.append([])
             for i in range(0, len(indices), chunk_size):
                 chunk = indices[i : i + chunk_size]
-                k_cpu = self.k_buffer[layer_id][chunk].to("cpu", non_blocking=True)
-                v_cpu = self.v_buffer[layer_id][chunk].to("cpu", non_blocking=True)
-                kv_cache_cpu[-1].append([k_cpu, v_cpu])
+                kv_cache_cpu[-1].append(
+                    [
+                        family[layer_id]
+                        .view(torch.uint8)[chunk]
+                        .to("cpu", non_blocking=True)
+                        if self.is_mxfp8
+                        else family[layer_id][chunk].to("cpu", non_blocking=True)
+                        for family in self._row_buffers()
+                    ]
+                )
         current_platform.synchronize()
         return kv_cache_cpu
 
@@ -618,14 +766,14 @@ class MHAView(MHAKVView):
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk = indices[i : i + chunk_size]
-                k_cpu, v_cpu = kv_cache_cpu[layer_id][i // chunk_size]
-                assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk)
-                self.k_buffer[layer_id][chunk] = k_cpu.to(
-                    self.k_buffer[0].device, non_blocking=True
-                )
-                self.v_buffer[layer_id][chunk] = v_cpu.to(
-                    self.v_buffer[0].device, non_blocking=True
-                )
+                saved = kv_cache_cpu[layer_id][i // chunk_size]
+                assert len(saved) == len(self._row_buffers())
+                for family, cpu in zip(self._row_buffers(), saved):
+                    dst = family[layer_id]
+                    if self.is_mxfp8:
+                        dst = dst.view(torch.uint8)
+                    assert cpu.shape[0] == len(chunk)
+                    dst[chunk] = cpu.to(dst.device, non_blocking=True)
         current_platform.synchronize()
 
 

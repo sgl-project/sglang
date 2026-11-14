@@ -649,6 +649,7 @@ def alloc_paged_token_slots_decode(
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
+    req_to_token_write: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     out_cache_loc = _storage(tree_cache).take_decode(
@@ -657,6 +658,7 @@ def alloc_paged_token_slots_decode(
         seq_lens_cpu=seq_lens_cpu,
         last_loc=last_loc,
         make_room=_room_in(tree_cache),
+        req_to_token_write=req_to_token_write,
         tree_cache=tree_cache,
         batch=batch,
     )
@@ -688,14 +690,25 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
+    fused_write = False
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, seq_lens_gpu - 1
-        ]
+        fused_write = (
+            token_per_req == 1
+            and not batch.model_config.is_encoder_decoder
+            and type(batch.req_to_token_pool).write is ReqToTokenPool.write
+            and batch.tree_cache.token_to_kv_pool_allocator.supports_fused_decode_write
+        )
+        last_loc = (
+            None
+            if fused_write
+            else batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices, seq_lens_gpu - 1
+            ]
+        )
         seq_lens_next = seq_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
@@ -705,17 +718,23 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
             batch=batch,
+            req_to_token_write=(
+                (batch.req_to_token_pool.req_to_token, batch.req_pool_indices)
+                if fused_write
+                else None
+            ),
         )
 
-    # Write to req_to_token_pool
-    if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
-    else:
-        locs = seq_lens_gpu.clone()
+    # Write to req_to_token_pool (alloc_decode already did when fused_write)
+    if not fused_write:
+        if batch.model_config.is_encoder_decoder:
+            locs = batch.encoder_lens + seq_lens_gpu
+        else:
+            locs = seq_lens_gpu.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:

@@ -488,6 +488,12 @@ class TestEncoderPreprocessorKimiGrid(CustomTestCase):
         self.assertEqual(preprocessor.get_num_patches(grid, Modality.IMAGE), 384)
         self.assertEqual(preprocessor.get_num_tokens(grid, Modality.IMAGE), 48)
 
+    def test_inkling2_image_tokens_are_the_grid_cells(self):
+        grid = torch.tensor([1, 3, 4])
+        preprocessor = self._make_preprocessor("inkling2")
+        self.assertEqual(preprocessor.get_num_patches(grid, Modality.IMAGE), 12)
+        self.assertEqual(preprocessor.get_num_tokens(grid, Modality.IMAGE), 12)
+
     def test_grid_metadata_is_safe_to_deserialize(self):
         grid = self._make_preprocessor()._get_mm_grid_dim(
             {"image_grid_hws": np.array([[40, 60]], dtype=np.int64)},

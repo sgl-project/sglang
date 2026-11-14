@@ -23,6 +23,11 @@ def _mxfp8_quant_store_qkv_kernel(
     skh,
     svt,
     svh,
+    skct: tl.constexpr,
+    svct: tl.constexpr,
+    sskt: tl.constexpr,
+    ssvt: tl.constexpr,
+    INTERLEAVED: tl.constexpr,
     NQ: tl.constexpr,
     NKV: tl.constexpr,
     D: tl.constexpr,
@@ -61,11 +66,15 @@ def _mxfp8_quant_store_qkv_kernel(
             h = r - NQ
             cache = kc_ptr
             sfb = sfk_ptr
+            cache_stride = skct
+            sf_stride = sskt
         else:
             h = r - NQ - NKV
             cache = vc_ptr
             sfb = sfv_ptr
-        tl.store(cache + (myloc * NKV + h) * D + off2, xq)
+            cache_stride = svct
+            sf_stride = ssvt
+        tl.store(cache + myloc * cache_stride + h * D + off2, xq)
         # BlockScaledBasicChunk byte layout (see mxfp8_interleave_sf.py):
         # a page block is (NKV, 32, PAGE//32, SF) bytes.
         po = myloc % PAGE
@@ -74,6 +83,8 @@ def _mxfp8_quant_store_qkv_kernel(
             + (po % 32) * ((PAGE // 32) * SF)
             + (po // 32) * SF
         )
+        if not INTERLEAVED:
+            base = myloc * sf_stride + h * SF
         tl.store(sfb + base + blk, sf)
 
 
@@ -88,11 +99,12 @@ def quant_store_kv_mxfp8(
     page_size: int = 128,
 ) -> None:
     """One kernel quantizes bf16 K/V rows, scatters the fp8 payload into the paged
-    cache at `loc`, and writes UE8M0 scales in the interleaved FA4 layout."""
+    cache at `loc`, and writes interleaved or token-major UE8M0 scale rows."""
     T, NKV, D = k.shape
     assert D % 32 == 0 and page_size % 32 == 0
     assert k.stride(2) == 1 and v.stride(2) == 1
-    assert k_cache.is_contiguous() and v_cache.is_contiguous()
+    assert k_cache.stride(1) == v_cache.stride(1) == D
+    assert k_cache.stride(2) == v_cache.stride(2) == 1
     if T == 0:
         return
     _mxfp8_quant_store_qkv_kernel[(T, 2 * NKV)](
@@ -112,6 +124,11 @@ def quant_store_kv_mxfp8(
         k.stride(1),
         v.stride(0),
         v.stride(1),
+        skct=k_cache.stride(0),
+        svct=v_cache.stride(0),
+        sskt=sfk.stride(0),
+        ssvt=sfv.stride(0),
+        INTERLEAVED=sfk.ndim == 5,
         NQ=0,
         NKV=NKV,
         D=D,

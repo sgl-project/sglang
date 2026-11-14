@@ -353,7 +353,8 @@ def create_state(
 
 def _launch_config(local_numel: int):
     assert local_numel % _NUMEL_PER_THREAD == 0
-    return _MIN_BLOCKS, _BLOCK_THREADS, _BLOCK_THREADS // 32, _NUMEL_PER_THREAD
+    blocks = min(_MAX_BLOCKS, max(_MIN_BLOCKS, local_numel >> 17))
+    return blocks, _BLOCK_THREADS, _BLOCK_THREADS // 32, _NUMEL_PER_THREAD
 
 
 def all_gather_inner(

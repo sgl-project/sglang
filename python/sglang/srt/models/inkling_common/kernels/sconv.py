@@ -4,7 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import is_cuda
+
+_PDL = is_arch_support_pdl()
 
 PAD_SLOT_ID = -1
 
@@ -1110,7 +1113,11 @@ def _save_intermediate_conv_windows_kernel(
     W_MINUS_1: tl.constexpr,
     BLOCK_D: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
     pid_d = tl.program_id(2)
@@ -1211,4 +1218,6 @@ def save_intermediate_conv_windows(
         W_MINUS_1=W_minus_1,
         BLOCK_D=BLOCK_D,
         PAD_SLOT_ID=PAD_SLOT_ID,
+        USE_PDL=_PDL,
+        launch_pdl=_PDL,
     )

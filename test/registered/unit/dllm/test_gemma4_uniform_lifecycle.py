@@ -385,7 +385,9 @@ class TestGemma4RequestValidation(unittest.TestCase):
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_session_radix_cache = False
-        scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+        scheduler.model_config = SimpleNamespace(
+            hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=128
+        )
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.tokenizer = None

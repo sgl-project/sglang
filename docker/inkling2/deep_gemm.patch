@@ -1,0 +1,592 @@
+diff --git a/csrc/apis/mega_moe.hpp b/csrc/apis/mega_moe.hpp
+index 3f5f8a0..641dcbc 100644
+--- a/csrc/apis/mega_moe.hpp
++++ b/csrc/apis/mega_moe.hpp
+@@ -45,10 +45,10 @@ get_symm_buffer_size_for_mega_moe(
+     DG_HOST_ASSERT(num_experts % num_ranks == 0);
+     DG_HOST_ASSERT(num_shared_experts >= 0);
+
+-    // SiTU is implemented only by the SM100 FP8xFP4 MegaMoE kernel.
++    // SiTU is implemented by the SM100 FP8xFP4/FP8xFP8/NVFP4 MegaMoE kernel.
+     const auto mma_kind = parse_mma_kind(mma_type);
+     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
+-                   (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
++                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4) and activation == "situ"));
+     DG_HOST_ASSERT(num_shared_experts >= 0);
+
+     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
+@@ -209,13 +209,20 @@ static void fp8_fp4_mega_moe(
+     const float& post_expert_norm_eps = 1e-6f,
+     const bool& post_expert_norm_weight_first = false,
+     const bool& use_trtllm_weights = false,
+-    const std::optional<int64_t>& global_num_tokens = std::nullopt
++    const std::optional<int64_t>& global_num_tokens = std::nullopt,
++    const bool& use_inkling2_weights = false,
++    const bool& broadcast_y = false
+ ) {
+     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+
+-    // Config checks
+-    const auto num_tokens = static_cast<int>(y.size(0));
++    // Config checks; a broadcast `y` holds every rank's rows (rank-major) inside the symmetric buffer
++    const auto num_ranks_y = broadcast_y ? static_cast<int>(sym_buffer_ptrs.size()) : 1;
++    DG_HOST_ASSERT(y.size(0) % num_ranks_y == 0);
++    DG_HOST_ASSERT(not broadcast_y or (
++        static_cast<const uint8_t*>(y.data_ptr()) >= static_cast<const uint8_t*>(sym_buffer.data_ptr()) and
++        static_cast<const uint8_t*>(y.data_ptr()) + y.nbytes() <= static_cast<const uint8_t*>(sym_buffer.data_ptr()) + sym_buffer.nbytes()));
++    const auto num_tokens = static_cast<int>(y.size(0)) / num_ranks_y;
+     const auto [rm, rn, rk] = recipe;
+     DG_HOST_ASSERT(rm == 1 and rn == 1 and (rk == 32 or rk == 16));
+     const auto mma_kind = parse_mma_kind(mma_type);
+@@ -229,8 +236,9 @@ static void fp8_fp4_mega_moe(
+                             std::to_string(get_sf_gran_k(mma_kind)) + ")");
+     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
+     DG_HOST_ASSERT(not use_trtllm_weights or mma_kind == MmaKind::NVFP4);
++    DG_HOST_ASSERT(not (use_trtllm_weights and use_inkling2_weights));
+     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
+-                   (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
++                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4) and activation == "situ"));
+     DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
+     const bool use_situ = activation == "situ";
+     const float swiglu_alpha = activation == "swigluoai" ? 1.702f : 0.0f;
+@@ -252,8 +260,11 @@ static void fp8_fp4_mega_moe(
+     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_weights_layout_3d(l2_weights);
+     DG_HOST_ASSERT(is_localized(l1_weights) == is_localized(l2_weights));
+     DG_HOST_ASSERT(not use_trtllm_weights or not is_localized(l1_weights));
++    DG_HOST_ASSERT(not use_inkling2_weights or not is_localized(l1_weights));
+     const auto weight_dtype = l1_weights.scalar_type();
+     DG_HOST_ASSERT(weight_dtype == torch::kFloat8_e4m3fn or weight_dtype == kPackedFP4);
++    DG_HOST_ASSERT(not use_inkling2_weights or mma_kind == MmaKind::NVFP4 or
++                   (mma_kind == MmaKind::MXFP8FP4 and weight_dtype == torch::kFloat8_e4m3fn));
+     DG_HOST_ASSERT(l2_weights.scalar_type() == weight_dtype);
+     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
+@@ -264,12 +275,19 @@ static void fp8_fp4_mega_moe(
+     constexpr int kGranMN = 1;
+     const int kGranK = rk;
+     // TRT weights require matching dense TRT scales; descriptors encode their layout.
+-    if (use_trtllm_weights)
++    if (use_trtllm_weights or use_inkling2_weights)
+         DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and l2_weights_sf.is_contiguous());
+-    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+-                    num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
+-    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+-                    num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
++    if (use_inkling2_weights) {
++        // CUTLASS 128x4 atoms: one byte per (row, K group) over 128-row-padded rows
++        DG_HOST_ASSERT(intermediate_hidden * 2 % 128 == 0 and hidden % 128 == 0);
++        DG_HOST_ASSERT(l1_weights_sf.nbytes() == int64_t(num_experts_per_rank) * intermediate_hidden * 2 * (hidden / kGranK));
++        DG_HOST_ASSERT(l2_weights_sf.nbytes() == int64_t(num_experts_per_rank) * hidden * (intermediate_hidden / kGranK));
++    } else {
++        check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
++                        num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
++        check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
++                        num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
++    }
+
+     int num_shared_experts = 0, shared_intermediate_hidden = 0;
+     torch::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
+@@ -397,7 +415,7 @@ static void fp8_fp4_mega_moe(
+                                post_expert_norm_eps,
+                                mma_kind,
+                                use_fp8_combine, use_trtllm_weights, global_num_tokens,
+-                               situ_beta, situ_linear_beta);
++                               situ_beta, situ_linear_beta, use_inkling2_weights, broadcast_y);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+     }
+diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+index 5043cb2..f5dd475 100644
+--- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+@@ -13,6 +13,64 @@
+
+ namespace deep_gemm {
+
++// Inkling2 L1 rows interleave gate/up per row (gate 2i, up 2i+1). The descriptor loads them in
++// the `megamoe` SMEM order: packed FP4 per 32 rows [g0 g2 .. g14 u0 .. u14 g1 .. g15 u1 .. u15]
++// (SMEM row 16e + 8p + q <- GMEM row 4q + 2e + p), FP8 per 16 rows [g0 .. g7 u0 .. u7]
++// (SMEM row 8p + i <- GMEM row 2i + p).
++static CUtensorMap make_inkling2_l1_tma_desc(
++    const torch::Tensor& weights, const int inner_bytes, const int rows,
++    const int load_block_n, const bool packed_fp4) {
++    DG_HOST_ASSERT(weights.is_contiguous() and inner_bytes % 128 == 0);
++    DG_HOST_ASSERT(rows % 32 == 0 and load_block_n % 32 == 0);
++    CUtensorMap result;
++    const cuuint64_t row = static_cast<cuuint64_t>(inner_bytes);
++    if (packed_fp4) {
++        const cuuint64_t dims[5] = {row, 8, 2, 2, static_cast<cuuint64_t>(rows / 32)};
++        const cuuint64_t strides[4] = {4 * row, row, 2 * row, 32 * row};
++        const cuuint32_t box[5] = {128, 8, 2, 2, static_cast<cuuint32_t>(load_block_n / 32)};
++        const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
++        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
++            &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, weights.data_ptr(), dims,
++            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
++            CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
++            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
++    } else {
++        const cuuint64_t dims[4] = {row, 8, 2, static_cast<cuuint64_t>(rows / 16)};
++        const cuuint64_t strides[3] = {2 * row, row, 16 * row};
++        const cuuint32_t box[4] = {128, 8, 2, static_cast<cuuint32_t>(load_block_n / 16)};
++        const cuuint32_t element_strides[4] = {1, 1, 1, 1};
++        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
++            &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, weights.data_ptr(), dims,
++            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
++            CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
++            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
++    }
++    return result;
++}
++
++// Inkling2 L1 SFs: CUTLASS 128x4 atoms (`[row block][k chunk][128 words]`, word
++// 4 * (row % 32) + (row / 32) % 4) with the rows permuted as `make_inkling2_l1_tma_desc`.
++// The row block and k chunk dims are flattened, so one load covers one row block.
++static CUtensorMap make_inkling2_l1_sf_tma_desc(
++    const torch::Tensor& sf, const int& num_row_blocks, const int& num_k_chunks,
++    const int& box_k_chunks, const bool packed_fp4) {
++    DG_HOST_ASSERT(sf.is_contiguous() and box_k_chunks <= num_k_chunks);
++    CUtensorMap result;
++    const cuuint64_t dims[5] = {4, 8, 2, 2,
++                                static_cast<cuuint64_t>(num_row_blocks) * num_k_chunks};
++    // packed FP4: (q, p, e) rows 4q + 2e + p; FP8: (i, p, h) rows 16h + 2i + p (16-byte rows)
++    const cuuint64_t strides[4] = {packed_fp4 ? 64ull : 32ull, 16ull,
++                                   packed_fp4 ? 32ull : 256ull, 512ull};
++    const cuuint32_t box[5] = {4, 8, 2, 2, static_cast<cuuint32_t>(box_k_chunks)};
++    const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
++    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
++        &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 5, sf.data_ptr(), dims,
++        strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
++        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
++        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
++    return result;
++}
++
+ // Undo TRT's L2 shuffle: GMEM row 32*i3 + 8*i1 + i2 -> SMEM row 32*i3 + 4*i2 + i1.
+ static CUtensorMap make_trtllm_fp4_l2_tma_desc(
+     const torch::Tensor& weights, const int inner_bytes, const int rows) {
+@@ -104,7 +162,9 @@ static void sm100_fp8_fp4_mega_moe(
+     const bool& use_trtllm_weights = false,
+     const std::optional<int64_t>& global_num_tokens = std::nullopt,
+     const float& situ_beta = 4.0f,
+-    const float& situ_linear_beta = 25.0f
++    const float& situ_linear_beta = 25.0f,
++    const bool& use_inkling2_weights = false,
++    const bool& broadcast_y = false
+ ) {
+     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+     const auto num_experts = num_experts_per_rank * num_ranks;
+@@ -120,10 +180,12 @@ static void sm100_fp8_fp4_mega_moe(
+         mma_kind, global_num_tokens,
+         l1_weights.scalar_type() == kPackedFP4);
+
+-    if (use_trtllm_weights) {
+-        DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4 and num_shared_experts == 0);
++    if (use_trtllm_weights or use_inkling2_weights) {
++        DG_HOST_ASSERT(num_shared_experts == 0);
+         DG_HOST_ASSERT(config.block_n % 128 == 0 and config.block_k % (config.gran_k * 4) == 0);
+     }
++    if (use_trtllm_weights)
++        DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4);
+
+     // Make tensormap
+     const bool is_packed_fp4 = mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
+@@ -154,14 +216,21 @@ static void sm100_fp8_fp4_mega_moe(
+                                                         1, 0, 0, false,
+                                                         sf_smem_outer_dim, static_cast<int>(l1_acts_sf.stride(-1)));
+     // TRT L1 rows are addressed as one 2D `[E * N, K]` matrix; the rest use the localizable 4D layout
+-    const auto tensor_map_l1_weights = use_trtllm_weights ?
++    const auto tensor_map_l1_weights = use_inkling2_weights ?
++        make_inkling2_l1_tma_desc(l1_weights, weight_inner(hidden),
++                                 num_experts_per_rank * intermediate_hidden * 2,
++                                 config.load_block_n, is_packed_fp4) :
++        use_trtllm_weights ?
+         make_tma_2d_desc(weight_tensor(l1_weights),
+                          weight_inner(hidden), num_experts_per_rank * intermediate_hidden * 2,
+                          block_k_inner, config.load_block_n,
+                          static_cast<int>(l1_weights.stride(-2)),
+                          config.swizzle_weights_mode, 0, false, not is_packed_fp4) :
+         make_tma_weights_3d_desc(weight_tensor(l1_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
+-    const auto tensor_map_l1_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
++    const auto tensor_map_l1_weights_sf = use_inkling2_weights ? make_inkling2_l1_sf_tma_desc(
++        l1_weights_sf, num_experts_per_rank * intermediate_hidden * 2 / 128,
++        hidden / (kGranK * 4), sf_smem_outer_dim, is_packed_fp4) :
++        use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+         l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
+         hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
+         make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
+@@ -191,7 +260,10 @@ static void sm100_fp8_fp4_mega_moe(
+     const auto tensor_map_l2_weights = use_trtllm_weights ? make_trtllm_fp4_l2_tma_desc(
+         l2_weights, weight_inner(intermediate_hidden), num_experts_per_rank * hidden) :
+         make_tma_weights_3d_desc(weight_tensor(l2_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
+-    const auto tensor_map_l2_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
++    const auto tensor_map_l2_weights_sf = use_inkling2_weights ? make_trtllm_fp4_sf_tma_desc(
++        l2_weights_sf, true, num_experts_per_rank * hidden / 128,
++        intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
++        use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+         l2_weights_sf, false, num_experts_per_rank * hidden / 128,
+         intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
+         make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
+@@ -282,7 +354,7 @@ static void __instantiate_kernel() {{
+         {}, {}, {}, {}, {}, {},
+         {}, {},
+         {}, {}, {}, {}, {},
+-        {}, {}
++        {}, {}, {}, {}
+     >);
+ }};
+ )", num_max_tokens_per_rank,
+@@ -315,7 +387,9 @@ static void __instantiate_kernel() {{
+     to_string(post_norm_eps),
+     use_trtllm_weights ? "true" : "false",
+     config.use_sm107_k64 ? "true" : "false",
+-    config.use_simt_pull ? "true" : "false"));
++    config.use_simt_pull ? "true" : "false",
++    use_inkling2_weights ? "true" : "false",
++    broadcast_y ? "true" : "false"));
+     // Launch
+     launch_with_shared_memory_mode(
+         get_smem_mode_for_mega_moe(config.smem_size), kernel, {
+diff --git a/csrc/torch_library_api.cpp b/csrc/torch_library_api.cpp
+index e1092df..565022a 100644
+--- a/csrc/torch_library_api.cpp
++++ b/csrc/torch_library_api.cpp
+@@ -598,7 +598,8 @@ void dg_fp8_fp4_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor
+                          const OptTensor& l1_alphas, const OptTensor& l2_alphas, const OptTensor& l2_act_scales,
+                          bool post_expert_norm, const OptTensor& post_expert_norm_weight,
+                          double post_expert_norm_eps, bool post_expert_norm_weight_first,
+-                         bool use_trtllm_weights, std::optional<int64_t> global_num_tokens) {
++                         bool use_trtllm_weights, bool use_inkling2_weights,
++                         std::optional<int64_t> global_num_tokens, bool broadcast_y) {
+     DG_HOST_ASSERT(shared_l1_weights.has_value() == shared_l1_weights_sf.has_value());
+     DG_HOST_ASSERT(shared_l2_weights.has_value() == shared_l2_weights_sf.has_value());
+     const auto shared_l1 = shared_l1_weights.has_value()
+@@ -613,7 +614,7 @@ void dg_fp8_fp4_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor
+         mma_type, activation, to_optional_float(activation_clamp), fast_math, use_x_scales,
+         l1_alphas, l2_alphas, l2_act_scales,
+         post_expert_norm, post_expert_norm_weight, static_cast<float>(post_expert_norm_eps),
+-        post_expert_norm_weight_first, use_trtllm_weights, global_num_tokens);
++        post_expert_norm_weight_first, use_trtllm_weights, global_num_tokens, use_inkling2_weights, broadcast_y);
+ }
+
+ void dg_bf16_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l2_weights,
+@@ -855,8 +856,8 @@ TORCH_LIBRARY(deep_gemm, m) {
+           "int[] recipe, str mma_type, str activation, float? activation_clamp, bool fast_math, bool use_x_scales, "
+           "Tensor? l1_alphas, Tensor? l2_alphas, Tensor? l2_act_scales, "
+           "bool post_expert_norm, Tensor? post_expert_norm_weight, float post_expert_norm_eps, "
+-          "bool post_expert_norm_weight_first, bool use_trtllm_weights, "
+-          "int? global_num_tokens) -> ()");
++          "bool post_expert_norm_weight_first, bool use_trtllm_weights, bool use_inkling2_weights, "
++          "int? global_num_tokens, bool broadcast_y) -> ()");
+     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights, "
+           "Tensor? shared_l2_weights, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, "
+           "int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, "
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+index 158dfb9..554016f 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+@@ -128,6 +128,8 @@ template <
+     bool kUseSM107K64 = false,
+     // SIMT dispatch pull (no SMEM send buffer)
+     bool kUseSimtPull = false,
++    bool kUseInkling2Weights = false,
++    bool kBroadcastY = false,
+     bool kHasShared = (kNumSharedExperts > 0),
+     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
+     uint32_t L1_SHAPE_K = kHidden,
+@@ -194,6 +196,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+     DG_STATIC_ASSERT(not kUseTrtllmWeights or
+                      (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
+                      "TRT weight layout requires routed NVFP4 experts");
++    DG_STATIC_ASSERT(not kUseInkling2Weights or
++                     (not kUseTrtllmWeights and kNumSharedExperts == 0 and
++                      (kMmaKind == MmaKind::NVFP4 or (kMmaKind == MmaKind::MXFP8FP4 and
++                                                      cute::is_same_v<weight_dtype_t, cutlass::float_e4m3_t>))),
++                     "Inkling2 weight layout requires routed NVFP4 or FP8xFP8 experts");
+
+     // Thread indices
+     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
+@@ -595,6 +602,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                 // Graph replays reuse grid IDs. Clear local readiness before the
+                 // dispatch NVLink barrier permits this launch's peer notifications.
+                 *workspace.get_combine_ready_grid_idx_ptr(thread_idx) = 0;
++                if constexpr (kBroadcastY)
++                    *workspace.get_output_ready_grid_idx_ptr(thread_idx) = 0;
+                 *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+             }
+             __syncwarp();
+@@ -607,17 +616,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                 *sym_buffer.map(
+                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                     dst_rank_idx) = expert_status & 0xffffffff;
+-                if constexpr (kUseSimtPull) {
+-                    // NOTES: no return value, so the pushes of all experts are in flight together; the release of the
+-                    // NVLink barrier below orders them before the peers pull
+-                    ptx::red_add_sys(
+-                        sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+-                        expert_status);
+-                } else {
+-                    ptx::atomic_add_sys(
+-                        sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+-                        expert_status);
+-                }
++                // NOTES: no return value, so the pushes of all experts are in flight together; the release of the
++                // NVLink barrier below orders them before the peers pull
++                ptx::red_add_sys(
++                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
++                    expert_status);
+             }
+         }
+         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+@@ -1161,6 +1164,55 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                         else
+                             shared_storage.full_barriers[stage_idx].arrive(0u);
+                     }
++                } else if constexpr (kUseInkling2Weights) {
++                    // Inkling2 weights: L1 rows reordered into the `megamoe` SMEM order by the
++                    // descriptor; L2 rows are plain. SFs are CUTLASS 128x4 atoms (TRT SMEM order).
++                    const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
++                    const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
++                    const auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
++                    auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
++                    if (is_l1) {
++                        #pragma unroll
++                        for (uint32_t atom = 0; atom < BLOCK_K_BYTES / 128; ++ atom) {
++                            auto* tile = shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 128;
++                            if (cute::elect_one_sync()) {
++                                if constexpr (kIsWeightFP8) {
++                                    cute::SM100_TMA_2SM_LOAD_4D::copy(
++                                        tensor_map_b_ptr, full, cache_hint, tile,
++                                        k_idx + atom * 128, 0, 0, expert_n_idx / 16);
++                                } else {
++                                    cute::SM100_TMA_2SM_LOAD_5D::copy(
++                                        tensor_map_b_ptr, full, cache_hint, tile,
++                                        k_idx + atom * 128, 0, 0, 0, expert_n_idx / 32);
++                                }
++                            }
++                        }
++                    } else if (cute::elect_one_sync()) {
++                        tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
++                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
++                    }
++                    __syncwarp();
++                    if (cute::elect_one_sync()) {
++                        const uint32_t sf_row_block = expert_n_idx / 128;
++                        const uint32_t sf_k_chunk = k_block_idx * kNumSFChunksPerBlock;
++                        if (is_l1) {
++                            #pragma unroll
++                            for (uint32_t i = 0; i < BLOCK_N / 128; ++ i)
++                                cute::SM100_TMA_2SM_LOAD_5D::copy(
++                                    tensor_map_sfb_ptr, full, cache_hint,
++                                    shared_storage.smem_sfb[stage_idx] + i * kNumSFChunksPerBlock * kNumUTCCPAlignedElems,
++                                    0, 0, 0, 0, (sf_row_block + i) * shape_sfb_k + sf_k_chunk);
++                        } else {
++                            cute::SM100_TMA_2SM_LOAD_3D::copy(
++                                tensor_map_sfb_ptr, full, cache_hint, shared_storage.smem_sfb[stage_idx],
++                                0, sf_k_chunk, sf_row_block);
++                        }
++                        if (is_leader_cta)
++                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
++                                (sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0])) * 2);
++                        else
++                            shared_storage.full_barriers[stage_idx].arrive(0u);
++                    }
+                 } else if (cute::elect_one_sync()) {
+                     if (is_split_k) {
+                         tma::copy_nd<SHARED_BLOCK_K, LOAD_BLOCK_N, kSwizzleK64Mode, shared_b_dtype_t, 4>(
+@@ -1301,7 +1353,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             #pragma unroll
+                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                                 auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
+-                                    (kUseTrtllmWeights
++                                    ((kUseTrtllmWeights or kUseInkling2Weights)
+                                         ? i * (kNumSFChunksPerBlock * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
+                                         : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+@@ -2369,9 +2421,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                 }
+                 __syncwarp();
+
+-                // TMA store the BF16 chunk to gmem y. Output byte offset still
+-                // tracks BF16 chunks (= kNumChunkBytes).
+-                if (cute::elect_one_sync()) {
++                // Broadcast: every rank's gathered `y` (in the symmetric buffer) gets this row at
++                // `rank_idx * num_tokens + token_idx`, written over NVLink
++                if constexpr (kBroadcastY) {
++                    const auto dst_ptr = math::advance_ptr<uint4>(
++                        y, (static_cast<uint64_t>(sym_buffer.rank_idx) * num_tokens + token_idx) * kNumHiddenBytes + chunk * kNumChunkBytes);
++                    #pragma unroll
++                    for (uint32_t j = lane_idx; j < kNumChunkUint4; j += 32) {
++                        const auto value = ptx::ld_shared(combine_store_buffer + j);
++                        #pragma unroll
++                        for (uint32_t r = 0; r < kNumRanks; ++ r)
++                            *sym_buffer.map(dst_ptr + j, (sym_buffer.rank_idx + r) % kNumRanks) = value;
++                    }
++                    __syncwarp();
++                } else if (cute::elect_one_sync()) {
+                     cute::tma_store_fence();
+                     ptx::tma_store_1d(
+                         math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk * kNumChunkBytes),
+@@ -2381,6 +2444,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                 __syncwarp();
+             }
+         }
++
++        if constexpr (kBroadcastY) {
++            // All this rank's broadcast rows are written after the fence and grid sync; then tag every peer
++            // and wait until every peer has tagged this rank, so `y` is complete when the kernel finishes
++            __threadfence_system();
++            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
++                workspace, sm_idx, epilogue_thread_idx,
++                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
++            );
++            if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
++                ptx::st_rel_sys(sym_buffer.map(workspace.get_output_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
++                const auto ready_ptr = workspace.get_output_ready_grid_idx_ptr(epilogue_thread_idx);
++                comm::wait_until([&]() { return ptx::ld_acq_sys(ready_ptr) == grid_idx; },
++                                 [&]() { printf("DeepGEMM broadcast output timeout: rank=%u, peer=%u\n", sym_buffer.rank_idx, epilogue_thread_idx); });
++            }
++        }
+     }
+ #else
+     if (blockIdx.x == 0 and threadIdx.x == 0)
+diff --git a/deep_gemm/include/deep_gemm/layout/mega_moe.cuh b/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
+index 56a0e61..31a9c7b 100644
+--- a/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
+@@ -73,6 +73,9 @@ struct alignas(128) MegaMoESignals {
+     // rank are done. Dispatch clears readiness before its NVLink barrier because graph replays reuse grid IDs.
+     alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
+     alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];
++    // Broadcast output readiness: `output_ready_grid_idx[peer] == own grid index` means the peer's combined rows
++    // are written into this rank's gathered `y`. Cleared with `combine_ready_grid_idx`.
++    alignas(128) uint64_t output_ready_grid_idx[kNumMaxRanks];
+
+     // Expert token counts
+     alignas(128) uint64_t expert_send_count[kNumMaxExperts];
+@@ -177,6 +180,11 @@ struct Workspace {
+         return signals->combine_ready_grid_idx + peer_rank_idx;
+     }
+
++    CUTLASS_DEVICE
++    uint64_t* get_output_ready_grid_idx_ptr(const uint32_t& peer_rank_idx = 0) const {
++        return signals->output_ready_grid_idx + peer_rank_idx;
++    }
++
+     CUTLASS_DEVICE
+     uint64_t* get_peer_grid_idx_ptr(const uint32_t& peer_rank_idx = 0) const {
+         return signals->peer_grid_idx + peer_rank_idx;
+diff --git a/deep_gemm/mega/__init__.py b/deep_gemm/mega/__init__.py
+index 62440b7..8941d6f 100644
+--- a/deep_gemm/mega/__init__.py
++++ b/deep_gemm/mega/__init__.py
+@@ -48,11 +48,12 @@ class SymmBuffer:
+                  num_shared_experts: int = 0,
+                  mma_type: str = 'fp8xfp4',
+                  activation: str = 'swiglu',
+-                 base: Optional['SymmBuffer'] = None):
++                 base: Optional['SymmBuffer'] = None,
++                 gather_output: bool = False):
+         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+         assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
+-        assert activation != 'situ' or mma_type == 'fp8xfp4', \
+-            '`situ` activation is supported only for `fp8xfp4` MegaMoE'
++        assert activation != 'situ' or mma_type in ('fp8xfp4', 'fp8xfp8', 'nvfp4xnvfp4'), \
++            '`situ` activation is supported only for `fp8xfp4`, `fp8xfp8` and `nvfp4xnvfp4` MegaMoE'
+         _check_legacy_fp4_acts_env()
+         self.group = group
+         self.num_experts = num_experts
+@@ -71,6 +72,9 @@ class SymmBuffer:
+                        mma_type, activation,
+                        num_shared_experts)
+         num_bytes = _C.get_symm_buffer_size_for_mega_moe(*layout_args)
++        # `gather_output` appends every rank's output rows at the end of the buffer for `broadcast_y`
++        num_gathered_bytes = group.size() * num_max_tokens_per_rank * hidden * 2 if gather_output else 0
++        num_bytes = align(num_bytes, 128) + num_gathered_bytes
+         if base is None:
+             allocator = torch if group.size() == 1 else symm_mem
+             self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+@@ -88,8 +92,11 @@ class SymmBuffer:
+             assert num_bytes <= base.buffer.nbytes, \
+                 (f'The reused Mega MoE config requires {num_bytes} bytes, '
+                  f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
++            assert num_gathered_bytes == 0 or base.gathered_y is not None, 'The reused buffer has no gathered output'
+             self.buffer = base.buffer
+             self.handle = base.handle
++        self.gathered_y = (self.buffer[self.buffer.nbytes - num_gathered_bytes:].view(torch.bfloat16).view(-1, hidden)
++                           if gather_output else None)
+
+         # Create input buffer views; absent ones (BF16 SFs, no shared experts) are empty byte tensors
+         (self.x, self.x_sf,
+@@ -194,7 +201,7 @@ def transform_weights_for_mega_moe(
+     assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
+     assert activation != 'situ' or (
+         isinstance(l1_weights, tuple) and isinstance(l2_weights, tuple)
+-    ), '`situ` activation is supported only for FP8xFP4 MegaMoE weights'
++    ), '`situ` activation needs quantized (weight, sf) MegaMoE weights'
+     if isinstance(l1_weights, tuple):
+         # FP8/MXFP4/NVFP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP.
+         interleave = _interleave_weights_packed_fp4 if mma_type in ('mxf4xmxf4', 'nvfp4xnvfp4') \
+@@ -221,10 +228,13 @@ def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tens
+
+
+ def _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights):
+-    if weight_layout not in ('megamoe', 'trtllm'):
++    # `inkling2`: checkpoint gate/up rows interleaved per row (gate 2i, up 2i+1), unpacked
++    # `[E, N, K]` weights, and weight SFs in the CUTLASS 128x4-atom layout
++    # (`[E][N / 128][K / (4 * gran_k)][128 words]`); NVFP4 or FP8 (`fp8xfp8`) weights.
++    if weight_layout not in ('megamoe', 'trtllm', 'inkling2'):
+         raise ValueError(f'Unsupported MegaMoE weight layout: {weight_layout!r}')
+-    if weight_layout == 'trtllm' and (shared_l1_weights is not None or shared_l2_weights is not None):
+-        raise ValueError('TRT-LLM weight layout does not support shared experts')
++    if weight_layout != 'megamoe' and (shared_l1_weights is not None or shared_l2_weights is not None):
++        raise ValueError(f'{weight_layout} weight layout does not support shared experts')
+
+
+ def _validate_global_num_tokens(global_num_tokens: Optional[int], num_ranks: int,
+@@ -259,11 +269,18 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+                      post_expert_norm: bool = False,
+                      post_expert_norm_weight: Optional[torch.Tensor] = None,
+                      post_expert_norm_eps: float = 1e-6,
+-                     post_expert_norm_weight_first: bool = False):
++                     post_expert_norm_weight_first: bool = False,
++                     broadcast_y: bool = False):
++    # `broadcast_y`: `y` is `sym_buffer.gathered_y[:num_ranks * num_tokens]`; every rank gets all ranks' rows, rank-major
+     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
++    if broadcast_y:
++        assert sym_buffer.gathered_y is not None and y.data_ptr() == sym_buffer.gathered_y.data_ptr(), \
++            '`broadcast_y` needs `y` to be a leading slice of `sym_buffer.gathered_y`'
+     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
+     if weight_layout == 'trtllm' and sym_buffer.mma_type != 'nvfp4xnvfp4':
+         raise ValueError('TRT-LLM packed weights require NVFP4 MMA')
++    if weight_layout == 'inkling2' and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
++        raise ValueError('Inkling2 weights require NVFP4 or FP8xFP8 MMA')
+     if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':
+         raise ValueError(
+             '`use_x_scales` is only supported for `nvfp4xnvfp4`; '
+@@ -290,7 +307,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
+         post_expert_norm, post_expert_norm_weight,
+         post_expert_norm_eps, post_expert_norm_weight_first,
+-        weight_layout == 'trtllm', global_num_tokens
++        weight_layout == 'trtllm', weight_layout == 'inkling2', global_num_tokens, broadcast_y
+     )
+
+ def nvfp4_mega_moe(y: torch.Tensor,
+@@ -346,6 +363,8 @@ def bf16_mega_moe(y: torch.Tensor,
+                   post_expert_norm_eps: float = 1e-6,
+                   post_expert_norm_weight_first: bool = False):
+     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
++    if weight_layout == 'inkling2':
++        raise ValueError('Inkling2 weights require NVFP4 or FP8xFP8 MMA')
+     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
+     _C.bf16_mega_moe(
+         y,
+diff --git a/sgl_deep_gemm/VERSION b/sgl_deep_gemm/VERSION
+index a53741c..978110d 100644
+--- a/sgl_deep_gemm/VERSION
++++ b/sgl_deep_gemm/VERSION
+@@ -1 +1 @@
+-0.2.6
+\ No newline at end of file
++0.2.6+inkling2.0f96f72.1

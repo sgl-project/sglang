@@ -1520,7 +1520,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+        is_below_minimum_capture = 0 < num_tokens < self.capture_num_tokens[0]
+        if (
+            not is_below_minimum_capture
+            and padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR
+        ):
             return False
         return True
 

@@ -253,6 +253,8 @@ def _draft_step(
         logits_out=logits_out,
         # Rows sample at their temperatures only when the step logits are kept.
         has_sampled_rows=None if logits_out is not None else False,
+        softcap=markov_head.step_softcap,
+        vocab_limit=markov_head.step_vocab_limit,
         **sharded,
     )
     return tokens, state
