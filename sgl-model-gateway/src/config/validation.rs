@@ -286,6 +286,14 @@ impl ConfigValidator {
             });
         }
 
+        if config.decode_dispatch_limit == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "decode_dispatch_limit".to_string(),
+                value: "0".to_string(),
+                reason: "Must be > 0 when specified".to_string(),
+            });
+        }
+
         if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
             // Allow 0 for pure concurrency limiting (semaphore behavior)
             if tokens_per_second < 0 {

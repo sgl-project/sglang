@@ -1,12 +1,16 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.attention_unittest.attention_methods import dense_attention
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
+    TinyModelConfig,
     make_swa_no_prefix_input_config_cases,
     make_swa_prefix_input_config_cases,
     run_dense_attention_case,
@@ -23,9 +27,18 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=21, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
+# backend-specific: the gfx950 window-only DSpark draft verify (triton_backend_hip).
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+class _AllWindowDSparkDraftConfig(TinyModelConfig):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.hf_config.architectures = ["DSparkMiniMaxDraftModel"]
+        self.hf_config.layer_types = ["sliding_attention"]
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -252,6 +265,60 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_attention_case(self, case)
 
+    # Every other SWA case here keeps the extend length under BLOCK_M (64 or
+    # 128 on the architectures we build for), so `cur_block_m` is always 0 and
+    # the extend-KV loop always starts at tile 0. The kernel bounds that loop
+    # below by the sliding-window floor, and that bound is only reachable once
+    # a query tile starts past the window. These lengths are therefore load
+    # bearing: they must stay above BLOCK_M with a window well below it, or
+    # the bound goes unexercised and a wrong or missing one stays green.
+    MULTI_TILE_SWA_CASES = (
+        DenseAttentionCase(
+            name="swa_extend_multi_tile_no_prefix",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(384, 321),
+            sliding_window_size=24,
+        ),
+        # Non-empty prefix so the prefix sweep runs too, and a window that is
+        # not a multiple of any BLOCK_N we use, which is where rounding the
+        # floor down to a tile boundary would show up.
+        DenseAttentionCase(
+            name="swa_extend_multi_tile_with_prefix",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(48, 130),
+            extend_lens=(384, 300),
+            sliding_window_size=72,
+        ),
+        # Window exactly on a tile boundary: the floor lands on a tile start,
+        # so an off-by-one in the bound drops a tile that still contributes.
+        DenseAttentionCase(
+            name="swa_extend_multi_tile_window_tile_aligned",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(448,),
+            sliding_window_size=128,
+        ),
+    )
+
+    def test_multi_tile_swa_extend_cases(self):
+        for case in self.MULTI_TILE_SWA_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                # The kit defaults to 64, which these lengths exceed.
+                run_dense_attention_case(self, case, max_context_len=512)
+
     # Layout-robustness. See dense/test_triton.py for full rationale.
     # The default `shuffled_pages` layout is already exercised by
     # test_projected_swa_attention_cases; this method opts into the
@@ -339,6 +406,46 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                     topk=topk,
                     spec_kind=spec_kind,
                 )
+
+    @unittest.skipUnless(is_gfx95_supported(), "the window-only verify is gfx950-only")
+    def test_all_window_dspark_draft_verify_reads_window_indices_only(self):
+        """The all-window M3.1 DSpark draft verifies correctly, eager and graphed, without
+        packing the full-context KV index stream."""
+        from sglang.srt.layers.attention import triton_backend_hip
+
+        packs = []
+        fill = TritonAttnBackend._fill_kv_indptr_and_indices
+
+        def record_fill(backend, plan, bs, seq_lens, req_pool_indices, kv_indices, *a):
+            packs.append(kv_indices is not None)
+            return fill(backend, plan, bs, seq_lens, req_pool_indices, kv_indices, *a)
+
+        case = DenseAttentionCase(
+            name="dspark_draft_verify_swa_above_window",
+            backend="triton",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=16,
+            prefix_lens=(6, 8),
+            extend_lens=(3, 3),
+            sliding_window_size=4,
+        )
+        with (
+            patch.object(
+                dense_attention, "TinyModelConfig", _AllWindowDSparkDraftConfig
+            ),
+            patch.object(TritonAttnBackend, "_fill_kv_indptr_and_indices", record_fill),
+            patch.object(
+                triton_backend_hip, "is_minimax_m31_dspark_draft", lambda *_: True
+            ),
+        ):
+            run_dense_spec_verify_case(self, case, topk=1, spec_kind="dflash")
+            run_dense_spec_verify_cuda_graph_case(
+                self, case, topk=1, spec_kind="dflash"
+            )
+        self.assertTrue(packs)
+        self.assertFalse(any(packs))
 
 
 if __name__ == "__main__":

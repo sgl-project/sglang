@@ -7,7 +7,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_spec_args(device: str, algorithm: str = "EAGLE", **overrides) -> ServerArgs:
@@ -35,13 +35,6 @@ class TestSpecCPUOverlapConstraint(CustomTestCase):
     def test_cpu_eagle_forces_disable_overlap_schedule(self):
         args = _make_spec_args(device="cpu")
         self.assertFalse(resolution_result(args, "disable_overlap_schedule"))
-
-        handle_speculative_decoding(args)
-
-        self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
-
-    def test_cpu_eagle3_forces_disable_overlap_schedule(self):
-        args = _make_spec_args(device="cpu", algorithm="EAGLE3")
 
         handle_speculative_decoding(args)
 

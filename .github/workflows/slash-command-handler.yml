@@ -23,10 +23,15 @@ jobs:
       (contains(github.event.comment.body, '/tag-run-ci-label') ||
        contains(github.event.comment.body, '/rerun-failed-ci') ||
        contains(github.event.comment.body, '/tag-and-rerun-ci') ||
+       contains(github.event.comment.body, '/run-ci') ||
+       contains(github.event.comment.body, '/run-base-ci') ||
+       contains(github.event.comment.body, '/rerun-base-ci') ||
        contains(github.event.comment.body, '/run-full-ci') ||
        contains(github.event.comment.body, '/run-extra-ci') ||
        contains(github.event.comment.body, '/rerun-full-ci') ||
        contains(github.event.comment.body, '/rerun-extra-ci') ||
+       contains(github.event.comment.body, '/run-cpu-ci') ||
+       contains(github.event.comment.body, '/rerun-cpu-ci') ||
        contains(github.event.comment.body, '/rerun-group') ||
        contains(github.event.comment.body, '/rerun-test') ||
        startsWith(github.event.comment.body, '/tag-') ||
@@ -92,7 +97,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |

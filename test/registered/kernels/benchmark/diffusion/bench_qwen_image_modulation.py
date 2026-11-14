@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
 register_cuda_ci(
-    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 register_amd_ci(est_time=13, stage="jit-kernel-benchmark", runner_config="amd")
 

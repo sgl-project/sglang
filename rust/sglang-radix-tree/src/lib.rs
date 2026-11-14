@@ -16,6 +16,7 @@
     clippy::useless_conversion
 )]
 
+mod cache_action;
 mod components;
 mod node;
 #[cfg(feature = "python-extension")]

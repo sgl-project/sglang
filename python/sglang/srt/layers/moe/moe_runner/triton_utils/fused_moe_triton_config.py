@@ -272,8 +272,14 @@ def try_get_optimal_moe_config(
     per_channel_quant: bool = False,
     return_down_config: bool = False,
 ):
-    from sglang.srt.layers.moe.moe_runner.triton_utils import get_config
+    from sglang.srt.layers.moe.moe_runner.triton_utils import (
+        get_config,
+        get_config_lookup,
+    )
 
+    lookup = get_config_lookup()
+    if lookup is not None:
+        M, top_k = lookup
     down_config = None
     max_block_m = None
     override_config = get_config()

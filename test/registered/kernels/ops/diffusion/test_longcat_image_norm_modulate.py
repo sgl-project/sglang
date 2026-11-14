@@ -11,7 +11,7 @@ from sglang.kernels.ops.diffusion import BitExactFusionGate, modulate_scale_shif
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 class TestLongCatNormModulation(CustomTestCase):
@@ -70,7 +70,9 @@ class TestLongCatNormModulation(CustomTestCase):
         self.assertTrue(longcat._LONGCAT_LN_MOD.verified)
         leaves = [t.detach().clone().requires_grad_() for t in (x, scale, shift)]
         refs = [t.detach().clone().requires_grad_() for t in leaves]
-        with patch.object(longcat.diffusion_ops, "fused_layernorm_modulate") as fused:
+        with patch.object(
+            longcat.diffusion_ops, "fused_layernorm_modulate_raw"
+        ) as fused:
             actual = longcat._longcat_norm_modulate(norm, *leaves)
             actual.float().sum().backward()
             fused.assert_not_called()
@@ -100,7 +102,9 @@ class TestLongCatNormModulation(CustomTestCase):
     def test_unverified_capture_uses_eager_reference(self):
         norm, x, scale, shift = self.inputs(seq=17)
         expected = modulate_scale_shift(norm(x), scale, shift)
-        with patch.object(longcat.diffusion_ops, "fused_layernorm_modulate") as fused:
+        with patch.object(
+            longcat.diffusion_ops, "fused_layernorm_modulate_raw"
+        ) as fused:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 actual = longcat._longcat_norm_modulate(norm, x, scale, shift)
@@ -115,13 +119,15 @@ class TestLongCatNormModulation(CustomTestCase):
         expected = norm(x) * (1 + scale[:, None]) + shift[:, None]
         with patch.object(
             longcat.diffusion_ops,
-            "fused_layernorm_modulate",
+            "fused_layernorm_modulate_raw",
             return_value=torch.zeros_like(x),
         ):
             actual = longcat._longcat_norm_modulate(norm, x, scale, shift)
         self.assertTrue(longcat._LONGCAT_LN_MOD.disabled)
         self.assertTrue(torch.equal(actual, expected))
-        with patch.object(longcat.diffusion_ops, "fused_layernorm_modulate") as fused:
+        with patch.object(
+            longcat.diffusion_ops, "fused_layernorm_modulate_raw"
+        ) as fused:
             actual = longcat._longcat_norm_modulate(norm, x, scale, shift)
             fused.assert_not_called()
         self.assertTrue(torch.equal(actual, expected))

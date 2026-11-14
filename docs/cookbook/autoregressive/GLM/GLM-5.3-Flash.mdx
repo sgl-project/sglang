@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, and MI355X, with MTP and multimodal serving."
+description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, MI355X, and TPU7x, with MTP and multimodal serving, plus Ascend A3 and 950PR/DT series NPU recipes."
 tag: NEW
 ---
 
@@ -20,6 +20,67 @@ For the listed NVIDIA hardware, the deployment panel can render a complete `dock
 
 For MI355X, follow the [AMD GPU installation guide](/docs/hardware-platforms/amd_gpu) and run the generated **Python** command on four GPUs. Select FP8 or [MXFP4](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4); SGLang downloads the model and tokenizer automatically.
 
+For TPU7x, install [sglang-torchtpu](https://github.com/sgl-project/sglang-torchtpu) from source (its `main` branch; the `v0.1.0-tpu` image predates the GLM-5.3-Flash MTP fixes) and run the generated **Python** command on one TPU7x host with 4 chips:
+
+```bash Command
+git clone https://github.com/sgl-project/sglang-torchtpu.git
+cd sglang-torchtpu
+cp python/pyproject_tpu.toml python/pyproject.toml
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -e python/
+pip install --no-deps -e .
+```
+
+</Accordion>
+
+<Accordion title="Install and prepare Ascend NPUs">
+
+Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environment. Follow the
+[Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) and the
+[GLM-5.3-Flash deployment tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3_flash#installation) to start a container with the NPU devices, driver mounts, and checkpoint directory. Run the setup and the generated **Python** command inside that container.
+
+<Tabs>
+<Tab title="A3">
+
+```bash Command
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash
+```
+
+Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+```
+
+</Tab>
+<Tab title="950PR/DT series">
+
+Use a CANN 9.1.0 SGLang image with the custom operators and MemFabric runtime required by the tutorial; PD mode also requires DP-attention support. The tutorial does not specify a 950PR/DT series image tag.
+
+```bash Command
+NPU_IMAGE="<your-compatible-950pr-dt-series-image>"
+docker pull "$NPU_IMAGE"
+```
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+source /usr/local/memfabric_hybrid/set_env.sh
+```
+
+</Tab>
+</Tabs>
+
+Replace the model path in the generated command with your mounted ModelSlim checkpoint directory. Include its configuration, tokenizer, quantization metadata, and MTP weights.
+
+Use [W8A8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) for A3 and [W8A8_MXFP8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) for 950PR/DT series.
+
+Replace network placeholders such as `<network-interface>`, `<prefill-head-ip>`, and `<decode-head-ip>` in the generated NPU command with your cluster settings.
+
 </Accordion>
 
 The cookbook opens on **B300**. Choose your hardware, then choose the operating point that matches your workload:
@@ -27,7 +88,7 @@ The cookbook opens on **B300**. Choose your hardware, then choose the operating 
 - **Low Latency** starts with MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
 
-Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+Every listed GPU platform exposes both strategies; TPU7x has a Low Latency recipe only. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
 The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, Breakable Cuda Graph, and HiCache tiers. The MI355X commands are marked **Not Verified** because the selector defaults to HiCache off, whereas the measured AgentX configuration adds the host tier described in [Extend the cache hierarchy](#extend-the-cache-hierarchy). Do not treat the CUDA benchmark rows as MI355X measurements.
 
@@ -40,7 +101,7 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-flash-benchmar
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
-Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which is a generic starting point rather than a workload-tuned split: too low starves the KDA state pool and clamps `max_running_requests`, too high over-provisions it and shrinks the KV pool. Use the repo-local [`compute-mamba-ratio`](https://github.com/sgl-project/sglang/blob/main/.claude/skills/compute-mamba-ratio/SKILL.md) skill to compute the balanced ratio — or the `--max-mamba-cache-size` pin to use instead — from your average request length and the two pool sizes printed in one boot log. See [Size both memory pools](#size-both-memory-pools) for what each pool caps.
+GLM-5.3-Flash defaults to `--mamba-full-memory-ratio 0.25` with `--mamba-radix-cache-strategy extra_buffer_lazy`: a small KDA state pool and a large KV pool, so multi-turn agent sessions stay resident between turns. High Throughput commands on GPUs where that small state pool would cap running requests below the benchmarked concurrency (GB300 FP8, GB200, H200, H100) pin `--mamba-full-memory-ratio 0.9`, because many short concurrent requests need more KDA states than KV. Neither is a workload-tuned split: too low starves the KDA state pool and clamps `max_running_requests`, too high shrinks the KV pool. Use the repo-local [`compute-mamba-ratio`](https://github.com/sgl-project/sglang/blob/main/.claude/skills/compute-mamba-ratio/SKILL.md) skill to compute the balanced ratio — or the `--max-mamba-cache-size` pin to use instead — from your average request length and the two pool sizes printed in one boot log. See [Size both memory pools](#size-both-memory-pools) for what each pool caps.
 </Note>
 
 ## Playground
@@ -110,6 +171,10 @@ The **Speculative** card in the Playground changes the algorithm without leaving
 
 Neither algorithm runs with DP-Attention; the card disables the affected chips and names the reason. DFlash2's FA4 draft path is also disabled on MI355X.
 
+### Serve on TPU7x
+
+The TPU7x recipe serves the language model with DeepSeek Sparse Attention on the Pallas sparse MLA kernels and MTP 3/1/4 on the experimental chain speculative worker (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`). On TPU7x, 3/1/4 decodes faster than 5/1/6 at the same accept length, because each extra draft row widens the target verify. It is sized for one request with 8K input and 1K output: `--context-length 10240`, `--max-running-requests 1`, and a 20,480-token KV pool. Raise `--context-length`, `--max-total-tokens`, `--max-running-requests` and `--max-mamba-cache-size` together for longer or concurrent requests; those settings are outside the verified command. The first start compiles every decode and prefill shape listed in `--tpu-compile-bs` and `--tpu-compile-tokens`, so it takes longer than later starts that reuse the compilation cache.
+
 ### Size both memory pools
 
 GLM-5.3-Flash maintains a paged KV pool for attention and a separate KDA state pool. The KDA state pool can limit concurrency before the KV pool is full. If startup reduces `max_running_requests` because of KDA state capacity, increase `--mamba-full-memory-ratio` or set `--max-mamba-cache-size` for the expected concurrency, then tune `--max-running-requests` to the workload.
@@ -118,9 +183,92 @@ Keep the prefix cache enabled for every strategy.
 
 Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not override `linear_lower_bound` through `--json-model-override-args`.
 
+### Tune B300 TP4 for long-context agent traffic
+
+For long-context agent workloads with prefix reuse, tune the prefill interval together with the KV/KDA memory split. On **four NVIDIA B300 GPUs with TP4 and FP8 weights**, the configuration below increased AgentX S19 total throughput by **26.3%** and output throughput by **35.6%** at client concurrency 64.
+
+| Parameter | Baseline | Tuned |
+| --- | --- | --- |
+| `--prefill-decode-interval` | `0` | `1` |
+| `--chunked-prefill-size` | `16384` | `16384` |
+| `--cuda-graph-max-bs-prefill` | `8192` | `8192` |
+| `--mamba-max-states-per-path` | `-1` (unlimited) | `2` |
+| `--mamba-full-memory-ratio` | `0.9` | `0.5` |
+
+Reducing the memory ratio shifts capacity from KDA states to KV tokens. KV capacity increased from 13.92M to 17.62M tokens, while KDA checkpoint capacity decreased from 1,626 to 1,144 states. At C64, the input cache-hit rate rose from 87.00% to 92.12%.
+
+<Accordion title="Benchmark server command">
+
+Measured on Linux with SGLang revision `3fa242f27c5e6caca28ccd2538f2043eec654740`, FlashInfer 0.7.2, and PyTorch 2.14.1+cu130. Set `MODEL_PATH` to the public model identifier or your local FP8 checkpoint.
+
+The benchmark pins speculative acceptance to 3.5 with the three `SGLANG_SIMULATE_ACC_*` variables below. Omit these variables for normal serving and accuracy evaluation.
+
+```bash
+MODEL_PATH="zai-org/GLM-5.3-Flash"
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+SGLANG_SIMULATE_ACC_LEN=3.5 \
+SGLANG_SIMULATE_ACC_METHOD=match-expected \
+SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token \
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --served-model-name zai-org/GLM-5.3-Flash \
+  --tp-size 4 \
+  --dsa-prefill-backend trtllm \
+  --dsa-decode-backend trtllm \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-runner-backend flashinfer_trtllm \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --enable-linear-replayssm-spec \
+  --max-running-requests 32 \
+  --cuda-graph-max-bs-decode 32 \
+  --cuda-graph-backend-prefill breakable \
+  --cuda-graph-max-bs-prefill 8192 \
+  --mem-fraction-static 0.9 \
+  --prefill-decode-interval 1 \
+  --chunked-prefill-size 16384 \
+  --mamba-max-states-per-path 2 \
+  --mamba-full-memory-ratio 0.5 \
+  --random-seed 316023864 \
+  --weight-loader-prefetch-checkpoints \
+  --weight-loader-prefetch-num-threads 16 \
+  --watchdog-timeout 3600 \
+  --enable-metrics --enable-cache-report \
+  --host 127.0.0.1 --port 30000
+```
+
+For the baseline, change the interval to `0`, the path-state cap to `-1`, and the memory ratio to `0.9`. Both configurations use 16,384-token prefill chunks and explicitly pin the prefill graph capacity to 8,192 tokens to match the measured configuration rather than rely on version-dependent defaults.
+
+</Accordion>
+
+The same configuration was also measured at C4. Total throughput increased by 2.9% and output throughput by 1.1%; median TTFT increased from 125.6 to 136.2 ms. C4 and C64 are client concurrency levels; the server's `max_running_requests` remains 32.
+
+| Client concurrency | Configuration | Total tokens/s | Output tokens/s | TTFT p50 (ms) | TPOT p99 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 4 | Baseline | 29,078.6 | 190.8 | 125.6 | 4.68 |
+| 4 | Tuned | 29,929.3 | 192.8 | 136.2 | 4.37 |
+| 64 | Baseline | 179,693.8 | 1,210.9 | 1,744.2 | 163.25 |
+| 64 | Tuned | 227,018.8 | 1,642.5 | 642.4 | 65.77 |
+
+Total throughput includes cached input tokens. TPOT p99 is the 99th percentile of per-request average time per output token.
+
+Tune the cap and memory ratio together: with interval `1` and ratio `0.9`, adding `cap=2` reduced C64 total throughput from 184,053.1 to 166,257.3 tokens/s. A follow-up at ratio `0.5` with an unlimited path-state cap measured 190,658.5 total tokens/s and 1,292.1 output tokens/s, compared with 227,018.8 and 1,642.5 with `cap=2`.
+
+<Accordion title="Measurement details">
+
+Each C4/C64 point is one 900-second AgentX send window after graph/kernel warmup, snapshot primers, and one additional warmup request per client lane. Each point used a fresh server, client seed 42, and corpus revision `23f152f6f0f9399a85901b89a6458def0ef16729`. Native full-run metrics include a final drain of up to 30 seconds.
+
+The C64 baseline completed 1,344 requests and cancelled 5 at the measurement boundary; the tuned configuration completed 1,644 with no cancellations. Both passed the native submission checks with no request errors. The sweep covers C4 and C64 with simulated acceptance; repeated runs and natural-acceptance performance are separate follow-ups.
+
+</Accordion>
+
 ### Keep the KV and DSA backends paired
 
 On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. MI355X instead uses FP8 KV with TileLang DSA in the recorded ROCm recipe. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination, and TRT-LLM DSA is not the MI355X backend.
+
+On Hopper, BF16 KV can also run the sparse prefill in FP8 with `--dsa-prefill-backend flashmla_sparse_q8` (decode stays on `tilelang` and the cache stays BF16): on H200 this pairing measured 5.8–12.1% higher throughput on prefill-only requests, with GSM8K accuracy within noise of BF16 + TileLang. It is SM90-only and requires a build that includes [PR #41790](https://github.com/sgl-project/sglang/pull/41790); FP8 KV is not available with it for this model.
 
 ### Extend the cache hierarchy
 

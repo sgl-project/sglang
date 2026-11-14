@@ -578,10 +578,18 @@ export const Qwen35Deployment = () => {
     if (model === '397b' && hardware === 'mi355x' && quantization === 'fp8' && kvOffload === 'hicache') {
       cmd += ' \\\n  --enable-hierarchical-cache';
       cmd += ' \\\n  --hicache-ratio 1.5';
-      cmd += ' \\\n  --hicache-write-policy write_through_selective';
+      cmd += ' \\\n  --hicache-write-policy write_through';
       cmd += ' \\\n  --hicache-io-backend kernel';
       cmd += ' \\\n  --hicache-mem-layout page_first';
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
+      // Scheduler / tokenizer tuning from the same recipe: larger prefill chunks,
+      // coarser scheduler polling and token streaming, and parallel tokenization
+      // so 256k-token warmups stay within client timeouts.
+      cmd += ' \\\n  --chunked-prefill-size 16384';
+      cmd += ' \\\n  --max-prefill-tokens 16384';
+      cmd += ' \\\n  --scheduler-recv-interval 60';
+      cmd += ' \\\n  --stream-interval 50';
+      cmd += ' \\\n  --tokenizer-worker-num 6';
     }
 
     // FP4-specific backend settings

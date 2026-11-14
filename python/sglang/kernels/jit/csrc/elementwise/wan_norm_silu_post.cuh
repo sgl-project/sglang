@@ -2,6 +2,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -60,7 +61,7 @@ __global__ void wan_norm_silu_post_kernel(
       y = __fmul_rn(y, scale);
       y = __fmul_rn(y, weight);
       y = __fadd_rn(y, offset);
-      result[i] = __fdiv_rn(y, __fadd_rn(1.f, expf(-y)));
+      result[i] = device::activation::silu<false>(y);
     }
     result.store(output, vec);
   }
@@ -83,7 +84,7 @@ void wan_norm_silu_post(
   auto elements = SymbolicSize{"elements"};
   auto pixels = SymbolicSize{"pixels"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
   TensorMatcher({elements}).with_dtype<X>().with_device(device_).verify(input);
   TensorMatcher({pixels}).with_dtype<float>().with_device(device_).verify(denominator);
   TensorMatcher({channels}).with_dtype<A>().with_device(device_).verify(gamma);

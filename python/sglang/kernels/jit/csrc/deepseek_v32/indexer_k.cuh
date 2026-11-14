@@ -1,5 +1,3 @@
-// DeepSeek-V3.2 only.
-//
 // DSA indexer K kernels: single-head LayerNorm (not RMS), ropes the leading
 // kRopeDim dims, and fp8-quantizes the rotated activations. V3.2 drops the
 // Hadamard incoherence rotation; it is logit-preserving (see main_norm_rope.cuh).
@@ -18,6 +16,7 @@
 #include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/dsa/indexer_rope.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -61,7 +60,7 @@ struct FusedKIndexerNormRopeParams {
   float eps;
 };
 
-template <typename DType, typename PosT, bool kUsePDL>
+template <typename DType, typename PosT, bool kUsePDL, bool kHadamard, bool kNeoxStyle>
 K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIndexerNormRopeParams params) {
   using namespace device;
 
@@ -88,7 +87,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
-  Float4 data, freq, gamma, beta;
+  Float4 data, freq, freq_sin, gamma, beta;
 
   // part 1: LayerNorm
   {
@@ -96,7 +95,13 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
     input_vec.load(input_ptr, lane_id);
     gamma.load(params.weight, lane_id);
     beta.load(params.bias, lane_id);
-    if (is_rope_lane) freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+    if (is_rope_lane) {
+      if constexpr (kNeoxStyle) {
+        dsa_indexer::load_neox_cos_sin<kRopeDim>(cos_sin_cache, lane_id, freq, freq_sin);
+      } else {
+        freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+      }
+    }
 
     float sum = 0.0f;
 #pragma unroll
@@ -120,8 +125,10 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
     }
   }
 
-  // part 2: rope on rope lanes
-  if (is_rope_lane) {
+  // part 2: rope
+  if constexpr (kNeoxStyle) {
+    dsa_indexer::apply_neox_rope<kRopeSize>(data, freq, freq_sin, lane_id, is_rope_lane);
+  } else if (is_rope_lane) {
     const auto x_real = data[0];
     const auto x_imag = data[1];
     const auto y_real = data[2];
@@ -137,6 +144,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   }
 
   PDLTriggerSecondary<kUsePDL>();
+  if constexpr (kHadamard) dsa_indexer::hadamard_128(data, lane_id);
 
   {
     Storage out_vec;
@@ -148,10 +156,10 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   }
 }
 
-template <typename DType, bool kUsePDL>
+template <typename DType, bool kUsePDL, bool kHadamard = false, bool kNeoxStyle = false>
 struct FusedKIndexerNormRopeKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_k_indexer_norm_rope<DType, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_k_indexer_norm_rope<DType, PosT, kUsePDL, kHadamard, kNeoxStyle>;
 
   static void forward(
       const tvm::ffi::TensorView k_input,
@@ -167,7 +175,7 @@ struct FusedKIndexerNormRopeKernel {
 
     auto B = SymbolicSize{"batch_size"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, kHeadDim})  //
         .with_strides({-1, 1})
@@ -233,11 +241,13 @@ struct FusedKIndexerNormRopeStoreParams {
   const void* __restrict__ positions;       // (B,) PosT
   // Row stride for `k_input` (caller passes the non-contiguous wk slice directly).
   int64_t k_input_stride_batch;
+  // Bytes between consecutive pages of `cache`.
+  int64_t cache_page_stride;
   uint32_t batch_size;
   float eps;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits>
+template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits, bool kHadamard, bool kNeoxStyle>
 K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ FusedKIndexerNormRopeStoreParams params) {
   using namespace device;
 
@@ -245,7 +255,6 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   constexpr int64_t kRopeDim = 64;
   constexpr int64_t kVecSize = 4;
   constexpr uint32_t kRopeSize = kRopeDim / kVecSize;  // = 16
-  constexpr int64_t kPageBytes = 132ll << kPageBits;
   static_assert(kHeadDim == kWarpThreads * kVecSize);
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
@@ -266,7 +275,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
-  Float4 data, freq, gamma, beta;
+  Float4 data, freq, freq_sin, gamma, beta;
 
   // part 1: LayerNorm
   {
@@ -274,7 +283,13 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
     input_vec.load(input_ptr, lane_id);
     gamma.load(params.weight, lane_id);
     beta.load(params.bias, lane_id);
-    if (is_rope_lane) freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+    if (is_rope_lane) {
+      if constexpr (kNeoxStyle) {
+        dsa_indexer::load_neox_cos_sin<kRopeDim>(cos_sin_cache, lane_id, freq, freq_sin);
+      } else {
+        freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+      }
+    }
 
     float sum = 0.0f;
 #pragma unroll
@@ -298,8 +313,10 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
     }
   }
 
-  // part 2: rope on rope lanes
-  if (is_rope_lane) {
+  // part 2: rope
+  if constexpr (kNeoxStyle) {
+    dsa_indexer::apply_neox_rope<kRopeSize>(data, freq, freq_sin, lane_id, is_rope_lane);
+  } else if (is_rope_lane) {
     const auto x_real = data[0];
     const auto x_imag = data[1];
     const auto y_real = data[2];
@@ -315,6 +332,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   }
 
   PDLTriggerSecondary<kUsePDL>();
+  if constexpr (kHadamard) dsa_indexer::hadamard_128(data, lane_id);
 
   // part 3: fp8 act-quant + paged store. Round through bf16 first so the fp8
   // scale matches the un-fused path.
@@ -333,7 +351,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const auto index = static_cast<const int64_t*>(params.indices)[work_id];
   const int32_t page = static_cast<int32_t>(index >> kPageBits);
   const int32_t offset = static_cast<int32_t>(index & ((1 << kPageBits) - 1));
-  const auto page_ptr = static_cast<uint8_t*>(params.cache) + page * kPageBytes;
+  const auto page_ptr = static_cast<uint8_t*>(params.cache) + page * params.cache_page_stride;
   const auto value_ptr = page_ptr + offset * kHeadDim;
   const auto scale_ptr = page_ptr + (kHeadDim << kPageBits) + offset * 4;
 
@@ -344,14 +362,15 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   if (lane_id == 0) *reinterpret_cast<float*>(scale_ptr) = scale;
 }
 
-template <typename DType, bool kUsePDL, uint32_t kPageSize>
+template <typename DType, bool kUsePDL, uint32_t kPageSize, bool kHadamard = false, bool kNeoxStyle = false>
 struct FusedKIndexerNormRopeStoreKernel {
   static constexpr int32_t kPageBits = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = 132ll * kPageSize;
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
 
   template <typename PosT>
-  static constexpr auto kernel = fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits>;
+  static constexpr auto kernel =
+      fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits, kHadamard, kNeoxStyle>;
 
   static void forward(
       const tvm::ffi::TensorView k_input,
@@ -368,15 +387,17 @@ struct FusedKIndexerNormRopeStoreKernel {
 
     auto B = SymbolicSize{"batch_size"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, kHeadDim})  //
         .with_strides({-1, 1})
         .with_dtype<DType>()
         .with_device(device_)
         .verify(k_input);
-    TensorMatcher({-1, -1})  //
-        .with_strides({kPageBytes, 1})
+    auto num_pages = SymbolicSize{"num_pages"};
+    auto page_stride = SymbolicSize{"page_stride"};
+    TensorMatcher({num_pages, kPageBytes})  // one row per page, rows may be strided
+        .with_strides({page_stride, 1})
         .with_dtype<uint8_t>()
         .with_device(device_)
         .verify(cache);
@@ -402,6 +423,14 @@ struct FusedKIndexerNormRopeStoreKernel {
         .with_device(device_)
         .verify(positions);
 
+    // A single-page view may report any row stride (DLPack normalizes it).
+    const int64_t cache_page_stride = num_pages.unwrap() > 1 ? page_stride.unwrap() : kPageBytes;
+    // the fp32 scales need 4-byte alignment in every page
+    RuntimeCheck(
+        cache_page_stride >= kPageBytes && cache_page_stride % 4 == 0,
+        "invalid index-K page stride: ",
+        cache_page_stride);
+
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     if (batch_size == 0) return;
 
@@ -414,6 +443,7 @@ struct FusedKIndexerNormRopeStoreKernel {
         .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
         .positions = positions.data_ptr(),
         .k_input_stride_batch = k_input.stride(0),
+        .cache_page_stride = cache_page_stride,
         .batch_size = batch_size,
         .eps = static_cast<float>(eps),
     };

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kda_kernels import _cuda_source
 
@@ -78,8 +79,7 @@ def try_fused_flux2_qkv_epilogue(
         and _qkv_tensor(txt_k, txt_q)
         and _qkv_tensor(txt_v, txt_q)
         and img_q.shape[2] == txt_q.shape[2]
-        and torch.version.cuda is not None
-        and torch.cuda.get_device_capability(img_q.device)[0] >= 10
+        and current_arch().is_sm_at_least(10)
     ):
         return None
     if torch.cuda.is_current_stream_capturing():

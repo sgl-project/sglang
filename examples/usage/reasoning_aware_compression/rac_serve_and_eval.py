@@ -31,7 +31,7 @@ from typing import List, Optional
 import msgspec
 
 import sglang as sgl
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful AI Assistant that provides well-reasoned and detailed "

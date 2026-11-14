@@ -67,7 +67,7 @@ class SanaVideoTextEncodingStage(TextEncodingStage):
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
-            max_length=300,
+            max_length=batch.max_sequence_length or 300,
         )
         return outputs
 

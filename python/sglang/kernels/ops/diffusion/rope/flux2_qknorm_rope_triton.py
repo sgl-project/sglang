@@ -4,6 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
+
 
 def can_use_flux2_strided_qknorm_rope(q, k, q_weight, k_weight, cache) -> bool:
     if (
@@ -11,7 +14,7 @@ def can_use_flux2_strided_qknorm_rope(q, k, q_weight, k_weight, cache) -> bool:
         or torch.is_grad_enabled()
         or torch.version.hip is not None
         or not q.is_cuda
-        or torch.cuda.get_device_capability(q.device) != (9, 0)
+        or not current_arch().is_sm(9, 0)
         or q.ndim != 4
         or q.shape[-2:] != (24, 128)
         or q.numel() == 0
@@ -91,6 +94,7 @@ def _flux2_strided_qknorm_rope_kernel(
     tl.store(y_ptr + rows * 128 + dims, rotated, mask=rows < ROWS)
 
 
+@replay_launches
 def flux2_strided_qknorm_rope(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -2,16 +2,16 @@
 
 import unittest
 
+from sglang.srt.multimodal.media_io import VideoData
 from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     jinja_template_may_reorder_tool_results,
     process_content_for_template_format,
 )
-from sglang.srt.utils import VideoData
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
