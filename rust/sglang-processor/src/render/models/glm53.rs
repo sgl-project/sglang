@@ -7,7 +7,8 @@ use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Value, json};
 
 use super::pydantic_dump::{
-    continues_final_message, engine_message, normalize_tools, split_continuation,
+    continues_final_message, engine_message, fold_thinking_parts, normalize_tools,
+    split_continuation,
 };
 use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
@@ -175,6 +176,7 @@ fn template_message(message: Value) -> Result<Value, RenderError> {
     if message["role"] == "assistant" {
         parse_tool_arguments(&mut message)?;
     }
+    fold_thinking_parts(&mut message)?;
     if let Some(parts) = message["content"].as_array() {
         let parts = parts
             .iter()
