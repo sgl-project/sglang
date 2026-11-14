@@ -51,7 +51,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -982,7 +982,7 @@ def spec_stage_span(name: str):
     """Profiler span for a coarse speculative-decoding stage (``draft`` /
     ``draft_extend`` / ``verify``).
     """
-    return profile_range(name)
+    return forward_nvtx_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(

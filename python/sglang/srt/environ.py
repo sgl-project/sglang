@@ -472,6 +472,7 @@ class Envs:
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
+    SGLANG_ENABLE_NVTX_FORWARD = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).

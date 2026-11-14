@@ -96,7 +96,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import fast_topk
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -886,7 +886,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         if can_run_decode_cuda_graph:
             # Graph replay bypasses ModelRunner.forward, which emits the
             # step[...] trace span for every other phase; emit it here.
-            with profile_range(build_step_span_name(forward_batch)):
+            with forward_nvtx_range(build_step_span_name(forward_batch)):
                 cgr = self.cuda_graph_runner_for_draft_extend
                 # Populate the single shared buffer set once; each step replays
                 # against it and the chain is advanced in place between steps.

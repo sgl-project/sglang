@@ -1134,6 +1134,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_NVTX_SCHEDULER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Emit the scheduler stages (<code>scheduler.recv_requests</code>, <code>scheduler.run_batch</code>, ...) as NVTX ranges for Nsight Systems. Requires the <code>nvtx</code> package.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_NVTX_OPERATIONS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Emit the batch-overlap operations as NVTX ranges for Nsight Systems. Requires the <code>nvtx</code> package.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_NVTX_FORWARD</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Emit the per-step forward span (<code>step[EXTEND bs=8 toks=4096]</code>, <code>step[DECODE bs=48]</code>, ...) and the speculative-decoding stage spans (<code>draft</code>, <code>draft_extend</code>, <code>verify</code>) as NVTX ranges for Nsight Systems. Requires the <code>nvtx</code> package.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config BatchSpanProcessor.schedule_delay_millis if tracing is enabled</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`500`</td>
