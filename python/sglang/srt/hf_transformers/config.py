@@ -25,6 +25,7 @@ from sglang.srt.configs.deepseek_v41 import (
     DeepseekV41Config,
     normalize_deepseek_v41_config,
 )
+from sglang.srt.configs.jina_ocr import is_jina_ocr_config
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -59,7 +60,10 @@ def _set_architectures(config, arch_name):
 
 def _apply_deepseek_ocr_overrides(config, model):
     _override_v_head_dim_if_zero(config)
-    _set_architectures(config, "DeepseekOCRForCausalLM")
+    arch = (
+        "JinaOCRForCausalLM" if is_jina_ocr_config(config) else "DeepseekOCRForCausalLM"
+    )
+    _set_architectures(config, arch)
     config._name_or_path = model
 
 
