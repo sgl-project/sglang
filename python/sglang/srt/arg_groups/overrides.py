@@ -1234,18 +1234,27 @@ def _deterministic_attention_backend(view: Any) -> dict:
     decode_note = ""
     if decode_backend == "aiter":
         # AITER paged decode reduces fixed 256-token KV partitions per request, so it is
-        # batch-invariant (verified on gfx950); MLA decode sizes its KV splits by batch
-        # size, and speculative decoding would run AITER's unverified verify kernels.
+        # batch-invariant (verified on gfx950). MLA decode is too with a fixed KV split
+        # count, which the backend sets in deterministic mode; verified for the bf16
+        # KV cache without decode context parallelism. Speculative decoding would run
+        # AITER's unverified verify kernels.
         if (
             is_gfx95_supported()
-            and not use_mla_backend(view)
+            and (
+                not use_mla_backend(view)
+                or (
+                    view.kv_cache_dtype in ("auto", "bf16", "bfloat16")
+                    and view.dcp_size == 1
+                )
+            )
             and view.speculative_algorithm is None
         ):
             decode_choices.append("aiter")
         else:
             decode_note = (
-                " (aiter decode is accepted only on gfx950, for non-MLA models and "
-                "without speculative decoding)"
+                " (aiter decode is accepted only on gfx950, without speculative "
+                "decoding, and for MLA models only with a bf16 KV cache and no "
+                "--dcp-size)"
             )
 
     prefill_choices = list(DETERMINISTIC_ATTENTION_BACKEND_CHOICES)
