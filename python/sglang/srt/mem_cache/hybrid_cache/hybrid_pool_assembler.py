@@ -42,6 +42,9 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    reserve_dsv4_paged_host_memory,
+)
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
@@ -896,6 +899,14 @@ def build_deepseek_v4_hicache_stack(
         c128_attn_allocator=c128_attn_allocator,
     )
 
+    reserve_dsv4_paged_host_memory(
+        infos=infos,
+        num_host_pages=num_host_pages,
+        swa_num_host_pages=swa_num_host_pages,
+        c128_num_host_pages=c128_num_host_pages,
+        num_draft_swa_layers=len(mtp_swa_device_buffers),
+    )
+
     logical_host_pool = LogicalHostPool(
         num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
     )
@@ -1137,7 +1148,9 @@ def _state_host_layout() -> str:
     # pool has no separate K/V buffers, so kv_split does not apply; override
     # to page_first_direct.
     layout = get_memory().hicache_mem_layout
-    return "page_first_direct" if layout == "page_first_kv_split" else layout
+    if layout in ("page_first_kv_split", "layer_first_kv_split"):
+        return "page_first_direct"
+    return layout
 
 
 def build_mamba_host_pool(
@@ -1745,7 +1758,7 @@ def _build_mha_mla_host_pool(
     # The global layout is page_first_kv_split only when the target model
     # uses MLA; that layout is MLA-specific, so MHA draft pools must use
     # the non-MLA layout (NPU default: page_first_direct).
-    if is_mha and layout == "page_first_kv_split":
+    if is_mha and layout in ("page_first_kv_split", "layer_first_kv_split"):
         layout = "page_first_direct"
 
     kwargs = dict(
@@ -2065,13 +2078,6 @@ class StackStrategy:
         raise NotImplementedError
 
 
-def _delegate_c128_host_evict(cache, n: int) -> int:
-    """Delegate C128 host pressure to FULL leaf eviction.
-
-    For example, ``n`` C128 slots request ``n * 128`` FULL tokens."""
-    return cache.evict_host(n * 128, ComponentType.FULL)
-
-
 class _DeepSeekV4Strategy(StackStrategy):
     def owns(self, kvcache):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -2118,9 +2124,9 @@ class _DeepSeekV4Strategy(StackStrategy):
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
-            # _delegate_c128_host_evict converts C128 slots to FULL tokens.
+            # C128's host eviction counts reclaimed summary slots directly.
             host_c128_evict_fn=(
-                (lambda n: _delegate_c128_host_evict(cache, n))
+                (lambda n: cache.evict_host(n, ComponentType.C128))
                 if independent_c128
                 else None
             ),

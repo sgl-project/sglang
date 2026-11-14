@@ -108,9 +108,7 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
         )
         memory = SimpleNamespace(disable_radix_cache=False)
         modules = {
-            "sgl_kernel.flash_attn": _fake_attention_module(
-                "sgl_kernel.flash_attn", with_scheduler_metadata=True
-            ),
+            "sgl_fa3": _fake_attention_module("sgl_fa3", with_scheduler_metadata=True),
             "sglang.kernels.ops.attention.flash_attention_v4": _fake_attention_module(
                 "sglang.kernels.ops.attention.flash_attention_v4"
             ),

@@ -333,6 +333,7 @@ class Dots3MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
                 if get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 else "tp",
             )
@@ -384,7 +385,9 @@ class Dots3MoE(nn.Module):
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._enable_deepep_moe = (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops()
+        )
 
     def get_moe_weights(self):
         return [
