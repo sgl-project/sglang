@@ -49,6 +49,8 @@ def chunk_gated_delta_rule_fwd(
     o_chunk_indices: torch.LongTensor | None = None,
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -75,6 +77,8 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
         chunk_offsets=chunk_offsets,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
     )
     o = chunk_fwd_o(
         q=q,
@@ -115,6 +119,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         chunk_offsets: Optional[torch.LongTensor] = None,
         out: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
+        track_state: Optional[torch.Tensor] = None,
+        track_chunk_idx: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -144,6 +150,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             o_chunk_indices=o_chunk_indices,
             out=out,
             output_indices=output_indices,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
         )
         return o.to(q.dtype), h
 
@@ -166,6 +174,8 @@ def chunk_gated_delta_rule(
     chunk_offsets: Optional[torch.LongTensor] = None,
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -200,6 +210,11 @@ def chunk_gated_delta_rule(
             Inference-only contiguous output buffer and one destination per input token.
             The caller supplies unique, in-range destinations and initializes unmapped
             positions. Mapped output is only supported for flattened variable lengths.
+        track_state (Optional[torch.Tensor]):
+            fp32 buffer of shape `[N, H, V, K]` that receives, for each sequence, the state at the
+            chunk boundary given by `track_chunk_idx` (a prefix-cache checkpoint). Default: `None`.
+        track_chunk_idx (Optional[torch.Tensor]):
+            Per-sequence chunk index of that boundary; passed together with `track_state`.
 
     Returns:
         o (torch.Tensor):
@@ -314,6 +329,8 @@ def chunk_gated_delta_rule(
         chunk_offsets,
         out,
         output_indices,
+        track_state,
+        track_chunk_idx,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
