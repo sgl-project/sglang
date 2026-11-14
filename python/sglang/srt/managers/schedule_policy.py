@@ -357,7 +357,6 @@ class SchedulePolicy:
         from sglang.srt.managers.lpm_opportunity import (
             RECHECK_SECONDS,
             competition_opportunity,
-            prefix_opportunity,
         )
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -384,8 +383,6 @@ class SchedulePolicy:
         if not isinstance(capacity, int) or capacity <= 0:
             return False
         candidates = waiting_queue[:BOUNDED_LPM_WINDOW_SIZE]
-        if not prefix_opportunity(candidates):
-            return False
         self._lpm_gate_competition = competition_opportunity(
             candidates, capacity, include_pairs=False
         )

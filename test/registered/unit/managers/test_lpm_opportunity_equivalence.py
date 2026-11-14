@@ -3,8 +3,7 @@
 import copy
 import random
 import unittest
-from collections import Counter
-from itertools import chain, islice
+from itertools import chain
 from types import SimpleNamespace
 
 from sglang.srt.managers import lpm_opportunity as new
@@ -14,33 +13,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 Req = SimpleNamespace
 
 PREFIX_TOKENS = 4096
-MIN_DUPLICATE_RATIO = 0.20
 RECHECK_SECONDS = 1.0
-
-
-def reference_prefix_opportunity(requests):
-    """Exact namespace-aware prefix grouping; never accesses/mutates the KV tree.
-
-    Duplicate tokens are a structural lower bound at one checkpoint, not
-    predicted savings relative to FCFS. Do not add overlapping checkpoints.
-    """
-    counts = Counter()
-    total = 0
-    for req in requests:
-        size = len(req.origin_input_ids) + len(req.output_ids)
-        total += size
-        if size >= PREFIX_TOKENS:
-            key = (
-                req.extra_key,
-                req.cache_salt,
-                tuple(
-                    islice(chain(req.origin_input_ids, req.output_ids), PREFIX_TOKENS)
-                ),
-            )
-            counts[key] += 1
-    duplicate = sum(n - 1 for n in counts.values()) * PREFIX_TOKENS
-    ratio = duplicate / total if total else 0.0
-    return ratio >= MIN_DUPLICATE_RATIO
 
 
 def _lcp(a, b):
@@ -119,7 +92,6 @@ def reference_competition_opportunity(requests, capacity):
 
 
 old = SimpleNamespace(
-    prefix_opportunity=reference_prefix_opportunity,
     competition_opportunity=reference_competition_opportunity,
 )
 
@@ -141,7 +113,6 @@ def clean(result):
 class Equivalence(unittest.TestCase):
     def check(self, rs, kv):
         before = copy.deepcopy(rs)
-        self.assertEqual(old.prefix_opportunity(rs), new.prefix_opportunity(rs))
         expected = clean(old.competition_opportunity(rs, kv))
         self.assertEqual(expected, clean(new.competition_opportunity(rs, kv)))
         if "pairs" in expected:
@@ -169,10 +140,8 @@ class Equivalence(unittest.TestCase):
         self.check(rs, 4097)
         self.assertFalse(new.competition_opportunity(rs, 4097)["allowed"])
         rs = [req([1] * 4096), req([1] * 4096), req([2] * 12288)]
-        self.assertTrue(new.prefix_opportunity(rs))
         self.check(rs, 8192)
         rs[-1].output_ids.append(2)
-        self.assertFalse(new.prefix_opportunity(rs))
         self.check(rs, 8192)
 
     def test_no_cross_call_cache(self):

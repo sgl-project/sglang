@@ -1,36 +1,9 @@
 """Bounded-window opportunity estimates for cache-aware scheduling."""
 
-from collections import Counter
-from itertools import chain, islice
+from itertools import chain
 
 PREFIX_TOKENS = 4096
-MIN_DUPLICATE_RATIO = 0.20
 RECHECK_SECONDS = 1.0
-
-
-def prefix_opportunity(requests):
-    """Exact namespace-aware prefix grouping; never accesses/mutates the KV tree.
-
-    Duplicate tokens are a structural lower bound at one checkpoint, not
-    predicted savings relative to FCFS. Do not add overlapping checkpoints.
-    """
-    counts = Counter()
-    total = 0
-    for req in requests:
-        size = len(req.origin_input_ids) + len(req.output_ids)
-        total += size
-        if size >= PREFIX_TOKENS:
-            key = (
-                req.extra_key,
-                req.cache_salt,
-                tuple(
-                    islice(chain(req.origin_input_ids, req.output_ids), PREFIX_TOKENS)
-                ),
-            )
-            counts[key] += 1
-    duplicate = sum(n - 1 for n in counts.values()) * PREFIX_TOKENS
-    ratio = duplicate / total if total else 0.0
-    return ratio >= MIN_DUPLICATE_RATIO
 
 
 def _lcp(a, b):
@@ -54,7 +27,7 @@ def competition_opportunity(requests, capacity, *, include_pairs=True):
 
     Count long-prefix reuse pairs whose intervening unique input working set,
     including the target prefix, exceeds total KV capacity. Namespace boundaries
-    prevent false sharing. Called after the duplicate-density check, at most once per second.
+    prevent false sharing. Evaluated at most once per second for long LPM queues.
     """
     import time
     from collections import defaultdict
