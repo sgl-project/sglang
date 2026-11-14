@@ -278,6 +278,106 @@ __global__ void moe_align_block_size_kernel(
   }
 }
 
+// moe_align_block_size_kernel for more expert buckets than threads in the block: each thread owns
+// EXPERTS_PER_THREAD consecutive buckets. Ported from the JIT kernel (#21610); the block-wide scan
+// goes through shared memory so the same code builds for CUDA and ROCm.
+template <typename scalar_t, int EXPERTS_PER_THREAD>
+__global__ void moe_align_block_size_large_experts_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    int32_t num_experts,
+    int32_t block_size,
+    size_t numel,
+    int32_t* __restrict__ cumsum,
+    bool pad_sorted_token_ids,
+    bool ignore_invalid_expert,
+    int32_t max_num_tokens_padded) {
+  // Use a separate thread block to populate sorted_token_ids
+  if (blockIdx.x == 1) {
+    if (pad_sorted_token_ids) {
+      Vec fill_vec;
+      fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
+      // Whole vectors only; a partial last vector would write past the buffer.
+      int32_t total_vecs = max_num_tokens_padded / VEC_SIZE;
+      Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
+      for (int32_t i = threadIdx.x; i < total_vecs; i += blockDim.x) {
+        out_ptr[i] = fill_vec;
+      }
+      for (int32_t i = total_vecs * VEC_SIZE + threadIdx.x; i < max_num_tokens_padded; i += blockDim.x) {
+        sorted_token_ids[i] = numel;
+      }
+    }
+    return;
+  }
+
+  extern __shared__ int32_t smem[];
+  int32_t* shared_counts = smem;           // [num_experts]
+  int32_t* scan_buf = smem + num_experts;  // [blockDim.x]
+
+  const int tid = threadIdx.x;
+  const int first_expert = tid * EXPERTS_PER_THREAD;
+
+  for (int i = tid; i < num_experts; i += blockDim.x) {
+    shared_counts[i] = 0;
+  }
+  __syncthreads();
+
+  for (size_t i = tid; i < numel; i += blockDim.x) {
+    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
+    int expert_id = topk_ids[i] + 1;
+    if (expert_id < num_experts) {
+      atomicAdd(&shared_counts[expert_id], 1);
+    }
+  }
+  __syncthreads();
+
+  int32_t padded_counts[EXPERTS_PER_THREAD];
+  int32_t thread_sum = 0;
+#pragma unroll
+  for (int e = 0; e < EXPERTS_PER_THREAD; ++e) {
+    const int expert = first_expert + e;
+    padded_counts[e] = expert < num_experts ? CEILDIV(shared_counts[expert], block_size) * block_size : 0;
+    thread_sum += padded_counts[e];
+  }
+
+  // Block-wide inclusive scan of the per-thread sums
+  scan_buf[tid] = thread_sum;
+  __syncthreads();
+  for (int offset = 1; offset < blockDim.x; offset <<= 1) {
+    const int32_t v = tid >= offset ? scan_buf[tid - offset] : 0;
+    __syncthreads();
+    scan_buf[tid] += v;
+    __syncthreads();
+  }
+
+  int32_t running = scan_buf[tid] - thread_sum;
+#pragma unroll
+  for (int e = 0; e < EXPERTS_PER_THREAD; ++e) {
+    if (first_expert + e < num_experts) {
+      cumsum[first_expert + e] = running;
+    }
+    running += padded_counts[e];
+  }
+  if (tid == blockDim.x - 1) {
+    cumsum[num_experts] = scan_buf[tid];
+    *total_tokens_post_pad = scan_buf[tid];
+  }
+  __syncthreads();
+
+  // fill expert_ids (bucket 0 holds the -1 ids, so bucket b is expert b - 1)
+#pragma unroll
+  for (int e = 0; e < EXPERTS_PER_THREAD; ++e) {
+    const int expert = first_expert + e;
+    if (expert < num_experts) {
+      for (int i = cumsum[expert]; i < cumsum[expert + 1]; i += block_size) {
+        expert_ids[i / block_size] = expert - 1;
+      }
+    }
+  }
+}
+
 template <typename scalar_t, int32_t fill_threads>
 __global__ void moe_align_block_size_small_batch_expert_kernel(
     const scalar_t* __restrict__ topk_ids,
@@ -401,23 +501,56 @@ void moe_align_block_size(
           ignore_invalid_expert,
           max_num_tokens_padded);
     } else {
-      auto align_kernel = moe_align_block_size_kernel<scalar_t>;
+      if (num_experts <= threads) {
+        auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
-      const size_t scan_size = next_pow2(num_experts);
-      const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + WARP_SIZE) * sizeof(int32_t);
-      align_kernel<<<2, threads, shared_mem_size, stream>>>(
-          topk_ids.data_ptr<scalar_t>(),
-          sorted_token_ids.data_ptr<int32_t>(),
-          experts_ids.data_ptr<int32_t>(),
-          num_tokens_post_pad.data_ptr<int32_t>(),
-          num_experts,
-          block_size,
-          topk_ids.numel(),
-          cumsum_buffer.data_ptr<int32_t>(),
-          pad_sorted_token_ids,
-          ignore_invalid_expert,
-          scan_size,
-          max_num_tokens_padded);
+        const size_t scan_size = next_pow2(num_experts);
+        const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + WARP_SIZE) * sizeof(int32_t);
+        align_kernel<<<2, threads, shared_mem_size, stream>>>(
+            topk_ids.data_ptr<scalar_t>(),
+            sorted_token_ids.data_ptr<int32_t>(),
+            experts_ids.data_ptr<int32_t>(),
+            num_tokens_post_pad.data_ptr<int32_t>(),
+            num_experts,
+            block_size,
+            topk_ids.numel(),
+            cumsum_buffer.data_ptr<int32_t>(),
+            pad_sorted_token_ids,
+            ignore_invalid_expert,
+            scan_size,
+            max_num_tokens_padded);
+      } else {
+        // More buckets than threads: each thread scans several buckets.
+        TORCH_CHECK(
+            num_experts <= 8 * threads,
+            "moe_align_block_size supports at most ",
+            8 * threads,
+            " expert buckets (num_experts + 1), got ",
+            num_experts);
+        const size_t shared_mem_size = (num_experts + threads) * sizeof(int32_t);
+        auto launch = [&](auto experts_per_thread) {
+          auto large_kernel = moe_align_block_size_large_experts_kernel<scalar_t, decltype(experts_per_thread)::value>;
+          large_kernel<<<2, threads, shared_mem_size, stream>>>(
+              topk_ids.data_ptr<scalar_t>(),
+              sorted_token_ids.data_ptr<int32_t>(),
+              experts_ids.data_ptr<int32_t>(),
+              num_tokens_post_pad.data_ptr<int32_t>(),
+              num_experts,
+              block_size,
+              topk_ids.numel(),
+              cumsum_buffer.data_ptr<int32_t>(),
+              pad_sorted_token_ids,
+              ignore_invalid_expert,
+              max_num_tokens_padded);
+        };
+        if (num_experts <= 2 * threads) {
+          launch(std::integral_constant<int, 2>{});
+        } else if (num_experts <= 4 * threads) {
+          launch(std::integral_constant<int, 4>{});
+        } else {
+          launch(std::integral_constant<int, 8>{});
+        }
+      }
 
       const int block_threads = std::min(256, (int)threads);
       const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
