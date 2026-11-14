@@ -35,6 +35,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.io_struct import ActiveRanksOutput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.managers.prefill_session_placement import PrefillSessionPlacement
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -520,6 +521,92 @@ class TestTotalTokensScheduler(CustomTestCase):
         ctl.workers[1].send_pyobj.assert_called_once()
         ctl.workers[0].send_pyobj.assert_not_called()
         self.assertEqual(ctl.dp_budget.total_tokens, [10, 3])
+
+
+class TestPrefillSessionTokens(CustomTestCase):
+    def make_controller(self, **options):
+        ctl = _make_controller(2)
+        ctl.load_balance_method = LoadBalanceMethod.PREFILL_SESSION_TOKENS
+        ctl.prefill_sessions = PrefillSessionPlacement(2, **options)
+        ctl.dp_budget.update_budget(
+            [_load(dp_rank=r, timestamp=1, max_total_num_tokens=90) for r in range(2)]
+        )
+        return ctl
+
+    def dispatch(self, ctl, sid, size, output=0, force=None):
+        req = _req(routed_dp_rank=force, input_ids=[0] * size)
+        req.session_id = sid
+        req.sampling_params = SimpleNamespace(max_new_tokens=output)
+        calls = [w.send_pyobj.call_count for w in ctl.workers]
+        ctl.prefill_session_tokens_scheduler(req)
+        targets = [
+            r for r, w in enumerate(ctl.workers) if w.send_pyobj.call_count != calls[r]
+        ]
+        self.assertEqual(len(targets), 1)
+        return targets[0]
+
+    def test_cold_slots_and_follow_up_growth_use_online_information(self):
+        ctl = self.make_controller()
+        self.assertEqual(self.dispatch(ctl, "a", 16, 4), 0)
+        self.assertEqual(self.dispatch(ctl, "b", 16, 4), 1)
+        self.assertEqual(self.dispatch(ctl, "c", 40), 0)
+        self.assertEqual(ctl.prefill_sessions.occupied, [{0, 2}, {0}])
+        ctl.dp_budget.total_tokens[0] = 90
+        self.assertEqual(self.dispatch(ctl, "a", 25, 4), 0)
+        # The new 25-token prompt grew by 9. Charge the new footprint once.
+        self.assertEqual(ctl.prefill_sessions.retained, [40 + 25 + 9 + 4, 20])
+
+    def test_override_rebinds_and_inactive_rank_is_forgotten(self):
+        ctl = self.make_controller()
+        self.assertEqual(self.dispatch(ctl, "a", 20), 0)
+        self.assertEqual(self.dispatch(ctl, "a", 24, force=1), 1)
+        self.assertEqual(self.dispatch(ctl, "a", 25), 1)
+        self.assertEqual(ctl.prefill_sessions.retained[0], 0)
+        ctl.status[1] = False
+        ctl._refresh_active_workers()
+        self.assertEqual(ctl.prefill_sessions.retained, [0, 0])
+        with self.assertRaisesRegex(ValueError, "not active"):
+            self.dispatch(ctl, "a", 26, force=1)
+        self.assertEqual(self.dispatch(ctl, "a", 26), 0)
+
+    def test_lru_and_expiry_release_charges_and_slots(self):
+        ctl = self.make_controller(max_sessions=2, idle_seconds=30)
+        with patch(
+            "sglang.srt.managers.prefill_session_placement.time.monotonic",
+            return_value=1,
+        ):
+            for sid in ("a", "b", "c"):
+                self.dispatch(ctl, sid, 20)
+        self.assertEqual(list(ctl.prefill_sessions.sessions), ["b", "c"])
+        self.assertEqual(sum(ctl.prefill_sessions.retained), 40)
+        with patch(
+            "sglang.srt.managers.prefill_session_placement.time.monotonic",
+            return_value=32,
+        ):
+            self.dispatch(ctl, "d", 15)
+        self.assertEqual(sum(ctl.prefill_sessions.retained), 15)
+        self.assertEqual(sum(map(len, ctl.prefill_sessions.occupied)), 1)
+
+    def test_capacity_fallback_and_soft_slots(self):
+        ctl = self.make_controller(slots_per_rank=1)
+        ctl.dp_budget.capacity = [30, 100]
+        self.assertEqual(self.dispatch(ctl, "long", 31), 1)
+        self.assertEqual(self.dispatch(ctl, "longer", 42), 1)
+        self.assertIsNone(ctl.prefill_sessions.sessions["longer"].slot)
+        ctl.dp_budget.capacity = [0, 100]
+        ctl.dp_budget.total_tokens = [100, 0]
+        self.assertEqual(self.dispatch(ctl, None, 8), 1)
+        self.assertEqual(len(ctl.prefill_sessions.sessions), 2)
+
+    def test_embedding_rows_without_session_and_no_active_workers(self):
+        ctl = self.make_controller(slots_per_rank=0)
+        ctl._active_workers = [1]
+        ctl.prefill_session_tokens_scheduler(_req(input_embeds=[[0.0] * 4] * 3))
+        self.assertEqual(ctl.dp_budget.total_tokens, [0, 3])
+        self.assertFalse(ctl.prefill_sessions.sessions)
+        ctl._active_workers = []
+        with self.assertRaisesRegex(RuntimeError, "No active DP"):
+            self.dispatch(ctl, "a", 8)
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):

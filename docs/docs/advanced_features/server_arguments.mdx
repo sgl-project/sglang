@@ -1268,9 +1268,9 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--load-balance-method`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The load balancing strategy for data parallelism. The `total_tokens` algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The load balancing strategy for data parallelism. The `total_tokens` algorithm uses the live token load of DP attention workers. On a PD prefill engine, `prefill_session_tokens` uses the current prompt, requested output and per-rank KV capacity to place a new session. Send the same `session_id` on later turns to prefer its active rank. An explicit `routed_dp_rank` takes precedence.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>round_robin</code>, <code>follow_bootstrap_room</code>, <code>total_requests</code>, <code>total_tokens</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>round_robin</code>, <code>follow_bootstrap_room</code>, <code>total_requests</code>, <code>total_tokens</code>, <code>prefill_session_tokens</code></td>
     </tr>
   </tbody>
 </table>

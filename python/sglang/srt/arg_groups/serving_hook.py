@@ -220,6 +220,14 @@ def handle_load_balance_method(server_args: Any):
     if cfg.disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(f"Invalid disaggregation_mode={cfg.disaggregation_mode!r}")
 
+    if (
+        cfg.load_balance_method == "prefill_session_tokens"
+        and cfg.disaggregation_mode != "prefill"
+    ):
+        raise ValueError(
+            "prefill_session_tokens requires --disaggregation-mode prefill"
+        )
+
     if cfg.load_balance_method == "auto":
         # Default behavior:
         # - non-PD: round_robin

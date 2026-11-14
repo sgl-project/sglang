@@ -1756,6 +1756,21 @@ class TestLoraForwardDomains(unittest.TestCase):
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
+    def test_session_tokens_only_on_prefill(self):
+        method = "prefill_session_tokens"
+        args = self._load_balance_args(
+            disaggregation_mode="prefill", load_balance_method=method
+        )
+        self.assertEqual(args.load_balance_method, method)
+        for mode in ("null", "decode"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "requires.*prefill"),
+            ):
+                self._load_balance_args(
+                    disaggregation_mode=mode, load_balance_method=method
+                )
+
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)
         handle_pd_disaggregation(server_args)
