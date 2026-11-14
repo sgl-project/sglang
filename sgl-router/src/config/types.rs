@@ -34,6 +34,10 @@ pub struct ProxyConfig {
     pub decode_dispatch_limit: Option<NonZeroU32>,
     /// PD: return decode's response only once prefill completes.
     pub stream_after_prefill: bool,
+    /// Replay a POST once when a worker closes its HTTP/1.1 connection before
+    /// answering. On by default (keeps idle keep-alive closes transparent);
+    /// set true to trade that resilience for never running a request twice.
+    pub disable_non_idempotent_retry: bool,
 }
 
 impl ProxyConfig {
@@ -67,6 +71,7 @@ impl Default for ProxyConfig {
             max_backoff_ms: 2000,
             decode_dispatch_limit: None,
             stream_after_prefill: false,
+            disable_non_idempotent_retry: false,
         }
     }
 }

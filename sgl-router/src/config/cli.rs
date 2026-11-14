@@ -158,6 +158,14 @@ pub struct ServerArgs {
     /// first token, queueing included. Must be greater than zero.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
+    /// Do not replay a POST whose worker connection closed before any
+    /// response. The default replay keeps an idle keep-alive close
+    /// transparent, but a worker that read the request and died while
+    /// producing is indistinguishable from one that never read it, so the
+    /// replay can run the model twice for one request — set this flag when
+    /// duplicate compute/billing is the bigger risk (issue #50132).
+    #[arg(long, default_value_t = false)]
+    pub disable_non_idempotent_retry: bool,
     /// Maximum silence between upstream stream chunks, in seconds.
     #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
     pub stream_idle_timeout_secs: u64,
@@ -694,6 +702,7 @@ impl Cli {
                 max_backoff_ms: self.server.retry_max_backoff_ms,
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
+                disable_non_idempotent_retry: self.server.disable_non_idempotent_retry,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
