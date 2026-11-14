@@ -22,7 +22,7 @@ const CONSUMER_24G = ["rtx4090", "rtx3090"];
 // The only tier measured on a physical desktop rather than under an allocator
 // cap: an RTX 5090 with 60 GB of host RAM and a PCIe 5.0 NVMe, where the VRAM,
 // the host RAM and the drive are all real at once.
-const CONSUMER_32G = ["rtx5090"];
+const CONSUMER_32G = ["rtx5090", "b70"];
 // Workstation cards a home builder can actually buy. No hard-cap anchor was
 // measured for these sizes (the lab card is 24 GB and caps only shrink), so
 // their recipes are derived from the tier logic, not verified runs.
@@ -202,6 +202,7 @@ return {
     "rtx5070",
     "rtx4070",
     "rtx3060",
+    "b70",
   ],
   hardware: [
     { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
@@ -217,6 +218,7 @@ return {
     { id: "rtx5070", label: "RTX 5070", vram: "12GB", vendor: "consumer" },
     { id: "rtx4070", label: "RTX 4070", vram: "12GB", vendor: "consumer" },
     { id: "rtx3060", label: "RTX 3060", vram: "12GB", vendor: "consumer" },
+    { id: "b70", label: "Arc Pro B70", vram: "32GB", vendor: "consumer" },
   ],
   groupHardware: false,
 
@@ -335,7 +337,7 @@ return {
             const recipe = config.commandBuilder.resource.verifiedRecipes.find((entry) =>
               entry.hw === s.hw && entry.nodes === Number(s.nodes)
               && entry.gpus_per_node === Number(s.gpus_per_node));
-            const placement = recipe?.placement || (s.hw === "rtx5090" ? "offload" : "resident");
+            const placement = recipe?.placement || (s.hw === "rtx5090" || s.hw === "b70" ? "offload" : "resident");
             if (placement === "fsdp") return ["--performance-mode speed", "--use-fsdp-inference true"];
             return placement === "offload" ? [
                 "--performance-mode memory",
@@ -352,7 +354,7 @@ return {
           flags: ["--performance-mode speed"],
           disabled: (s) => CONSUMER_SINGLE.includes(s.hw),
           disableReason: "The 61.7 GB DiT cannot be resident on a single consumer card.",
-          recommendedWhen: (s) => s.hw !== "rtx5090" && !CONSUMER_SINGLE.includes(s.hw),
+          recommendedWhen: (s) => s.hw !== "rtx5090" && s.hw !== "b70" && !CONSUMER_SINGLE.includes(s.hw),
           description: "Lowest-latency path when the full pipeline fits in aggregate GPU memory.",
         },
         {
@@ -375,9 +377,9 @@ return {
             ];
           },
           hints: (s) => (consumerSingleCard(s) ? consumerHints(s) : []),
-          soft: (s) => s.hw !== "rtx5090" && !CONSUMER_SINGLE.includes(s.hw),
+          soft: (s) => s.hw !== "rtx5090" && s.hw !== "b70" && !CONSUMER_SINGLE.includes(s.hw),
           softReason: "Tuned and verified on the consumer cards. It runs on the datacenter GPUs too, where a resident recipe is simply faster.",
-          recommendedWhen: (s) => s.hw === "rtx5090" || CONSUMER_SINGLE.includes(s.hw),
+          recommendedWhen: (s) => s.hw === "rtx5090" || s.hw === "b70" || CONSUMER_SINGLE.includes(s.hw),
           description: "Capacity-first PCIe path. It is substantially slower than a resident datacenter recipe.",
         },
       ],
@@ -651,6 +653,8 @@ return {
         { id: "rtx5070-offload-1", hw: "rtx5070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
         { id: "rtx3060-offload-1", hw: "rtx3060", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
         { id: "rtx4070-offload-1", hw: "rtx4070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "b70-offload-4", hw: "b70", nodes: 1, gpus_per_node: 4, placement: "offload", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto", default: true },
+        { id: "b70-offload-8", hw: "b70", nodes: 1, gpus_per_node: 8, placement: "offload", tp_size: 4, ulysses_degree: 2, ring_degree: 1, encoder: "auto", default: true, extraFlags: ["--sp-degree 2"] },
       ],
       autoTopology: (s) => {
         const recipes = config.commandBuilder.resource.verifiedRecipes;
@@ -727,10 +731,10 @@ return {
         && entry.ring_degree === topology.ring_degree);
       const resolvedPlacement = s.placement === "auto"
         ? (automaticRecipe?.placement
-          || (s.hw === "rtx5090" || CONSUMER_SINGLE.includes(s.hw) ? "offload" : "resident"))
+          || (s.hw === "rtx5090" || s.hw === "b70" || CONSUMER_SINGLE.includes(s.hw) ? "offload" : "resident"))
         : s.placement;
       const coverageWarnings = [];
-      if (resolvedPlacement === "offload" && s.hw !== "rtx5090"
+      if (resolvedPlacement === "offload" && s.hw !== "rtx5090" && s.hw !== "b70"
         && !CONSUMER_SINGLE.includes(s.hw)) {
         coverageWarnings.push("Layerwise offload is tuned and verified on consumer cards; on this hardware it runs unverified and a resident recipe is faster.");
       }
@@ -794,6 +798,7 @@ return {
       if (topology.tp_size > 1) flags.push(`--tp-size ${topology.tp_size}`);
       if (topology.ulysses_degree > 1) flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
       if (topology.ring_degree > 1) flags.push(`--ring-degree ${topology.ring_degree}`);
+      if (recipe?.extraFlags) flags.push(...recipe.extraFlags);
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");
 
       const warnings = [...coverageWarnings];
