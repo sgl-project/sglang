@@ -61,6 +61,11 @@ class BaseGrammarObject:
         self.grammar_stats = None
         self.current_token = None
 
+    def __repr__(self):
+        # Req.__repr__ prints the grammar, and rank consensus checks compare
+        # those reprs across ranks; the default repr carries a per-process address.
+        return f"{type(self).__name__}()"
+
     def maybe_init_reasoning(self, reasoning: bool):
         pass
 
