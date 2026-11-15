@@ -54,13 +54,17 @@ To learn more details about R-Fork, please check **<a href="https://lmsys.org/bl
 
 ### NCCL as backend
 
+The client asks the seed's admin endpoints to send the weights, so start both instances with the same `SGLANG_ADMIN_API_KEY` (or the same `--admin-api-key`): the client sends its own key to the seed, and a seed without one refuses the request.
+
 seed instance:
 ```shell Command
+export SGLANG_ADMIN_API_KEY=[admin_api_key]
 python -m sglang.launch_server [args]
 ```
 
 client instance:
 ```shell Command
+export SGLANG_ADMIN_API_KEY=[admin_api_key]
 python -m sglang.launch_server [args] \
   --load-format remote_instance \
   --remote-instance-weight-loader-seed-instance-ip [seed_instance_ip] \

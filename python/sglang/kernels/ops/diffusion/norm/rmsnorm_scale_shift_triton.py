@@ -29,6 +29,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.numerics import round_bf16_to_fp32
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -206,6 +207,124 @@ def _rmsnorm_indexed_scale_shift_cuda(
     return out
 
 
+@triton.jit
+def _indexed_gate_rmsnorm_scale_shift_kernel(
+    y_ptr,
+    x_ptr,
+    other_ptr,
+    gate_ptr,
+    w_ptr,
+    scale_ptr,
+    shift_ptr,
+    idx_ptr,
+    gate_row_stride,
+    mod_row_stride,
+    idx_stride,
+    DIM: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_SIZE_DIM: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE_DIM)
+    mask = cols < DIM
+    index = tl.load(idx_ptr + row * idx_stride)
+
+    # _indexed_gate_bf16_kernel's residual, stored in place at its rounding
+    x = tl.load(x_ptr + row * DIM + cols, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.load(gate_ptr + index * gate_row_stride + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    other = tl.load(other_ptr + row * DIM + cols, mask=mask, other=0.0).to(tl.float32)
+    x = (x + round_bf16_to_fp32(gate * other)).to(x_ptr.dtype.element_ty)
+    tl.store(x_ptr + row * DIM + cols, x, mask=mask)
+
+    # then _rmsnorm_indexed_scale_shift_kernel on the stored row
+    x = x.to(tl.float32)
+    mod_ptr = index * mod_row_stride + cols
+    rstd = tl.math.rsqrt(tl.sum(x * x, axis=0) / DIM + EPS)
+    w = tl.load(w_ptr + cols, mask=mask).to(tl.float32)
+    scale = tl.load(scale_ptr + mod_ptr, mask=mask).to(tl.float32)
+    shift = tl.load(shift_ptr + mod_ptr, mask=mask).to(tl.float32)
+    y = (x * rstd * w) * (1.0 + scale) + shift
+    tl.store(y_ptr + row * DIM + cols, y, mask=mask)
+
+
+@register_custom_op(
+    op_name="indexed_gate_rmsnorm_scale_shift_cuda",
+    mutates_args=["x"],
+    out_shape="x",
+)
+def _indexed_gate_rmsnorm_scale_shift_cuda(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    S, D = x.shape
+    with torch.get_device_module().device(x.device):
+        _indexed_gate_rmsnorm_scale_shift_kernel[(S,)](
+            out,
+            x,
+            other,
+            gate,
+            weight,
+            scale,
+            shift,
+            indices,
+            gate.stride(0),
+            scale.stride(0),
+            indices.stride(0),
+            DIM=D,
+            EPS=eps,
+            BLOCK_SIZE_DIM=triton.next_power_of_2(D),
+            num_warps=8,
+        )
+    return out
+
+
+def can_use_indexed_gate_rmsnorm_scale_shift(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    return (
+        x.dtype == other.dtype == gate.dtype == torch.bfloat16
+        and other.shape == x.shape
+        and other.is_contiguous()
+        and gate.dim() == 2
+        and gate.shape[1] == x.shape[1]
+        and gate.stride(1) == 1
+        and can_use_rmsnorm_indexed_scale_shift(x, weight, shift, scale, indices)
+    )
+
+
+def indexed_gate_rmsnorm_scale_shift_(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """``indexed_gate_bf16_(x, gate, other, indices)`` then
+    ``rmsnorm_indexed_scale_shift`` of the updated ``x``, in one pass with the
+    same roundings; ``x`` is updated in place and the normed rows returned."""
+    return _indexed_gate_rmsnorm_scale_shift_cuda(
+        x, gate, other, weight, shift, scale, indices, eps
+    )
+
+
 def can_use_rmsnorm_indexed_scale_shift(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -248,7 +367,9 @@ def rmsnorm_indexed_scale_shift(
 
 
 __all__ = [
+    "can_use_indexed_gate_rmsnorm_scale_shift",
     "can_use_rmsnorm_indexed_scale_shift",
+    "indexed_gate_rmsnorm_scale_shift_",
     "can_use_rmsnorm_scale_shift_per_token",
     "rmsnorm_indexed_scale_shift",
     "rmsnorm_scale_shift_per_token",

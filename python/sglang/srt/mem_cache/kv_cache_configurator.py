@@ -91,12 +91,16 @@ from sglang.srt.mem_cache.page_interleave import (
     get_kv_shard_group,
     get_shared_kv_shard_pool,
     make_page_shard_spec,
+    page_shard_row_bytes,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveDSATokenToKVPool,
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
+)
+from sglang.srt.mem_cache.platform_kv_cache_dtype import (
+    registered_kv_cache_storage_dtype,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -542,6 +546,14 @@ class KVCacheConfigurator:
         self.kv_shard_rank = self.kv_shard_spec.shard_rank
         self.kv_shard_size = self.kv_shard_spec.shard_size
         self.kv_shard_group = get_kv_shard_group(self.use_mla_backend)
+
+    def page_shard_scratch_row_bytes(self) -> int:
+        """Bytes per token row of the logical-page KV sharding scratch.
+
+        Override when the sharded pool stores wider rows than the standard
+        K/V or MLA layout (for example grouped rows or embedded scales).
+        """
+        return page_shard_row_bytes(self)
 
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -1832,6 +1844,7 @@ class KVCacheConfigurator:
         elif (
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
+            self._reject_registered_kv_cache_dtype(pool="the Ascend KV pool")
             if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -1890,6 +1903,9 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif is_unlimited_ocr_v2(self.model_config.hf_config):
+                self._reject_registered_kv_cache_dtype(
+                    pool="the Unlimited-OCR-v2 KV pool"
+                )
                 token_to_kv_pool = self._build_unlimited_ocr_v2_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
@@ -2198,7 +2214,19 @@ class KVCacheConfigurator:
     def _resolve_kv_pool_class(self, *, kind: KVPoolKind, default: type) -> type:
         pool_cls = current_platform.get_kv_pool_cls(kind=kind)
         if pool_cls is None:
-            return default
+            if registered_kv_cache_storage_dtype(self.kv_cache_dtype_str) is None:
+                return default
+            # No in-tree pool stores a registered dtype; refuse only when a builder
+            # constructs this kind, so kinds a layout never builds are unaffected.
+            return _platform_kv_pool_required(
+                base=default,
+                message=(
+                    f"--kv-cache-dtype {self.kv_cache_dtype_str} needs a platform KV "
+                    f"pool of kind {kind!r} for this model, but "
+                    f"{type(current_platform).__name__}.get_kv_pool_cls(kind={kind!r}) "
+                    "returns None. Choose another --kv-cache-dtype."
+                ),
+            )
         base = _KV_POOL_BASE_FOR_KIND[kind]
         if not (isinstance(pool_cls, type) and issubclass(pool_cls, base)):
             raise TypeError(
@@ -2206,6 +2234,15 @@ class KVCacheConfigurator:
                 f"returned {pool_cls!r}; expected a subclass of {base.__name__}"
             )
         return pool_cls
+
+    def _reject_registered_kv_cache_dtype(self, *, pool: str) -> None:
+        if registered_kv_cache_storage_dtype(self.kv_cache_dtype_str) is not None:
+            raise ValueError(
+                f"--kv-cache-dtype {self.kv_cache_dtype_str} cannot use {pool}: it "
+                "is built in-tree, not through the platform's get_kv_pool_cls, and "
+                "no in-tree pool stores a platform-registered KV cache dtype. "
+                "Choose another --kv-cache-dtype."
+            )
 
     def _build_ascend_swa_kv_pool(
         self,
@@ -2842,6 +2879,7 @@ class KVCacheConfigurator:
         if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
             return dsa_pool_class
         if _is_npu:
+            self._reject_registered_kv_cache_dtype(pool="the NPU KV pool")
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
@@ -3757,3 +3795,13 @@ def calculate_mla_kv_cache_dim(
         return fp8_ds_mla_row_width(kv_lora_rank, qk_rope_head_dim)
 
     return kv_cache_dim
+
+
+def _platform_kv_pool_required(*, base: type, message: str) -> type:
+    # Still a subclass of the in-tree default, as the resolver promises a pool
+    # class of that kind; constructing it raises before anything is allocated.
+    class PlatformKVPoolRequired(base):
+        def __init__(self, *args, **kwargs):
+            raise ValueError(message)
+
+    return PlatformKVPoolRequired
