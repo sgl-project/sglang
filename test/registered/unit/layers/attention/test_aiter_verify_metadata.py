@@ -322,19 +322,16 @@ class TestAiterDecodeWorkspace(CustomTestCase):
 
 
 class TestAiterVerifyPageTableWidth(CustomTestCase):
-    """A request at its length cap is verified a few positions past context_len,
-    inside the req_to_token row headroom. A verify page table sized by
-    context_len ends before those positions, so unified_attention read page ids
-    past its row."""
-
     def test_verify_page_table_spans_the_req_to_token_row(self):
+        """Verify reads past context_len at the length cap,
+        so its page table is as wide as the req_to_token row."""
         backend = _init_mha_backend("nhd")
         with patch.object(
             aiter_backend, "scatter_req_to_token_to_page_table_kernel", _NoopKernel()
         ):
             page_table, *_ = backend._build_verify_unified_metadata(
                 bs=_BATCH_SIZE,
-                seq_lens=torch.full((_BATCH_SIZE,), _MHA_CONTEXT_LEN - 4),
+                seq_lens=torch.full((_BATCH_SIZE,), fill_value=_MHA_CONTEXT_LEN - 4),
                 req_pool_indices=torch.arange(_BATCH_SIZE),
                 draft_num=8,
             )

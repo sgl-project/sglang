@@ -216,11 +216,8 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
                         )
 
     def test_graph_page_tables_span_the_req_to_token_row(self):
-        """A request at its length cap is still verified and drafted a few
-        positions past context_len, inside the req_to_token row headroom. Page
-        tables sized by context_len end before those positions, so the kernel
-        read page ids past its row: another request's page, or an illegal
-        memory access."""
+        """Verify and draft read past context_len at the length cap,
+        so the graph page tables are as wide as the req_to_token row."""
         context_len, extra_context_len = 128, 21
         for fa_impl_ver in (3, 4):
             for page_size in (1, 16):
@@ -236,7 +233,7 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
                     backend.init_cuda_graph_state(max_bs=2, max_num_tokens=16)
 
                     row_pages = -(-(context_len + extra_context_len) // page_size)
-                    page_table_widths = {
+                    page_tables = {
                         "decode": backend.decode_cuda_graph_metadata["page_table"],
                         "draft decode": backend.decode_cuda_graph_metadata[
                             "page_table_draft_decode"
@@ -244,7 +241,7 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
                         "target verify": backend.target_verify_metadata["page_table"],
                         "draft extend": backend.draft_extend_metadata["page_table"],
                     }
-                    for name, page_table in page_table_widths.items():
+                    for name, page_table in page_tables.items():
                         self.assertEqual(page_table.shape[1], row_pages, name)
 
 

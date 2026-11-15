@@ -15,8 +15,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _CONTEXT_LEN = 4096
-# A request that still decodes holds at most context_len - 3 tokens, and the
-# newest one has no KV yet.
+# A request that still decodes holds at most context_len - 3 tokens,
+# and the newest one has no KV yet.
 _MAX_KV_COMMITTED_LEN = _CONTEXT_LEN - 4
 
 
@@ -27,12 +27,8 @@ class TestReqToTokenRowHeadroom(CustomTestCase):
         self.addCleanup(cm.__exit__, None, None, None)
 
     def test_row_holds_the_decode_allocation_at_the_length_cap(self):
-        """Every speculative decode step allocates kv_committed_len plus the
-        decode reserve, rounded up to a page, for a request at its length cap
-        too. The reserve-sized headroom used to apply only at page_size > 1, so
-        at page_size 1 the write ran past the row into the next request's row
-        once the reserve outgrew 4 + num_draft_tokens: that request's KV
-        mapping was overwritten, and the slots were never freed."""
+        """A request at its length cap still allocates the decode reserve;
+        the row holds it at every page size, not the next request's row."""
         cases = (
             # algorithm, num_steps, eagle_topk, num_draft_tokens
             ("EAGLE", 3, 1, 4),

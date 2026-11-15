@@ -167,8 +167,7 @@ def get_req_to_token_extra_context_len() -> int:
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (max_speculative_num_draft_tokens() or 0)
     if get_spec().speculative_algorithm is not None:
-        # A request at the length cap still allocates committed + the decode
-        # reserve, rounded up to a page. A narrower row lets that write spill
-        # into the next request's row.
+        # A request at its length cap still allocates the page-aligned reserve;
+        # a narrower row spills that write into the next request's row.
         extra = max(extra, get_alloc_reserve_per_decode() + get_alloc_page_size() - 1)
     return extra

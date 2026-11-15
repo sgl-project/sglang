@@ -333,9 +333,8 @@ class TritonAttnBackend(AttentionBackend):
         self.lean_v_head_dim = triton.next_power_of_2(
             max((self.v_head_dim, *self.extra_v_head_dims))
         )
-        # Speculative decoding reads past context_len at the length cap, into
-        # the req_to_token row headroom, so the index buffers and masks are
-        # sized by the whole row.
+        # Speculative decoding reads past context_len at the length cap,
+        # into the req_to_token row headroom, so buffers are sized by the row.
         self.max_context_len = self.req_to_token.shape[1]
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)

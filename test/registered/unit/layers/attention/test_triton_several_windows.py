@@ -561,13 +561,11 @@ class TestTritonSeveralWindows(SeveralWindowsCase):
         self.assertIs(single.backend.runner_ids, single.runner.runner_ids)
 
     def test_graph_kv_indices_span_the_req_to_token_row(self):
-        """REGRESSION: a request at its length cap is still verified a few
-        positions past context_len, inside the req_to_token row headroom.
-        kv_indices sized by context_len per request was too small once every
-        row of a batch was past it, and the kernel read past the buffer."""
-        row_headroom = 12
+        """REGRESSION: verify reads past context_len at the length cap,
+        so kv_indices holds max_num_tokens rows of the req_to_token row width."""
+        extra_context_len = 12
         case = DenseAttentionCase(
-            name="row_headroom",
+            name="row_width",
             backend="triton",
             forward_mode=ForwardMode.EXTEND,
             num_heads=_HEADS,
@@ -586,13 +584,13 @@ class TestTritonSeveralWindows(SeveralWindowsCase):
             ),
             dtype=_DTYPE,
             device="cuda",
-            max_context_len=_CONTEXT + row_headroom,
+            max_context_len=_CONTEXT + extra_context_len,
             head_dim=_HEAD_DIM,
         )
         backend = TritonAttnBackend(runner)
         backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2)
         self.assertEqual(
-            backend.cuda_graph_kv_indices.numel(), 2 * (_CONTEXT + row_headroom)
+            backend.cuda_graph_kv_indices.numel(), 2 * (_CONTEXT + extra_context_len)
         )
 
 

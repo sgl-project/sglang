@@ -758,8 +758,8 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # Parse constants
-        # Speculative decoding reads past context_len at the length cap, into
-        # the req_to_token row headroom, so the page tables span the whole row.
+        # Speculative decoding reads past context_len at the length cap,
+        # into the req_to_token row headroom, so page tables span the whole row.
         self.max_context_len = self.req_to_token.shape[1]
         self.skip_prefill = skip_prefill
 
