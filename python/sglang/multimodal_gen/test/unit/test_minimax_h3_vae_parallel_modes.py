@@ -455,7 +455,10 @@ def test_fused_residual_adds_match_the_eager_fp32_add(dtype):
     reference = nn.functional.rms_norm(expected, (2048,), weight, 1e-5)
     torch.testing.assert_close(normed, reference, rtol=1e-5, atol=1e-5)
 
-    # stored in the autocast dtype, the rows round exactly as the linear's input cast
+    # stored in the autocast dtype, the rows round exactly as the linear's input
+    # cast; only ROCm stores it (vae_vit.py), and only there is it bit-equal
+    if not current_platform.is_rocm():
+        return
     with torch.no_grad():
         _, normed_half = h3_vae_scale_add_rmsnorm(
             residual.clone(), update, scale, weight, 1e-5, out_dtype=dtype
