@@ -194,6 +194,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
     ReleaseUocrDocReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1529,6 +1530,7 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -1630,11 +1632,14 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-        draft_token_to_kv_pool = (
-            self.draft_worker.primary_draft_kv_pool
-            if self.draft_worker is not None
-            else None
-        )
+        # A DFLASH draft KV ring is sent as its own state, not as draft KV pages.
+        draft_kv_ring = None
+        draft_token_to_kv_pool = None
+        if self.draft_worker is not None:
+            if get_spec().speculative_dflash_draft_kv_ring:
+                draft_kv_ring = self.draft_worker.draft_kv_ring
+            else:
+                draft_token_to_kv_pool = self.draft_worker.primary_draft_kv_pool
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # Derive the rank-uniform PD wire schema from config because only the
@@ -1676,6 +1681,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                max_top_logprobs_num=get_disagg().disaggregation_max_top_logprobs_num,
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
@@ -1703,6 +1709,7 @@ class Scheduler(
                 max_total_num_tokens=self.max_total_num_tokens,
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
+                draft_kv_ring=draft_kv_ring,
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1717,6 +1724,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                max_top_logprobs_num=get_disagg().disaggregation_max_top_logprobs_num,
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
@@ -1732,6 +1740,7 @@ class Scheduler(
                 scheduler=self,
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
+                draft_kv_ring=draft_kv_ring,
             )
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2361,6 +2370,11 @@ class Scheduler(
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                elif get_parallel().pp_size > 1 and isinstance(
+                    output, ReleaseMemoryOccupationReqOutput
+                ):
+                    # Answered by the first stage once every stage has released.
+                    self._pp_pass_release_verdict(output, recv_req)
                 else:
                     self.send_control_output(output, recv_req)
 
@@ -3495,12 +3509,28 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            and req.return_logprob
+            and req.logprob.top_logprobs_num
+            > get_disagg().disaggregation_max_top_logprobs_num
+        ):
+            self._reject_bad_request(
+                req,
+                f"top_logprobs_num {req.logprob.top_logprobs_num} exceeds "
+                "disaggregation metadata capacity "
+                f"{get_disagg().disaggregation_max_top_logprobs_num}. Lower "
+                "top_logprobs_num or raise --disaggregation-max-top-logprobs-num "
+                "on prefill and decode.",
+            )
+            return
+
         if req.return_sampling_mask:
             if (
                 self.disaggregation_mode != DisaggregationMode.NULL
                 and not self.disagg_metadata_buffers.enable_sampling_mask
             ):
-                self._reject_sampling_mask_request(
+                self._reject_bad_request(
                     req,
                     "return_sampling_mask requires "
                     "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
@@ -3516,13 +3546,13 @@ class Scheduler(
                     f"{top_k}. Lower top_k or increase "
                     "--sampling-mask-max-tokens."
                 )
-                self._reject_sampling_mask_request(req, error_msg)
+                self._reject_bad_request(req, error_msg)
                 return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
             if error_msg is not None:
-                self._reject_sampling_mask_request(req, error_msg)
+                self._reject_bad_request(req, error_msg)
                 return
 
         # Handle multimodal inputs
@@ -3842,8 +3872,8 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
-    def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
-        """Return a sampling-mask validation error without running the model."""
+    def _reject_bad_request(self, req: Req, error_msg: str) -> None:
+        """Return a validation error as a 400 without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.request_retirer.retire_unadmitted(req)
@@ -4242,8 +4272,8 @@ class Scheduler(
             # only finished requests to running_batch.
             reqs_to_exclude.add(self.chunked_req)
 
-            # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
-            # extend_end at prefix_len: it computed no new KV, so nothing to stash.
+            # A parked chunk (add_chunked_req found no budget) leaves extend_end
+            # at prefix_len: it computed no new KV, so nothing to stash.
             if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 self.stash_chunked_request(self.chunked_req)
 
@@ -4527,7 +4557,10 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        # After the early returns, so a full-batch pass does not scan the queue.
+        self._ack_waiting_health_checks()
         # Get priority queue
+        self.policy.poll_storage_prefetches(self.waiting_queue)
         self.waiting_queue.reorder(
             self.policy.calc_priority(
                 self.waiting_queue,
@@ -4593,6 +4626,7 @@ class Scheduler(
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                processed_tokens=self.processed_tokens_counter,
             )
             if adder.add_chunked_req(resumed_req) is None:
                 # Its last chunk is in this batch.
@@ -4627,13 +4661,18 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        # A parked chunk found no budget in this pass: admit no one ahead of it,
+        # so no batch carries a chunked request it does not run.
+        chunk_parked = (
+            self.chunked_req is not None and self.chunked_req not in adder.can_run_list
+        )
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
-            if adder.budget_state() == AddReqResult.OTHER:
+            if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
@@ -4975,8 +5014,9 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
-        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
-        if batch.extend_num_tokens:
+        # Accumulate the prefill-token counter used for HRRN and shortest-prefill-first aging.
+        # A batch reused for decode keeps its stale extend_num_tokens, so count extend batches only.
+        if batch.forward_mode.is_extend() and batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
 
         if self.scripted_scheduler_hook is not None:
@@ -5821,6 +5861,25 @@ class Scheduler(
                 result.get_num_generated_tokens(batch_size),
             )
 
+    def _ack_waiting_health_checks(self) -> None:
+        probes = [r for r in self.waiting_queue if is_health_check_generate_req(r)]
+        # A lone probe runs: its forward pass is the check. Behind a prompt or a
+        # chunked prefill it would wait out every chunk, so it is acknowledged.
+        if not probes or (
+            len(probes) == len(self.waiting_queue) and self.chunked_req is None
+        ):
+            return
+        is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        for probe in probes:
+            self.return_health_check_ipcs.append(probe.http_worker_ipc)
+            # The acknowledgement is the probe's final output.
+            record_send(probe, "health_check")
+            # Released as _abort_waiting does, without an abort to the tokenizer.
+            if is_prefill:
+                self.release_prefill_sender(probe, abort_sender=True)
+            probe.finish_outside_step(FINISH_ABORT())
+            self.request_retirer.release(probe, checkpoint=False)
+
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
             # Return some signal for the health check.
@@ -6427,9 +6486,6 @@ class Scheduler(
                     )
                 else:
                     req.request_finish(FINISH_ABORT())
-
-    def _pause_engine(self) -> Tuple[List[Req], int]:
-        raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
