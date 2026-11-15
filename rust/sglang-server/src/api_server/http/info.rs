@@ -60,7 +60,7 @@ async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) ->
     if state.server_args.api_keys.admin_api_key.is_none()
         && forwarded_tag(&body).is_some_and(|tag| ADMIN_FORCE_TAGS.contains(&tag.as_str()))
     {
-        return super::hicache::admin_key_missing();
+        return super::auth::admin_key_missing();
     }
     match state.core.forward_control_req(body).await {
         Ok(reply) => (
@@ -73,7 +73,8 @@ async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) ->
     }
 }
 
-/// The forwarded control messages of the routes in `auth::ADMIN_FORCE_PATHS`.
+/// The forwarded control messages of the served `admin_force` routes, kept by
+/// hand: a forced route added to this server adds its message here.
 const ADMIN_FORCE_TAGS: &[&str] = &[
     "AttachHiCacheStorageReqInput",
     "DetachHiCacheStorageReqInput",
@@ -1820,46 +1821,69 @@ mod tests {
         assert_eq!(done, "[DONE]");
     }
 
-    /// Without an admin key, the peer route refuses the HiCache attach and
-    /// detach `/hicache/storage-backend` refuses, before they reach the
+    /// Without an admin key, the peer route refuses the operations of the
+    /// forced admin routes, as those routes do, before they reach the
     /// scheduler; other control messages still go through.
     #[tokio::test]
-    async fn peer_route_refuses_hicache_storage_changes_without_an_admin_key() {
-        use crate::message::io_struct::{ControlRequest, DetachHiCacheStorageReqInput};
-        let detach = ControlRequest::DetachHiCacheStorageReqInput(
-            DetachHiCacheStorageReqInput::new("sender-rid".into()),
-        )
-        .encode()
-        .unwrap();
-        let post = |state: Arc<AppState>| {
+    async fn peer_route_refuses_forced_admin_operations_without_an_admin_key() {
+        use crate::message::io_struct::{
+            AttachHiCacheStorageReqInput, CheckWeightsReqInput, ControlRequest,
+            DetachHiCacheStorageReqInput, ProfileReq,
+        };
+        let rid = || "sender-rid".to_string();
+        let forced = [
+            ControlRequest::AttachHiCacheStorageReqInput(AttachHiCacheStorageReqInput::new(
+                rid(),
+                "file".into(),
+                None,
+                None,
+                None,
+            )),
+            ControlRequest::DetachHiCacheStorageReqInput(DetachHiCacheStorageReqInput::new(rid())),
+            ControlRequest::CheckWeightsReqInput(CheckWeightsReqInput::new(
+                rid(),
+                "checksum".into(),
+                false,
+                None,
+                "target".into(),
+                None,
+            )),
+            ControlRequest::ProfileReq(ProfileReq::stop(rid())),
+        ];
+        let post = |state: Arc<AppState>, message: &ControlRequest| {
             routes().with_state(state).oneshot(
                 HttpRequest::builder()
                     .method("POST")
                     .uri(FORWARD_PEER_PATH)
-                    .body(Body::from(detach.clone()))
+                    .body(Body::from(message.encode().unwrap()))
                     .unwrap(),
             )
         };
 
         let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
-        // A relayed detach would wait on the scheduler's reply forever.
-        let response = tokio::time::timeout(std::time::Duration::from_secs(5), post(state))
+        for message in &forced {
+            // A relayed operation would wait on the scheduler's reply forever.
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                post(state.clone(), message),
+            )
             .await
             .expect("refused without waiting on the scheduler")
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        assert!(
-            String::from_utf8_lossy(&body).contains("requires admin API key"),
-            "{body:?}"
-        );
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{message:?}");
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("requires admin API key"),
+                "{body:?}"
+            );
+        }
         assert!(intake_rx.is_empty(), "refused before the scheduler");
 
         // With an admin key, the relayed detach reaches the scheduler.
         let mut args = ServerArgs::default();
         args.api_keys.admin_api_key = Some("sk-admin".into());
         let (state, intake_rx, _abort_rx) = test_state(args);
-        let response = tokio::spawn(post(state));
+        let response = tokio::spawn(post(state, &forced[1]));
         let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
             panic!("the detach must reach the scheduler");
         };

@@ -1,6 +1,8 @@
 """Unit tests for srt/utils/auth.py — no server, no model loading."""
 
+import json
 import unittest
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
@@ -320,6 +322,90 @@ class TestDecideRequestAuth(CustomTestCase):
             auth_level=AuthLevel.NORMAL,
         )
         self.assertTrue(decision.allowed)
+
+
+AUTH_DECISIONS_FIXTURE = (
+    Path(__file__).parents[4] / "rust/sglang-server/testdata/auth_decisions.json"
+)
+_API, _ADMIN = "sk-api", "sk-admin"
+
+
+def build_auth_decisions_fixture() -> dict:
+    """`decide_request_auth`'s status for each key setup, level and header; the
+    Rust server's `auth.rs` tests answer the same cases.
+
+    Regenerate the file with `render_auth_decisions_fixture()`.
+    """
+    authorizations = [
+        None,
+        "",
+        "Bearer nope",
+        f"Bearer {_API}",
+        f"Bearer {_ADMIN}",
+        f"bEaReR {_ADMIN}",
+        f"Bearer  {_ADMIN}",
+        f"Bearer {_ADMIN} ",
+        f"Basic {_ADMIN}",
+        "Bearer",
+        f"Bearer {_ADMIN[:-1]}",
+    ]
+    requests = [("POST", "/generate", level) for level in AuthLevel]
+    # Probes and preflights skip the check at any level.
+    requests += [
+        ("GET", path, AuthLevel.ADMIN_FORCE)
+        for path in ["/health", "/health_generate", "/metrics", "/metrics/x", "/ready"]
+    ]
+    requests.append(("OPTIONS", "/generate", AuthLevel.ADMIN_FORCE))
+    cases = []
+    for api_key, admin_api_key in [
+        (None, None),
+        (_API, None),
+        (None, _ADMIN),
+        (_API, _ADMIN),
+        ("", ""),
+    ]:
+        for method, path, level in requests:
+            statuses = []
+            for authorization in authorizations:
+                decision = decide_request_auth(
+                    method=method,
+                    path=path,
+                    authorization_header=authorization,
+                    api_key=api_key,
+                    admin_api_key=admin_api_key,
+                    auth_level=level,
+                )
+                statuses.append(200 if decision.allowed else decision.error_status_code)
+            cases.append(
+                {
+                    "api_key": api_key,
+                    "admin_api_key": admin_api_key,
+                    "method": method,
+                    "path": path,
+                    "level": level.value,
+                    "statuses": statuses,
+                }
+            )
+    return {"authorizations": authorizations, "cases": cases}
+
+
+def render_auth_decisions_fixture() -> str:
+    """The fixture as written: one case per line."""
+    fixture = build_auth_decisions_fixture()
+    cases = ",\n".join(f"    {json.dumps(case)}" for case in fixture["cases"])
+    authorizations = json.dumps(fixture["authorizations"])
+    return (
+        f'{{\n  "authorizations": {authorizations},\n  "cases": [\n{cases}\n  ]\n}}\n'
+    )
+
+
+class TestRustAuthDecisionsFixture(CustomTestCase):
+    def test_fixture_matches_python(self):
+        self.assertEqual(
+            AUTH_DECISIONS_FIXTURE.read_text(),
+            render_auth_decisions_fixture(),
+            "regenerate auth_decisions.json with render_auth_decisions_fixture()",
+        )
 
 
 class TestApiKeyMiddleware(CustomTestCase):
