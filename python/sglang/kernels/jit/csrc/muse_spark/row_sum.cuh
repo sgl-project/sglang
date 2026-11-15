@@ -67,7 +67,7 @@ void muse_spark_row_sum(
   SymbolicSize N{"num_rows"};
   SymbolicSize K{"num_cols"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({N, K}).with_dtype<fp32_t>().with_device(device_).verify(input);
   TensorMatcher({N}).with_dtype<fp32_t>().with_device(device_).verify(out);

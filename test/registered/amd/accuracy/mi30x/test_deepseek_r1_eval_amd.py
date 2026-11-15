@@ -29,7 +29,10 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - DeepSeek-R1 accuracy tests (~120 min)
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-accuracy-8-gpu-deepseek-r1", nightly=True
+    est_time=7200,
+    suite="nightly-amd-accuracy-8-gpu-deepseek-r1",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999

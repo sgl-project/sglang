@@ -1,8 +1,10 @@
+import asyncio
 import itertools
+import math
 import pickle
 import time
 import zlib
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import zmq
 import zmq.asyncio
@@ -15,6 +17,7 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
+    ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
@@ -28,6 +31,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.ipc_array import (
+    array_ipc_request,
     is_local_endpoint,
     materialize_file_refs,
 )
@@ -37,6 +41,9 @@ from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.request_logger import (
     DiffusionRequestLogger,
@@ -45,7 +52,7 @@ from sglang.multimodal_gen.runtime.utils.request_logger import (
 logger = init_logger(__name__)
 
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
-# DP they must reach every replica rather than one.
+# DP they reach every replica unless a fatal device error aborts the fan-out.
 _CONTROL_REQ_TYPES = (
     SetLoraReq,
     MergeLoraWeightsReq,
@@ -91,32 +98,21 @@ async def run_zeromq_broker(server_args: ServerArgs):
     ctx = zmq.asyncio.Context()
     socket = ctx.socket(zmq.REP)
     broker_endpoint = f"tcp://127.0.0.1:{server_args.broker_port}"
-    socket.bind(broker_endpoint)
-    logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
-
     try:
+        socket.bind(broker_endpoint)
+        logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
         while True:
+            # transport failures must stop the broker so readiness can reject work
+            payload = await socket.recv()
             try:
-                # 1. Receive a request from an offline client
-                payload = await socket.recv()
                 request_batch = pickle.loads(payload)
                 logger.debug("Broker received an offline job from a client.")
-
-                # 2. Forward the request to the main Scheduler via the shared client
                 response_batch = await async_scheduler_client.forward(request_batch)
-
-                # 3. Send the Scheduler's reply back to the offline client
-                await socket.send(pickle.dumps(response_batch))
-
+                response = pickle.dumps(response_batch)
             except Exception as e:
-                logger.error(f"Error in ZMQ Broker: {e}", exc_info=True)
-                # A reply must be sent to prevent the client from hanging
-                try:
-                    await socket.send(
-                        pickle.dumps({"status": "error", "message": str(e)})
-                    )
-                except Exception:
-                    pass
+                logger.exception("Error in ZMQ Broker request: %s", e)
+                response = pickle.dumps({"status": "error", "message": str(e)})
+            await socket.send(response)
     finally:
         socket.close(linger=0)
         ctx.destroy(linger=0)
@@ -127,6 +123,8 @@ def _session_key(batch: Any) -> str | None:
     session must land on the same one."""
     reqs = batch if isinstance(batch, list) else [batch]
     for req in reqs:
+        if isinstance(req, ReleaseRealtimeSessionReq):
+            return req.session_id
         if isinstance(req, Req) and req.realtime_session_id:
             return req.realtime_session_id
     return None
@@ -141,13 +139,24 @@ def _select_replica(batch: Any, dp_size: int, counter: "itertools.count") -> int
     return next(counter) % dp_size
 
 
+def _is_fatal_reply(result: Any) -> bool:
+    return (
+        isinstance(result, OutputBatch)
+        and result.error is not None
+        and is_unrecoverable_device_error(result.error)
+    )
+
+
 def _merge_fanout_results(results: list[Any]) -> Any:
-    """One reply for a control op sent to every replica: the first error wins,
-    because "succeeded" must mean succeeded everywhere."""
+    """Prefer fatal device errors, then the first error, over successful replies."""
+    first_error = None
     for result in results:
-        if isinstance(result, OutputBatch) and result.error:
+        if _is_fatal_reply(result):
             return result
-    return results[0]
+        if isinstance(result, OutputBatch) and result.error:
+            if first_error is None:
+                first_error = result
+    return first_error if first_error is not None else results[0]
 
 
 class SchedulerClient:
@@ -171,37 +180,104 @@ class SchedulerClient:
         self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.Context()
 
-    def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
-        """Sends a batch or request to the scheduler and waits for the response."""
-        return self._forward_routed(batch, timeout_ms)
+    def forward(
+        self,
+        batch: Any,
+        timeout_ms: int | None = None,
+        *,
+        replica: int | None = None,
+        check_worker_health: Callable[[], None] | None = None,
+    ) -> Any:
+        """Sends a batch or request to the scheduler and waits for the response.
 
-    def _forward_one(self, endpoint: str, batch: Any, timeout_ms: int | None) -> Any:
+        `replica` pins an ordinary request to one replica, bypassing the
+        round-robin so the counter only advances for real traffic. Control
+        requests always reach every replica. An optional health check interrupts
+        the wait if an owned worker exits.
+        """
+        if check_worker_health is None:
+            return self._forward_routed(batch, timeout_ms, replica)
+        return self._forward_routed(
+            batch, timeout_ms, replica, check_worker_health=check_worker_health
+        )
+
+    def _forward_one(
+        self,
+        endpoint: str,
+        batch: Any,
+        timeout_ms: int | None,
+        *,
+        check_worker_health: Callable[[], None] | None = None,
+    ) -> Any:
         socket = self.context.socket(zmq.REQ)
         try:
             socket.setsockopt(zmq.LINGER, 0)
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
-            socket.connect(endpoint)
-            socket.send_pyobj(_prepare_local_payload(endpoint, batch))
-            output_batch = socket.recv_pyobj()
-            _materialize_output_batch_file_refs(output_batch)
-            _materialize_local_cuda_refs(endpoint, output_batch)
-            return output_batch
+            with array_ipc_request(endpoint) as identity:
+                if identity is not None:
+                    socket.setsockopt(zmq.IDENTITY, identity)
+                socket.connect(endpoint)
+                socket.send_pyobj(_prepare_local_payload(endpoint, batch))
+                if check_worker_health is not None:
+                    # Poll so an owned worker's exit can interrupt an otherwise
+                    # unbounded receive. Keep one deadline across all polls.
+                    deadline = (
+                        time.monotonic() + effective_timeout / 1000
+                        if effective_timeout is not None
+                        else None
+                    )
+                    while True:
+                        check_worker_health()
+                        poll_timeout_ms = 1000
+                        if deadline is not None:
+                            remaining_ms = math.ceil(
+                                (deadline - time.monotonic()) * 1000
+                            )
+                            if remaining_ms <= 0:
+                                raise zmq.Again()
+                            poll_timeout_ms = min(poll_timeout_ms, remaining_ms)
+                        if socket.poll(poll_timeout_ms, zmq.POLLIN):
+                            break
+                output_batch = socket.recv_pyobj()
+                _materialize_output_batch_file_refs(output_batch)
+                _materialize_local_cuda_refs(endpoint, output_batch)
+                return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
             raise TimeoutError("Scheduler did not respond in time.")
         finally:
             socket.close()
 
-    def _forward_routed(self, batch: Any, timeout_ms: int | None) -> Any:
+    def _forward_routed(
+        self,
+        batch: Any,
+        timeout_ms: int | None,
+        replica: int | None = None,
+        *,
+        check_worker_health: Callable[[], None] | None = None,
+    ) -> Any:
         self.request_logger.log_received_request(batch)
         endpoints = self.server_args.scheduler_endpoints
+        forward_kwargs = (
+            {"check_worker_health": check_worker_health}
+            if check_worker_health is not None
+            else {}
+        )
         if isinstance(batch, _CONTROL_REQ_TYPES):
-            results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
+            results = []
+            for ep in endpoints:
+                reply = self._forward_one(ep, batch, timeout_ms, **forward_kwargs)
+                results.append(reply)
+                if _is_fatal_reply(reply):
+                    break
             output_batch = _merge_fanout_results(results)
         else:
-            replica = _select_replica(batch, len(endpoints), self._replica_counter)
-            output_batch = self._forward_one(endpoints[replica], batch, timeout_ms)
+            if replica is None:
+                replica = _select_replica(batch, len(endpoints), self._replica_counter)
+            output_batch = self._forward_one(
+                endpoints[replica], batch, timeout_ms, **forward_kwargs
+            )
         self.request_logger.log_finished_request(batch, output_batch)
         return output_batch
 
@@ -248,6 +324,8 @@ class AsyncSchedulerClient:
         self.server_args = None
         self.request_logger: Optional[DiffusionRequestLogger] = None
         self._replica_counter = itertools.count()
+        self.failure_reason: str | None = None
+        self._pending_requests: set[asyncio.Task] = set()
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -259,10 +337,25 @@ class AsyncSchedulerClient:
         self.server_args = server_args
         self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.asyncio.Context()
+        self.failure_reason = None
         logger.debug("AsyncSchedulerClient initialized with zmq.asyncio.Context")
 
-    async def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
-        """Sends a batch or request to the scheduler and waits for the response."""
+    def mark_failed(self, reason: str) -> None:
+        """Stop admitting work and wake callers even without an RPC deadline."""
+        if self.failure_reason is None:
+            self.failure_reason = reason
+            for task in self._pending_requests:
+                task.cancel()
+
+    async def forward(
+        self, batch: Any, timeout_ms: int | None = None, *, replica: int | None = None
+    ) -> Any:
+        """Sends a batch or request to the scheduler and waits for the response.
+
+        `replica` pins an ordinary request to one replica, bypassing the
+        round-robin so the counter only advances for real traffic. Control
+        requests always reach every replica.
+        """
         self.request_logger.log_received_request(batch)
         if self.context is None:
             raise RuntimeError(
@@ -271,13 +364,16 @@ class AsyncSchedulerClient:
 
         endpoints = self.server_args.scheduler_endpoints
         if isinstance(batch, _CONTROL_REQ_TYPES):
-            # replica state (weights, LoRA, memory) must change everywhere
-            results = [
-                await self._forward_one(ep, batch, timeout_ms) for ep in endpoints
-            ]
+            results = []
+            for ep in endpoints:
+                reply = await self._forward_one(ep, batch, timeout_ms)
+                results.append(reply)
+                if _is_fatal_reply(reply):
+                    break
             output_batch = _merge_fanout_results(results)
         else:
-            replica = _select_replica(batch, len(endpoints), self._replica_counter)
+            if replica is None:
+                replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = await self._forward_one(
                 endpoints[replica], batch, timeout_ms
             )
@@ -287,24 +383,36 @@ class AsyncSchedulerClient:
     async def _forward_one(
         self, endpoint: str, batch: Any, timeout_ms: int | None
     ) -> Any:
+        if self.failure_reason is not None:
+            raise RuntimeError(self.failure_reason)
         # a temporary REQ socket per request keeps concurrent requests from
         # interleaving on one socket's strict send/recv alternation
         socket = self.context.socket(zmq.REQ)
+        task = asyncio.current_task()
+        self._pending_requests.add(task)
         try:
             socket.setsockopt(zmq.LINGER, 0)
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
-            socket.connect(endpoint)
-            await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
-            payload = await socket.recv()
-            output_batch = pickle.loads(payload)
-            _materialize_output_batch_file_refs(output_batch)
-            _materialize_local_cuda_refs(endpoint, output_batch)
-            return output_batch
+            with array_ipc_request(endpoint) as identity:
+                if identity is not None:
+                    socket.setsockopt(zmq.IDENTITY, identity)
+                socket.connect(endpoint)
+                await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
+                payload = await socket.recv()
+                output_batch = pickle.loads(payload)
+                _materialize_output_batch_file_refs(output_batch)
+                _materialize_local_cuda_refs(endpoint, output_batch)
+                return output_batch
+        except asyncio.CancelledError:
+            if self.failure_reason is not None:
+                raise RuntimeError(self.failure_reason) from None
+            raise
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
             raise TimeoutError("Scheduler did not respond in time.")
         finally:
+            self._pending_requests.discard(task)
             socket.close()
 
     async def ping(self) -> bool:

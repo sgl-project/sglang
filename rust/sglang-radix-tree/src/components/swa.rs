@@ -7,13 +7,17 @@ use std::collections::HashMap;
 
 use tch::{Kind, Tensor};
 
+use crate::cache_action::{
+    FreeComponentHostSlot, FreeDeviceKVFullOnly, RebuildFullToSwaMapping, RecoverSwaWithLockedFull,
+    SwaRebuild,
+};
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL, SWA};
+use crate::components::{ComponentType, FULL, Family, SWA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_tree_core::{
-    CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
+    CacheActions, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
     PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
@@ -57,6 +61,7 @@ impl SwaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         leaf_id: NodeIdx_,
+        cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         let leaf = tree_core.arena.node(leaf_id);
         if leaf.is_root() || leaf.device_lock_ref(SWA) > 0 {
@@ -79,9 +84,12 @@ impl SwaComponent {
 
         let (new_parent, action) = tree_core.split_node_(leaf_id, split_at);
         assert!(
-            action.is_none(),
+            action.as_ref().is_none_or(|action| action.ack_id.is_none()),
             "fresh SWA leaf cannot be write-through-pending"
         );
+        if let Some(action) = action {
+            cache_actions.push(Box::new(action));
+        }
         Some(new_parent)
     }
 
@@ -115,14 +123,6 @@ impl SwaComponent {
             node.dec_host_lock_ref(SWA);
         } else {
             node.dec_device_lock_ref(SWA);
-        }
-    }
-
-    fn value_len<K: ChildKeyType>(node: &Node<K>, host: bool) -> usize {
-        if host {
-            node.host_value_len(SWA)
-        } else {
-            node.device_value_len(SWA)
         }
     }
 
@@ -169,7 +169,12 @@ impl SwaComponent {
         let mut cur_id = node_id;
         while covered_tokens < self.sliding_window_size {
             let cur = tree_core.arena.node(cur_id);
-            if cur.is_root() || cur.write_through_pending_id.is_some() {
+            // A copy in the same write-back batch already committed this SWA
+            // host value.
+            if cur.is_root()
+                || (cur.write_through_pending_id.is_some()
+                    && !tree_core.is_round_write_pending_(cur))
+            {
                 break;
             }
             let (on_device, on_host) = (cur.has_device_value(SWA), cur.has_host_value(SWA));
@@ -191,12 +196,12 @@ impl SwaComponent {
 
 impl SwaComponent {
     /// Queue a free of the given SWA host slots; empty tensors are dropped.
-    fn release_swa_host_(&self, host_indices: Tensor, cache_actions: &mut Vec<CacheAction>) {
+    fn release_swa_host_(&self, host_indices: Tensor, cache_actions: &mut CacheActions) {
         if host_indices.numel() > 0 {
-            cache_actions.push(CacheAction::FreeComponentHostSlot {
+            cache_actions.push(Box::new(FreeComponentHostSlot {
                 component_type: SWA,
                 host_indices: vec![host_indices],
-            });
+            }));
         }
     }
 
@@ -222,7 +227,7 @@ impl SwaComponent {
 
     /// Fill the prefetched SWA window onto the leaf→anchor path.
     ///
-    /// All-or-nothing over one full window: `loaded_pages` is the cross-rank
+    /// All-or-nothing over the staged window: `loaded_pages` is the cross-rank
     /// MIN, so `loaded_pages < window_pages` drops the whole window (keeps the
     /// tree identical across TP ranks). Otherwise map the buffer to token range
     /// `[loaded_start, total_len)` and walk leaf→anchor, filling SWA
@@ -232,7 +237,7 @@ impl SwaComponent {
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
@@ -267,15 +272,6 @@ impl SwaComponent {
             }
             return;
         };
-        // Cache-mode graft commit only (buffer fills never reach here):
-        // a hit-shrunk window mid-tree is missing its head, so drop it.
-        // Root anchors are complete windows of their own.
-        if node_id != tree_core.arena.root()
-            && window_require_pages < self.sliding_window_size.div_ceil(page_size)
-        {
-            self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
-            return;
-        }
         if window_require_pages == 0 || loaded_pages < window_require_pages {
             self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
             return;
@@ -305,7 +301,7 @@ impl SwaComponent {
                 if fill_start > node_start {
                     let (_, action) = tree_core.split_node_(cur, fill_start - node_start);
                     if let Some(action) = action {
-                        cache_actions.push(action);
+                        cache_actions.push(Box::new(action));
                     }
                 }
                 self.attach_swa_host_value_(tree_core, cur, slice);
@@ -339,6 +335,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         SWA
     }
 
+    fn family(&self) -> Family {
+        Family::Window
+    }
+
     fn refresh_lru(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -352,10 +352,27 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             LRURefreshPhase::Walkdown => {}
             LRURefreshPhase::MatchEnd | LRURefreshPhase::InsertEnd => {
                 let window = self.sliding_window_size + tree_core.page_size;
+                let stamps_joint_lru = tree_core.joint_lru.is_some();
+                let mut refreshed = Vec::new();
                 let (lru, arena) = tree_core.device_lru_list_mut_with_arena(SWA);
                 lru.reset_node_and_window_ancestors_mru(node_id, window, arena, |node| {
-                    node.has_device_value(SWA)
+                    let included = node.has_device_value(SWA);
+                    if included && stamps_joint_lru {
+                        refreshed.push(node.idx);
+                    }
+                    included
                 });
+                if !refreshed.is_empty() {
+                    // The first refreshed (deepest) node is the newest, as in the
+                    // refreshed SWA LRU order.
+                    let newest_tick = tree_core
+                        .arena
+                        .get_and_batch_bump_access_counter(refreshed.len() as i64);
+                    let joint_lru = tree_core.joint_lru.as_mut().expect("checked above");
+                    for (i, idx) in refreshed.into_iter().enumerate() {
+                        joint_lru.set_swa_tick(idx, newest_tick - i as i64);
+                    }
+                }
             }
         }
     }
@@ -437,8 +454,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         total_prefix_len: usize,
         value_slice: Tensor,
         params: &InsertParams<'_, K>,
+        preserve_full_ids: bool,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> usize {
         if params.prev_prefix_len >= total_prefix_len + prefix_len {
             return prefix_len;
@@ -450,7 +468,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             return prefix_len;
         }
 
-        let swa_evicted_seqlen = params.swa_evicted_seqlen;
+        // Never recover below the request's protected prefix: its incoming ids are the node's own.
+        let swa_evicted_seqlen = params.swa_evicted_seqlen.max(params.prev_prefix_len);
         // A locked tombstone is legal (segment locks count every node); the
         // full-value swap below is safe because full lock_ref >= swa
         // lock_ref, so a locked-SWA node always takes the Recover branch.
@@ -463,55 +482,61 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         if swa_evicted_seqlen <= total_prefix_len {
             // Branch 1: entire value_slice is within SWA window — recover
             result.record_adopted_range(SWA, total_prefix_len, total_prefix_len + prefix_len);
-            if node.device_lock_ref(FULL) > 0 {
-                cache_actions.push(CacheAction::RecoverSwaWithLockedFull {
+            if node.device_lock_ref(FULL) > 0 || preserve_full_ids {
+                cache_actions.push(Box::new(RecoverSwaWithLockedFull {
                     node_id: node.id,
                     kept_full: node.device_value(FULL).shallow_clone(),
                     incoming_full: value_slice,
-                });
+                }));
                 return 0;
             }
             result.record_adopted_range(FULL, total_prefix_len, total_prefix_len + prefix_len);
             let old_full = node.take_device_value(FULL);
             node.set_device_value(FULL, value_slice.copy());
-            cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
-            cache_actions.push(CacheAction::SwaRebuild {
+            cache_actions.push(Box::new(FreeDeviceKVFullOnly {
+                indices: vec![old_full],
+                tree_owned: true,
+            }));
+            cache_actions.push(Box::new(SwaRebuild {
                 node_id: node.id,
                 source_value: value_slice,
-            });
+            }));
             0
         } else if swa_evicted_seqlen < total_prefix_len + prefix_len {
             // Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             let start_idx = swa_evicted_seqlen - total_prefix_len;
             result.record_adopted_range(SWA, swa_evicted_seqlen, total_prefix_len + prefix_len);
             let node_ext_id = node.id;
-            let is_locked = node.device_lock_ref(FULL) > 0;
+            let preserve_full = node.device_lock_ref(FULL) > 0 || preserve_full_ids;
             let full_len = node.device_value_len(FULL);
             let old_full =
                 node.device_value(FULL)
                     .narrow(0, start_idx as i64, (full_len - start_idx) as i64);
             let (_, action) = tree_core.split_node_(node_id, start_idx);
             if let Some(action) = action {
-                cache_actions.push(action);
+                cache_actions.push(Box::new(action));
             }
             let new_full = value_slice.narrow(0, start_idx as i64, (prefix_len - start_idx) as i64);
-            if is_locked {
-                cache_actions.push(CacheAction::RecoverSwaWithLockedFull {
+            if preserve_full {
+                cache_actions.push(Box::new(RecoverSwaWithLockedFull {
                     node_id: node_ext_id,
                     kept_full: old_full,
                     incoming_full: new_full,
-                });
+                }));
                 return start_idx;
             }
             result.record_adopted_range(FULL, swa_evicted_seqlen, total_prefix_len + prefix_len);
             let node = tree_core.arena.node_mut(node_id);
             let _ = node.take_device_value(FULL);
             node.set_device_value(FULL, new_full.copy());
-            cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
-            cache_actions.push(CacheAction::SwaRebuild {
+            cache_actions.push(Box::new(FreeDeviceKVFullOnly {
+                indices: vec![old_full],
+                tree_owned: true,
+            }));
+            cache_actions.push(Box::new(SwaRebuild {
                 node_id: node_ext_id,
                 source_value: new_full,
-            });
+            }));
             start_idx
         } else {
             // Branch 3: entire value_slice is outside SWA window — not consumed
@@ -527,7 +552,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         total_prefix_len: usize,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         // _unevict_node_on_insert already wrote the request's fresh KV slice
         // into the base value. We just need to rebuild SWA from that slice for
@@ -549,7 +574,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let start_idx = swa_evicted_seqlen - total_prefix_len;
             let (_, action) = tree_core.split_node_(node_id, start_idx);
             if let Some(action) = action {
-                cache_actions.push(action);
+                cache_actions.push(Box::new(action));
             }
         } else {
             return;
@@ -559,10 +584,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             total_prefix_len.max(swa_evicted_seqlen),
             total_prefix_len + prefix_len,
         );
-        cache_actions.push(CacheAction::SwaRebuild {
+        cache_actions.push(Box::new(SwaRebuild {
             node_id: tree_core.arena.node(node_id).id,
             source_value: tree_core.arena.device_value(node_id, FULL).shallow_clone(),
-        });
+        }));
     }
 
     fn commit_insert_component_data(
@@ -572,7 +597,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         is_new_leaf: bool,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         if let Some(branching_seqlen) = params.swa_branching_seqlen {
             result.swa_branch_inserted = params.key.atom_len() >= branching_seqlen;
@@ -595,27 +620,29 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 // Node straddles the boundary: split into an out-of-window parent
                 // (tombstone) and an in-window child; `node` becomes the child.
                 let (_, action) = tree_core.split_node_(node_id, split_pos);
-                assert!(action.is_none(), "new leaf cannot be write-through-pending");
+                if let Some(action) = action {
+                    cache_actions.push(Box::new(action));
+                }
             }
         }
         result.record_adopted_range(SWA, node_start.max(params.swa_evicted_seqlen), node_end);
         // Cap the in-window leaf at one window for lock granularity, then rebuild SWA
         // onto the in-window node(s) at apply time; rebuild the older prefix first so
         // the in-window tail lands more-MRU.
-        let capped_parent = self.maybe_split_leaf_for_swa_lock_(tree_core, node_id);
+        let capped_parent = self.maybe_split_leaf_for_swa_lock_(tree_core, node_id, cache_actions);
         if let Some(capped_parent) = capped_parent {
-            cache_actions.push(CacheAction::SwaRebuild {
+            cache_actions.push(Box::new(SwaRebuild {
                 node_id: tree_core.arena.node(capped_parent).id,
                 source_value: tree_core
                     .arena
                     .device_value(capped_parent, FULL)
                     .shallow_clone(),
-            });
+            }));
         }
-        cache_actions.push(CacheAction::SwaRebuild {
+        cache_actions.push(Box::new(SwaRebuild {
             node_id: tree_core.arena.node(node_id).id,
             source_value: tree_core.arena.device_value(node_id, FULL).shallow_clone(),
-        });
+        }));
     }
 
     fn redistribute_on_node_split(
@@ -666,10 +693,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
         let ct = SWA;
-        let node = tree_core.arena.node_mut(node_id);
+        let node = tree_core.arena.node(node_id);
         let mut freed = 0;
         let mut host_freed = 0;
 
@@ -682,8 +710,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 .entry(ct)
                 .or_default()
                 .push(node.device_value(FULL).shallow_clone());
-            freed = node.device_value_len(SWA);
-            let _ = node.take_device_value(SWA);
+            freed = tree_core.component_reclaimable_value_len_(node_id, SWA);
+            let _ = tree_core.arena.node_mut(node_id).take_device_value(SWA);
             tree_core.dec_evictable_size(SWA, freed);
         }
 
@@ -735,6 +763,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         let ct = SWA;
         assert!(
@@ -776,7 +805,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             // The SWA LRU filters its own transfer/request locks. A Full load
             // pin can also cover an ancestor outside the loaded SWA window,
             // whose separately restored SWA rows remain independently evictable.
-            if tree_core.evictable_device_leaves.contains(x) {
+            if !tree_core.component_state(SWA).evict_device_strip_only
+                && tree_core.evictable_device_leaves.contains(x)
+            {
                 break 'step Some(x);
             }
             let node = tree_core.arena.node(x);
@@ -808,10 +839,19 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 ct,
                 device_frees,
                 host_frees,
+                cache_actions,
                 EvictLayer::Device,
                 Some(tracker),
             );
-            tree_core.cascade_evict_(x, ct, tracker, device_frees, host_frees, EvictLayer::Device);
+            tree_core.cascade_evict_(
+                x,
+                ct,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+                EvictLayer::Device,
+            );
             None
         };
         tree_core.component_state_mut(SWA).evict_device_cursor = cursor;
@@ -832,6 +872,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) {
         let ct = SWA;
         let mut x = tree_core
@@ -853,7 +894,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             // The host LRU filters SWA's own locks. A Full load-back pin may
             // cover an ancestor outside the SWA transfer window.
             if tree_core.evictable_host_leaves.contains(cur) {
-                tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees);
+                tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees, cache_actions);
             } else {
                 assert!(
                     tree_core.arena.has_host_value(cur, SWA),
@@ -864,6 +905,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     ct,
                     device_frees,
                     host_frees,
+                    cache_actions,
                     EvictLayer::Host,
                     Some(tracker),
                 );
@@ -873,6 +915,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     tracker,
                     device_frees,
                     host_frees,
+                    cache_actions,
                     EvictLayer::Host,
                 );
             }
@@ -1038,7 +1081,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
@@ -1123,10 +1166,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 assert_eq!(offset, host_indices.size()[0]);
                 // Rebuild the full->swa mapping for the loaded chunks at the orchestration layer.
                 if !full_chunks.is_empty() {
-                    cache_actions.push(CacheAction::RebuildFullToSwaMapping {
+                    cache_actions.push(Box::new(RebuildFullToSwaMapping {
                         full_indices: full_chunks,
                         swa_indices: swa_chunks,
-                    });
+                    }));
                 }
             }
             CacheTransferPhase::Prefetch => {
@@ -1165,16 +1208,16 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
         let mut cur = node_id;
         loop {
-            let node = tree_core.arena.node_mut(cur);
+            let node = tree_core.arena.node(cur);
             if node.is_root() || covered >= sliding_window_size {
                 break;
             }
             let parent = node.parent();
             let key_len = node.key.atom_len();
             let has_value = Self::has_value(node, lock_host);
-            let value_len = Self::value_len(node, lock_host);
+            let value_len = tree_core.component_reclaimable_value_len_(cur, SWA);
             let newly_locked = Self::lock_ref(node, lock_host) == 0;
-            Self::inc_lock_ref(node, lock_host);
+            Self::inc_lock_ref(tree_core.arena.node_mut(cur), lock_host);
             if newly_locked && has_value {
                 if lock_host {
                     let host_lru = tree_core.host_lru_list_mut(SWA);
@@ -1211,7 +1254,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
         let mut cur = node_id;
         loop {
-            let node = tree_core.arena.node_mut(cur);
+            let node = tree_core.arena.node(cur);
             if node.is_root() {
                 break;
             }
@@ -1225,7 +1268,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 if lock_host { "host_" } else { "" }
             );
             let has_value = Self::has_value(node, lock_host);
-            let value_len = Self::value_len(node, lock_host);
+            let value_len = tree_core.component_reclaimable_value_len_(cur, SWA);
             if lock_ref == 1 && has_value {
                 if lock_host {
                     if !node.has_device_value(SWA) {
@@ -1270,6 +1313,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         params: &DecLockRefParams,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) {
         if tree_core.arena.node(node_id).is_root() {
             return;
@@ -1278,7 +1322,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         let ct = SWA;
         let mut cur = node_id;
         loop {
-            let node = tree_core.arena.node_mut(cur);
+            let node = tree_core.arena.node(cur);
             if node.is_root() {
                 break;
             }
@@ -1288,9 +1332,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 "SWA window release hit lock_ref=0 on node {cur}"
             );
             let has_value = node.has_device_value(SWA);
-            let value_len = node.device_value_len(SWA);
-            node.dec_device_lock_ref(SWA);
-            let now_unlocked = node.device_lock_ref(SWA) == 0;
+            let value_len = tree_core.component_reclaimable_value_len_(cur, SWA);
+            let now_unlocked = node.device_lock_ref(SWA) == 1;
+            tree_core.arena.node_mut(cur).dec_device_lock_ref(SWA);
             if now_unlocked {
                 tree_core.update_evictable_leaf_sets_(cur);
             }
@@ -1303,6 +1347,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                         ct,
                         device_frees,
                         host_frees,
+                        cache_actions,
                         EvictLayer::Device,
                         /* tracker = */ None,
                     );

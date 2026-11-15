@@ -54,6 +54,7 @@ __all__ = ["reshape_and_cache_flash"]
 # Other Triton kernels migrated into this group (from attention/mem_cache
 # triton_ops); registered for inventory. Import them from their modules.
 _TRITON_KERNELS = [
+    ("dsv41_window_layout", "build_window_layout"),
     ("shuffle_5d_cache", "launch_reshape_and_cache_shuffle_5d"),
     ("shuffle_5d_cache", "launch_gather_shuffle_5d_to_linear"),
     ("pd_dcp_gather", "copy_mla_rows_into_pack"),

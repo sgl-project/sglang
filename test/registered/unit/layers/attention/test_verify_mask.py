@@ -4,6 +4,9 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention import trtllm_mha_backend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
@@ -11,11 +14,11 @@ from sglang.srt.layers.attention.verify_mask import (
     tree_mask_numel,
 )
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, default_tree_mask_mode
+from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _MAX_BS = 4
 _DRAFT = 3
@@ -148,7 +151,7 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
         kv_cache_dtype=None,
         token_to_kv_pool=object(),
         req_to_token_pool=object(),
-        kv_index_translator=None,
+        runner_ids=None,
         server_args=SimpleNamespace(
             speculative_attention_mode=speculative_attention_mode
         ),
@@ -183,6 +186,38 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
         backend = _make_hybrid_backend("prefill", _mask(64, is_read=False), None)
 
         self.assertTrue(backend.verify_mask.fits(_MAX_BS))
+
+
+class TestTrtllmMhaVerifyMask(CustomTestCase):
+    """TRT-LLM MHA's target verify reads no tree mask. With
+    SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY, a topk-1 target declares an unread mask, which
+    builds the chain without one; a tree, a draft runner, or a server without the
+    switch keeps SGLang's default."""
+
+    def _mask(self, *, topk=1, chain_tree=True, draft=False):
+        backend = trtllm_mha_backend.TRTLLMHAAttnBackend.__new__(
+            trtllm_mha_backend.TRTLLMHAAttnBackend
+        )
+        backend.__dict__.update(
+            topk=topk,
+            is_draft_runner=draft,
+            skip_prefill=False,
+            max_context_len=_MAX_CONTEXT_LEN,
+            speculative_num_draft_tokens=_DRAFT,
+            device="cpu",
+        )
+        with envs.SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY.override(chain_tree):
+            return backend._unread_verify_mask(_MAX_BS)
+
+    def test_only_a_topk1_target_with_the_switch_declares_an_unread_mask(self):
+        mask = self._mask()
+        self.assertEqual(
+            (mask.mode, mask.is_read, mask.max_bs),
+            (TreeMaskMode.QLEN_ONLY, False, _MAX_BS),
+        )
+        for case in (dict(topk=2), dict(chain_tree=False), dict(draft=True)):
+            with self.subTest(**case):
+                self.assertIsNone(self._mask(**case))
 
 
 class TestTreeMaskNumel(CustomTestCase):

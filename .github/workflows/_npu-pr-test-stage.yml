@@ -54,6 +54,14 @@ on:
         description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
         type: string
         default: ''
+      sgl_router:
+        description: 'Fetch sgl-router for the PD disaggregation tests in this suite.'
+        type: boolean
+        default: false
+      sgl_router_artifact:
+        description: "sgl-router-build's artifact; empty builds sgl-router here."
+        type: string
+        default: ''
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -198,23 +206,28 @@ jobs:
               core.notice('[health-check] PASS: no root cause failures detected');
             }
 
+      # Not download-sgl-router: these k8s container jobs cannot load a local action.
+      # continue-on-error: the artifact expires in a day, so a re-run builds instead.
+      - name: Download prebuilt sgl-router
+        if: inputs.sgl_router && inputs.sgl_router_artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.sgl_router_artifact }}
+          path: sgl-router-bin
+
+      - name: Build sgl-router if no artifact, and export its path
+        if: inputs.sgl_router
+        run: bash scripts/ci/utils/prepare_sgl_router.sh
+
       - name: Install dependencies
         env:
-          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
-          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
-          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
-          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
         shell: bash
         run: |
           set -euo pipefail
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
-
-          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
-          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
-          pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host "${CACHING_URL}"
 
           if [[ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]]; then
             bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
@@ -251,15 +264,14 @@ jobs:
 
           # Install missing python deps (skip if already importable).
           PYTHON_FOR_SGLANG="python"
-          PIP_INDEXES=("https://pypi.org/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple")
-          PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
+          PIP_INDEXES=("https://repo.huaweicloud.com/repository/pypi/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple")
           install_pkg() {
             local pkg="$1"
             ok=0
             for index in "${PIP_INDEXES[@]}"; do
               echo "${pkg}: try via ${index}"
               if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
-                  -i "${index}" --trusted-host "${PIP_TRUSTED_HOST}"; then
+                  -i "${index}"; then
                 ok=1; break
               fi
             done
