@@ -41,7 +41,8 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # The CuTe DSL paged-logits cases need SM100.
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-SLOTS, TIER, WIDTH, TOPK = 8, 16, 256, 64
+# TOPK: FlashMLA's SM100 128-head sparse kernel walks top-k in blocks of 128.
+SLOTS, TIER, WIDTH, TOPK = 8, 16, 256, 128
 
 
 def _paged_index_cache_view(packed):
