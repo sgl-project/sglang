@@ -14,8 +14,10 @@ from sglang.srt.layers.layer_boundary.layout import TokenAxis
 from sglang.srt.layers.layer_boundary.residual.gated import GatedResidualState
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPLELayer,
+    Qwen4ExpVLModel,
     _build_qwen4_exp_stages,
     _has_ple,
+    _sp_moe_keeps_local_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -166,6 +168,41 @@ class TestQwen4ExpPleSequenceParallelRows(CustomTestCase):
         expected = layernorm_sp.shard_token_rows(full, group=group)
         torch.testing.assert_close(layer.key_proj.call_args.args[0], expected)
         self.assertEqual(output.shape, (local_rows, 1))
+
+    def test_returned_hc_hidden_states_gather_all_tp4_rows(self):
+        local_hc = torch.arange(2, dtype=torch.float32).unsqueeze(-1)
+        forward_batch = SimpleNamespace(
+            forward_mode=object(),
+            capture_hidden_mode=SimpleNamespace(need_capture=lambda: True),
+        )
+        with (
+            patch.object(layernorm_sp, "runs_sp", return_value=True),
+            patch.object(
+                layernorm_sp,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_group=_FakeTPGroup()),
+            ),
+        ):
+            hidden_states = Qwen4ExpVLModel._captured_hc_hidden_states(
+                local_hc, torch.arange(8), forward_batch
+            )
+
+        torch.testing.assert_close(hidden_states, local_hc.repeat(4, 1))
+
+    def test_complete_a2a_moe_keeps_sequence_parallel_rows_local(self):
+        for backend_name in ("deepep", "megamoe"):
+            backend = SimpleNamespace(
+                is_deepep=lambda: backend_name == "deepep",
+                is_megamoe=lambda: backend_name == "megamoe",
+            )
+            with (
+                self.subTest(backend=backend_name),
+                patch(
+                    "sglang.srt.models.qwen4_exp.get_moe_a2a_backend",
+                    return_value=backend,
+                ),
+            ):
+                self.assertTrue(_sp_moe_keeps_local_rows())
 
 
 if __name__ == "__main__":

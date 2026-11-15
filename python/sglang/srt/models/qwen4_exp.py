@@ -1670,6 +1670,11 @@ def _prepare_decode_moe_comm(mlp):
     return prepare_qwen4_decode_comm(mlp)
 
 
+def _sp_moe_keeps_local_rows() -> bool:
+    a2a = get_moe_a2a_backend()
+    return a2a.is_deepep() or a2a.is_megamoe()
+
+
 class Qwen4ExpLayerExtensionMixin:
     stage_facts = staticmethod(_qwen4_exp_stage_facts)
 
@@ -1873,17 +1878,25 @@ class Qwen4ExpLayerExtensionMixin:
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 if get_forward().sp_active:
-                    hidden_states = layernorm_sp.run_replicated_token_rows(
-                        hidden_states,
-                        lambda full_tokens: self.mlp(
-                            full_tokens,
-                            forward_batch,
-                            defer_finalize=False,
-                        ),
-                        output_is_tp_partial=not post_experts_output_is_complete(
-                            is_tp_path=True
-                        ),
-                    )
+                    if _sp_moe_keeps_local_rows():
+                        with get_forward().scoped(sp_active=False):
+                            hidden_states = self.mlp(
+                                hidden_states,
+                                forward_batch,
+                                defer_finalize=False,
+                            )
+                    else:
+                        hidden_states = layernorm_sp.run_replicated_token_rows(
+                            hidden_states,
+                            lambda full_tokens: self.mlp(
+                                full_tokens,
+                                forward_batch,
+                                defer_finalize=False,
+                            ),
+                            output_is_tp_partial=not post_experts_output_is_complete(
+                                is_tp_path=True
+                            ),
+                        )
                 else:
                     hidden_states = self.mlp(
                         hidden_states,
@@ -2357,6 +2370,22 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
+    @staticmethod
+    def _captured_hc_hidden_states(
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        if not layernorm_sp.runs_sp(forward_batch.forward_mode):
+            return hidden_states
+        capture = forward_batch.capture_hidden_mode
+        if capture is None or not capture.need_capture():
+            return None
+        return layernorm_sp.sp_exit_gather(
+            hidden_states,
+            num_tokens=input_ids.shape[0],
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -2382,6 +2411,11 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             return model_output
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
+            self.last_hc_hidden_states = self._captured_hc_hidden_states(
+                self.last_hc_hidden_states,
+                input_ids,
+                forward_batch,
+            )
             return hidden_states
         return model_output
 
