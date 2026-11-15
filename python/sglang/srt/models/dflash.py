@@ -179,8 +179,9 @@ def _probe_candidate_ag(group) -> bool:
     ):
         return False
 
+    lease = k3_ar_fusion._get_state().lease
     try:
-        sp_collective.register_comm(group.ca_comm.obj)
+        sp_collective.register_comm(lease.get_communicator, world_size=lease.world_size)
     except AssertionError:
         logger.warning(
             "DFLASH fused candidate all-gather: another communicator owns "
