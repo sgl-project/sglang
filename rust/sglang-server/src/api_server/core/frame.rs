@@ -495,7 +495,7 @@ fn finish_reason(reason: &FinishReason) -> api::FinishReason {
         FinishReason::Known(FinishKind::Stop { matched }) => Kind::Stop(api::FinishStop {
             matched: matched.as_ref().map(matched_value),
         }),
-        FinishReason::Known(FinishKind::Length { length }) => {
+        FinishReason::Known(FinishKind::Length { length, .. }) => {
             Kind::Length(api::FinishLength { length: *length })
         }
         FinishReason::Known(FinishKind::Abort(abort)) => Kind::Abort(Box::new(api::FinishAbort {
