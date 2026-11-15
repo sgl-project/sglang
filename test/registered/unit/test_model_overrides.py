@@ -3810,6 +3810,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 moe_a2a_backend="none",
                 kv_cache_dtype="auto",
                 fp8_gemm_runner_backend="auto",
+                disaggregation_mode="null",
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -3818,6 +3819,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with override_platform(is_hip=False), override_platform(is_blackwell=True):
             ov = _minimax_m3_overrides(_args(), hf)
             self.assertEqual(ov["fp8_gemm_runner_backend"], "flashinfer_cutlass")
+            ov = _minimax_m3_overrides(_args(disaggregation_mode="prefill"), hf)
+            self.assertEqual(ov["fp8_gemm_runner_backend"], "flashinfer_cutlass")
+            ov = _minimax_m3_overrides(_args(disaggregation_mode="decode"), hf)
+            self.assertNotIn("fp8_gemm_runner_backend", ov)
             ov = _minimax_m3_overrides(
                 _args(fp8_gemm_runner_backend="flashinfer_cutedsl"), hf
             )
