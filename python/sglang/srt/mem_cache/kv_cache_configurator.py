@@ -3317,6 +3317,30 @@ class KVCacheConfigurator:
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
+        if self.device == "npu" and get_parallel().dcp_enabled:
+            from sglang.srt.hardware_backend.npu.attention.dcp_memory import (
+                runtime_gather_reserve_bytes,
+            )
+
+            gather_bytes = runtime_gather_reserve_bytes(
+                self.model,
+                max(
+                    get_schedule().chunked_prefill_size or 0,
+                    get_schedule().max_prefill_tokens or 0,
+                ),
+                context_tokens=self.model_config.context_len,
+                page_size=get_schedule().page_size,
+                prefill_requests=max(
+                    1,
+                    get_schedule().prefill_max_requests
+                    or get_schedule().max_running_requests
+                    or 1,
+                ),
+            )
+            slack_gb += gather_bytes / (1 << 30)
+            logger.info(
+                "NPU DCP runtime gather reserve: %.3f GiB", gather_bytes / (1 << 30)
+            )
         # Every prefill batch fits a captured bucket when batches are capped at the
         # request slots; the exemption also needs an explicit Mamba size: a larger
         # rest_memory would otherwise auto-size a bigger physical Mamba pool below.
