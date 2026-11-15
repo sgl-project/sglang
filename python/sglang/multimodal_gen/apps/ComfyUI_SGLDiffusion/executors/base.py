@@ -113,8 +113,18 @@ def _slice_transformer_options(options, index: int, batch: int):
     return sliced
 
 
-def _unsupported_model_patch_error(details: str) -> ValueError:
-    return ValueError(
+class UnsupportedModelPatchAttributeError(ValueError, AttributeError):
+    """The unsupported-patch error for an attribute that patch nodes read.
+
+    As an AttributeError, hasattr() and getattr() with a default still treat the
+    attribute as missing, so only code that uses the attribute fails.
+    """
+
+
+def _unsupported_model_patch_error(
+    details: str, error_type: type = ValueError
+) -> ValueError:
+    return error_type(
         "SGLD integrated mode runs the diffusion model in its worker and cannot "
         f"apply ComfyUI model patches ({details}). Remove "
         "speed-only patch nodes (attention backends, caches, compile) and set "
@@ -413,8 +423,14 @@ class SGLDiffusionExecutor(torch.nn.Module):
         )
         return self._execute_packed(packed, x, timestep)
 
-    @property
-    def transformer_blocks(self):
+    def __getattr__(self, name):
         # ComfyUI block-patch nodes (e.g. Fun ControlNet) read
-        # diffusion_model.transformer_blocks before registering patches.
-        raise _unsupported_model_patch_error("diffusion_model.transformer_blocks")
+        # diffusion_model.transformer_blocks before registering patches. This is
+        # not a property: nn.Module.__getattr__ would replace an AttributeError
+        # raised in a property with its generic "has no attribute" message.
+        if name == "transformer_blocks":
+            raise _unsupported_model_patch_error(
+                "diffusion_model.transformer_blocks",
+                UnsupportedModelPatchAttributeError,
+            )
+        return super().__getattr__(name)
