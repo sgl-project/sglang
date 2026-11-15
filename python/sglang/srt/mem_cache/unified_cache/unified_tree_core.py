@@ -2272,7 +2272,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for spare_imminent_demotes in (True, False):
             if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
                 break
-            for node in self.full_host_duplicates.values():
+            # Sort by node.id for deterministic iteration order across TP ranks.
+            # The rolling reclaim digest is order-dependent; all ranks must
+            # visit candidates in the same order to produce matching digests.
+            for node in sorted(self.full_host_duplicates.values(), key=lambda n: n.id):
                 if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
                     break
                 cd = node.component_data[BASE_COMPONENT_TYPE]
