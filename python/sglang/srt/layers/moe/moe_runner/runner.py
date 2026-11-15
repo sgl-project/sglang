@@ -144,6 +144,11 @@ class MoeRunner:
             import sglang.srt.layers.moe.flashinfer_megamoe  # noqa: F401
         elif runner_backend.is_cutlass():
             self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
+        elif runner_backend.is_nvfp4_w4a16_sm90():
+            self.runner_core = None  # fused path only, registered by this import
+            from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
+                nvfp4_w4a16_sm90,
+            )
         elif runner_backend.is_hpc_ops():
             import torch
 

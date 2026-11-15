@@ -3467,10 +3467,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             quant_config is not None
             and quant_config.get_name() == "modelopt_fp4"
             and is_sm90_supported()
-            and get_moe_runner_backend().is_marlin()
+            and (
+                get_moe_runner_backend().is_marlin()
+                or get_moe_runner_backend().is_nvfp4_w4a16_sm90()
+            )
         ):
             return (
-                "Hopper modelopt_fp4 with moe_runner_backend=marlin: "
+                "Hopper modelopt_fp4 with moe_runner_backend=marlin or nvfp4_w4a16_sm90: "
                 "fusion off by default until the shared-expert fused load path "
                 "is validated."
             )
