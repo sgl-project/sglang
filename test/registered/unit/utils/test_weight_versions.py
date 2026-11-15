@@ -427,6 +427,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
         scheduler.output_streamer = MagicMock()
         scheduler.hisparse_coordinator = None
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
 
         with patch(

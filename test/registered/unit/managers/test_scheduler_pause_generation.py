@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.sparsity.host_ledger import HiSparseHostLedger
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -155,6 +156,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.beam_coordinator = MagicMock()
         scheduler.output_streamer = MagicMock()
         scheduler.send_abort_output = MagicMock()
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         return scheduler
 
@@ -494,6 +496,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.hisparse_coordinator.ack_staging_queue = IndexedReqList(
             ListKind.HISPARSE_STAGING
         )
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         last_req = self._make_req("last")
         last_req.kv.req_pool_idx = 0
@@ -534,6 +537,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         coordinator.mem_pool_host.allocated_host_indices.return_value = torch.empty(0)
         coordinator.req_to_host_pool = torch.full((2, 8), -1, dtype=torch.int64)
         coordinator.req_to_host_pool_allocated_len = torch.zeros(2, dtype=torch.int64)
+        # The host half of a release is filed through the ledger.
+        coordinator.host_ledger = HiSparseHostLedger(
+            coordinator.mem_pool_host,
+            coordinator.req_to_host_pool,
+            coordinator.req_to_host_pool_allocated_len,
+        )
         coordinator._skip_first_backup = {}
         coordinator.spec_swap = MagicMock()
         for slot, req in enumerate((older, newer)):
@@ -542,6 +551,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             req.hisparse_staging = True
             coordinator.ack_staging_queue.join([HiSparseAct(None, MagicMock(), req)])
         scheduler.hisparse_coordinator = coordinator
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
         prefill = self._make_batch(
@@ -916,6 +926,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         scheduler.enable_continuous_input_polling = False
         scheduler.pause_state = PauseState()
@@ -944,6 +955,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         prealloc_queue.scheduler = scheduler

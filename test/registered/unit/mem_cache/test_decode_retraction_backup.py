@@ -398,6 +398,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 sliding_window_size=8 if hybrid_swa else None,
                 enable_hisparse=False,
                 enable_hisparse_host_radix=False,
+                # No HiSparse engine: host admission must price nothing.
+                hisparse_coordinator=None,
                 enable_decode_hicache=False,
                 enable_lora=False,
                 enable_priority_scheduling=False,

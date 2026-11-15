@@ -116,12 +116,21 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size(),
         )
 
-    # Set by the scheduler when the HiSparse host pool can run out before the
-    # logical pool (host-radix or host_token_capacity); see check_decode_capacity.
-    _host_decode_capacity_fn = None
+    # The coordinator owns the HiSparse host pool and decides whether its
+    # capacity can bind.
+    _host_pool = None
 
-    def set_host_decode_capacity_fn(self, fn) -> None:
-        self._host_decode_capacity_fn = fn
+    def set_host_pool(self, coordinator, *, host_radix: bool = False) -> None:
+        coordinator.set_host_radix(host_radix)
+        self._host_pool = coordinator
+
+    def _host_binds(self) -> bool:
+        return self._host_pool is not None and self._host_pool.host_can_bind
+
+    def host_fits(self, demand) -> bool:
+        if demand.host_tokens <= 0 or not self._host_binds():
+            return True
+        return self._host_pool.host_available() >= demand.host_tokens
 
     def check_decode_capacity(
         self,
@@ -138,25 +147,13 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             spec_algorithm=spec_algorithm,
         ):
             return False
-        fn = self._host_decode_capacity_fn
-        return fn is None or requests is None or fn(requests)
-
-    def max_new_tokens_for_memory(
-        self,
-        input_tokens: int,
-        max_new_tokens: int,
-        *,
-        token_capacity: int,
-        sliding_window_size: int | None,
-        chunk_size: int | None,
-    ) -> int | None:
-        return super().max_new_tokens_for_memory(
-            input_tokens,
-            max_new_tokens,
-            token_capacity=max(token_capacity, self._size_full),
-            sliding_window_size=sliding_window_size,
-            chunk_size=chunk_size,
-        )
+        if requests is None or not self._host_binds():
+            return True
+        demand = self._host_pool.next_step_host_demand(requests)
+        # A shortfall here retracts (HiSparse re-bootstraps) instead of failing
+        # in the backup alloc, so this check may reclaim tree-held slots first.
+        self._host_pool.host_reclaim(demand.host_tokens)
+        return self.host_fits(demand)
 
     @property
     def supports_deferred_release(self) -> bool:

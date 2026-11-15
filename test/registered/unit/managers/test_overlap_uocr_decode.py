@@ -360,6 +360,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         ):
             setattr(scheduler, name, Mock())
         scheduler.hisparse_coordinator = None
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
 
         with patch("sglang.srt.managers.utils.get_serving"):

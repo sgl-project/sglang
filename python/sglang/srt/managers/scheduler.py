@@ -1383,13 +1383,10 @@ class Scheduler(
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
-        if (
-            self.enable_hisparse_host_radix
-            or self.hisparse_coordinator.host_pool_decoupled
-        ):
-            self.token_to_kv_pool_allocator.set_host_decode_capacity_fn(
-                self.hisparse_coordinator.host_decode_capacity_ok
-            )
+        self.token_to_kv_pool_allocator.set_host_pool(
+            self.hisparse_coordinator,
+            host_radix=self.enable_hisparse_host_radix,
+        )
 
         if self.enable_hisparse_host_radix:
             from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -1397,7 +1394,7 @@ class Scheduler(
             self.hisparse_coordinator.set_host_evict_fn(self.tree_cache.evict_host)
             self.tree_cache.hisparse_coordinator = self.hisparse_coordinator
             self.hisparse_coordinator.set_host_borrow_release_fn(
-                self.tree_cache.release_host_prefix
+                self.tree_cache.dec_host_lock_ref
             )
             self.hisparse_coordinator.indexer_host_pool = (
                 self.tree_cache.host_pool_group.get_pool(PoolName.INDEXER)

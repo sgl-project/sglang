@@ -591,6 +591,8 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
         scheduler.enable_hisparse = False
+        # No HiSparse engine here: host admission must price nothing.
+        scheduler.hisparse_coordinator = None
         scheduler.enable_hisparse_host_radix = False
         scheduler.enable_lora = False
         scheduler.waiting_queue = []
@@ -617,6 +619,9 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
                     padded_buffer_size=4160,
                     spec_swap=SimpleNamespace(scratch_capacity=1024),
                     host_pool_decoupled=False,
+                    # A tied pool without host-radix cannot run out of host
+                    # slots before logical rows, so host admission is inert.
+                    host_can_bind=False,
                 )
                 queue.token_to_kv_pool_allocator.logical_attn_allocator = (
                     SimpleNamespace(available_size=lambda: 32768)

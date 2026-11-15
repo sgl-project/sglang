@@ -289,6 +289,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             req_to_host_pool_allocated_len=object(),
             host_token_len=MagicMock(side_effect=lambda token_len: token_len // 4),
         )
+        coordinator.host_ledger = MagicMock()
+        coordinator.host_ledger.alloc.return_value = host_indices
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.req_to_token_pool = req_to_token_pool
         queue.token_to_kv_pool_allocator = allocator
@@ -320,12 +322,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(req.extend_end, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
         coordinator.host_token_len.assert_called_once_with(fill_len)
-        regular_host_alloc.assert_called_once_with(
-            coordinator.req_to_host_pool,
-            coordinator.req_to_host_pool_allocated_len,
-            req.kv.req_pool_idx,
-            0,
-            len(host_indices),
+        coordinator.host_ledger.alloc.assert_called_once_with(
+            req.kv.req_pool_idx, 0, len(host_indices)
         )
         self.assertTrue(torch.equal(req_to_token_pool.writes[0][1], kv_loc))
 
@@ -422,6 +420,58 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         np.testing.assert_array_equal(info.dst_kv_indices, host_pages)
         np.testing.assert_array_equal(info.dst_device_kv_indices, device_pages)
+
+
+class TestHiSparseHostPricing(CustomTestCase):
+    """The host half of a preallocation is priced where the slots are taken.
+
+    ``prealloc_fits`` stays a pure logical comparison, so the decode admission
+    path reclaims and prices host capacity itself; the per-step check keeps its
+    evicting semantics because a shortfall there retracts instead of failing the
+    backup alloc.
+    """
+
+    DEMAND = 32
+
+    def _alloc(self, available):
+        alloc = object.__new__(HiSparseTokenToKVPoolAllocator)
+        alloc.logical_attn_allocator = SimpleNamespace(available_size=lambda: 64)
+        alloc.hisparse_attn_allocator = SimpleNamespace(available_size=lambda: 64)
+        reclaims = []
+        coord = SimpleNamespace(
+            host_can_bind=True,
+            host_available=lambda: available,
+            host_reclaim=lambda n: reclaims.append(n) or available,
+            next_step_host_demand=lambda reqs: KVDemand(host_tokens=self.DEMAND),
+            set_host_radix=lambda enabled: None,
+        )
+        alloc.set_host_pool(coord)
+        return alloc, reclaims
+
+    def test_prealloc_fits_compares_budgets_only(self):
+        alloc, reclaims = self._alloc(available=0)
+        # A host demand no pool could meet changes nothing: host is not priced here.
+        demand = KVDemand(full_tokens=64, host_tokens=1 << 20)
+        self.assertTrue(
+            alloc.prealloc_fits(demand, evictable={}, full_budget_tokens=64)
+        )
+        self.assertFalse(
+            alloc.prealloc_fits(demand, evictable={}, full_budget_tokens=32)
+        )
+        self.assertEqual(reclaims, [])
+
+    def test_check_decode_capacity_still_reclaims_before_it_prices(self):
+        alloc, reclaims = self._alloc(available=0)
+        self.assertFalse(
+            alloc.check_decode_capacity(num_tokens=8, tree_cache=None, requests=["r"])
+        )
+        self.assertEqual(reclaims, [self.DEMAND])
+
+    def test_host_fits_is_a_pure_predicate(self):
+        alloc, reclaims = self._alloc(available=self.DEMAND)
+        self.assertTrue(alloc.host_fits(KVDemand(host_tokens=self.DEMAND)))
+        self.assertFalse(alloc.host_fits(KVDemand(host_tokens=self.DEMAND + 1)))
+        self.assertEqual(reclaims, [])
 
 
 if __name__ == "__main__":

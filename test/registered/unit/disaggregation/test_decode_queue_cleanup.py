@@ -286,6 +286,8 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             scheduler = MagicMock()
             scheduler.enable_decode_hicache = True
             scheduler.enable_hisparse = False
+            # No HiSparse engine: host admission must price nothing.
+            scheduler.hisparse_coordinator = None
             scheduler.metrics_reporter.enable_metrics = False
             queue.scheduler = scheduler
 
@@ -448,6 +450,8 @@ class TestDeferredDestinationPublish(CustomTestCase):
             enable_hisparse_host_radix=False,
             enable_lora=False,
             enable_decode_hicache=False,
+            # No HiSparse engine: host admission must price nothing.
+            hisparse_coordinator=None,
         )
         queue.scheduler.running_batch.reqs = []
         return queue

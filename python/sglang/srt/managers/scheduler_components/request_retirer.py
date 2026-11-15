@@ -99,7 +99,7 @@ class RequestRetirer:
         # HiSparse clears its mapping of the row before the row is freed. Under
         # host-radix the host half waits until the checkpoint insert has claimed
         # the host slots the tree keeps.
-        hisparse_host_after = False
+        hisparse_host_after = None
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             if self.enable_hisparse_host_radix:
                 hisparse_host_after = self.hisparse_coordinator.release_request_device(
@@ -109,8 +109,10 @@ class RequestRetirer:
                 self.hisparse_coordinator.release_request(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
-        if hisparse_host_after:
-            self.hisparse_coordinator.release_host_after_insert(req)
+        if hisparse_host_after is not None:
+            self.hisparse_coordinator.release_host_after_insert(
+                req, hisparse_host_after
+            )
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""

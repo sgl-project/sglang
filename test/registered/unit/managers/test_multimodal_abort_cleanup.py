@@ -102,6 +102,7 @@ def _queued_scheduler(req):
     scheduler.output_streamer = MagicMock()
     scheduler.collect_inflight_reqs = lambda: set()
     scheduler.hisparse_coordinator = None
+    scheduler.enable_hisparse_host_radix = False
     scheduler.init_request_retirer()
     return scheduler
 
