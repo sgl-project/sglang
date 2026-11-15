@@ -23,7 +23,6 @@ from sglang.srt.layers.attention.local_attention import (
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
@@ -46,6 +45,8 @@ from sgl_kernel import (
     merge_state_v2,
 )
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+from sglang.srt.mem_cache.pool.base import KVWriteLoc, window_write_locs
 
 
 class XPUDCPMetadata(msgspec.Struct):

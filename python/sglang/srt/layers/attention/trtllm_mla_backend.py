@@ -63,7 +63,6 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.dcp.layout import get_dcp_lens, is_mla_dcp_lse_base_on_e
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -185,6 +184,7 @@ class TRTLLMMLAPrefillMetadata:
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.mem_cache.pool.base import KVWriteLoc
 
 # Arm PDL on the trtllm-gen decode launch so its prolog overlaps the tail of
 # the query-prep kernels (which already trigger their PDL secondary).

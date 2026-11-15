@@ -93,8 +93,8 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    unwrap_write_loc,
 )
+from sglang.srt.mem_cache.pool.base import unwrap_write_loc
 from sglang.srt.utils import ceil_div, get_bool_env_var, is_cuda
 from sglang.srt.utils.common import ceil_align
 

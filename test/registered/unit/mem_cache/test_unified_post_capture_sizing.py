@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DraftBand,
     FusedDraftPlacement,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.pool.base import KVWriteLoc
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase

@@ -31,7 +31,8 @@ for name in (
 
 from sglang.srt.hardware_backend.npu import memory_pool_npu as pool_mod
 from sglang.srt.hardware_backend.npu.attention import ascend_backend as mod
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.pool.base import KVCache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 
 

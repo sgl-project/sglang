@@ -33,7 +33,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 def _loc_info(virtual_loc, swa_phys=None, full_phys=None, physical=False):
     """A write loc whose window sub-pool "swa" writes at ``swa_phys``."""
-    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+    from sglang.srt.mem_cache.pool.base import KVWriteLoc
 
     return KVWriteLoc(
         virtual_loc,
@@ -54,7 +54,7 @@ class _RecordingPool:
         self.physical = []
 
     def set_kv_buffer(self, layer, loc_info, cache_k, cache_v, *args, **kwargs):
-        from sglang.srt.mem_cache.memory_pool import (
+        from sglang.srt.mem_cache.pool.base import (
             unwrap_write_loc,
             write_loc_is_physical,
         )

@@ -33,7 +33,8 @@ if TYPE_CHECKING:
 
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
-    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.pool.base import KVCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 

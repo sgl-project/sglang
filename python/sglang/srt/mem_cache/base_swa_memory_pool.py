@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.pool.base import KVCache
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.dsv41_request_window import RequestWindow

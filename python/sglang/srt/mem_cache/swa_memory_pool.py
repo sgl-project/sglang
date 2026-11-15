@@ -9,11 +9,10 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
-    KVCache,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    unwrap_write_loc,
 )
+from sglang.srt.mem_cache.pool.base import KVCache, unwrap_write_loc
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 
 logger = logging.getLogger(__name__)

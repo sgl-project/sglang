@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.pool.base import KVCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput

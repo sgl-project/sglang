@@ -33,9 +33,9 @@ import torch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
-from sglang.srt.mem_cache.memory_pool import (
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool.base import (
     KVWriteLoc,
-    MHATokenToKVPool,
     unwrap_write_loc,
     write_loc_is_physical,
 )

@@ -156,7 +156,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_extend_vectorized_5d,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
+from sglang.srt.mem_cache.pool.base import KVWriteLoc, window_write_locs
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)

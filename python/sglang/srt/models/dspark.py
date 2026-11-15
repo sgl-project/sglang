@@ -19,7 +19,7 @@ from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
+from sglang.srt.mem_cache.pool.base import KVWriteLoc, layer_window_locs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.runtime_context import get_parallel, get_spec

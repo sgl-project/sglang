@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.flashmla_backend import (
     FlashMLADecodeMetadata,
     FlashMLAMultiStepDraftBackend,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.pool.base import KVWriteLoc
 from sglang.srt.model_executor.forward_mode import ForwardMode
 
 if TYPE_CHECKING:

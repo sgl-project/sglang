@@ -14,11 +14,8 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
-    MiniMaxSparseKVPool,
-    unwrap_write_loc,
-)
+from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from sglang.srt.mem_cache.pool.base import KVCache, unwrap_write_loc
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.async_probe import maybe_detect_oob

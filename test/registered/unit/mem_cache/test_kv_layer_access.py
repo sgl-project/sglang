@@ -13,10 +13,10 @@ from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
-    KVWriteLoc,
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.pool.base import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.frozen_kv_mtp_utils import target_kv_pool_view

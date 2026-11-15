@@ -95,7 +95,7 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
         self, layer, loc_info, commit_lens, cache_k, cache_v, *args, **kwargs
     ) -> None:
         """Commit each request's live prefix using this layer's physical ids."""
-        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+        from sglang.srt.mem_cache.pool.base import unwrap_write_loc
 
         write_loc = loc_info if self.plain else self._write_loc(layer, loc_info)
         loc, _, _ = unwrap_write_loc(write_loc)
@@ -120,7 +120,7 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
     def store_mla_prefix(
         self, layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
     ) -> None:
-        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+        from sglang.srt.mem_cache.pool.base import unwrap_write_loc
 
         write_loc = loc_info if self.plain else self._write_loc(layer, loc_info)
         loc, _, _ = unwrap_write_loc(write_loc)
@@ -131,7 +131,7 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
 
     def _write_loc(self, layer, loc_info):
         # Imported here: memory_pool imports this module for its routers.
-        from sglang.srt.mem_cache.memory_pool import (
+        from sglang.srt.mem_cache.pool.base import (
             KVWriteLoc,
             unwrap_write_loc,
             write_loc_is_physical,

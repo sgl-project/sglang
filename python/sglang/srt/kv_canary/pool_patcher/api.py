@@ -13,10 +13,10 @@ from sglang.srt.kv_canary.pool_patcher.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patcher.buffer_alloc import resolve_real_kv_read_bytes
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
 )
+from sglang.srt.mem_cache.pool.base import KVCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 logger = logging.getLogger(__name__)
