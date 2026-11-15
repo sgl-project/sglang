@@ -836,9 +836,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
             token_pos_in_items_ptr.append(pos_within_item.to(torch.uint16))
 
+            # Clamp at 0 when prefix_len == 0 (e.g. empty query on BOS-less models)
+            # so delimiters at pos_within_item == 0 do not index RoPE cache with -1.
             forward_batch.positions[seq_start + first_delim : seq_end] = (
-                prefix_len + pos_within_item - 1
-            ).to(device, non_blocking=True)
+                (prefix_len + pos_within_item - 1)
+                .clamp_min(0)
+                .to(device, non_blocking=True)
+            )
 
             seq_start = seq_end
 
