@@ -9,7 +9,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-    amax_topk_blocks,
+    TopKOp,
     candidate_block_mask,
     candidate_row_lens,
     candidate_topk,
@@ -29,7 +29,6 @@ from .scoring import (
     score_tiles,
     select_decode,
     select_prefill_block_ids,
-    topk_ragged,
     write_decode,
     write_prefill,
 )
@@ -42,6 +41,8 @@ from .types import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    from .selector import TopKSelector
 
 # A compact DeepGEMM call packs one contiguous K range per query. Bound the
 # repeated K, including requests in the batch with disjoint candidate sets.
@@ -78,6 +79,7 @@ class DenseBlocksBackend:
         candidate_block_size: int,
         use_deep_gemm_publish: bool,
         use_deep_gemm_consume: bool,
+        selector: TopKSelector,
         use_sm90_deep_gemm_consume: bool = False,
     ) -> None:
         self.token_to_kv_pool = token_to_kv_pool
@@ -87,6 +89,7 @@ class DenseBlocksBackend:
         self.use_deep_gemm_publish = use_deep_gemm_publish
         self.use_deep_gemm_consume = use_deep_gemm_consume
         self.use_sm90_deep_gemm_consume = use_sm90_deep_gemm_consume
+        self.selector = selector
 
     def publish_prefill(self, inputs: PrefillInputs):
         if self.use_deep_gemm_publish:
@@ -124,28 +127,30 @@ class DenseBlocksBackend:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            compute_topk_plan=self.selector.backend.is_sgl_kernel(),
         )
         if d is None:
             return None
         if isinstance(d, PagedDecodeScores):
             assert self.block_size == 8
-            blocks = amax_topk_blocks(
+            blocks = self.selector.amax_blocks(
                 d.scores, d.lens, (d.lens + 7) // 8, self.topk_blocks
             )
+            # Paged consumers read the blocks only through decode_mask, so order is free.
             published = BlockIds(
                 blocks=blocks,
                 decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
             )
         else:
-            published = BlockIds(
-                blocks=select_candidate_block_ids(
-                    d.scores,
-                    d.lens[:, None],
-                    topk_blocks=self.topk_blocks,
-                    block_size=self.block_size,
-                )
+            blocks = select_candidate_block_ids(
+                d.scores,
+                d.lens[:, None],
+                topk_blocks=self.topk_blocks,
+                block_size=self.block_size,
+                topk_op=self.selector.dense,
             )
-        select_decode(inputs, d, inputs.indexer.index_topk)
+            published = BlockIds(blocks=self.selector.order_candidates(blocks))
+        select_decode(inputs, d, inputs.indexer.index_topk, selector=self.selector)
         return published
 
     def consume_decode(
@@ -158,17 +163,23 @@ class DenseBlocksBackend:
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             candidate_mask=published.decode_mask if published is not None else None,
+            compute_topk_plan=self.selector.backend.is_sgl_kernel(),
         )
         if d is None:
             return
         assert published is not None and published.blocks.shape[0] == d.bs
         if isinstance(d, PagedDecodeScores):
             assert published.decode_mask is not None
-            select_decode(inputs, d, inputs.indexer.index_topk)
+            select_decode(inputs, d, inputs.indexer.index_topk, selector=self.selector)
             return
         k = min(inputs.indexer.index_topk, d.lmax)
         idx = topk_among_blocks(
-            d.scores, d.lens, published.blocks, k, block_size=self.block_size
+            d.scores,
+            d.lens,
+            published.blocks,
+            k,
+            block_size=self.block_size,
+            topk_op=self.selector.dense,
         )
         write_decode(inputs, d, idx.masked_fill(idx < 0, d.lmax))
 
@@ -187,10 +198,14 @@ class DenseBlocksBackend:
             topk=inputs.indexer.index_topk,
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
+            selector=self.selector,
             fast_block_topk=self.use_sm90_deep_gemm_consume,
         )
         data.write_selection(selected, inputs)
-        return BlockIds(blocks=blocks, rows_per_request=data.rows_per_request)
+        return BlockIds(
+            blocks=self.selector.order_candidates(blocks),
+            rows_per_request=data.rows_per_request,
+        )
 
     def _deep_gemm_consume_prefill(
         self,
@@ -210,6 +225,7 @@ class DenseBlocksBackend:
             topk=inputs.indexer.index_topk,
             blocks=published.blocks,
             block_size=self.block_size,
+            topk_op=self.selector.dense,
         )
         data.write_selection(selected, inputs)
 
@@ -248,6 +264,7 @@ class DenseBlocksBackend:
                     lens[tile],
                     data.request_starts[tile],
                     selected[tile],
+                    selector=self.selector,
                 )
             data.write_selection(selected, inputs)
             return
@@ -257,7 +274,12 @@ class DenseBlocksBackend:
         )
         if max(data.lens_per_request, default=0) <= blocks.shape[1] * self.block_size:
             # The source selected every visible block. Reuse full top-k directly.
-            dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+            dense_prefill_topk(
+                data,
+                kv,
+                out=inputs.out_raw_indices[: data.num_rows],
+                selector=self.selector,
+            )
             data.write_page_indices(inputs)
             return
         selected = data.empty_selection(inputs.indexer.index_topk)
@@ -272,6 +294,7 @@ class DenseBlocksBackend:
                 lens,
                 data.request_starts[tile],
                 selected[tile],
+                selector=self.selector,
             )
         data.write_selection(selected, inputs)
 
@@ -292,10 +315,11 @@ class DenseBlocksBackend:
                             chunk.lens[:, None],
                             topk_blocks=self.topk_blocks,
                             block_size=self.block_size,
+                            topk_op=self.selector.dense,
                         ),
                     )
                 )
-                idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
+                _, idx = self.selector.dense(chunk.scores, request.k)
                 write_prefill(inputs, request, chunk, idx)
         width = max((ids.shape[1] for _, ids in picked), default=0)
         blocks = torch.full(
@@ -306,7 +330,10 @@ class DenseBlocksBackend:
         )
         for rows, ids in picked:
             blocks[rows, : ids.shape[1]] = ids
-        return BlockIds(blocks=blocks, rows_per_request=inputs.rows_per_request)
+        return BlockIds(
+            blocks=self.selector.order_candidates(blocks),
+            rows_per_request=inputs.rows_per_request,
+        )
 
     def _torch_consume_prefill(
         self,
@@ -329,6 +356,7 @@ class DenseBlocksBackend:
                         published.blocks[chunk.tok],
                         request.k,
                         self.block_size,
+                        topk_op=self.selector.dense,
                     )
                 else:
                     idx = topk_among_blocks(
@@ -337,6 +365,7 @@ class DenseBlocksBackend:
                         published.blocks[chunk.tok],
                         request.k,
                         block_size=self.block_size,
+                        topk_op=self.selector.dense,
                     )
                 write_prefill(
                     inputs, request, chunk, idx.masked_fill(idx < 0, request.lc)
@@ -350,6 +379,7 @@ def _publish_prefill_blocks(
     topk: int,
     topk_blocks: int,
     block_size: int,
+    selector: TopKSelector,
     fast_block_topk: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     selected = data.empty_selection(topk)
@@ -363,7 +393,12 @@ def _publish_prefill_blocks(
             lens = data.compress_lens[tile]
             nblocks, _ = candidate_row_lens(lens, width)
             select_prefill_block_ids(
-                logits, lens, nblocks, blocks[tile], offsets=zero_offsets[tile]
+                logits,
+                lens,
+                nblocks,
+                blocks[tile],
+                offsets=zero_offsets[tile],
+                selector=selector,
             )
         else:
             _publish_tile_blocks(
@@ -373,8 +408,9 @@ def _publish_prefill_blocks(
                 blocks=blocks[tile],
                 topk_blocks=topk_blocks,
                 block_size=block_size,
+                topk_op=selector.dense,
             )
-        topk_ragged(
+        selector.ragged(
             logits,
             data.compress_lens[tile],
             out=selected[tile],
@@ -405,8 +441,10 @@ def _select_candidate_positions(
     lens: torch.Tensor,
     starts: torch.Tensor,
     out: torch.Tensor,
+    *,
+    selector: TopKSelector,
 ) -> None:
-    topk_ragged(logits, lens, out=out, offsets=torch.zeros_like(lens))
+    selector.ragged(logits, lens, out=out, offsets=torch.zeros_like(lens))
     columns = positions.gather(1, out.clamp_min(0).long()) + starts[:, None]
     out.copy_(columns.masked_fill(out < 0, -1))
 
@@ -419,6 +457,7 @@ def _publish_tile_blocks(
     blocks: torch.Tensor,
     topk_blocks: int,
     block_size: int,
+    topk_op: TopKOp,
 ) -> None:
     lens = data.compress_lens[tile]
     for rows, lc in _requests_in_tile(data, tile):
@@ -432,6 +471,7 @@ def _publish_tile_blocks(
             compress_lens=lens[rows, None],
             topk_blocks=topk_blocks,
             block_size=block_size,
+            topk_op=topk_op,
         )
         blocks[rows, : ids.shape[1]] = ids
 
@@ -443,6 +483,7 @@ def _consume_prefill_blocks(
     topk: int,
     blocks: torch.Tensor,
     block_size: int,
+    topk_op: TopKOp,
 ) -> torch.Tensor:
     selected = data.empty_selection(topk)
     # the block-aligned slices of `_consume_tile_blocks` stay within the logits width
@@ -455,6 +496,7 @@ def _consume_prefill_blocks(
             blocks=blocks[tile],
             block_size=block_size,
             out=selected[tile],
+            topk_op=topk_op,
         )
         # Free this tile's logits before the generator scores the next one.
         del logits
@@ -469,6 +511,7 @@ def _consume_tile_blocks(
     blocks: torch.Tensor,
     block_size: int,
     out: torch.Tensor,
+    topk_op: TopKOp,
 ) -> None:
     lens = data.compress_lens[tile]
     starts = data.request_starts[tile]
@@ -481,6 +524,7 @@ def _consume_tile_blocks(
             blocks[rows],
             out.shape[1],
             block_size=block_size,
+            topk_op=topk_op,
         )
         out[rows] = torch.where(positions >= 0, positions + starts[rows, None], -1).to(
             torch.int32

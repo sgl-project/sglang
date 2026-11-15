@@ -545,7 +545,8 @@ def test_fp4_paged_logits_balanced_matches_per_row_replay(heads, ratio, masked):
 )
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_hopper_indexer_backends_replay(ratio):
-    from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+    from sglang.srt.layers.attention.dsv4.v41_indexer import TopKSelector, scoring
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         DenseBlocksBackend,
     )
@@ -586,7 +587,11 @@ def test_hopper_indexer_backends_replay(ratio):
         paged_metadata=metadata,
         is_verify=True,
     )
-    kwargs = dict(token_to_kv_pool=pool, req_to_token=req_table)
+    kwargs = dict(
+        token_to_kv_pool=pool,
+        req_to_token=req_table,
+        selector=TopKSelector(DSATopKBackend.SGL_KERNEL),
+    )
     full = FullTopKIndexer(
         **kwargs, use_deep_gemm_prefill=False, use_deep_gemm_decode=False
     )

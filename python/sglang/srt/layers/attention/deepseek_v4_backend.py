@@ -93,6 +93,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     DecodeInputs,
     PrefillInputs,
     RowShard,
+    TopKSelector,
     make_candidate_indexer,
     make_full_topk_indexer,
 )
@@ -1395,12 +1396,15 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
+        low_ratio_topk_selector = TopKSelector(self.dsa_topk_backend)
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             page_size=self.page_size,
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
+            selector=low_ratio_topk_selector,
         )
         self.index_topk = getattr(cfg, "index_topk", DEFAULT_INDEX_TOPK)
         self.full_topk_indexer = make_full_topk_indexer(
@@ -1408,6 +1412,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             index_heads=int(cfg.index_n_heads),
             index_topk=self.index_topk,
+            selector=low_ratio_topk_selector,
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
@@ -1432,7 +1437,6 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
         # Prefill CUDA graph source projection buffers per ratio, newest first.
         self._source_proj_bufs: Dict[int, list] = {}
-        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         self._cutedsl_h16_c128_combined_topk: Optional[int] = None
         if self.dsv4_prefill_backend == DSV4_CUTEDSL_H16_PREFILL_BACKEND:
