@@ -127,6 +127,7 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "enable_trace",
     "completion_template",
     "hf_chat_template_name",
+    "trust_request_chat_template",
     "enable_custom_logit_processor",
     "enable_return_routed_experts",
     "enable_lora",
