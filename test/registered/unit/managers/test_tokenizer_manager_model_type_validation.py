@@ -24,7 +24,9 @@ class TestTokenizerManagerModelTypeValidation(CustomTestCase):
         manager.allow_auto_truncate = False
         manager.validate_total_tokens = False
         manager.is_generation = is_generation
-        manager.model_config = SimpleNamespace(joint_head_config=None)
+        manager.model_config = SimpleNamespace(
+            joint_head_config=None, pointer_head=None
+        )
         manager._validate_token_ids_logprob = Mock()
         return manager
 
