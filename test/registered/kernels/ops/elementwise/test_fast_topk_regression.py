@@ -93,3 +93,9 @@ def test_fast_topk_overflow_stable_across_runs(topk, length):
             .values
         )
         assert torch.equal(got, first), "top-k selection unstable across runs"
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
