@@ -57,6 +57,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
+    ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
@@ -66,7 +67,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_validate_and_cleanup_local_snapshot,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
@@ -214,6 +215,14 @@ def _resolve_explicit_draft_quant_config(
         return ModelOptFp4Config.for_online_weight_quantization(
             quant_config.packed_modules_mapping
         )
+
+    # MIXED_PRECISION exports can ship block-FP8 MTP experts; they resolve to
+    # modelopt_mixed, so read the requested draft quantization from the spec args.
+    if (
+        isinstance(quant_config, ModelOptMixedPrecisionConfig)
+        and get_spec().speculative_draft_model_quantization == "modelopt_fp4"
+    ):
+        quant_config.convert_block_fp8_experts_to_nvfp4()
 
     return quant_config
 

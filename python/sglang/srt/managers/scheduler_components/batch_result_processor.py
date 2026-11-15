@@ -1604,9 +1604,9 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_indexer_topk(req)
 
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
-                # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                if not self.decode_offload_manager.offload_kv_cache(req):
-                    self.decode_offload_manager.finalize_release_on_finish(req)
+                # The release waits for every Device->Host copy of the request to land.
+                self.decode_offload_manager.offload_kv_cache(req)
+                self.decode_offload_manager.finalize_release_on_finish(req)
             else:
                 self._prepare_kv_cache_release(req)
                 checkpoint = (

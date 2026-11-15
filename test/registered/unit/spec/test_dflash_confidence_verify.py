@@ -423,6 +423,7 @@ def test_compact_is_refused_on_a_target_backend_without_ragged_verify(monkeypatc
     def init_backends(supports_ragged_verify_graph):
         worker = types.SimpleNamespace(
             _draft_worker=types.SimpleNamespace(init_attention_backends=lambda: None),
+            draft_kv_ring=None,
             draft_parallel_layout=None,
             draft_owns_attention=False,
             model_runner=types.SimpleNamespace(
@@ -445,3 +446,56 @@ def test_compact_is_refused_on_a_target_backend_without_ragged_verify(monkeypatc
             setattr(features, field, False)
     with envs.SGLANG_RAGGED_VERIFY_MODE.override("cap-accept"):
         init_backends(False)
+
+
+@pytest.mark.parametrize(
+    "verify_lens,num_tokens,expected_deltas",
+    [
+        (None, 6, [0, 0, 20, 20, -3, -3]),
+        ([1, 3, 2], 8, [0, 20, 20, 20, -3, -3, 0, 0]),
+    ],
+)
+def test_spec_mrope_mixed_batch_preserves_request_and_padding_deltas(
+    verify_lens, num_tokens, expected_deltas
+):
+    """A nonblocking stacked transfer must still expand one delta per request
+    over ragged query rows, with no delta applied to graph-padding rows."""
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    positions = torch.arange(10, 10 + num_tokens, dtype=torch.int64)
+    layout = (
+        None
+        if verify_lens is None
+        else types.SimpleNamespace(verify_lens=torch.tensor(verify_lens))
+    )
+    batch = types.SimpleNamespace(
+        multimodal_inputs=[
+            None,
+            types.SimpleNamespace(mrope_position_delta=torch.tensor([[20]])),
+            types.SimpleNamespace(mrope_position_delta=torch.tensor([[-3]])),
+        ],
+        spec_info=types.SimpleNamespace(
+            positions=positions, ragged_verify_layout=layout
+        ),
+    )
+    forward = ForwardBatch(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        batch_size=3,
+        input_ids=torch.zeros(num_tokens, dtype=torch.int64),
+        req_pool_indices=torch.arange(3),
+        seq_lens=torch.tensor([4, 5, 6]),
+        out_cache_loc=torch.arange(num_tokens),
+        seq_lens_sum=15,
+    )
+    forward.compute_spec_mrope_positions(
+        types.SimpleNamespace(device=torch.device("cpu")), batch
+    )
+    expected = positions + torch.tensor(expected_deltas)
+    torch.testing.assert_close(forward.mrope_positions, expected.repeat(3, 1))
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -101,6 +101,9 @@ class InsertParams:
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
+    # Prepare held the running request's state back from the tree; the request
+    # keeps its tracked checkpoint for a later insert.
+    mamba_checkpoint_deferred: bool = False
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
@@ -801,6 +804,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> tuple[int, Optional[int]]:
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(handle), None
+
+    def staged_storage_prefix_end(self, handle: CacheRequestHandle) -> int:
+        """Absolute end of a completed storage prefetch held outside the tree
+        until admission, or 0 when nothing is staged."""
+        return 0
+
+    def can_poll_prefetch_progress(self) -> bool:
+        """Whether poll_prefetch_progress may run before admission without
+        cutting a storage prefetch short."""
+        return False
 
     def ready_to_load_host_cache(self) -> Any:
         """

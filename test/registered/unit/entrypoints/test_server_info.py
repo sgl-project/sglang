@@ -231,12 +231,18 @@ class TestServerInfoTransportParity(CustomTestCase):
                 self.assertEqual(rust_launch.pop("max_total_num_tokens"), 2048)
                 self.assertEqual(rust_launch, leader)
 
-                # The Rust listener is HTTP/1 only, so it never advertises h2.
+                # The Rust listener serves h2c with --enable-http2, so it
+                # advertises it and its stream limit, which a router reads to
+                # pick its protocol.
                 scheduler.server_args = ServerArgs(
-                    model_path="dummy", page_size=64, enable_http2=True
+                    model_path="dummy",
+                    page_size=64,
+                    enable_http2=True,
+                    http2_max_concurrent_streams=64,
                 )
                 rust_launch = json.loads(rust_config._launch_server_info(scheduler))
-                self.assertIs(rust_launch["enable_http2"], False)
+                self.assertIs(rust_launch["enable_http2"], True)
+                self.assertEqual(rust_launch["http2_max_concurrent_streams"], 64)
 
                 with (
                     patch.object(

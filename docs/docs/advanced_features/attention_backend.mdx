@@ -459,6 +459,12 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default decode on Blackwell (BF16); default for FP8 on Blackwell (prefill + decode)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>prims_ts</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer Prims-TS sparse MLA on the <code>trtllm</code> route (same raw FP8 KV layout, no head padding); opt-in. SM100/SM103/SM107, D576 MLA, <code>--kv-cache-dtype fp8_e4m3</code>; <code>--dcp-size</code> &gt; 1 only with Kimi-K3.1's sharded index-K. Kimi-K3.1 needs it for both phases (an unset phase follows the set one); other models can pair it with <code>trtllm</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>tilelang</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>

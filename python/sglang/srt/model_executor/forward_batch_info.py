@@ -70,7 +70,10 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import (
+    async_h2d_stack,
+    is_pin_memory_available,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1538,7 +1541,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             for i in range(batch_size)
         ]
         token_deltas = spec_mrope_token_deltas(
-            deltas=torch.cat(mrope_deltas).to(device=device),
+            deltas=async_h2d_stack(mrope_deltas, device=device).reshape(-1),
             num_tokens=seq_positions.numel(),
             verify_lens=None if ragged_layout is None else ragged_layout.verify_lens,
         )

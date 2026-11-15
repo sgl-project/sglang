@@ -21,7 +21,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.communication.all_reduce_residual import _COMM_MAP
+from sglang.kernels.ops.communication.all_reduce_residual import get_comm
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -62,7 +62,7 @@ def _gemm_ag_op(
     c: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    _jit_module(world_size).run(_COMM_MAP[world_size], x, weight, b, c, out)
+    _jit_module(world_size).run(get_comm(world_size), x, weight, b, c, out)
 
 
 @register_custom_op(mutates_args=["out"])
@@ -73,7 +73,7 @@ def _gather_add3_op(
     c: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    _jit_module(world_size).gather(_COMM_MAP[world_size], local, b, c, out)
+    _jit_module(world_size).gather(get_comm(world_size), local, b, c, out)
 
 
 def gemm_ag_up_proj(

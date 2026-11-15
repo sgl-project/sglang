@@ -24,9 +24,13 @@ use crate::server::error::ApiError;
 use crate::server::routes::chat::{
     chat_completions, enforce_minimax_m31_thinking, MAX_CHAT_BODY_BYTES,
 };
-use crate::server::routes::tokenize::tokenizer_for;
+use crate::server::routes::tokenize::served_tokenizer;
 
-/// Upstream replies are buffered up to the same cap as requests.
+/// Cap on a buffered non-streaming upstream reply. Pinned to the compiled-in
+/// request default, not the configured request cap: a reply grows with the
+/// generated output, not with the prompt, so raising the request cap for large
+/// prompts should not raise per-reply memory, and lowering it should not start
+/// failing large replies.
 const MAX_REPLY_BYTES: usize = MAX_CHAT_BODY_BYTES;
 
 pub(crate) async fn messages(
@@ -34,7 +38,7 @@ pub(crate) async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    let prepared = off_worker::run(|| {
+    let prepared = off_worker::run_for_body(body.len(), || {
         let converted = parse(&body, false)?;
         let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
         Ok::<_, ApiError>((converted, chat_body))
@@ -55,12 +59,12 @@ pub(crate) async fn count_tokens(
     State(ctx): State<Arc<AppContext>>,
     body: Bytes,
 ) -> Response<Body> {
-    let mut converted = match off_worker::run(|| parse(&body, true)) {
+    let mut converted = match off_worker::run_for_body(body.len(), || parse(&body, true)) {
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
-    let model = ctx.config.model.served_name(&converted.echo.model);
-    if let Err(e) = tokenizer_for(&ctx, model) {
+    let model = ctx.config.model.id.as_str();
+    if let Err(e) = served_tokenizer(&ctx) {
         return adapt(e.into_response(), None).await;
     }
     if ctx.tokenizers.is_minimax_m31(model) {
@@ -127,8 +131,8 @@ async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Respo
         return Response::from_parts(parts, Body::from(bytes));
     };
     // A non-streaming reply can be as large as a request body.
-    off_worker::run(
-        || match serde_json::from_slice::<serde_json::Value>(&bytes) {
+    off_worker::run_for_body(bytes.len(), || {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(chat) => {
                 let body = serde_json::to_vec(&chat_to_message(&chat, &echo)).expect("serialize");
                 rebuild(parts, body)
@@ -141,8 +145,8 @@ async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Respo
                     anthropic::error_body(502, "upstream reply is not a valid chat completion"),
                 )
             }
-        },
-    )
+        }
+    })
 }
 
 /// The body limit rejects oversized requests before the handler runs; give

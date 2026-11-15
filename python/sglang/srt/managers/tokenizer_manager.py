@@ -1465,6 +1465,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
             self._validate_top_logprobs_num(obj)
+            self._validate_logprob_start_len(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1615,6 +1616,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError(
                 f"top_logprobs must be an integer in [0, {vocab_size}], "
                 f"got {top_logprobs_num!r}."
+            )
+
+    def _validate_logprob_start_len(self, obj: GenerateReqInput) -> None:
+        # -1 means output tokens only; a lower value slices the prompt from its
+        # end and fails an assert in the scheduler.
+        logprob_start_len = obj.logprob_start_len
+        if not obj.return_logprob or logprob_start_len is None:
+            return
+        if type(logprob_start_len) is not int or logprob_start_len < -1:
+            raise ValueError(
+                "logprob_start_len must be an integer >= -1, "
+                f"got {logprob_start_len!r}."
             )
 
     def _create_tokenized_object(
