@@ -238,8 +238,11 @@ class MambaComponent(TreeComponent):
         if src_index is None:
             # A source from an earlier match of an unadmitted request may have
             # been evicted and its slot reused since; never carry it over.
-            if params.req is not None:
-                params.req.kv.mamba_cow_src_index = None
+            req = params.req
+            if req is not None and req.kv.mamba_cow_src_index is not None:
+                req.kv.mamba_cow_src_index = None
+                # The slot kept from that match never received its copy.
+                req.kv.mamba_needs_clear = req.kv.holds_mamba
             return result
         req = params.req
         assert req is not None
