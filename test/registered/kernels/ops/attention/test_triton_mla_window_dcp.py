@@ -144,7 +144,7 @@ def _ring_shard(ring, keys, req_to_token, pool_idx, positions, rank, floors):
     of keys at DFlashDraftKVRing.locs, kept under the pool's DCP owner rule; rows
     below a request's floor hold another request's stale keys."""
     rows = draft_kv_ring_pool_rows(
-        req_pool_rows=req_to_token.shape[0],
+        req_to_token_rows=req_to_token.shape[0],
         rows_per_req=ring.rows_per_req,
         page_size=PAGE,
     )
@@ -192,9 +192,11 @@ def test_ring_rows_read_as_the_request_window():
             window_left=WINDOW_LEFT, block_size=Q_LEN, dcp_size=DCP
         ),
         dcp_size=DCP,
-        req_pool_rows=req_to_token.shape[0],
+        req_to_token_rows=req_to_token.shape[0],
         device="cuda",
         window_left=WINDOW_LEFT,
+        dcp_rank=0,
+        pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
     )
     # Prefix-cache hits must not read stale keys below the first extend.
     floors = [max(0, c - 37) for c in CONTEXTS]
