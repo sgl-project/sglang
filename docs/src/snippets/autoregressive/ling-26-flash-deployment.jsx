@@ -96,7 +96,7 @@ export const Ling26FlashDeployment = () => {
     cmd += `  --port \${PORT}`;
     if (yarn === 'enabled') {
       cmd += ` \\\n  --context-length 262144`;
-      cmd += ` \\\n  --json-model-override-args '{"rope_scaling": {"rope_type": "yarn", "factor": 2.0, "rope_theta": 6000000, "partial_rotary_factor": 0.5, "original_max_position_embeddings": 131072}}'`;
+      cmd += ` \\\n  --json-model-override-args '{"rope_parameters": {"rope_type": "yarn", "factor": 2.0, "rope_theta": 6000000, "partial_rotary_factor": 0.5, "original_max_position_embeddings": 131072}}'`;
     }
     if (toolcall === 'enabled') {
       cmd += ` \\\n  --tool-call-parser qwen25`;
