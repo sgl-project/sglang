@@ -9,7 +9,9 @@ import torch
 from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+    fused_qkv_gating_gdn_prefill,
     fused_qkv_split_gdn_prefill,
 )
 from sglang.srt.layers.attention.linear import gdn_backend
@@ -145,6 +147,204 @@ class TestGDNMISOutput(CustomTestCase):
     def test_fused_split_qk_norm_within_one_ulp_across_chunk_boundary(self):
         self._assert_fused_split_norm(num_tokens=198, allow_norm_ulp=True)
 
+    @torch.inference_mode()
+    def test_mapped_prepare_preserves_gate_rounding_and_strides(self):
+        for dtype, index_dtype in (
+            (torch.bfloat16, torch.int64),
+            (torch.float16, torch.int32),
+            (torch.float32, torch.int64),
+        ):
+            with self.subTest(dtype=dtype, index_dtype=index_dtype):
+                torch.manual_seed(55)
+                tokens, source_tokens, heads, dim = 19, 29, 5, 64
+                packed = torch.randn(
+                    tokens, (2 * 3 + heads) * dim, device="cuda", dtype=dtype
+                )
+                a = torch.randn(source_tokens, heads * 3, device="cuda", dtype=dtype)[
+                    :, ::3
+                ]
+                b = torch.randn(source_tokens, heads * 4, device="cuda", dtype=dtype)[
+                    :, 1::4
+                ]
+                a[0] = 40
+                a[1] = -40
+                A_log = torch.randn(heads * 2, device="cuda")[::2]
+                dt_bias = torch.randn(heads * 2, device="cuda", dtype=dtype)[::2]
+                indices = (
+                    torch.arange(tokens - 1, -1, -1, device="cuda")
+                    .to(index_dtype)
+                    .contiguous()
+                )
+                expected = fused_gdn_gating(
+                    A_log.contiguous(),
+                    a[indices],
+                    b[indices],
+                    dt_bias.contiguous(),
+                )
+                actual = fused_qkv_gating_gdn_prefill(
+                    packed,
+                    3,
+                    3,
+                    heads,
+                    dim,
+                    dim,
+                    dim,
+                    A_log=A_log,
+                    a=a,
+                    b=b,
+                    dt_bias=dt_bias,
+                    token_indices=indices,
+                )
+                for result, reference in zip(actual[3:], expected):
+                    torch.testing.assert_close(result, reference, rtol=0, atol=0)
+                    self.assertEqual(result.dtype, torch.float32)
+
+    @torch.inference_mode()
+    def test_mapped_prepare_preserves_large_gate_offsets(self):
+        """Mapped reads preserve valid gate offsets beyond signed int32."""
+        heads, row_stride = 2, 1 << 30
+        storage = torch.empty(
+            2 * row_stride + heads, device="cuda", dtype=torch.bfloat16
+        )
+        strided = torch.as_strided(storage, (3, heads), (row_stride, 1))
+        strided[2].fill_(0.5)
+        contiguous = torch.full((3, heads), -0.5, device="cuda", dtype=storage.dtype)
+        packed = torch.zeros(1, 384, device="cuda", dtype=storage.dtype)
+        A_log = torch.zeros(heads, device="cuda")
+        dt_bias = torch.zeros(heads, device="cuda", dtype=storage.dtype)
+        for index_dtype in (torch.int64, torch.int32):
+            for a, b in ((strided, contiguous), (contiguous, strided)):
+                with self.subTest(index_dtype=index_dtype, a_stride=a.stride(0)):
+                    indices = torch.tensor([2], device="cuda", dtype=index_dtype)
+                    expected = fused_gdn_gating(A_log, a[indices], b[indices], dt_bias)
+                    actual = fused_qkv_gating_gdn_prefill(
+                        packed,
+                        2,
+                        2,
+                        2,
+                        64,
+                        64,
+                        64,
+                        A_log=A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=dt_bias,
+                        token_indices=indices,
+                    )
+                    for result, reference in zip(actual[3:], expected):
+                        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_mapped_prepare_preserves_large_qkv_offsets(self):
+        """Compact token reads preserve valid QKV offsets beyond signed int32."""
+        row_stride = 1 << 30
+        storage = torch.empty(2 * row_stride + 384, device="cuda", dtype=torch.bfloat16)
+        packed = torch.as_strided(storage, (3, 384), (row_stride, 1))
+        for row in range(3):
+            packed[row].fill_(0.5)
+        gates = torch.full((3, 2), 0.5, device="cuda", dtype=storage.dtype)
+        parameters = dict(
+            A_log=torch.zeros(2, device="cuda"),
+            a=gates,
+            b=gates,
+            dt_bias=torch.zeros(2, device="cuda", dtype=storage.dtype),
+            token_indices=torch.arange(3, device="cuda"),
+        )
+        actual = fused_qkv_gating_gdn_prefill(packed, 2, 2, 2, 64, 64, 64, **parameters)
+        expected = fused_qkv_gating_gdn_prefill(
+            packed.contiguous(), 2, 2, 2, 64, 64, 64, **parameters
+        )
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_mapped_prepare_preserves_large_head_offsets(self):
+        """Strided gate heads and parameters preserve large element offsets."""
+        heads, stride = 3, 1 << 30
+        storage = torch.empty(2 * stride + 1, device="cuda")
+        strided = torch.as_strided(storage, (heads,), (stride,))
+        strided.fill_(0.5)
+        packed = torch.zeros(1, heads * 3 * 64, device="cuda", dtype=torch.bfloat16)
+        indices = torch.zeros(1, device="cuda", dtype=torch.int64)
+        for field in ("a", "b", "A_log", "dt_bias"):
+            with self.subTest(field=field):
+                values = dict(
+                    A_log=torch.zeros(heads, device="cuda"),
+                    dt_bias=torch.zeros(heads, device="cuda"),
+                    a=torch.zeros(1, heads, device="cuda"),
+                    b=torch.zeros(1, heads, device="cuda"),
+                )
+                values[field] = strided.unsqueeze(0) if field in ("a", "b") else strided
+                expected = fused_gdn_gating(
+                    values["A_log"].contiguous(),
+                    values["a"][indices],
+                    values["b"][indices],
+                    values["dt_bias"].contiguous(),
+                )
+                actual = fused_qkv_gating_gdn_prefill(
+                    packed,
+                    heads,
+                    heads,
+                    heads,
+                    64,
+                    64,
+                    64,
+                    **values,
+                    token_indices=indices,
+                )
+                for result, reference in zip(actual[3:], expected):
+                    torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_mapped_prepare_preserves_large_qkv_column_offsets(self):
+        """Strided QKV columns preserve offsets beyond signed int32."""
+        column_stride = 1 << 23
+        storage = torch.empty(
+            383 * column_stride + 1, device="cuda", dtype=torch.bfloat16
+        )
+        packed = torch.as_strided(storage, (1, 384), (1, column_stride))
+        packed.fill_(0.5)
+        gates = torch.zeros(1, 2, device="cuda", dtype=storage.dtype)
+        parameters = dict(
+            A_log=torch.zeros(2, device="cuda"),
+            a=gates,
+            b=gates,
+            dt_bias=torch.zeros(2, device="cuda", dtype=storage.dtype),
+            token_indices=torch.zeros(1, device="cuda", dtype=torch.int64),
+        )
+        for prepare in (
+            lambda tensor: fused_qkv_gating_gdn_prefill(
+                tensor, 2, 2, 2, 64, 64, 64, **parameters
+            ),
+            lambda tensor: fused_qkv_split_gdn_prefill(tensor, 2, 2, 2, 64, 64, 64),
+        ):
+            actual, expected = prepare(packed), prepare(packed.contiguous())
+            for result, reference in zip(actual, expected):
+                torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_prepare_rejects_malformed_gate_mapping(self):
+        packed = torch.empty(3, 384, device="cuda", dtype=torch.bfloat16)
+        a = torch.empty(5, 2, device="cuda", dtype=packed.dtype)
+        args = dict(
+            A_log=torch.zeros(2, device="cuda"),
+            a=a,
+            b=a,
+            dt_bias=torch.zeros(2, device="cuda"),
+            token_indices=torch.arange(3, device="cuda"),
+        )
+        for override in (
+            {"token_indices": torch.arange(2, device="cuda")},
+            {"token_indices": torch.arange(3, device="cuda").float()},
+            {"token_indices": torch.arange(6, device="cuda")[::2]},
+            {"token_indices": torch.arange(3)},
+        ):
+            with self.subTest(fields=tuple(override)):
+                with self.assertRaisesRegex(ValueError, "GDN preparation requires"):
+                    fused_qkv_gating_gdn_prefill(
+                        packed, 2, 2, 2, 64, 64, 64, **(args | override)
+                    )
+
     def _assert_within_ulp(self, actual, expected, max_ulp=1):
         self.assertTrue(bool(torch.isfinite(actual).all()))
         self.assertTrue(bool(torch.isfinite(expected).all()))
@@ -227,11 +427,29 @@ class TestGDNMISOutput(CustomTestCase):
 
     @torch.inference_mode()
     def test_mis_norm_composition_preserves_output_and_state(self):
+        self._assert_mis_composition(mapped_gating=False)
+
+    @torch.inference_mode()
+    def test_mis_mapped_gating_preserves_output_and_state(self):
+        self._assert_mis_composition(mapped_gating=True)
+
+    def _assert_mis_composition(self, *, mapped_gating):
         split = gdn_backend.fused_qkv_split_gdn_prefill
 
         def separate_norm(*args, normalize_qk=False):
             q, k, v = split(*args)
             return (l2norm_fwd(q), l2norm_fwd(k), v) if normalize_qk else (q, k, v)
+
+        def separate_prepare(*args, A_log, a, b, dt_bias, token_indices):
+            qkv = (
+                split(*args, normalize_qk=True)
+                if mapped_gating
+                else separate_norm(*args, normalize_qk=True)
+            )
+            return (
+                *qkv,
+                *fused_gdn_gating(A_log, a[token_indices], b[token_indices], dt_bias),
+            )
 
         for dtype in (torch.bfloat16, torch.float16):
             for query_len in (0, 5):
@@ -289,8 +507,14 @@ class TestGDNMISOutput(CustomTestCase):
                     inputs = torch.randn(
                         tokens + 3, channels, device="cuda", dtype=dtype
                     )
-                    a = torch.randn(tokens + 3, heads, device="cuda", dtype=dtype)
-                    b = torch.randn_like(a)
+                    if mapped_gating:
+                        gates = torch.randn(
+                            tokens + 3, heads * 2, device="cuda", dtype=dtype
+                        )
+                        a, b = gates.split(heads, dim=-1)
+                    else:
+                        a = torch.randn(tokens + 3, heads, device="cuda", dtype=dtype)
+                        b = torch.randn_like(a)
                     conv = torch.randn(6, channels, 3, device="cuda", dtype=dtype)
                     ssm = torch.randn(6, heads, dim, dim, device="cuda")
                     expected_conv, expected_ssm = conv.clone(), ssm.clone()
@@ -303,7 +527,9 @@ class TestGDNMISOutput(CustomTestCase):
                     )
                     with (
                         patch.object(
-                            gdn_backend, "fused_qkv_split_gdn_prefill", separate_norm
+                            gdn_backend,
+                            "fused_qkv_gating_gdn_prefill",
+                            separate_prepare,
                         ),
                         patch.object(
                             backend.kernel_dispatcher,
@@ -317,7 +543,7 @@ class TestGDNMISOutput(CustomTestCase):
                     actual = backend._forward_extend_mis(
                         **args, conv_states=conv, ssm_states=ssm
                     )
-                    if dtype == torch.bfloat16:
+                    if mapped_gating or dtype == torch.bfloat16:
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     else:
                         # Fused FP32 reductions can differ by one ULP and the
@@ -363,6 +589,9 @@ class TestGDNMISOutput(CustomTestCase):
                     dt_bias=torch.randn(heads, device="cuda", dtype=packed.dtype),
                 )
                 index = torch.tensor([0], device="cuda")
+                token_indices = torch.tensor([4, 0, 2], device="cuda")
+                a = torch.randn(tokens + 2, heads, device="cuda", dtype=packed.dtype)
+                b = torch.randn_like(a)
                 with (
                     patch.object(
                         gdn_backend,
@@ -375,8 +604,8 @@ class TestGDNMISOutput(CustomTestCase):
                     backend._forward_mis_segments(
                         layer=layer,
                         mixed_qkv=packed,
-                        a=torch.randn(tokens, heads, device="cuda", dtype=packed.dtype),
-                        b=torch.randn(tokens, heads, device="cuda", dtype=packed.dtype),
+                        a=a,
+                        b=b,
                         conv_states=torch.empty(
                             1, channels, 3, device="cuda", dtype=packed.dtype
                         ),
@@ -393,12 +622,20 @@ class TestGDNMISOutput(CustomTestCase):
                         ),
                         ssm_cache_indices=index,
                         inplace_update=True,
+                        output_indices=token_indices,
                     )
                 captured = backend.kernel_dispatcher.extend.call_args.kwargs
                 supported = (
                     cuda_split and channels <= gdn_backend.MAX_FUSED_QKV_SPLIT_DIM
                 )
                 self.assertIs(captured["use_qk_l2norm_in_kernel"], not supported)
+                expected_g, expected_beta = fused_gdn_gating(
+                    layer.A_log, a[token_indices], b[token_indices], layer.dt_bias
+                )
+                torch.testing.assert_close(captured["g"], expected_g, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    captured["beta"], expected_beta, rtol=0, atol=0
+                )
                 for field, unnormalized in zip(
                     ("q", "k"), packed.split(heads * dimension, -1)[:2]
                 ):
