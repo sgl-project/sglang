@@ -563,10 +563,10 @@ class TestPythonicDetector(unittest.TestCase):
     def test_reserved_kwarg_reverse_mapping_preserves_other_names_and_values(self):
         cases = [
             (
-                '[get_weather(from=1, from_pyreservedkw_=2, '
+                "[get_weather(from=1, from_pyreservedkw_=2, "
                 'from_pyreservedkw__pyreservedkw_=3, location="from=, in=, class=", '
                 'payload={"class": "in=", "from_pyreservedkw_": 4}, '
-                'enabled=True, missing=None)]',
+                "enabled=True, missing=None)]",
                 [
                     {
                         "from": 1,
@@ -598,9 +598,7 @@ class TestPythonicDetector(unittest.TestCase):
                     ):
                         text = content
                         if detector_type is Lfm2Detector:
-                            text = (
-                                "<|tool_call_start|>" + content + "<|tool_call_end|>"
-                            )
+                            text = "<|tool_call_start|>" + content + "<|tool_call_end|>"
                         detector = detector_type()
                         if streaming:
                             split = len(text) // 2
@@ -624,7 +622,7 @@ class TestPythonicDetector(unittest.TestCase):
 
     def test_reserved_kwarg_rewrite_leaves_nonkeyword_identifiers_unchanged(self):
         text = (
-            'from_pyreservedkw_(from=1, value=from_pyreservedkw_, '
+            "from_pyreservedkw_(from=1, value=from_pyreservedkw_, "
             'other=True, text="class=2")'
         )
         rewritten, renamed = rename_reserved_kwargs(text)

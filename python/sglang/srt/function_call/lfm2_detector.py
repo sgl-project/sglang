@@ -578,7 +578,9 @@ class Lfm2Detector(BaseFormatDetector):
                     if not salvaged:
                         raise
                     calls = []
-                    for call_index, (call, segment_renamed_kwargs) in enumerate(salvaged):
+                    for call_index, (call, segment_renamed_kwargs) in enumerate(
+                        salvaged
+                    ):
                         item = self._parse_pythonic_call(
                             call,
                             call_index,
