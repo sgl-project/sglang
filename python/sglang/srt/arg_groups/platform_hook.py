@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
+
+from packaging.version import Version
 
 from sglang.kernels.arch import current_arch
 from sglang.srt.arg_groups.model_override_base import (
@@ -28,6 +31,18 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import is_host_cpu_arm64
 
 logger = logging.getLogger(__name__)
+
+# oneCCL releases before this skip collectives recorded into torch.xpu.XPUGraph
+# (#45034). Drop the check once the torch XPU wheel requires oneCCL >= 2022.1.2.
+_XPU_GRAPH_MIN_ONECCL = Version("2022.1.2")
+
+
+def _pip_oneccl_version() -> Optional[Version]:
+    """oneCCL version of the pip wheel torch loads; None when oneCCL is not pip-installed."""
+    try:
+        return Version(importlib.metadata.version("oneccl"))
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def handle_hardware_runtime_validation(server_args: Any):
@@ -168,6 +183,28 @@ def handle_xpu_backends(server_args: Any):
                 cuda_graph_config=with_phase(
                     cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
                 ),
+            )
+
+        # oneCCL before 2022.1.2 skips all-reduce under torch.xpu.XPUGraph: on
+        # replay each rank keeps its own partial result, so a graph at TP > 1
+        # decodes garbage. Refuse explicit requests instead of serving it.
+        graph_requested = any(
+            (phase, "backend") in server_args._cuda_graph_config_locked
+            and phase_config.backend in (Backend.FULL, Backend.BREAKABLE)
+            for phase, phase_config in (
+                (Phase.DECODE, cfg.cuda_graph_config.decode),
+                (Phase.PREFILL, cfg.cuda_graph_config.prefill),
+            )
+        )
+        oneccl_version = (
+            _pip_oneccl_version() if cfg.tp_size > 1 and graph_requested else None
+        )
+        if oneccl_version is not None and oneccl_version < _XPU_GRAPH_MIN_ONECCL:
+            raise ValueError(
+                f"oneCCL {oneccl_version} skips all-reduce inside XPU graphs, so "
+                "--cuda-graph-backend-decode/--cuda-graph-backend-prefill give wrong "
+                f"output with --tp-size {cfg.tp_size}. Install "
+                f"oneccl>={_XPU_GRAPH_MIN_ONECCL} or use --tp-size 1."
             )
 
         # Prefill graph is also opt-in on XPU unless explicitly configured.
