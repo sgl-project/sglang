@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Dispatch mode: cuda | multimodal_gen | cpu | npu"
+        description: "Dispatch mode: cuda | multimodal_gen | cpu | npu | amd"
         required: true
         type: choice
         options:
@@ -13,6 +13,7 @@ on:
           - multimodal_gen
           - cpu
           - npu
+          - amd
       test_command:
         description: "Test command(s) to run, one per line (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
         required: true
@@ -38,7 +39,7 @@ on:
         type: string
         default: ""
       suite:
-        description: "Registered suite the files belong to (npu only)"
+        description: "Registered suite the files belong to (npu and amd only)"
         required: false
         type: string
         default: ""
@@ -105,6 +106,10 @@ jobs:
       image: ${{ steps.partition.outputs.image }}
       sgl_router: ${{ steps.partition.outputs.sgl_router }}
       collect_nightly_tests: ${{ steps.partition.outputs.collect_nightly_tests }}
+      # amd only (and sgl_router above): the setup-amd-ci inputs and container
+      # env of the suite's job in pr-test-amd.yml or pr-test-amd-extra.yml.
+      rocm_version: ${{ steps.partition.outputs.rocm_version }}
+      exec_env: ${{ steps.partition.outputs.exec_env }}
     steps:
       - name: Checkout partition script
         uses: actions/checkout@v4
@@ -129,12 +134,13 @@ jobs:
           SUITE: ${{ inputs.suite }}
         run: |
           python3 scripts/ci/partition_rerun_tests.py
-          # Fails for a suite no stage job runs, so only those names reach the
-          # stage's shell steps.
-          if [[ "$MODE" == "npu" ]]; then
+          # Fails for a suite no stage or setup-amd-ci job runs, so only those
+          # names reach the later shell steps. This checkout is github.sha, so
+          # the derived values come from the base branch's workflows.
+          if [[ "$MODE" == "npu" || "$MODE" == "amd" ]]; then
             python3 -c 'import yaml' 2>/dev/null ||
               python3 -m pip install --disable-pip-version-check pyyaml
-            python3 scripts/ci/npu_suites.py "$SUITE" >> "$GITHUB_OUTPUT"
+            python3 "scripts/ci/${MODE}_suites.py" "$SUITE" >> "$GITHUB_OUTPUT"
           fi
 
   rerun-test-cuda:
@@ -506,8 +512,103 @@ jobs:
       collect_nightly_tests: ${{ needs.prepare-partitions.outputs.collect_nightly_tests == 'true' }}
       sgl_router: ${{ needs.prepare-partitions.outputs.sgl_router == 'true' }}
 
+  # Runs each file directly, as rerun-test-cuda does, in the AMD CI container
+  # set up as the suite's job sets it up (scripts/ci/amd_suites.py).
+  rerun-test-amd:
+    name: rerun-test-amd (partition ${{ matrix.partition }})
+    needs: prepare-partitions
+    if: inputs.mode == 'amd'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
+    runs-on: ${{ inputs.runs_on }}
+    # The 60-minute Run test step plus the image pull and install.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      issues: write
+    env:
+      # Fork code runs on this runner, so a fork PR's rerun pulls anonymously.
+      DOCKERHUB_AMD_USERNAME: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_AMD_USERNAME || '' }}
+      DOCKERHUB_AMD_TOKEN: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_AMD_TOKEN || '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
+      - uses: ./.github/actions/check-maintenance
+
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ needs.prepare-partitions.outputs.rocm_version }}
+          sgl_router: ${{ needs.prepare-partitions.outputs.sgl_router }}
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
+          EXEC_ENV: ${{ needs.prepare-partitions.outputs.exec_env }}
+        run: |
+          read -ra kvs <<< "$EXEC_ENV"
+          exec_env=()
+          for kv in "${kvs[@]}"; do
+            exec_env+=(-e "$kv")
+          done
+          cmds=()
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            cmds+=("$cmd")
+          done <<< "$TEST_COMMAND"
+          total=${#cmds[@]}
+          failed=()
+          suite_start=$SECONDS
+          for idx in "${!cmds[@]}"; do
+            i=$((idx + 1))
+            cmd="${cmds[$idx]}"
+            echo ""
+            echo "."
+            echo "Begin ($i/$total): python3 $cmd"
+            echo "."
+            file_start=$SECONDS
+            if ! bash scripts/ci/amd/amd_ci_exec.sh "${exec_env[@]}" -w /sglang-checkout/test python3 $cmd -f; then
+              failed+=("$cmd")
+            fi
+            elapsed=$(( SECONDS - file_start ))
+            echo "."
+            echo "End ($i/$total): elapsed=${elapsed}s"
+            echo "."
+            echo ""
+          done
+          total_elapsed=$(( SECONDS - suite_start ))
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
+            printf '  %s\n' "${failed[@]}"
+            {
+              echo "### Failed tests (partition ${{ matrix.partition }})"
+              printf -- '- `%s`\n' "${failed[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "All $total test(s) passed in ${total_elapsed}s"
+
   write-back-result:
-    needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu, rerun-test-npu]
+    needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu, rerun-test-npu, rerun-test-amd]
     if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
     runs-on: ubuntu-latest
     permissions:
@@ -532,7 +633,8 @@ jobs:
           if [[ "${{ needs.rerun-test-cuda.result }}" == "success" \
              || "${{ needs.rerun-test-multimodal-gen.result }}" == "success" \
              || "${{ needs.rerun-test-cpu.result }}" == "success" \
-             || "${{ needs.rerun-test-npu.result }}" == "success" ]]; then
+             || "${{ needs.rerun-test-npu.result }}" == "success" \
+             || "${{ needs.rerun-test-amd.result }}" == "success" ]]; then
             STATUS=success
           else
             STATUS=failure
