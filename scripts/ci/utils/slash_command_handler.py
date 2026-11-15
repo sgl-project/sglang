@@ -31,6 +31,8 @@ PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regress
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 CHANGED_TESTS_FLAG = "--changed"
 CHANGED_TESTS_SHORT_FLAG = "-c"
+# Run the specs on their AMD registrations instead of CUDA/CPU.
+AMD_FLAG = "--amd"
 # CI selections: name -> workflow files and an optional opt-in label.
 # A null label selects existing workflows without a new hardware gate.
 # Resolved next to this script so it loads from any cwd;
@@ -1182,13 +1184,18 @@ def detect_suite(file_path_from_test):
     if labels:
         backends = ", ".join(labels)
         where = f" (suite `{suites[0]}`)" if suites else ""
+        if "AMD" in labels:
+            hint = f"add `{AMD_FLAG}` to rerun it on AMD."
+        else:
+            hint = (
+                f"rerun-test.yml has no {backends} job. Rerun it with "
+                f"/rerun-failed-ci, or dispatch the {backends} workflow manually."
+            )
         return [
             _dispatch_err(
                 suites[0] if suites else None,
                 f"`{full_path}` is registered for {backends}{where}, not for "
-                f"CUDA or CPU; rerun-test.yml has no {backends} job. Rerun it "
-                f"with /rerun-failed-ci, or dispatch the {backends} workflow "
-                f"manually.",
+                f"CUDA or CPU; {hint}",
             )
         ]
 
@@ -1201,7 +1208,7 @@ def detect_suite(file_path_from_test):
     ]
 
 
-def _resolve_test_spec(test_spec):
+def _resolve_test_spec(test_spec, run_on_amd=False):
     """
     Resolve a single test spec into one or more dispatch entries.
 
@@ -1224,6 +1231,8 @@ def _resolve_test_spec(test_spec):
     if err:
         return [{"spec": test_spec, "error": err}]
 
+    if is_multimodal and run_on_amd:
+        return [{"spec": test_spec, "error": "multimodal_gen tests run on NV only."}]
     if is_multimodal:
         runner_label, err = detect_multimodal_suite(resolved_path)
         if err:
@@ -1256,6 +1265,8 @@ def _resolve_test_spec(test_spec):
     test_command = resolved_path
     if test_selector:
         test_command = f"{resolved_path} {test_selector}"
+    if run_on_amd:
+        return _resolve_amd_entries(test_spec, resolved_path, test_command)
 
     out = []
     for info in detect_suite(resolved_path):
@@ -1282,6 +1293,46 @@ def _resolve_test_spec(test_spec):
             "error": None,
         }
         err = _too_long_for_rerun(entry, f"test/{resolved_path}")
+        out.append({"spec": test_spec, "error": err} if err else entry)
+    return out
+
+
+def _resolve_amd_entries(test_spec, resolved_path, test_command):
+    """One entry per AMD runner the file is registered on (AMD_SUITE_RUNNERS)."""
+    full_path = f"test/{resolved_path}"
+    suites = _partition.amd_suites(Path(full_path))
+    if not suites:
+        return [
+            {
+                "spec": test_spec,
+                "error": f"`{full_path}` is not registered for AMD.",
+                "not_on_amd": True,
+            }
+        ]
+    out = []
+    for suite in dict.fromkeys(suites):
+        runs_on = _partition.AMD_SUITE_RUNNERS.get(suite)
+        if runs_on is None:
+            out.append(
+                {
+                    "spec": test_spec,
+                    "error": f"AMD suite `{suite}` of `{full_path}` is not "
+                    "dispatchable via /rerun-test (only per-commit and extra AMD "
+                    "suites are); run it through its own AMD workflow.",
+                }
+            )
+            continue
+        entry = {
+            "spec": test_spec,
+            "test_command": test_command,
+            "mode": "amd",
+            "runs_on": runs_on,
+            "install_script": "",
+            "install_timeout": "",
+            "rdma_devices": "",
+            "error": None,
+        }
+        err = _too_long_for_rerun(entry, full_path)
         out.append({"spec": test_spec, "error": err} if err else entry)
     return out
 
@@ -1475,6 +1526,8 @@ def handle_rerun_test(
     command_label=None,
     refresh_precision_baseline=False,
     include_changed_tests=False,
+    run_on_amd=False,
+    expanded_from_group=False,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
@@ -1503,7 +1556,8 @@ def handle_rerun_test(
             "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching "
             "file; wrap the pattern in backticks so GitHub keeps the `*` literal)\n"
             f"- `/rerun-test {CHANGED_TESTS_FLAG}` (or `{CHANGED_TESTS_SHORT_FLAG}`; "
-            "every test file this PR adds or modifies)"
+            "every test file this PR adds or modifies)\n"
+            f"- `/rerun-test {AMD_FLAG} test_srt_endpoint.py` (on AMD runners)"
         )
         return False
 
@@ -1523,6 +1577,12 @@ def handle_rerun_test(
             )
             return False
         test_specs = list(test_specs or []) + changed
+    else:
+        changed = []
+    # Files a group, glob or --changed selected rather than ones the user named;
+    # on --amd, those without an AMD registration are summarized, not each a ⛔.
+    bulk_selected = set(changed) | (set(test_specs) if expanded_from_group else set())
+    not_on_amd = []
 
     # Phase 0: Expand wildcard specs into concrete test files. A spec whose
     # file part contains a glob metacharacter (* ? [) expands to every
@@ -1563,6 +1623,7 @@ def handle_rerun_test(
             _record_failure(spec, err)
             continue
         expanded_specs.extend(matched)
+        bulk_selected.update(matched)
 
     # Phase 1: Resolve all specs, de-duping by the *resolved* identity. A glob
     # expands to `test/`-prefixed paths while an explicit spec keeps the form
@@ -1574,7 +1635,10 @@ def handle_rerun_test(
     resolved = []
     seen_commands = set()
     for spec in expanded_specs:
-        for r in _resolve_test_spec(spec):
+        for r in _resolve_test_spec(spec, run_on_amd):
+            if r.get("not_on_amd") and spec in bulk_selected:
+                not_on_amd.append(spec)
+                continue
             if r.get("error"):
                 _record_failure(r["spec"], r["error"])
                 continue
@@ -1669,12 +1733,21 @@ def handle_rerun_test(
     for r in resolve_failures:
         lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
+    if not_on_amd:
+        lines.append(
+            f"<details><summary>ℹ️ Skipped {len(not_on_amd)} selected "
+            f"file{'s' if len(not_on_amd) > 1 else ''} with no `register_amd_ci`"
+            "</summary>\n\n"
+            + "\n".join(f"- `{s}`" for s in sorted(not_on_amd))
+            + "\n</details>"
+        )
+
     body = "\n\n".join(lines)
 
     successes = [dr for dr in dispatch_results if dr["success"]]
     if successes:
         comment.create_reaction("+1")
-    if not successes and (resolve_failures or dispatch_results):
+    if not successes and (resolve_failures or dispatch_results or not_on_amd):
         comment.create_reaction("confused")
 
     reply_comment.edit(body)
@@ -1682,7 +1755,14 @@ def handle_rerun_test(
 
 
 def handle_rerun_group(
-    gh_repo, pr, comment, user_perms, group_names, token, command_label=None
+    gh_repo,
+    pr,
+    comment,
+    user_perms,
+    group_names,
+    token,
+    command_label=None,
+    run_on_amd=False,
 ):
     """
     Handles the /rerun-group command. Expands one or more registered test
@@ -1731,6 +1811,8 @@ def handle_rerun_group(
         token,
         skip_permission_check=True,
         command_label=command_label,
+        run_on_amd=run_on_amd,
+        expanded_from_group=True,
     )
 
 
@@ -2072,7 +2154,8 @@ def main():
             print("Combined command finished, but no actions were taken.")
 
     elif first_line.startswith("/rerun-group"):
-        group_names = first_line.split()[1:]
+        group_args = first_line.split()[1:]
+        group_names = [arg for arg in group_args if arg != AMD_FLAG]
         handle_rerun_group(
             repo,
             pr,
@@ -2081,6 +2164,7 @@ def main():
             group_names or None,
             token,
             command_label=first_line,
+            run_on_amd=AMD_FLAG in group_args,
         )
 
     elif first_line.startswith("/rerun-test"):
@@ -2088,7 +2172,7 @@ def main():
         refresh_precision_baseline = PRECISION_BASELINE_REFRESH_FLAG in rerun_args
         changed_flags = {CHANGED_TESTS_FLAG, CHANGED_TESTS_SHORT_FLAG}
         include_changed_tests = bool(changed_flags & set(rerun_args))
-        flags = changed_flags | {PRECISION_BASELINE_REFRESH_FLAG}
+        flags = changed_flags | {PRECISION_BASELINE_REFRESH_FLAG, AMD_FLAG}
         test_specs = [arg for arg in rerun_args if arg not in flags]
         handle_rerun_test(
             repo,
@@ -2100,6 +2184,7 @@ def main():
             command_label=first_line,
             refresh_precision_baseline=refresh_precision_baseline,
             include_changed_tests=include_changed_tests,
+            run_on_amd=AMD_FLAG in rerun_args,
         )
 
     else:
