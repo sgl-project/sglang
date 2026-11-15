@@ -324,8 +324,14 @@ struct Job {
     polls: u64,
 }
 impl Job {
+    fn never_submitted(&self) -> bool {
+        // A release resets submission state for its new message, but the
+        // original PIN may still protect the worker's cache.
+        !self.releasing_pin && !self.attempted && !self.submitted
+    }
+
     fn needs_first_submission(&self) -> bool {
-        !self.releasing_pin && !self.attempted && !self.submitted && !self.quiescent
+        self.never_submitted() && !self.quiescent
     }
 
     fn has_terminal_result(&self) -> bool {
@@ -853,7 +859,7 @@ impl Actor {
         self.busy.get(&job.url).and_then(Option::as_ref) != Some(&job.id)
             && job.quiescent
             && (job.action != "sglang.pin"
-                || !job.attempted
+                || job.never_submitted()
                 || !self.book.job(&job.id).is_some_and(|b| b.cancel_requested)
                 || self.shares_live_claim(job))
     }
@@ -1695,7 +1701,7 @@ impl WorkerPoll {
         cancel: bool,
         request_only: bool,
     ) -> Result<(), String> {
-        if !job.submitted && !job.attempted && cancel {
+        if cancel && job.never_submitted() {
             job.quiescent = true;
             return Ok(());
         }
@@ -1758,7 +1764,7 @@ impl WorkerPoll {
             job.caps.clone()
         };
         if !job.submitted {
-            if !job.attempted && !job.releasing_pin && Instant::now() >= job.deadline {
+            if job.never_submitted() && Instant::now() >= job.deadline {
                 job.quiescent = true;
                 return Err("expired before submission".into());
             }

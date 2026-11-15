@@ -1217,6 +1217,38 @@ async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task
             .is_none()));
 }
 
+#[tokio::test]
+async fn pin_cancel_retries_release_after_worker_refresh_fails() {
+    let engine = Engine::start().await;
+    let mut cfg = orchestration();
+    cfg.poll_ms = cfg.operation_ttl_ms;
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "task").await;
+    api(&router,json!({"kind":"submit","task":task("task"),"message_id":"keep","action":"sglang.pin","target":prefix(vec![1,2,3,4]),
+        "location":{"tier":"host"},"mode":"acquire","claim_id":"keep","revision":1,"priority":1})).await;
+    let view = query(&router, "task", "keep").await;
+    assert_eq!(view["operations"][0]["claim"]["state"], "active");
+
+    engine.state.lock().unwrap().fail_capabilities = true;
+    api(
+        &router,
+        json!({"kind":"cancel","task":task("task"),"message_id":"keep"}),
+    )
+    .await;
+    for _ in 0..3 {
+        let view = query(&router, "task", "keep").await;
+        assert_eq!(view["quiescent"], false, "{view}");
+    }
+    {
+        let mut state = engine.state.lock().unwrap();
+        assert!(state.claims.values().any(|c| c["state"] == "active"));
+        state.fail_capabilities = false;
+    }
+    let view = query(&router, "task", "keep").await;
+    assert_eq!(view["operations"][0]["claim"]["state"], "released");
+    acknowledge_drained_pin(&engine, &router).await;
+}
+
 async fn acknowledge_drained_pin(engine: &Engine, router: &TestRouter) {
     let delayed = Arc::new(DelayedQuery::default());
     {
