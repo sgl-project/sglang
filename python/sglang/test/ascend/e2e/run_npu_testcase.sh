@@ -31,6 +31,23 @@ echo "===== Install kubernetes - End ====="
 
 PYTHON_FOR_SGLANG="python"
 PIP_FOR_SGLANG="pip"
+
+# The pods run the checked-out sglang (see PYTHONPATH below) on top of the
+# image's site-packages, so an image built before a dependency was added to
+# python/pyproject_npu.toml dies at import time on that dependency. blake3
+# (#47120) is imported by srt/multimodal/cache/digest.py via
+# managers/schedule_batch.py, i.e. on every server start, so a stale image such
+# as cann9.1.0-a3-B106 fails every e2e case with
+# "ModuleNotFoundError: No module named 'blake3'" before any test runs.
+echo "===== Install checkout runtime dependencies - Begin ====="
+if ${PYTHON_FOR_SGLANG} -c "import blake3" >/dev/null 2>&1; then
+  echo "blake3 is already available in the image."
+else
+  echo "blake3 is missing from the image, install it online."
+  ${PIP_FOR_SGLANG} install blake3 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+fi
+echo "===== Install checkout runtime dependencies - End ====="
+
 if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
   echo "===== Install transformers for sglang - Begin ====="
   TRANSFORMERS_PKG_PATH_SOURCE=/root/.cache/.cache/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
