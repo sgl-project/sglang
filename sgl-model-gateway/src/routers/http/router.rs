@@ -297,7 +297,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard = ["cache_aware", "manual"]
+        let load_guard = ["cache_aware", "manual", "power_of_two"]
             .contains(&policy.name())
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
