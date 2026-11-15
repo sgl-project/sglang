@@ -8,9 +8,11 @@ the chain kernel -- which indexes ``q`` by target token id -- can read it.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
+import sglang.srt.speculative.eagle_worker_v2 as eagle_worker_v2
 from sglang.srt.environ import envs
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_utils import scatter_draft_probs_to_target_vocab
@@ -125,6 +127,68 @@ class TestScatterDraftProbsToTargetVocab(CustomTestCase):
         self.assertLess(float((empirical - p).abs().max()), 4 * float(standard_error))
 
 
+class TestVerifyDraftProbsVocabularyMapping(CustomTestCase):
+    def test_full_width_permutation_is_scattered(self):
+        """A full-width permutation must not take the identity-map fast path."""
+        worker = object.__new__(EagleDraftWorker)
+        worker.hot_token_id = torch.tensor([1, 0, 2, 3], dtype=torch.int64)
+        worker.target_vocab_size = 4
+        worker.draft_probs_need_vocab_scatter = not torch.equal(
+            worker.hot_token_id,
+            torch.arange(
+                worker.hot_token_id.numel(), device=worker.hot_token_id.device
+            ),
+        )
+        rows = [torch.rand(2, 4) for _ in range(3)]
+        tokens = worker.hot_token_id[torch.tensor([[0, 1, 2], [1, 2, 3]])]
+
+        out = worker._build_verify_draft_probs(rows, tokens)
+
+        expected = torch.stack(rows, dim=1).scatter(
+            -1,
+            worker.hot_token_id.view(1, 1, -1).expand(2, 3, -1),
+            torch.stack(rows, dim=1),
+        )
+        torch.testing.assert_close(out, expected)
+
+    def test_full_width_identity_map_returns_stacked_distribution(self):
+        """Identity maps must not allocate and scatter a duplicate q tensor."""
+        worker = object.__new__(EagleDraftWorker)
+        worker.hot_token_id = torch.arange(4, dtype=torch.int64)
+        worker.target_vocab_size = 4
+        worker.draft_probs_need_vocab_scatter = not torch.equal(
+            worker.hot_token_id,
+            torch.arange(
+                worker.hot_token_id.numel(), device=worker.hot_token_id.device
+            ),
+        )
+        rows = [torch.rand(2, 4) for _ in range(3)]
+        tokens = torch.tensor([[0, 1, 2], [1, 2, 3]])
+
+        with patch.object(
+            eagle_worker_v2,
+            "scatter_draft_probs_to_target_vocab",
+            side_effect=AssertionError("identity map must not be scattered"),
+        ):
+            out = worker._build_verify_draft_probs(rows, tokens)
+
+        torch.testing.assert_close(out, torch.stack(rows, dim=1))
+
+    def test_chain_rows_keep_step_order(self):
+        """Distinct per-step distributions must stay aligned with their tokens."""
+        worker = object.__new__(EagleDraftWorker)
+        worker.hot_token_id = torch.arange(4, dtype=torch.int64)
+        worker.target_vocab_size = 4
+        worker.draft_probs_need_vocab_scatter = False
+        rows = [torch.full((2, 4), i + 1, dtype=torch.float32) for i in range(3)]
+
+        out = worker._build_verify_draft_probs(
+            rows, torch.tensor([[0, 1, 2], [1, 2, 3]])
+        )
+
+        self.assertEqual(out[0, :, 0].tolist(), [1.0, 2.0, 3.0])
+
+
 class TestVerifyDraftProbsAssert(CustomTestCase):
     """The ``q > 0`` probe in ``_build_verify_draft_probs`` under async asserts."""
 
@@ -132,8 +196,12 @@ class TestVerifyDraftProbsAssert(CustomTestCase):
         self.worker = object.__new__(EagleDraftWorker)
         self.worker.hot_token_id = torch.tensor([1, 3, 4, 9, 15], dtype=torch.int64)
         self.worker.target_vocab_size = 16
+        self.worker.draft_probs_need_vocab_scatter = True
         # Two requests, three chain slots; slot i's token is drawn from row i.
-        self.rows = [torch.full((2, 5), 0.2) for _ in range(3)]
+        # Distinct rows make a row permutation detectable.
+        self.rows = [
+            torch.full((2, 5), (i + 1) / 5, dtype=torch.float32) for i in range(3)
+        ]
         self.draft_tokens = self.worker.hot_token_id[
             torch.tensor([[0, 2, 4], [1, 3, 0]])
         ]

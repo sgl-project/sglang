@@ -260,6 +260,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+        self.draft_probs_need_vocab_scatter = (
+            self.hot_token_id is not None
+            and not torch.equal(
+                self.hot_token_id,
+                torch.arange(
+                    self.hot_token_id.numel(), device=self.hot_token_id.device
+                ),
+            )
+        )
 
         if get_spec().speculative_use_rejection_sampling:
             self.target_vocab_size = self.target_worker.model_config.vocab_size
@@ -956,7 +965,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if draft_probs_list is None:
             return None
         draft_probs = torch.stack(draft_probs_list, dim=1)
-        if self.hot_token_id is None:
+        if not self.draft_probs_need_vocab_scatter:
             return draft_probs
         draft_probs = scatter_draft_probs_to_target_vocab(
             draft_probs, self.hot_token_id, self.target_vocab_size
