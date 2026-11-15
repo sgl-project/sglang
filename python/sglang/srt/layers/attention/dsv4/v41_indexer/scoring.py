@@ -4,6 +4,7 @@ a selection back into pool slots."""
 
 from __future__ import annotations
 
+import functools
 import itertools
 from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 
@@ -22,12 +23,17 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_paged,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
-from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    FLAT_LOGITS_WIDTH_ALIGN,
+    flat_index_logits_rows_per_tile,
+    flat_index_logits_tiles,
+)
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import async_h2d
 
 from .types import DecodeInputs, PrefillInputs, RowShard
@@ -297,11 +303,87 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
     )
 
 
+# A block 19 or more binades below its vector's largest rounds to zero in e4m3,
+# so the table stops there.
+_FP4_TO_FP8_SHIFTS = 20
+
+
+@functools.cache
+def _fp4_byte_to_fp8_pair(device: torch.device) -> torch.Tensor:
+    """[shift * 256 + byte] int16: the two e4m3 codes of a packed fp4 byte, low
+    nibble first, scaled by 2**(6 - shift)."""
+    from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
+    byte = torch.arange(256)
+    pair = DSV4_DEQUANT_FP4_TABLE[torch.stack([byte & 15, byte >> 4], dim=-1)]
+    scale = torch.exp2(6.0 - torch.arange(_FP4_TO_FP8_SHIFTS, dtype=torch.float32))
+    e4m3 = (scale[:, None, None] * pair).to(torch.float8_e4m3fn)
+    return e4m3.view(torch.int16).flatten().to(device)
+
+
+def widen_fp4_to_fp8(
+    payload: torch.Tensor, scales: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp4 vectors (``payload`` [..., 64] int8, ``scales`` [...] int32 of four packed
+    ue8m0 block exponents) as e4m3 [..., 128] times an fp32 [...] scale. Exact while
+    every block is within 14 binades of the vector's largest: e4m3 has 2**6
+    headroom over fp4's 6 and subnormals down to 2**-9."""
+    exponents = scales.unsqueeze(-1).view(torch.uint8).int()
+    top = exponents.amax(-1, keepdim=True)
+    shifts = (top - exponents).clamp_max(_FP4_TO_FP8_SHIFTS - 1)
+    # The table entry of each byte: its block's shift, then the byte itself.
+    index = payload.view(torch.uint8).unflatten(-1, (4, 16)) + shifts[..., None] * 256
+    pairs = _fp4_byte_to_fp8_pair(payload.device).index_select(0, index.flatten())
+    fp8 = pairs.view(payload.shape).view(torch.float8_e4m3fn)
+    # fp32 bits of 2**(top - 127 - 6); quantizers floor block exponents far above 6.
+    return fp8, ((top.squeeze(-1) - 6) << 23).view(torch.float32)
+
+
+def _sm90_score_tiles(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+) -> Generator[Tuple[slice, torch.Tensor], None, None]:
+    """``flat_index_logits_tiles`` on Hopper: fp32 logits of the operands widened
+    to e4m3, with the query scale folded into the head weights."""
+    from deep_gemm import fp8_mqa_logits
+
+    rows = data.num_rows
+    width = ceil_align(max(data.lens_per_request, default=0), FLAT_LOGITS_WIDTH_ALIGN)
+    if rows == 0 or width == 0:
+        return
+    k = widen_fp4_to_fp8(*kv)
+    rows_per_tile = flat_index_logits_rows_per_tile(
+        rows,
+        width,
+        heads=data.q_fp4.shape[1],
+        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+    )
+    for offset in range(0, rows, rows_per_tile):
+        tile = slice(offset, min(offset + rows_per_tile, rows))
+        q, q_scale = widen_fp4_to_fp8(data.q_fp4[tile], data.q_sf[tile])
+        starts = data.request_starts[tile]
+        yield (
+            tile,
+            fp8_mqa_logits(
+                q,
+                k,
+                data.weights[tile] * q_scale,
+                starts,
+                starts + data.compress_lens[tile],
+                clean_logits=False,
+                max_seqlen_k=width,
+            ),
+        )
+
+
 def score_tiles(
     data: DeepGEMMPrefillData,
     kv: Tuple[torch.Tensor, torch.Tensor],
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
     """Score tiles whose row slices are relative to this data's query-row view."""
+    if get_platform().is_sm90:
+        yield from _sm90_score_tiles(data, kv)
+        return
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
