@@ -1503,9 +1503,9 @@ class Scheduler(
         # A DP peer below prefill_decode_interval_min_bs does not defer and runs
         # the delayer's all-gather; join it with nothing to prefill.
         if (
-            self.prefill_delayer is None
-            or not self.require_mlp_sync
+            not self.require_mlp_sync
             or self.prefill_decode_interval_min_bs == 0
+            or self.prefill_delayer is None
         ):
             return
         PrefillDelayerSinglePassExecutor(
