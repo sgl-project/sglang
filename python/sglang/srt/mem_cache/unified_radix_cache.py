@@ -2686,8 +2686,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices[: insert_result.prefix_len]
             )
             loaded_from_storage = completed_tokens - insert_result.prefix_len
+            # A concurrent publication can already cover the entire result.
+            # Keep its resident pages until this request is admitted.
             if (
-                loaded_from_storage > 0
+                completed_tokens > 0
                 and on_publish is None
                 and hasattr(operation, "control_prefix")
                 and self.prefetch_stop_policy == "wait_complete"

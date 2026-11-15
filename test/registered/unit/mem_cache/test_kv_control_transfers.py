@@ -1394,6 +1394,49 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 assert_retired(cache, service)
                 cache.sanity_check()
 
+    def test_ordinary_restore_retains_an_already_published_host_prefix(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True, write_policy="write_through") as owner:
+            _, cache, service, _ = owner
+            target = cache_fixtures.target()
+            self._cold_scopes(owner, [target])
+            first = CacheRequestHandle("first-restore", 0)
+            second = CacheRequestHandle("overlapping-restore", 0)
+            reads = service.control.executor.storage_reads
+            try:
+                with (
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    patch.object(cache.cache_controller, "prefetch_capacity_limit", 16),
+                    # Exercise two already-issued reads, independent of coalescing.
+                    patch.object(reads, "join_demand", return_value=False),
+                ):
+                    self._ordinary_prefetch(cache, service, target, first)
+                    self._ordinary_prefetch(cache, service, target, second)
+
+                    def published():
+                        cache.drain_storage_control_queues()
+                        return all(
+                            req not in cache.ongoing_prefetch for req in (first, second)
+                        )
+
+                    wait_for(service, published)
+                    self.assertEqual(cache.pop_prefetch_loaded_span(first), (4, 0))
+                    self.assertEqual(cache.pop_prefetch_loaded_span(second), (0, None))
+                    self.assertEqual(reads.snapshot()["admission_held_tokens"], 4)
+
+                    cache.finish_storage_prefetch_admission(first, 4, None)
+                    # The second request still needs the same resident pages.
+                    self.assertEqual(cache.evict_host(4), 0)
+                    cache.release_aborted_request(second)
+                    self.assertEqual(cache.evict_host(4), 4)
+            finally:
+                cache.release_aborted_request(first)
+                cache.release_aborted_request(second)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def test_admission_budget_counts_shared_host_prefix_once(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
