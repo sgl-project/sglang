@@ -17,6 +17,7 @@ from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     SGL_ROUTER_REQUEST_TIMEOUT_SECS,
     find_sgl_router_binary,
+    sgl_router_command,
 )
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 
@@ -394,6 +395,14 @@ def _get_nnodes_from_args(args_list):
     return None
 
 
+def _is_instance_head(pod_index, is_multi_node_instance, nnodes):
+    if not is_multi_node_instance:
+        return True
+    if nnodes is not None and nnodes >= 1:
+        return pod_index % nnodes == 0
+    return pod_index == 0
+
+
 def _get_served_model_name(model_config):
     args = model_config["prefill_args"]
     if "--served-model-name" in args:
@@ -707,19 +716,12 @@ def launch_router(model_config, router_binary):
     prefill_url = []
     decode_url = []
     node_ip_list = []
-    is_multi_node_prefill_instance = "--node-rank" not in model_config["prefill_args"]
-    is_multi_node_decode_instance = "--node-rank" not in model_config["decode_args"]
-
-    prefill_nnodes = (
-        _get_nnodes_from_args(model_config["prefill_args"])
-        if is_multi_node_prefill_instance
-        else None
-    )
-    decode_nnodes = (
-        _get_nnodes_from_args(model_config["decode_args"])
-        if is_multi_node_decode_instance
-        else None
-    )
+    roles = []
+    for role, urls in (("prefill", prefill_url), ("decode", decode_url)):
+        args = model_config[f"{role}_args"]
+        is_multi_node_instance = "--node-rank" not in args
+        nnodes = _get_nnodes_from_args(args) if is_multi_node_instance else None
+        roles.append((role, urls, is_multi_node_instance, nnodes))
 
     is_ready = False
     start_time = time.time()
@@ -745,38 +747,11 @@ def launch_router(model_config, router_binary):
                 continue
             pod_index = int(last_part)
 
-            if "prefill" in pod_name:
-                if is_multi_node_prefill_instance:
-                    if prefill_nnodes is not None and prefill_nnodes > 1:
-                        if pod_index % prefill_nnodes == 0:
-                            prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                    elif prefill_nnodes is not None and prefill_nnodes == 1:
-                        prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                        node_ip_list.append(pod_ip)
-                    else:
-                        if pod_index == 0:
-                            prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                else:
-                    prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                    node_ip_list.append(pod_ip)
-
-            if "decode" in pod_name:
-                if is_multi_node_decode_instance:
-                    if decode_nnodes is not None and decode_nnodes > 1:
-                        if pod_index % decode_nnodes == 0:
-                            decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                    elif decode_nnodes is not None and decode_nnodes == 1:
-                        decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                        node_ip_list.append(pod_ip)
-                    else:
-                        if pod_index == 0:
-                            decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                else:
-                    decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
+            for role, urls, is_multi_node_instance, nnodes in roles:
+                if role in pod_name and _is_instance_head(
+                    pod_index, is_multi_node_instance, nnodes
+                ):
+                    urls.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
                     node_ip_list.append(pod_ip)
 
         if prefill_url and decode_url:
@@ -804,29 +779,20 @@ def launch_router(model_config, router_binary):
     set_environment_variables(model_config.get("router_envs"))
 
     router_args = [str(x) for x in model_config["router_args"]]
-    if "--request-timeout-secs" not in router_args:
-        router_args += ["--request-timeout-secs", str(SGL_ROUTER_REQUEST_TIMEOUT_SECS)]
-    request_timeout_secs = router_args[router_args.index("--request-timeout-secs") + 1]
-    # The router reads each worker's PD role and bootstrap port from its
-    # /server_info, so prefill and decode URLs go in one list.
-    router_command = [
+    request_timeout_secs = SGL_ROUTER_REQUEST_TIMEOUT_SECS
+    if "--request-timeout-secs" in router_args:
+        i = router_args.index("--request-timeout-secs")
+        request_timeout_secs = router_args[i + 1]
+        del router_args[i : i + 2]
+    router_command = sgl_router_command(
         router_binary,
-        "--model-id",
         _get_served_model_name(model_config),
-        "--worker-urls",
-        *[f"http://{url}" for url in prefill_url + decode_url],
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(SERVICE_PORT),
-        # Workers tokenize and render chat themselves.
-        "--no-tokenizer",
-        # The stale-request reaper (600s by default) would cut a request the
-        # request timeout still allows.
-        "--stale-request-timeout-secs",
-        request_timeout_secs,
-        *router_args,
-    ]
+        [f"http://{url}" for url in prefill_url + decode_url],
+        host="0.0.0.0",
+        port=SERVICE_PORT,
+        request_timeout_secs=request_timeout_secs,
+        extra_args=router_args,
+    )
 
     logger.info(f"Starting router with command: {' '.join(router_command)}")
     try:
@@ -834,6 +800,24 @@ def launch_router(model_config, router_binary):
         logger.info(f"Router process started with PID: {router_process.pid}")
     except Exception as e:
         raise RuntimeError(f"Failed to start router process: {e}")
+
+
+def start_router_thread(model_config, base_url):
+    logger.info(f"Starting router in thread...")
+    # Looked up here so a missing binary fails the test, not the daemon thread.
+    router_binary = find_sgl_router_binary()
+    router_thread = threading.Thread(
+        target=launch_router, args=(model_config, router_binary)
+    )
+    router_thread.daemon = True
+    router_thread.start()
+
+    # /health answers once the router listens; /readiness waits for the
+    # prefill and decode workers to be registered.
+    health_check_url = f"{base_url}/readiness"
+    logger.info(f"Waiting for router to be ready at {health_check_url}")
+    wait_server_ready(health_check_url)
+    return router_thread
 
 
 def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
@@ -1009,19 +993,7 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["router"])
     def start_router_server(cls):
-        logger.info(f"Starting router in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_router,
-            args=(cls.model_config, find_sgl_router_binary()),
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-
-        # /health answers once the router listens; /readiness waits for the
-        # prefill and decode workers to be registered.
-        health_check_url = f"{cls.base_url}/readiness"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
+        cls.sglang_thread = start_router_thread(cls.model_config, cls.base_url)
 
         logger.info(
             f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
