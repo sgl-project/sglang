@@ -30,6 +30,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
 )
+from sglang.srt.layers.attention.flashinfer_backend import (
+    SM100_CUTLASS_FMHA_HEAD_DIMS,
+)
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
     update_local_kv_lens_for_dcp,
@@ -225,6 +228,19 @@ def _planned_causal(model: torch.nn.Module) -> bool:
     return causal != {False}
 
 
+# FlashInfer's fmha_cutlass_sm100.cu DISPATCH_head_dim only instantiates
+# SM100_CUTLASS_FMHA_HEAD_DIMS; other MLA shapes such as GLM-4.7-Flash
+# (192 + 64 = 256, 256) fall back to backend="auto" (cuDNN FMHA when eligible
+# on SM100, or FA2 otherwise).
+def _select_ragged_fmha_backend(model_config) -> str:
+    if not get_platform().is_sm100:
+        return "auto"
+    qk_head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
+    if (qk_head_dim, model_config.v_head_dim) in SM100_CUTLASS_FMHA_HEAD_DIMS:
+        return "cutlass"
+    return "auto"
+
+
 class FlashInferMLAAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -299,10 +315,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        if get_platform().is_sm100:
-            self.fmha_backend = "cutlass"
-        else:
-            self.fmha_backend = "auto"
+        self.fmha_backend = _select_ragged_fmha_backend(model_runner.model_config)
 
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=self.fmha_backend
