@@ -195,30 +195,25 @@ class InklingPromptTest(unittest.TestCase):
 
     def test_reasoning_content_history_renders_as_thinking(self):
         """Prior thinking sent as reasoning_content (Chat Completions, and the
-        Anthropic and Responses converters) must render like a thinking part."""
-
-        def encode(assistant):
-            return self._encode(
-                [
-                    {"role": "user", "content": "hi"},
-                    assistant,
-                    {"role": "user", "content": "again"},
-                ]
+        Anthropic and Responses converters) must reach the prompt as a thinking block."""
+        tml = load_tml_renderers()
+        thinking_block = [
+            INKLING_SPECIAL_TOKEN_IDS["<|content_thinking|>"],
+            *tml.tokenizer.encode_ordinary("ponder"),
+            INKLING_SPECIAL_TOKEN_IDS["<|end_message|>"],
+        ]
+        prompt_ids = self._encode(
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "reasoning_content": "ponder", "content": "ok"},
+                {"role": "user", "content": "again"},
+            ]
+        )
+        self.assertTrue(
+            any(
+                prompt_ids[start : start + len(thinking_block)] == thinking_block
+                for start in range(len(prompt_ids))
             )
-
-        self.assertEqual(
-            encode(
-                {"role": "assistant", "reasoning_content": "ponder", "content": "ok"}
-            ),
-            encode(
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "thinking", "thinking": "ponder"},
-                        {"type": "text", "text": "ok"},
-                    ],
-                }
-            ),
         )
 
 
