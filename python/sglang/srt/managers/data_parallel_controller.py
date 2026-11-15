@@ -826,6 +826,9 @@ class DataParallelController:
                     for info in self._scheduler_init_infos
                 ]
             )
+            for info in self._scheduler_init_infos:
+                if info.get("router_l3_layout"):
+                    init_info["router_l3_layout"] = info["router_l3_layout"]
         if layout is not None:
             init_info["hicache_object_layout"] = layout
         return init_info

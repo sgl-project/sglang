@@ -281,6 +281,28 @@ def sample_draft_proposal(
     return probs, topk_p, topk_index
 
 
+def scatter_draft_probs_to_target_vocab(
+    draft_probs: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    target_vocab_size: int,
+) -> torch.Tensor:
+    """Map reduced-vocabulary probabilities onto target token ids.
+
+    ``hot_token_id`` maps the draft head's columns to target vocabulary columns.
+    Columns outside the hot vocabulary have zero probability. The result is fp32,
+    and the caller owns it independently of later calls.
+    """
+    out = torch.zeros(
+        (*draft_probs.shape[:-1], target_vocab_size),
+        dtype=torch.float32,
+        device=draft_probs.device,
+    )
+    # hot_token_id must contain unique target IDs.
+    # index_copy_ accepts the 1-D vocabulary map directly.
+    out.index_copy_(-1, hot_token_id, draft_probs.to(torch.float32))
+    return out
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
@@ -1240,8 +1262,8 @@ def commit_mamba_states_after_verify(
             commit_ple_states_after_verify,
         )
 
-        # Persistent destinations are state slots; replay/scratch rows still
-        # index requests.
+        # Persistent destinations are state slots; a request-scoped ring is
+        # indexed by the rows the forward resolved (`ForwardStateSlots.ring`).
         if state_slots is None:
             state_slots = model_runner.attn_backend.forward_state_slots(
                 bs, batch.mamba_track_indices
@@ -1294,6 +1316,8 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
+        assert state_slots.ring is not None, "the GDN ring is indexed per request"
+        replay_indices = state_slots.ring[:bs]
         # Advance the request cursors by the accepted count (incl. the bonus
         # token), fold capacity rows into `temporal`, and roll back conv.
         commit_gdn_replayssm_after_verify(
@@ -1302,7 +1326,7 @@ def commit_mamba_states_after_verify(
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             state_batch_indices=replay_state_indices,
-            replay_indices=batch.req_pool_indices,
+            replay_indices=replay_indices,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
             max_spec_len=draft_token_num,
@@ -1340,7 +1364,9 @@ def commit_mamba_states_after_verify(
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         ring_indices = None
         if mamba_pool.replayssm_request_ring:
-            ring_indices = batch.req_pool_indices[: replay_state_indices.shape[0]]
+            # The ring rows the forward resolved, never the live request table.
+            assert state_slots.ring is not None, "request-scoped ring without rows"
+            ring_indices = state_slots.ring[: replay_state_indices.shape[0]]
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             state_batch_indices=replay_state_indices,
@@ -1384,6 +1410,7 @@ def relayed_commit_state_slots(
     return ForwardStateSlots(
         state_ids.ids(req_pool.get_mamba_indices(batch.req_pool_indices)),
         None if track is None else state_ids.ids(track),
+        model_runner.runner_ids.request_ids().ids(batch.req_pool_indices),
     )
 
 

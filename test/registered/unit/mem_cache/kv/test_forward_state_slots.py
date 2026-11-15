@@ -355,6 +355,10 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
             for name, (flags, kernel) in branches.items():
                 with self.subTest(branch=name):
                     f = _Forward(mode=ForwardMode.TARGET_VERIFY, graph=graph)
+                    # The ring rows the forward resolved: what a request-scoped
+                    # ring is indexed by, never the live request table.
+                    ring_rows = torch.tensor([5, 6], dtype=torch.int32)
+                    f.backend.forward_metadata.replayssm_ring_indices = ring_rows
                     mamba_pool = SimpleNamespace(
                         replayssm_cache_base=torch.zeros(8, dtype=torch.int32),
                         replayssm_spec_write_pos=torch.zeros(8, dtype=torch.int32),
@@ -390,6 +394,10 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
                         kwargs["state_batch_indices"].tolist(),
                         f.working_physical.tolist(),
                     )
+                    if name == "circular":
+                        self.assertEqual(
+                            kwargs["replay_indices"].tolist(), ring_rows.tolist()
+                        )
                     self.assertEqual(
                         kwargs["mamba_track_indices"].tolist(),
                         f.track_physical.tolist(),

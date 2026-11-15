@@ -26,6 +26,15 @@ from sglang.srt.utils.device import (
 logger = logging.getLogger(__name__)
 
 
+def handle_admin_api_key_env(server_args: Any) -> None:
+    """`--admin-api-key` wins; without it the server takes `SGLANG_ADMIN_API_KEY`."""
+    env_key = envs.SGLANG_ADMIN_API_KEY.get()
+    if resolving_view(server_args).admin_api_key is None and env_key:
+        declare_resolution(
+            server_args, "_handle_admin_api_key_env", admin_api_key=env_key
+        )
+
+
 def handle_watermark_config(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.watermark_config is None:
@@ -100,13 +109,16 @@ def handle_ssl_validation(server_args: Any):
                 "1024 and 2147483647."
             )
 
-        try:
-            import granian  # noqa: F401
-        except ImportError:
-            raise ValueError(
-                "--enable-http2 requires the 'granian' package. "
-                'Install it with: pip install "sglang[http2]"'
-            )
+        # The Rust listener serves HTTP/2 itself; only the Python frontend
+        # runs on Granian.
+        if not envs.SGLANG_RUST_SERVER.get():
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
 
         if cfg.enable_ssl_refresh:
             raise ValueError(
@@ -441,7 +453,8 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.api_key or cfg.admin_api_key:
             raise ValueError(
-                "--grpc-port is incompatible with --api-key/--admin-api-key: "
+                "--grpc-port is incompatible with --api-key/--admin-api-key "
+                "(or SGLANG_ADMIN_API_KEY): "
                 "the native gRPC listener bypasses HTTP auth middleware."
             )
 
