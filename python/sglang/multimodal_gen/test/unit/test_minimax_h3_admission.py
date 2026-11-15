@@ -839,6 +839,7 @@ def test_validate_server_args_accepts_ring_on_lse_backends(backend):
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
         component_attention_backends={},
+        component_quantizations={},
         attention_backend=backend,
         ring_degree=2,
         performance_mode="speed",
