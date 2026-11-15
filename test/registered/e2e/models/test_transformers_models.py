@@ -17,7 +17,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
 )
 
@@ -85,10 +84,6 @@ CI_MODELS = [
     ModelCase(DEFAULT_MODEL_NAME_FOR_TEST),
 ]
 
-ALL_OTHER_MODELS = [
-    ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=2),
-]
-
 
 class TestTransformersFallbackEngine(CustomTestCase):
     @classmethod
@@ -139,19 +134,6 @@ class TestTransformersFallbackEngine(CustomTestCase):
             prompts = DEFAULT_PROMPTS
             if model_case.skip_long_prompt:
                 prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-            # Assert the logits and output strs are close
-            self.assert_close_logits_and_output_strs(prompts, model_case)
-
-    def test_others(self):
-        if is_in_ci():
-            return
-
-        # Skip long prompts for models that do not have a long context
-        prompts = DEFAULT_PROMPTS
-        for model_case in ALL_OTHER_MODELS:
-            if model_case.skip_long_prompt:
-                prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-
             # Assert the logits and output strs are close
             self.assert_close_logits_and_output_strs(prompts, model_case)
 

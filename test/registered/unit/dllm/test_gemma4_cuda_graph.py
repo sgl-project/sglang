@@ -23,7 +23,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class _ReadStream:
     reads_are_translated = False
-    window_kv_kind = IdSpaceKind.FULL
+    # The windowed layers store in the full sub-pool.
+    window_storage = IdSpaceKind.FULL.value
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
@@ -60,9 +61,15 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         backend.token_to_kv_pool = None
         backend.kv_indptr = torch.zeros(4, dtype=torch.int32)
         backend.qo_indptr = torch.zeros(4, dtype=torch.int32)
-        backend.window_kv_indptr = torch.zeros(4, dtype=torch.int32)
+        full = IdSpaceKind.FULL.value
+        backend.window_lengths = {full: 6}
+        backend.window_write_sub_pools = ()
+        backend.window_kv_indptr = {full: torch.zeros(4, dtype=torch.int32)}
         backend.cuda_graph_kv_indices = torch.zeros(64, dtype=torch.int64)
-        backend.cuda_graph_window_kv_indices = torch.zeros(64, dtype=torch.int64)
+        backend.cuda_graph_window_kv_indices = {
+            full: torch.zeros(64, dtype=torch.int64)
+        }
+        backend.cuda_graph_window_kv_offsets = {full: torch.zeros(3, dtype=torch.int32)}
         return backend
 
     def test_graph_canvas_stays_bidirectional(self):
@@ -105,8 +112,9 @@ class TestGemma4GraphMetadata(unittest.TestCase):
             spec_info=None,
         )
         metadata = backend._build_cuda_graph_forward_metadata(
-            3, ForwardMode.DLLM_EXTEND, None
+            3, ForwardMode.DLLM_EXTEND, None, {}
         )
+        window = metadata.windows[IdSpaceKind.FULL.value]
         self.assertEqual(metadata.max_extend_len, 4)
         self.assertIsNone(metadata.custom_mask)
         torch.testing.assert_close(
@@ -120,17 +128,17 @@ class TestGemma4GraphMetadata(unittest.TestCase):
             torch.tensor(list(range(16, 19)) + list(range(32, 43))),
         )
         torch.testing.assert_close(
-            metadata.window_kv_indptr, torch.tensor([0, 3, 9, 9], dtype=torch.int32)
+            window.kv_indptr, torch.tensor([0, 3, 9, 9], dtype=torch.int32)
         )
         torch.testing.assert_close(
-            metadata.window_kv_indices[:9],
+            window.kv_indices[:9],
             torch.tensor(list(range(16, 19)) + list(range(37, 43))),
         )
 
         # The captured views must see different lengths and request slots on replay.
         pointers = (
             metadata.kv_indices.data_ptr(),
-            metadata.window_kv_indices.data_ptr(),
+            window.kv_indices.data_ptr(),
         )
         backend._apply_cuda_graph_metadata(
             plan=None,
@@ -144,10 +152,10 @@ class TestGemma4GraphMetadata(unittest.TestCase):
             metadata.kv_indptr, torch.tensor([0, 0, 5, 5], dtype=torch.int32)
         )
         torch.testing.assert_close(metadata.kv_indices[:5], torch.arange(16, 21))
-        torch.testing.assert_close(metadata.window_kv_indices[:5], torch.arange(16, 21))
+        torch.testing.assert_close(window.kv_indices[:5], torch.arange(16, 21))
         self.assertEqual(
             pointers,
-            (metadata.kv_indices.data_ptr(), metadata.window_kv_indices.data_ptr()),
+            (metadata.kv_indices.data_ptr(), window.kv_indices.data_ptr()),
         )
 
 
@@ -158,7 +166,9 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
         runner.ragged_verify_mode = False
         runner.deepep_adapter = Mock()
         runner.bs = 4
+        runner.raw_bs = 4
         runner.raw_num_token = 12
+        runner.require_mlp_tp_gather = False
         runner.captured_req_width = 4
         runner.attention_graph_variants = None
         runner._capture_graph_size = Mock(return_value=4)

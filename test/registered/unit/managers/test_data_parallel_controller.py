@@ -199,6 +199,7 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.startup_time = {}
         scheduler.page_size = 64
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.kv_events_publisher = component
         publisher = MagicMock()
         publisher.describe_local_source.return_value = self._source(4, 256)
@@ -270,6 +271,25 @@ class TestLocalKvEventSources(CustomTestCase):
         self.assertEqual(
             controller.local_kv_event_sources, [self._source(2), self._source(3)]
         )
+
+
+class TestInitInfoReply(CustomTestCase):
+    @staticmethod
+    def _reply(*scheduler_infos):
+        controller = DataParallelController.__new__(DataParallelController)
+        controller._scheduler_init_info_lock = threading.Lock()
+        controller._scheduler_init_infos = []
+        controller._record_scheduler_init_infos(list(scheduler_infos))
+        return controller.get_init_info()
+
+    def test_router_l3_layout_is_forwarded_only_when_a_scheduler_reports_it(self):
+        """The reply holds only the keys the controller names, so it must name this one."""
+        info = {"max_total_num_tokens": 64, "max_req_input_len": 32}
+        reporting = {**info, "router_l3_layout": "layout-a"}
+        self.assertEqual(
+            self._reply(reporting, reporting)["router_l3_layout"], "layout-a"
+        )
+        self.assertNotIn("router_l3_layout", self._reply(info, info))
 
 
 class TestDPBudgetUpdateBudget(CustomTestCase):

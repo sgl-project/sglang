@@ -14,11 +14,11 @@ from typing import Callable, Optional
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.profile_utils import (
+from sglang.srt.observability.profile_utils import (
     export_cuda_graph_capture_trace,
     graph_capture_profile_dir,
 )
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 

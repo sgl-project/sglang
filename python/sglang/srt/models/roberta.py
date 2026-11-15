@@ -6,6 +6,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.hf_transformers import download_from_hf
 from sglang.srt.layers.pooler import CrossEncodingPooler, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.sparse_pooler import SparsePooler
@@ -13,7 +14,6 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bert import BertEncoder
-from sglang.srt.utils.hf_transformers import download_from_hf
 
 RobertaConfig = None
 
