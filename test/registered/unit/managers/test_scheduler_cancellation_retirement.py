@@ -240,6 +240,31 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertEqual(self.outputs[-1][0].status, "retired")
         self.assertIsNone(scheduler._cancellation_retirements["operation-a"].req)
 
+    def test_retraction_abort_waits_for_launched_steps_without_finishing_in_place(self):
+        scheduler = self._scheduler()
+        req = self._req(scheduler)
+        first, second = ScheduleBatch(reqs=[req]), ScheduleBatch(reqs=[req])
+        first.add_inflight_step()
+        second.add_inflight_step()
+        move([req], scheduler.running_reqs)
+        scheduler.running_batch = second
+        self._cancel(scheduler, req)
+
+        scheduler.request_retirer.retract(req, offload_kv=False)
+        scheduler.request_retirer.abort_retracted(req, reason=req.to_finish)
+        self.assertFalse(req.finished())
+        self.assertFalse(req.kv.holds_kv)
+        self.assertTrue(req.kv.is_kv_released)
+        scheduler._check_cancellation_retirements()
+        self.assertEqual(self.outputs, [])
+
+        scheduler._on_step_processed(first, None)
+        self.assertEqual(self.outputs, [])
+        scheduler._on_step_processed(second, None)
+        self.assertEqual([out.status for out, _ in self.outputs], ["retired"])
+        self.assertFalse(req.finished())
+        self.assertEqual(scheduler.req_to_token_pool.available_size(), 8)
+
     def test_parked_chunked_abort_releases_real_resources_before_receipt(self):
         scheduler = self._scheduler()
         req = self._req(scheduler)

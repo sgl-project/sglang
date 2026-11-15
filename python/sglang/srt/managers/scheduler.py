@@ -6537,7 +6537,7 @@ class Scheduler(
                     entry, "unsupported", scope_error
                 )
             elif (
-                req.finished()
+                (req.finished() or req.retraction_aborted)
                 and req.inflight_steps == 0
                 and not req.kv.holds_kv
                 and not req.kv.holds_mamba

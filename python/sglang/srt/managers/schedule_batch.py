@@ -594,6 +594,8 @@ class Req(ReqDllmMixin):
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
+        # Retraction aborts leave finished_reason unset for already launched steps.
+        self.retraction_aborted = False
         # Set by exit_ledger (CI only).
         self.exit_via: Optional[str] = None
         self.send_via: Optional[str] = None

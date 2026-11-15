@@ -21,12 +21,12 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.entrypoints import http_server
-from sglang.srt.environ import envs
-from sglang.srt.managers.cancellation_retirement import CancellationRetirementRegistry
-from sglang.srt.managers.scheduler_components.request_list import move
-from sglang.srt.managers.io_struct import (
+from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.entrypoints import http_server  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.managers.cancellation_retirement import CancellationRetirementRegistry  # noqa: E402
+from sglang.srt.managers.scheduler_components.request_list import move  # noqa: E402
+from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     CancellationRetirementOutput,
     CancellationRetirementReq,
@@ -35,11 +35,11 @@ from sglang.srt.managers.io_struct import (
     msgpack_decode,
     msgpack_encode,
 )
-from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
-from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
-from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
-from sglang.srt.runtime_context import create_context, use_context
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper  # noqa: E402
+from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager  # noqa: E402
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats  # noqa: E402
+from sglang.srt.runtime_context import create_context, use_context  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
