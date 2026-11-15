@@ -675,6 +675,82 @@ impl PDRouter {
         }
     }
 
+    async fn check_decode_stream_start(
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        // SGLang /generate commits HTTP 200 before bootstrap finishes. A failed
+        // handshake then arrives as an SSE abort, while prefill still waits for
+        // its receiver. Inspect the first data event before waiting for prefill.
+        let status = response.status();
+        let version = response.version();
+        let mut headers = response.headers().clone();
+        let mut stream = response.bytes_stream();
+        let mut prefix = bytes::BytesMut::new();
+        let mut scanned = 0;
+        'read: while let Some(chunk) = stream.next().await {
+            prefix.extend_from_slice(&chunk?);
+            loop {
+                let remaining = &prefix[scanned..];
+                let boundary = [
+                    memmem::find(remaining, b"\n\n").map(|i| (i, 2)),
+                    memmem::find(remaining, b"\r\n\r\n").map(|i| (i, 4)),
+                ]
+                .into_iter()
+                .flatten()
+                .min_by_key(|(i, _)| *i);
+                let Some((end, delimiter_len)) = boundary else {
+                    break;
+                };
+                let event = String::from_utf8_lossy(&remaining[..end]);
+                let data = event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .map(str::trim_start)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                scanned += end + delimiter_len;
+                if data.is_empty() {
+                    continue;
+                } // Preserve heartbeat comments.
+                if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                    let reason = value.pointer("/meta_info/finish_reason");
+                    let abort = reason.filter(|r| r["type"] == "abort");
+                    if value.get("error").is_some_and(|error| !error.is_null()) || abort.is_some() {
+                        let code = abort
+                            .and_then(|r| r["status_code"].as_u64())
+                            .or_else(|| value.pointer("/error/code").and_then(Value::as_u64));
+                        let status = code
+                            .and_then(|c| u16::try_from(c).ok())
+                            .and_then(|c| StatusCode::from_u16(c).ok())
+                            .filter(|s| s.is_client_error() || s.is_server_error())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let mut error_response =
+                            http::Response::new(reqwest::Body::from(value.to_string()));
+                        *error_response.status_mut() = status;
+                        headers.remove(CONTENT_LENGTH);
+                        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                        *error_response.headers_mut() = headers;
+                        return Ok(reqwest::Response::from(error_response));
+                    }
+                }
+                break 'read;
+            }
+            // Bound lookahead for oversized or non-SSE upstream responses.
+            if prefix.len() >= 64 * 1024 {
+                break;
+            }
+        }
+        // Replay every inspected byte before the rest of the original stream.
+        let replay =
+            futures_util::stream::once(async move { Ok::<_, reqwest::Error>(prefix.freeze()) })
+                .chain(stream);
+        let mut response = http::Response::new(reqwest::Body::wrap_stream(replay));
+        *response.status_mut() = status;
+        *response.version_mut() = version;
+        *response.headers_mut() = headers;
+        Ok(reqwest::Response::from(response))
+    }
+
     // Internal method that performs the actual dual dispatch (without retry logic)
     #[allow(clippy::too_many_arguments)]
     async fn execute_dual_dispatch_internal(
@@ -774,6 +850,12 @@ impl PDRouter {
             if let Some(slot) = &slot {
                 slot.release();
             }
+            let result = match result {
+                Ok(response) if context.is_stream && response.status().is_success() => {
+                    Self::check_decode_stream_start(response).await
+                }
+                other => other,
+            };
             Ok((decode, decode_guard, result))
         };
 
@@ -796,7 +878,30 @@ impl PDRouter {
                     break;
                 }
                 dr = &mut decode_leg, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+                    let (decode, decode_guard, decode_result) = match dr {
+                        Ok(leg) => leg,
+                        Err(mut response) => {
+                            // Prefill is cancelled, not a failed worker.
+                            response.extensions_mut().insert(BreakerOutcomesRecorded);
+                            return (response, None);
+                        }
+                    };
+                    if !decode_result.as_ref().is_ok_and(|res| res.status().is_success()) {
+                        // Decode rejected before prefill finished. Returning drops
+                        // the pending prefill request, so it cannot wait for KV
+                        // transfer to a receiver that has already failed.
+                        let response = self
+                            .process_pd_responses(
+                                &context,
+                                Arc::clone(&prefill),
+                                Arc::clone(&decode),
+                                None,
+                                decode_result,
+                            )
+                            .await;
+                        return (response, Some(decode));
+                    }
+                    decode_early = Some(Ok((decode, decode_guard, decode_result)));
                 }
             }
         }
@@ -861,7 +966,7 @@ impl PDRouter {
                 &context,
                 Arc::clone(&prefill),
                 Arc::clone(&decode),
-                prefill_result,
+                Some(prefill_result),
                 decode_result,
             )
             .await;
@@ -873,7 +978,7 @@ impl PDRouter {
         context: &PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
-        prefill_result: Result<reqwest::Response, reqwest::Error>,
+        prefill_result: Option<Result<reqwest::Response, reqwest::Error>>,
         decode_result: Result<reqwest::Response, reqwest::Error>,
     ) -> Response {
         // Process decode response
@@ -891,9 +996,8 @@ impl PDRouter {
                     );
 
                     // Per-worker breaker attribution before the synthetic 5xx
-                    // response takes over. Prefill ran concurrently in the
-                    // `tokio::join!`: tick it based on its actual response
-                    // status, not on the decode-driven failure. For
+                    // response takes over. If prefill completed, tick it based
+                    // on its actual status, not on the decode-driven failure. For
                     // non-streaming the response carries no tracked stream
                     // so record decode's outcome here too — but treat 4xx
                     // as a client fault rather than a worker fault, matching
@@ -905,14 +1009,14 @@ impl PDRouter {
                     // decode on drop, so skip to avoid double-counting.
                     // Mark the response so the outer dispatcher skips its
                     // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
-                    prefill.record_outcome(prefill_ok);
+                    // A cancelled prefill has no worker outcome to record.
+                    if let Some(result) = &prefill_result {
+                        let prefill_ok = match result {
+                            Ok(r) => r.status().is_success() || r.status().is_client_error(),
+                            Err(_) => false,
+                        };
+                        prefill.record_outcome(prefill_ok);
+                    }
                     if !context.is_stream {
                         let decode_ok = status.is_success() || status.is_client_error();
                         decode.record_outcome(decode_ok);
@@ -925,6 +1029,8 @@ impl PDRouter {
                     return response;
                 }
 
+                // Successful decode still waits for prefill before reaching here.
+                let prefill_result = prefill_result.expect("successful decode requires prefill");
                 // Process prefill response
                 let prefill_body = if context.return_logprob {
                     match self
@@ -1016,22 +1122,20 @@ impl PDRouter {
                 // stream will ever wrap a response (streaming path) and
                 // we shortcut past the outer non-streaming
                 // `record_outcome` too — so record decode failure
-                // directly. Prefill ran concurrently in the
-                // `tokio::join!`: record its real per-worker outcome
-                // (success on a 2xx/4xx send, failure on transport
-                // error) so the decode-driven 502 doesn't penalise a
-                // healthy prefill. Mark the response so the outer
+                // directly. Record prefill's real outcome only if it completed
+                // (success on 2xx/4xx, failure on transport error), so the
+                // decode-driven 502 doesn't penalise a cancelled prefill.
+                // Mark the response so the outer
                 // dispatcher skips its status-derived `record_outcome`
                 // and we don't double-count.
                 decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
-                prefill.record_outcome(prefill_ok);
+                if let Some(result) = &prefill_result {
+                    let prefill_ok = match result {
+                        Ok(res) => res.status().is_success() || res.status().is_client_error(),
+                        Err(_) => false,
+                    };
+                    prefill.record_outcome(prefill_ok);
+                }
 
                 let mut response = error::bad_gateway(
                     "decode_server_error",

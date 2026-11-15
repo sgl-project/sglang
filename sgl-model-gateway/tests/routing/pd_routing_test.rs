@@ -766,6 +766,223 @@ mod pd_responses_routing_tests {
         }
     }
 
+    /// Decode can reject during bootstrap before prefill produces KV. The
+    /// pending prefill socket must close without any worker-side timeout.
+    #[tokio::test]
+    async fn test_pd_early_decode_failure_cancels_pending_prefill() {
+        for stream in [false, true] {
+            // None models a transport failure before response headers.
+            for (status, sse_body, expected_status) in [
+                (Some(400), None, 400),
+                (Some(500), None, 500),
+                (None, None, 502),
+                (Some(200), Some("data: {\"text\":\"\",\"meta_info\":{\"finish_reason\":{\"type\":\"abort\",\"status_code\":500,\"message\":\"incompatible PD state\"}}}\n\n"), 500),
+                (Some(200), Some("data: {\"error\":{\"message\":\"incompatible PD state\",\"code\":400}}\r\n\r\n"), 400),
+            ] {
+                if sse_body.is_some() && !stream { continue; }
+                let prefill_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let decode_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let prefill_url = format!("http://{}", prefill_listener.local_addr().unwrap());
+                let decode_url = format!("http://{}", decode_listener.local_addr().unwrap());
+                let (prefill_started_tx, prefill_started_rx) = oneshot::channel();
+                let mut prefill_task = tokio::spawn(async move {
+                    let (socket, _) = prefill_listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    read_responses_post(&mut socket).await;
+                    prefill_started_tx.send(()).unwrap();
+                    let mut byte = [0];
+                    assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+                });
+                let decode_task = tokio::spawn(async move {
+                    let (socket, _) = decode_listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    read_responses_post(&mut socket).await;
+                    prefill_started_rx.await.unwrap();
+                    if let Some(status) = status {
+                        if let Some(sse_body) = sse_body {
+                            socket.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                            let payload = format!(": heartbeat\r\n\r\n{sse_body}");
+                            for piece in payload.as_bytes().chunks(17) {
+                                socket.get_mut().write_all(format!("{:x}\r\n", piece.len()).as_bytes()).await.unwrap();
+                                socket.get_mut().write_all(piece).await.unwrap();
+                                socket.get_mut().write_all(b"\r\n").await.unwrap();
+                                tokio::task::yield_now().await;
+                            }
+                            // No EOF/terminating chunk: first-event rejection
+                            // must cancel the still-open decode stream too.
+                            assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+                            return;
+                        }
+                        let body = r#"{"error":"incompatible PD state"}"#;
+                        let response = format!(
+                            "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        socket
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                });
+                let mut router = make_pd_router();
+                router.retry_config.max_retries = 0;
+                let prefill = Arc::new(
+                    BasicWorkerBuilder::new(prefill_url)
+                        .worker_type(CoreWorkerType::Prefill {
+                            bootstrap_port: Some(9001),
+                        })
+                        .build(),
+                );
+                let decode = Arc::new(
+                    BasicWorkerBuilder::new(decode_url)
+                        .worker_type(CoreWorkerType::Decode)
+                        .build(),
+                );
+                prefill.set_healthy(true);
+                decode.set_healthy(true);
+                router.worker_registry.register(prefill.clone());
+                router.worker_registry.register(decode.clone());
+                let request = responses_request(json!({
+                    "model":"mock-model", "input":"hi", "stream":stream
+                }));
+                let result = timeout(Duration::from_secs(5), async {
+                    let response = router.route_responses(None, &request, None).await;
+                    assert_eq!(response.status().as_u16(), expected_status);
+                    let body = response.into_body().collect().await.unwrap().to_bytes();
+                    if status.is_some() {
+                        assert!(std::str::from_utf8(&body)
+                            .unwrap()
+                            .contains("incompatible PD state"));
+                    }
+                    (&mut prefill_task).await.unwrap();
+                })
+                .await;
+                if result.is_err() {
+                    prefill_task.abort();
+                    decode_task.abort();
+                }
+                result.expect("decode failure must return and cancel prefill promptly");
+                decode_task.await.unwrap();
+                assert_eq!(prefill.load(), 0);
+                assert_eq!(decode.load(), 0);
+                let prefill_stats = prefill.circuit_breaker().stats();
+                assert_eq!(prefill_stats.total_failures, 0);
+                assert_eq!(prefill_stats.total_successes, 0);
+                let decode_stats = decode.circuit_breaker().stats();
+                assert_eq!(decode_stats.total_failures, u64::from(expected_status >= 500));
+                assert_eq!(decode_stats.total_successes, u64::from(expected_status < 500));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pd_early_decode_success_still_waits_for_prefill() {
+        for stream in [false, true] {
+            let prefill_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let decode_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let prefill_url = format!("http://{}", prefill_listener.local_addr().unwrap());
+            let decode_url = format!("http://{}", decode_listener.local_addr().unwrap());
+            let (release_prefill_tx, release_prefill_rx) = oneshot::channel();
+            let (decode_done_tx, decode_done_rx) = oneshot::channel();
+            let prefill_task = tokio::spawn(async move {
+                let (socket, _) = prefill_listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                read_responses_post(&mut socket).await;
+                release_prefill_rx.await.unwrap();
+                socket.get_mut().write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                ).await.unwrap();
+            });
+            let expected = if stream {
+                "data: {\"error\":null,\"type\":\"response.completed\"}\n\n"
+            } else {
+                DECODE_RESPONSE
+            };
+            let decode_task = tokio::spawn(async move {
+                let (socket, _) = decode_listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                read_responses_post(&mut socket).await;
+                let content_type = if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{expected}",
+                    expected.len()
+                );
+                socket
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                decode_done_tx.send(()).unwrap();
+            });
+            let router = make_pd_router();
+            register_workers(&router, prefill_url, decode_url);
+            let request = responses_request(json!({
+                "model":"mock-model", "input":"hi", "stream":stream
+            }));
+            let response = router.route_responses(None, &request, None);
+            tokio::pin!(response);
+            tokio::select! {
+                _ = &mut response => panic!("successful decode must wait for prefill"),
+                _ = decode_done_rx => {}
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("decode request must reach worker"),
+            }
+            assert!(timeout(Duration::from_millis(50), &mut response)
+                .await
+                .is_err());
+            release_prefill_tx.send(()).unwrap();
+            let body = timeout(Duration::from_secs(5), async {
+                let response = response.await;
+                assert_eq!(response.status(), StatusCode::OK);
+                response.into_body().collect().await.unwrap().to_bytes()
+            })
+            .await
+            .expect("successful PD response must finish after prefill");
+            assert_eq!(body.as_ref(), expected.as_bytes());
+            prefill_task.await.unwrap();
+            decode_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pd_deferred_decode_selection_failure_does_not_penalise_prefill() {
+        use smg::routers::http::decode_gate::DecodeGate;
+
+        let (prefill_url, prefill_task) = spawn_capture_worker(
+            Arc::new(Mutex::new(Vec::new())),
+            WorkerReply::Json(StatusCode::OK, "{}"),
+        )
+        .await;
+        let mut router = make_pd_router();
+        router.retry_config.max_retries = 0;
+        router.decode_gate = Some(Arc::new(DecodeGate::new(1)));
+        let prefill = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(CoreWorkerType::Prefill {
+                    bootstrap_port: Some(9001),
+                })
+                .build(),
+        );
+        prefill.set_healthy(true);
+        router.worker_registry.register(prefill.clone());
+        let request = responses_request(json!({"model":"mock-model", "input":"hi"}));
+        let response = timeout(
+            Duration::from_secs(5),
+            router.route_responses(None, &request, None),
+        )
+        .await
+        .expect("missing decode worker must fail promptly");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(prefill.circuit_breaker().stats().total_failures, 0);
+        assert_eq!(prefill.circuit_breaker().stats().total_successes, 0);
+        prefill_task.abort();
+    }
+
     /// Detached background responses (`background=true, stream=false`) are
     /// retrieved through the /v1/responses/{id} endpoints, which the PD router
     /// does not implement. They must be rejected deterministically instead of
