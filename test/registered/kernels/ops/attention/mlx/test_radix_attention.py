@@ -20,6 +20,61 @@ register_mps_ci(est_time=45, suite="stage-a-unit-test-mps")
     "Requires Torch MPS and MLX",
 )
 class TestCompiledRadix(CustomTestCase):
+    def test_invalid_slot_cannot_be_hidden_by_large_finite_scores(self):
+        """An invalid slot must stay visible beside the largest finite fp32 scores."""
+        import mlx.core as mx
+
+        from sglang.kernels.ops.attention.mlx.radix_attention import radix_decode
+
+        q = mx.ones((2, 4, 64))
+        k = mx.full((2, 2, 64), torch.finfo(torch.float32).max / 64)
+        pool = mx.full((32, 2, 64), torch.finfo(torch.float32).max / 64)
+        table = mx.stack(
+            [mx.concatenate([mx.array([-1]), mx.arange(1, 32)]), mx.arange(32)]
+        )
+        run = mx.compile(
+            lambda rows, lengths: radix_decode(
+                q,
+                k,
+                mx.ones(k.shape),
+                pool,
+                mx.ones(pool.shape),
+                table,
+                rows,
+                lengths,
+                1.0,
+            )
+        )
+        result = run(mx.array([0, 1]), mx.array([17, 17]))
+        self.assertTrue(mx.all(mx.isnan(result[0])).item())
+        self.assertTrue(mx.allclose(result[1], mx.ones((4, 64))).item())
+
+    def test_compiled_replay_accepts_changed_query_strides(self):
+        """Equal query values must give equal attention after a replay layout change."""
+        import mlx.core as mx
+
+        from sglang.kernels.ops.attention.mlx.radix_attention import radix_decode
+
+        q = mx.cos(mx.arange(512).reshape(4, 2, 64) * 0.03).transpose(1, 0, 2)
+        k = mx.sin(mx.arange(256).reshape(2, 2, 64) * 0.05)
+        pool = mx.sin(mx.arange(8192).reshape(64, 2, 64) * 0.03)
+        values = mx.cos(pool * 2)
+        args = (
+            k,
+            k * 3,
+            pool,
+            values,
+            mx.stack([mx.arange(32, dtype=mx.int32)] * 2),
+            mx.array([0, 1]),
+            mx.array([17, 31]),
+        )
+        expected = radix_decode(q, *args, 0.125)
+        run = mx.compile(lambda query, *x: radix_decode(query, *x, 0.125))
+        for query in (mx.contiguous(q), q, mx.contiguous(q)):
+            self.assertTrue(
+                mx.allclose(run(query, *args), expected, atol=1e-5, rtol=1e-5).item()
+            )
+
     def test_aot_graph_handles_strides_streams_and_missing_extension(self):
         import mlx.core as mx
         from sgl_kernel import metal

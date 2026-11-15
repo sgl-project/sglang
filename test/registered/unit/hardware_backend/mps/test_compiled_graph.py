@@ -919,7 +919,29 @@ class TestCompiledGraph(CustomTestCase):
                         model.right = Branch()
                     torch.mps.synchronize()
                     output = graph.launch(graph.bind(inputs))
-                    torch.testing.assert_close(mlx_to_torch(output[0]), model(*inputs))
+                    actual, expected = mlx_to_torch(output[0]), model(*inputs)
+
+                    def failure_details(message):
+                        import platform
+                        import subprocess
+                        from copy import deepcopy
+                        from importlib.metadata import version
+
+                        cpu = (
+                            deepcopy(model)
+                            .cpu()
+                            .double()(*[x.cpu().double() for x in inputs])
+                        )
+                        return (
+                            f"{message}\nreplace={replace}, hardware={platform.platform()}, "
+                            f"chip={subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True).strip()}, "
+                            f"torch={torch.__version__}, torch_git={torch.version.git_version}, "
+                            f"mlx={version('mlx')}\nactual={actual.cpu().tolist()}\n"
+                            f"eager={expected.cpu().tolist()}\ncpu_fp64={cpu.tolist()}\n"
+                            f"bindings={[(i, str(view.torch_tensor.dtype), tuple(view.torch_tensor.shape), tuple(view.torch_tensor.stride()), view.torch_tensor.storage_offset()) for i, view in graph.views.items()]}"
+                        )
+
+                    torch.testing.assert_close(actual, expected, msg=failure_details)
 
     def test_compiled_live_weights_and_dependent_launch(self):
         import mlx.core as mx
