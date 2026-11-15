@@ -301,6 +301,9 @@ class Envs:
     SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # HiCache write-back eviction demotes without a host wait for the copies: the
+    # streams that next touch the freed pages or their host copies wait on them. Opt-in.
+    SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE = EnvRuntimeBool(False)
     # Host-only Mamba checkpoint: read a running request's empty tracking slot from the
     # host flag, not the device tensor. Opt-in.
     SGLANG_OPT_MAMBA_CHECKPOINT_HOST_EMPTY_FLAG = EnvRuntimeBool(False)
