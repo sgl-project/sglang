@@ -16,9 +16,13 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     validate_gdn_mis_backend,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
@@ -497,6 +501,64 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "supports KDA only"):
                     GDNKernelDispatcher(decode_backend, prefill_backend)
+
+
+class TestGDNPrefillOnStridedStatePool(CustomTestCase):
+    """An envelope-strided state pool prefills in place exactly when every prefill
+    kernel follows its slot pitch; otherwise prefill runs on packed copies."""
+
+    @staticmethod
+    def envelope_pool(slots=3, heads=2, v_dim=2, k_dim=2, pad=5):
+        # A [slots, H, V, K] state pool whose slots sit `pad` elements apart.
+        base = torch.zeros(slots, heads * v_dim * k_dim + pad)
+        return base[:, : heads * v_dim * k_dim].view(slots, heads, v_dim, k_dim)
+
+    @staticmethod
+    def backend(extend_honors_slot_pitch):
+        backend = object.__new__(GDNAttnBackend)
+        backend.kernel_dispatcher = SimpleNamespace(
+            extend_honors_slot_pitch=extend_honors_slot_pitch
+        )
+        return backend
+
+    def test_strided_pool_prefills_in_place_when_kernels_follow_the_pitch(self):
+        ssm_states = self.envelope_pool()
+        self.assertFalse(ssm_states.is_contiguous())
+        with patch.object(gdn_backend, "is_cuda", return_value=True):
+            self.assertTrue(
+                self.backend(True)._prefill_kernels_follow_slot_pitch(ssm_states)
+            )
+            self.assertFalse(
+                self.backend(False)._prefill_kernels_follow_slot_pitch(ssm_states)
+            )
+            # A slot whose own state is not packed still needs the copy.
+            self.assertFalse(
+                self.backend(True)._prefill_kernels_follow_slot_pitch(
+                    ssm_states.transpose(2, 3)
+                )
+            )
+
+    def test_other_platforms_keep_the_packed_copy(self):
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=False),
+            patch.object(gdn_backend, "_is_hip", False),
+        ):
+            self.assertFalse(
+                self.backend(True)._prefill_kernels_follow_slot_pitch(
+                    self.envelope_pool()
+                )
+            )
+
+    def test_extend_kernels_declare_whether_they_follow_the_pitch(self):
+        dispatcher = GDNKernelDispatcher(
+            LinearAttnKernelBackend.TRITON,
+            LinearAttnKernelBackend.TRITON,
+        )
+        # The Triton chunk entry point packs a strided state, so it keeps the copy.
+        self.assertFalse(dispatcher.extend_honors_slot_pitch)
+        self.assertFalse(TritonGDNKernel.extend_honors_slot_pitch)
+        self.assertTrue(FlashInferGDNKernel.extend_honors_slot_pitch)
+        self.assertFalse(LinearAttnKernelBase.extend_honors_slot_pitch)
 
 
 if __name__ == "__main__":
