@@ -246,6 +246,9 @@ jobs:
             bash scripts/ci/npu/npu_nightly_eval_deps.sh
           fi
 
+          # The hicache_hash_cpp JIT build includes <openssl/sha.h>.
+          apt-get install -y libssl-dev
+
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
