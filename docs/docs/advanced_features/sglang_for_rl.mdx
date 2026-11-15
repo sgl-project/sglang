@@ -339,17 +339,19 @@ Use ModelExpress (MX) to refit from a published S3 delta or full checkpoint. MX 
 
 **Prerequisites:**
 
-- Install ModelExpress from the current `main` branch in each worker environment:
+- Install ModelExpress v0.8.0 or later in each worker environment:
+
+  ```bash
+  uv pip install "modelexpress>=0.8.0"
+  ```
+
+  To get the latest features and fixes, build ModelExpress from source instead:
 
   ```bash
   uv pip install "git+https://github.com/ai-dynamo/modelexpress@main#subdirectory=modelexpress_client/python"
   ```
 
 - Give the workers access to the MX server, S3 credentials, and a writable checkpoint cache directory.
-
-<Note>
-ModelExpress v0.8.0 is coming soon and will include this support. Once released, you can `pip install modelexpress` v0.8.0 instead of installing from `main`.
-</Note>
 
 This example uses Linux with NVIDIA CUDA, a local Hugging Face checkpoint for `Qwen/Qwen3-30B-A3B`, and tensor parallelism across four GPUs:
 
