@@ -1,4 +1,3 @@
-import ast
 import functools
 import importlib.util
 import json
@@ -18,6 +17,17 @@ UBUNTU_CPU_SUITES = {"base-a-test-cpu"}
 B200_RERUN_RUNNER = "4-gpu-b200"
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# ci_register.py imports nothing from sglang, so it loads without the package.
+sys.path.insert(0, str(_REPO_ROOT / "python/sglang/test/ci"))
+import ci_register  # noqa: E402
+
+_BACKENDS = {
+    "cuda": ci_register.HWBackend.CUDA,
+    "cpu": ci_register.HWBackend.CPU,
+    "npu": ci_register.HWBackend.NPU,
+    "amd": ci_register.HWBackend.AMD,
+}
 
 
 @functools.cache
@@ -46,40 +56,16 @@ def _runner_config_labels():
     return {name: resolve_runs_on(cfg) for name, cfg in runner_configs.load().items()}
 
 
-def _registrations(path, register_name):
-    """Return [(est_time, runner_config, suite, stage)] or None if any estimate is
+def _registrations(path, backend):
+    """The file's registrations for `backend`, or None if any estimate is
     unusable."""
     try:
-        tree = ast.parse(path.read_text())
-    except (OSError, SyntaxError):
+        registrations, _ = ci_register.ut_parse_one_file(str(path))
+    except (OSError, SyntaxError, ValueError):
         return None
-    found = []
-    for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == register_name
-        ):
-            continue
-        kwargs = {kw.arg: kw.value for kw in node.keywords}
-        value = kwargs.get("est_time", node.args[0] if node.args else None)
-        try:
-            estimate = ast.literal_eval(value)
-        except (ValueError, TypeError):
-            return None
-        if (
-            type(estimate) not in (int, float)
-            or not math.isfinite(estimate)
-            or estimate <= 0
-        ):
-            return None
-        tags = []
-        for key in ("runner_config", "suite", "stage"):
-            try:
-                tags.append(ast.literal_eval(kwargs[key]))
-            except (KeyError, ValueError, TypeError):
-                tags.append(None)
-        found.append((estimate, *tags))
+    found = [r for r in registrations if r.backend == backend]
+    if any(not math.isfinite(r.est_time) or r.est_time <= 0 for r in found):
+        return None
     return found
 
 
@@ -114,34 +100,27 @@ def estimate_seconds(command, root, mode, runs_on="", suite=""):
             return cases.get(case.group(1))
         return standalone.get(filename, standalone.get(Path(filename).name))
 
-    register_name = {
-        "cuda": "register_cuda_ci",
-        "cpu": "register_cpu_ci",
-        "npu": "register_npu_ci",
-        "amd": "register_amd_ci",
-    }.get(mode)
-    if register_name is None:
+    backend = _BACKENDS.get(mode)
+    if backend is None:
         return None
     filename = command.split()[0].split("::", 1)[0]
-    found = _registrations(root / "test" / filename, register_name)
+    found = _registrations(root / "test" / filename, backend)
     if not found:
         return None
     if mode == "cuda":
         labels = _runner_config_labels()
-        matching = [est for est, rc, *_ in found if rc and labels.get(rc) == runs_on]
-    elif mode == "npu":
-        matching = [est for est, _, s, _ in found if s == suite]
-    elif mode == "amd":
-        # ci_register's effective_suite: `stage=` with `runner_config=` names it.
         matching = [
-            est
-            for est, rc, s, stage in found
-            if (f"{stage}-test-{rc}" if stage and rc else s) == suite
+            r.est_time
+            for r in found
+            if r.runner_config and labels.get(r.runner_config) == runs_on
         ]
+    elif mode == "cpu":
+        matching = [r.est_time for r in found if r.effective_suite in UBUNTU_CPU_SUITES]
     else:
-        matching = [est for est, _, suite, _ in found if suite in UBUNTU_CPU_SUITES]
+        # An npu or amd dispatch names the suite it runs.
+        matching = [r.est_time for r in found if r.effective_suite == suite]
     # A file may register on multiple pools; without a match, stay conservative.
-    return max(matching or [est for est, *_ in found])
+    return max(matching or [r.est_time for r in found])
 
 
 def _pack(items):
