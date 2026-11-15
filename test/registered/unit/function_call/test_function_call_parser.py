@@ -1,5 +1,6 @@
 import functools
 import json
+import re
 import unittest
 import warnings
 from unittest.mock import patch
@@ -3363,6 +3364,70 @@ class TestGlm4MoeDetector(CustomTestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
+    def _stream_normal_text_and_names(self, text, chunks):
+        normal_text, names = "", []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            names.extend(c.name for c in result.calls if c.name)
+        return normal_text, names
+
+    def _weather_call(self, city):
+        return (
+            "<tool_call>get_weather\n"
+            f"<arg_key>city</arg_key>\n<arg_value>{city}</arg_value>\n"
+            "</tool_call>"
+        )
+
+    def _chunkings(self, text):
+        yield "chars", list(text)
+        yield "words", re.findall(r"\S+|\s+", text)
+
+    def test_streaming_whitespace_between_tool_calls_not_emitted(self):
+        for sep in ("\n", "\n\n", " \t\n"):
+            text = self._weather_call("Paris") + sep + self._weather_call("Tokyo")
+            for name, chunks in self._chunkings(text):
+                with self.subTest(sep=sep, chunking=name):
+                    self.setUp()
+                    normal_text, names = self._stream_normal_text_and_names(
+                        text, chunks
+                    )
+                    self.assertEqual(normal_text, "")
+                    self.assertEqual(names, ["get_weather", "get_weather"])
+
+    def test_streaming_trailing_whitespace_after_tool_call_not_emitted(self):
+        text = self._weather_call("Paris") + "\n"
+        for name, chunks in self._chunkings(text):
+            with self.subTest(chunking=name):
+                self.setUp()
+                normal_text, names = self._stream_normal_text_and_names(text, chunks)
+                self.assertEqual(normal_text, "")
+                self.assertEqual(names, ["get_weather"])
+
+    def test_streaming_text_after_tool_call_still_emitted(self):
+        text = self._weather_call("Paris") + "\nDone, anything else?"
+        for name, chunks in self._chunkings(text):
+            with self.subTest(chunking=name):
+                self.setUp()
+                normal_text, names = self._stream_normal_text_and_names(text, chunks)
+                self.assertEqual(normal_text, "\nDone, anything else?")
+                self.assertEqual(names, ["get_weather"])
+
+    def test_streaming_single_tool_call_has_no_normal_text(self):
+        text = self._weather_call("Paris")
+        for name, chunks in self._chunkings(text):
+            with self.subTest(chunking=name):
+                self.setUp()
+                normal_text, names = self._stream_normal_text_and_names(text, chunks)
+                self.assertEqual(normal_text, "")
+                self.assertEqual(names, ["get_weather"])
+
+    def test_nonstreaming_whitespace_between_tool_calls_not_in_normal_text(self):
+        text = self._weather_call("Paris") + "\n" + self._weather_call("Tokyo")
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 2)
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -4054,6 +4119,37 @@ class TestLing3Detector(unittest.TestCase):
                 self.assertEqual(len(tool_calls), 1)
                 self.assertEqual(tool_calls[0]["name"], "get_weather")
                 self.assertEqual(tool_calls[0]["parameters"], expected)
+
+    def _stream_normal_text(self, chunks):
+        return "".join(
+            self.detector.parse_streaming_increment(c, self.tools).normal_text
+            for c in chunks
+        )
+
+    def test_streaming_whitespace_between_tool_calls_not_emitted(self):
+        call = (
+            "<tool_call>get_weather\n"
+            "<arg_key>city</arg_key><arg_value>{}</arg_value></tool_call>"
+        )
+        text = call.format("Paris") + "\n" + call.format("Tokyo")
+        for name, chunks in {
+            "whole": [text],
+            "chars": list(text),
+            "words": re.findall(r"\S+|\s+", text),
+        }.items():
+            with self.subTest(chunking=name):
+                self.setUp()
+                self.assertEqual(self._stream_normal_text(chunks), "")
+
+    def test_streaming_text_after_tool_call_still_emitted(self):
+        text = "<tool_call>get_date</tool_call>\nDone"
+        for name, chunks in {
+            "chars": list(text),
+            "words": re.findall(r"\S+|\s+", text),
+        }.items():
+            with self.subTest(chunking=name):
+                self.setUp()
+                self.assertEqual(self._stream_normal_text(chunks), "\nDone")
 
 
 class TestJsonArrayParser(unittest.TestCase):
