@@ -11,6 +11,7 @@ entries each static pool family registers. All of it goes when those pools do.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
@@ -613,6 +614,10 @@ class StaticKVStorage:
     def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` free state slots of ``sub_pool``; None when none are free."""
         return self._allocator.state_slots.alloc(count)
+
+    def lease_state_slots(self, sub_pool: str, count: int):
+        """A static pool's take is a free-list slice: nothing to lease."""
+        return nullcontext()
 
     def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
         self._allocator.state_slots.free(slots)

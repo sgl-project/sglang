@@ -248,15 +248,17 @@ python3 -m sglang.launch_server \
 #   PREFILL_HOST_IP: prefill node IP address
 #   DECODE_HOST_IP: decode node IP address
 #   ROUTER_HOST_IP: router node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 #============================================================
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<PREFILL_HOST_IP>:8000 8995 \
-    --decode http://<DECODE_HOST_IP>:8232 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<PREFILL_HOST_IP>:8000 http://<DECODE_HOST_IP>:8232 \
     --host <ROUTER_HOST_IP> \
-    --port 6689
+    --port 6689 \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Prefill Context Parallel (PCP) on 2 x A3 Series nodes
@@ -365,13 +367,13 @@ python3 -m sglang.launch_server \
 #   PREFILL_HOST_IP: prefill node IP address
 #   DECODE_HOST_IP: decode node IP address
 #   ROUTER_HOST_IP: router node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 #============================================================
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<PREFILL_HOST_IP>:8000 8995 \
-    --decode http://<DECODE_HOST_IP>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<PREFILL_HOST_IP>:8000 http://<DECODE_HOST_IP>:8001 \
     --host <ROUTER_HOST_IP> \
     --port 6689
 ```

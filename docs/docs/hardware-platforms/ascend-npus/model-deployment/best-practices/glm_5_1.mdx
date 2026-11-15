@@ -332,13 +332,15 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy round_robin
+    --policy round_robin \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -534,10 +536,10 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --policy round_robin
@@ -744,13 +746,15 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy round_robin
+    --policy round_robin \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -947,13 +951,15 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy round_robin
+    --policy round_robin \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -1149,13 +1155,15 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy round_robin
+    --policy round_robin \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark

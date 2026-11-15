@@ -151,6 +151,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
@@ -663,6 +666,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal and not get_disagg().language_model_only:
             import_processors("sglang.srt.multimodal.processors")
+            register_token_space_models()
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
             _processor = get_processor_wrapper()

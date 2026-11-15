@@ -14,7 +14,8 @@
 """Round-trip correctness of ``MambaSubPoolSpec.views`` -- the
 envelope-strided conv/temporal (SSM) state views that back ``StateView``.
 Guards against garbled greedy decode from a stride/offset/alignment bug in the
-state views. CPU-only.
+state views. Runs on CPU; the whole-entry clear case also runs on a GPU when
+one is present.
 
 Within one slot's envelope the bytes are
 ``[conv[0] L0 | conv[0] L1 | ... | conv[1] L0 | ... | temporal L0 | ...]``,
@@ -211,6 +212,51 @@ class TestUnifiedMambaViews(unittest.TestCase):
         self.assertEqual(float(conv[0][0, 2].item()), 7)
         self.assertEqual(float(temporal[0, 2].item()), 11)
         self.assertEqual(temporal.data_ptr() % 4, 0)
+
+    def test_whole_entry_clear_zeroes_exactly_the_cleared_entries(self):
+        """The whole-entry clear fills words, not bytes, when the entry rows
+        allow it: it must zero exactly the listed entries (duplicates included)
+        and pick the widest word that the row size, row stride and base offset
+        all divide, falling back to bytes otherwise."""
+        from sglang.srt.mem_cache.kv.layout.state import StateView, _as_widest_words
+
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device, layout="arena"):
+                pool, spec = _make_pool(**self.FALCON_KW, device=device)
+                view = StateView(arena=pool, spec=spec, mamba_layer_ids=[0, 1, 2, 3, 4])
+                self.assertEqual(view._entry_words.dtype, torch.int64)
+                pool.raw.fill_(0xAB)
+                expected = pool.raw.clone()
+                entry = spec.entry_bytes()
+                for slot in (2, 5):
+                    expected[slot * entry : (slot + 1) * entry] = 0
+                view.clear_slots(torch.tensor([2, 5, 2], device=device))
+                self.assertTrue(torch.equal(pool.raw, expected))
+
+            # (row bytes, row stride, base offset) -> widest legal word.
+            layouts = {
+                (24, 24, 0): torch.int64,
+                (24, 32, 0): torch.int64,
+                (24, 24, 4): torch.int32,
+                (24, 28, 0): torch.int32,
+                (12, 16, 0): torch.int32,
+                (24, 24, 1): torch.uint8,
+                (6, 6, 0): torch.uint8,
+            }
+            for (row, stride, offset), dtype in layouts.items():
+                with self.subTest(device=device, row=row, stride=stride, offset=offset):
+                    raw = torch.full(
+                        (offset + 4 * stride,), 0xAB, dtype=torch.uint8, device=device
+                    )
+                    rows = raw.as_strided((4, row), (stride, 1), offset)
+                    words = _as_widest_words(rows)
+                    self.assertEqual(words.dtype, dtype)
+                    expected = raw.clone()
+                    for r in (1, 3):
+                        expected[offset + r * stride : offset + r * stride + row] = 0
+                    words.index_fill_(0, torch.tensor([1, 3, 1], device=device), 0)
+                    self.assertTrue(torch.equal(raw, expected))
 
 
 def _k3_kda_mamba_geometry(heads_per_rank: int) -> dict:

@@ -367,6 +367,9 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -991,6 +994,7 @@ class Scheduler(
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
+                register_token_space_models()
                 self._mm_processor = get_mm_processor(
                     self.model_config.hf_config,
                     server_args,

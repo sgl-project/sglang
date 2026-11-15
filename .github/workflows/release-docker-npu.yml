@@ -10,43 +10,11 @@ on:
         required: true
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04-arm
-    strategy:
-      matrix:
-        cann_version: ["9.1.0"]
-        device_type: ["a3", "950"]
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Free up disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          docker-images: false
-
-        # push with tag
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            lmsysorg/sglang
-          tags: |
-            type=ref,event=pr
-          flavor: |
-            latest=false
-
-      # Login against a Docker registry except on PR
-      # https://github.com/docker/login-action
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        if: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Get version from tag
         id: version
         run: |
@@ -66,12 +34,51 @@ jobs:
             exit 1
           fi
           echo "version=v${VERSION}" >> $GITHUB_OUTPUT
-          echo "TAG=lmsysorg/sglang:v${VERSION}-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
-      # Enable Docker multi-architecture build environment
-      # Emulate non-native architectures
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      # Required for building and pushing multi-arch Docker images
+
+  # Each platform builds on a runner of its own architecture: the image compiles
+  # sgl-router, which is slow under QEMU emulation.
+  build:
+    name: build ${{ matrix.platform }}-${{ matrix.device_type }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        cann_version: ["9.1.0"]
+        device_type: ["a3", "950"]
+        platform: ["amd64", "arm64"]
+        include:
+          - platform: amd64
+            runner: ubuntu-latest
+          - platform: arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          docker-images: false
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            lmsysorg/sglang
+          flavor: |
+            latest=false
+
+      # Login against a Docker registry except on PR
+      # https://github.com/docker/login-action
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        if: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -81,13 +88,40 @@ jobs:
         with:
           context: docker
           file: docker/npu.Dockerfile
-          platforms: linux/arm64,linux/amd64
+          platforms: linux/${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ${{ steps.meta.outputs.tags || steps.version.outputs.TAG }}
+          tags: lmsysorg/sglang:${{ needs.version.outputs.version }}-cann${{ matrix.cann_version }}-${{ matrix.device_type }}-${{ matrix.platform }}
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
             SGLANG_KERNEL_NPU_TAG=2026.11.0.post5
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
-            SGLANG_TAG=${{ steps.version.outputs.version }}
+            SGLANG_TAG=${{ needs.version.outputs.version }}
+
+  merge:
+    name: merge multi-arch manifest
+    needs: [version, build]
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cann_version: ["9.1.0"]
+        device_type: ["a3", "950"]
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          IMAGE="lmsysorg/sglang:${{ needs.version.outputs.version }}-cann${{ matrix.cann_version }}-${{ matrix.device_type }}"
+          docker buildx imagetools create \
+            -t "${IMAGE}" \
+            "${IMAGE}-amd64" \
+            "${IMAGE}-arm64"
