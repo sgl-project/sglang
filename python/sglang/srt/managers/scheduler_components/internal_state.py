@@ -93,11 +93,8 @@ class SchedulerInternalStateController:
     def _add_disaggregation(self, state: Dict[str, Any]) -> None:
         # PD role switch: report this instance's role and the decode CUDA graph
         # batch sizes it captured, which a router feeds back as
-        # PdRoleSwitchReqInput.decode_cuda_graph_bs. Unset until
-        # init_disaggregation runs, which also re-derives it on every flip.
-        mode = getattr(self.scheduler, "disaggregation_mode", None)
-        if mode is None:
-            return
+        # PdRoleSwitchReqInput.decode_cuda_graph_bs.
+        mode = self.scheduler.disaggregation_mode
         graph_memory = state["memory_usage"]["graph"]
         state["disaggregation_mode"] = mode.value
         state["decode_cuda_graph_bs"] = (

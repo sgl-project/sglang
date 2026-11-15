@@ -12,7 +12,6 @@ maybe_stub_sgl_kernel()
 
 import torch
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
@@ -81,7 +80,6 @@ class TestCheckTreeCacheGate(CustomTestCase):
             is_hybrid_ssm=hybrid_ssm,
         )
         return SchedulerInvariantChecker(
-            disaggregation_mode=DisaggregationMode.NULL,
             page_size=1,
             tree_cache=tree_cache,
             token_to_kv_pool_allocator=MagicMock(),
@@ -144,7 +142,6 @@ class TestCheckTreeCacheGate(CustomTestCase):
 
 def _checker_over(lists):
     return SchedulerInvariantChecker(
-        disaggregation_mode=DisaggregationMode.NULL,
         page_size=1,
         tree_cache=None,
         token_to_kv_pool_allocator=None,
@@ -210,7 +207,6 @@ class TestEveryWindowIsConserved(CustomTestCase):
             "window_64": 4,
         }.__getitem__
         checker = SchedulerInvariantChecker(
-            disaggregation_mode=DisaggregationMode.NULL,
             page_size=1,
             tree_cache=tree_cache,
             token_to_kv_pool_allocator=MagicMock(),
@@ -320,7 +316,6 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             enable_hisparse=False,
         )
         return SchedulerInvariantChecker(
-            disaggregation_mode=DisaggregationMode.PREFILL,
             page_size=self.PAGE_SIZE,
             tree_cache=self.cache,
             token_to_kv_pool_allocator=self.allocator,

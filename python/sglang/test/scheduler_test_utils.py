@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Iterable
 from unittest.mock import MagicMock
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -101,7 +100,6 @@ def empty_request_lists(scheduler: Scheduler) -> None:
     scheduler.hisparse_coordinator = None
     scheduler.uocr_runtime = None
     scheduler.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
         output_streamer=None,
         request_retirer=None,
         send_abort=None,

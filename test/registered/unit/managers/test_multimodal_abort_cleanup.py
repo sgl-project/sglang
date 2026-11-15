@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -96,7 +95,6 @@ def _queued_scheduler(req):
     if req is not None:
         move([req], scheduler.waiting_queue)
     scheduler.mm_receiver = None
-    scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.tree_cache = MagicMock()
     scheduler.beam_coordinator = MagicMock()
     scheduler.ipc_channels = MagicMock()

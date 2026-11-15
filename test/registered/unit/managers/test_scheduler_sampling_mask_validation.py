@@ -7,7 +7,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -30,7 +35,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.model_config = SimpleNamespace(
                     hf_eos_token_id={1}, vocab_size=128
                 )
-                scheduler.disaggregation_mode = mode
+                enter_scope(self, published_topology(disaggregation_mode=mode.value))
                 scheduler.disagg_metadata_buffers = SimpleNamespace(
                     enable_sampling_mask=False
                 )
@@ -78,6 +83,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
 
     def test_rejected_streaming_turn_leaves_session_idle(self):
         """A turn rejected after `create_req` must not wedge its streaming session."""
+        enter_scope(self, published_topology())
         for name in ("sampling_mask", "dllm"):
             with self.subTest(rejection=name):
                 scheduler = Scheduler.__new__(Scheduler)
@@ -85,7 +91,6 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.model_config = SimpleNamespace(
                     hf_eos_token_id={1}, vocab_size=128
                 )
-                scheduler.disaggregation_mode = DisaggregationMode.NULL
                 scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
                 scheduler.tokenizer = None
                 scheduler.dllm_config = None

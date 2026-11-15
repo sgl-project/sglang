@@ -5,23 +5,21 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _MOD = "sglang.srt.managers.scheduler"
 
 
-def _check(align, chunk, attn_dp_size=1, mode=DisaggregationMode.NULL):
+def _check(align, chunk, attn_dp_size=1):
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.disaggregation_mode = mode
     scheduler.truncation_align_size = align
     scheduler.chunked_prefill_size = chunk
     parallel = SimpleNamespace(attn_dp_size=attn_dp_size)
-    with patch(f"{_MOD}.get_parallel", return_value=parallel):
+    with published_topology(), patch(f"{_MOD}.get_parallel", return_value=parallel):
         scheduler.check_truncation_align_fits_chunk()
 
 

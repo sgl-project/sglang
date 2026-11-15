@@ -3,11 +3,14 @@ from collections import deque
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
@@ -45,6 +48,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
     in-flight requests)."""
 
     def _new_scheduler(self) -> Scheduler:
+        enter_scope(self, published_topology())
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
         scheduler.pause_state = PauseState()
@@ -53,7 +57,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.last_batch = None
         scheduler.cur_batch = None
         scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
         scheduler.result_queue = deque()
@@ -76,7 +79,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
         scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
             request_retirer=None,
             send_abort=None,

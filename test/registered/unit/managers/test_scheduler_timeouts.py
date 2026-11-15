@@ -11,9 +11,8 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -214,7 +213,6 @@ class TestQueuedAbort(CustomTestCase):
         req = _req("queued")
         # Still listed in the last batch, as a requeued or dLLM request is.
         s = _scheduler([req], last_batch_reqs=[req])
-        s.disaggregation_mode = DisaggregationMode.NULL
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
@@ -237,7 +235,6 @@ class TestQueuedAbort(CustomTestCase):
         staging = IndexedReqList(ListKind.HISPARSE_STAGING, req_of=lambda x: x.req)
         move([SimpleNamespace(req=req)], staging)
         s = _scheduler([])
-        s.disaggregation_mode = DisaggregationMode.NULL
         s.hisparse_coordinator = SimpleNamespace(
             ack_staging_queue=staging,
             request_lists=lambda: {ListKind.HISPARSE_STAGING: staging},
@@ -284,7 +281,7 @@ class TestRunningTimeout(CustomTestCase):
         s = _scheduler([], last_batch_reqs=[fresh])
         s.enable_continuous_input_polling = True
         s.result_queue = deque([(_batch([stale]), None), (s.last_batch, None)])
-        s.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()

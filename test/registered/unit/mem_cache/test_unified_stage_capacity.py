@@ -201,7 +201,6 @@ def _request_stage(
     """A scheduler that runs production request intake on ``allocator``."""
     from types import SimpleNamespace as NS
 
-    from sglang.srt.disaggregation.mode import DisaggregationMode
     from sglang.srt.managers.scheduler import Scheduler
 
     s = Scheduler.__new__(Scheduler)
@@ -221,7 +220,6 @@ def _request_stage(
         cache_controller=None,
     )
     s.enable_session_radix_cache = False
-    s.disaggregation_mode = DisaggregationMode.NULL
     s.model_config = NS(hf_eos_token_id={1}, vocab_size=128)
     s.metrics_reporter = NS(enable_metrics=False)
     s.tokenizer = s.dllm_config = None

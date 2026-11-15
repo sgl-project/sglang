@@ -10,7 +10,6 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskStatus,
@@ -96,7 +95,6 @@ def _run(cls, *, hisparse=False):
     )
     kwargs.update(
         is_generation=True,
-        disaggregation_mode=DisaggregationMode.NULL,
         model_config=SimpleNamespace(
             self_opened_think_start_ids=None, think_end_ids=None
         ),

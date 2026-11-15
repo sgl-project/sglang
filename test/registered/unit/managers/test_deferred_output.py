@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req
@@ -24,7 +23,7 @@ from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import get_context, get_serving
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.weight_versions import (
     WeightVersionSpan,
@@ -52,7 +51,6 @@ def _req(rid, return_logprob=False):
 
 def _scheduler():
     scheduler = object.__new__(Scheduler)
-    scheduler.disaggregation_mode = DisaggregationMode.NULL
     empty_request_lists(scheduler)
     scheduler.collect_inflight_reqs = lambda: set()
     scheduler.ipc_channels = Mock()
@@ -109,8 +107,7 @@ def test_defer_response_rejects_invalid_ownership(invalid):
     elif invalid == "listed":
         move([req], scheduler.running_reqs)
     else:
-        scheduler.disaggregation_mode = DisaggregationMode(invalid)
-        scheduler.init_deferred_responses()
+        get_context().override("test", disaggregation_mode=invalid)
 
     with pytest.raises(ValueError):
         scheduler.defer_response(req, Future())
@@ -234,7 +231,6 @@ def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler = MagicMock()
     scheduler.output_streamer = _scheduler().output_streamer
     scheduler.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
         output_streamer=scheduler.output_streamer,
         request_retirer=leaving_retirer(),
         send_abort=None,
@@ -244,7 +240,6 @@ def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler._last_stall_publish_ts = float("inf")
     scheduler.enable_hicache_storage = False
     scheduler.enable_lmcache = False
-    scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.enable_hisparse = True  # skips the pool accounting checks
 
     def poll():

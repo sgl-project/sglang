@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Callable, Dict, Optional
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mode import (
+    DisaggregationMode,
+    current_disaggregation_mode,
+)
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -33,12 +36,10 @@ class DeferredResponses:
     def __init__(
         self,
         *,
-        disaggregation_mode: DisaggregationMode,
         output_streamer: SchedulerOutputStreamer,
         request_retirer: RequestRetirer,
         send_abort: Callable[[Req, Optional[FinishReasonDict]], None],
     ):
-        self.disaggregation_mode = disaggregation_mode
         self.output_streamer = output_streamer
         self.request_retirer = request_retirer
         self.send_abort = send_abort
@@ -51,7 +52,7 @@ class DeferredResponses:
         return {ListKind.DEFERRED: self.held}
 
     def defer(self, req: Req, completion: ResponseCompletion) -> None:
-        if self.disaggregation_mode != DisaggregationMode.NULL:
+        if current_disaggregation_mode() != DisaggregationMode.NULL:
             raise ValueError("deferred responses do not support PD disaggregation")
         if not req.finished() or req.finished_output:
             raise ValueError("only finished, unstreamed responses can be deferred")

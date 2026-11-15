@@ -14,11 +14,15 @@ from unittest.mock import MagicMock, Mock, patch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
@@ -45,9 +49,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class TestOnIdleStallPublish(CustomTestCase):
     def _stalled_scheduler(self) -> Scheduler:
+        enter_scope(self, published_topology())
         s = Scheduler.__new__(Scheduler)
         s.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
             request_retirer=None,
             send_abort=None,
@@ -55,7 +59,6 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
         s.enable_unified_cache_external_linker = False
-        s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_lmcache = False
         s.maybe_send_health_check_signal = MagicMock()
         s.is_fully_idle = MagicMock(return_value=False)  # stalled, not idle
@@ -104,9 +107,9 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         return materializer, future, value
 
     def _idle_scheduler(self, materializer):
+        enter_scope(self, published_topology())
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
             request_retirer=None,
             send_abort=None,
@@ -125,7 +128,6 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler._pp_microbatches_drained = MagicMock(return_value=True)
         scheduler.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.enable_hisparse = False
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.running_reqs = []

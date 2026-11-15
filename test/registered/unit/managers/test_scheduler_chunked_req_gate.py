@@ -6,11 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -63,7 +67,6 @@ def _make_tree_cache() -> BasePrefixCache:
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
     s.scheduler_stage_metrics = None
-    s.disaggregation_mode = DisaggregationMode.NULL
     s.dllm_config = None
     s.dllm_manager = None
     s.enable_hisparse = False
@@ -116,6 +119,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
     POST_RESET_FILL_LEN = 32  # length after init_next_round_input rebuilds
 
     def _build(self, *, fill_len: int):
+        enter_scope(self, published_topology())
         cache = _make_tree_cache()
         req = _make_req(
             req_pool_idx=self.POOL_IDX,

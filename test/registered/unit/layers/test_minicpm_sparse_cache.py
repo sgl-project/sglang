@@ -208,7 +208,6 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
     )
     observer = _state_model_observer(pool, allocator, tree_cache)
     checker = SchedulerInvariantChecker(
-        disaggregation_mode=None,
         page_size=1,
         tree_cache=tree_cache,
         token_to_kv_pool_allocator=allocator,
@@ -275,7 +274,6 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         ckpt_pool=None,
     )
     checker = SchedulerInvariantChecker(
-        disaggregation_mode=None,
         page_size=1,
         tree_cache=SimpleNamespace(
             mamba_protected_size=lambda: 0,

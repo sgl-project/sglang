@@ -23,7 +23,6 @@ from sglang.srt.disaggregation.common.conn import (  # noqa: E402
     CommonKVManager,
     CommonKVSender,
 )
-from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
@@ -35,6 +34,7 @@ from sglang.srt.managers.scheduler_components.pause_state import (  # noqa: E402
     PauseState,
 )
 from sglang.srt.managers.scheduler_components.request_list import move  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -75,7 +75,6 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     if chunked_req is not None:
         move([chunked_req], sched.chunked_reqs)
     sched._pending_chunked_abort_req = pending_req
-    sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
     sched.mm_receiver = None
     sched.rust_server = None
@@ -165,7 +164,7 @@ class TestPPPrefillLoopAppliesChunkedAbort(CustomTestCase):
         req.disagg_kv_sender = None
         req.metadata_buffer_index = -1
         sched = _make_scheduler(None, chunked_req=req, running_reqs=[])
-        sched.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         sched.req_to_metadata_buffer_idx_allocator = Mock()
         sched.init_pp_loop_state = Mock()
         sched.pp_loop_size = 1
@@ -275,7 +274,7 @@ class TestPrefillAbortRetiresSendRecord(CustomTestCase):
         manager, sender = self._sender_after_first_chunk()
         req = self._req("chunked", sender)
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.disaggregation_mode = DisaggregationMode.PREFILL
+        get_context().override("test", disaggregation_mode="prefill")
         sched.req_to_metadata_buffer_idx_allocator = Mock()
 
         with (

@@ -21,7 +21,6 @@ maybe_stub_sgl_kernel()
 
 from test_unified_page_writability import _Bands, _chain  # noqa: E402
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.utils import EmbeddingBatchResult
@@ -125,7 +124,6 @@ class TestEmbeddingForwardRecords(_Bands):
         scheduler.scheduler_stage_metrics = None
         scheduler._on_step_launch = mock.Mock()
         scheduler.forward_sleep_time = None
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.is_generation = False
         scheduler.enable_overlap = True
         scheduler.enable_unified_memory = True

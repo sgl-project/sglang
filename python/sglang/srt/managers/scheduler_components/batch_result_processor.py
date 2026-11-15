@@ -17,7 +17,10 @@ from typing import (
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mode import (
+    DisaggregationMode,
+    current_disaggregation_mode,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -133,7 +136,6 @@ def _record_token_values(
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
-    disaggregation_mode: DisaggregationMode
     model_config: ModelConfig
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
@@ -159,7 +161,7 @@ class SchedulerBatchResultProcessor:
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
-        assert self.disaggregation_mode == DisaggregationMode.DECODE
+        assert current_disaggregation_mode() == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()

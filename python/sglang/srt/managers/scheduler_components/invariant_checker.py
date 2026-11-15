@@ -18,7 +18,6 @@ from typing import (
 
 import torch
 
-from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -63,7 +62,6 @@ BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
-    disaggregation_mode: DisaggregationMode
     # Logical token page width; CP KV sharding uses CP size * physical page_size.
     page_size: int
     tree_cache: BasePrefixCache

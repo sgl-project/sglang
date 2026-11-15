@@ -44,6 +44,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -345,7 +346,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
             skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
@@ -378,7 +378,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
             skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
@@ -416,7 +415,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
             skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
@@ -457,7 +455,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
             skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
@@ -482,7 +479,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
             skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
@@ -508,7 +504,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
             skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
@@ -530,7 +525,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
                 server_args=SimpleNamespace(),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
-                disaggregation_mode=DisaggregationMode.NULL,
                 skip_tokenizer_init=False,
                 enable_hicache_storage=lambda: False,
                 rust_server=object(),
@@ -598,7 +592,6 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
             skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
             rust_server=rust_server,
@@ -638,7 +631,6 @@ def _streamer(outputs, enable_hicache_storage=lambda: False, is_generation=True)
         server_args=SimpleNamespace(enable_lmcache=False),
         is_generation=is_generation,
         spec_algorithm=SpeculativeAlgorithm.NONE,
-        disaggregation_mode=DisaggregationMode.NULL,
         skip_tokenizer_init=False,
         enable_hicache_storage=enable_hicache_storage,
     )
@@ -800,7 +792,6 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=disaggregation_mode,
             skip_tokenizer_init=False,
             enable_hicache_storage=lambda: storage_backend is not None,
             rust_server=rust_server,
@@ -811,7 +802,8 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
         req.cached_tokens_device = 1
         req.cached_tokens_host = 2
         req.cached_tokens_storage = 3
-        streamer._stream_output_generation([req], False)
+        with get_disagg().override(disaggregation_mode=disaggregation_mode.value):
+            streamer._stream_output_generation([req], False)
         return rust_server.push_generation.call_args.args[2:4]
 
     def test_rust_frames_split_cached_tokens_by_tier(self):
@@ -838,6 +830,9 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
 
 
 class TestOutputStreamerRustRequestStats(unittest.TestCase):
+    def setUp(self):
+        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
+
     def _stats_sent(self, *, metrics, speculative):
         """The `request_stats` one Rust egress frame carries for a running
         request and a finished one, which was retracted twice, waited on a
@@ -871,7 +866,6 @@ class TestOutputStreamerRustRequestStats(unittest.TestCase):
             spec_algorithm=(
                 SpeculativeAlgorithm.EAGLE if speculative else SpeculativeAlgorithm.NONE
             ),
-            disaggregation_mode=DisaggregationMode.NULL,
             skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
             rust_server=rust_server,
@@ -1203,7 +1197,6 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
             server_args=SimpleNamespace(enable_lmcache=False),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
             skip_tokenizer_init=True,
             enable_hicache_storage=lambda: False,
         )
