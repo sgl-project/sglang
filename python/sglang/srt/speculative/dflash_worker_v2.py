@@ -941,6 +941,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             output_multiplier=draft_config.output_multiplier,
             final_logit_softcapping=draft_config.final_logit_softcapping,
+            memory_saver_adapter=self._target_worker.model_runner.memory_saver_adapter,
         )
         if self._target_tp_rank == 0:
             if blocker is None:
