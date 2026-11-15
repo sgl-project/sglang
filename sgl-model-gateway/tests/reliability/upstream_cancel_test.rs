@@ -552,10 +552,6 @@ mod upstream_cancel_tests {
     }
 
     /// PD-disagg streaming cancel: client disconnects mid-decode-stream.
-    /// The decode worker's slow-stream tracker is what proves cancel
-    /// actually reached the upstream — prefill is fully drained
-    /// synchronously by `process_prefill_response`, so it's expected
-    /// to complete regardless.
     #[tokio::test]
     async fn test_pd_streaming_cancel_on_client_disconnect() {
         let prefill_port = 20258;
@@ -1625,10 +1621,6 @@ mod upstream_cancel_tests {
     /// PD streaming client disconnect:
     /// - decode breaker must show zero delta (`BreakerTrackedStream` drops
     ///   Active → no tick).
-    /// - prefill breaker must show exactly +1 success (prefill is fully
-    ///   drained before decode streaming starts, so `record_outcome(true)`
-    ///   fires for the 2xx prefill regardless of what the client does to
-    ///   the decode stream).
     #[tokio::test]
     async fn test_disconnect_does_not_move_breaker_pd_decode() {
         let prefill_port = 20272;
