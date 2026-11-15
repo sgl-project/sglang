@@ -365,6 +365,104 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             self.serving_embedding._validate_request(invalid_request),
         )
 
+    def test_validate_request_rejects_booleans_in_token_id_list(self):
+        bool_first = EmbeddingRequest.model_construct(
+            model="test-model", input=[True, False], encoding_format="float"
+        )
+        self.assertIn(
+            "Unsupported input item type: bool",
+            self.serving_embedding._validate_request(bool_first),
+        )
+
+        bool_later = EmbeddingRequest.model_construct(
+            model="test-model", input=[1, True], encoding_format="float"
+        )
+        self.assertIn(
+            "All items in input list must be integers",
+            self.serving_embedding._validate_request(bool_later),
+        )
+
+    def test_validate_request_validates_nested_token_id_batches(self):
+        valid_batch = EmbeddingRequest(
+            model="test-model", input=[[1, 2, 3], [4, 5]], encoding_format="float"
+        )
+        self.assertIsNone(self.serving_embedding._validate_request(valid_batch))
+
+        empty_inner = EmbeddingRequest(
+            model="test-model", input=[[1, 2], []], encoding_format="float"
+        )
+        self.assertIn(
+            "Token ID list at index 1 cannot be empty",
+            self.serving_embedding._validate_request(empty_inner),
+        )
+
+        negative_token = EmbeddingRequest(
+            model="test-model", input=[[1, 2], [3, -1]], encoding_format="float"
+        )
+        self.assertIn(
+            "Token ID at index 1 in list 1 must be non-negative, got -1",
+            self.serving_embedding._validate_request(negative_token),
+        )
+
+        bool_token = EmbeddingRequest.model_construct(
+            model="test-model", input=[[1, 2], [3, False]], encoding_format="float"
+        )
+        self.assertIn(
+            "All items in token ID list at index 1 must be integers, "
+            "got bool at index 1",
+            self.serving_embedding._validate_request(bool_token),
+        )
+
+        non_list_item = EmbeddingRequest.model_construct(
+            model="test-model", input=[[1, 2], "hello"], encoding_format="float"
+        )
+        self.assertIn(
+            "All items in input list must be lists of integers, got str at index 1",
+            self.serving_embedding._validate_request(non_list_item),
+        )
+
+    def test_validate_request_validates_all_multimodal_items(self):
+        empty_second = EmbeddingRequest(
+            model="test-model",
+            input=[
+                MultimodalEmbeddingInput(text="Hello", image=None, video=None),
+                MultimodalEmbeddingInput(text=None, image=None, video=None),
+            ],
+            encoding_format="float",
+        )
+        self.assertIn(
+            "At least one of text, image, or video must be provided",
+            self.serving_embedding._validate_request(empty_second),
+        )
+
+        whitespace_second = EmbeddingRequest(
+            model="test-model",
+            input=[
+                MultimodalEmbeddingInput(text="Hello", image=None, video=None),
+                MultimodalEmbeddingInput(text="   ", image=None, video=None),
+            ],
+            encoding_format="float",
+        )
+        self.assertIn(
+            "Input text cannot be empty or whitespace only when no "
+            "image or video is provided",
+            self.serving_embedding._validate_request(whitespace_second),
+        )
+
+        mixed_second = EmbeddingRequest.model_construct(
+            model="test-model",
+            input=[
+                MultimodalEmbeddingInput(text="Hello", image=None, video=None),
+                "not-a-multimodal-item",
+            ],
+            encoding_format="float",
+        )
+        self.assertIn(
+            "All items in input list must be MultimodalEmbeddingInput, "
+            "got str at index 1",
+            self.serving_embedding._validate_request(mixed_second),
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
