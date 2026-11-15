@@ -16,13 +16,13 @@ lies past it.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import msgspec
 import torch
 
 from sglang.kernels.ops.kvcache.copy_pages import copy_pages
-from sglang.kernels.ops.kvcache.zero_pages import zero_pages
+from sglang.kernels.ops.kvcache.zero_pages import bind_zero_pages, zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
@@ -240,6 +240,35 @@ class KVArena:
         )
         if name in self.page_parts:
             self.page_parts[name].reset_rows(units)
+
+    def bind_zero_units(
+        self,
+        name: str,
+        virtual_units: torch.Tensor,
+        v2p: torch.Tensor,
+        p2v: torch.Tensor,
+        *,
+        start: Optional[int] = None,
+        units: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Bind ``virtual_units`` to physical units of one band in its tables
+        ``v2p``/``p2v`` and zero those units as `zero_units` does, the bind
+        and the zeroing in one launch. The physical units are ``units``, or the
+        ascending run from ``start``; returns them."""
+        band = self._by_name[name]
+        units = bind_zero_pages(
+            self.raw,
+            virtual_units,
+            v2p,
+            p2v,
+            num_pages=self._extent[name] // band.unit_entries,
+            page_bytes=band.unit_bytes,
+            start_page=start,
+            pages=units,
+        )
+        if name in self.page_parts:
+            self.page_parts[name].reset_rows(units)
+        return units
 
     # -- backing --
 
