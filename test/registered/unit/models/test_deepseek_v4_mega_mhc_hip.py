@@ -1,0 +1,341 @@
+import sys
+import types
+import unittest
+from unittest import mock
+
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.models import deepseek_v4_mhc as mhc
+from sglang.srt.models import deepseek_v4_platform_stage
+from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _cfg(*, mult=4, hidden=5120, cp_prefill=False):
+    return mhc.HcConfig(
+        mult=mult,
+        sinkhorn_iters=20,
+        eps=1e-6,
+        rms_eps=1e-6,
+        hidden=hidden,
+        pre_from_prev=True,
+        cp_prefill=cp_prefill,
+    )
+
+
+class _Norm:
+    def __init__(self):
+        self.weight = torch.ones(4)
+        self.variance_epsilon = 1e-6
+
+
+def _sublayer(cfg):
+    return mhc.HcSubLayer(
+        cfg=cfg,
+        fn=torch.zeros(1),
+        scale=torch.zeros(1),
+        base=torch.zeros(1),
+        norm=_Norm(),
+    )
+
+
+class TestMegaMhcGate(unittest.TestCase):
+    def test_gate(self):
+        # (flag, gfx950, config, expected)
+        cases = [
+            (False, True, _cfg(), False),
+            (True, True, _cfg(), True),
+            (True, True, _cfg(mult=2), False),
+            (True, True, _cfg(hidden=4096), False),
+            (True, True, _cfg(cp_prefill=True), False),
+            (True, False, _cfg(), False),
+        ]
+        for flag, gfx95, cfg, expected in cases:
+            with (
+                self.subTest(flag=flag, gfx95=gfx95, cfg=cfg),
+                envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(flag),
+                mock.patch.object(mhc, "_is_hip", True),
+                mock.patch.object(mhc, "_is_gfx95_supported", gfx95),
+            ):
+                self.assertEqual(mhc._can_use_mega_mhc(cfg), expected)
+
+
+class TestHipFlydslDispatch(unittest.TestCase):
+    def _boundary(self, cfg):
+        hc = _sublayer(cfg)
+        return mhc.HcNextBoundary(
+            norm=hc.norm,
+            accepts_mxfp8=False,
+            norm_fusable=True,
+            hc=hc,
+            extend=True,
+        )
+
+    def test_calls_flydsl_bf16_and_packs_next_stats(self):
+        cfg = _cfg()
+        y = torch.zeros(2, 4)
+        residual = torch.zeros(2, 4, 4)
+        pre = torch.zeros(2, 4)
+        post_mix = torch.zeros(2, 4)
+        comb = torch.zeros(2, 4, 4)
+        updated = torch.ones(2, 4, 4)
+        normalized = torch.full((2, 4), 3.0)
+        next_post = torch.full((2, 4, 1), 4.0)
+        next_comb = torch.full((2, 4, 4), 5.0)
+        next_pre = torch.full((2, 4), 6.0)
+        seen = {}
+
+        def fake_flydsl(*args, **kwargs):
+            seen["out_dtype"] = kwargs["out_dtype"]
+            seen["post_ndim"] = kwargs["post_layer_mix"].ndim
+            return updated, next_post, next_comb, normalized, next_pre
+
+        flydsl = types.ModuleType("aiter.ops.flydsl")
+        flydsl.flydsl_mega_mhc = fake_flydsl
+        ops = types.ModuleType("aiter.ops")
+        ops.flydsl = flydsl
+        aiter = types.ModuleType("aiter")
+        aiter.ops = ops
+        with (
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(True),
+            mock.patch.object(mhc, "_is_hip", True),
+            mock.patch.object(mhc, "_is_gfx95_supported", True),
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "aiter": aiter,
+                    "aiter.ops": ops,
+                    "aiter.ops.flydsl": flydsl,
+                },
+            ),
+        ):
+            state = mhc._post_fusion(
+                _sublayer(cfg), y, residual, (pre, post_mix, comb), self._boundary(cfg)
+            )
+
+        self.assertEqual(seen["out_dtype"], "bf16")
+        self.assertEqual(seen["post_ndim"], 3)
+        self.assertIsInstance(state.input, mhc.HcNormed)
+        self.assertTrue(torch.equal(state.input.rows, normalized))
+        self.assertTrue(torch.equal(state.streams, updated))
+        self.assertEqual(state.stats[0].shape, (2, 4))
+        self.assertEqual(state.stats[1].shape, (2, 4))
+        self.assertTrue(torch.equal(state.pre, pre))
+
+
+class TestHipClosedSeam(unittest.TestCase):
+    def _hc(self, hidden=5120):
+        norm = _Norm()
+        norm.weight = torch.ones(hidden, dtype=torch.bfloat16)
+        norm.cast_x_before_out_mul = False
+        norm.variance_size_override = None
+        return mhc.HcSubLayer(
+            cfg=_cfg(),
+            fn=torch.zeros(1),
+            scale=torch.zeros(1),
+            base=torch.zeros(1),
+            norm=norm,
+        )
+
+    def _run(self, state, *, hc=None, extend=True, flag=True):
+        normalized = torch.full((2, 4), 3.0)
+        post_mix = torch.full((2, 4, 1), 4.0)
+        comb = torch.full((2, 4, 4), 5.0)
+        next_pre = torch.full((2, 4), 6.0)
+        calls = []
+
+        def fake_flydsl(residual, *args, **kwargs):
+            calls.append((args, kwargs))
+            return residual, post_mix, comb, normalized, next_pre
+
+        flydsl = types.ModuleType("aiter.ops.flydsl")
+        flydsl.flydsl_mega_mhc = fake_flydsl
+        ops = types.ModuleType("aiter.ops")
+        ops.flydsl = flydsl
+        aiter = types.ModuleType("aiter")
+        aiter.ops = ops
+        hc = hc or self._hc()
+        with (
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(flag),
+            mock.patch.object(mhc, "_is_hip", True),
+            mock.patch.object(mhc, "_is_gfx95_supported", True),
+            mock.patch.dict(
+                sys.modules,
+                {"aiter": aiter, "aiter.ops": ops, "aiter.ops.flydsl": flydsl},
+            ),
+        ):
+            out = mhc.mega_closed_seam(hc, state, extend)
+        return out, calls, hc, (next_pre, comb, normalized)
+
+    def test_engram_seam_runs_no_post_mega(self):
+        residual = torch.zeros(2, 4, 5120)
+        pre = torch.full((2, 4), 0.25)
+        state = mhc.HcState(residual, pre)
+        out, calls, hc, (next_pre, comb, normalized) = self._run(state)
+
+        self.assertEqual(len(calls), 1)
+        args, kwargs = calls[0]
+        self.assertIs(args[8], pre)
+        for key in ("sublayer_out", "post_layer_mix", "comb_res_mix", "residual_out"):
+            self.assertNotIn(key, kwargs)
+        self.assertIs(kwargs["norm_weight"], hc.norm.weight)
+        self.assertEqual(kwargs["out_dtype"], "bf16")
+        self.assertIs(out.streams, residual)
+        self.assertIs(out.pre, pre)
+        self.assertIsInstance(out.input, mhc.HcNormed)
+        self.assertTrue(torch.equal(out.input.rows, normalized))
+        self.assertTrue(torch.equal(out.stats[0], next_pre))
+        self.assertEqual(out.stats[1].shape, (2, 4))
+        self.assertTrue(torch.equal(out.stats[2], comb))
+        self.assertIsNone(state.streams)
+
+    def test_first_layer_takes_identity_pre(self):
+        out, calls, _, _ = self._run(mhc.HcState(torch.zeros(2, 4, 5120)))
+        self.assertIsNone(calls[0][0][8])
+        self.assertIsNone(out.pre)
+
+    def test_other_seams_unchanged(self):
+        residual = torch.zeros(2, 4, 5120)
+        pre = torch.zeros(2, 4)
+        cases = {
+            "folded input": (
+                mhc.HcState(residual, pre, mhc.HcNormed(residual[:, 0])),
+                {},
+            ),
+            "folded stats": (
+                mhc.HcState(residual, pre, None, (pre, pre, residual)),
+                {},
+            ),
+            "decode": (mhc.HcState(residual, pre), {"extend": False}),
+            "flag off": (mhc.HcState(residual, pre), {"flag": False}),
+            "no rows": (mhc.HcState(torch.zeros(0, 4, 5120), pre), {}),
+            "norm not fusable": (mhc.HcState(residual, pre), {"hc": self._hc(4096)}),
+        }
+        for name, (state, kwargs) in cases.items():
+            with self.subTest(name):
+                out, calls, _, _ = self._run(state, **kwargs)
+                self.assertIs(out, state)
+                self.assertEqual(calls, [])
+
+
+class TestHipBoundaryExtend(unittest.TestCase):
+    def test_prefill_boundaries_extend(self):
+        layer = deepseek_v4_platform_stage.NonCudaDecoderMixin()
+        layer.hc_cfg = _cfg()
+        layer.hc_stats_stream = None
+        layer.attn_hc = layer.ffn_hc = _sublayer(_cfg())
+        layer.post_attention_layernorm = _Norm()
+        layer._next_layer = mock.Mock()
+        layer.self_attn = mock.MagicMock(attn_tp_size=1)
+        layer.self_attn.accepts_mxfp8_swizzled_input.return_value = False
+        layer._can_fuse_attn_mhc = layer._can_fuse_ffn_mhc = False
+        layer.mlp = mock.Mock(tp_size=1)
+        layer._run_moe_ffn_dp_sync = mock.Mock()
+        seen = []
+
+        def boundary(norm, **kwargs):
+            return mhc.HcNextBoundary(
+                norm=norm, accepts_mxfp8=False, norm_fusable=True, hc=kwargs["hc"]
+            )
+
+        def post(hc, y, residual, *, next, **kwargs):
+            seen.append(next.extend)
+            return mock.Mock()
+
+        def closed_seam(hc, state, extend):
+            seen.append(extend)
+            return state
+
+        modes = {
+            ForwardMode.EXTEND: True,
+            ForwardMode.MIXED: True,
+            ForwardMode.DECODE: False,
+            ForwardMode.TARGET_VERIFY: False,
+        }
+        # (HIP, decode env) -> whether decode / verify steps take the extend boundaries
+        switches = {(True, False): False, (True, True): True, (False, True): False}
+        with (
+            mock.patch.object(mhc, "make_boundary", side_effect=boundary),
+            mock.patch.object(mhc, "use_stats_stream", return_value=False),
+            mock.patch.object(mhc, "fork_stats_stream"),
+            mock.patch.object(mhc, "combine"),
+            mock.patch.object(mhc, "mega_closed_seam", side_effect=closed_seam),
+            mock.patch.object(mhc, "run_attn_post", side_effect=post),
+            mock.patch.object(mhc, "run_moe_post", side_effect=post),
+        ):
+            for (hip, mega_decode), decode_extends in switches.items():
+                for mode, extend in modes.items():
+                    with (
+                        self.subTest(hip=hip, mega_decode=mega_decode, mode=mode.name),
+                        mock.patch.object(mhc, "_is_hip", hip),
+                        envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.override(mega_decode),
+                    ):
+                        seen.clear()
+                        layer.forward_hc_pre_from_prev(
+                            None,
+                            mock.Mock(),
+                            None,
+                            types.SimpleNamespace(forward_mode=mode),
+                            None,
+                        )
+                        expected = extend or decode_extends
+                        # the closed-seam check, the attention seam, then the MoE seam
+                        self.assertEqual(seen, [expected, expected, expected])
+
+
+class TestFusedBoundaryRouting(unittest.TestCase):
+    def test_routing(self):
+        layer = mock.Mock(hc_pre_from_prev_sublayer=True, hc_mult=4)
+        with (
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(True),
+            mock.patch.object(deepseek_v4_hip, "_is_gfx95_supported", True),
+            mock.patch.object(
+                deepseek_v4_hip.gfx95_dense,
+                "fused_rmsnorm_fp8_quant_eligible",
+                return_value=False,
+            ),
+            mock.patch.object(
+                deepseek_v4_hip.gfx95_dense,
+                "fused_rmsnorm_fake_quant_eligible",
+                return_value=False,
+            ),
+        ):
+            deepseek_v4_hip.init_decoder_layer(layer, quant_config=None)
+        # the AMD monokernel refuses a layer without it at attach
+        self.assertTrue(layer.hc_boundary_fused)
+
+        prefill = (ForwardMode.EXTEND, ForwardMode.MIXED)
+        decode = (
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND_V2,
+        )
+        # (prefill env, decode env) -> (fused prefill, fused decode)
+        cases = {
+            (False, False): (True, True),
+            (False, True): (True, True),
+            (True, False): (False, True),
+            (True, True): (False, False),
+        }
+        for (mega, mega_decode), (fused_prefill, fused_decode) in cases.items():
+            for modes, expected in ((prefill, fused_prefill), (decode, fused_decode)):
+                for mode in modes:
+                    with (
+                        self.subTest(
+                            mega=mega, mega_decode=mega_decode, mode=mode.name
+                        ),
+                        envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(mega),
+                        envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.override(mega_decode),
+                    ):
+                        fused = deepseek_v4_hip.fused_boundary_this_step(
+                            types.SimpleNamespace(forward_mode=mode)
+                        )
+                        self.assertEqual(fused, expected)
+
+
+if __name__ == "__main__":
+    unittest.main()
