@@ -11,9 +11,10 @@ new, because FA4 compiles CuTe DSL rather than tracing Python.
 
 Rather than re-implement the visibility algebra in CuTe, the kernel reads a
 truth table that the host already computed over semantic runs. Every token
-carries the id of its run; the answer for a pair is one bit at
-``(q_run, k_run)``. The rules stay in Python, and this kernel never learns what
-a view or a frame is.
+carries the id of its run; the answer for a pair is one byte at
+``(q_run, key position)``, or one bit at ``(q_run, k_run)`` for a table too
+large to expand over the keys. The rules stay in Python, and this kernel never
+learns what a view or a frame is.
 
 Everything CuTe/CUTLASS is imported lazily: the vendored FA4 CuTe kernels are
 Hopper/Blackwell-only, and the multiview module must stay importable on
@@ -43,20 +44,21 @@ _OP_NAME = "cosmos3_multiview_fa4"
 # eq=False: the fields are tensors, so a generated __eq__ would return a tensor
 # rather than a bool. Instances are cache values compared by identity.
 class Fa4BlockSparsity(msgspec.Struct, frozen=True, eq=False):
-    """Block map and packed run table in the layout the FA4 custom op consumes.
+    """Block map and pair table in the layout the FA4 custom op consumes.
 
-    ``partial_*``/``full_*`` are the FlexAttention KV-block layout. The aux
-    tensors resolve pairs inside partial tiles and must be exactly as long as
-    the padded query/key streams (see ``_build_mask_mod``).
+    ``partial_*``/``full_*`` are the FlexAttention KV-block layout. The other
+    tensors resolve pairs inside partial tiles: ``allowed_table`` in either
+    form ``fa4_mask_table`` builds, with ``q_table_base`` and ``k_group_ids``
+    exactly as long as the padded query/key streams (see ``_build_mask_mods``).
     """
 
     partial_counts: torch.Tensor
     partial_indices: torch.Tensor
     full_counts: torch.Tensor
     full_indices: torch.Tensor
-    q_word_base: torch.Tensor
+    q_table_base: torch.Tensor
     k_group_ids: torch.Tensor
-    allowed_words: torch.Tensor
+    allowed_table: torch.Tensor
     q_block_size: int
     kv_block_size: int
 
@@ -64,31 +66,35 @@ class Fa4BlockSparsity(msgspec.Struct, frozen=True, eq=False):
 class _Fa4Entry(NamedTuple):
     flash_attn_func: Any
     block_sparse_cls: Any
-    mask_mod: Any
+    # mask_mod per ``allowed_table`` dtype: int8 key-expanded, int32 packed words
+    mask_mods: dict[torch.dtype, Any]
 
 
 _entry: _Fa4Entry | None = None
 
 
-def _build_mask_mod(cutlass, cute, fa_utils):
-    """Multiview mask_mod over the packed run truth table.
+def _build_mask_mods(cutlass, cute, fa_utils) -> dict[torch.dtype, Any]:
+    """The multiview mask_mods, one per form of the truth table.
 
     ``aux_tensors`` are, in order:
 
-    * ``q_word_base`` ``(seqlen_q,)`` int32: ``q_run * words_per_row``.
-    * ``k_group_ids`` ``(seqlen_k,)`` int32: the key token's run id.
-    * ``allowed_words`` ``(q_runs * words_per_row,)`` int32: the truth table
-      over run pairs, bit-packed 32 keys per word.
+    * ``q_table_base`` ``(seqlen_q,)`` int32: the query row's offset into the
+      table, ``q_run * seqlen_k`` (key-expanded) or ``q_run * words_per_row``.
+    * ``k_group_ids`` ``(seqlen_k,)`` int32: the key token's run id, read only
+      for the packed words.
+    * ``allowed_table``: int8 over ``(q_run, key position)``, or int32 words
+      over run pairs, bit-packed 32 key runs per word.
 
     FA4 wraps the indices modulo ``seqlen_q``/``seqlen_k`` before calling a
     mask_mod that has aux tensors, so reads on out-of-range padded lanes stay
     in bounds; those lanes are force-masked afterwards. That holds only while
-    the aux tensors are exactly ``seqlen_q``/``seqlen_k`` long, which
-    ``multiview_fa4_attention`` checks.
+    ``q_table_base``/``k_group_ids`` are exactly ``seqlen_q``/``seqlen_k`` long
+    and a key-expanded row is ``seqlen_k`` wide, which
+    ``fa4_block_sparse_attention`` checks.
     """
 
     @cute.jit
-    def multiview_mask_mod(
+    def key_expanded_mask_mod(
         batch: Any,
         head: Any,
         m_idx: Any,
@@ -96,13 +102,32 @@ def _build_mask_mod(cutlass, cute, fa_utils):
         seqlen_info: Any,
         aux_tensors: Any,
     ) -> Any:
-        q_word_base = aux_tensors[0]
-        k_group_ids = aux_tensors[1]
-        allowed_words = aux_tensors[2]
+        q_table_base = aux_tensors[0]
+        allowed_bytes = aux_tensors[2]
 
         # The query row is shared by every lane of a scalar mask_mod call, so
         # its lookup is hoisted out of the per-key loop.
-        base = q_word_base[m_idx[0]]
+        base = q_table_base[m_idx[0]]
+        result = cute.make_rmem_tensor(n_idx.shape, dtype=cutlass.Boolean)
+        for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
+            # The table holds exactly 0 or 1, so the byte is the predicate.
+            result[j] = cutlass.Boolean(allowed_bytes[base + cutlass.Int32(n_idx[j])])
+        return result.load()
+
+    @cute.jit
+    def packed_mask_mod(
+        batch: Any,
+        head: Any,
+        m_idx: Any,
+        n_idx: Any,
+        seqlen_info: Any,
+        aux_tensors: Any,
+    ) -> Any:
+        q_table_base = aux_tensors[0]
+        k_group_ids = aux_tensors[1]
+        allowed_words = aux_tensors[2]
+
+        base = q_table_base[m_idx[0]]
         result = cute.make_rmem_tensor(n_idx.shape, dtype=cutlass.Boolean)
         for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
             group_k = k_group_ids[n_idx[j]]
@@ -113,11 +138,11 @@ def _build_mask_mod(cutlass, cute, fa_utils):
             )
         return result.load()
 
-    return multiview_mask_mod
+    return {torch.int8: key_expanded_mask_mod, torch.int32: packed_mask_mod}
 
 
 def _load_fa4() -> _Fa4Entry:
-    """Import FA4 and build the mask_mod once per process.
+    """Import FA4 and build the mask_mods once per process.
 
     Raises rather than falling back: ``backend='fa4'`` is an explicit request,
     and silently running a different kernel would invalidate any comparison
@@ -145,7 +170,7 @@ def _load_fa4() -> _Fa4Entry:
     _entry = _Fa4Entry(
         flash_attn_func=flash_attn_func,
         block_sparse_cls=BlockSparseTensorsTorch,
-        mask_mod=_build_mask_mod(cutlass, cute, fa_utils),
+        mask_mods=_build_mask_mods(cutlass, cute, fa_utils),
     )
     logger.info("Cosmos3 multiview attention using the FlashAttention-4 CuTe backend.")
     return _entry
@@ -193,13 +218,13 @@ if not hasattr(getattr(torch.ops, _OP_NAMESPACE), _OP_NAME):
         partial_indices: torch.Tensor,
         full_counts: torch.Tensor,
         full_indices: torch.Tensor,
-        q_word_base: torch.Tensor,
+        q_table_base: torch.Tensor,
         k_group_ids: torch.Tensor,
-        allowed_words: torch.Tensor,
+        allowed_table: torch.Tensor,
         q_block_size: int,
         kv_block_size: int,
     ) -> torch.Tensor:
-        """``MultiviewBlockSparsity`` flattened to the tensors/ints a schema allows."""
+        """``Fa4BlockSparsity`` flattened to the tensors/ints a schema allows."""
         entry = _load_fa4()
         # FA4 accepts singleton batch/head dims and broadcasts them; the
         # multiview mask is identical across both.
@@ -214,10 +239,9 @@ if not hasattr(getattr(torch.ops, _OP_NAMESPACE), _OP_NAME):
             q,
             k,
             v,
-            mask_mod=entry.mask_mod,
-            # Same order as MultiviewBlockSparsity.aux_tensors(), which is the
-            # order _build_mask_mod indexes them in.
-            aux_tensors=[q_word_base, k_group_ids, allowed_words],
+            mask_mod=entry.mask_mods[allowed_table.dtype],
+            # The order the mask_mods of _build_mask_mods index them in.
+            aux_tensors=[q_table_base, k_group_ids, allowed_table],
             block_sparse_tensors=block_sparse,
         )
         if isinstance(out, tuple):
@@ -235,9 +259,9 @@ if not hasattr(getattr(torch.ops, _OP_NAMESPACE), _OP_NAME):
         partial_indices,
         full_counts,
         full_indices,
-        q_word_base,
+        q_table_base,
         k_group_ids,
-        allowed_words,
+        allowed_table,
         q_block_size,
         kv_block_size,
     ):
@@ -264,15 +288,21 @@ def fa4_block_sparse_attention(
     """
     _validate_tensors(q, k, v)
     # FA4 wraps aux reads modulo these lengths; a shorter tensor would alias.
-    if q.shape[1] != sparsity.q_word_base.numel():
+    if q.shape[1] != sparsity.q_table_base.numel():
         raise ValueError(
             "Cosmos3 FA4 padded query length must match the block map: "
-            f"q={q.shape[1]}, q_word_base={sparsity.q_word_base.numel()}."
+            f"q={q.shape[1]}, q_table_base={sparsity.q_table_base.numel()}."
         )
     if k.shape[1] != sparsity.k_group_ids.numel():
         raise ValueError(
             "Cosmos3 FA4 padded key length must match the block map: "
             f"k={k.shape[1]}, k_group_ids={sparsity.k_group_ids.numel()}."
+        )
+    table = sparsity.allowed_table
+    if table.dtype == torch.int8 and table.numel() % k.shape[1]:
+        raise ValueError(
+            "Cosmos3 FA4 key-expanded mask table rows must span the padded keys: "
+            f"k={k.shape[1]}, allowed_table={table.numel()}."
         )
     expected = fa4_sparse_block_sizes(q.device)
     if (sparsity.q_block_size, sparsity.kv_block_size) != expected:
@@ -289,9 +319,9 @@ def fa4_block_sparse_attention(
         sparsity.partial_indices,
         sparsity.full_counts,
         sparsity.full_indices,
-        sparsity.q_word_base,
+        sparsity.q_table_base,
         sparsity.k_group_ids,
-        sparsity.allowed_words,
+        sparsity.allowed_table,
         sparsity.q_block_size,
         sparsity.kv_block_size,
     )
@@ -318,9 +348,9 @@ def multiview_fa4_attention(
             partial_indices=sparsity.partial_indices,
             full_counts=sparsity.full_counts,
             full_indices=sparsity.full_indices,
-            q_word_base=sparsity.q_word_base,
+            q_table_base=sparsity.q_table_base,
             k_group_ids=sparsity.k_group_ids,
-            allowed_words=sparsity.allowed_words,
+            allowed_table=sparsity.allowed_table,
             q_block_size=sparsity.q_block_size,
             kv_block_size=sparsity.kv_block_size,
         ),

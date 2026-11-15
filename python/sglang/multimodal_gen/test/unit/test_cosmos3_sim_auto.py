@@ -38,8 +38,10 @@ from sglang.multimodal_gen.registry import (
 )
 from sglang.multimodal_gen.runtime.models.dits import cosmos3_sim_auto
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto import (
+    ChunkReuse,
     ChunkShard,
     UlyssesGroup,
+    generated_token_mask,
     local_head_group,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_attention import (
@@ -51,7 +53,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_atten
     build_replay_fa4_mask,
     build_replay_mask,
     build_replay_plan,
+    drop_unused_query_blocks,
     replay_attention,
+    reusable_token_mask,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_layout import (
     CAPTION_SCOPE_ALL,
@@ -689,16 +693,21 @@ def _dense_oracle(q, k, v, mask):
 def _expand_fa4_mask(mask):
     """Token mask exactly as the CuTe kernel resolves it: skipped, full and partial tiles.
 
-    Partial tiles read bit ``k_run % 32`` of word ``q_word_base[q] + k_run // 32``.
+    Partial tiles read byte ``q_table_base[q] + k`` of a key-expanded table, or
+    bit ``k_run % 32`` of word ``q_table_base[q] + k_run // 32`` of a packed one.
     """
     sparsity = mask.sparsity
     q_block, kv_block = sparsity.q_block_size, sparsity.kv_block_size
-    k_runs = sparsity.k_group_ids.long()
-    base = sparsity.q_word_base.long()
-    words = sparsity.allowed_words.long() & 0xFFFFFFFF
-    table = (
-        (words[base[:, None] + k_runs[None, :] // 32] >> (k_runs[None, :] % 32)) & 1
-    ).bool()
+    base = sparsity.q_table_base.long()
+    if sparsity.allowed_table.dtype == torch.int8:
+        keys = torch.arange(mask.padded_kv_len)
+        table = sparsity.allowed_table[base[:, None] + keys[None, :]].bool()
+    else:
+        k_runs = sparsity.k_group_ids.long()
+        words = sparsity.allowed_table.long() & 0xFFFFFFFF
+        table = (
+            (words[base[:, None] + k_runs[None, :] // 32] >> (k_runs[None, :] % 32)) & 1
+        ).bool()
     dense = torch.zeros(mask.padded_q_len, mask.padded_kv_len, dtype=torch.bool)
     for q_index in range(mask.padded_q_len // q_block):
         rows = slice(q_index * q_block, (q_index + 1) * q_block)
@@ -712,7 +721,7 @@ def _expand_fa4_mask(mask):
     return dense[: mask.q_len, : mask.kv_len]
 
 
-def _wide_plan(grid=SensorGrid(5, 7, 1, 1), lengths=(30, 40, 50)):
+def _wide_plan(grid=SensorGrid(5, 7, 1, 1), lengths=(30, 40, 50), pass_kind=PASS_NOISY):
     """Chunk 1 of a three-camera RGB rollout whose runs span several tiles."""
     schedule = _schedule()
     items = build_chunk_items(
@@ -739,7 +748,7 @@ def _wide_plan(grid=SensorGrid(5, 7, 1, 1), lengths=(30, 40, 50)):
         build_caption_documents(lengths=lengths, sink_tokens=4, horizon_seconds=1.0)
     )
     return build_replay_plan(
-        current=chunk_token_metadata(items, step=1, pass_kind=PASS_NOISY),
+        current=chunk_token_metadata(items, step=1, pass_kind=pass_kind),
         history=history,
         history_tokens=2 * chunk_token_count(items),
         captions=captions,
@@ -779,35 +788,48 @@ class TestBlockMask(unittest.TestCase):
         torch.manual_seed(1)
         self._check(_wide_plan())
 
-    def test_fa4_tiles_and_packed_table_resolve_the_predicate(self):
-        """Hopper (128x128) and Blackwell (256x128) maps classify tiles and pack bits like the predicate."""
+    def test_fa4_tiles_and_both_table_forms_resolve_the_predicate(self):
+        """Hopper (128x128) and Blackwell (256x128) maps classify tiles like the
+        predicate, and the key-expanded bytes and the packed words a table past
+        int32 offsets falls back to both answer every pair like it."""
         plans = (
             _plan(2, PASS_NOISY, joint=True, lengths=(9, 13), sink=4)[0],
             _wide_plan(grid=SensorGrid(9, 11, 1, 1), lengths=(130, 70, 90)),
         )
-        for block_size in ((256, 128), (128, 128)):
-            for index, plan in enumerate(plans):
-                with self.subTest(block_size=block_size, plan=index):
+        cases = [
+            (block_size, index, plan, table_dtype)
+            for block_size in ((256, 128), (128, 128))
+            for index, plan in enumerate(plans)
+            for table_dtype in (torch.int8, torch.int32)
+        ]
+        for block_size, index, plan, table_dtype in cases:
+            with self.subTest(block_size=block_size, plan=index, table=table_dtype):
+                with mock.patch(
+                    "sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation"
+                    ".multiview_attention.MAX_KEY_EXPANDED_TABLE_BYTES",
+                    2**31 - 1 if table_dtype == torch.int8 else 0,
+                ):
                     mask = build_replay_fa4_mask(
                         plan, device=torch.device("cpu"), block_size=block_size
                     )
-                    self.assertEqual(mask.padded_q_len % block_size[0], 0)
-                    self.assertEqual(mask.padded_kv_len % block_size[1], 0)
-                    # FA4 wraps aux reads modulo the padded lengths; shorter tensors alias.
-                    sparsity = mask.sparsity
-                    self.assertEqual(sparsity.q_word_base.numel(), mask.padded_q_len)
-                    self.assertEqual(sparsity.k_group_ids.numel(), mask.padded_kv_len)
-                    torch.testing.assert_close(
-                        _expand_fa4_mask(mask), _dense_token_mask(plan)
-                    )
-                    if index == 1:
-                        # The wide plan must exercise all three tile classes.
-                        tiles = sparsity.full_indices.numel()
-                        full = int(sparsity.full_counts.sum())
-                        partial = int(sparsity.partial_counts.sum())
-                        self.assertGreater(full, 0)
-                        self.assertGreater(partial, 0)
-                        self.assertLess(full + partial, tiles)
+                self.assertEqual(mask.padded_q_len % block_size[0], 0)
+                self.assertEqual(mask.padded_kv_len % block_size[1], 0)
+                # FA4 wraps aux reads modulo the padded lengths; shorter tensors alias.
+                sparsity = mask.sparsity
+                self.assertEqual(sparsity.allowed_table.dtype, table_dtype)
+                self.assertEqual(sparsity.q_table_base.numel(), mask.padded_q_len)
+                self.assertEqual(sparsity.k_group_ids.numel(), mask.padded_kv_len)
+                torch.testing.assert_close(
+                    _expand_fa4_mask(mask), _dense_token_mask(plan)
+                )
+                if index == 1:
+                    # The wide plan must exercise all three tile classes.
+                    tiles = sparsity.full_indices.numel()
+                    full = int(sparsity.full_counts.sum())
+                    partial = int(sparsity.partial_counts.sum())
+                    self.assertGreater(full, 0)
+                    self.assertGreater(partial, 0)
+                    self.assertLess(full + partial, tiles)
 
     def test_build_replay_mask_dispatch(self):
         plan = _plan(1, PASS_NOISY)[0]
@@ -845,10 +867,303 @@ class TestBlockMask(unittest.TestCase):
         )
         expected = _dense_oracle(q, k, v, _dense_token_mask(plan).to(device))
         torch.testing.assert_close(fa4.float(), expected, atol=3e-2, rtol=3e-2)
+        # The packed words a larger table falls back to are the same predicate.
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation"
+            ".multiview_attention.MAX_KEY_EXPANDED_TABLE_BYTES",
+            0,
+        ):
+            packed = build_replay_mask(plan, device=device, backend="fa4")
+        self.assertEqual(packed.sparsity.allowed_table.dtype, torch.int32)
+        self.assertTrue(torch.equal(replay_attention(q, k, v, packed), fa4))
         triton = replay_attention(
             q, k, v, build_replay_mask(plan, device=device, backend="triton")
         )
         torch.testing.assert_close(fa4.float(), triton.float(), atol=3e-2, rtol=3e-2)
+
+
+def _listed_blocks(counts, indices):
+    """``[query blocks, key blocks]`` bool: the key blocks each query block's list holds."""
+    listed = torch.zeros(indices.shape, dtype=torch.bool)
+    for q_block, count in enumerate(counts.tolist()):
+        listed[q_block, indices[q_block, :count].long()] = True
+    return listed
+
+
+class TestPaddingRows(unittest.TestCase):
+    def test_padding_rows_make_no_key_block_visible(self):
+        """A query block lists exactly the key blocks a real row of it may read.
+
+        The padding rows that fill the last block admit every key; counting them
+        made that block visit the whole key stream, empty ring slots included.
+        """
+        plan = _wide_plan()
+        cpu = torch.device("cpu")
+        fa4 = build_replay_fa4_mask(plan, device=cpu, block_size=(128, 128)).sparsity
+        triton = build_replay_block_mask(plan, device=cpu).block_mask
+        for label, (q_block, kv_block), lists in (
+            (
+                "fa4",
+                (128, 128),
+                (
+                    (fa4.partial_counts, fa4.partial_indices),
+                    (fa4.full_counts, fa4.full_indices),
+                ),
+            ),
+            (
+                "triton",
+                (64, 64),
+                (
+                    (triton.kv_num_blocks[0, 0], triton.kv_indices[0, 0]),
+                    (triton.full_kv_num_blocks[0, 0], triton.full_kv_indices[0, 0]),
+                ),
+            ),
+        ):
+            with self.subTest(kernel=label):
+                self.assertNotEqual(plan.num_query_tokens % q_block, 0)
+                listed = _listed_blocks(*lists[0]) | _listed_blocks(*lists[1])
+                real = torch.zeros(
+                    listed.shape[0] * q_block, listed.shape[1] * kv_block
+                )
+                real[: plan.num_query_tokens, : plan.num_key_tokens] = (
+                    _dense_token_mask(plan)
+                )
+                readable = (
+                    real.view(listed.shape[0], q_block, listed.shape[1], kv_block)
+                    .sum(dim=(1, 3))
+                    .bool()
+                )
+                self.assertTrue(torch.equal(listed, readable))
+
+
+class _TupleLinear(torch.nn.Module):
+    """``ReplicatedLinear`` stand-in: returns ``(output, None)``."""
+
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear = torch.nn.Linear(in_features, out_features, bias=False)
+
+    def forward(self, tokens):
+        return self.linear(tokens), None
+
+
+def _replay_layer(hidden, heads, kv_heads, head_dim):
+    layer = cosmos3_sim_auto.Cosmos3SimAutoGenDecoderLayer.__new__(
+        cosmos3_sim_auto.Cosmos3SimAutoGenDecoderLayer
+    )
+    torch.nn.Module.__init__(layer)
+    layer.cross_attention = SimpleNamespace(
+        local_num_attention_heads=heads,
+        local_num_key_value_heads=kv_heads,
+        head_dim=head_dim,
+        to_qkv=_TupleLinear(hidden, (heads + 2 * kv_heads) * head_dim),
+        to_out=_TupleLinear(heads * head_dim, hidden),
+        norm_q=None,
+        norm_k=None,
+    )
+    layer.input_layernorm = torch.nn.LayerNorm(hidden)
+    layer.post_attention_layernorm = torch.nn.LayerNorm(hidden)
+    layer.mlp = torch.nn.Sequential(
+        torch.nn.Linear(hidden, 2 * hidden),
+        torch.nn.GELU(),
+        torch.nn.Linear(2 * hidden, hidden),
+    )
+    return layer
+
+
+def _positional_shift(q, k, norm_q, norm_k, head_dim, cos_sin_cache, positions):
+    """Stand-in for the fused qk-norm and RoPE: a per-position offset on Q and K."""
+    shift = cos_sin_cache[positions].view(1, -1, 1, head_dim)
+    return q + shift, k + shift
+
+
+class TestChunkReuse(unittest.TestCase):
+    """Which tokens a chunk's later forwards take from its first, and that taking them changes no row."""
+
+    def test_reusable_tokens_are_the_ones_the_timestep_never_reaches(self):
+        """The replay predicate and the embedder must agree on which tokens stay fixed."""
+        for step, joint in ((1, False), (2, True)):
+            with self.subTest(step=step, joint=joint):
+                plans, items = [], None
+                for pass_kind in (PASS_NOISY, PASS_CLEAN):
+                    plan, items, _, _ = _plan(step, pass_kind, joint=joint)
+                    plans.append(plan)
+                embedded = torch.cat(
+                    [
+                        torch.zeros(item.num_tokens, dtype=torch.bool)
+                        if item.is_control
+                        else generated_token_mask(item)
+                        for item in items
+                    ]
+                )
+                reusable = reusable_token_mask(plans)
+                self.assertTrue(torch.equal(reusable, ~embedded))
+                self.assertTrue(bool(reusable.any()) and not bool(reusable.all()))
+                # In both passes a reused token reads the same keys, none recomputed.
+                recomputed = torch.zeros(plans[0].num_key_tokens, dtype=torch.bool)
+                recomputed[: plans[0].num_current_tokens] = ~reusable
+                noisy, clean = (_dense_token_mask(plan) for plan in plans)
+                self.assertTrue(torch.equal(noisy[reusable], clean[reusable]))
+                self.assertFalse(bool(noisy[reusable][:, recomputed].any()))
+
+    def test_a_token_reading_a_recomputed_token_is_recomputed(self):
+        def plans():
+            return [_plan(1, pass_kind)[0] for pass_kind in (PASS_NOISY, PASS_CLEAN)]
+
+        noisy = plans()[0]
+        runs = noisy.query_runs
+        controls = runs.role == ROLE_CONTROL
+        target = int(torch.nonzero(runs.role == ROLE_CURRENT_TARGET)[0])
+        victim = int(torch.nonzero(controls & (runs.view_id == 0))[0])
+
+        # One control run of view 0 reads a generated target in every pass: the
+        # controls of view 0 read each other, so all of them follow it.
+        changed = plans()
+        for plan in changed:
+            plan.allowed = plan.allowed.clone()
+            plan.allowed[victim, target] = True
+        reusable_runs = torch.zeros(runs.num_runs, dtype=torch.bool)
+        reusable_runs[noisy.query_run_ids[reusable_token_mask(changed)].unique()] = True
+        self.assertTrue(torch.equal(reusable_runs, controls & (runs.view_id != 0)))
+
+        # The passes disagree on what one control run reads (an extra ring run).
+        changed = plans()
+        unread = torch.nonzero(~changed[0].allowed[victim, runs.num_runs :])
+        ring_run = runs.num_runs + int(unread[0])
+        changed[0].allowed = changed[0].allowed.clone()
+        changed[0].allowed[victim, ring_run] = True
+        self.assertFalse(
+            bool(reusable_token_mask(changed)[noisy.query_run_ids == victim].any())
+        )
+
+    def test_unused_query_blocks_are_dropped_and_read_rows_keep_their_keys(self):
+        plans = [_wide_plan(pass_kind=kind) for kind in (PASS_NOISY, PASS_CLEAN)]
+        plan = plans[0]
+        rows = torch.nonzero(~reusable_token_mask(plans)).flatten()
+        cpu = torch.device("cpu")
+
+        fa4 = build_replay_fa4_mask(plan, device=cpu, block_size=(128, 128))
+        dense = _expand_fa4_mask(drop_unused_query_blocks(fa4, rows))
+        used = torch.zeros(plan.num_query_tokens, dtype=torch.bool)
+        for block in (rows // 128).unique().tolist():
+            used[block * 128 : (block + 1) * 128] = True
+        self.assertTrue(bool(used.any()) and not bool(used.all()))
+        self.assertTrue(torch.equal(dense[used], _dense_token_mask(plan)[used]))
+        self.assertFalse(bool(dense[~used].any()))
+
+        block = build_replay_block_mask(plan, device=cpu)
+        reduced = drop_unused_query_blocks(block, rows)
+        unused = torch.ones(block.padded_q_len // 64, dtype=torch.bool)
+        unused[(rows // 64).unique()] = False
+        for counts in (
+            reduced.block_mask.kv_num_blocks,
+            reduced.block_mask.full_kv_num_blocks,
+        ):
+            self.assertEqual(int(counts[0, 0, unused].sum()), 0)
+        torch.manual_seed(3)
+        q = torch.randn(1, plan.num_query_tokens, 4, 16)
+        k = torch.randn(1, plan.num_key_tokens, 2, 16)
+        v = torch.randn(1, plan.num_key_tokens, 2, 16)
+        torch.testing.assert_close(
+            replay_attention(q, k, v, reduced)[:, rows],
+            replay_attention(q, k, v, block)[:, rows],
+            rtol=0,
+            atol=0,
+        )
+
+    def test_later_forwards_match_full_forwards(self):
+        """A forward that recomputes only the tokens the timestep reaches returns
+        the predictions and chunk K/V of a full forward, and a K/V-only forward
+        returns the K/V alone."""
+        torch.manual_seed(5)
+        hidden_size, heads, kv_heads, head_dim = 16, 4, 2, 4
+        noisy_plan, items, frame_unit, _ = _plan(1, PASS_NOISY)
+        clean_plan = _plan(1, PASS_CLEAN)[0]
+        num_tokens = noisy_plan.num_current_tokens
+        rows = torch.nonzero(~reusable_token_mask([noisy_plan, clean_plan])).flatten()
+        cpu = torch.device("cpu")
+        noisy, clean = (
+            build_replay_block_mask(plan, device=cpu)
+            for plan in (noisy_plan, clean_plan)
+        )
+
+        model = _sim_auto_model()
+        model.num_hidden_layers = 2
+        model.gen_layers = torch.nn.ModuleList(
+            [_replay_layer(hidden_size, heads, kv_heads, head_dim) for _ in range(2)]
+        )
+        model.ulysses = None
+        model.norm_moe_gen = torch.nn.LayerNorm(hidden_size)
+        model.proj_out = _TupleLinear(hidden_size, hidden_size)
+        model.unpatchify = lambda projected, *shape: projected
+        model.embed_items = lambda items, latents, **_: latents[0]
+        model.chunk_position_ids = mock.Mock(return_value=torch.zeros(3, num_tokens))
+        rope_cache = torch.randn(num_tokens, head_dim)
+        model.language_model = SimpleNamespace(
+            rotary_emb=SimpleNamespace(
+                build_rope_cache_inputs=lambda ids, cache_dtype: (
+                    rope_cache,
+                    torch.arange(num_tokens),
+                )
+            )
+        )
+        kv_shape = (kv_heads, head_dim)
+        history_kv = [
+            (torch.randn(1, 2 * frame_unit, *kv_shape),) * 2 for _ in range(2)
+        ]
+        und_kv = [
+            (torch.randn(1, noisy_plan.num_und_tokens, *kv_shape),) * 2
+            for _ in range(2)
+        ]
+
+        def forward(hidden, mask, **kwargs):
+            with (
+                mock.patch.object(
+                    cosmos3_sim_auto, "_apply_qwen3_qk_norm_rope", _positional_shift
+                ),
+                torch.no_grad(),
+            ):
+                return model(
+                    items=items,
+                    latents=[hidden, torch.zeros(1, 1, 1, 1, 1)],
+                    timestep=None,
+                    text_extent=0,
+                    und_kv=und_kv,
+                    history_kv=history_kv,
+                    mask=mask,
+                    rig_view_ids=None,
+                    **kwargs,
+                )
+
+        def assert_same_kv(actual, expected, **tolerance):
+            for layer, reference in zip(actual, expected, strict=True):
+                torch.testing.assert_close(layer, reference, **tolerance)
+
+        close = {"rtol": 1e-4, "atol": 1e-5}
+        base = torch.randn(1, num_tokens, hidden_size)
+        reuse = ChunkReuse(rows=rows)
+        for step in range(3):
+            hidden = base.clone()
+            hidden[:, rows] += torch.randn(1, rows.numel(), hidden_size)
+            expected = forward(hidden, noisy)
+            mask = drop_unused_query_blocks(noisy, rows) if reuse.ready else noisy
+            actual = forward(hidden, mask, reuse=reuse)
+            torch.testing.assert_close(actual.targets, expected.targets, **close)
+            assert_same_kv(actual.current_kv, expected.current_kv, **close)
+        # later forwards update the first forward's K/V in place
+        self.assertIs(actual.current_kv[0][0], reuse.layer_kv[0][0])
+
+        hidden = base.clone()
+        hidden[:, rows] += torch.randn(1, rows.numel(), hidden_size)
+        expected = forward(hidden, clean)
+        committed = forward(hidden, clean, reuse=reuse, kv_only=True)
+        self.assertEqual(committed.targets, [])
+        assert_same_kv(committed.current_kv, expected.current_kv, **close)
+        plain = forward(hidden, clean, kv_only=True)
+        self.assertEqual(plain.targets, [])
+        assert_same_kv(plain.current_kv, expected.current_kv, rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "K/V-only"):
+            forward(hidden, clean, reuse=ChunkReuse(rows=rows), kv_only=True)
 
 
 class TestUlyssesShard(unittest.TestCase):

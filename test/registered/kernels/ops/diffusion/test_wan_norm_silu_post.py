@@ -30,9 +30,8 @@ class TestWanNormSiLUPost(CustomTestCase):
     def assertBitsEqual(self, actual, expected):
         self.assertEqual(actual.dtype, expected.dtype)
         self.assertEqual(actual.stride(), expected.stride())
-        self.assertTrue(
-            torch.equal(actual.view(torch.int32), expected.view(torch.int32))
-        )
+        bits = torch.int16 if actual.dtype == torch.bfloat16 else torch.int32
+        self.assertTrue(torch.equal(actual.view(bits), expected.view(bits)))
 
     @staticmethod
     def module(channels=64, *, bias=False, dtype=torch.bfloat16):
@@ -73,6 +72,24 @@ class TestWanNormSiLUPost(CustomTestCase):
                                     ),
                                 )
                             self.assertTrue(torch.equal(original + 0.125, x))
+
+    @torch.inference_mode()
+    def test_bf16_chain_outside_autocast_rounds_every_op(self):
+        # 96 channels: the scale is not a BF16 value, and aten multiplies by it in FP32
+        for layout in (torch.contiguous_format, torch.channels_last_3d):
+            for bias in (False, True):
+                with self.subTest(layout=layout, bias=bias):
+                    module = self.module(96, bias=bias)
+                    x = torch.randn(
+                        2, 96, 3, 8, 12, device="cuda", dtype=torch.bfloat16
+                    ).to(memory_format=layout)
+                    for _ in range(2):
+                        expected = reference(x, module.gamma, module.bias, module.scale)
+                        self.assertEqual(expected.dtype, torch.bfloat16)
+                        self.assertBitsEqual(module(x), expected)
+                        self.assertTrue(module._post_gate.verified)
+                        self.assertFalse(module._post_gate.disabled)
+                        x.mul_(3.0)
 
     @torch.inference_mode()
     def test_deferred_conv_bias_precedes_lossless_norm_post_ops(self):
@@ -145,12 +162,16 @@ class TestWanNormSiLUPost(CustomTestCase):
         for domain in (finite, fp32):
             for layout in (torch.contiguous_format, torch.channels_last_3d):
                 x = domain.to(memory_format=layout)
-                denominator = torch.ones((1, 1, *x.shape[2:]), device="cuda")
                 gamma = torch.ones((64, 1, 1, 1), device="cuda", dtype=torch.bfloat16)
-                expected = F.silu((x / denominator) * 1.0 * gamma + 0.0)
-                self.assertBitsEqual(
-                    wan_norm_silu_post(x, denominator, gamma, scale=1.0), expected
-                )
+                # an FP32 denominator selects the FP32 chain, a BF16 one the BF16 chain
+                for denominator_dtype in {torch.float32, x.dtype}:
+                    denominator = torch.ones(
+                        (1, 1, *x.shape[2:]), device="cuda", dtype=denominator_dtype
+                    )
+                    expected = F.silu((x / denominator) * 1.0 * gamma + 0.0)
+                    self.assertBitsEqual(
+                        wan_norm_silu_post(x, denominator, gamma, scale=1.0), expected
+                    )
 
     @torch.inference_mode()
     def test_graph_replay_recomputes_norm_and_affine(self):

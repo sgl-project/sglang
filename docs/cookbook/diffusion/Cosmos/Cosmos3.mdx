@@ -172,6 +172,11 @@ supports Ulysses without TP or Ring; Sim-Auto supports TP and Ulysses subject to
 the checkpoint's query/KV head divisibility, but not Ring or CFG parallelism.
 Causal pipelines use the exported fixed-step schedule and require guidance `1.0`.
 
+At the default `quality="lossless"`, Sim-Auto computes each chunk's control tokens
+once and reuses them in the chunk's later forwards, and Transfer-Auto and Sim-Auto
+decode with the fused VAE normalization kernel. Send `quality="exact"` to turn
+both off.
+
 Use `--component-residency` for memory-constrained deployments. Joint checkpoints
 register `lidar_encoder` and `lidar_decoder` separately from the camera `vae`.
 Bimanual overlaps causal VAE decode only when the VAE is resident; offloaded VAEs

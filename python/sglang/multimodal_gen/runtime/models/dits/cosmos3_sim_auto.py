@@ -150,6 +150,16 @@ class ChunkShard(msgspec.Struct, frozen=True):
         )
         return q, k, v
 
+    def kv_heads_from_tokens(self, k: torch.Tensor, v: torch.Tensor) -> KVPair:
+        """:meth:`heads_from_tokens` for K/V alone, when no query follows."""
+        for tensor in (k, v):
+            self._check_local(tensor)
+        k, v = (
+            _usp_input_all_to_all(tensor, head_dim=2)[:, : self.num_tokens]
+            for tensor in (k, v)
+        )
+        return k, v
+
     def tokens_from_heads(self, output: torch.Tensor) -> torch.Tensor:
         """``[B, num_tokens, H / U, D]`` attention output -> ``[B, local_tokens, H, D]``."""
         if output.shape[1] != self.num_tokens:
@@ -185,8 +195,12 @@ class SpCheck(msgspec.Struct):
         values: torch.Tensor,
         mask: ReplayMask,
         out: torch.Tensor,
+        rows: torch.Tensor | None,
     ) -> None:
-        """Full-head attention sliced to this rank's heads must equal ``out`` bitwise (same kernel, same tokens)."""
+        """Full-head attention sliced to this rank's heads must equal ``out`` bitwise (same kernel, same tokens).
+
+        ``rows`` limits the comparison to the query rows the forward reads.
+        """
         full = replay_attention(
             _all_heads(q, shard.group),
             _all_heads(keys, shard.group),
@@ -194,6 +208,8 @@ class SpCheck(msgspec.Struct):
             mask,
         )
         mine = full[:, :, shard.group.head_slice(full.shape[2])]
+        if rows is not None:
+            mine, out = mine.index_select(1, rows), out.index_select(1, rows)
         self.layers += 1
         self.identical += int(torch.equal(mine, out))
         self.max_diff = max(
@@ -251,30 +267,54 @@ KVPair = tuple[torch.Tensor, torch.Tensor]
 
 
 class Cosmos3SimAutoForwardOutput(msgspec.Struct):
-    """Predictions of the target items (in item order) plus the chunk's per-layer ``[1, S, H_kv, D]`` K/V."""
+    """Predictions of the target items (in item order) plus the chunk's per-layer ``[1, S, H_kv, D]`` K/V.
+
+    ``targets`` is empty for a ``kv_only`` forward.
+    """
 
     targets: list[torch.Tensor]
     current_kv: list[KVPair]
 
 
-def _replay_layer_attention(
+def generated_token_mask(
+    item: StreamItem, *, device: torch.device | None = None
+) -> torch.Tensor:
+    """``[item.num_tokens]`` bool: tokens of the target item's generated frames, which take the timestep embedding."""
+    generated = torch.tensor(
+        [frame not in item.condition_frames for frame in item.frames],
+        dtype=torch.bool,
+        device=device,
+    )
+    return generated.repeat(len(item.view_ids)).repeat_interleave(item.tokens_per_frame)
+
+
+class ChunkReuse(msgspec.Struct, eq=False):
+    """What a chunk's later forwards take from its first one.
+
+    ``rows`` are the current-chunk tokens every forward recomputes (int64, on
+    the model device). The other tokens cannot change within the chunk
+    (``sim_auto_attention.reusable_token_mask``), so the first forward's
+    whole-stream K/V and final hidden states stand in for them; later forwards
+    overwrite ``rows`` of both in place.
+    """
+
+    rows: torch.Tensor
+    layer_kv: list[KVPair] = []
+    hidden: torch.Tensor | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.hidden is not None
+
+
+def _project_qkv(
     attention: Cosmos3CrossAttention,
     hidden: torch.Tensor,
     *,
     cos_sin_cache: torch.Tensor,
     rope_positions: torch.Tensor,
-    history: KVPair,
-    captions: KVPair,
-    mask: ReplayMask,
-    shard: ChunkShard | None,
-    sp_check: SpCheck | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One softmax over ``[current | ring | captions]``; returns the output and the chunk's K/V.
-
-    With ``shard`` the hidden states, RoPE positions and output are the rank's
-    token shard, while the K/V streams and the returned K/V hold every token
-    for the rank's head group.
-    """
+    """Post-norm, post-RoPE Q and K and raw V of ``hidden``, ``[B, S, H, D]`` each."""
     batch_size, seq_len = hidden.shape[:2]
     num_q_heads = attention.local_num_attention_heads
     num_kv_heads = attention.local_num_key_value_heads
@@ -294,20 +334,94 @@ def _replay_layer_attention(
         cos_sin_cache,
         rope_positions,
     )
+    return q, k, v
+
+
+def _chunk_stream_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    rows: torch.Tensor | None,
+    stream_kv: KVPair | None,
+) -> KVPair:
+    """The whole chunk's K/V; with ``rows``, ``k``/``v`` hold those rows and the rest is ``stream_kv``."""
+    if rows is None:
+        return k.contiguous(), v.contiguous()
+    stream_k, stream_v = stream_kv
+    stream_k.index_copy_(1, rows, k)
+    stream_v.index_copy_(1, rows, v)
+    return stream_k, stream_v
+
+
+def _replay_layer_attention(
+    attention: Cosmos3CrossAttention,
+    hidden: torch.Tensor,
+    *,
+    cos_sin_cache: torch.Tensor,
+    rope_positions: torch.Tensor,
+    history: KVPair,
+    captions: KVPair,
+    mask: ReplayMask,
+    shard: ChunkShard | None,
+    sp_check: SpCheck | None,
+    rows: torch.Tensor | None = None,
+    stream_kv: KVPair | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One softmax over ``[current | ring | captions]``; returns the output and the chunk's K/V.
+
+    With ``shard`` the hidden states, RoPE positions and output are the rank's
+    token shard, while the K/V streams and the returned K/V hold every token
+    for the rank's head group.
+
+    With ``rows`` the hidden states are those current-chunk tokens only and
+    ``stream_kv`` is the chunk's whole-stream K/V, updated in place and
+    returned. ``mask`` still covers the whole chunk.
+    """
+    batch_size, seq_len = hidden.shape[:2]
+    q, k, v = _project_qkv(
+        attention, hidden, cos_sin_cache=cos_sin_cache, rope_positions=rope_positions
+    )
     if shard is not None:
         q, k, v = shard.heads_from_tokens(q, k, v)
-    k = k.contiguous()
-    v = v.contiguous()
+    k, v = _chunk_stream_kv(k, v, rows=rows, stream_kv=stream_kv)
+    if rows is not None:
+        # The kernel keeps the whole chunk's query blocks, so a row accumulates
+        # its keys in the same order as in a full forward; the other rows are
+        # zeros whose output is dropped below.
+        q = q.new_zeros((batch_size, k.shape[1], *q.shape[2:])).index_copy_(1, rows, q)
     # Key order is the plan's stream order: current chunk, ring, captions.
     keys = torch.cat([k, history[0], captions[0]], dim=1)
     values = torch.cat([v, history[1], captions[1]], dim=1)
     out = replay_attention(q, keys, values, mask)
+    if sp_check is not None:
+        sp_check.compare(
+            shard, q=q, keys=keys, values=values, mask=mask, out=out, rows=rows
+        )
+    if rows is not None:
+        out = out.index_select(1, rows)
     if shard is not None:
-        if sp_check is not None:
-            sp_check.compare(shard, q=q, keys=keys, values=values, mask=mask, out=out)
         out = shard.tokens_from_heads(out)
     out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
     return out, k, v
+
+
+def _replay_layer_kv(
+    attention: Cosmos3CrossAttention,
+    hidden: torch.Tensor,
+    *,
+    cos_sin_cache: torch.Tensor,
+    rope_positions: torch.Tensor,
+    shard: ChunkShard | None,
+    rows: torch.Tensor | None = None,
+    stream_kv: KVPair | None = None,
+) -> KVPair:
+    """The chunk's K/V as :func:`_replay_layer_attention` returns it, without the softmax."""
+    _, k, v = _project_qkv(
+        attention, hidden, cos_sin_cache=cos_sin_cache, rope_positions=rope_positions
+    )
+    if shard is not None:
+        k, v = shard.kv_heads_from_tokens(k, v)
+    return _chunk_stream_kv(k, v, rows=rows, stream_kv=stream_kv)
 
 
 class Cosmos3SimAutoGenDecoderLayer(Cosmos3GenDecoderLayer):
@@ -319,6 +433,12 @@ class Cosmos3SimAutoGenDecoderLayer(Cosmos3GenDecoderLayer):
         )
         hidden = hidden + attention_output
         return hidden + self.mlp(self.post_attention_layernorm(hidden)), k, v
+
+    def chunk_kv(self, hidden: torch.Tensor, **kv_kwargs: Any) -> KVPair:
+        """The K/V :meth:`forward` returns, for a caller that reads no hidden states."""
+        return _replay_layer_kv(
+            self.cross_attention, self.input_layernorm(hidden), **kv_kwargs
+        )
 
 
 class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
@@ -517,13 +637,7 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
                 self._generated_masks = [
                     None
                     if item.is_control
-                    else torch.tensor(
-                        [frame not in item.condition_frames for frame in item.frames],
-                        dtype=torch.bool,
-                        device=camera_rows.device,
-                    )
-                    .repeat(len(item.view_ids))
-                    .repeat_interleave(item.tokens_per_frame)
+                    else generated_token_mask(item, device=camera_rows.device)
                     .view(1, -1, 1)
                     .to(dtype)
                     for item in items
@@ -578,6 +692,8 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
         history_kv: Sequence[KVPair],
         mask: ReplayMask,
         rig_view_ids: torch.Tensor,
+        reuse: ChunkReuse | None = None,
+        kv_only: bool = False,
     ) -> Cosmos3SimAutoForwardOutput:
         """Denoise (``timestep`` set) or clean-refresh (``timestep`` None) one chunk.
 
@@ -587,6 +703,15 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
         tokens a query may read. Under Ulysses every K/V argument and result
         holds the rank's head group for every token; only the GEN layers run
         on a token shard.
+
+        ``reuse`` is shared by the forwards of one chunk: the first fills it,
+        the later ones run only ``reuse.rows`` through the GEN layers and take
+        the other tokens from it. ``mask`` and the returned K/V cover the whole
+        chunk either way; a later forward may pass a mask reduced by
+        ``sim_auto_attention.drop_unused_query_blocks``.
+
+        ``kv_only`` returns ``current_kv`` alone and skips what only the
+        predictions need: the last layer's attention and MLP and the output head.
         """
         if (
             len(und_kv) != self.num_hidden_layers
@@ -613,30 +738,31 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
             )
             self._rope_inputs_key = rope_key
         cos_sin_cache, rope_positions = self._rope_inputs
-        shard = None if self.ulysses is None else self.ulysses.shard(hidden.shape[1])
-        sp_check = None
-        if shard is not None:
-            hidden = shard.split(hidden, dim=1)
-            rope_positions = shard.split(rope_positions, dim=0)
-            if envs.SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK:
-                sp_check = SpCheck()
-        current_kv: list[KVPair] = []
-        for layer_idx, layer in enumerate(self.gen_layers):
-            hidden, k, v = layer(
-                hidden,
-                cos_sin_cache=cos_sin_cache,
-                rope_positions=rope_positions,
-                history=history_kv[layer_idx],
-                captions=und_kv[layer_idx],
-                mask=mask,
-                shard=shard,
-                sp_check=sp_check,
+        replay = reuse if reuse is not None and reuse.ready else None
+        if kv_only and reuse is not None and replay is None:
+            raise ValueError(
+                "A K/V-only forward computes no final hidden states to fill a chunk reuse."
             )
-            current_kv.append((k, v))
-        if shard is not None:
-            hidden = shard.gather(hidden)
-            if sp_check is not None:
-                logger.info(sp_check.summary(shard.group))
+        if replay is not None:
+            hidden = hidden.index_select(1, replay.rows)
+            rope_positions = rope_positions.index_select(0, replay.rows)
+        hidden, current_kv = self._run_gen_layers(
+            hidden,
+            cos_sin_cache=cos_sin_cache,
+            rope_positions=rope_positions,
+            und_kv=und_kv,
+            history_kv=history_kv,
+            mask=mask,
+            replay=replay,
+            kv_only=kv_only,
+        )
+        if kv_only:
+            return Cosmos3SimAutoForwardOutput(targets=[], current_kv=current_kv)
+        if replay is not None:
+            hidden = replay.hidden.index_copy_(1, replay.rows, hidden)
+        elif reuse is not None:
+            reuse.layer_kv = current_kv
+            reuse.hidden = hidden
         hidden = self.norm_moe_gen(hidden)
         outputs = []
         parts = hidden.split([item.num_tokens for item in items], dim=1)
@@ -652,6 +778,60 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
                 projected, _ = self.proj_out(part)
                 outputs.append(self.unpatchify(projected, *latent.shape[2:]))
         return Cosmos3SimAutoForwardOutput(targets=outputs, current_kv=current_kv)
+
+    def _run_gen_layers(
+        self,
+        hidden: torch.Tensor,
+        *,
+        cos_sin_cache: torch.Tensor,
+        rope_positions: torch.Tensor,
+        und_kv: Sequence[KVPair],
+        history_kv: Sequence[KVPair],
+        mask: ReplayMask,
+        replay: ChunkReuse | None,
+        kv_only: bool,
+    ) -> tuple[torch.Tensor | None, list[KVPair]]:
+        """The GEN stack over ``hidden``: its final hidden states (``None`` with ``kv_only``) and the chunk's per-layer K/V.
+
+        ``hidden`` and ``rope_positions`` hold the whole chunk, or with
+        ``replay`` its ``rows``; under Ulysses the rank runs its token shard of
+        them and the returned hidden states are gathered back.
+        """
+        shard = None if self.ulysses is None else self.ulysses.shard(hidden.shape[1])
+        sp_check = None
+        if shard is not None:
+            hidden = shard.split(hidden, dim=1)
+            rope_positions = shard.split(rope_positions, dim=0)
+            if envs.SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK:
+                sp_check = SpCheck()
+        last_layer = len(self.gen_layers) - 1
+        current_kv: list[KVPair] = []
+        for layer_idx, layer in enumerate(self.gen_layers):
+            chunk = {
+                "cos_sin_cache": cos_sin_cache,
+                "rope_positions": rope_positions,
+                "shard": shard,
+                "rows": None if replay is None else replay.rows,
+                "stream_kv": None if replay is None else replay.layer_kv[layer_idx],
+            }
+            if kv_only and layer_idx == last_layer:
+                current_kv.append(layer.chunk_kv(hidden, **chunk))
+                hidden = None
+                break
+            hidden, k, v = layer(
+                hidden,
+                history=history_kv[layer_idx],
+                captions=und_kv[layer_idx],
+                mask=mask,
+                sp_check=sp_check,
+                **chunk,
+            )
+            current_kv.append((k, v))
+        if sp_check is not None:
+            logger.info(sp_check.summary(shard.group))
+        if shard is not None and hidden is not None:
+            hidden = shard.gather(hidden)
+        return hidden, current_kv
 
 
 EntryClass = Cosmos3SimAutoTransformer

@@ -1718,8 +1718,20 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self._causal_decode_initialized = True
         return out
 
+    @staticmethod
+    def causal_prefix_frames(latent_frames: int) -> int:
+        """Input frames the cached encode reads for its first ``latent_frames`` latents."""
+        return 1 + 4 * (latent_frames - 1)
+
     @cached_vae_encode
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, latent_frames: int | None = None) -> torch.Tensor:
+        """``latent_frames`` zero-pads the latent to that length, for a clip cut to a causal prefix.
+
+        The cached encode feeds latent ``i`` only frames up to
+        ``causal_prefix_frames(i + 1)``, so the prefix latents are those of the
+        full clip; padding before ``quant_conv`` keeps its input shape, and
+        with it the conv algorithm, the same as for the full clip.
+        """
         if self.use_feature_cache:
             self.clear_cache()
             if self.config.patch_size is not None:
@@ -1736,12 +1748,23 @@ class AutoencoderKLWan(ParallelTiledVAE):
                     else:
                         out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
                         out = torch.cat([out, out_], 2)
+            if latent_frames is not None and latent_frames > out.shape[2]:
+                tail = out.new_zeros(
+                    (*out.shape[:2], latent_frames - out.shape[2], *out.shape[3:])
+                )
+                if out.is_contiguous(memory_format=torch.channels_last_3d):
+                    tail = tail.contiguous(memory_format=torch.channels_last_3d)
+                out = torch.cat([out, tail], 2)
             enc = self.quant_conv(out)
             mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
             enc = torch.cat([mu, logvar], dim=1)
             enc = DiagonalGaussianDistribution(enc)
             self.clear_cache()
         else:
+            if latent_frames is not None:
+                raise ValueError(
+                    "AutoencoderKLWan.encode(latent_frames=...) needs the cached causal encode."
+                )
             for block in self.encoder.down_blocks:
                 if isinstance(block, WanResample) and block.mode == "downsample3d":
                     _padding = list(block.time_conv._padding)

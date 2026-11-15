@@ -66,6 +66,10 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
+from sglang.multimodal_gen.configs.models.vaes.wanvae import (
+    WanVAEArchConfig,
+    WanVAEConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
@@ -1376,6 +1380,43 @@ def test_wan_vae_decoder_install_wires_resample_gate() -> None:
     assert resample._sgl_gate is gate
     attn = next(m for m in dec.modules() if type(m) is wanvae.WanAttentionBlock)
     assert attn._sgl_gate is gate
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("channels_last", [False, True], ids=["ncdhw", "cl3d"])
+def test_wan_vae_encoder_install_is_exact_and_ignores_the_decode_gate(
+    channels_last,
+) -> None:
+    # The encoder's latents seed the sampler: its fusions must reproduce the
+    # eager encoder bit for bit, also while a decode runs the gated kernels.
+    config = WanVAEConfig(
+        arch_config=WanVAEArchConfig(
+            base_dim=16,
+            z_dim=4,
+            dim_mult=(1, 2),
+            num_res_blocks=1,
+            temperal_downsample=(True,),
+            latents_mean=(0.0,) * 4,
+            latents_std=(1.0,) * 4,
+        )
+    )
+    torch.manual_seed(0)
+    vae = wanvae.AutoencoderKLWan(config).to("cuda", torch.bfloat16).eval()
+    if channels_last:
+        for m in vae.modules():
+            if isinstance(m, nn.Conv3d):
+                m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
+    x = torch.randn(1, 3, 5, 32, 32, device="cuda", dtype=torch.bfloat16)
+    expected = vae.encode(x).mode()
+    keys = set(vae.state_dict())
+    wan_vae_cuda_opt.maybe_optimize_wan_vae(vae)
+    assert set(vae.state_dict()) == keys
+    fused = [m for m in vae.encoder.modules() if isinstance(m, FusedWanRMSNormSiLU)]
+    assert fused
+    with use_vae_fast_path(vae, True):
+        actual = vae.encode(x).mode()
+    assert torch.equal(actual, expected)
+    assert all(m._post_gate.verified and not m._post_gate.disabled for m in fused)
 
 
 # -------------------------------------------------------------------------

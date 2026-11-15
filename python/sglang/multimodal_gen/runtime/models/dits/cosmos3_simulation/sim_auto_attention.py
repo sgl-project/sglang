@@ -29,9 +29,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_atte
     TRITON_KV_BLOCK_SIZE,
     TRITON_Q_BLOCK_SIZE,
     _block_indices,
+    fa4_mask_table,
     fa4_sparse_block_sizes,
     flex_attention,
-    pack_allowed_bits,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_fa4 import (
     Fa4BlockSparsity,
@@ -332,6 +332,48 @@ def build_replay_plan(
     )
 
 
+# Roles the timestep embedding never reaches (``Cosmos3SimAutoTransformer.embed_items``).
+_TIMELESS_ROLES = (ROLE_CONTROL, ROLE_TARGET_CONDITION)
+
+
+def reusable_token_mask(plans: Sequence[ReplayPlan]) -> torch.Tensor:
+    """Current-chunk tokens whose K/V and hidden states are the same in every forward of the chunk.
+
+    ``plans`` are the chunk's passes (noisy and clean) over one ring and one
+    caption set. A token qualifies when no pass embeds a timestep into it,
+    every pass admits it the same keys, and none of those keys is a
+    current-chunk token that does not qualify itself. The ring and the
+    captions do not change within a chunk, so every layer's output for such a
+    token is fixed by the chunk's first forward.
+    """
+    first = plans[0]
+    num_runs = first.query_runs.num_runs
+    for plan in plans:
+        if plan.num_query_tokens != plan.num_current_tokens:
+            raise ValueError("reusable_token_mask needs plans over the whole chunk.")
+        # The current-chunk key runs are the query runs, in the same order.
+        if not torch.equal(plan.key_runs.start[:num_runs], plan.query_runs.start):
+            raise RuntimeError("The current-chunk key runs are not the query runs.")
+        if not (
+            torch.equal(plan.query_runs.start, first.query_runs.start)
+            and torch.equal(plan.key_runs.start, first.key_runs.start)
+        ):
+            return torch.zeros(first.num_query_tokens, dtype=torch.bool)
+    reusable = torch.ones(num_runs, dtype=torch.bool)
+    timeless = torch.tensor(_TIMELESS_ROLES, dtype=torch.int64)
+    for plan in plans:
+        reusable &= torch.isin(plan.query_runs.role, timeless)
+        reusable &= (plan.allowed == first.allowed).all(dim=1)
+    # Greatest fixed point: drop a run as soon as it reads a dropped run.
+    within_chunk = first.allowed[:, :num_runs]
+    for _ in range(num_runs):
+        kept = reusable & ~within_chunk[:, ~reusable].any(dim=1)
+        if torch.equal(kept, reusable):
+            break
+        reusable = kept
+    return reusable[first.query_run_ids]
+
+
 class ReplayBlockMask(msgspec.Struct, eq=False):
     """FlexAttention block mask over the padded query and key streams of one plan."""
 
@@ -419,6 +461,10 @@ def _project_blocks(streams: _PaddedStreams, block_size: tuple[int, int]) -> _Bl
     q_block, kv_block = block_size
     num_q_runs, num_k_runs = streams.allowed.shape
     q_presence = _presence(streams.q_ids, q_block, num_q_runs).to(torch.float32)
+    # The padding query run admits every key but its rows are discarded, so it
+    # must not make a block visible: real rows would score such a block all
+    # -inf, which the online softmax accumulates as an exact no-op.
+    q_presence[:, num_q_runs - 1] = 0.0
     k_presence = _presence(streams.k_ids, kv_block, num_k_runs).to(torch.float32)
     allowed = streams.allowed.to(torch.float32)
     visible = (q_presence @ allowed @ k_presence.T) > 0
@@ -481,7 +527,7 @@ def build_replay_fa4_mask(
     device: torch.device,
     block_size: tuple[int, int] | None = None,
 ) -> ReplayFa4Mask:
-    """FlashAttention-4 block map at the device's tile geometry plus the packed run table.
+    """FlashAttention-4 block map at the device's tile geometry plus the run table.
 
     ``block_size`` pins the geometry for CPU tests; on CUDA it follows the
     compute capability (Hopper 128x128, Blackwell 256x128).
@@ -490,15 +536,19 @@ def build_replay_fa4_mask(
         block_size = fa4_sparse_block_sizes(device)
     streams = _padded_streams(plan, block_size)
     blocks = _project_blocks(streams, block_size)
-    allowed_words, words_per_row = pack_allowed_bits(streams.allowed)
+    k_ids = streams.k_ids.to(device)
+    # Expanded on the device: the table is run count times key count bytes.
+    q_table_base, allowed_table = fa4_mask_table(
+        streams.allowed.to(device), streams.q_ids.to(device), k_ids
+    )
     sparsity = Fa4BlockSparsity(
         partial_counts=blocks.partial_counts.to(device),
         partial_indices=blocks.partial_indices.to(device),
         full_counts=blocks.full_counts.to(device),
         full_indices=blocks.full_indices.to(device),
-        q_word_base=(streams.q_ids * words_per_row).to(torch.int32).to(device),
-        k_group_ids=streams.k_ids.to(torch.int32).to(device),
-        allowed_words=allowed_words.to(device),
+        q_table_base=q_table_base,
+        k_group_ids=k_ids.to(torch.int32),
+        allowed_table=allowed_table,
         q_block_size=block_size[0],
         kv_block_size=block_size[1],
     )
@@ -523,6 +573,60 @@ def build_replay_mask(
         "Cosmos3-Nano-Sim-Auto attention backend must be one of "
         f"{list(REPLAY_BACKENDS)}, got {backend!r}."
     )
+
+
+def drop_unused_query_blocks(mask: ReplayMask, rows: torch.Tensor) -> ReplayMask:
+    """``mask`` with empty key lists for the query blocks that hold none of ``rows``.
+
+    For a forward that reads only ``rows`` of the attention output. The other
+    blocks keep their key lists, so ``rows`` accumulate the same keys in the
+    same order as under ``mask``; the remaining rows come back unspecified.
+    """
+    if isinstance(mask, ReplayFa4Mask):
+        sparsity = mask.sparsity
+        used = _used_query_blocks(
+            rows,
+            q_block=sparsity.q_block_size,
+            padded_q_len=mask.padded_q_len,
+            device=sparsity.partial_counts.device,
+        )
+        return msgspec.structs.replace(
+            mask,
+            sparsity=msgspec.structs.replace(
+                sparsity,
+                partial_counts=sparsity.partial_counts * used,
+                full_counts=sparsity.full_counts * used,
+            ),
+        )
+    block_mask = mask.block_mask
+    used = _used_query_blocks(
+        rows,
+        q_block=block_mask.BLOCK_SIZE[0],
+        padded_q_len=mask.padded_q_len,
+        device=block_mask.kv_num_blocks.device,
+    )
+    return msgspec.structs.replace(
+        mask,
+        block_mask=BlockMask.from_kv_blocks(
+            block_mask.kv_num_blocks * used,
+            block_mask.kv_indices,
+            block_mask.full_kv_num_blocks * used,
+            block_mask.full_kv_indices,
+            BLOCK_SIZE=block_mask.BLOCK_SIZE,
+            mask_mod=block_mask.mask_mod,
+            seq_lengths=block_mask.seq_lengths,
+            compute_q_blocks=False,
+        ),
+    )
+
+
+def _used_query_blocks(
+    rows: torch.Tensor, *, q_block: int, padded_q_len: int, device: torch.device
+) -> torch.Tensor:
+    """``[query blocks]`` bool: the blocks holding at least one of ``rows``."""
+    used = torch.zeros(padded_q_len // q_block, dtype=torch.bool, device=rows.device)
+    used[torch.div(rows, q_block, rounding_mode="floor")] = True
+    return used.to(device)
 
 
 def _pad_bhsd(tensor: torch.Tensor, length: int) -> torch.Tensor:
