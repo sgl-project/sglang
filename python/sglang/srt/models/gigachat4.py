@@ -24,14 +24,19 @@ from torch import nn
 
 from sglang.srt.configs.gigachat4 import GigaChat4Config
 from sglang.srt.configs.model_config import dsa_draft_shards_under_dcp
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.gigachat35 import (
     GigaChat35DecoderLayer,
     GigaChat35ForCausalLM,
@@ -74,9 +79,14 @@ class GigaChat4DecoderLayer(GigaChat35DecoderLayer):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
+        )
 
         if self.use_linear_attn:
             hidden_states = self.self_attn(
@@ -150,6 +160,58 @@ class GigaChat4Model(GigaChat35Model):
         else:
             self.norm = None
 
+        self.layers_to_capture: list[int] = []
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        if self.pp_group.is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+            residual_batch.start(forward_batch)
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
+
+        total_num_layers = self.end_layer - self.start_layer
+        zero_allocator = BumpAllocator(
+            buffer_size=total_num_layers * 2,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+
+        aux_hidden_states = AuxHiddenStatePacker.for_batch(
+            forward_batch, len(self.layers_to_capture)
+        )
+        for i in range(self.start_layer, self.end_layer):
+            hidden_states = self.layers[i](
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                captured_last_layer_outputs=(
+                    aux_hidden_states if i in self.layers_to_capture else None
+                ),
+            )
+
+        if not self.pp_group.is_last_rank:
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states.finalize()
+
 
 class GigaChat4ForCausalLM(GigaChat35ForCausalLM):
     def __init__(
@@ -178,6 +240,42 @@ class GigaChat4ForCausalLM(GigaChat35ForCausalLM):
         else:
             self.lm_head = None
         self.logits_processor = LogitsProcessor(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, inputs_embeds, pp_proxy_tensors
+        )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+        )
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    @property
+    def capture_aux_hidden_states(self) -> bool:
+        return bool(self.model.layers_to_capture)
+
+    def get_aux_hidden_states_width(self) -> int:
+        return len(self.model.layers_to_capture) * self.config.hidden_size
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.pp_group.is_last_rank:
+            # Layer k's output is captured at the input of layer k + 1.
+            self.model.layers_to_capture = [i + 1 for i in layer_ids]
 
 
 EntryClass = [GigaChat4ForCausalLM]

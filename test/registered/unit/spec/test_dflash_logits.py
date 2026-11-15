@@ -366,6 +366,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     )
     draft_model = SimpleNamespace(
         lm_head=None,
+        shift_label=False,
         candidate_selector=selector,
         compute_candidates=lambda hidden: (
             torch.zeros((1, 2), dtype=torch.int64),
