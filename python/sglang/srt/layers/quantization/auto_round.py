@@ -95,11 +95,19 @@ class AutoRoundConfig(QuantizationConfig):
         self.group_size = group_size
         self.sym = sym
         self.packing_format = packing_format
-        self.block_name_to_quantize = (
+        raw_block_names = (
             block_name_to_quantize.split(",")
             if isinstance(block_name_to_quantize, str)
             else block_name_to_quantize
         )
+        if raw_block_names:
+            self.block_name_to_quantize = [
+                self._normalize_block_path(name)
+                for name in raw_block_names
+                if isinstance(name, str) and name.strip()
+            ]
+        else:
+            self.block_name_to_quantize = None
         self.extra_config = extra_config
         self.data_type = data_type
         self.backend = backend
@@ -118,6 +126,58 @@ class AutoRoundConfig(QuantizationConfig):
             f"AutoRoundConfig(weight_bits={self.weight_bits}, "
             f"group_size={self.group_size}, sym={self.sym})"
         )
+
+    @staticmethod
+    def _normalize_block_path(path: str) -> str:
+        normalized = path.strip().strip(".")
+        while ".model.model." in normalized:
+            normalized = normalized.replace(".model.model.", ".model.")
+        if normalized.startswith("model.model."):
+            normalized = normalized.replace("model.model.", "model.", 1)
+        if normalized.startswith("language_model.model.model."):
+            normalized = normalized.replace(
+                "language_model.model.model.", "language_model.model.", 1
+            )
+        return normalized
+
+    @classmethod
+    def _path_aliases(cls, path: str) -> set[str]:
+        normalized = cls._normalize_block_path(path)
+        aliases = {normalized}
+
+        if normalized.startswith("language_model."):
+            aliases.add(normalized[len("language_model.") :])
+        else:
+            aliases.add(f"language_model.{normalized}")
+
+        if normalized.startswith("backbone."):
+            aliases.add(f"model.{normalized[len('backbone.') :]}")
+        if normalized.startswith("model."):
+            aliases.add(f"backbone.{normalized[len('model.') :]}")
+
+        aliases.update(name.replace(".backbone.", ".model.") for name in tuple(aliases))
+        aliases.update(name.replace(".model.", ".backbone.") for name in tuple(aliases))
+        return {alias for alias in aliases if alias}
+
+    @classmethod
+    def _matches_quant_block(cls, layer_name: str, block_name: str) -> bool:
+        layer_aliases = cls._path_aliases(layer_name)
+        block_aliases = cls._path_aliases(block_name)
+        return any(
+            layer_alias.startswith(block_alias)
+            for layer_alias in layer_aliases
+            for block_alias in block_aliases
+        )
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper):
+        if self.block_name_to_quantize:
+            self.block_name_to_quantize = [
+                self._normalize_block_path(name)
+                for name in hf_to_sglang_mapper.apply_list(self.block_name_to_quantize)
+            ]
+
+        if self.extra_config:
+            self.extra_config = hf_to_sglang_mapper.apply_dict(self.extra_config)
 
     @classmethod
     def get_name(cls):
@@ -199,7 +259,7 @@ class AutoRoundConfig(QuantizationConfig):
                     self.sym if quantized else True,
                 )
 
-            # Exact match first
+            # Exact match first, then alias match for wrapper/prefix variants.
             if name in self.extra_config:
                 cfg = self.extra_config[name]
                 return (
@@ -207,6 +267,15 @@ class AutoRoundConfig(QuantizationConfig):
                     cfg.get("group_size", self.group_size if quantized else -1),
                     cfg.get("sym", self.sym if quantized else True),
                 )
+
+            for alias in self._path_aliases(name):
+                if alias in self.extra_config:
+                    cfg = self.extra_config[alias]
+                    return (
+                        cfg.get("bits", self.weight_bits if quantized else 16),
+                        cfg.get("group_size", self.group_size if quantized else -1),
+                        cfg.get("sym", self.sym if quantized else True),
+                    )
 
             REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
             for pattern, cfg in self.extra_config.items():
@@ -240,7 +309,8 @@ class AutoRoundConfig(QuantizationConfig):
         quantized = not isinstance(layer, ParallelLMHead)
         if self.block_name_to_quantize:
             quantized = any(
-                layer_name.startswith(name) for name in self.block_name_to_quantize
+                self._matches_quant_block(layer_name, name)
+                for name in self.block_name_to_quantize
             )
 
         # 3. Handle fused MoE

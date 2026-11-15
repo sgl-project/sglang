@@ -929,9 +929,27 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 pad_loaded_weight,
             )
 
+            pad_sizes = output_sizes
+            # For tensors already packed on the output dimension (e.g. GPTQ qzeros),
+            # compute padding sizes in packed coordinates. Using unpacked sizes here
+            # can over-pad and zero out valid packed shards.
+            if (
+                isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
+                and param.packed_dim == param.output_dim
+            ):
+                pad_sizes = []
+                for _, shard_offset, shard_size in shard_offsets:
+                    packed_size, _ = param.adjust_shard_indexes_for_packing(
+                        shard_size=shard_size,
+                        shard_offset=shard_offset,
+                    )
+                    pad_sizes.append(packed_size)
+
             loaded_weight = pad_loaded_weight(
-                loaded_weight, param.output_dim, output_sizes
+                loaded_weight, param.output_dim, pad_sizes
             )
+
+        tp_rank, tp_size = get_group_rank_size(self.tp_group)
 
         for shard_id, shard_offset, shard_size in shard_offsets:
             # Special case for Quantization.
@@ -941,9 +959,35 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
                 and param.packed_dim == param.output_dim
             ):
-                shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
-                    shard_size=shard_size, shard_offset=shard_offset
+                # Slice packed checkpoint weights directly to this TP rank's
+                # local shard, then copy into the local packed destination.
+                # This avoids relying on a second TP slice inside
+                # load_merged_column_weight for already packed-output tensors.
+                local_shard_offset = shard_offset // tp_size
+                local_shard_size = shard_size // tp_size
+
+                packed_global_size, packed_global_offset = (
+                    param.adjust_shard_indexes_for_packing(
+                        shard_size=shard_size, shard_offset=shard_offset
+                    )
                 )
+                packed_local_size, packed_local_offset = (
+                    param.adjust_shard_indexes_for_packing(
+                        shard_size=local_shard_size, shard_offset=local_shard_offset
+                    )
+                )
+
+                packed_src_offset = packed_global_offset + tp_rank * packed_local_size
+                loaded_weight_local = loaded_weight.narrow(
+                    param.output_dim, packed_src_offset, packed_local_size
+                )
+                param_data_local = param.data.narrow(
+                    param.output_dim, packed_local_offset, packed_local_size
+                )
+                assert param_data_local.shape == loaded_weight_local.shape
+                param_data_local.copy_(loaded_weight_local)
+                continue
+
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_offset, shard_size
             )

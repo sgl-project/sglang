@@ -895,8 +895,8 @@ at::Tensor fused_experts_cpu(
   const bool is_int_quant =
       moe_comp_method == CPUQuantMethod::INT8_W8A8 || moe_comp_method == CPUQuantMethod::INT4_W4A8;
   TORCH_CHECK(
-      !is_int_quant || act_func == CPUActMethod::silu_and_mul,
-      "fused_experts_cpu: INT8_W8A8 and INT4_W4A8 support activation='silu' only, got: ",
+      !is_int_quant || act_func == CPUActMethod::silu_and_mul || act_func == CPUActMethod::relu2,
+      "fused_experts_cpu: INT8_W8A8 and INT4_W4A8 support activation in {silu, relu2} only, got: ",
       activation.value_or("silu"));
 
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
@@ -1189,7 +1189,8 @@ at::Tensor fused_experts_cpu(
           K,
           E,
           topk,
-          num_tokens_post_pad);
+          num_tokens_post_pad,
+          act_func);
     } else {
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
