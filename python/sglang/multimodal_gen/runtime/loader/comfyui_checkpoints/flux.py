@@ -35,6 +35,12 @@ def _build_dit_config(server_args: ServerArgs) -> FluxConfig:
 
 
 def _checkpoint_has_guidance_embeds(model_path: str) -> bool:
+    if model_path.endswith(".gguf"):
+        from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+            read_gguf_tensor_meta,
+        )
+
+        return "guidance_in.in_layer.weight" in read_gguf_tensor_meta(model_path)
     with safe_open(model_path, framework="pt", device="cpu") as checkpoint:
         return "guidance_in.in_layer.weight" in checkpoint.keys()
 

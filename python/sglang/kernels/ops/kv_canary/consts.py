@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from enum import IntEnum, IntFlag
 from typing import Final
 
@@ -19,6 +20,8 @@ CANARY_FIELD_TOKEN: Final[int] = 0
 CANARY_FIELD_POSITION: Final[int] = 1
 CANARY_FIELD_PREV_HASH: Final[int] = 2
 CANARY_FIELD_REAL_KV_HASH: Final[int] = 3
+
+CANARY_INFO_SAMPLING_DIGEST_SALT: Final[int] = 1
 
 VIOLATION_FIELDS: Final[int] = 8
 VIOLATION_FIELD_KERNEL_KIND: Final[int] = 0
@@ -54,18 +57,57 @@ class RealKvHashMode(IntEnum):
     ALL = 2
 
 
-_U64_MASK: int = (1 << 64) - 1
+U64_MASK: Final[int] = (1 << 64) - 1
 
 
 def splitmix64(value: int) -> int:
-    x = value & _U64_MASK
-    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
-    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64_MASK
-    return (x ^ (x >> 31)) & _U64_MASK
+    x = value & U64_MASK
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & U64_MASK
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & U64_MASK
+    return (x ^ (x >> 31)) & U64_MASK
 
 
 def splitmix64_mix3(a: int, b: int, c: int) -> int:
-    h = splitmix64(a & _U64_MASK)
-    h = splitmix64(h ^ (b & _U64_MASK))
-    h = splitmix64(h ^ (c & _U64_MASK))
+    h = splitmix64(a & U64_MASK)
+    h = splitmix64(h ^ (b & U64_MASK))
+    h = splitmix64(h ^ (c & U64_MASK))
     return h
+
+
+def to_signed_int64(value: int) -> int:
+    value &= U64_MASK
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def canary_chain_initial_hash() -> int:
+    return splitmix64(CANARY_CHAIN_ANCHOR)
+
+
+def canary_chain_extend_hash(digest: int, token_id: int, position: int) -> int:
+    return splitmix64_mix3(digest, token_id, position)
+
+
+def float_to_u32_bits(value: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def sampling_digest_from_values(
+    *,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+) -> int:
+    h = splitmix64(CANARY_CHAIN_ANCHOR ^ CANARY_INFO_SAMPLING_DIGEST_SALT)
+    for value in (
+        float_to_u32_bits(temperature),
+        float_to_u32_bits(top_p),
+        int(top_k),
+        float_to_u32_bits(min_p),
+    ):
+        h = splitmix64(h ^ (value & U64_MASK))
+    return h
+
+
+def canary_info(prefix_digest: int, token_id: int, sampling: int) -> int:
+    return splitmix64_mix3(prefix_digest, token_id, sampling)

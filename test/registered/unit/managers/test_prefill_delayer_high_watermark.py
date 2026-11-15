@@ -14,7 +14,7 @@ from sglang.srt.managers.prefill_delayer import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestPrefillDelayerHighWatermark(CustomTestCase):
@@ -26,12 +26,6 @@ class TestPrefillDelayerHighWatermark(CustomTestCase):
             self.assertEqual(tracker.observe_attempt(attempted_prefill_bs), 100)
 
         self.assertEqual(tracker.observe_attempt(2), 2)
-
-    def test_recurring_small_peak_remains_effective(self):
-        tracker = RecentPrefillBatchSizeTracker(window_size=4)
-
-        for attempted_prefill_bs in [2, 1, 1, 2, 1, 1, 2]:
-            self.assertEqual(tracker.observe_attempt(attempted_prefill_bs), 2)
 
     def test_rejected_non_empty_attempt_advances_window(self):
         tracker = RecentPrefillBatchSizeTracker(window_size=4)

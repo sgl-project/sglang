@@ -15,7 +15,9 @@ import torch
 from flashinfer import SfLayout, nvfp4_quantize
 from flashinfer.prims_ts import gemm as prims_ts_gemm
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion.gemm.flux3_prims_ts_config import (
+    delta_kwargs,
     flux3_prims_ts_config,
 )
 
@@ -188,9 +190,9 @@ def _prepared_qkv(
     head_dim = q_norm_weight.numel()
     if separate_qkv_output:
         if config is None:
-            major, minor = torch.cuda.get_device_capability(weight_packed.device)
+            cuda = current_arch().cuda
             config = prims_ts_gemm.PrimsTsGemmConfig(
-                arch=major * 10 + minor,
+                arch=cuda.sm_version,
                 operand_format="nvfp4_e2m1",
                 output_format="bf16",
                 epilogue="qkv_qknorm_rope",
@@ -253,6 +255,8 @@ def flux3_nvfp4_linear(
     input_global_scale: float,
     weight_global_scale: float,
     quantized: QuantizedNvfp4Activation | None = None,
+    *,
+    delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a FLUX.3 projection entirely through PrimsTS NVFP4 GEMM."""
     a_packed, a_scale_128x4, _ = _quantized_activation(x, input_global_scale, quantized)
@@ -270,7 +274,7 @@ def flux3_nvfp4_linear(
         ),
     )
     if prepared is not None:
-        out = prepared(a_packed, a_scale_128x4)
+        out = prepared(a_packed, a_scale_128x4, **delta_kwargs(delta))
     else:
         out = prims_ts_gemm.fp4_linear(
             a_packed,
@@ -279,6 +283,7 @@ def flux3_nvfp4_linear(
             weight_packed,
             weight_scale_128x4,
             weight_global_scale,
+            **delta_kwargs(delta),
             skip_check=True,
         )
     return out.view(*x.shape[:-1], out.shape[-1])
@@ -328,6 +333,8 @@ def flux3_nvfp4_linear_swiglu(
     input_global_scale: float,
     weight_global_scale: float,
     quantized: QuantizedNvfp4Activation | None = None,
+    *,
+    delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run FLUX.3's gated MLP-up projection with PrimsTS' SwiGLU epilogue."""
     a_packed, a_scale_128x4, _ = _quantized_activation(x, input_global_scale, quantized)
@@ -347,7 +354,7 @@ def flux3_nvfp4_linear_swiglu(
         device=x.device,
     )
     if prepared is not None:
-        out = prepared(a_packed, a_scale_128x4)
+        out = prepared(a_packed, a_scale_128x4, **delta_kwargs(delta))
     else:
         out = prims_ts_gemm.fp4_linear_swiglu(
             a_packed,
@@ -356,6 +363,7 @@ def flux3_nvfp4_linear_swiglu(
             weight_packed,
             weight_scale_128x4,
             weight_global_scale,
+            **delta_kwargs(delta),
             skip_check=True,
         )
     return out.view(*x.shape[:-1], out.shape[-1])
@@ -425,6 +433,7 @@ def flux3_nvfp4_qkv_qknorm_rope(
     quantized: QuantizedNvfp4Activation | None = None,
     *,
     separate_qkv_output: bool = False,
+    delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fuse NVFP4 QKV GEMM, Q/K RMSNorm, and RoPE through PrimsTS.
 
@@ -458,6 +467,7 @@ def flux3_nvfp4_qkv_qknorm_rope(
             a_scale_128x4,
             cos_sin=cos_sin_cache,
             positions=positions,
+            **delta_kwargs(delta),
         )
     elif separate_qkv_output:
         raise RuntimeError("separate QKV output requires a prepared CUDA projection")
@@ -479,6 +489,7 @@ def flux3_nvfp4_qkv_qknorm_rope(
             head_dim=head_dim,
             is_neox=False,
             qkv_scale=qkv_scale,
+            **delta_kwargs(delta),
             skip_check=True,
         )
     if separate_qkv_output:

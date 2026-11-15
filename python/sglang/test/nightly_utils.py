@@ -105,7 +105,7 @@ class NightlyBenchmarkRunner:
         command = [
             "python3",
             "-m",
-            "sglang.bench_one_batch_server",
+            "sglang.benchmark.one_batch_server",
             "--model",
             model_path,
             "--base-url",

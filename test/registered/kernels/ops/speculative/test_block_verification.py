@@ -15,7 +15,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
 
@@ -380,6 +380,77 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
     assert (bonus[sampled] == 4).all()
     token_correct_len, _, _ = accept(False)
     assert (token_correct_len[sampled] == 0).any()
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_ragged_cutoff_preserves_distribution(block):
+    """DSpark compact verify: rows past a request's verify window are point-mass
+    padding and the accept is capped at verify_lens - 1. With verify lengths
+    chosen from x_<i only, the emitted tokens must still follow the target."""
+    batch, gamma, anchor = 400_000, 3, 0
+    target_transition = torch.tensor([[0.25, 0.75], [0.6, 0.4]], device=DEVICE)
+    draft_transition = torch.tensor([[0.85, 0.15], [0.3, 0.7]], device=DEVICE)
+    previous = torch.full((batch,), anchor, device=DEVICE)
+    drafts = []
+    for _ in range(gamma):
+        previous = torch.multinomial(draft_transition[previous], 1).squeeze(1)
+        drafts.append(previous)
+    draft_tokens = torch.stack(drafts, dim=1)
+    candidates = torch.cat(
+        [torch.full((batch, 1), anchor, device=DEVICE), draft_tokens], dim=1
+    )
+    # Confidence of draft j reads only q_j, a function of the draft before it.
+    confidence = draft_transition[candidates[:, :gamma]].max(dim=-1).values
+    survival = torch.cumprod(confidence, dim=1)
+    verify_lens = 1 + (survival >= 0.5).sum(dim=1).to(torch.int32)
+    target_logits = torch.log(target_transition[candidates])
+    row = torch.arange(gamma + 1, device=DEVICE).view(1, -1)
+    target_logits[row >= verify_lens.view(-1, 1)] = torch.tensor(
+        [0.0, -1.0e4], device=DEVICE
+    )
+    correct_len, bonus, _ = accept_draft_tokens(
+        candidates=candidates,
+        target_logits=target_logits.view(batch * (gamma + 1), 2),
+        draft_block=DraftBlockResult(
+            draft_tokens=draft_tokens,
+            corrected_logits=torch.log(draft_transition[candidates[:, :gamma]]),
+            greedy_mask=torch.zeros(batch, dtype=torch.bool, device=DEVICE),
+            temperatures=torch.ones(batch, device=DEVICE),
+            greedy_draft=False,
+        ),
+        sampling_info=SimpleNamespace(
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            temperatures=torch.ones(batch, 1, device=DEVICE),
+        ),
+        draft_input=SimpleNamespace(max_top_k=1, uniform_top_k_value=None),
+        gamma=gamma,
+        verify_num_draft_tokens=gamma + 1,
+        cutoff_layout=SimpleNamespace(verify_lens=verify_lens),
+        block_verification=block,
+    )
+    assert (correct_len <= verify_lens - 1).all()
+    output = torch.empty((batch, gamma + 1), dtype=torch.long, device=DEVICE)
+    for step in range(gamma + 1):
+        before = output[:, step - 1] if step else candidates[:, 0]
+        completion = torch.multinomial(target_transition[before], 1).squeeze(1)
+        drafted = draft_tokens[:, min(step, gamma - 1)]
+        output[:, step] = torch.where(
+            step < correct_len,
+            drafted,
+            torch.where(step == correct_len, bonus, completion),
+        )
+    for sequence in itertools.product(range(2), repeat=gamma + 1):
+        observed = (
+            (output == torch.tensor(sequence, device=DEVICE)).all(-1).float().mean()
+        )
+        expected, before = 1.0, anchor
+        for token in sequence:
+            expected *= target_transition[before, token].item()
+            before = token
+        assert abs(observed.item() - expected) < 0.004, (sequence, observed, expected)
 
 
 if __name__ == "__main__":

@@ -24,7 +24,8 @@ export const DeepSeekOCRDeployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' }
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware !== 'xeon', disabledReason: 'This DP recipe is only available on Intel Xeon CPUs' },
+        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Expert Parallel (EP) is not supported on Intel Xeon CPUs' }
       ]
     }
   };
@@ -94,6 +95,7 @@ export const DeepSeekOCRDeployment = () => {
   const generateCommand = () => {
     const { hardware, quantization, strategy } = values;
     const strategyArray = Array.isArray(strategy) ? strategy : [];
+    const tpSize = 1;
 
     // Validation checks
     // Check MI300X compatibility - MI300X + DeepSeek-OCR only supports FP16 quantization
@@ -113,7 +115,11 @@ export const DeepSeekOCRDeployment = () => {
 
     // TP strategy
     if (strategyArray.includes('tp')) {
-      cmd += ` \\\n  --tp 1`;
+      cmd += ` \\\n  --tp ${tpSize}`;
+    }
+
+    if (hardware === 'xeon' && strategyArray.includes('dp')) {
+      cmd += ` \\\n  --dp ${tpSize}`;
     }
 
     // EP strategy

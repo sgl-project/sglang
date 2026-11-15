@@ -19,9 +19,11 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentResidencyStrategy,
     ComponentUse,
     ResidencyState,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -416,6 +418,18 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         # model_index.json records absent optional components as [null, null].
         return bool(entry) and entry[0] is not None
 
+    def create_comfyui_stages(self, server_args: ServerArgs) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.comfyui_step import (
+            LTX2ComfyUIStepStage,
+        )
+
+        self.add_stage(
+            LTX2ComfyUIStepStage(
+                transformer=self.get_module("transformer"),
+                model_path=server_args.model_path,
+            )
+        )
+
     def initialize_pipeline(self, server_args: ServerArgs):
         orig = self.get_module("scheduler")
         scheduler_overrides: dict = {}
@@ -546,7 +560,7 @@ class LTX2ResidentResidencyStrategy(LTX2TwoStageResidencyStrategy):
         self._ensure_on_gpu("transformer")
         self._ensure_on_gpu("transformer_2")
         logger.info(
-            "Using resident LTX-2.3 two-stage transformers mode (both DiTs stay on GPU)"
+            "Using resident LTX-2 two-stage transformers mode (both DiTs stay on GPU)"
         )
         self.manager._active_phase = "stage1"
         self.manager._sync_refinement_stage_transformer("stage1")
@@ -607,14 +621,15 @@ class LTX2TwoStageResidencyController:
 
     @property
     def should_use_premerged(self) -> bool:
-        """Whether to keep a pre-merged stage-2 DiT for LTX-2.3 two-stage.
+        """Whether to keep a second DiT with the distilled LoRA merged in for stage 2.
 
-        We only enable this optimization for resident native LTX-2.3 two-stage
-        and when users did not explicitly provide a stage-1 LoRA path
+        Resident mode keeps both DiTs on the GPU, so stage 2 runs merged weights
+        like the official two-stage pipelines instead of a per-layer dynamic LoRA;
+        it needs the distilled LoRA and no user-provided stage-1 LoRA
         """
         return (
             self.mode == "resident"
-            and self.pipeline._should_merge_stage2_distilled_lora(self.server_args)
+            and self.pipeline._distilled_lora_path is not None
             and self.pipeline._stage1_lora_path is None
         )
 

@@ -5,6 +5,7 @@ edition = "2024"
 description = "Rust tree core for the Unified Radix Cache"
 license = "Apache-2.0"
 repository = "https://github.com/sgl-project/sglang"
+publish = false
 
 [package.metadata.sglang]
 python-module = "sglang.srt.mem_cache.rust_tree_core.mem_cache"

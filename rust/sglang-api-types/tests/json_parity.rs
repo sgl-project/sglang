@@ -44,6 +44,27 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "GenerateStreamError" => check::<api::GenerateStreamError>(&name, input, canonical),
             "GetModelInfoResponse" => check::<api::GetModelInfoResponse>(&name, input, canonical),
             "GetServerInfoResponse" => check::<api::GetServerInfoResponse>(&name, input, canonical),
+            "AttachHiCacheStorageRequest" => {
+                check::<api::AttachHiCacheStorageRequest>(&name, input, canonical)
+            }
+            "HiCacheStatus" => check::<api::HiCacheStatus>(&name, input, canonical),
+            "HiCacheStorageResponse" => {
+                check::<api::HiCacheStorageResponse>(&name, input, canonical)
+            }
+            "ClearHiCacheStorageRequest" => {
+                check::<api::ClearHiCacheStorageRequest>(&name, input, canonical)
+            }
+            "DetachHiCacheStorageRequest" => {
+                check::<api::DetachHiCacheStorageRequest>(&name, input, canonical)
+            }
+            "GetHiCacheStorageRequest" => {
+                check::<api::GetHiCacheStorageRequest>(&name, input, canonical)
+            }
+            "ListModelsResponse" => check::<api::ListModelsResponse>(&name, input, canonical),
+            "DetokenizeRequest" => check::<api::DetokenizeRequest>(&name, input, canonical),
+            "DetokenizeResponse" => check::<api::DetokenizeResponse>(&name, input, canonical),
+            "AbortRequest" => check::<api::AbortRequest>(&name, input, canonical),
+            "AbortResponse" => check::<api::AbortResponse>(&name, input, canonical),
             other => panic!("fixture type {other} has no Rust mapping; add it here"),
         }
     }

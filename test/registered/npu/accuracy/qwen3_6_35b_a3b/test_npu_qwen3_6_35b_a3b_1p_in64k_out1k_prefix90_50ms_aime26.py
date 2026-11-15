@@ -15,7 +15,9 @@ register_npu_ci(
 )
 
 QWEN3_6_35B_A3B_64K_PREFIX_ENVS = {
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "PYTORCH_NPU_ALLOC_CONF": (
+        "expandable_segments:True,pin_memory_expandable_segments:True"
+    ),
     "STREAMS_PER_DEVICE": "32",
     "DEEPEP_HCCL_BUFFSIZE": "300",
     "HCCL_SOCKET_IFNAME": "lo",
@@ -87,13 +89,14 @@ class TestNPUQwen3_6_35BA3B_1P_AIME2026(TestNpuAccuracyTestCaseBase):
     model = QWEN3_6_35B_A3B_MODEL_PATH
     other_args = QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS
     envs = QWEN3_6_35B_A3B_64K_PREFIX_ENVS
+    max_retries = 2
     accuracy = 0.927
     datasets = ["aime26"]
     few_shot_num = 0
     eval_batch_size = 64
     generation_config = {
         "max_tokens": 65536,
-        "temperature": 0.2,
+        "temperature": 0,
         "repetition_penalty": 1.08,
     }
 

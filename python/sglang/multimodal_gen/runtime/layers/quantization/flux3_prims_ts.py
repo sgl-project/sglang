@@ -11,6 +11,8 @@ Projections without a plan keep the generic method's layout and ``apply``.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 from enum import Enum
 from typing import Any, ClassVar
@@ -62,6 +64,25 @@ def flux3_prims_ts_available() -> bool:
     if forced is not None and forced is not KernelBackend.FLASHINFER:
         return False
     return capabilities_satisfied(FLUX3_PRIMS_TS_CAPABILITIES, PlatformInfo.detect())
+
+
+@functools.cache
+def flux3_prims_ts_supports_lora() -> bool:
+    """Whether FlashInfer's PrimsTS GEMMs take the ``delta`` epilogue input."""
+    try:
+        from flashinfer.prims_ts import gemm as prims_ts_gemm
+    except ImportError:
+        return False
+    entry_points = (
+        prims_ts_gemm.fp8_linear,
+        prims_ts_gemm.fp8_linear_swiglu,
+        prims_ts_gemm.fp8_qkv_qknorm_rope,
+        prims_ts_gemm.fp4_linear,
+        prims_ts_gemm.fp4_linear_swiglu,
+        prims_ts_gemm.fp4_qkv_qknorm_rope,
+        prims_ts_gemm.PreparedFp4Linear.__call__,
+    )
+    return all("delta" in inspect.signature(fn).parameters for fn in entry_points)
 
 
 def _use_separate_qkv_output() -> bool:
@@ -180,7 +201,7 @@ class Flux3PrimsTsMethodMixin:
         raise NotImplementedError
 
     def apply_prims_ts_linear(
-        self, layer: nn.Module, x: torch.Tensor, quantized=None
+        self, layer: nn.Module, x: torch.Tensor, quantized=None, *, delta=None
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -196,6 +217,7 @@ class Flux3PrimsTsMethodMixin:
         quantized=None,
         *,
         packed_output: bool = False,
+        delta=None,
     ):
         raise NotImplementedError
 
@@ -208,6 +230,8 @@ class Flux3PrimsTsMethodMixin:
         cos_sin_cache: torch.Tensor,
         positions: torch.Tensor,
         quantized=None,
+        *,
+        delta=None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -327,12 +351,12 @@ class Flux3Fp8LinearMethod(Flux3PrimsTsMethodMixin, Fp8LinearMethod):
         return quantize_flux3_activation(x)
 
     def apply_prims_ts_linear(
-        self, layer: nn.Module, x: torch.Tensor, quantized=None
+        self, layer: nn.Module, x: torch.Tensor, quantized=None, *, delta=None
     ) -> torch.Tensor:
         from sglang.kernels.ops.diffusion import flux3_clustered_fp8_linear
 
         return flux3_clustered_fp8_linear(
-            x, layer.weight.t(), layer.weight_scale, quantized
+            x, layer.weight.t(), layer.weight_scale, quantized, delta=delta
         )
 
     def apply_prims_ts_swiglu(
@@ -342,12 +366,15 @@ class Flux3Fp8LinearMethod(Flux3PrimsTsMethodMixin, Fp8LinearMethod):
         quantized=None,
         *,
         packed_output: bool = False,
+        delta=None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.diffusion import flux3_fused_mlp_up
 
         if packed_output:
             raise NotImplementedError(f"{layer.prefix}: FP8 SwiGLU emits BF16 only")
-        return flux3_fused_mlp_up(x, layer.weight.t(), layer.weight_scale, quantized)
+        return flux3_fused_mlp_up(
+            x, layer.weight.t(), layer.weight_scale, quantized, delta=delta
+        )
 
     def apply_prims_ts_qkv_qknorm_rope(
         self,
@@ -358,6 +385,8 @@ class Flux3Fp8LinearMethod(Flux3PrimsTsMethodMixin, Fp8LinearMethod):
         cos_sin_cache: torch.Tensor,
         positions: torch.Tensor,
         quantized=None,
+        *,
+        delta=None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.diffusion import (
             flux3_clustered_fp8_qkv_qknorm_rope,
@@ -373,6 +402,7 @@ class Flux3Fp8LinearMethod(Flux3PrimsTsMethodMixin, Fp8LinearMethod):
             positions,
             quantized,
             separate_qkv_output=_use_separate_qkv_output(),
+            delta=delta,
         )
 
 
@@ -594,7 +624,7 @@ class Flux3Nvfp4LinearMethod(Flux3PrimsTsMethodMixin, ModelOptFp4LinearMethod):
         return quantize_flux3_nvfp4_activation(x, layer.prims_ts_input_global_scale)
 
     def apply_prims_ts_linear(
-        self, layer: nn.Module, x: torch.Tensor, quantized=None
+        self, layer: nn.Module, x: torch.Tensor, quantized=None, *, delta=None
     ) -> torch.Tensor:
         from sglang.kernels.ops.diffusion import flux3_nvfp4_linear
 
@@ -605,6 +635,7 @@ class Flux3Nvfp4LinearMethod(Flux3PrimsTsMethodMixin, ModelOptFp4LinearMethod):
             layer.prims_ts_input_global_scale,
             layer.prims_ts_weight_global_scale,
             quantized,
+            delta=delta,
         )
 
     def apply_prims_ts_linear_from_packed(
@@ -628,24 +659,34 @@ class Flux3Nvfp4LinearMethod(Flux3PrimsTsMethodMixin, ModelOptFp4LinearMethod):
         quantized=None,
         *,
         packed_output: bool = False,
+        delta=None,
     ):
         from sglang.kernels.ops.diffusion import (
             flux3_nvfp4_linear_swiglu,
             flux3_nvfp4_linear_swiglu_fp4,
         )
 
-        op = (
-            flux3_nvfp4_linear_swiglu_fp4
-            if packed_output
-            else flux3_nvfp4_linear_swiglu
-        )
-        return op(
+        if packed_output:
+            if delta is not None:
+                raise NotImplementedError(
+                    f"{layer.prefix}: packed NVFP4 SwiGLU output has no delta input"
+                )
+            return flux3_nvfp4_linear_swiglu_fp4(
+                x,
+                layer.weight,
+                layer.weight_scale_prims_ts_128x4,
+                layer.prims_ts_input_global_scale,
+                layer.prims_ts_weight_global_scale,
+                quantized,
+            )
+        return flux3_nvfp4_linear_swiglu(
             x,
             layer.weight,
             layer.weight_scale_prims_ts_128x4,
             layer.prims_ts_input_global_scale,
             layer.prims_ts_weight_global_scale,
             quantized,
+            delta=delta,
         )
 
     def apply_prims_ts_qkv_qknorm_rope(
@@ -657,6 +698,8 @@ class Flux3Nvfp4LinearMethod(Flux3PrimsTsMethodMixin, ModelOptFp4LinearMethod):
         cos_sin_cache: torch.Tensor,
         positions: torch.Tensor,
         quantized=None,
+        *,
+        delta=None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.diffusion import (
             flux3_nvfp4_qkv_qknorm_rope,
@@ -675,4 +718,5 @@ class Flux3Nvfp4LinearMethod(Flux3PrimsTsMethodMixin, ModelOptFp4LinearMethod):
             getattr(layer, "prims_ts_qkv_scale", None),
             quantized,
             separate_qkv_output=_use_separate_qkv_output(),
+            delta=delta,
         )

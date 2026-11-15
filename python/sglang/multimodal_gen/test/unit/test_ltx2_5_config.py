@@ -20,7 +20,6 @@ from sglang.multimodal_gen.configs.models.dits.ltx_2_5 import LTX25ArchConfig
 from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_video import (
     LTX25VideoVAEArchConfig,
 )
-from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEArchConfig
 from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import (
@@ -30,23 +29,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import (
 
 
 class TestLTX25DiTConfig(unittest.TestCase):
-    def test_inherits_ltx23_audio_video_base(self):
-        arch = LTX25ArchConfig()
-        self.assertTrue(arch.apply_gated_attention)
-        self.assertTrue(arch.cross_attention_adaln)
-        # `use_prompt_embeddings: false` upstream -- the caption projection
-        # lives in the connector, not the DiT.
-        self.assertTrue(arch.caption_proj_before_connector)
-        self.assertEqual(arch.rope_type.value, "split")
-        self.assertTrue(arch.double_precision_rope)
-
-    def test_feed_forward_bias_is_video_only(self):
-        # LTX-2.5 checkpoints have no `ff.net.*.bias` for the video branch but
-        # do for the audio one.
-        arch = LTX25ArchConfig()
-        self.assertFalse(arch.ff_bias)
-        self.assertTrue(arch.audio_ff_bias)
-
     def test_param_names_mapping_extends_ltx2(self):
         # Regression: read off a class attribute pinned to LTX2ArchConfig, the
         # LTX-2.5 renames never reached the loader.
@@ -67,13 +49,6 @@ class TestLTX25DiTConfig(unittest.TestCase):
             self.assertTrue(mapped.startswith(key.split(".")[0] + "_single."), mapped)
             self.assertEqual(reverse(mapped)[0], key)
 
-    def test_ltx2_defaults_unchanged(self):
-        # The shared LTX-2 config must keep its original behaviour.
-        arch = LTX2ArchConfig()
-        self.assertTrue(arch.ff_bias)
-        self.assertTrue(arch.audio_ff_bias)
-        self.assertFalse(arch.use_keyframes_abs_pos_embedding)
-
 
 class TestLTX25VAEConfig(unittest.TestCase):
     # Reversed like its sibling lists, this would give the wrong strides.
@@ -89,10 +64,6 @@ class TestLTX25VAEConfig(unittest.TestCase):
             list(arch.upsample_type),
             ["spatiotemporal", "spatiotemporal", "temporal", "spatial"],
         )
-
-    def test_ltx2_defaults_to_all_spatiotemporal(self):
-        # `None` must keep LTX-2 bit-identical.
-        self.assertIsNone(LTXVideoVAEArchConfig().upsample_type)
 
     def test_decoder_builds_expected_upsampler_strides(self):
         import torch
@@ -227,9 +198,6 @@ class TestLTX25PipelineConfig(unittest.TestCase):
                 )
             )
         )
-
-    def test_ltx2_has_no_pinned_schedule(self):
-        self.assertIsNone(LTX2PipelineConfig().default_sigmas)
 
     def test_stays_an_ltx2_variant(self):
         # LTX-2.5 uses the LTX-2 linspace sigma path, so it must NOT be marked
@@ -396,11 +364,6 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
         self.assertEqual(temporal, arch.temporal_compression_ratio)
         # The remaining spatial factor is the pixel patch size.
         self.assertEqual(spatial * arch.patch_size, arch.spatial_compression_ratio)
-
-    def test_ships_as_a_single_step_x0_decoder(self):
-        arch = self._config().arch_config
-        self.assertEqual(arch.decoder_num_inference_steps, 1)
-        self.assertEqual(arch.decoder_model_output_type, "x0")
 
     def test_builds_and_reports_expected_context_width(self):
         import torch

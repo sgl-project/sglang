@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 
 
+# Not layernorm.rmsnorm_fp32: 1 / sqrt(var + eps) rounds differently from rsqrt.
 @triton.jit
 def _rmsnorm_kernel(
     x_ptr,

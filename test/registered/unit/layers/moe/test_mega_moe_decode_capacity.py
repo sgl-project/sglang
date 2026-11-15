@@ -8,16 +8,17 @@ collectives and graph replay are out of scope.
 
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import sglang.srt.arg_groups.mega_moe_hook as hook
 import sglang.srt.layers.moe.mega_moe_flydsl as mega
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 LARGE = 16384
 DECODE = 512
@@ -30,6 +31,7 @@ def _layer(value=0):
     return SimpleNamespace(
         num_experts=EXPERTS,
         should_fuse_routed_scaling_factor_in_topk=True,
+        uses_expert_location=False,
         **{
             name: torch.full((48, 4), value, dtype=torch.uint8)
             for name in ("_mega_w1", "_mega_w1_scale", "_mega_w2", "_mega_w2_scale")
@@ -60,11 +62,6 @@ def runtime(monkeypatch):
     monkeypatch.setattr(mega, "get_dp_global_num_tokens", lambda: state.global_tokens)
     monkeypatch.setattr(mega, "_ensure_mori_shmem", lambda: None)
     monkeypatch.setattr(mega, "_ep_rank_world", lambda: (state.rank, 8))
-    monkeypatch.setattr(
-        mega,
-        "ExpertLocationDispatchInfo",
-        SimpleNamespace(init_new=lambda layer_id: None),
-    )
     utils = ModuleType("sglang.srt.models.deepseek_common.utils")
     utils._use_aiter = True
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
@@ -99,6 +96,13 @@ def runtime(monkeypatch):
         state.extend = extend
         state.capture = capture
         state.global_tokens = global_tokens
+        topk = Mock(
+            return_value=SimpleNamespace(
+                topk_ids=torch.zeros(local_rows, TOPK, dtype=torch.int64),
+                topk_weights=torch.ones(local_rows, TOPK),
+            )
+        )
+        topk.routing_inputs.return_value = (None, None)
         moe = SimpleNamespace(
             config=SimpleNamespace(
                 hidden_size=HIDDEN,
@@ -109,13 +113,11 @@ def runtime(monkeypatch):
             num_fused_shared_experts=0,
             experts=state.layer if layer is None else layer,
             gate=lambda h, forward_batch=None: torch.zeros(h.shape[0], EXPERTS),
-            topk=lambda h, logits, **kwargs: SimpleNamespace(
-                topk_ids=torch.zeros(h.shape[0], TOPK, dtype=torch.int64),
-                topk_weights=torch.ones(h.shape[0], TOPK),
-            ),
+            topk=topk,
             is_hash=False,
             layer_id=0,
             routed_scaling_factor=1.0,
+            routed_scaling_factor_fused_in_topk=True,
         )
         forward_batch = (
             None
@@ -209,7 +211,6 @@ def test_an_extend_on_any_rank_moves_the_step_to_the_large_capacity(runtime):
     [
         ForwardMode.EXTEND,
         ForwardMode.MIXED,
-        ForwardMode.SPLIT_PREFILL,
         ForwardMode.DLLM_EXTEND,
         None,
     ],
@@ -310,7 +311,6 @@ def _cfg(**overrides):
 
 @pytest.fixture
 def startup(monkeypatch):
-    monkeypatch.setenv("SGLANG_AMD_USE_FLYDSL_MEGA_MOE", "1")
     monkeypatch.setenv("SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR", str(LARGE))
     monkeypatch.setenv("SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR", str(DECODE))
     monkeypatch.setattr(hook, "get_platform", lambda: SimpleNamespace(is_hip=True))
@@ -368,19 +368,20 @@ def test_startup_rejects_attention_context_parallelism(startup):
 
 
 @pytest.mark.parametrize(
-    ("env", "overrides"),
+    ("env", "overrides", "is_hip"),
     [
-        ({}, dict(disaggregation_mode="prefill")),
-        ({"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR": "0"}, {}),
-        ({"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR": str(LARGE)}, {}),
-        ({"SGLANG_AMD_USE_FLYDSL_MEGA_MOE": "0"}, {}),
+        ({}, dict(disaggregation_mode="prefill"), True),
+        ({"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR": "0"}, {}, True),
+        ({"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR": str(LARGE)}, {}, True),
+        ({}, {}, False),
     ],
 )
 def test_startup_skips_runs_without_a_decode_capacity(
-    startup, monkeypatch, env, overrides
+    startup, monkeypatch, env, overrides, is_hip
 ):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setattr(hook, "get_platform", lambda: SimpleNamespace(is_hip=is_hip))
     startup(_cfg(max_running_requests=None, **overrides))
 
 

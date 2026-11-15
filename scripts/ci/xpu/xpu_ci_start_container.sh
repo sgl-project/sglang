@@ -158,8 +158,15 @@ echo "Launching container: ${CONTAINER_NAME} from ${IMAGE}"
 # SYCL_CACHE_PERSISTENT=0: the SYCL runtime's persistent kernel cache mishandles
 # torch 2.13's XPU aten.topk kernel on compute-runtime 26.05 / IGC 2.28 -- reload
 # segfaults inside libsycl. Keep off until Intel ships a fix in newer runtimes.
+# UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1: with copy offload on, a new process's first
+# H2D copy intermittently deadlocks on the copy engine (bcs and ccs both parked
+# in MI_SEMAPHORE_WAIT) and urEventWait blocks forever; keep copies on ccs.
+# SYS_PTRACE: Level Zero IPC (NIXL's UCX ze_ipc and Mooncake's XPU transport) maps
+# the peer's device memory via pidfd_getfd(), which needs ptrace rights. Without
+# them NIXL fails with EPERM and Mooncake stops copying KV card to card.
 docker run -dt \
   --shm-size 8g \
+  --cap-add SYS_PTRACE \
   --group-add 992 \
   ${VIDEO_GID:+--group-add "${VIDEO_GID}"} \
   ${RENDER_GID:+--group-add "${RENDER_GID}"} \
@@ -176,6 +183,7 @@ docker run -dt \
   -e NEO_CACHE_PERSISTENT=1 \
   -e SYCL_CACHE_DIR=/root/.cache/sglang-xpu/sycl \
   -e SYCL_CACHE_PERSISTENT=0 \
+  -e UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1 \
   "${GPU_AFFINITY_ARGS[@]}" \
   --name "${CONTAINER_NAME}" \
   "${IMAGE}"
