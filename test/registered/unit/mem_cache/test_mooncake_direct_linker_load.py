@@ -4,9 +4,21 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from queue import Queue
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
+from sglang.srt.mem_cache.page_interleave import (
+    PageInterleavePlacement,
+    PageShardSpec,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
@@ -231,6 +243,84 @@ class TestGroupedLoad(CustomTestCase):
         last_get = max(t for kind, t in store.events if kind == "get")
         first_end = min(t for kind, t in store.events if kind == "end")
         self.assertGreater(first_end, last_get)
+
+
+class TestShardedLoadAndOffload(CustomTestCase):
+    def _linker(self, batch_set_v2):
+        linker = object.__new__(MooncakeDirectLinker)
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((8, 1), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        linker.pool_group = DevicePoolGroup([entry], num_layers=1, page_size=2)
+        linker.pool_group.shard_placement = PageInterleavePlacement(
+            PageShardSpec(
+                shard_rank=0,
+                shard_size=2,
+                page_size=2,
+                max_prefix_tokens=4,
+                chunk_tokens=2,
+            )
+        )
+        linker.kv_sharded = True
+        linker.page_size = 2
+        linker.offload_pools = {PoolName.KV}
+        linker.pending_loads = {}
+        linker.gc_frozen = True
+        linker.stats = {"offload": 0}
+        linker.offload_queue, linker.offload_results = Queue(), Queue()
+        linker.storage = SimpleNamespace(batch_set_v2=batch_set_v2)
+        linker.record_transfer_ready = lambda: SimpleNamespace(synchronize=lambda: None)
+        thread = threading.Thread(target=linker.offload_thread_func)
+        thread.start()
+
+        def stop():
+            linker.offload_queue.put(None)
+            thread.join(5)
+
+        self.addCleanup(stop)
+        return linker
+
+    @staticmethod
+    def _transfer(keys, indices):
+        return PoolTransfer(
+            name=PoolName.KV, keys=keys, device_indices=torch.tensor(indices)
+        )
+
+    def test_rank_without_owned_pages_queues_an_empty_load(self):
+        linker = self._linker(batch_set_v2=None)
+        self.assertTrue(linker.load("peer", [self._transfer(["b"], [2, 3])]))
+        self.assertTrue(linker.load("own", [self._transfer(["a", "b"], [4, 5, 2, 3])]))
+        self.assertEqual(linker.pending_loads["peer"], [])
+        (own,) = linker.pending_loads["own"]
+        self.assertEqual(own.keys, ["a"])
+        self.assertEqual(own.host_indices.tolist(), [2, 3])
+
+    def test_offload_results_keep_node_order(self):
+        release = threading.Event()
+        written = []
+
+        def batch_set_v2(transfers, extra_info):
+            self.assertTrue(release.wait(5))
+            written.extend((t.keys, t.host_indices.tolist()) for t in transfers)
+            return {PoolName.KV: [False]}
+
+        linker = self._linker(batch_set_v2)
+        self.assertTrue(linker.offload([self._transfer(["a"], [4, 5])]))
+        self.assertTrue(linker.offload([self._transfer(["b"], [2, 3])]))
+        time.sleep(0.1)
+        self.assertEqual(linker.num_completed_offloads(), 0)
+        release.set()
+        linker.offload_queue.join()
+        self.assertEqual(
+            [linker.pop_completed_offload() for _ in range(2)], [False, True]
+        )
+        self.assertEqual(written, [(["a"], [2, 3])])
 
 
 if __name__ == "__main__":

@@ -17,6 +17,9 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    PageInterleavePoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -183,6 +186,7 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        "token_to_kv_pool_allocator": SimpleNamespace(),
     }
     defaults.update(kwargs)
     # The stand-in's window slots, as a tree with these slots reports them.
@@ -2362,6 +2366,54 @@ def test_linker_load_preserves_swa_boundaries(
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "device_hit_len, expected_base, expected_start_owner", [(4, 1, 3), (0, 0, 0)]
+)
+def test_sharded_load_back_continues_the_prefix_rotation(
+    device_hit_len, expected_base, expected_start_owner
+):
+    def build_transfer(phase, node, keys, **kwargs):
+        return PoolTransfer(
+            name=PoolName.KV, keys=list(keys), device_indices=torch.arange(4)
+        )
+
+    full = SimpleNamespace(
+        component_type=ComponentType.FULL,
+        build_external_linker_transfer=MagicMock(side_effect=build_transfer),
+        update_external_linker_load=lambda *args, **kwargs: args[3],
+    )
+    allocator = PageInterleavePoolAllocator.__new__(PageInterleavePoolAllocator)
+    allocator.shard_size = 3
+    allocator.least_full_class = lambda: 0
+    cache = _cache_for_wrapper(
+        _components_tuple=(full,),
+        page_size=2,
+        components={ComponentType.FULL: full},
+        token_to_kv_pool_allocator=allocator,
+        rotation_base_of=lambda node: {7: 1}[node],
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
+        tail_hashes=["a", "b"], device_hit_len=device_hit_len
+    )
+    req = SimpleNamespace(
+        rid="rid",
+        kv=ReqKvInfo(),
+        last_node=7 if device_hit_len else 0,
+        swa_branching_seqlen=None,
+        kv_rotation_base=None,
+    )
+
+    assert wrapper.load_back(req)[0] == 4
+    assert req.kv_rotation_base == expected_base
+    full.build_external_linker_transfer.assert_called_once_with(
+        LinkerTransferPhase.LOAD,
+        None,
+        ["a", "b"],
+        start_owner=expected_start_owner,
+    )
 
 
 class TestTransferReadyEvents(CustomTestCase):

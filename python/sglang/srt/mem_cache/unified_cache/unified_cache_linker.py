@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -654,11 +655,27 @@ class UnifiedCacheLinkerWrapper:
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
+        # Logical-page KV sharding: the loaded pages continue the owner
+        # rotation of the device prefix, or start a new chain.
+        rotation_base = None
+        shard_kwargs = {}
+        allocator = cache.token_to_kv_pool_allocator
+        if page_interleave_shard_size(allocator) > 1:
+            rotation_base = (
+                cache.rotation_base_of(req.last_node)
+                if device_hit_len
+                else allocator.least_full_class()
+            )
+            assert rotation_base is not None, "sharded device prefix has no base"
+            shard_kwargs["start_owner"] = (
+                rotation_base + device_hit_len // cache.page_size
+            )
+
         # Build per-component linker transfers.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
         for component in self._components:
             transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
+                LinkerTransferPhase.LOAD, None, tail_hashes, **shard_kwargs
             )
             if transfer is None:
                 self._update_load(
@@ -695,6 +712,9 @@ class UnifiedCacheLinkerWrapper:
             component_transfers,
             prefix_len,
         )
+        if rotation_base is not None:
+            # Extends and the insert of the loaded tail follow this chain.
+            req.kv_rotation_base = rotation_base
 
         # Components omitted from the linker do not run their PREPARE hook.
         # Keep a non-restorable window range as tombstones instead of rebuilding
