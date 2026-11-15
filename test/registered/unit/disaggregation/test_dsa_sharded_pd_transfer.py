@@ -58,6 +58,7 @@ def _manager(rank, size, sources, destinations):
         dst_state_dim_per_tensor=[[]],
         dst_state_layer_ids=[[]],
         dst_attn_tp_size=1,
+        requires_dcp_relayout=False,
     )
     return mgr, peer
 

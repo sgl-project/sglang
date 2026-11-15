@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -95,7 +96,10 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
+    PLE_FILE_PREFETCH_MIN_ROWS,
+    advise_rows_willneed,
     allocate_ple_host_table,
+    device_faults_pageable_pages,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
@@ -182,6 +186,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     token_offsets: torch.Tensor
     valid_tokens: torch.Tensor
     state_indices: torch.Tensor
+    query_start_loc: torch.Tensor | None
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
 
@@ -277,6 +282,7 @@ def _prepare_ple_batch(
     processed_tokens = _get_processed_token_count(forward_batch, physical_tokens)
     tokens = input_ids[:processed_tokens]
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
+    packed_query_start_loc = None
 
     if mode.is_target_verify():
         assert forward_batch.spec_info is not None
@@ -325,6 +331,11 @@ def _prepare_ple_batch(
         query_start_loc = torch.cat(
             [lengths.new_zeros(1), torch.cumsum(lengths, dim=0)]
         )
+        if mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            packed_query_start_loc = query_start_loc
         sequence_count = lengths.shape[0]
         req_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         if processed_tokens:
@@ -340,15 +351,13 @@ def _prepare_ple_batch(
     else:
         valid_tokens = token_offsets < lengths.index_select(0, req_indices)
 
+    # The forward's resolved slots: the request table may already be reused here.
+    # Graph replay marks padded rows -1; the clamp sends them to dummy slot 0.
     state_indices = (
-        get_req_to_token_pool()
-        .get_mamba_indices(forward_batch.req_pool_indices[:sequence_count])
-        .long()
-    )
-
-    pool = get_req_to_token_pool()
-    state_indices = (
-        get_attn_backend().runner_ids.state_ids(pool.state_sub_pool).ids(state_indices)
+        get_attn_backend()
+        .forward_state_slots(sequence_count, None)
+        .working.long()
+        .clamp(min=0)
     )
 
     # CUDA graph padding uses request slot 0, which may belong to a real request.
@@ -411,6 +420,7 @@ def _prepare_ple_batch(
         token_offsets=token_offsets,
         valid_tokens=valid_tokens,
         state_indices=state_indices,
+        query_start_loc=packed_query_start_loc,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
     )
@@ -521,6 +531,44 @@ def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     out = x.new_zeros((total_tokens, *x.shape[1:]))
     out[: x.shape[0]] = x
     return out
+
+
+def _use_qwen4_varlen_prefill(
+    mode: ForwardMode,
+    query_start_loc: torch.Tensor | None,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    req_indices: torch.Tensor,
+    token_offsets: torch.Tensor,
+    dilation: int,
+) -> bool:
+    if (
+        not envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
+        or not is_cuda()
+        or mode
+        not in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        )
+        or query_start_loc is None
+    ):
+        return False
+    from sglang.kernels.ops.mamba.qwen4_short_conv import (
+        can_fuse_qwen4_varlen_conv,
+    )
+
+    return can_fuse_qwen4_varlen_conv(
+        x,
+        weight,
+        state,
+        state_indices,
+        query_start_loc,
+        req_indices,
+        token_offsets,
+        dilation,
+    )
 
 
 def _use_attn_tp_ngram() -> bool:
@@ -983,6 +1031,18 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
+        # ... and only there does a prefill-sized gather read its rows on the host, on a
+        # GPU that faults each row's page through the driver (see _gathers_on_host).
+        table_path = getattr(host_table, "_sglang_ple_file_path", None)
+        self._stages_on_host = (
+            table_path is not None
+            and torch.cuda.is_available()
+            and device_faults_pageable_pages(torch.cuda.current_device())
+        )
+        # The host copy advises its rows' pages through this descriptor first.
+        self._table_fd = (
+            os.open(table_path, os.O_RDONLY) if self._stages_on_host else None
+        )
         # ... and only it needs its resident set bounded: a fault maps a whole
         # folio, so the mapping would otherwise creep towards the full table.
         self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
@@ -1029,23 +1089,65 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
-            if self._file_prefetcher is not None:
+            table, ids = self.weight, flat_ids
+            vocab_start = self.shard_indices.org_vocab_start_index
+            vocab_end = self.shard_indices.org_vocab_end_index
+            if self._gathers_on_host(flat_ids):
+                table, ids = self._stage_rows(flat_ids, vocab_start, vocab_end)
+                vocab_start, vocab_end = 0, table.shape[0]
+            elif self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
-                    flat_ids,
-                    vocab_start=self.shard_indices.org_vocab_start_index,
-                    vocab_end=self.shard_indices.org_vocab_end_index,
+                    flat_ids, vocab_start=vocab_start, vocab_end=vocab_end
                 )
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
-                flat_ids,
+                table.data_ptr(),
+                ids,
                 output,
                 embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                tp_vocab_start=vocab_start,
+                tp_vocab_end=vocab_end,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
                 BLOCK_D=self._block_d,
             )
         return output
+
+    def _gathers_on_host(self, flat_ids: torch.Tensor) -> bool:
+        """A prefill-sized gather from the file-backed table reads its rows on the host when
+        the GPU faults pageable pages through the driver (HMM): from the kernel, every row
+        whose page the GPU has not mapped is a fault served one at a time, ~0.5 ms per page,
+        seconds per prefill chunk. A GPU that reads through the host's page tables (GB10),
+        decode-sized gathers and captured ones stay in the kernel."""
+        return (
+            self._stages_on_host
+            and flat_ids.is_cuda
+            and flat_ids.numel() >= PLE_FILE_PREFETCH_MIN_ROWS
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _stage_rows(self, flat_ids: torch.Tensor, vocab_start: int, vocab_end: int):
+        """This rank's distinct rows of ``flat_ids``, read from the table on the host into
+        pinned memory and copied to the device in one transfer, and the ids remapped into
+        them (-1 outside the shard). The kernel then converts the staged rows exactly as it
+        converts the table's."""
+        ids = flat_ids.cpu()  # a prefill chunk's ids: one sync, as the page hint takes
+        in_range = (ids >= vocab_start) & (ids < vocab_end)
+        rows, inverse = torch.unique(ids[in_range] - vocab_start, return_inverse=True)
+        if rows.numel() == 0:
+            # The kernel reads row 0 for an id outside the shard before zeroing it.
+            rows = torch.zeros(1, dtype=torch.int64)
+        # [rows, row bytes], whatever the dtype.
+        table = self.weight.data.view(torch.uint8)
+        # The copy below runs on one thread: queue every cold row's read first.
+        advise_rows_willneed(self._table_fd, rows, table.shape[1])
+        staged = torch.empty(
+            (rows.numel(), table.shape[1]), dtype=torch.uint8, pin_memory=True
+        )
+        torch.index_select(table, 0, rows, out=staged)
+        local = torch.full(ids.shape, -1, dtype=torch.int64)
+        local[in_range] = inverse
+        device = flat_ids.device
+        staged = staged.to(device, non_blocking=True).view(self.weight.dtype)
+        return staged, local.pin_memory().to(device, non_blocking=True)
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
@@ -1150,6 +1252,37 @@ class Qwen4ExpPLELayer(nn.Module):
             self.layer_id, SHORT_CONV_PART
         )
         conv_state = short_conv.view.layer_cache(short_conv.view_layer_id)
+
+        if _use_qwen4_varlen_prefill(
+            batch.mode,
+            batch.query_start_loc,
+            x,
+            self.conv1d.weight,
+            conv_state,
+            batch.state_indices,
+            batch.req_indices,
+            batch.token_offsets,
+            self.short_conv_dilation,
+        ):
+            from sglang.kernels.ops.mamba.qwen4_short_conv import (
+                fused_qwen4_varlen_conv,
+            )
+
+            track = _ple_track_targets(forward_batch, batch)
+            track_indices, track_offsets = track if track is not None else (None, None)
+            conv_output = fused_qwen4_varlen_conv(
+                x,
+                self.conv1d.weight,
+                conv_state,
+                batch.state_indices,
+                batch.query_start_loc,
+                batch.req_indices,
+                batch.token_offsets,
+                self.short_conv_dilation,
+                track_indices=track_indices,
+                track_offsets=track_offsets,
+            )
+            return F.silu(conv_output)
 
         if batch.use_decode_fast_path:
             # With row_width=1 the padded/transpose path is x.unsqueeze(-1),

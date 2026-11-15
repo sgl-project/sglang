@@ -6,6 +6,8 @@ fused QKV as ``[q_all, k_all, v_all]``. Identity name mapping is enough, but
 the DiT's default HF weight loader must not run the grouped→concat reorder.
 """
 
+import os
+
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
     ComfyUICheckpointSpec,
@@ -22,7 +24,38 @@ def _build_dit_config(server_args: ServerArgs) -> MiniMaxH3DiTConfig:
     # ComfyUI / Comfy-Org files match the runtime QKV layout. Native
     # ``sglang serve`` keeps the default grouped HF reorder.
     dit_config.arch_config.qkv_checkpoint_grouped = False
+    # FastH3 single files (FastVideo's Comfy release) are the base layout plus
+    # the VSA compression gate on every block's attention.
+    if has_vsa_gate(getattr(server_args, "model_path", None)):
+        dit_config.arch_config.has_gate_compress = True
     return dit_config
+
+
+def has_vsa_gate(path: str | None) -> bool:
+    if not path or not path.endswith(".safetensors") or not os.path.isfile(path):
+        return False
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        return any(".attn.to_gate_compress." in key for key in f.keys())
+
+
+def is_reference_checkpoint(path: str) -> bool:
+    """Whether a single file holds the Ref2VA (reference) transformer.
+
+    FastVideo's Comfy exports record the source component in the header
+    (``source: transformer_ref`` for OmniRef); the file name is the fallback.
+    """
+    name = os.path.basename(path).lower()
+    if "ref2va" in name or "omniref" in name:
+        return True
+    if not path.endswith(".safetensors") or not os.path.isfile(path):
+        return False
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        metadata = f.metadata() or {}
+    return metadata.get("source") == "transformer_ref"
 
 
 register_comfyui_checkpoint(

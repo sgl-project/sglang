@@ -48,6 +48,9 @@ class CacheInitParams:
 
     pp_rank: int = 0
     pp_size: int = 1
+    # Rounds the PP loop lets a rank run ahead of the next (its pp_loop_size is
+    # pp_size + this); the HiCache PP-sync window matches it.
+    pp_async_batch_depth: int = 0
 
     attn_cp_rank: int = 0
     attn_cp_size: int = 1
@@ -59,8 +62,6 @@ class CacheInitParams:
     # paged SWA pool only a draft uses), so it must not gate prefix matching.
     swa_gates_prefix_match: bool = True
     decoder_swa_bounded_replay: bool = False
-    # Additional reader reaches keyed by actual storage band, not attention role.
-    draft_window_reaches: Optional[dict[str, int]] = None
 
     # The prefix tree's slots in drive order; the KV storage supplies them.
     tree_slots: Optional[tuple[TreeSlot, ...]] = None
@@ -79,17 +80,20 @@ class CacheInitParams:
         """The tree slots' ids, in drive order."""
         if self.tree_slots is None:
             return None
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
 
-        return tuple(ComponentType[slot.component] for slot in self.tree_slots)
+        slot_ids = tree_slot_ids(self.tree_slots)
+        return tuple(slot_ids[slot.component] for slot in self.tree_slots)
 
     @property
     def swa_retain_window(self) -> Optional[int]:
         # Cache history required by every reader of the SWA sub-pool. Retention,
         # tree locks, prefix matching and host transfers must use the same span.
         # The model's attention window remains sliding_window_size.
-        if self.sliding_window_size is None:
-            return None
-        return max(
-            self.sliding_window_size, (self.draft_window_reaches or {}).get("swa", 0)
+        from sglang.srt.mem_cache.base_prefix_cache import retained_target_window
+
+        return retained_target_window(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.sliding_window_size,
         )

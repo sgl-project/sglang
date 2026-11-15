@@ -951,7 +951,7 @@ def test_dsv4_v41_draft_swa_sidecar_moves_whole_pages():
     )
     with patch.object(assembler, "_get_allocator_type", return_value="default"):
         _, (entry,) = assembler.build_swa_draft_pools(
-            draft_kv_pool=draft, tree_cache=tree_cache
+            draft_kv_pool=draft, tree_cache=tree_cache, target_window_host=PoolName.SWA
         )
     host, device_pool = entry.host_pool, entry.device_pool
     buffers = [buffer.view(torch.uint8) for buffer in device_pool.kv_buffer]
