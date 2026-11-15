@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dp_attention import (
     get_cuda_graph_max_batch_size,
     get_eager_max_batch_size,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
@@ -63,11 +61,11 @@ def _update_token_table(tokens, ne_token_table, row_indices, column_starts, req_
 @dataclass(frozen=True, slots=True, kw_only=True)
 class NgramEmbeddingManager:
     enabled: bool
-    table: Optional[torch.Tensor]
+    table: torch.Tensor | None
     n: int
     # Draft runners have no hasher even when their config has engram layers.
-    engram_hasher: Optional[EngramHasher] = None
-    engram_stager: Optional[EngramRowStager] = None
+    engram_hasher: EngramHasher | None = None
+    engram_stager: EngramRowStager | None = None
 
     @classmethod
     def from_model(
@@ -185,10 +183,10 @@ class NgramEmbeddingManager:
 
     def prepare_for_forward(
         self,
-        batch: Optional[ScheduleBatch],
+        batch: ScheduleBatch | None,
         *,
-        chunked_req: Optional[Req],
-    ) -> Optional[ScheduleBatch]:
+        chunked_req: Req | None,
+    ) -> ScheduleBatch | None:
         """Fill the ngram token table and engram history before a forward pass."""
         if batch is None:
             return batch
@@ -199,7 +197,55 @@ class NgramEmbeddingManager:
         if not self.enabled:
             return batch
         batch.ne_token_table = self.table
-        if batch.forward_mode == ForwardMode.EXTEND:
+        if batch.forward_mode.is_prebuilt():
+            all_tokens = []
+            column_starts = []
+            request_lengths = []
+            req_pool_indices = []
+            for req in batch.reqs:
+                fill_ids = req.origin_input_ids + req.output_ids
+                total_len = len(fill_ids)
+                if total_len <= self.n:
+                    tokens = fill_ids
+                    col_start = 0
+                else:
+                    tokens = fill_ids[total_len - self.n :]
+                    col_start = total_len - self.n
+                all_tokens.extend(tokens)
+                column_starts.append(col_start)
+                request_lengths.append(len(tokens))
+                req_pool_indices.append(
+                    req.kv.req_pool_idx
+                    if hasattr(req, "kv") and hasattr(req.kv, "req_pool_idx")
+                    else getattr(req, "req_pool_idx", 0)
+                )
+            if all_tokens:
+                dtype = self.table.dtype
+                device = self.table.device
+                row_indices = (
+                    batch.req_pool_indices
+                    if getattr(batch, "req_pool_indices", None) is not None
+                    else torch.tensor(
+                        req_pool_indices, dtype=torch.int64, device=device
+                    )
+                )
+                if not isinstance(row_indices, torch.Tensor):
+                    row_indices = torch.tensor(
+                        row_indices, dtype=torch.int64, device=device
+                    )
+                _update_token_table(
+                    ne_token_table=self.table,
+                    tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
+                    row_indices=row_indices,
+                    column_starts=torch.tensor(
+                        column_starts, dtype=torch.int32, device=device
+                    ),
+                    req_lens=torch.tensor(
+                        request_lengths, dtype=torch.int32, device=device
+                    ),
+                )
+            return batch
+        if batch.forward_mode.is_extend_without_speculative():
             all_tokens = []
             column_starts = []
             request_lengths = []
@@ -220,19 +266,27 @@ class NgramEmbeddingManager:
                     column_starts.append(start - self.n + 1)
                 all_tokens.extend(tokens)
                 request_lengths.append(len(tokens))
-            dtype = self.table.dtype
-            device = self.table.device
-            _update_token_table(
-                ne_token_table=self.table,
-                tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
-                row_indices=batch.req_pool_indices,
-                column_starts=torch.tensor(
-                    column_starts, dtype=torch.int32, device=device
-                ),
-                req_lens=torch.tensor(
-                    request_lengths, dtype=torch.int32, device=device
-                ),
-            )
+            if all_tokens:
+                dtype = self.table.dtype
+                device = self.table.device
+                row_indices = (
+                    batch.req_pool_indices
+                    if isinstance(batch.req_pool_indices, torch.Tensor)
+                    else torch.tensor(
+                        batch.req_pool_indices, dtype=torch.int64, device=device
+                    )
+                )
+                _update_token_table(
+                    ne_token_table=self.table,
+                    tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
+                    row_indices=row_indices,
+                    column_starts=torch.tensor(
+                        column_starts, dtype=torch.int32, device=device
+                    ),
+                    req_lens=torch.tensor(
+                        request_lengths, dtype=torch.int32, device=device
+                    ),
+                )
             # Mark the chunked (not-yet-finished) prefill request so sample()
             # skips writing its pseudo next-token into the ngram token table.
             # Use self.chunked_req identity (not req.is_chunked) to avoid
