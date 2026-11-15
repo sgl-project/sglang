@@ -136,9 +136,21 @@ def get_version_describe() -> str:
     return get_latest_version_tag_describe()
 
 
-def get_latest_version_tag() -> str:
-    """Return just the highest version tag (PEP 440 ordered), or empty string."""
-    tags_raw = run_git("tag", "--list", "v*.*.*")
+def get_latest_version_tag(remote: bool = False) -> str:
+    """Return just the highest version tag (PEP 440 ordered), or empty string.
+
+    With remote=True, list the tags on origin with `git ls-remote` instead of
+    reading local tags, so a shallow CI checkout needs no `git fetch --tags`.
+    """
+    if remote:
+        refs = run_git("ls-remote", "--tags", "--refs", "origin", "v*.*.*")
+        tags_raw = "\n".join(
+            line.split("refs/tags/", 1)[1]
+            for line in refs.splitlines()
+            if "refs/tags/" in line
+        )
+    else:
+        tags_raw = run_git("tag", "--list", "v*.*.*")
     if not tags_raw:
         return ""
     tag_list = sorted(tags_raw.splitlines(), key=parse_version_tuple, reverse=True)
@@ -147,9 +159,10 @@ def get_latest_version_tag() -> str:
 
 def main() -> None:
     # --tag-only: print just the latest version tag (for CI scripts)
+    # --remote: with --tag-only, read the tags on origin instead of local tags
     tag_only = "--tag-only" in sys.argv
     if tag_only:
-        result = get_latest_version_tag()
+        result = get_latest_version_tag(remote="--remote" in sys.argv)
     else:
         result = get_version_describe()
     if not result:

@@ -396,7 +396,7 @@ void qsa_index_q_prep(
   using namespace host;
   auto tokens = SymbolicSize{"tokens"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   constexpr int64_t D = kHeadDim;
 
   TensorMatcher({tokens, (num_q_heads + 1) * D}).with_dtype<T>().with_device(device).verify(qk);
@@ -460,7 +460,7 @@ void qsa_index_k_compress(
     float eps) {
   using namespace host;
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   constexpr int64_t D = kHeadDim;
 
   auto slots = SymbolicSize{"state_slots"};

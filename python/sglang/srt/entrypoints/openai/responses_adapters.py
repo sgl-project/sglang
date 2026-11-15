@@ -21,6 +21,11 @@ from typing import Any, Dict, Iterator, Optional, Set, Tuple
 
 CUSTOM_TOOL_INPUT_KEY = "input"
 
+
+def response_tool_name(name, names):
+    return names.get(name, {"name": name})
+
+
 _SIMPLE_ESCAPES = {
     '"': '"',
     "\\": "\\",

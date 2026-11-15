@@ -15,7 +15,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req  # noqa: E402
+from sglang.srt.managers.req_types import FINISH_LENGTH  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator  # noqa: E402
 from sglang.srt.mem_cache.allocator.paged import (  # noqa: E402
     PagedTokenToKVPoolAllocator,
@@ -30,7 +31,7 @@ from sglang.srt.mem_cache.memory_pool import (  # noqa: E402
     MHATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (  # noqa: E402
+from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: E402
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
@@ -40,6 +41,7 @@ from sglang.srt.server_args import (  # noqa: E402
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
+from sglang.test.tree_slots import tree_slots_of  # noqa: E402
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -99,7 +101,7 @@ class _RetractionCase(CustomTestCase):
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=self.PAGE,
                 disable=False,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
             )
         )
         self.page_tail = []  # unused slots of the row's last page

@@ -175,8 +175,12 @@ Causal pipelines use the exported fixed-step schedule and require guidance `1.0`
 Use `--component-residency` for memory-constrained deployments. Joint checkpoints
 register `lidar_encoder` and `lidar_decoder` separately from the camera `vae`.
 Bimanual overlaps causal VAE decode only when the VAE is resident; offloaded VAEs
-use the final serial decode stage. History-window reduction and frustum retrieval
-change the attention context and are not lossless acceleration settings.
+use the final serial decode stage. The causal pipelines default to `history_mode: auto`,
+which follows the export's training K/V window: a sliding cache over the artifact's
+`window_frames` and `sink_frames` when the export records `kv_cache_inference_size`, the
+whole clip otherwise; frustum retrieval needs `history_mode: full`. History-window
+reduction and frustum retrieval change the attention context and are not lossless
+acceleration settings.
 
 ## 4. OpenAI-Compatible Requests
 
@@ -354,7 +358,7 @@ Poll and download this job with the same status and content endpoints used by th
 
 ### Action generation
 
-For DROID policy generation, start a single-GPU server with either the Nano or Edge policy checkpoint. Cosmos3 action generation does not currently support CFG or sequence parallelism.
+For DROID policy generation, start a server with either the Nano or Edge policy checkpoint. One GPU is enough; to split a request across GPUs, use Ulysses sequence parallelism (`--num-gpus 2 --ulysses-degree 2`). Cosmos3 action generation does not support CFG parallel; policy requests run with `guidance_scale=1.0`, so this only matters if you raise the guidance scale on a multi-GPU server.
 
 ```bash Command
 sglang serve \

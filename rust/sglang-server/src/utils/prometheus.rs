@@ -5,7 +5,8 @@
 //!
 //! With metrics enabled, every Python process writes its samples to files under
 //! `PROMETHEUS_MULTIPROC_DIR`, and Python's `/metrics` merges those files per
-//! scrape. Reading them here serves the same text without taking the GIL.
+//! scrape. Reading them here serves the same text without taking the GIL, and
+//! the frontend's own samples, written in the same format, merge with them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -13,8 +14,8 @@ use std::hash::Hash;
 use std::io;
 use std::path::Path;
 
-/// One `MmapedDict` entry: the JSON key (Python's `mmap_key`), the value and
-/// the timestamp (read only by `mostrecent` gauges).
+/// One `MmapedDict` entry: the JSON key (see [`mmap_key`]), the value and the
+/// timestamp (read only by `mostrecent` gauges).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub key: String,
@@ -74,6 +75,70 @@ pub fn read_entries(data: &[u8]) -> Result<Vec<Entry>, String> {
         pos += 16;
     }
     Ok(entries)
+}
+
+/// Encode entries as `MmapedDict` writes them, up to the used length.
+pub fn encode_entries<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Vec<u8> {
+    let mut out = vec![0u8; HEADER_LEN];
+    for entry in entries {
+        let key = entry.key.as_bytes();
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        out.extend_from_slice(key);
+        out.resize(out.len() + padded_key_len(key.len()) - key.len(), b' ');
+        out.extend_from_slice(&entry.value.to_le_bytes());
+        out.extend_from_slice(&entry.timestamp.to_le_bytes());
+    }
+    let used = out.len() as u32;
+    out[..4].copy_from_slice(&used.to_le_bytes());
+    out
+}
+
+/// Python `mmap_key`: `json.dumps([metric_name, name, labels, help_text],
+/// sort_keys=True)`, byte for byte.
+pub fn mmap_key(metric_name: &str, name: &str, labels: &[(String, String)], help: &str) -> String {
+    let mut sorted: Vec<&(String, String)> = labels.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::from("[");
+    push_json_str(&mut out, metric_name);
+    out.push_str(", ");
+    push_json_str(&mut out, name);
+    out.push_str(", {");
+    for (i, (key, value)) in sorted.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        push_json_str(&mut out, key);
+        out.push_str(": ");
+        push_json_str(&mut out, value);
+    }
+    out.push_str("}, ");
+    push_json_str(&mut out, help);
+    out.push(']');
+    out
+}
+
+/// A JSON string as Python's `json.dumps` writes it (`ensure_ascii=True`).
+fn push_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            ' '..='~' => out.push(c),
+            _ => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    let _ = write!(out, "\\u{unit:04x}");
+                }
+            }
+        }
+    }
+    out.push('"');
 }
 
 type Labels = Vec<(String, String)>;
@@ -503,6 +568,15 @@ pub fn read_dir_files(dir: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
     Ok(files)
 }
 
+/// Replace `dir/file_name` with `data` (see [`encode_entries`]), atomically: a
+/// scrape reads either the previous file or this one, never a partial write.
+pub fn write_file(dir: &Path, file_name: &str, data: &[u8]) -> io::Result<()> {
+    // Not `*.db`, so a concurrent glob never lists the partial file.
+    let tmp = dir.join(format!("{file_name}.tmp"));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, dir.join(file_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +624,26 @@ mod tests {
                 .map(|(name, data)| (name.as_str(), data.as_slice())),
         );
         assert_eq!(render(&families), text);
+    }
+
+    /// Re-encoding every fixture file reproduces Python's bytes up to the used
+    /// length (Python preallocates the rest), and each key is what Python's
+    /// `mmap_key` writes for its parsed parts.
+    #[test]
+    fn encodes_files_and_keys_as_python_does() {
+        let (files, _) = fixture();
+        for (name, data) in &files {
+            let entries = read_entries(data).unwrap();
+            let used = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+            assert_eq!(encode_entries(&entries), data[..used], "{name}");
+            for entry in &entries {
+                let (metric_name, sample_name, labels, help) = parse_key(&entry.key).unwrap();
+                assert_eq!(
+                    mmap_key(&metric_name, &sample_name, &labels, &help),
+                    entry.key
+                );
+            }
+        }
     }
 
     #[test]
@@ -603,7 +697,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("prom-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (files, _) = fixture();
-        std::fs::write(dir.join(&files[0].0), &files[0].1).unwrap();
+        let entries = read_entries(&files[0].1).unwrap();
+        write_file(&dir, &files[0].0, &encode_entries(&entries)).unwrap();
         std::fs::write(dir.join(".hidden.db"), b"").unwrap();
         std::fs::write(dir.join("counter_1.db.tmp"), b"").unwrap();
         let listed = read_dir_files(&dir).unwrap();

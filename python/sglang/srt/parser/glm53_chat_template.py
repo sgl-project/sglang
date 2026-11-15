@@ -20,8 +20,7 @@ from typing import Any, Optional
 _UNDEFINED = object()
 
 _TOOLS_PREFIX = (
-    "<|system|>\n"
-    "# Tools\n\n"
+    "\n# Tools\n\n"
     "You may call one or more functions to assist with the user query.\n\n"
     "You are provided with function signatures within <tools></tools> XML tags:\n"
     "<tools>\n"
@@ -315,16 +314,19 @@ def _render(
     clear_thinking: Any,
     reasoning_content: Any,
     multimodal: bool,
-) -> str:
+) -> list[str]:
     effective_reasoning_effort = (
         reasoning_effort if reasoning_effort in ("low", "high") else "max"
     )
     parts = [
-        "[gMASK]<sop>",
-        f"<|system|>Reasoning Effort: {effective_reasoning_effort.capitalize()}",
+        "[gMASK]",
+        "<sop>",
+        "<|system|>",
+        f"Reasoning Effort: {effective_reasoning_effort.capitalize()}",
     ]
 
     if tools:
+        parts.append("<|system|>")
         parts.append(_TOOLS_PREFIX)
         for tool in tools:
             tool = _unwrap_tool(tool)
@@ -343,9 +345,8 @@ def _render(
         message = messages[index]
         role = _get(message, "role")
         if role == "user":
-            parts.append(
-                "<|user|>" + _visible_text(_get(message, "content"), multimodal)
-            )
+            parts.append("<|user|>")
+            parts.append(_visible_text(_get(message, "content"), multimodal))
         elif role == "assistant":
             parts.append("<|assistant|>")
             content = _visible_text(_get(message, "content"), multimodal)
@@ -386,17 +387,17 @@ def _render(
                 )
                 index = end
         elif role == "system":
-            parts.append(
-                "<|system|>" + _visible_text(_get(message, "content"), multimodal)
-            )
+            parts.append("<|system|>")
+            parts.append(_visible_text(_get(message, "content"), multimodal))
         index += 1
 
     if add_generation_prompt:
-        parts.append("<|assistant|><think>")
-    return "".join(parts)
+        parts.append("<|assistant|>")
+        parts.append("<think>")
+    return parts
 
 
-def render_glm53(
+def render_glm53_segments(
     messages: list[Any],
     tools: Optional[list[Any]] = None,
     add_generation_prompt: bool = False,
@@ -404,8 +405,12 @@ def render_glm53(
     clear_thinking: Any = False,
     reasoning_content: Any = _UNDEFINED,
     **_: Any,
-) -> str:
-    """Render a GLM-5.3 (text-only) chat prompt."""
+) -> list[str]:
+    """Render a GLM-5.3 (text-only) chat prompt as the strings it concatenates.
+
+    The special tokens that open the prompt and each turn are strings of their
+    own, so the prompt can be encoded one segment at a time.
+    """
     return _render(
         messages,
         tools,
@@ -417,7 +422,7 @@ def render_glm53(
     )
 
 
-def render_glm53_flash(
+def render_glm53_flash_segments(
     messages: list[Any],
     tools: Optional[list[Any]] = None,
     add_generation_prompt: bool = False,
@@ -425,8 +430,8 @@ def render_glm53_flash(
     clear_thinking: Any = False,
     reasoning_content: Any = _UNDEFINED,
     **_: Any,
-) -> str:
-    """Render a GLM-5.3-Flash (multimodal) chat prompt."""
+) -> list[str]:
+    """``render_glm53_segments`` for GLM-5.3-Flash (multimodal)."""
     return _render(
         messages,
         tools,
@@ -436,3 +441,13 @@ def render_glm53_flash(
         reasoning_content,
         multimodal=True,
     )
+
+
+def render_glm53(*args: Any, **kwargs: Any) -> str:
+    """Render a GLM-5.3 (text-only) chat prompt."""
+    return "".join(render_glm53_segments(*args, **kwargs))
+
+
+def render_glm53_flash(*args: Any, **kwargs: Any) -> str:
+    """Render a GLM-5.3-Flash (multimodal) chat prompt."""
+    return "".join(render_glm53_flash_segments(*args, **kwargs))

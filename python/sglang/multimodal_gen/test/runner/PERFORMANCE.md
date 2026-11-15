@@ -51,8 +51,8 @@ scenarios; use a separate `--out` file when collecting pool-specific candidates.
 `flux1_modelopt_nvfp4_t2i` and 17742.04 ms for
 `qwen_image_2512_modelopt_nvfp4_t2i`. The measured Cirrascale 3 and Cirrascale 4
 runners below also have separate references, and `b200-cirrascale1-4567` reuses
-the `1-0123` references. Other Cirrascale runners retain the defaults until
-calibrated.
+the `1-0123` references. Cirrascale 2 joins the pool below. Other Cirrascale
+runners retain the defaults until calibrated.
 
 The Cirrascale 1, 3 and 4 hosts match on CPU, memory, kernel, driver, VBIOS,
 power limit and GPU settings, and their per-step denoise timings agree, so these
@@ -141,6 +141,89 @@ Each row is the minimum of the job's seven retried attempts, at most 6% below
 the Cirrascale 3 references. Under the pool rule above each half reuses its
 Cirrascale 3 counterpart: 1470.24 / 17894.49 ms for `4-0123`, and 1471.19 /
 17346.65 ms for `4-4567`.
+
+### Cirrascale 2 historical CI reference
+
+`b200-cirrascale2` is one runner over all eight GPUs, with no `-0123`/`-4567`
+suffix, so it matches the `b200-cirrascale2` prefix. It runs the same B200 and
+driver (580.126.20) as Cirrascale 4, and its per-step denoise timings agree:
+
+| CI job | Flux1 E2E (ms) | Flux1 step (ms) | Qwen2512 E2E (ms) | Qwen2512 step (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| [PR #46926, `cirrascale2`](https://github.com/sgl-project/sglang/actions/runs/41712145442/job/126183089454) | 1169–1196 | 80.7–82.9 | 16136–16967 | 317.5–334.0 |
+| [Scheduled, `cirrascale4-4567`](https://github.com/sgl-project/sglang/actions/runs/41624885463/job/125879877166) | 1194.61 | 82.9 | 17071.79 | 336.1 |
+
+The `cirrascale2` row covers all seven attempts. Without an override, every one
+failed both E2E guards against the Verda defaults (1045.89 / 12062.58 ms
+limits). Under the pool rule above it reuses the `4-4567` references: 1471.19 /
+17346.65 ms.
+
+## H100 runner baselines
+
+`h100.json` keeps its references as the defaults. Since 2026-11-02 the
+`multimodal-gen-test-1-gpu` jobs run on the `h100-computable-d-*` and
+`h100-computable-e-*` hosts instead of `h100-novita-*`. Those hosts start
+servers and load weights more slowly, so the loading guard fails there for most
+cases, on `main` as well as on PRs. Its `runner_overrides` give each of the two
+pools its own loading and E2E references, keyed `h100-computable-d-` and
+`h100-computable-e-` so that a future `h100-computable-dx` pool does not match.
+Other runners keep the defaults.
+Stage/step and memory references and all tolerances are unchanged.
+
+Scheduled PR Test Base runs, 2026-10-18 to 2026-11-06 (127 jobs; one `computable-d` job was still running):
+
+| Pool | Jobs passed | Load / reference (median) | E2E / reference (median) |
+| --- | ---: | ---: | ---: |
+| `h100-novita` (to 11-02) | 98 / 100 | 1.03 | 0.97 |
+| `h100-computable-e` | 8 / 15 | 1.34 | 0.98 |
+| `h100-computable-d` | 0 / 11 | 1.67 | 1.06 |
+
+The slowdown covers the whole server startup, not particular models. Median
+time from `Starting server...` to the scheduler binding is 10 s on `novita`,
+11 s on `computable-e` and 14 s on `computable-d`. From `Loading pipeline
+modules...` to `All workers are ready` it is 13 s, 19 s and 21 s. Denoise steps
+run at the same speed.
+
+### Calibration
+
+Sources are the `multimodal-gen-test-1-gpu` jobs of scheduled runs
+[41542824410](https://github.com/sgl-project/sglang/actions/runs/41542824410),
+[41624885463](https://github.com/sgl-project/sglang/actions/runs/41624885463),
+[41736410757](https://github.com/sgl-project/sglang/actions/runs/41736410757),
+[41818760693](https://github.com/sgl-project/sglang/actions/runs/41818760693),
+[41931046936](https://github.com/sgl-project/sglang/actions/runs/41931046936),
+[42016279283](https://github.com/sgl-project/sglang/actions/runs/42016279283),
+[42127018428](https://github.com/sgl-project/sglang/actions/runs/42127018428),
+[42207797310](https://github.com/sgl-project/sglang/actions/runs/42207797310) and
+[42309543238](https://github.com/sgl-project/sglang/actions/runs/42309543238):
+27 jobs on 14 runners. Each case was measured in at least two jobs on each pool.
+
+For each pool and case, the reference is the minimum `load_time_ms` or `e2e_ms`
+over all attempts, the same minimum-observed rule used above. A reference is
+only raised, and only when that minimum is more than 5% above the default, so
+cases the pool runs normally keep the default guard. This gives 51 loading and
+14 E2E overrides for `computable-d`, and 46 loading and 4 E2E overrides for
+`computable-e`.
+
+Leaving out one scheduled run at a time, calibrating on the rest and checking
+the left-out jobs against the loading and E2E guards (with in-job retries): 11
+of 12 `computable-d` jobs and 15 of 15 `computable-e` jobs pass, against 0 of
+12 and 8 of 15 with the defaults.
+
+`ltx_2_3_hq_pipeline` also gets per-pool denoise references (average, median,
+steps 0-14 and `LTX2AVDenoisingStage`) by the same rule, from the same runs.
+Its denoise is slower on both pools (minimum average 1183 ms on `computable-d`
+and 996 ms on `computable-e`, against the 914 ms default), so after the E2E
+override every `computable-d` attempt failed the denoise guard instead. Checked
+against all guards on the 2026-11-07 to 11-09 PR runs, which are not in the
+calibration set, 10 of 10 `computable-d` and 11 of 11 `computable-e` jobs pass,
+against 0 of 10 and 10 of 11 without these references. Override maps such as
+`stages_ms` and `denoise_step_ms` merge into the defaults, so unlisted stages
+and steps keep their default references.
+
+These references describe slower hosts, not slower code. On these pools a
+loading regression must exceed the host's own minimum by 40% before it fails.
+When the hosts are fixed or leave the pool, remove their entries.
 
 ## Initial loading references
 

@@ -88,6 +88,9 @@ NCCL_API_MAGIC = 0xCAFEBEEF
 # from nccl.h.in.
 NCCL_CONFIG_VERSION = 23000  # NCCL_VERSION(2, 30, 0)
 
+# ncclConfig_t.CTAPolicy: run eligible collectives without SMs (copy engines).
+NCCL_CTA_POLICY_ZERO = 0x02
+
 
 class ncclConfig_t(ctypes.Structure):
     """Mirror of ``ncclConfig_t`` (``ncclConfig_v22800``) from nccl.h.in.
@@ -406,6 +409,14 @@ class NCCLLibrary:
         ),
         # ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win);
         Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
+        # ncclResult_t ncclMemAlloc(void** ptr, size_t size);
+        Function(
+            "ncclMemAlloc",
+            ncclResult_t,
+            [ctypes.POINTER(buffer_type), ctypes.c_size_t],
+        ),
+        # ncclResult_t ncclMemFree(void* ptr);
+        Function("ncclMemFree", ncclResult_t, [buffer_type]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -441,7 +452,9 @@ class NCCLLibrary:
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
-            exported_functions = NCCLLibrary.exported_functions
+            # Copy: optional symbols of this library must not leak into the
+            # class list that another library path binds from.
+            exported_functions = list(NCCLLibrary.exported_functions)
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
             for func in exported_functions:
@@ -649,6 +662,14 @@ class NCCLLibrary:
 
     def ncclCommWindowDeregister(self, comm: ncclComm_t, window: ncclWindow_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommWindowDeregister"](comm, window))
+
+    def ncclMemAlloc(self, size: int) -> int:
+        ptr = buffer_type()
+        self.NCCL_CHECK(self._funcs["ncclMemAlloc"](ctypes.byref(ptr), size))
+        return ptr.value
+
+    def ncclMemFree(self, ptr: int) -> None:
+        self.NCCL_CHECK(self._funcs["ncclMemFree"](buffer_type(ptr)))
 
     def ncclGroupStart(self) -> None:
         self.NCCL_CHECK(self._funcs["ncclGroupStart"]())

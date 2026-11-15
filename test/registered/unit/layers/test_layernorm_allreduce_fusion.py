@@ -11,13 +11,13 @@ import torch
 
 from sglang.srt.distributed import communication_op
 from sglang.srt.layers import flashinfer_comm_fusion, layernorm
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 HIDDEN = 8
 PEERS = 4
@@ -115,6 +115,27 @@ def rmsnorm():
 class TestDeclinedFusedAllReduceNorm(CustomTestCase):
     def setUp(self):
         torch.manual_seed(0)
+
+    def test_gemma_honors_non_attention_group_when_attention_tp_is_one(self):
+        """CP decode owes the MoE/TP sum even when prefill attention TP is one."""
+        reduced = []
+        with (
+            declined_fused_kernel(reduced, moe_ep_size=1, moe_tp_size=PEERS),
+            get_parallel().override(attn_tp_size=1, attn_cp_size=PEERS),
+        ):
+            norm = GemmaRMSNorm(HIDDEN)
+            # Exercise the real norm math on CPU even on a CUDA test host.
+            norm._forward_method = norm.forward_native
+            norm.weight.data.copy_(torch.randn(HIDDEN))
+            norm.refresh_gemma_weight()
+            x, residual = torch.randn(3, HIDDEN), torch.randn(3, HIDDEN)
+            expected = norm.forward_native(x * PEERS, residual.clone())
+            out, residual_out = norm.forward_with_allreduce_fusion(
+                x, residual, use_attn_tp_group=False
+            )
+            self.assertEqual(reduced, ["moe_tp"])
+            torch.testing.assert_close(out, expected[0])
+            torch.testing.assert_close(residual_out, expected[1])
 
     def test_declined_kernel_all_reduces_once_over_the_kernel_group(self):
         for use_attn_tp_group, topology, group in FUSION_GROUPS:
