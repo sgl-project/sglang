@@ -928,9 +928,9 @@ async def server_info():
 
 
 # example usage:
-# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
+# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def set_internal_state(
     obj: Annotated[SetInternalStateReq, Body()], request: Request
 ):
@@ -942,7 +942,7 @@ async def set_internal_state(
 if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 
     @app.api_route("/dumper/{method}", methods=["POST"])
-    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    @auth_level(AuthLevel.ADMIN_FORCE)
     async def _dumper_control_handler(method: str, request: Request):
         body_bytes = await request.body()
         body = await request.json() if body_bytes else {}
@@ -1076,7 +1076,7 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
 
 
 @app.post("/add_external_corpus")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def add_external_corpus(request: Request):
     """Add an external corpus for ngram speculative decoding."""
     from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
@@ -1101,7 +1101,7 @@ async def add_external_corpus(request: Request):
 
 
 @app.post("/remove_external_corpus")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def remove_external_corpus(request: Request):
     """Remove an external corpus by ID."""
     body = await request.json()
@@ -1149,6 +1149,7 @@ async def clear_hicache_storage_backend():
 # example usage:
 # curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
 #  -H 'Content-Type: application/json' \
+#  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
 #   -d '{
 #     "hicache_storage_backend": "file",
 #     "hicache_storage_backend_extra_config_json": "{}",
@@ -1156,7 +1157,7 @@ async def clear_hicache_storage_backend():
 #     "hicache_write_policy": "write_through"
 #   }'
 @app.api_route("/hicache/storage-backend", methods=["PUT"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def attach_hicache_storage_backend(
     obj: Annotated[AttachHiCacheStorageReqInput, Body()],
 ):
@@ -1164,9 +1165,6 @@ async def attach_hicache_storage_backend(
 
     Only allowed when there are NO running / queued requests.
     """
-    if not get_serving().admin_api_key:
-        return _admin_api_key_missing_response()
-
     ret = await _global_state.tokenizer_manager.attach_hicache_storage(
         hicache_storage_backend=obj.hicache_storage_backend,
         hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
@@ -1190,15 +1188,12 @@ async def attach_hicache_storage_backend(
 # example usage:
 # curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend
 @app.api_route("/hicache/storage-backend", methods=["DELETE"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def detach_hicache_storage_backend():
     """Detach (disable) HiCache storage backend at runtime.
 
     Only allowed when there are NO running / queued requests.
     """
-    if not get_serving().admin_api_key:
-        return _admin_api_key_missing_response()
-
     ret = await _global_state.tokenizer_manager.detach_hicache_storage()
     msg = ret.message
     return Response(
@@ -1217,12 +1212,9 @@ async def detach_hicache_storage_backend():
 # example usage:
 # curl -s http://127.0.0.1:30000/hicache/storage-backend
 @app.get("/hicache/storage-backend")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def hicache_storage_backend_status():
     """Get current HiCache storage backend status (tokenizer-side view)."""
-    if not get_serving().admin_api_key:
-        return _admin_api_key_missing_response()
-
     return {
         name: _global_state.tokenizer_manager.config_value(name)
         for name in (
@@ -1254,7 +1246,7 @@ async def get_hicache_l3_cache_layout():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     """Start profiling."""
     await _global_state.tokenizer_manager.start_profile(obj or ProfileReq())
@@ -1265,7 +1257,7 @@ async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = Non
 
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def stop_profile_async():
     """Stop profiling."""
     await _global_state.tokenizer_manager.stop_profile()
@@ -1300,7 +1292,7 @@ async def freeze_gc_async():
 
 
 @app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def start_expert_distribution_record_async():
     """Start recording the expert distribution. Clear the previous record if any."""
     await _global_state.tokenizer_manager.start_expert_distribution_record()
@@ -1311,7 +1303,7 @@ async def start_expert_distribution_record_async():
 
 
 @app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def stop_expert_distribution_record_async():
     """Stop recording the expert distribution."""
     await _global_state.tokenizer_manager.stop_expert_distribution_record()
@@ -1322,7 +1314,7 @@ async def stop_expert_distribution_record_async():
 
 
 @app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
     await _global_state.tokenizer_manager.dump_expert_distribution_record()
@@ -1333,7 +1325,7 @@ async def dump_expert_distribution_record_async():
 
 
 @app.post("/update_weights_from_disk")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_disk(
     obj: Annotated[UpdateWeightFromDiskReqInput, Body()], request: Request
 ):
@@ -1362,7 +1354,7 @@ async def update_weights_from_disk(
 
 
 @app.post("/init_weights_send_group_for_remote_instance")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def init_weights_send_group_for_remote_instance(
     obj: Annotated[InitWeightsSendGroupForRemoteInstanceReqInput, Body()],
     request: Request,
@@ -1381,7 +1373,7 @@ async def init_weights_send_group_for_remote_instance(
 
 
 @app.post("/send_weights_to_remote_instance")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def send_weights_to_remote_instance(
     obj: Annotated[SendWeightsToRemoteInstanceReqInput, Body()], request: Request
 ):
@@ -1437,7 +1429,7 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 
 
 @app.post("/init_weights_update_group")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def init_weights_update_group(
     obj: Annotated[InitWeightsUpdateGroupReqInput, Body()], request: Request
 ):
@@ -1453,7 +1445,7 @@ async def init_weights_update_group(
 
 
 @app.post("/destroy_weights_update_group")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def destroy_weights_update_group(
     obj: Annotated[DestroyWeightsUpdateGroupReqInput, Body()], request: Request
 ):
@@ -1469,7 +1461,7 @@ async def destroy_weights_update_group(
 
 
 @app.post("/update_weights_from_tensor")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_tensor(
     obj: Annotated[UpdateWeightsFromTensorReqInput, Body()], request: Request
 ):
@@ -1491,7 +1483,7 @@ async def update_weights_from_tensor(
 
 
 @app.post("/begin_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def begin_weight_update(
     obj: Annotated[BeginWeightUpdateReqInput, Body()], request: Request
 ):
@@ -1506,7 +1498,7 @@ async def begin_weight_update(
 
 
 @app.post("/end_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def end_weight_update(
     obj: Annotated[EndWeightUpdateReqInput, Body()], request: Request
 ):
@@ -1521,7 +1513,7 @@ async def end_weight_update(
 
 
 @app.post("/plugin_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def plugin_weight_update(
     obj: Annotated[PluginWeightUpdateReqInput, Body()], request: Request
 ):
@@ -1539,7 +1531,7 @@ async def plugin_weight_update(
 
 
 @app.post("/update_weights_from_distributed")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_distributed(
     obj: Annotated[UpdateWeightsFromDistributedReqInput, Body()], request: Request
 ):
@@ -1559,7 +1551,7 @@ async def update_weights_from_distributed(
 
 
 @app.post("/update_weights_from_ipc")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_ipc(
     obj: Annotated[UpdateWeightsFromIPCReqInput, Body()], request: Request
 ):
@@ -1578,7 +1570,7 @@ async def update_weights_from_ipc(
 
 
 @app.post("/update_weight_version")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weight_version(
     obj: Annotated[UpdateWeightVersionReqInput, Body()], request: Request
 ):
@@ -1610,7 +1602,7 @@ async def update_weight_version(
 
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def get_weights_by_name(
     obj: Annotated[GetWeightsByNameReqInput, Body()], request: Request
 ):
@@ -1626,7 +1618,7 @@ async def get_weights_by_name(
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def release_memory_occupation(
     obj: Annotated[ReleaseMemoryOccupationReqInput, Body()], request: Request
 ):
@@ -1638,7 +1630,7 @@ async def release_memory_occupation(
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def resume_memory_occupation(
     obj: Annotated[ResumeMemoryOccupationReqInput, Body()], request: Request
 ):
@@ -1650,7 +1642,7 @@ async def resume_memory_occupation(
 
 
 @app.api_route("/weights_checker", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def check_weights(
     obj: Annotated[Optional[CheckWeightsReqInput], Body()] = None,
     request: Request = None,
@@ -1672,7 +1664,7 @@ async def check_weights(
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
     when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
@@ -1686,7 +1678,7 @@ async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
 
 
 @app.api_route("/pd_role_switch", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def pd_role_switch(
     obj: Annotated[PdRoleSwitchReqInput, Body()], request: Request
 ):
@@ -1703,7 +1695,7 @@ async def pd_role_switch(
 
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def load_lora_adapter(
     obj: Annotated[LoadLoRAAdapterReqInput, Body()], request: Request
 ):
@@ -1714,7 +1706,7 @@ async def load_lora_adapter(
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def load_lora_adapter_from_tensors(
     obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
@@ -1727,7 +1719,7 @@ async def load_lora_adapter_from_tensors(
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def unload_lora_adapter(
     obj: Annotated[UnloadLoRAAdapterReqInput, Body()], request: Request
 ):
@@ -1762,7 +1754,7 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
 
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def configure_logging(
     obj: Annotated[ConfigureLoggingReq, Body()], request: Request
 ):
@@ -1882,7 +1874,7 @@ async def separate_reasoning_request(
 
 
 @app.post("/pause_generation")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def pause_generation(
     obj: Annotated[PauseGenerationReqInput, Body()], request: Request
 ):
@@ -1895,7 +1887,7 @@ async def pause_generation(
 
 
 @app.post("/continue_generation")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def continue_generation(
     obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
 ):
@@ -2338,27 +2330,6 @@ def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}},
         status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),
-    )
-
-
-# FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so
-# would currently cause all endpoints to go through add_api_key_middleware
-# (even when neither api-key nor admin-api-key is configured).
-#
-# For now, we simulate ADMIN_FORCE by explicitly checking the admin API key parameter.
-# Once the auth wiring is refactored so ADMIN_FORCE only affects the intended
-# admin endpoints, we should switch this logic to use ADMIN_FORCE directly.
-def _admin_api_key_missing_response(
-    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
-) -> ORJSONResponse:
-    return ORJSONResponse(
-        content={
-            "error": (
-                "This endpoint requires admin API key, but this server was started "
-                "without one (admin-api-key). Restart with --admin-api-key to enable."
-            )
-        },
-        status_code=status_code,
     )
 
 

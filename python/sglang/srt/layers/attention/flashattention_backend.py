@@ -421,7 +421,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def _init_flash_attention_functions(self, device_capability):
         if self.fa_impl_ver == 3:
-            from sgl_kernel.flash_attn import get_scheduler_metadata
+            from sgl_fa3 import get_scheduler_metadata
 
             from sglang.kernels.ops.attention.flash_attention_v3 import (
                 flash_attn_varlen_func,
