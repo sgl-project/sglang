@@ -1930,8 +1930,17 @@ class ModelConfig:
     def _parse_quant_hf_config(self):
         if self.hf_config.architectures == ["Inkling2ForConditionalGenerationMTP"]:
             return None
-        quant_cfg = _quant_config_to_dict(
-            getattr(self.hf_config, "quantization_config", None)
+        is_inkling2 = self.hf_config.architectures == [
+            "Inkling2ForConditionalGeneration"
+        ]
+        # Inkling2's generic ModelOpt declaration is compatibility metadata;
+        # its standalone precision file is authoritative.
+        quant_cfg = (
+            None
+            if is_inkling2
+            else _quant_config_to_dict(
+                getattr(self.hf_config, "quantization_config", None)
+            )
         )
         if quant_cfg is not None:
             # Identify modelopt quantization
@@ -1945,7 +1954,7 @@ class ModelConfig:
                 if parsed_cfg:
                     quant_cfg.update(parsed_cfg)
 
-        if quant_cfg is None:
+        if quant_cfg is None and not is_inkling2:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
         if quant_cfg is None:

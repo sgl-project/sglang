@@ -40,6 +40,7 @@ register_cuda_ci(est_time=37, stage="base-c", runner_config="4-gpu-gb300")
 _RELEASE_CONFIG = {
     "architectures": ["Inkling2ForConditionalGeneration"],
     "model_type": "inkling2",
+    "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
     "eos_token_id": 200006,
     "text_config": {
         "model_max_length": 1048576,
@@ -182,6 +183,7 @@ def test_public_config_load_and_roundtrip(tmp_path, release_config):
 
 
 def test_precision_file_is_detected_without_launch_flag(tmp_path, release_config):
+    """The standalone precision file wins over the generic ModelOpt declaration."""
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.model_loader.weight_utils import get_quant_config
@@ -202,6 +204,7 @@ def test_precision_file_is_detected_without_launch_flag(tmp_path, release_config
     assert config.is_hybrid_swa_compress
     assert not config.is_multimodal
     loaded = get_quant_config(config, LoadConfig(), packed_modules_mapping={})
+    assert isinstance(loaded, Inkling2QuantConfig)
     assert loaded.quantizes_input("model.llm.layers.0.mlp.experts.w13_weight")
 
 

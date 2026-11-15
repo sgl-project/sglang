@@ -288,7 +288,13 @@ def get_quant_config(
     if model_config.quantization == "gguf":
         return quant_cls.from_config({})
 
-    checkpoint_quant_spec = resolve_checkpoint_quant_spec(model_config.hf_config)
+    # Inkling2 also has a generic ModelOpt declaration in config.json. Its
+    # standalone precision file must be loaded by Inkling2QuantConfig instead.
+    checkpoint_quant_spec = (
+        None
+        if model_config.quantization == "inkling2"
+        else resolve_checkpoint_quant_spec(model_config.hf_config)
+    )
     if checkpoint_quant_spec is not None:
         hf_quant_config = checkpoint_quant_spec.config
         # For modelopt_mixed, config.json's quantization_config may not
