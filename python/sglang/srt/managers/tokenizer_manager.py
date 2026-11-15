@@ -1630,6 +1630,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         indices = obj.token_indices_to_pool
         if indices is None:
             return
+        # Only a prompt-only request reads these positions; any other request
+        # would ignore them.
+        if obj.sampling_params.get("max_new_tokens") != 0:
+            raise ValueError("token_indices_to_pool requires max_new_tokens=0.")
         if input_ids is not None:
             seq_len = len(input_ids)
         elif obj.input_embeds is not None:
