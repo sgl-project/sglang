@@ -387,16 +387,17 @@ def handle_data_parallelism(server_args: Any):
                 enable_dp_attention_local_control_broadcast=True,
             )
         assert cfg.tp_size % cfg.attn_dp_size == 0
-        original_chunked_prefill_size = cfg.chunked_prefill_size
-        declare_resolution(
-            server_args,
-            "_handle_data_parallelism",
-            chunked_prefill_size=cfg.chunked_prefill_size // cfg.attn_dp_size,
-        )
-        logger.warning(
-            f"DP attention is enabled. chunked prefill size is adjusted "
-            f"from {original_chunked_prefill_size} to {cfg.chunked_prefill_size}."
-        )
+        if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0:
+            original_chunked_prefill_size = cfg.chunked_prefill_size
+            declare_resolution(
+                server_args,
+                "_handle_data_parallelism",
+                chunked_prefill_size=cfg.chunked_prefill_size // cfg.attn_dp_size,
+            )
+            logger.warning(
+                f"DP attention is enabled. chunked prefill size is adjusted "
+                f"from {original_chunked_prefill_size} to {cfg.chunked_prefill_size}."
+            )
 
         # The prefill CUDA graph max_bs was derived from the pre-DP-division
         # chunked_prefill_size in _handle_gpu_memory_settings (which runs
@@ -405,13 +406,23 @@ def handle_data_parallelism(server_args: Any):
         # capture never exceeds the MoE all-to-all's max_num_tokens budget,
         # which is also sized from the DP-adjusted chunked_prefill_size.
         prefill_cfg = cfg.cuda_graph_config.prefill
+        per_rank_prefill_budget = (
+            cfg.chunked_prefill_size
+            if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0
+            else (
+                max(4, prefill_cfg.max_bs // cfg.attn_dp_size)
+                if prefill_cfg.max_bs is not None and prefill_cfg.max_bs >= 4
+                else prefill_cfg.max_bs
+            )
+        )
         if (
             prefill_cfg.backend != Backend.DISABLED
             and prefill_cfg.max_bs is not None
-            and prefill_cfg.max_bs > cfg.chunked_prefill_size
+            and per_rank_prefill_budget is not None
+            and prefill_cfg.max_bs > per_rank_prefill_budget
             and (Phase.PREFILL, "max_bs") not in server_args._cuda_graph_config_locked
         ):
-            clamped = {"max_bs": cfg.chunked_prefill_size}
+            clamped = {"max_bs": per_rank_prefill_budget}
             if (Phase.PREFILL, "bs") not in server_args._cuda_graph_config_locked:
                 clamped["bs"] = generate_prefill_cuda_graph_batch_sizes(
                     clamped["max_bs"]

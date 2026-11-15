@@ -1672,14 +1672,12 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.extend_seq_lens_cpu, multi_item_delimiter_indices
             ):
                 if len(indices_tensor) > 0:
-                    # Note: if the first delimiter is at position 0 (empty query),
-                    # indices - 1 wraps to -1. This is harmless — the first
-                    # delimiter entry is always discarded by
-                    # _process_multi_item_scoring_results.
-                    all_tensors.append(indices_tensor + (offset - 1))
+                    # Clamp to 0 when first_delim == 0 at offset == 0 so
+                    # uninitialized padded tail rows are never indexed.
+                    all_tensors.append((indices_tensor + (offset - 1)).clamp_min(0))
                 offset += req_seq_len
         else:
-            all_tensors.append(multi_item_delimiter_indices[0] - 1)
+            all_tensors.append((multi_item_delimiter_indices[0] - 1).clamp_min(0))
         multi_item_indices = torch.cat(all_tensors).to(device, non_blocking=True)
 
         # Extract hidden states at delimiter positions for multi-item scoring

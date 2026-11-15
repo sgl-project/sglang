@@ -148,6 +148,18 @@ class TestMISMetadataBuild(CustomTestCase):
         fb = _build(None, 14)
         self.assertFalse(_run(fb).is_enabled())
 
+    def test_empty_prefix_clamps_delimiter_positions_to_zero(self):
+        # On BOS-less models with an empty query (first_delim == 0), delimiter
+        # positions must clamp at 0 rather than -1 so RoPE does not read OOB.
+        fb = _build([torch.tensor([0, 3, 6])], 7, seq_lens=[7])
+        p = _run(fb)
+
+        self.assertEqual(p.prefix_len_ptr.tolist(), [0])
+        self.assertEqual(p.token_pos_in_items_ptr.tolist(), [0, 1, 2, 0, 1, 2, 0])
+        self.assertEqual(p.max_item_len_ptr.tolist(), [2])
+        self.assertEqual(fb.positions.tolist(), [0, 0, 1, 0, 0, 1, 0])
+        self.assertTrue((fb.positions >= 0).all())
+
     def test_empty_delimiters_skipped(self):
         # A sequence with no delimiters is skipped; with only such sequences the
         # builder returns empty params.

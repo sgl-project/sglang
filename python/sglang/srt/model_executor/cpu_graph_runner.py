@@ -50,6 +50,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
+    has_custom_prefill_readout,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -2386,7 +2387,9 @@ class CPUGraphRunner:
     def _can_run_prefill_graph(self, forward_batch: ForwardBatch) -> bool:
         if not self.capture_num_tokens:
             return False
-        if forward_batch.return_logprob and not self._prefill_uses_eager_logits_tail:
+        if (
+            forward_batch.return_logprob or has_custom_prefill_readout(forward_batch)
+        ) and not self._prefill_uses_eager_logits_tail:
             return False
         if forward_batch.input_embeds is not None:
             return False

@@ -210,7 +210,7 @@ class ExecFeatures(msgspec.Struct):
     ] = 4096
     enable_mis: A[
         bool,
-        "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
+        "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables decode CUDA graph, non-breakable prefill CUDA graph backends, radix cache, and chunked prefill.",
     ] = False
 
 
