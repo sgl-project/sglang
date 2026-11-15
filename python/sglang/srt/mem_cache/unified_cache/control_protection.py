@@ -100,6 +100,7 @@ class HostCacheProtection:
         limits: ProtectionLimits,
         clock: Callable[[], float],
         max_result_targets: int,
+        prepare_shards=None,
     ):
         if type(limits.max_events) is not int or not 1 <= limits.max_events <= 1 << 24:
             raise ControlError(
@@ -117,6 +118,7 @@ class HostCacheProtection:
             engine_epoch=executor.engine_epoch,
             namespace=executor.config.namespace,
             clock=clock,
+            prepare_shards=prepare_shards,
             **{
                 name: getattr(limits, name)
                 for name in limits.__struct_fields__

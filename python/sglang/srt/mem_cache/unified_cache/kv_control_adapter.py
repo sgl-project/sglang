@@ -93,6 +93,8 @@ class UnifiedCacheExecutor:
             self.core.page_size,
             cache._sliding_window_size or 0,
         )
+        if cache.tp_world_size > 1:
+            self.layout_id += f":tp{cache.tp_world_size}"
         self.generation = self.control_state.generation
         self._thread = threading.get_ident()
         self.cache_salt_transform = None

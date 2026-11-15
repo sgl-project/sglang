@@ -218,20 +218,10 @@ class UnifiedRadixCache(BasePrefixCache):
             threading.get_ident() if params.kv_control_config is not None else None
         )
         if params.kv_control_config is not None:
-            if (
-                params.is_eagle
-                or params.pp_size != 1
-                or params.attn_cp_size != 1
-                or any(
-                    group is not None and torch.distributed.get_world_size(group) > 1
-                    for group in (
-                        params.tp_cache_group,
-                        params.attn_cp_cache_group,
-                        params.attn_tp_cache_group,
-                    )
+            if params.is_eagle or params.pp_size != 1 or params.attn_cp_size != 1:
+                self._kv_control_unsupported_reason = (
+                    "Speculative, pipeline and context parallel caches are unsupported"
                 )
-            ):
-                self._kv_control_unsupported_reason = "Speculative and distributed cache priority execution is not integrated"
             elif (
                 params.mtp_draft_device_pools
                 or params.mtp_draft_mamba_pools

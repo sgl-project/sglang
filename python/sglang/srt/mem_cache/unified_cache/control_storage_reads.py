@@ -642,8 +642,10 @@ class StorageCacheReads:
     def _defer_host_allocation(self, job, needed):
         self._release_query_anchor(job)
         job.waiting = "whole_scope_capacity"
-        if job.demands:
+        if job.demands or self.cache.tp_world_size > 1:
             # A real request can recompute instead of waiting behind hard PINs.
+            # TP uses the rank-ordered staging queue; do not park a read
+            # outside that queue while peers can send its successor to IO.
             job.failure_status = Status.DEFERRED
             job.failure = (
                 job.waiting,
@@ -653,6 +655,20 @@ class StorageCacheReads:
         return None
 
     def _allocate_host(self, job, needed):
+        allocation = self._allocate_host_local(job, needed)
+        if self.cache.tp_world_size <= 1:
+            return allocation
+        staged = allocation is not None and allocation[0] is not None
+        service = self.cache.kv_control_service
+        if service.all_shards_ready(staged):
+            return allocation
+        if staged:
+            self.cache.cache_controller.free_prefetch_host_buffers(
+                job.operation, allocation[0]
+            )
+        return self._defer_host_allocation(job, needed)
+
+    def _allocate_host_local(self, job, needed):
         """Owner-side allocation after the metadata verdict, never in the query worker.
 
         None parks a live hint without retaining its source. A failed tuple

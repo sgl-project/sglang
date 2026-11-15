@@ -103,7 +103,7 @@ class StorageCacheTransfers:
         return [(node, start, end) for node, start, end, _ in path]
 
     def _stage(self, job):
-        try:
+        def prepare():
             rows = self._rows(job)
             if any(node.write_through_pending_id is not None for node, _, _ in rows):
                 blocked = "inflight_backup"
@@ -115,7 +115,6 @@ class StorageCacheTransfers:
                 # endpoint prevents reclaiming any of its ancestors.
                 blocked = self._host_reclamation_reason(rows[-1][0])
             if blocked:
-                job.failure_status = Status.DEFERRED
                 raise ControlError(blocked, "No host range can be reclaimed")
             if any(
                 value.numel() != end - start
@@ -131,10 +130,16 @@ class StorageCacheTransfers:
             ]
             if len(hashes) * self.cache.page_size != len(job.tokens):
                 raise ControlError("unsupported", "Incomplete source page-hash chain")
+            return rows, torch.cat(values), hashes
+
+        try:
+            rows, host_indices, hashes = self.cache.kv_control_service.prepare_shards(
+                prepare
+            )
             self.executor._hold_host(job.host_locks, (node for node, _, _ in rows))
             # The worker owns the complete hash chain and source slots through ACK.
             job.operation_id = self.cache.cache_controller.write_storage(
-                torch.cat(values),
+                host_indices,
                 list(job.tokens),
                 hashes,
                 [] if self.cache.hicache_storage_pass_prefix_keys else None,
@@ -147,6 +152,12 @@ class StorageCacheTransfers:
                 "missing": Status.MISSING,
                 "unsupported": Status.UNSUPPORTED,
                 "capacity": Status.DEFERRED,
+                "inflight_backup": Status.DEFERRED,
+                "inflight_load": Status.DEFERRED,
+                "active_reference": Status.DEFERRED,
+                "source_gpu_resident": Status.DEFERRED,
+                "structural_dependency": Status.DEFERRED,
+                "not_reclaimable": Status.DEFERRED,
             }.get(job.failure[0], job.failure_status)
             self._retire(job)
 
@@ -194,9 +205,11 @@ class StorageCacheTransfers:
     def _reclaim_host(self, job, rows):
         # Worker ACK is quiescent. Only this job's source receipts have been
         # released; PINs, computation and other transfers keep their own holds.
+        service = self.cache.kv_control_service
         for node, _, _ in reversed(rows):
-            if self._host_reclamation_reason(node):
-                continue
+            if not service.all_shards_ready(not self._host_reclamation_reason(node)):
+                # An unreclaimed descendant prevents reclaiming its ancestors.
+                break
             result = self.cache.tree_core.evict_host_leaf(node.id)
             freed = sum(value.numel() for value in result.host_frees.get(FULL, ()))
             self.cache._free_values(result.device_frees, result.host_frees)

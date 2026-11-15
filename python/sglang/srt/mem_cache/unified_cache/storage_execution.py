@@ -111,7 +111,6 @@ class MooncakeExecutionAdapter(_Adapter):
             or any(
                 v != 1
                 for v in (
-                    config.tp_size,
                     config.pp_size,
                     config.attn_cp_size,
                     config.dcp_size,
@@ -124,7 +123,7 @@ class MooncakeExecutionAdapter(_Adapter):
         ):
             raise ControlError(
                 "unsupported",
-                "Mooncake control requires TP1 FULL MHA page_first_direct",
+                "Mooncake control requires FULL MHA page_first_direct within one TP group",
             )
         # Use exactly the writer's tag and K/V/rank expansion. Probe only buffer
         # metadata, without allocating, reading or writing the first host page.
@@ -135,23 +134,34 @@ class MooncakeExecutionAdapter(_Adapter):
             raise ControlError(
                 "unsupported", "Unsupported Mooncake physical page layout"
             )
-        self.object_sizes = sizes
+        self.tp_size = config.tp_size
+        self.object_sizes = sizes * self.tp_size
         c = store.config
         super().__init__(
             store,
             pool,
-            (c.master_server_address, c.metadata_server, c.tenant_id, keys, sizes),
+            (
+                c.master_server_address,
+                c.metadata_server,
+                c.tenant_id,
+                self._page_keys(store, "", self.tp_size) if self.tp_size > 1 else keys,
+                self.object_sizes,
+            ),
         )
+        if self.tp_size > 1:
+            self.profile = "tp_full_mha_page_first_direct_v1"
+
+    @staticmethod
+    def _page_keys(store, hash_value, tp_size):
+        key = store._tag_keys([hash_value])
+        return [
+            name for rank in range(tp_size) for name in store.mha_page_keys(key, rank)
+        ]
 
     def describe_pages(self, hashes):
-        # Reuse a metadata-only page for each key; no host allocation/residency
-        # is asserted and the returned description never exposes buffer addresses.
-        indices = torch.arange(self.pool.page_size, dtype=torch.int64)
         return [
             {
-                "keys": self.store._batch_preprocess(
-                    self.store._tag_keys([h]), indices
-                )[0],
+                "keys": self._page_keys(self.store, h, self.tp_size),
                 "object_bytes": list(self.object_sizes),
             }
             for h in hashes
@@ -180,6 +190,8 @@ def storage_execution_adapter(cache) -> tuple[StorageExecutionAdapter | None, st
         valid = isinstance(store, MooncakeStore)
     if not valid:
         return None, "Storage backend instance does not match its adapter"
+    if backend == "file" and cache.tp_world_size > 1:
+        return None, "Rank-sharded control requires the Mooncake adapter"
     try:
         return factory(store, cache.host_pool_group.anchor_entry.host_pool), ""
     except ControlError as error:

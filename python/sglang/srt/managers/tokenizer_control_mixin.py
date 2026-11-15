@@ -205,16 +205,12 @@ class TokenizerControlMixin:
 
     async def kv_control(self: TokenizerManager, command: Dict[str, Any]):
         self.auto_create_handle_loop()
-        if (
-            get_parallel().num_dp_ranks != 1
-            or get_parallel().tp_size != 1
-            or get_parallel().pp_size != 1
-        ):
+        if get_parallel().num_dp_ranks != 1 or get_parallel().pp_size != 1:
             return {
                 "success": False,
                 "error": {
                     "code": "unsupported",
-                    "reason": "KV control requires a single owner",
+                    "reason": "KV control requires one TP group",
                 },
             }
         response = await self.kv_control_communicator(

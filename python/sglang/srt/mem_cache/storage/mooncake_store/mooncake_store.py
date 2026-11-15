@@ -1312,12 +1312,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for i in range(0, len(element_size_list), nbuf)
         ]
 
+    @staticmethod
+    def mha_page_keys(keys, shard):
+        return [f"{key}_{shard}_{part}" for key in keys for part in ("k", "v")]
+
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mha_suffix}_k")
-            key_list.append(f"{key_}_{self.mha_suffix}_v")
+        key_list = self.mha_page_keys(keys, self.mha_suffix)
         if len(key_list) != len(ptr_list):
             raise RuntimeError(
                 "Mooncake layer_first multi-buffer is only supported for MLA "

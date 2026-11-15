@@ -721,6 +721,11 @@ class Scheduler(
                 self.tree_cache,
                 runtime_config(),
                 namespace_keys=True,
+                tp_group=(
+                    get_parallel().tp_group.cpu_group
+                    if get_parallel().tp_size > 1
+                    else None
+                ),
             )
 
         # Init request dispatcher
@@ -2518,6 +2523,12 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+            kv_control=(
+                self.kv_control_service
+                if self.kv_control_service is not None
+                and self.kv_control_service.tp_group is not None
+                else None
+            ),
         )
 
     def init_dp_attn_adapter(self) -> None:

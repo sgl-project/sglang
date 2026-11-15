@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import pickle
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -51,6 +52,7 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.kv_control.service import KVControlService
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -75,6 +77,7 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    kv_control: Optional[KVControlService] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -103,7 +106,17 @@ class SchedulerRequestReceiver:
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
+        # Only the ingress rank samples time. Deadlines and TTLs must take
+        # effect at the same request boundary on every owner of the TP cache.
+        if (
+            self.kv_control is not None
+            and get_parallel().tp_rank == 0
+            and (recv_reqs or local_reqs or self.kv_control.has_background_work)
+        ):
+            recv_reqs = [time.monotonic(), *(recv_reqs or ())]
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
+        if self.kv_control is not None and recv_reqs:
+            self.kv_control.tp_time = recv_reqs.pop(0)
 
         if get_parallel().pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)

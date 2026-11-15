@@ -23,11 +23,11 @@ python -m sglang.launch_server --model-path MODEL_PATH \
   --kv-control-config '{"namespace":"model-weights-v1","engine_id":"worker-a"}'
 ```
 
-Configure the Mooncake backend separately. The file backend is also useful for
-local tests. Transfers and PIN require a built-in FULL-attention cache with
-persistent host HiCache. The serving profile has one TP/PP/CP/DP owner and
-ordinary text requests. Discovery reports which actions and directions the
-current backend can execute.
+Configure the Mooncake backend separately. Transfers and PIN require a built-in
+FULL-attention cache with persistent host HiCache. One worker can use a single
+scheduler or a tensor-parallel group on one node. Rank-sharded transfers use
+Mooncake FULL MHA with the page_first_direct host layout. File storage also
+supports single-rank tests. Discovery reports the available actions and layout.
 
 ## Control API
 

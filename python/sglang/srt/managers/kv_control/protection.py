@@ -113,6 +113,7 @@ class ProtectionRegistry:
         max_scope_prefixes: int = 256,
         max_ttl_seconds: float = 86400.0 * 365,
         clock: Callable[[], float] = time.monotonic,
+        prepare_shards=None,
     ) -> None:
         for name, value in (
             ("engine_id", engine_id),
@@ -164,6 +165,7 @@ class ProtectionRegistry:
         )
         self.max_ttl_seconds = float(max_ttl_seconds)
         self._clock = clock
+        self._prepare_shards = prepare_shards or (lambda prepare: prepare())
         self._last_now = -math.inf
         self._records: dict[ProtectionKey, _Record] = {}
         # Physical page starts survive radix splits. Remove their entries before
@@ -374,7 +376,7 @@ class ProtectionRegistry:
         for node_id, receipt in reversed(holds):
             self._cache.dec_host_lock_ref(node_id, receipt)
 
-    def _hold_ttl(self, spans, pages, ttl, *, replacing=None):
+    def _check_hold_budget(self, pages, replacing):
         old_pages = replacing.pages if replacing is not None and replacing.holds else ()
         added = len(pages.difference(self._physical_refs))
         removed = sum(self._physical_refs[p] == 1 for p in set(old_pages) - pages)
@@ -382,6 +384,8 @@ class ProtectionRegistry:
             self.max_protected_tokens
         ):
             raise ControlError("capacity", "L2 protection token capacity exhausted")
+
+    def _hold_ttl(self, spans, pages, ttl):
         holds = self._hold(self._materialize(spans))
         try:
             now = self._now()
@@ -419,18 +423,36 @@ class ProtectionRegistry:
     ) -> ProtectionSnapshot:
         self._check()
         _revision(revision)
-        now = self._now()
-        ttl, priority = self._parameters(ttl_seconds, priority, now)
-        record = self._record(key, now)
-        fingerprint = ("acquire", prefixes, ttl, priority)
-        replay = self._replay(record, revision, fingerprint)
+
+        def prepare():
+            now = self._now()
+            ttl, effective_priority = self._parameters(ttl_seconds, priority, now)
+            record = self._record(key, now)
+            fingerprint = ("acquire", prefixes, ttl, effective_priority)
+            replay = self._replay(record, revision, fingerprint)
+            if replay is not None:
+                return replay, None
+            self._admit_key(record)
+            spans, pages = self._resolve(prefixes)
+            if ttl is not None:
+                self._check_hold_budget(pages, record)
+            return None, (
+                now,
+                ttl,
+                effective_priority,
+                record,
+                fingerprint,
+                spans,
+                pages,
+            )
+
+        replay, prepared = self._prepare_shards(prepare)
         if replay is not None:
             return replay
-        self._admit_key(record)
-        spans, pages = self._resolve(prefixes)
+        now, ttl, priority, record, fingerprint, spans, pages = prepared
         holds = ()
         if ttl is not None:
-            holds, now = self._hold_ttl(spans, pages, ttl, replacing=record)
+            holds, now = self._hold_ttl(spans, pages, ttl)
         else:
             self._materialize(spans)
         # Acquire the replacement first: an update never opens an eviction gap.
@@ -488,21 +510,40 @@ class ProtectionRegistry:
     ) -> ProtectionSnapshot:
         self._check()
         _revision(revision)
-        now = self._now()
-        ttl, priority = self._parameters(ttl_seconds, priority, now)
-        record = self._record(key, now)
-        fingerprint = ("renew", ttl, priority)
-        replay = self._replay(record, revision, fingerprint)
+
+        def prepare():
+            now = self._now()
+            ttl, effective_priority = self._parameters(ttl_seconds, priority, now)
+            record = self._record(key, now)
+            fingerprint = ("renew", ttl, effective_priority)
+            replay = self._replay(record, revision, fingerprint)
+            if replay is not None:
+                return replay, None
+            if record is None:
+                raise ControlError(
+                    "missing", "Renew requires an existing active protection claim"
+                )
+            self._admit_key(record)
+            spans, pages = (), frozenset()
+            if ttl is not None and not record.holds:
+                spans, pages = self._resolve(record.snapshot.prefixes)
+                assert pages == record.pages
+                self._check_hold_budget(pages, None)
+            return None, (
+                now,
+                ttl,
+                effective_priority,
+                record,
+                fingerprint,
+                spans,
+                pages,
+            )
+
+        replay, prepared = self._prepare_shards(prepare)
         if replay is not None:
             return replay
-        if record is None:
-            raise ControlError(
-                "missing", "Renew requires an existing active protection claim"
-            )
-        self._admit_key(record)
-        if ttl is not None and not record.holds:
-            spans, pages = self._resolve(record.snapshot.prefixes)
-            assert pages == record.pages
+        now, ttl, priority, record, fingerprint, spans, pages = prepared
+        if spans:
             record.holds, now = self._hold_ttl(spans, pages, ttl)
         if priority is not None:
             self._set_priority(record, priority)

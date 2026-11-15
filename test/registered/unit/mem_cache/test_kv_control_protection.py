@@ -78,6 +78,31 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             operation(**kwargs)
         self.assertEqual(caught.exception.code, code)
 
+    def test_peer_rejection_keeps_unsplit_host_span_without_claim(self):
+        with transfer_fixtures.hicache(self) as owner:
+            _, cache, _, _ = owner
+            leaf = host_copy(owner)
+            parent = leaf.parent
+
+            def reject_after_local_admission(prepare):
+                prepare()
+                raise ControlError("missing", "A peer shard has no complete copy")
+
+            pins = registry(owner, prepare_shards=reject_after_local_admission)
+            self.error(
+                "missing",
+                pins.acquire,
+                key=claim(),
+                revision=1,
+                prefixes=prefixes((1, 2)),
+                ttl_seconds=10,
+            )
+            self.assertEqual(len(leaf.key), 4)
+            self.assertIs(leaf.parent, parent)
+            self.assertEqual(leaf.component_data[FULL].host_lock_ref, 0)
+            self.assertEqual(pins.active_claims, 0)
+            cache.sanity_check()
+
     def test_native_host_pressure_preserves_bytes_until_independent_claim_release(self):
         with transfer_fixtures.hicache(self) as owner:
             _, cache, _, _ = owner

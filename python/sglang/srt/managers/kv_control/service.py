@@ -84,18 +84,21 @@ def runtime_config():
     if config is None:
         return None
     parallel = get_parallel()
-    if any(
-        size != 1
-        for size in (
-            parallel.tp_size,
-            parallel.pp_size,
-            parallel.attn_cp_size,
-            parallel.num_dp_ranks,
-            parallel.nnodes,
+    if (
+        any(
+            size != 1
+            for size in (
+                parallel.pp_size,
+                parallel.attn_cp_size,
+                parallel.attn_dcp_size,
+                parallel.num_dp_ranks,
+                parallel.nnodes,
+            )
         )
+        or parallel.attn_dp_enabled
     ):
         raise ValueError(
-            "KV control currently requires one TP/PP/CP/DP owner on one node"
+            "KV control requires one TP group on one node, without PP, CP or DP"
         )
     if get_spec().speculative_algorithm or get_disagg().disaggregation_mode != "null":
         raise ValueError(
@@ -210,6 +213,7 @@ class KVControlService:
         *,
         clock=time.monotonic,
         namespace_keys=False,
+        tp_group=None,
     ):
         if type(namespace_keys) is not bool:
             raise ValueError("namespace_keys must be a bool")
@@ -218,13 +222,38 @@ class KVControlService:
         if config is None:
             raise ValueError("An enabled KV service requires configuration")
         self.cache, self.config = cache, config
+        self.tp_group = tp_group
+        self.tp_size = 1
+        self.tp_time: float | None = None
+        self._request_sequence = 0
+        engine_id, epoch = config.engine_id or uuid.uuid4().hex, None
+        self.key_namespace = config.namespace
+        if tp_group is not None:
+            import torch.distributed as dist
+
+            self.tp_size = dist.get_world_size(tp_group)
+            rank = dist.get_rank(tp_group)
+            identity = (
+                [engine_id, uuid.uuid4().hex, clock()] if rank == 0 else [None] * 3
+            )
+            dist.broadcast_object_list(identity, group=tp_group, group_src=0)
+            engine_id, epoch, self.tp_time = identity
+            clock = self._tp_clock
+            # Rank suffixes alone cannot distinguish TP2's first shard from
+            # TP4's first shard when both use the same model and Store.
+            pool = cache.token_to_kv_pool_allocator.get_kvcache()
+            self.key_namespace = (
+                f"{config.namespace}:tp{self.tp_size}"
+                f":p{cache.tree_core.page_size}:{pool.dtype}"
+            )
         if self.namespace_keys:
             self.cache_salt(None)  # Reject an unencodable namespace at startup.
         self.control = KVControl(
-            config.engine_id or uuid.uuid4().hex,
+            engine_id,
             config.namespace,
             enabled=True,
             limits=config.limits,
+            engine_epoch=epoch,
             clock=clock,
         )
         self.control.executor = self._bind_executor()
@@ -235,6 +264,37 @@ class KVControlService:
             )
         cache.kv_control_service = self
         self._bind_feedback()
+
+    def _tp_clock(self):
+        return self.tp_time
+
+    def prepare_shards(self, prepare):
+        """Agree on fallible local admission before any rank changes ownership."""
+        if self.tp_group is None:
+            return prepare()
+        import torch.distributed as dist
+
+        result, error = None, None
+        try:
+            result = prepare()
+        except (ControlError, RuntimeError) as exc:
+            error = (getattr(exc, "code", "shard_admission_failed"), str(exc)[:512])
+        verdicts = [None] * self.tp_size
+        dist.all_gather_object(verdicts, error, group=self.tp_group)
+        for failed in verdicts:
+            if failed is not None:
+                raise ControlError(*failed)
+        return result
+
+    def all_shards_ready(self, ready: bool) -> bool:
+        if self.tp_group is None:
+            return ready
+        import torch
+        import torch.distributed as dist
+
+        vote = torch.tensor(int(ready), dtype=torch.int32, device="cpu")
+        dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=self.tp_group)
+        return bool(vote.item())
 
     def _bind_feedback(self):
         registry = self.control.registry
@@ -279,7 +339,10 @@ class KVControlService:
             context is None
             or context.engine_epoch != self.control.registry.engine_epoch
         ):
-            context = self.control.context("request", binding_id=uuid.uuid4().hex)
+            self._request_sequence += 1
+            context = self.control.context(
+                "request", binding_id=str(self._request_sequence)
+            )
             req.kv_control_feedback_context = context
             self.feedback.register_request(context, req.rid)
         return context
@@ -297,13 +360,16 @@ class KVControlService:
                 limits=self.config.protection_limits,
                 clock=self.control._clock,
                 max_result_targets=self.config.limits.max_scope_spans,
+                prepare_shards=self.prepare_shards
+                if self.tp_group is not None
+                else None,
             )
         return executor
 
     def cache_salt(self, original):
         from sglang.srt.managers.kv_control.key_namespace import encode_cache_salt
 
-        return encode_cache_salt(self.config.namespace, original)
+        return encode_cache_salt(self.key_namespace, original)
 
     def prepare_request(self, req):
         self._feedback_context(req)
@@ -339,10 +405,13 @@ class KVControlService:
             "engine_epoch": registry.engine_epoch,
             "namespace": registry.namespace,
             "executor": {**executor, "actions": tuple(public["actions"])},
-            "topology": "single_owner",
+            "topology": "tensor_parallel"
+            if self.tp_group is not None
+            else "single_owner",
+            "tp_size": self.tp_size,
             "attached_caller_id": "request",
             "weight_updates": "unsupported",
-            "cache_salt_namespace": registry.namespace if self.namespace_keys else None,
+            "cache_salt_namespace": self.key_namespace if self.namespace_keys else None,
             "cache_salt_encoding": SALT_ENCODING
             if self.namespace_keys
             else "owner_assertion",
@@ -420,7 +489,11 @@ class KVControlService:
         self.progress_protection()
 
     def reset_after_cache_flush(self):
-        self.control.reset(self.config.namespace)
+        epoch = None
+        if self.tp_group is not None:
+            previous = self.control.registry.engine_epoch
+            epoch = hashlib.sha256(f"reset:{previous}".encode()).hexdigest()[:32]
+        self.control.reset(self.config.namespace, engine_epoch=epoch)
         self.control.executor = self._bind_executor()
         self._bind_feedback()
 
