@@ -69,6 +69,7 @@ if not is_cpu():
 if is_cuda() or is_hip() or is_xpu():
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
         can_use_fused_qkvzba_causal_conv1d_update_contiguous,
+        fused_qkv_gating_gdn_prefill,
         fused_qkv_split_gdn_prefill,
         fused_qkvzba_causal_conv1d_update_contiguous,
         fused_qkvzba_split_reshape_cat_contiguous,
@@ -1619,8 +1620,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if batch_tensors is None:
             raise ValueError("GDN MIS batch tensors must be prepared before execution")
 
-        conv_states[cache_indices] = 0
-        ssm_states[cache_indices] = 0
+        reset_indices = cache_indices.to(torch.int64)
+        conv_states.index_fill_(0, reset_indices, 0)
+        ssm_states.index_fill_(0, reset_indices, 0)
         output = mixed_qkv.new_zeros(
             1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
         )
@@ -1629,8 +1631,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._forward_mis_segments(
                 layer=layer,
                 mixed_qkv=mixed_qkv[metadata.query_token_indices],
-                a=a[metadata.query_token_indices],
-                b=b[metadata.query_token_indices],
+                a=a,
+                b=b,
                 conv_states=conv_states,
                 conv_cache_indices=batch_tensors.query_cache_indices,
                 has_initial_states=batch_tensors.query_has_initial_states,
@@ -1647,8 +1649,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._forward_mis_segments(
             layer=layer,
             mixed_qkv=mixed_qkv[metadata.item_token_indices],
-            a=a[metadata.item_token_indices],
-            b=b[metadata.item_token_indices],
+            a=a,
+            b=b,
             conv_states=item_conv_states,
             conv_cache_indices=batch_tensors.item_conv_indices,
             has_initial_states=batch_tensors.item_has_initial_states,
@@ -1678,7 +1680,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_cache_indices: torch.Tensor,
         inplace_update: bool,
         out: Optional[torch.Tensor] = None,
-        output_indices: Optional[torch.Tensor] = None,
+        output_indices: torch.Tensor,
     ) -> torch.Tensor:
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
@@ -1695,7 +1697,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
         qk_normalized = False
         if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
-            query, key, value = fused_qkv_split_gdn_prefill(
+            query, key, value, g, beta = fused_qkv_gating_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
                 layer.num_k_heads,
@@ -1703,7 +1705,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.head_q_dim,
                 layer.head_k_dim,
                 layer.head_v_dim,
-                normalize_qk=True,
+                A_log=layer.A_log,
+                a=a,
+                b=b,
+                dt_bias=layer.dt_bias,
+                token_indices=output_indices,
             )
             qk_normalized = True
         else:
@@ -1714,8 +1720,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query = query.view(1, num_tokens, layer.num_q_heads, layer.head_q_dim)
             key = key.view(1, num_tokens, layer.num_k_heads, layer.head_k_dim)
             value = value.view(1, num_tokens, layer.num_v_heads, layer.head_v_dim)
+            a = a[output_indices]
+            b = b[output_indices]
+            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
-        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
         output, _, _ = self.kernel_dispatcher.extend(
             q=query,
             k=key,
