@@ -25,6 +25,7 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 mod cancellation;
+mod fuzz_smoke;
 mod reorg;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
