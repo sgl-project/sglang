@@ -21,7 +21,11 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.ops.diffusion import BitExactFusionGate
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_rmsnorm_mean_square,
+    rmsnorm_mean_square_bitexact,
+)
 from sglang.multimodal_gen.configs.models.vaes.nomas import NomasVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_group_coordinator,
@@ -40,6 +44,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _QK_MROPE_FUSION = BitExactFusionGate("Nomas VAE Q/K norm + MRoPE", per_signature=True)
+_MEAN_SQUARE_FUSION = BitExactFusionGate("Nomas VAE mean-square", per_signature=True)
 TUBELET = (4, 16, 16)
 TUBE_DIM = TUBELET[0] * TUBELET[1] * TUBELET[2] * 3
 LATENT_CHANNELS = 32
@@ -142,7 +147,7 @@ def apply_mrope(
     return x * cos + rotated * sin
 
 
-# Mean-square reductions stay in ATen to keep their summation order.
+# The fallback retains ATen's mean-square summation order.
 def _square(x):
     return x.float().pow(2)
 
@@ -188,7 +193,17 @@ def _compiled_silu_mul():
 
 
 def _mean_square(x):
-    return _compiled_square()(x).mean(-1, keepdim=True)
+    def reference():
+        return _compiled_square()(x).mean(-1, keepdim=True)
+
+    if can_use_rmsnorm_mean_square(x):
+        return _MEAN_SQUARE_FUSION.run(
+            lambda: rmsnorm_mean_square_bitexact(x),
+            reference,
+            sig=(x.shape, x.stride(), x.device),
+            logger=logger,
+        )
+    return reference()
 
 
 def local_attention_layout(grid: tuple[int, int, int], tile: int, device):
