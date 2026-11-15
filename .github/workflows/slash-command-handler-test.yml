@@ -4,26 +4,14 @@ on:
   pull_request:
     paths:
       - ".github/workflows/slash-command-handler-test.yml"
-      - "scripts/ci/utils/slash_command_handler.py"
-      - "scripts/ci/utils/test_slash_command_handler.py"
-      - "scripts/ci/partition_rerun_tests.py"
-      - "scripts/ci/runner_configs.py"
-      - "scripts/ci/runner_configs.yml"
+      - ".github/workflows/*-test-npu.yml"
+      - "scripts/ci/utils/*slash_command_handler.py"
       - "scripts/ci/npu_suites.py"
+      - "scripts/ci/partition_rerun_tests.py"
+      - "scripts/ci/runner_configs.*"
       - "python/sglang/test/ci/ci_register.py"
-      - ".github/workflows/rerun-test.yml"
-      - ".github/workflows/pr-test-npu.yml"
-      - ".github/workflows/nightly-test-npu.yml"
-      - ".github/workflows/full-test-npu.yml"
-      - ".github/workflows/_npu-pr-test-stage.yml"
-      - ".github/workflows/_npu-single-node-test-stage.yml"
-  workflow_dispatch:
 
 permissions: {}
-
-concurrency:
-  group: slash-command-handler-test-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 jobs:
   slash-command-handler-unit-test:
@@ -32,18 +20,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install requests PyYAML
-
-      - name: Test the /rerun-test handler
-        run: python -m unittest discover -s scripts/ci/utils -p 'test_slash_command_handler.py'
+      - run: pip install requests PyYAML
+      - run: python -m unittest discover -s scripts/ci/utils -p 'test_slash_command_handler.py'

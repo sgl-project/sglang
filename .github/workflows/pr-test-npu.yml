@@ -33,10 +33,6 @@ on:
         type: boolean
         default: false
 
-env:
-  # The CANN image a3 jobs install the PR into; /rerun-test reads it from here.
-  NPU_A3_PR_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
-
 concurrency:
   group: pr-test-npu-${{ inputs.coverage_mode == true && 'coverage-' || '' }}${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
@@ -117,7 +113,7 @@ jobs:
       - name: Set image config
         id: set-vars
         run: |
-          echo "CANN_image_a3=${NPU_A3_PR_IMAGE}" >> $GITHUB_OUTPUT
+          echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12" >> $GITHUB_OUTPUT
 
   # Stage-A gate: CPU-only unit tests. The NPU attention-backend UTs stub out
   # torch_npu / sgl_kernel_npu before importing, so a hosted runner suffices.

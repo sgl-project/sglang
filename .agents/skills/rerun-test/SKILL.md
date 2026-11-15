@@ -23,8 +23,8 @@ Put every spec in one comment, for example `/rerun-test registered/hicache/test_
 
 - A file estimated above 60 minutes is rejected; it runs only in its scheduled tier.
 - CPU tests run only for the ubuntu CPU suite (`base-a-test-cpu`); Xeon and arm64 suites are not supported.
-- NPU tests run as whole files (no `::` selector) through their suite's NPU stage workflow, with the PR installed as in `pr-test-npu.yml`. Only the single-node a3 suites that the stage jobs of `pr-test-npu.yml`, `nightly-test-npu.yml`, and `full-test-npu.yml` run are supported; `base-a-test-npu`, a2/a5, and multi-node NPU tests are rejected.
-- A file registered only for NPU runs on NPU; one registered for CUDA or CPU as well runs only there unless the comment adds `--hw npu`. `--hw cuda` never falls back to NPU. `--hw` takes a comma-separated list (`--hw cuda,npu`): each backend resolves on its own, and one a file does not register for is rejected while the others still run. AMD tests are not supported.
+- NPU tests run as whole files (no `::` selector) through `_npu-pr-test-stage.yml`, with the PR installed as in `pr-test-npu.yml`. Only the a3 suites that a job in `pr-test-npu.yml`, `nightly-test-npu.yml`, or `full-test-npu.yml` runs through that stage are supported; the perf/accuracy single-node stage, `base-a-test-npu`, a2/a5, and multi-node NPU tests are rejected.
+- Without `--hw`, a file runs on CUDA/CPU if it registers either, else on NPU. `--hw` takes `cuda`, `npu`, a comma-separated list (`--hw cuda,npu`), or `all` (every backend the file registers). With a list, a backend a dispatched file does not register is noted as skipped next to its command. AMD tests are not supported.
 - No PR-local `sglang-kernel` wheel is built. A change under `python/sglang/kernels/aot/` needs the normal PR CI.
 - Each CUDA or CPU file runs directly (`python3 <file> -f`), not through `test/run_suite.py`, and `/run-cpu-ci` runs main's stage workflow. A change to the CI runner itself (`run_suite.py`, `ci_utils.py`, `fork_test_worker.py`, the stage workflows) is validated by the PR's own PR Test run.
 
