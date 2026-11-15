@@ -244,6 +244,19 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     req.prefix_len = req.extend_end
 
 
+def checkpoint_prompt_end(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Insert a just-prefilled request's prompt into the tree with its SWA tail.
+    Do this before decode retires the window at the prompt end.
+    PD prefill keeps the tail in the same way when it releases the request."""
+    # With overlap scheduling, a request can finish in prefill before it is marked
+    # finished. Its release then inserts from the prompt end this checkpoint protects.
+    if req.finished() or not req.kv.holds_kv:
+        return
+    # With a pending swa_branching_seqlen, this one checkpoint inserts up to the
+    # branching point. It then inserts the rest up to the prompt end.
+    checkpoint_kv_cache(req, tree_cache)
+
+
 def evict_from_tree_cache(
     tree_cache: BasePrefixCache | None, num_tokens: int
 ) -> bool | None:

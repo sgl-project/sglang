@@ -348,7 +348,11 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.capacity import shares_memory
-from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
+from sglang.srt.mem_cache.common import (
+    checkpoint_kv_cache,
+    checkpoint_prompt_end,
+    storage_prefetch_end,
+)
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
 from sglang.srt.mem_cache.kv.alloc.forward_steps import (
@@ -4172,6 +4176,17 @@ class Scheduler(
         """The request between two chunks of its prefill, or None."""
         return next(iter(self.chunked_reqs), None)
 
+    def _checkpoints_prompt_end(self) -> bool:
+        """Whether a finished prefill publishes its prompt-end SWA tail.
+        PD prefill already does this when it releases the request."""
+        return (
+            envs.SGLANG_OPT_CHECKPOINT_PROMPT_END_SWA_TAIL.get()
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and self.is_generation
+            and self.tree_cache.supports_swa()
+            and self.tree_cache.supports_prefix_sharing()
+        )
+
     def stash_chunked_request(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
@@ -4344,6 +4359,12 @@ class Scheduler(
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
+
+            if self._checkpoints_prompt_end():
+                # Rows not running yet are the ones whose prefill just ended.
+                for req in last_batch.reqs:
+                    if req not in self.running_reqs:
+                        checkpoint_prompt_end(req, self.tree_cache)
 
             # Merge the new batch into the running batch. A running batch that
             # DP attention converted to extend is last_batch itself: filtered

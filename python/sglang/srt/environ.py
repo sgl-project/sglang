@@ -820,6 +820,9 @@ class Envs:
     # Once decode passes the sliding window, drop the SWA part of the prefill's
     # tree lock; its SWA KV becomes evictable rather than freed.
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBool(False)
+    # Without PD, checkpoint each request's prompt with its SWA tail when prefill ends.
+    # A later turn that diverges at that prompt end can then hit the prefix.
+    SGLANG_OPT_CHECKPOINT_PROMPT_END_SWA_TAIL = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime
