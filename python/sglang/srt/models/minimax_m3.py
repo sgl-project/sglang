@@ -1707,23 +1707,23 @@ def _mori_oproj_sum_impl():
 
     Off unless SGLANG_MORI_OPROJ_AR=1; see
     srt/layers/communication/mori_gemm_ar_bf16.py.
+
+    Declaring any sum here costs the aiter fused all-reduce + add_norm on the
+    attention -> FFN edge: the entry completes a DeclaredSum itself and then
+    runs the step built without fusions (layer_boundary/prepare.py). That holds
+    for every batch, including the decode shapes this never fuses, so the two
+    are alternatives rather than additive.
     """
     if not _is_gfx95_supported:
         return None
-    # Declaring any sum here costs the aiter fused all-reduce + add_norm on the
-    # attention -> FFN edge: the entry completes a DeclaredSum itself and then
-    # runs the step built without fusions (layer_boundary/prepare.py). That
-    # applies to every batch, including the decode shapes this never fuses, so
-    # the two are alternatives rather than additive.
-    #
     # Standard EP keeps the attention-TP sum on the boundary's own collective,
     # as it already does for the aiter fused all-reduce (arg_groups/
     # model_overrides/minimax_m3.py). That kernel's documented failure is a
     # deferred sum meeting sparse MoE partial outputs, which an attention
     # sum_impl does not reproduce -- it finishes directly into a DeclaredSum
-    # (layer_boundary/stage.py) and never reaches the exit's deferral. This is
-    # held back as an untested combination, not a known one; lift it with
-    # evidence from a standard-EP run.
+    # (layer_boundary/stage.py) and never reaches the exit's deferral. Held
+    # back as an untested combination, not a known one; lift it with evidence
+    # from a standard-EP run.
     if get_parallel().moe_ep_size > 1 and get_moe_a2a_backend().is_none():
         return None
     return mori_gemm_ar_bf16.sum_impl()
