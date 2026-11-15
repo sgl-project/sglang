@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import torch
 from test_unified_mamba_views import _make_pool
 
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
 from sglang.srt.mem_cache.kv.layout.state import StateView
@@ -144,14 +145,22 @@ class TestMambaCompaction(CustomTestCase):
         self._verify(f, set(range(holes, 2 * holes)))
         self.assertEqual(sum(c.args[0].numel() for c in f.move.call_args_list), holes)
         self.assertEqual(f.alloc.flush_for_allocation(), 0)
-        # Ordinary COW copies whole entries after relocation.
-        cow_id = f.alloc.alloc(1).clone()
-        dst = f.alloc.ids.virtual_to_physical[cow_id]
-        src = f.alloc.ids.virtual_to_physical[f.ids[-1:]]
+        # Ordinary COW copies whole entries after relocation, as one unit move
+        # of the band on the int32 slot ids a forward passes, and writes no
+        # other byte of the arena.
+        cow_ids = f.alloc.alloc(2).clone()
+        dst = f.alloc.ids.virtual_to_physical[cow_ids].to(torch.int32)
+        src = f.alloc.ids.virtual_to_physical[f.ids[-2:]].to(torch.int32)
+        before_cow = f.pool.raw.cpu()
+        expected = before_cow.clone()
+        n = f.spec.entry_bytes()
+        for s, d in zip(src.tolist(), dst.tolist()):
+            expected[d * n : (d + 1) * n] = before_cow[s * n : (s + 1) * n]
+        moves = len(f.move.call_args_list)
         f.kv.copy_from(src, dst)
+        self.assertTrue(torch.equal(f.pool.raw.cpu(), expected))
+        self.assertEqual(len(f.move.call_args_list), moves + 1)
         state_tensors = [*f.kv.mamba_cache.conv, f.kv.mamba_cache.temporal]
-        for tensor in state_tensors:
-            self.assertTrue(torch.equal(tensor[:, src], tensor[:, dst]))
         sources = [t[:, src].clone() for t in state_tensors]
         f.kv.clear_slots(dst)
         for tensor, source in zip(state_tensors, sources):
@@ -160,6 +169,16 @@ class TestMambaCompaction(CustomTestCase):
         before_empty = f.pool.raw.clone()
         f.pool.move_units("mamba", f.ids[:0], f.ids[:0])
         self.assertTrue(torch.equal(f.pool.raw, before_empty))
+
+    def test_state_copy_onto_its_own_source_is_refused(self):
+        """A state copy runs its pairs concurrently on the device, so a slot
+        that is both a source and a destination would read a half-written
+        entry; invariant checks refuse it."""
+        f = self._fixture("cpu", "down", count=4)
+        slots = f.alloc.ids.virtual_to_physical[f.ids].to(torch.int32)
+        with envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT)):
+            with self.assertRaisesRegex(RuntimeError, "state.copy_disjoint"):
+                f.kv.copy_from(slots[:2], slots[1:3])
 
     def test_side_states_beside_the_entry_are_refused(self):
         f = self._fixture("cpu", "down", count=4)
