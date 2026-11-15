@@ -294,10 +294,15 @@ def _hc_seam_up_kernel(
     t_b = tl.load(
         t_ptr + offs_m[:, None] * L + rb[None, :], mask=mask_m[:, None], other=0.0
     )
-    # Loaded as W_up^T ([LA, N], [LB, N]), the dots' B operands: a row-major load needs a layout conversion through
-    # LDS before tl.trans, emitted right after the load, so each part's load waited for the previous one's.
-    wu_a = tl.load(wu_ptr + cols[None, :] * L + ra[:, None])
-    wu_b = tl.load(wu_ptr + cols[None, :] * L + rb[:, None])
+    if BM <= 32:
+        # Loaded as W_up^T ([LA, N], [LB, N]), the dots' B operands: a row-major load needs a layout conversion
+        # through LDS before tl.trans, emitted right after the load, so each part's load waited for the previous
+        # one's. The 64-row tile keeps the row-major load: transposed, it takes more LDS traffic than it saves.
+        wu_a = tl.load(wu_ptr + cols[None, :] * L + ra[:, None])
+        wu_b = tl.load(wu_ptr + cols[None, :] * L + rb[:, None])
+    else:
+        wu_a = tl.trans(tl.load(wu_ptr + cols[:, None] * L + ra[None, :]))
+        wu_b = tl.trans(tl.load(wu_ptr + cols[:, None] * L + rb[None, :]))
     xr = tl.load(
         r_ptr + offs_m[:, None] * D + cols[None, :], mask=mask_m[:, None], other=0.0
     ).to(tl.float32)
