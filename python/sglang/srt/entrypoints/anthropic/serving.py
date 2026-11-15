@@ -408,6 +408,8 @@ class AnthropicServing:
                     if block.type == "text" and block.text:
                         system_parts.append(block.text)
 
+        # sgl-router's /v1/messages (protocol/anthropic/request.rs) places
+        # inline system text the same way; keep the two in step.
         if self._merge_inline_system:
             for msg in anthropic_request.messages:
                 if msg.role != "system":

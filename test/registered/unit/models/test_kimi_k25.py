@@ -73,6 +73,9 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
@@ -808,8 +811,9 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor._tokenizer = _Tokenizer()
-    processor.mm_feature_transport = "cpu"
-    processor.use_cuda_ipc = False
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     artifact = _cached_k3_artifact("sha256:" + "ab" * 32, "sha256:" + "cd" * 32)
 
     first = processor.compose_request([1, 99, 2], [artifact])
@@ -827,7 +831,9 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
 
 def test_kimi_k3_cached_deferred_artifact_has_model_contract():
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.mm_feature_transport = "cpu"
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     feature = torch.zeros((3, 2, 2), dtype=torch.uint8)
 
     artifact = processor._make_artifact(
@@ -1108,10 +1114,11 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
 
 def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.mm_feature_transport = "cpu"
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor._tokenizer = _Tokenizer()
-    processor.use_cuda_ipc = False
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     feature = torch.zeros((4, 3), dtype=torch.float32)
     digest = "sha256:" + "ab" * 32
 
@@ -1332,8 +1339,9 @@ def test_kimi_k3_cancelled_artifact_owner_does_not_fail_joiner():
 def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
-    processor.mm_feature_transport = "cpu"
-    processor.use_cuda_ipc = False
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     processor._processor = SimpleNamespace(
         preprocess_config=_k3_preprocess_config(patch_size=2),
         prepare_deferred=Mock(
@@ -1413,7 +1421,9 @@ def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
     image_shape, in_patch_limit, expected
 ):
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.mm_feature_transport = "cpu"
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     processor._processor = SimpleNamespace(
         preprocess_config=_k3_preprocess_config(in_patch_limit=in_patch_limit),
     )
@@ -1425,7 +1435,9 @@ def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
 
 def test_kimi_k3_does_not_defer_non_uint8_tensor_preprocessing():
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.mm_feature_transport = "cpu"
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
 
     with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
         assert not processor._should_defer_gpu_preprocessing(
@@ -1435,7 +1447,9 @@ def test_kimi_k3_does_not_defer_non_uint8_tensor_preprocessing():
 
 def test_kimi_k3_does_not_defer_empty_image_batch():
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.mm_feature_transport = "cpu"
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
 
     with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
         assert not processor._should_defer_gpu_preprocessing([])
@@ -1455,7 +1469,9 @@ def test_kimi_k3_eager_preprocessing_preserves_float_tensor_support():
 @pytest.mark.parametrize("transport", ["cuda_ipc", "cuda_vmm"])
 def test_kimi_k3_keeps_gpu_transport_preprocessing_eager(transport):
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.mm_feature_transport = transport
+    processor._feature_transport = MultimodalFeatureTransport(
+        transport, base_gpu_id=0, skip_mm_pool=True
+    )
 
     with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
         assert not processor._should_defer_gpu_preprocessing(
@@ -1482,10 +1498,10 @@ def test_kimi_k3_rejects_silently_dropped_images():
 def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_preprocess_cache = MultimodalPreprocessCache(0)
-    processor.mm_feature_transport = "cpu"
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
+    )
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
-    processor.mm_feature_transport = "cuda_ipc"
-    processor.use_cuda_ipc = True
     processor.fast_load_mm_data = AsyncMock(
         return_value=SimpleNamespace(
             images=[object(), object()], input_ids=[1, 99, 2, 99, 3]
@@ -1607,8 +1623,9 @@ def test_kimi_k3_video_request_serves_chunks_and_images_in_prompt_order():
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.video_slot_token_id = 77
     processor.media_proc_cfg = _K3_VIDEO_CFG
-    processor.mm_feature_transport = "cpu"
-    processor.use_cuda_ipc = False
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     processor._tokenizer = SimpleNamespace(
         encode=lambda text, allowed_special=None: [5]
     )
