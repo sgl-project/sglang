@@ -1,0 +1,79 @@
+import types
+import unittest
+from array import array
+
+import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+ENCODER_LEN = 4
+EXTEND_LEN = 6  # 4 encoder (image) tokens + 2 decoder text tokens
+
+
+def _make_req(logprob_start_len):
+    return types.SimpleNamespace(
+        multimodal_inputs=types.SimpleNamespace(num_image_tokens=ENCODER_LEN),
+        prefix_len=0,
+        extend_len=EXTEND_LEN,
+        logprob_start_len=logprob_start_len,
+    )
+
+
+def _make_extend_batch(reqs):
+    batch = ScheduleBatch(reqs=reqs)
+    batch.device = "cpu"
+    batch.forward_mode = ForwardMode.EXTEND
+    batch.prefix_lens = [0] * len(reqs)
+    batch.extend_lens = [EXTEND_LEN] * len(reqs)
+    batch.extend_num_tokens = EXTEND_LEN * len(reqs)
+    batch.out_cache_loc = torch.arange(EXTEND_LEN * len(reqs), dtype=torch.int64)
+    return batch
+
+
+def _run_prepare(batch):
+    input_ids = [array("q", range(EXTEND_LEN)) for _ in batch.reqs]
+    seq_lens = [EXTEND_LEN for _ in batch.reqs]
+    batch.prepare_encoder_info_extend(input_ids, seq_lens)
+
+
+class TestEncoderLogprobStartSentinel(CustomTestCase):
+    def test_minus_one_sentinel_is_preserved(self):
+        """-1 means "output logprobs only" and must survive the encoder clamp.
+
+        prepare_encoder_info_extend must not turn the sentinel into an absolute
+        input position. On a chunked prefill the clobbered value is re-read when
+        chunk 2 is scheduled (compute_extend_logprob_start_len), so the request
+        collects input logprobs it never asked for and trips the
+        relevant_tokens_len assert in the logprob result processor, killing the
+        scheduler.
+        """
+        req = _make_req(logprob_start_len=-1)
+        batch = _make_extend_batch([req])
+        _run_prepare(batch)
+        self.assertEqual(req.logprob_start_len, -1)
+
+    def test_explicit_start_len_is_still_clamped_to_encoder_len(self):
+        req = _make_req(logprob_start_len=2)
+        batch = _make_extend_batch([req])
+        _run_prepare(batch)
+        self.assertEqual(req.logprob_start_len, ENCODER_LEN)
+
+    def test_mixed_batch(self):
+        sentinel_req = _make_req(logprob_start_len=-1)
+        explicit_req = _make_req(logprob_start_len=2)
+        batch = _make_extend_batch([sentinel_req, explicit_req])
+        _run_prepare(batch)
+        self.assertEqual(sentinel_req.logprob_start_len, -1)
+        self.assertEqual(explicit_req.logprob_start_len, ENCODER_LEN)
+
+
+if __name__ == "__main__":
+    unittest.main()

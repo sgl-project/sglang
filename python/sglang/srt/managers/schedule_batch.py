@@ -2345,7 +2345,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_len = self.encoder_lens_cpu[i]
             if encoder_len == 0:
                 continue
-            req.logprob_start_len = max(req.logprob_start_len, encoder_len)
+            # -1 is the "output logprobs only" sentinel; clamping it to
+            # encoder_len would turn it into an absolute input position and
+            # make later chunks of a chunked prefill collect input logprobs
+            # the request never asked for.
+            if req.logprob_start_len >= 0:
+                req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
