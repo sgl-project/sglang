@@ -28,7 +28,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_flags
-from sglang.srt.utils import is_gfx1250_supported
+from sglang.srt.utils import is_gfx1250_supported, is_npu
 
 # Detect whether the current forward pass is in capture mode.
 is_capture_mode = False
@@ -56,7 +56,10 @@ def compile_in_capture_mode(func):
     torch.compile during cuda-graph capture without paying the
     compilation cost in the eager forward path.
     """
-    if is_capture_mode and not is_gfx1250_supported():
+    if is_capture_mode and not is_gfx1250_supported() and not is_npu():
+        # The first torch.compile trace builds dynamo's torch-obj rule map,
+        # which trips on torch_npu's monkeypatched functions (duplicate rule
+        # for manual_seed_all). Keep NPU graph capture on the eager path.
         return torch.compile(func)
     return func
 

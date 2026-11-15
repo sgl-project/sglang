@@ -2628,16 +2628,24 @@ class DeepseekV4AscendAttnBackend(
         first verify step. The check stays on ``_dsv4_has_low_ratio`` (a draft
         worker empties its ratios and writes no compressed rows).
 
-        DSV4 (ratios 4/128) runs EAGLE / NGRAM / DSpark but never DFLASH: a
-        DFLASH verify batch's ``seq_lens`` already carry the draft block, so
-        this backend's compression metadata (which adds it for every other
-        algorithm) would plan one page too many.
+        DSV4 (ratios 4/128) runs EAGLE / NGRAM / DSpark / DFLASH, following
+        upstream: a DFLASH verify batch's ``seq_lens`` already carry the draft
+        block, so the graph max_len skips the draft add for it
+        (``_is_dflash_verify``) while the eager verify and replay paths
+        consume the expanded lengths directly.
         DeepSeek-V4.1 (ratios 1/2) supports DSpark only: its low-ratio verify
         rows assume DSpark's layout, and no other algorithm has a verified
         refresh path.
         """
         if spec_algorithm is None or spec_algorithm.is_none():
             return
+        # ``is_dflash_family()`` also covers DSpark (the family shares
+        # DFlashVerifyInfo); gate on ``is_dflash()`` so DSpark passes.
+        if spec_algorithm.is_dflash() and self._dsv4_is_v41_model:
+            raise ValueError(
+                "DeepSeek-V4.1 on NPU supports only DSpark speculative "
+                f"decoding (static mode), got {spec_algorithm!r}."
+            )
         if (
             self._dsv4_is_v41_model
             and not spec_algorithm.is_dspark()
