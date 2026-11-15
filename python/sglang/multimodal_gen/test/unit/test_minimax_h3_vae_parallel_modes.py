@@ -485,3 +485,46 @@ def test_rocm_qk_rms_norm_replays_aten(width, dtype):
     norm = nn.RMSNorm(width, eps=1e-5, elementwise_affine=False)
     with torch.inference_mode():
         assert torch.equal(_apply_qk_norm(norm, q), ref)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm aten replica")
+@pytest.mark.parametrize("width,rot", [(64, 48), (64, 64), (128, 128)])
+def test_rocm_qk_norm_rope_replays_both_norms_and_the_rope(width, rot):
+    """One launch gives the bytes of the two aten RMSNorms plus sgl_kernel's
+    NeoX rope (BF16 products and sums each rounded), and the VAE attention
+    takes it through its gate."""
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    qkv = torch.randn(2, 777, 8, 3 * width, device="cuda") * 3
+    qkv = (qkv + torch.randn(2, 777, 8, 1, device="cuda")).to(dtype)
+    query, key, _ = torch.chunk(qkv, 3, dim=-1)
+    angle = torch.rand(777, rot // 2, device="cuda") * 50
+    cache = torch.cat((angle.cos(), angle.sin()), -1).to(dtype).contiguous()
+    positions = torch.arange(777, device="cuda").repeat(2)
+    rope = (None, None, cache, positions)
+    norm = nn.RMSNorm(width, eps=1e-5, elementwise_affine=False)
+    attn = SimpleNamespace(norm_q=norm, norm_k=norm)
+
+    with torch.inference_mode():
+        expected = apply_rotary_pos_emb_qk(
+            _apply_qk_norm(norm, query), _apply_qk_norm(norm, key), rope
+        )
+        fused = vit_attention._rocm_qk_norm_rope(attn, query, key, rope)
+
+    assert fused is not None
+    assert all(map(torch.equal, fused, expected))
+    assert vit_attention._ROCM_QK_NORM_ROPE.is_verified((width, rot, dtype))
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm aten replica")
+def test_rocm_decoder_attention_takes_the_fused_qk_norm_rope():
+    # H3's rope_dim_ratio 0.75 rotates 48 of the 64 head dims
+    decoder = _h3_shaped_decoder()
+    latent = torch.randn(2, 4, 1, 2, 2, device="cuda")
+    with (
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=torch.bfloat16),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+    ):
+        decoder(latent)
+    assert vit_attention._ROCM_QK_NORM_ROPE.is_verified((64, 48, torch.bfloat16))

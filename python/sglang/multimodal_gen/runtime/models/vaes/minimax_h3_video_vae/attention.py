@@ -10,7 +10,9 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    aten_rms_norm_neox_rope_qk_rocm,
     aten_rms_norm_rocm,
+    can_use_aten_rms_norm_neox_rope_qk_rocm,
     can_use_aten_rms_norm_rocm,
 )
 from sglang.multimodal_gen import envs
@@ -21,7 +23,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-from .vit_utils import apply_rotary_pos_emb_qk
+from .vit_utils import apply_rotary_pos_emb_qk, native_rope_cache
 
 logger = init_logger(__name__)
 _FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
@@ -129,6 +131,52 @@ def _apply_qk_norm(module, hidden_states):
     return module(_vit_norm_input(module, hidden_states)).to(hidden_states.dtype)
 
 
+# The two qk RMSNorms and the NeoX rope as one launch, same bytes as the three
+_ROCM_QK_NORM_ROPE = BitExactFusionGate(
+    "H3 VAE qk RMSNorm + rope (ROCm)", per_signature=True
+)
+
+
+def _rocm_qk_norm_rope(attn, query, key, rotary_pos_emb):
+    """``(query, key)`` normalized and rotated in one kernel, or None."""
+    norm_q, norm_k = attn.norm_q, attn.norm_k
+    if not (
+        envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM
+        and rotary_pos_emb is not None
+        and isinstance(norm_q, nn.RMSNorm)
+        and isinstance(norm_k, nn.RMSNorm)
+        and norm_q.weight is None
+        and norm_k.weight is None
+        and norm_q.eps == norm_k.eps
+        and not torch.is_grad_enabled()
+        and can_use_aten_rms_norm_rocm(query)
+    ):
+        return None
+    native = native_rope_cache(query, key, rotary_pos_emb)
+    if native is None:
+        return None
+    cache, positions = native
+    if not can_use_aten_rms_norm_neox_rope_qk_rocm(query, key, cache, positions):
+        return None
+    sig = (query.shape[-1], cache.shape[-1], query.dtype)
+    if not _ROCM_QK_NORM_ROPE.can_attempt(sig):
+        return None
+    eps = norm_q.eps if norm_q.eps is not None else torch.finfo(query.dtype).eps
+
+    def reference():
+        return apply_rotary_pos_emb_qk(
+            _apply_qk_norm(norm_q, query), _apply_qk_norm(norm_k, key), rotary_pos_emb
+        )
+
+    return _ROCM_QK_NORM_ROPE.run(
+        lambda: aten_rms_norm_neox_rope_qk_rocm(query, key, cache, positions, eps),
+        reference,
+        sig=sig,
+        equal=lambda a, b: all(map(torch.equal, a, b)),
+        logger=logger,
+    )
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -206,12 +254,16 @@ class Attention(nn.Module):
         qkv = qkv.view(batch_size, seq_len, -1, 3 * self.dim_head)
         query, key, value = torch.chunk(qkv, 3, dim=-1)
 
-        if self.norm_q is not None:
-            query = _apply_qk_norm(self.norm_q, query)
-        if self.norm_k is not None:
-            key = _apply_qk_norm(self.norm_k, key)
-        if rotary_pos_emb is not None:
-            query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
+        fused = _rocm_qk_norm_rope(self, query, key, rotary_pos_emb)
+        if fused is not None:
+            query, key = fused
+        else:
+            if self.norm_q is not None:
+                query = _apply_qk_norm(self.norm_q, query)
+            if self.norm_k is not None:
+                key = _apply_qk_norm(self.norm_k, key)
+            if rotary_pos_emb is not None:
+                query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
         if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
             hidden_states = self.attn(query, key, value)
