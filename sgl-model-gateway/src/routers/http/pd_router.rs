@@ -20,7 +20,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, Instrument};
 
 use super::{
     decode_gate::{DecodeGate, DecodeSlot},
@@ -600,7 +600,7 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
+                Some(prefill),
                 decode,
             )
         } else {
@@ -686,9 +686,9 @@ impl PDRouter {
         decode: Option<Arc<dyn Worker>>,
         _start_time: Instant,
     ) -> (Response, Option<Arc<dyn Worker>>) {
-        // Count the request from dispatch so load-based policies see it before
-        // upstream headers arrive; streaming responses attach their own guards.
-        let _prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
+        // Count P before headers arrive. Early handoff retains this guard
+        // in the task that finishes reading P's response.
+        let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -777,32 +777,82 @@ impl PDRouter {
             Ok((decode, decode_guard, result))
         };
 
-        // Run both in this handler task (not a detached tokio::spawn) so a client
-        // disconnect cancels the pending decode request too, keeping the
-        // upstream-cancel behavior from #19524.
-        let prefill_fut = prefill_request.send();
-        tokio::pin!(prefill_fut);
+        // Keep both requests in this handler until output is ready so a
+        // client disconnect cancels the pending decode request (#19524).
+        let wait_prefill_body = context.is_stream && !context.return_logprob;
+        let mut prefill_fut = Box::pin(async move {
+            let mut response = prefill_request.send().await?;
+            if wait_prefill_body && response.status().is_success() {
+                // Keep polling D while P's HTTP body is still being completed.
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(error) => {
+                            warn!(%error, "Failed to drain prefill response");
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok::<_, reqwest::Error>(response)
+        });
         tokio::pin!(decode_leg);
 
-        // Poll both until prefill resolves; decode normally resolves later, but
-        // may resolve first if it rejects the request outright.
-        let prefill_result;
+        // Wait for P completion or real D output; D headers alone do not
+        // release the stream while P may still fail.
+        let mut prefill_result = None;
         let mut decode_early = None;
+        let mut buffered = Vec::new();
         loop {
             tokio::select! {
                 biased;
                 pr = &mut prefill_fut => {
-                    prefill_result = pr;
+                    prefill_result = Some(pr);
                     break;
                 }
                 dr = &mut decode_leg, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+                    match dr {
+                        Ok((decode, _decode_guard, Ok(mut response)))
+                            if context.is_stream && !context.return_logprob
+                                && response.status().is_success() =>
+                        {
+                            // Headers and role-only deltas do not prove KV is ready.
+                            let generated = tokio::select! {
+                                biased;
+                                pr = &mut prefill_fut => {
+                                    prefill_result = Some(pr);
+                                    false
+                                }
+                                generated = Self::buffer_until_generated(&mut response, &mut buffered) => generated,
+                            };
+                            if generated {
+                                self.spawn_prefill_completion(prefill_fut, prefill_guard, Arc::clone(&prefill));
+                                events::RequestReceivedEvent {}.emit();
+                                let status = response.status();
+                                let headers = header_utils::preserve_response_headers(response.headers());
+                                let stream = futures_util::stream::iter(buffered).chain(response.bytes_stream());
+                                let mut response = self.create_streaming_response(
+                                    stream, status, None, false, Some(headers), None, Arc::clone(&decode),
+                                );
+                                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                                return (response, Some(decode));
+                            }
+                            decode_early = Some(Ok((decode, _decode_guard, Ok(response))));
+                            if prefill_result.is_some() {
+                                break;
+                            }
+                        }
+                        result => decode_early = Some(result),
+                    }
                 }
             }
         }
         if let Some(slot) = &slot {
             slot.release();
         }
+
+        let prefill_result = prefill_result.expect("prefill completed before normal dispatch");
 
         // Decode can't generate without prefill's KV, so any prefill failure
         // (non-2xx / transport error) dooms the paired decode request, which would
@@ -863,6 +913,7 @@ impl PDRouter {
                 Arc::clone(&decode),
                 prefill_result,
                 decode_result,
+                buffered,
             )
             .await;
         (response, Some(decode))
@@ -875,6 +926,7 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
         decode_result: Result<reqwest::Response, reqwest::Error>,
+        buffered: Vec<Result<bytes::Bytes, reqwest::Error>>,
     ) -> Response {
         // Process decode response
         match decode_result {
@@ -965,12 +1017,12 @@ impl PDRouter {
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
                     self.create_streaming_response(
-                        res.bytes_stream(),
+                        futures_util::stream::iter(buffered).chain(res.bytes_stream()),
                         status,
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
+                        Some(prefill),
                         decode,
                     )
                 } else {
@@ -1041,6 +1093,132 @@ impl PDRouter {
                 response
             }
         }
+    }
+
+    fn spawn_prefill_completion(
+        &self,
+        prefill_fut: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>
+            + Send
+            + 'static,
+        prefill_guard: WorkerLoadGuard,
+        prefill: Arc<dyn Worker>,
+    ) {
+        let request_timeout = self.request_timeout;
+        tokio::spawn(async move {
+            let _guard = prefill_guard;
+            let completion = tokio::time::timeout(request_timeout, async {
+                let response = prefill_fut.await?;
+                let status = response.status();
+                // Successful bodies were already consumed by prefill_fut.
+                if !status.is_success() {
+                    if let Err(error) = response.bytes().await {
+                        warn!(prefill_url = prefill.url(), %error, "Failed to drain delayed prefill response");
+                    }
+                }
+                Ok::<_, reqwest::Error>(status)
+            }).await;
+            let status = match completion {
+                Ok(Ok(status)) => status,
+                Ok(Err(error)) => {
+                    warn!(prefill_url = prefill.url(), %error, "Delayed prefill request failed");
+                    StatusCode::BAD_GATEWAY
+                }
+                Err(error) => {
+                    warn!(prefill_url = prefill.url(), %error, "Delayed prefill completion timed out");
+                    StatusCode::GATEWAY_TIMEOUT
+                }
+            };
+            prefill.record_outcome(status.is_success() || status.is_client_error());
+            if !status.is_success() {
+                warn!(prefill_url = prefill.url(), %status, "Prefill failed after decode generated output");
+            }
+            if status.is_server_error() {
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::CONNECTION_HTTP,
+                    error_type_from_status(status),
+                );
+            }
+        }.instrument(tracing::Span::current()));
+    }
+
+    // Buffer complete SSE events until real output, preserving every wire byte.
+    // Metadata-only/oversized streams retain the original prefill completion gate.
+    async fn buffer_until_generated(
+        response: &mut reqwest::Response,
+        buffered: &mut Vec<Result<bytes::Bytes, reqwest::Error>>,
+    ) -> bool {
+        let mut pending = Vec::new();
+        let mut total = 0;
+        while total < 1024 * 1024 {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    total += chunk.len();
+                    pending.extend_from_slice(&chunk);
+                    buffered.push(Ok(chunk));
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    buffered.push(Err(error));
+                    break;
+                }
+            }
+            while let Some((end, len)) = [b"\n\n".as_slice(), b"\r\n\r\n".as_slice()]
+                .iter()
+                .filter_map(|sep| memmem::find(&pending, sep).map(|end| (end, sep.len())))
+                .min_by_key(|(end, _)| *end)
+            {
+                let event = String::from_utf8_lossy(&pending[..end]);
+                let data = event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .map(str::trim_start)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let generated = serde_json::from_str::<Value>(&data)
+                    .is_ok_and(|value| Self::has_generated_output(&value));
+                pending.drain(..end + len);
+                if generated {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn has_generated_output(value: &Value) -> bool {
+        let nonempty = |v: Option<&Value>| v.and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+        value.get("error").is_none_or(Value::is_null)
+            && (nonempty(value.get("text"))
+                || value
+                    .get("output_ids")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ids| !ids.is_empty())
+                || value
+                    .pointer("/meta_info/completion_tokens")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|n| n > 0)
+                || value
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            let delta = &choice["delta"];
+                            nonempty(choice.get("text"))
+                                || ["content", "reasoning_content", "reasoning"]
+                                    .iter()
+                                    .any(|key| nonempty(delta.get(*key)))
+                                || delta
+                                    .get("tool_calls")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|calls| {
+                                        calls.iter().any(|call| {
+                                            nonempty(call.pointer("/function/name"))
+                                                || nonempty(call.pointer("/function/arguments"))
+                                        })
+                                    })
+                        })
+                    }))
     }
 
     fn policies_need_request_text(&self) -> bool {
@@ -1214,7 +1392,7 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
+        prefill: Option<Arc<dyn Worker>>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         use crate::core::AttachedBody;
@@ -1304,15 +1482,16 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
+        let mut guards = vec![WorkerLoadGuard::new(decode, headers.as_ref())];
+        if let Some(prefill) = prefill {
+            guards.push(WorkerLoadGuard::new(prefill, headers.as_ref()));
+        }
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
         let mut response_headers = headers.unwrap_or_default();
+        response_headers.remove(CONTENT_LENGTH);
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
@@ -2148,7 +2327,7 @@ mod tests {
                 None,
                 false,
                 None,
-                prefill_ref.clone(),
+                Some(prefill_ref.clone()),
                 decode_ref.clone(),
             );
 
@@ -2173,5 +2352,145 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delayed_prefill_timeout_releases_load() {
+        let mut router = create_test_pd_router();
+        router.request_timeout = Duration::ZERO;
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill".into(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        router.spawn_prefill_completion(
+            std::future::pending(),
+            WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            Arc::clone(&prefill),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while prefill.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(prefill.circuit_breaker().total_failures(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_decode_output_does_not_wait_for_prefill() {
+        check_stream_handoff(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_role_only_output_still_waits_for_prefill_failure() {
+        check_stream_handoff(true).await;
+    }
+
+    async fn check_stream_handoff(role_only: bool) {
+        use axum::{routing::post, Router};
+        use tokio::{
+            net::TcpListener,
+            sync::Notify,
+            time::{timeout, Duration},
+        };
+
+        let release = Arc::new(Notify::new());
+        let gate = Arc::clone(&release);
+        let seen = Arc::new(Notify::new());
+        let notify = Arc::clone(&seen);
+        let wire = if role_only {
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+        } else {
+            "data: {\"error\":null,\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+        };
+        let app = Router::new()
+            .route(
+                "/p/v1/chat/completions",
+                post(move || {
+                    let gate = Arc::clone(&gate);
+                    async move {
+                        gate.notified().await;
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            )
+            .route(
+                "/d/v1/chat/completions",
+                post(move || {
+                    let notify = Arc::clone(&notify);
+                    async move {
+                        notify.notify_one();
+                        ([(CONTENT_TYPE, "text/event-stream")], wire)
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("{base}/p"),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("{base}/d"),
+            WorkerType::Decode,
+            true,
+        ));
+        let mut router = create_test_pd_router();
+        router.retry_config.max_retries = 1;
+        router.worker_registry.register(Arc::clone(&prefill));
+        router.worker_registry.register(Arc::clone(&decode));
+        let request = serde_json::from_value(json!({
+            "model": "test", "messages": [{"role": "user", "content": "hi"}], "stream": true,
+        }))
+        .unwrap();
+        let mut result = Box::pin(router.route_chat(None, &request, None));
+        if role_only {
+            timeout(Duration::from_secs(2), async {
+                tokio::select! { _ = seen.notified() => {}, _ = &mut result => panic!("role-only output released the stream") }
+            }).await.unwrap();
+            assert!(timeout(Duration::from_millis(50), &mut result)
+                .await
+                .is_err());
+            release.notify_one();
+        }
+        let response = timeout(Duration::from_secs(2), result).await.unwrap();
+        assert_eq!(
+            response.status(),
+            if role_only {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::OK
+            }
+        );
+        if !role_only {
+            let body = timeout(
+                Duration::from_secs(2),
+                axum::body::to_bytes(response.into_body(), usize::MAX),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(body.as_ref(), wire.as_bytes());
+            assert_eq!(prefill.load(), 1);
+            release.notify_one();
+        }
+        timeout(Duration::from_secs(2), async {
+            while prefill.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.circuit_breaker().total_failures(), 1);
+        server.abort();
     }
 }
