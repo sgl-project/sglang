@@ -169,27 +169,22 @@ jobs:
       - name: Install protoc and Rust toolchain
         run: bash scripts/ci/utils/install_rust_protoc.sh
 
-      # Third-party crates are most of the compile and move only with the lock
-      # files, so a target dir saved from main leaves a PR just the sglang crates to
-      # build. Hosted runners only: cargo records absolute paths in the target dir,
-      # and only a runner that is fresh per job can keep one path in every job.
+      # Third-party crates move only with the lock files, so main's target dir leaves a
+      # PR the sglang crates. Hosted runners only: the target dir holds absolute paths.
       - name: Compute the cargo target cache key
         id: target-key
         if: runner.environment == 'github-hosted'
         env:
           # ci is the build step's SETUPTOOLS_RUST_CARGO_PROFILE. No torch pin:
-          # torch-sys, the one crate built against torch, is cleaned every run and
-          # left out of the entry.
+          # torch-sys, the one crate built against torch, is cleaned every run.
           PREFIX: rust-target-${{ runner.arch }}-py${{ matrix.python-version }}-ci-${{ hashFiles('rust/rust-toolchain.toml') }}-
           LOCKS: ${{ hashFiles('rust/Cargo.lock', 'rust/sglang-radix-tree/Cargo.lock') }}
         run: |
           {
               echo "dir=${RUNNER_TEMP}/sglang-cargo-target"
               echo "key=${PREFIX}${LOCKS}"
-              # Only main saves, so PR runs never add multi-GB entries to the
-              # near-full cache. A PR falls back to main's entry for an older lock,
-              # and cargo rebuilds what the lock moved; main starts clean on a miss
-              # instead, so no entry carries the artifacts of an older lock.
+              # Only main saves, so PRs add no multi-GB entries; a PR falls back to
+              # main's entry for an older lock, while main starts clean on a miss.
               if [ "${GITHUB_REF}" = refs/heads/main ]; then
                   echo "save=true"
               else
@@ -340,10 +335,6 @@ jobs:
           retention-days: 1
 
       # An exact hit means the entry is already there.
-      - name: Prune cargo target dir for the cache
-        if: steps.target-key.outputs.save == 'true' && steps.target-cache.outputs.cache-hit != 'true'
-        run: python3 scripts/ci/utils/prune_rust_ext_target.py "${{ steps.target-key.outputs.dir }}"
-
       - name: Save cargo target dir
         if: steps.target-key.outputs.save == 'true' && steps.target-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
