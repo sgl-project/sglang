@@ -271,8 +271,9 @@ def _hc_seam_up_kernel(
     LA: tl.constexpr,
     LB: tl.constexpr,
 ):
-    """A program owns BJ output columns: the W_up rows of all HC branches for them ([HC*BJ, L], loaded at once) go
-    through one dot pair with t ([BM, LA] + [BM, LB], LA + LB = L); the gated mean sums the branch axis."""
+    """A program owns BJ output columns: the W_up rows of all HC branches for them ([HC*BJ, L], loaded at once and
+    transposed) go through one dot pair with t ([BM, LA] + [BM, LB], LA + LB = L); the gated mean sums the branch
+    axis."""
     tl.static_assert(LA + LB == L)
     D: tl.constexpr = HC_ * HS_
     N: tl.constexpr = HC_ * BJ
@@ -293,8 +294,10 @@ def _hc_seam_up_kernel(
     t_b = tl.load(
         t_ptr + offs_m[:, None] * L + rb[None, :], mask=mask_m[:, None], other=0.0
     )
-    wu_a = tl.load(wu_ptr + cols[:, None] * L + ra[None, :])
-    wu_b = tl.load(wu_ptr + cols[:, None] * L + rb[None, :])
+    # Loaded as W_up^T ([LA, N], [LB, N]), the dots' B operands: a row-major load needs a layout conversion through
+    # LDS before tl.trans, emitted right after the load, so each part's load waited for the previous one's.
+    wu_a = tl.load(wu_ptr + cols[None, :] * L + ra[:, None])
+    wu_b = tl.load(wu_ptr + cols[None, :] * L + rb[:, None])
     xr = tl.load(
         r_ptr + offs_m[:, None] * D + cols[None, :], mask=mask_m[:, None], other=0.0
     ).to(tl.float32)
@@ -304,8 +307,8 @@ def _hc_seam_up_kernel(
         other=0.0,
     )
     wn = tl.load(wn_ptr + cols).to(tl.float32)
-    acc = tl.dot(t_a, tl.trans(wu_a))
-    acc = tl.dot(t_b, tl.trans(wu_b), acc)
+    acc = tl.dot(t_a, wu_a)
+    acc = tl.dot(t_b, wu_b, acc)
     xn = ((xr * rs) * (1.0 + wn)[None, :]).to(out_ptr.dtype.element_ty).to(tl.float32)
     prod = tl.reshape(tl.sigmoid(acc) * xn, (BM, HC_, BJ))
     out = tl.sum(prod, axis=1) * (1.0 / HC_)
