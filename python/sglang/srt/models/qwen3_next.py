@@ -981,6 +981,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
+            # ag_delay_reduce decode returns the DCP group's heads; the gate is TP-sharded.
+            if attn_output.shape[-1] != gate.shape[-1]:
+                gate = get_parallel().dcp_group.all_gather(gate.contiguous(), dim=1)
             if _is_hip:
                 from sglang.kernels.ops.elementwise.elementwise import (
                     fused_sigmoid_mul,

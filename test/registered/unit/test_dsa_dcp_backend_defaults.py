@@ -55,6 +55,18 @@ class TestDsaDcpBackendDefaults(CustomTestCase):
     def test_no_dcp_sets_nothing(self):
         self.assertEqual(_dsa_dcp_overrides(_cfg(dcp_size=1)), {})
 
+    def test_lse_only_merge_enables_query_replication(self):
+        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=False, is_npu=False)):
+            overrides = _dsa_dcp_overrides(_cfg(dcp_comm_backend="ag_delay_reduce"))
+        self.assertTrue(overrides["dcp_replicate_q_proj"])
+
+    def test_lse_only_merge_respects_explicit_query_replication(self):
+        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=False, is_npu=False)):
+            overrides = _dsa_dcp_overrides(
+                _cfg(dcp_comm_backend="ag_delay_reduce", dcp_replicate_q_proj=False)
+            )
+        self.assertNotIn("dcp_replicate_q_proj", overrides)
+
     def test_npu_pd_dcp_uses_native_backend(self):
         platform = SimpleNamespace(is_hip=False, is_npu=True)
         with patch(_PLATFORM, return_value=platform):
@@ -91,6 +103,47 @@ class TestDsaDcpBackendConstraints(CustomTestCase):
         _check_dsa_backend_constraints(
             "fp8_e4m3", "tilelang", "tilelang", hip=True, dcp_size=1
         )
+
+
+class TestLseOnlyDcpConstraints(CustomTestCase):
+    def _validate(self, **kw):
+        from sglang.srt.arg_groups import parallel_hook
+
+        cfg = _cfg(
+            dcp_comm_backend="ag_delay_reduce",
+            dcp_replicate_q_proj=False,
+            enable_prefill_cp=False,
+            enable_lora=False,
+            speculative_algorithm=None,
+        )
+        for name, value in kw.items():
+            setattr(cfg, name, value)
+        with (
+            patch.object(parallel_hook, "run_post_process_pass"),
+            patch.object(parallel_hook, "resolving_view", return_value=cfg),
+            patch.object(
+                parallel_hook,
+                "get_platform",
+                return_value=SimpleNamespace(is_cuda=True, is_hip=False),
+            ),
+        ):
+            parallel_hook.handle_decode_context_parallelism(object())
+
+    def test_supported_decode(self):
+        self._validate()
+        self._validate(dcp_replicate_q_proj=True)
+
+    def test_requires_multiple_dcp_ranks(self):
+        with self.assertRaisesRegex(ValueError, "requires.*> 1"):
+            self._validate(dcp_size=1)
+
+    def test_rejects_lora(self):
+        with self.assertRaisesRegex(ValueError, "does not support LoRA"):
+            self._validate(enable_lora=True)
+
+    def test_rejects_speculative_decoding(self):
+        with self.assertRaisesRegex(ValueError, "support speculative decoding"):
+            self._validate(speculative_algorithm="EAGLE")
 
 
 if __name__ == "__main__":

@@ -265,7 +265,10 @@ def handle_decode_context_parallelism(server_args: Any):
         )
     if cfg.dcp_size > 1 and cfg.enable_prefill_cp:
         raise ValueError("--dcp-size > 1 does not support --enable-prefill-cp.")
-    if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
+    if (
+        cfg.dcp_comm_backend in ("ag_delay_reduce", "a2a", "fi_a2a")
+        and cfg.dcp_size <= 1
+    ):
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "
             "decode context-parallel attention reduction and therefore "
@@ -279,12 +282,25 @@ def handle_decode_context_parallelism(server_args: Any):
             "within one MNNVL domain. Use 'a2a' or 'ag_rs' elsewhere, or leave "
             "the flag unset to resolve it."
         )
+    if cfg.dcp_comm_backend == "ag_delay_reduce":
+        if not (get_platform().is_cuda or get_platform().is_hip):
+            raise ValueError(
+                "--dcp-comm-backend ag_delay_reduce requires CUDA or ROCm."
+            )
+        if cfg.enable_lora:
+            raise ValueError(
+                "--dcp-comm-backend ag_delay_reduce does not support LoRA."
+            )
+        if cfg.speculative_algorithm is not None:
+            raise ValueError(
+                "--dcp-comm-backend ag_delay_reduce does not yet support speculative decoding."
+            )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
             raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
-        if cfg.dcp_comm_backend not in ("a2a", "fi_a2a"):
+        if cfg.dcp_comm_backend not in ("ag_delay_reduce", "a2a", "fi_a2a"):
             raise ValueError(
-                "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
+                "--dcp-replicate-q-proj only applies to the ag_delay_reduce/a2a/fi_a2a DCP "
                 "communication backend (it removes the head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
