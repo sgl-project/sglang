@@ -8,6 +8,7 @@ import struct
 import threading
 import time
 import uuid
+from collections import deque
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgspec
@@ -697,6 +698,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     for _ in self.transfer_queues
                 ]
+            # KDA TP late staging (k3_kda_tp.late_stage): rooms whose last chunk asked
+            # the decode for a staging slot, their first ask time, and PUSH sockets to
+            # the decode listeners.
+            self._kda_stage_asked: Dict[Tuple[int, str], float] = {}
+            self._kda_stage_socks: Dict[str, Any] = {}
+            self._kda_stage_lock = threading.Lock()
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -726,6 +733,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             if self.enable_staging:
                 self._init_staging_decode_ctx()
+            # KDA TP late staging: (room, prefill session) asks, drained by
+            # DecodeTransferQueue._serve_kda_stage_reqs on the scheduler thread.
+            self.kda_stage_reqs: deque = deque()
             self._start_decode_listener_thread()
             self._start_heartbeat_checker_thread()
         else:
@@ -1067,6 +1077,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_staging:
                         self._handle_staging_req(msg)
                     continue
+                if msg[0] == b"KDA_STAGE_REQ":
+                    self.kda_stage_reqs.append(
+                        (int(msg[1].decode("ascii")), msg[2].decode("ascii"))
+                    )
+                    continue
                 if self.handle_abort_ack_message(msg):
                     continue
                 parsed = self.parse_kv_status_message(msg)
@@ -1127,6 +1142,83 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
+
+    def _kda_stage_pending(self, kv_chunk, room_transfer_infos) -> bool:
+        """KDA TP late staging, prefill side: True while a decode peer of this last
+        chunk has not bound a staging slot for the state yet (its MAMBA destination is
+        k3_kda_tp.LATE_STAGE_UNBOUND). Asks each such peer once (KDA_STAGE_REQ); the
+        caller re-enqueues the chunk, so the prefill holds the state until the decode
+        binds a stage (KDA_STAGE_RSP, _bind_kda_stage)."""
+        if not kv_chunk.is_last_chunk or not kv_chunk.state_indices:
+            return False
+        import zmq
+
+        from sglang.srt.utils.network import NetworkAddress
+
+        mamba = self._kda_stage_components()
+        pending = False
+        for agent_name, tinfo in room_transfer_infos.items():
+            if tinfo.is_dummy or not tinfo.dst_state_indices:
+                continue
+            if all(
+                i >= 0
+                for c in mamba
+                if c < len(tinfo.dst_state_indices)
+                for i in tinfo.dst_state_indices[c]
+            ):
+                continue
+            pending = True
+            key = (tinfo.room, agent_name)
+            with self._kda_stage_lock:
+                if key in self._kda_stage_asked:
+                    continue
+                self._kda_stage_asked[key] = time.monotonic()
+                na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
+                ep = na.to_tcp()
+                sock = self._kda_stage_socks.get(ep)
+                if sock is None:
+                    sock = zmq.Context.instance().socket(zmq.PUSH)
+                    if na.is_ipv6:
+                        sock.setsockopt(zmq.IPV6, 1)
+                    sock.connect(ep)
+                    self._kda_stage_socks[ep] = sock
+                sock.send_multipart(
+                    [
+                        b"KDA_STAGE_REQ",
+                        str(tinfo.room).encode("ascii"),
+                        agent_name.encode("ascii"),
+                    ]
+                )
+        return pending
+
+    def _kda_stage_components(self) -> List[int]:
+        """State components a KDA TP stage replaces: the MAMBA ones. Other components
+        (e.g. sparse-attention index pages) keep their real page indices."""
+        state_types = getattr(self.kv_args, "state_types", None) or []
+        if not state_types:
+            return [0]
+        return [i for i, t in enumerate(state_types) if t == StateType.MAMBA]
+
+    def _bind_kda_stage(self, msg) -> None:
+        room = int(msg[1].decode("ascii"))
+        agent_name = msg[2].decode("ascii")
+        stage = int(msg[3].decode("ascii"))
+        tinfo = self.transfer_infos.get(room, {}).get(agent_name)
+        with self._kda_stage_lock:
+            asked = self._kda_stage_asked.pop((room, agent_name), None)
+        if tinfo is None:
+            return  # aborted / cleared meanwhile
+        components = set(self._kda_stage_components())
+        tinfo.dst_state_indices = [
+            [stage] * len(comp) if c in components else comp
+            for c, comp in enumerate(tinfo.dst_state_indices)
+        ]
+        if asked is not None and time.monotonic() - asked > 0.1:
+            logger.info(
+                "KDA TP late staging: room %s held its state %.0f ms for a decode stage",
+                room,
+                (time.monotonic() - asked) * 1e3,
+            )
 
     def _post_xfer(self, xfer_handle: Any, error_msg: str) -> None:
         # The NIXL Python API raises on a failed post rather than returning "ERR".
@@ -1718,6 +1810,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
+
+                if self._kda_stage_pending(kv_chunk, room_transfer_infos):
+                    # No decode stage yet: retry after the other queued chunks. The
+                    # chunk stays counted in _staging_outstanding.
+                    queue.put(kv_chunk)
+                    time.sleep(STAGING_WATERMARK_WAIT_S)
+                    continue
 
                 self.update_status(room, KVPoll.Transferring)
                 packer = (
@@ -3538,6 +3637,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if waiting_req_bytes[0] == b"WATERMARK":
                     if self.enable_staging:
                         handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                    continue
+
+                if waiting_req_bytes[0] == b"KDA_STAGE_RSP":
+                    self._bind_kda_stage(waiting_req_bytes)
                     continue
 
                 # Staging: decode replies with allocated staging offset

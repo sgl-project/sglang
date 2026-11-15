@@ -447,6 +447,20 @@ def _kda_tp_pd_staging(req_to_token_pool):
     return req_to_token_pool.mamba_pool.pd_staging
 
 
+def _bind_late_stage(req_to_token_pool, req: Req) -> bool:
+    """KDA TP late staging: a request whose prefill never asked for a stage (the PD
+    warmup's fake transfer sends no state) binds one when it joins the running batch;
+    False (keep waiting) while every stage is taken."""
+    key = getattr(req, "kda_tp_staged_slot", None)
+    if key is None:
+        return True
+    from sglang.srt.layers.communication import k3_kda_tp
+
+    if not k3_kda_tp.late_stage():
+        return True
+    return req_to_token_pool.mamba_pool.pd_staging.bind(key) is not None
+
+
 def _admit_lazy_mamba_slot(req_to_token_pool, req: Req) -> bool:
     """Give a KDA TP PD request that deferred its state slot (kda_tp_lazy_mamba) a slot as it
     joins the running batch, re-keying its staged state onto it. False if none is free."""
@@ -1865,8 +1879,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 break
 
-            if kda_tp_staging is not None and not kda_tp_staging.has_room(
-                self.req_to_token_pool.mamba_allocator, self.req_to_token_pool
+            # Late staging binds the stage when the prefill sends the state instead.
+            if (
+                kda_tp_staging is not None
+                and not k3_kda_tp.late_stage()
+                and not kda_tp_staging.has_room(
+                    self.req_to_token_pool.mamba_allocator, self.req_to_token_pool
+                )
             ):
                 break
 
@@ -2018,7 +2037,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
-            if kda_tp_staging is not None:
+            if kda_tp_staging is not None and not k3_kda_tp.late_stage():
                 # The stage is assigned when the destination is published, possibly after
                 # more admissions (deferred publish): hold it so has_room counts it.
                 kda_tp_staging.reserve()
@@ -2234,11 +2253,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
                     slot = k3_kda_tp.lazy_stage_key(decode_req.req.kv.req_pool_idx)
                 decode_req.req.kda_tp_staged_slot = slot
-                stage = staging.assign(
-                    slot,
-                    reserved=getattr(decode_req.req, "kda_tp_stage_reserved", False),
-                )
-                decode_req.req.kda_tp_stage_reserved = False
+                from sglang.srt.layers.communication import k3_kda_tp
+
+                if k3_kda_tp.late_stage():
+                    stage = k3_kda_tp.LATE_STAGE_UNBOUND
+                else:
+                    stage = staging.assign(
+                        slot,
+                        reserved=getattr(
+                            decode_req.req, "kda_tp_stage_reserved", False
+                        ),
+                    )
+                    decode_req.req.kda_tp_stage_reserved = False
                 return [np.full(slots.shape, stage, dtype=slots.dtype)]
             return [indices if non_blocking_metadata else indices.cpu().numpy()]
 
@@ -3413,6 +3439,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             req_of=lambda x: x.req,
         )
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
+        from sglang.srt.layers.communication import k3_kda_tp
+
+        self._kda_late_stage = k3_kda_tp.late_stage()
+        # room -> (first KDA_STAGE_REQ time, prefill sessions asking)
+        self._kda_stage_waiting: Dict[int, Tuple[float, set]] = {}
+        self._kda_stage_stats: List[float] = []
+        self._kda_stage_bound_max = 0
+        self._kda_stage_logged = time.monotonic()
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = get_parallel().tp_rank
         self.metadata_buffers = metadata_buffers
@@ -3697,6 +3731,86 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self._is_host_destination(decode_req):
             decode_req.kv_receiver.abort()
 
+    def _serve_kda_stage_reqs(self) -> None:
+        """KDA TP late staging: bind a stage for every room whose prefill asked for one
+        (KDA_STAGE_REQ, queued by the decode listener thread) and answer each prefill
+        rank of the room with it. Rooms wait in arrival order while every stage is
+        taken; a room whose request left the queue is dropped (its prefill sees the
+        abort)."""
+        if not self.queue:
+            return
+        kv_mgr = getattr(next(iter(self.queue.items())).kv_receiver, "kv_mgr", None)
+        incoming = getattr(kv_mgr, "kda_stage_reqs", None)
+        if incoming is None:
+            return
+        waiting = self._kda_stage_waiting
+        while incoming:
+            room, session = incoming.popleft()
+            waiting.setdefault(room, (time.monotonic(), set()))[1].add(session)
+        if not waiting:
+            return
+        staging = self.scheduler.req_to_token_pool.mamba_pool.pd_staging
+        by_room = {dr.req.bootstrap_room: dr for dr in self.queue.items()}
+        full = False
+        for room in list(waiting):
+            decode_req = by_room.get(room)
+            key = (
+                getattr(decode_req.req, "kda_tp_staged_slot", None)
+                if decode_req
+                else None
+            )
+            if key is None:
+                del waiting[room]
+                continue
+            # A later prefill rank of an already-bound room is answered even when the
+            # stages are full; new binds go in arrival order.
+            stage = staging.stage_of(key)
+            if stage is None and not full:
+                stage = staging.bind(key)
+                full = stage is None
+            if stage is None:
+                continue
+            asked, sessions = waiting.pop(room)
+            waited_ms = (time.monotonic() - asked) * 1e3
+            self._kda_stage_stats.append(waited_ms)
+            if waited_ms > 100:
+                logger.info(
+                    "KDA TP late staging: room %s waited %.0f ms for a stage (%d bound)",
+                    room,
+                    waited_ms,
+                    staging.num_bound(),
+                )
+            receiver = decode_req.kv_receiver
+            for bootstrap_info in receiver.bootstrap_infos or []:
+                sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
+                for session in sessions:
+                    with lock:
+                        sock.send_multipart(
+                            [
+                                b"KDA_STAGE_RSP",
+                                str(room).encode("ascii"),
+                                session.encode("ascii"),
+                                str(stage).encode("ascii"),
+                            ]
+                        )
+        self._kda_stage_bound_max = max(self._kda_stage_bound_max, staging.num_bound())
+        now = time.monotonic()
+        if now - self._kda_stage_logged > 60 and self._kda_stage_stats:
+            waits = sorted(self._kda_stage_stats)
+            logger.info(
+                "KDA TP late staging: %d binds, wait p50 %.1f / max %.1f ms, %d of %d "
+                "stages bound at most, %d rooms waiting",
+                len(waits),
+                waits[len(waits) // 2],
+                waits[-1],
+                self._kda_stage_bound_max,
+                staging.num_slots,
+                len(waiting),
+            )
+            self._kda_stage_stats = []
+            self._kda_stage_bound_max = 0
+            self._kda_stage_logged = now
+
     def move_transferred(self, dst: ReqList) -> List[Req]:
         transferred_reqs, _ = self.move_transferred_with_outcomes(dst)
         return transferred_reqs
@@ -3742,6 +3856,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         for every request concluded here. rids_to_check is the PP consensus as {rid: failed}: only
         these rids are concluded, and a rid failed on any stage is concluded as
         failed on every stage, whatever this stage's own receiver reports."""
+        # Queues built without __init__ (tests) carry no late-staging state.
+        if getattr(self, "_kda_late_stage", False):
+            self._serve_kda_stage_reqs()
         if not self.queue:
             return [], {}
 
@@ -4507,7 +4624,9 @@ class SchedulerDisaggregationDecodeMixin:
                 or req.kv.restore_done_event is None
                 or id(req) in restores_ready
             ):
-                if not _admit_lazy_mamba_slot(self.req_to_token_pool, req):
+                if not _bind_late_stage(
+                    self.req_to_token_pool, req
+                ) or not _admit_lazy_mamba_slot(self.req_to_token_pool, req):
                     # No free state slot yet: it stays in the waiting queue.
                     continue
                 can_run_list.append(req)

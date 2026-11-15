@@ -103,6 +103,16 @@ def _check_supported() -> None:
         )
     if (
         disagg.disaggregation_mode == "decode"
+        and envs.SGLANG_K3_KDA_TP_LATE_STAGE.get()
+        and disagg.disaggregation_transfer_backend != "nixl"
+    ):
+        problems.append(
+            "SGLANG_K3_KDA_TP_LATE_STAGE with transfer backend "
+            f"{disagg.disaggregation_transfer_backend} (the stage negotiation is "
+            "implemented for nixl)"
+        )
+    if (
+        disagg.disaggregation_mode == "decode"
         and disagg.disaggregation_decode_enable_radix_cache
     ):
         problems.append(
@@ -790,6 +800,17 @@ def lazy_mamba_slot(enable_mamba_extra_buffer: bool) -> bool:
     )
 
 
+def late_stage() -> bool:
+    """Whether a PD decode request binds its staging slot when the prefill is about to
+    send the state (KDA_STAGE_REQ with its last chunk) rather than at prealloc, so handoff
+    slots can outnumber staging slots (SGLANG_K3_KDA_TP_LATE_STAGE)."""
+    return state_shard_width() > 1 and envs.SGLANG_K3_KDA_TP_LATE_STAGE.get()
+
+
+# State destination a late-staged request advertises until its stage is bound.
+LATE_STAGE_UNBOUND = -1
+
+
 def lazy_stage_key(req_pool_idx: int) -> int:
     """Staging key of a request with no state slot yet: its request row, negated, so it
     never collides with a state slot id (>= 1)."""
@@ -1078,6 +1099,23 @@ class PdStateStaging(FullStateStaging):
         stage = self._free.pop()
         self._stage_of[slot] = stage
         return stage
+
+    def bind(self, slot: int) -> Optional[int]:
+        """Late staging: the stage of ``slot``, binding a free one if it has none yet;
+        None when every stage is taken (the prefill keeps the state and asks again)."""
+        stage = self._stage_of.get(slot)
+        if stage is not None:
+            return stage
+        self._reclaim()
+        if len(self._free) <= self._reserved:
+            return None
+        return self.assign(slot)
+
+    def stage_of(self, slot: int) -> Optional[int]:
+        return self._stage_of.get(slot)
+
+    def num_bound(self) -> int:
+        return len(self._stage_of)
 
     def queue_import(self, slot: int) -> None:
         if slot not in self._stage_of:

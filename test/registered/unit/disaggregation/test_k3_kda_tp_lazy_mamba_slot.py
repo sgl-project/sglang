@@ -193,6 +193,7 @@ class TestExhaustion(unittest.TestCase):
         self.assertEqual(admitted, 2)
         with self.assertRaises(RuntimeError):
             st.reserve()
+        self.assertIsNone(st.bind(9))  # late binding never takes a reserved stage
         st.assign(-1, reserved=True)
         st.unreserve()  # the second request aborted before its publish
         self.assertTrue(st.has_room(alloc, rows))

@@ -2537,6 +2537,10 @@ class Envs:
     # --enable-kda-tp PD decode: a request in its handoff holds only its staging slot; its
     # head-sharded state slot is allocated when it joins the running batch.
     SGLANG_K3_KDA_TP_LAZY_MAMBA_SLOT = EnvBool(True)
+    # --enable-kda-tp PD decode: bind a staging slot when the prefill is about to send the
+    # state (its last chunk), not at prealloc, so handoff slots can outnumber staging slots;
+    # the prefill holds the state until a stage is bound. NIXL transfer backend only.
+    SGLANG_K3_KDA_TP_LATE_STAGE = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
