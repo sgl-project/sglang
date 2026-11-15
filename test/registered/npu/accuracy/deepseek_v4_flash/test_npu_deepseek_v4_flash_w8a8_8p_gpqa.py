@@ -21,7 +21,7 @@ register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 
 register_npu_ci(
     est_time=3600,
-    suite="nightly-acc-16-npu-a3-",
+    suite="nightly-acc-16-npu-a3",
     nightly=True,
 )
 
