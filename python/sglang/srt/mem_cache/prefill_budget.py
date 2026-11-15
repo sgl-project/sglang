@@ -117,6 +117,10 @@ class PrefillBudget:
         self.total_offset = num_mixed_decode_tokens
         self.current_offset = num_mixed_decode_tokens
         self.swa_offset = 0
+        # Snapshotted once per round. Locking a prefix only moves tokens out of
+        # the evictable count; pinning a host match for load-back also removes
+        # write-back room, so that path refreshes it.
+        self.full_unreclaimable = tree_cache.full_unreclaimable_size()
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -138,11 +142,22 @@ class PrefillBudget:
     def load_back_scope(self, **kwargs):
         return nullcontext()
 
+    def _full_evictable(self) -> int:
+        """FULL evictable tokens eviction can actually free this round."""
+        return max(0, self.tree_cache.full_evictable_size() - self.full_unreclaimable)
+
+    def refresh_full_unreclaimable(self) -> bool:
+        """Re-read the unreclaimable FULL tokens after admission pinned host
+        nodes the snapshot counted as write-back room; True if they grew."""
+        previous = self.full_unreclaimable
+        self.full_unreclaimable = self.tree_cache.full_unreclaimable_size()
+        return self.full_unreclaimable > previous
+
     def _available_and_evictable(self):
         evictable = (
-            self.tree_cache.full_evictable_size()
+            self._full_evictable()
             if self.tree_cache.supports_mamba()
-            else self.tree_cache.evictable_size()
+            else max(0, self.tree_cache.evictable_size() - self.full_unreclaimable)
         )
         global_available_size = self.allocator.available_size()
         if is_cp_sharded_padded():
@@ -325,7 +340,7 @@ class SWAPrefillBudget(PrefillBudget):
         global_full_available_size = self.allocator.full_available_size()
         if is_cp_sharded_padded():
             global_full_available_size = from_cp_sharded(global_full_available_size)
-        return global_full_available_size + self.tree_cache.full_evictable_size()
+        return global_full_available_size + self._full_evictable()
 
     @property
     def remaining_window_tokens(self):
@@ -724,6 +739,8 @@ class ChainPrefillBudget(PrefillBudget):
         evictable = None
         if not empty_pool:
             evictable = evictable_by_sub_pool(self.tree_cache, self.allocator)
+            owner, _, _ = self.allocator.sub_pool_roles()
+            evictable[owner] = self._full_evictable()
         return self.allocator.admits(demand, evictable=evictable, empty_pool=empty_pool)
 
     def _admits(self, demand: KVDemand, **kwargs) -> bool:

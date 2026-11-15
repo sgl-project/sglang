@@ -175,6 +175,7 @@ def _admission(allocator, input_tokens, max_requests):
         window_checkpoint_interval=lambda: 0,
         transfers_in_flight=lambda: False,
         full_evictable_size=lambda: 0,
+        full_unreclaimable_size=lambda: 0,
         mamba_evictable_size=lambda: 0,
     )
     budget = create_prefill_budget(allocator, tree)

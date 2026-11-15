@@ -2601,6 +2601,7 @@ class TestDeclaredParts(CustomTestCase):
             # The target's window slot retains its own window; the draft's more.
             window_retain_size=lambda name: 16 if name == "window_16" else 32,
             full_evictable_size=lambda: 0,
+            full_unreclaimable_size=lambda: 0,
             window_evictable_size=lambda component: 0,
             supports_mamba=lambda: False,
             supports_prefix_sharing=lambda: True,
