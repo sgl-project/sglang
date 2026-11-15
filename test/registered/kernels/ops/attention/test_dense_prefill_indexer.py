@@ -17,6 +17,7 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_fp4
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
+from sglang.kernels.ops.quantization.fp4_to_fp8 import widen_fp4_to_fp8
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -139,8 +140,8 @@ def dense_scores(inputs):
     width = (max(n for _, n in inputs["request_lengths"]) + 3) // 4 * 4
     ends = inputs["starts"] + inputs["lengths"]
     if is_hopper():
-        q, q_scale = scoring.widen_fp4_to_fp8(*inputs["q"])
-        kv = scoring.widen_fp4_to_fp8(*inputs["kv"])
+        q, q_scale = widen_fp4_to_fp8(*inputs["q"])
+        kv = widen_fp4_to_fp8(*inputs["kv"])
         scores = fp8_mqa_logits(
             q, kv, inputs["weights"] * q_scale, inputs["starts"], ends, False, width
         )
@@ -189,7 +190,7 @@ class TestFp4ToFp8(CustomTestCase):
                 )
                 offsets[:, 0], offsets[:, 1] = 0, spread
                 scales = (top - offsets).to(torch.uint8).view(torch.int32)[:, 0]
-                fp8, scale = scoring.widen_fp4_to_fp8(payload, scales)
+                fp8, scale = widen_fp4_to_fp8(payload, scales)
                 widened = fp8.double() * scale.double()[:, None]
                 expected = dequant_fp4(payload, scales)
                 self.assertEqual(torch.equal(widened, expected), spread <= 14)
@@ -251,7 +252,6 @@ class TestDensePrefillIndexer(CustomTestCase):
                     consumer_inputs["kv"] = inputs["kv"]
                     consumer_inputs["candidate_topk_blocks"] = 128
                     consumer_scores = dense_scores(consumer_inputs)
-                    consumer_unmasked = consumer_scores.clone()
                     with patch.object(
                         scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", 128 << 10
                     ):
@@ -312,24 +312,6 @@ class TestDensePrefillIndexer(CustomTestCase):
                             candidates=candidates,
                         )
                         self.assertIsNone(published)
-                        self.assert_topk(consumer_inputs, selected, consumer_scores)
-                        # Hopper's consumer: torch's top-k among these blocks.
-                        selected.fill_(-1)
-                        row = 0
-                        for queries, context in inputs["request_lengths"]:
-                            rows = slice(row, row + queries)
-                            local = topk_among_blocks(
-                                consumer_unmasked[rows, :context],
-                                consumer_inputs["lengths"][rows],
-                                candidates.blocks[rows],
-                                min(inputs["topk"], context),
-                                block_size=8,
-                            )
-                            starts = inputs["starts"][rows, None]
-                            selected[rows, : local.shape[1]] = torch.where(
-                                local >= 0, local + starts, -1
-                            )
-                            row += queries
                         self.assert_topk(consumer_inputs, selected, consumer_scores)
                         tail_lengths = [0, 0, 7, 31]
                         rows, row = [], 0

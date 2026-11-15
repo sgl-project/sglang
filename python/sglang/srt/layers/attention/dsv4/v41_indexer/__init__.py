@@ -11,11 +11,13 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsa.litetopk_prefill import is_fp4_indexer_supported
-from sglang.kernels.ops.attention.dsv4.index_logits import index_weights_dtype
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    flat_index_logits_widen_to_fp8,
+    index_weights_dtype,
+)
 from sglang.srt.environ import envs
 
 from .full_topk import FullTopKIndexer
-from .scoring import uses_sm90_scores
 from .types import (
     CandidateMetadata,
     CapturedPrefillInputs,
@@ -81,9 +83,8 @@ def _use_deep_gemm_prefill() -> bool:
 
 @functools.cache
 def _use_sm90_prefill_scores() -> bool:
-    # DeepGEMM's fp8 mqa-logits on the fp4 operands widened to e4m3
-    # (scoring.widen_fp4_to_fp8); fp8_mqa_logits predates fp8_fp4_mqa_logits.
-    return uses_sm90_scores() and has_dense_fp4_indexer()
+    # The batched prefill with flat_index_logits_tiles on DeepGEMM's fp8 kernel.
+    return flat_index_logits_widen_to_fp8() and has_dense_fp4_indexer()
 
 
 def make_full_topk_indexer(
