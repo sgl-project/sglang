@@ -48,6 +48,7 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
 MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "KimiK31ForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
         "Qwen2MoeForCausalLM",
@@ -166,6 +167,21 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     )
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
+        if (
+            model_label == "KimiK31ForConditionalGeneration"
+            and cfg.max_running_requests is not None
+        ):
+            # Kimi repacks its experts at load and has no oversized eager fallback.
+            eager_requests = ceil_align(
+                cfg.max_running_requests // cfg.attn_dp_size,
+                cfg.tp_size // cfg.attn_dp_size,
+            )
+            tokens_per_request = (
+                (cfg.speculative_num_draft_tokens or 1)
+                if cfg.speculative_algorithm
+                else 1
+            )
+            decode_tokens = max(decode_tokens, eager_requests * tokens_per_request)
         if max_tokens_per_rank < decode_tokens:
             raise ValueError(
                 f"{model_label} with MegaMoE requires "
@@ -192,12 +208,35 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             "token requirement would not have a strict prefill-forward bound."
         )
 
+    prefill_tokens = cfg.chunked_prefill_size
+    kimi = model_label == "KimiK31ForConditionalGeneration"
+    if kimi:
+        prefill_tokens = max(prefill_tokens, getattr(cfg, "max_prefill_tokens", 0) or 0)
+        graph = cfg.cuda_graph_config.prefill if cfg.cuda_graph_config else None
+        if graph is not None and graph.backend != "disabled":
+            prefill_tokens = max(
+                prefill_tokens, graph.max_bs or 0, max(graph.bs or [0])
+            )
+        # Kimi repacks its experts at load and has no non-mega fallback, so the
+        # whole prefill forward must fit the MegaMoE workspace of the EP group.
+        ep_capacity = max_tokens_per_rank * (cfg.ep_size or 1)
+        if prefill_tokens > ep_capacity:
+            raise ValueError(
+                f"{model_label} with MegaMoE has no non-mega MoE fallback, so the "
+                f"largest prefill forward ({prefill_tokens} tokens, from "
+                "--chunked-prefill-size / --max-prefill-tokens / the prefill "
+                "CUDA graph buckets) must not exceed "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK x ep_size = "
+                f"{max_tokens_per_rank} x {cfg.ep_size or 1} = {ep_capacity}. "
+                "Lower --chunked-prefill-size or raise the env var."
+            )
+
     if cfg.enable_prefill_cp:
         token_partition_size = cfg.attn_cp_size
         token_partition_name = "attn_cp_size"
-        token_alignment = 1
+        token_alignment = token_partition_size if kimi else 1
         local_chunked_prefill_size = (
-            cfg.chunked_prefill_size + token_partition_size - 1
+            prefill_tokens + token_partition_size - 1
         ) // token_partition_size
     elif attn_dp_enabled_of(cfg):
         token_partition_size = cfg.attn_dp_size
@@ -216,7 +255,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             cfg.tp_size // token_partition_size // cfg.attn_cp_size,
             1,
         )
-        local_chunked_prefill_size = cfg.chunked_prefill_size
+        local_chunked_prefill_size = prefill_tokens
 
     if local_chunked_prefill_size <= 0:
         raise ValueError(

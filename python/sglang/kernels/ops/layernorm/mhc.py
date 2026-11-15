@@ -2135,7 +2135,7 @@ def npu_hc_pre(
     hc_eps: float,
     forward_batch=None,
 ) -> tuple:
-    """NPU-accelerated hc_pre via the custom_ops kernel.
+    """NPU-accelerated hc_pre via the fused pre+sinkhorn op.
 
     Returns (y, post, comb, norm_fused).  norm_fused is always False
     because npu_hc_pre does not fold input_layernorm — the caller must
@@ -2160,25 +2160,12 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    # Note the return order: (y, post, comb) — y is the (T, hidden)
-    # mixed activation, post / comb are the hc_post inputs. The
-    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
-    # cast back to the input dtype before the downstream
-    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
-    y, post, comb = torch.ops.custom.npu_hc_pre(
-        x,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        hc_mult=hc_mult,
-        hc_sinkhorn_iters=hc_sinkhorn_iters,
-        norm_eps=rms_norm_eps,
-        hc_eps=hc_eps,
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
+
+    y, post, comb = mhc_pre_dpskv4(
+        x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps
     )
-    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
-    # not fold input_layernorm. Return norm_fused=False so the caller
-    # applies the layernorm itself, matching the deepgemm/torch paths.
-    return y.to(dtype), post, comb, False
+    return y, post, comb, False
 
 
 @triton.jit
@@ -2352,10 +2339,23 @@ def _block_m_for(m: int) -> int:
     return _HC_MIX_BLOCK_M
 
 
-def _num_slices_for(k: int) -> int:
-    """Slice count depends only on K, never on batch size M."""
-    blocks = k // _HC_MIX_BLOCK_K
-    assert k % _HC_MIX_BLOCK_K == 0, k
+@functools.lru_cache(maxsize=None)
+def _hc_mix_stats_sinkhorn_block_k(device: torch.device) -> int:
+    # Query the input device lazily to avoid initializing CUDA before fork.
+    # SM121 has not been measured.
+    if (
+        device.type == "cuda"
+        and not _is_hip
+        and torch.cuda.get_device_capability(device) == (12, 0)
+    ):
+        return 32
+    return _HC_MIX_BLOCK_K
+
+
+def _num_slices_for(k: int, block_k: int = _HC_MIX_BLOCK_K) -> int:
+    """Slice count depends only on K and tile width, never on batch size M."""
+    blocks = k // block_k
+    assert k % block_k == 0, k
     for n in _HC_MIX_SLICE_CHOICES:
         if blocks % n == 0:
             return n
@@ -2513,11 +2513,15 @@ def hc_mix_stats_sinkhorn(
     if m == 0:
         return pre, post, comb
 
-    num_slices = _num_slices_for(k)
+    block_k = _hc_mix_stats_sinkhorn_block_k(dev)
+    num_slices = _num_slices_for(k, block_k)
     mix_pad = max(16, triton.next_power_of_2(mix))
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     block_m = _block_m_for(m)
+    if block_k == 32:
+        # SM120's 8-row tile changes rounding relative to 16/32-row batches.
+        block_m = max(16, block_m)
     _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
         x_flat,
         hc_fn,
@@ -2531,7 +2535,7 @@ def hc_mix_stats_sinkhorn(
         MIX_PAD=mix_pad,
         NUM_SLICES=num_slices,
         BLOCK_M=block_m,
-        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_K=block_k,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_HC_MIX_NUM_STAGES,
@@ -2580,6 +2584,7 @@ def hc_mix_stats_sinkhorn(
 # residual), accumulated over a fixed slice count to bound the fp32 error.
 _HC_MIX_COMPENSATED_SLICES = 16
 _HC_MIX_BF16X3_BLOCK_M = 128
+_HC_MIX_BF16X3_BLOCK_K = 64
 _HC_PRENORM_BLOCK_M = 64
 
 
@@ -2664,15 +2669,19 @@ def hc_mix_stats_sinkhorn_bf16x3(
     rms_eps: float,
     hc_eps: float,
     hc_mult: int = 4,
+    decode_grid: bool = False,
 ):
     m, k = x.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
-    block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+    if decode_grid:
+        slices, block_m = 64, 64
+    else:
+        slices = _HC_MIX_COMPENSATED_SLICES
+        block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
     assert x.is_contiguous() and x.dtype == torch.bfloat16
-    assert hopper_medium or 4096 <= m <= 65536
-    assert k % (slices * _HC_MIX_BLOCK_K) == 0
+    assert decode_grid or hopper_medium or 4096 <= m <= 65536
+    assert k % (slices * _HC_MIX_BF16X3_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(
         w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
@@ -2693,7 +2702,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
         K_PER_SLICE=k // slices,
         MIX_COLS=mix,
         MIX_PAD=triton.next_power_of_2(mix),
-        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_K=_HC_MIX_BF16X3_BLOCK_K,
         BLOCK_M=block_m,
         num_warps=4,
         num_stages=3,
@@ -2729,7 +2738,10 @@ def hc_mix_stats_sinkhorn_deepgemm(
     hc_eps: float,
     hc_mult: int = 4,
 ):
-    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+        tf32_hc_prenorm_gemm,
+        tf32_hc_prenorm_gemm_dual,
+    )
 
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
@@ -2747,10 +2759,13 @@ def hc_mix_stats_sinkhorn_deepgemm(
     mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
     mix_lo = torch.empty_like(mix_hi)
     sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
-    tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
-    # sq depends only on x_flat, so the second projection recomputes the same
-    # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
-    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
+    if current_arch().is_sm(10):
+        tf32_hc_prenorm_gemm_dual(x_flat, high, low, mix_hi, mix_lo, sq, slices)
+    else:
+        tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
+        # sq depends only on x_flat, so the second projection recomputes the same
+        # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
+        tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,
         sq,

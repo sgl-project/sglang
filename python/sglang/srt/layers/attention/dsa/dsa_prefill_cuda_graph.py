@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.layers.cp.utils import cp_live_store_rows
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -47,7 +48,7 @@ def pcg_dsa_indexer_prefill_split(
     x_s: Optional[torch.Tensor] = None,
     x_bf16: Optional[torch.Tensor] = None,
 ) -> None:
-    # Default in-graph indexer path for non-CP prefill: runs the whole indexer
+    # In-graph prefill indexer (also interleave CP under BCG): runs the indexer
     # (q/k proj, head gate, k-cache store, topk) as one eager split op. PCG calls
     # this as a split op; BCG uses the explicit eager wrapper below.
     #
@@ -75,13 +76,16 @@ def pcg_dsa_indexer_prefill_split(
     metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
     extend_num_tokens = forward_batch.extend_num_tokens
+    in_cp = forward_batch.attn_cp_metadata is not None
     # Empty buffer encodes return_indices=False for graph dispatch.
     return_indices = topk_result.numel() != 0
     k_only = not return_indices or (
         indexer._should_skip_logits_computation(forward_batch)
         and not indexer.dsa_enable_prefill_cp
     )
-    if k_only:
+    # The K-only path stores the local K without the CP all-gather, so a
+    # top-k-reuse layer under CP takes the gathered store below instead.
+    if k_only and not in_cp:
         indexer._forward_cuda_k_only(
             x,
             positions,
@@ -119,7 +123,6 @@ def pcg_dsa_indexer_prefill_split(
     # Fused path stores K and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
-    in_cp = forward_batch.attn_cp_metadata is not None
     if indexer.use_dsa_indexer_fusion and not in_cp:
         q_fp8, weights = indexer._fused_q_prepare_and_store(
             x,
@@ -149,13 +152,32 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    q_fp8, q_scale = indexer._quantize_query(query, act_quant)
-    # Reuse the compiled head-gate util shared with the eager path.
-    weights = (  # same head-gate choice as the eager CP branch
-        indexer._scale_head_gates(weights_raw, q_scale)
-        if indexer.use_dsa_indexer_fusion
-        else indexer._get_logits_head_gate(x, q_scale)
-    )
+    from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+
+    if (
+        _is_cuda
+        and indexer.bf16_head_gate
+        and indexer.skip_rope
+        and indexer.head_dim == indexer.block_size == 128
+        # The fused kernel writes the FP8 query; an FP4 indexer quantizes its own.
+        and type(indexer)._quantize_query is Indexer._quantize_query
+    ):
+        # Kimi's no-RoPE indexer: one kernel for the Q quantization and the
+        # BF16 head-gate scaling.
+        from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
+
+        gate = indexer._project_head_gates(x)
+        q_fp8, weights = indexer_q_quant_head_gate(
+            query, gate, indexer.softmax_scale, indexer.scale_fmt
+        )
+    else:
+        q_fp8, q_scale = indexer._quantize_query(query, act_quant)
+        # Reuse the compiled head-gate util shared with the eager path.
+        weights = (  # same head-gate choice as the eager CP branch
+            indexer._scale_head_gates(weights_raw, q_scale)
+            if indexer.use_dsa_indexer_fusion
+            else indexer._get_logits_head_gate(x, q_scale)
+        )
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.
@@ -173,6 +195,8 @@ def pcg_dsa_indexer_prefill_split(
         act_quant=act_quant,
         out_cache_loc=forward_batch.out_cache_loc[:n_store],
     )
+    if not return_indices:
+        return
     indexer._get_topk_ragged(
         False,
         forward_batch,
@@ -182,6 +206,21 @@ def pcg_dsa_indexer_prefill_split(
         metadata,
         topk_result,
     )
+    if is_interleave_extend(forward_batch):
+        # Interleave BCG replays a bucket-sized local shard: the top-k rows
+        # past this rank's logical tokens stay -1.
+        from sglang.srt.layers.cp.bcg.interleave_bcg import cp_interleave_indexer_rows
+
+        _, logical_tokens = cp_interleave_indexer_rows(forward_batch)
+        topk_result[logical_tokens:].fill_(-1)
 
 
-bcg_dsa_indexer_prefill_split = eager_on_graph(True)(pcg_dsa_indexer_prefill_split)
+def _dsa_indexer_prefill_on_capture(
+    layer_id, x, q_lora, positions, topk_result, **kwargs
+):
+    topk_result.fill_(-1)
+
+
+bcg_dsa_indexer_prefill_split = eager_on_graph(
+    True, on_capture=_dsa_indexer_prefill_on_capture
+)(pcg_dsa_indexer_prefill_split)

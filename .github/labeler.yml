@@ -101,6 +101,29 @@ deepseek:
     - any-glob-to-any-file:
       - '**/*deepseek*'
 
+# Reflection Beam model (exclude ordinary beam search)
+Beam:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'python/sglang/srt/models/beam.py'
+      - 'python/sglang/srt/configs/beam.py'
+      - 'python/sglang/srt/arg_groups/model_overrides/beam.py'
+      - 'python/sglang/srt/parser/beam.py'
+      - 'python/sglang/srt/function_call/beam_detector.py'
+      - 'python/sglang/srt/entrypoints/openai/responses_tools/beam.py'
+      - 'python/sglang/kernels/jit/csrc/distributed/beam_all_reduce.cuh'
+      - 'python/sglang/kernels/ops/communication/beam_all_reduce.py'
+      - 'python/sglang/kernels/ops/elementwise/beam_fused.py'
+      - 'python/sglang/kernels/ops/layernorm/beam_fused.py'
+      - 'test/registered/kernels/ops/communication/test_beam_all_reduce.py'
+      - 'test/registered/unit/parser/test_beam_*.py'
+      - 'docker/beam/**/*'
+      - 'docs/cookbook/autoregressive/Reflection/Beam-*.mdx'
+      - 'docs/src/snippets/configs/reflection/beam-*.jsx'
+    - all-globs-to-any-file:
+      - 'test/registered/e2e/models/test_beam_*.py'
+      - '!test/registered/e2e/models/test_beam_search*'
+
 memory-pool:
   - changed-files:
     - any-glob-to-any-file:

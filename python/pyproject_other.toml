@@ -110,9 +110,15 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+# Same pin as the CUDA pyproject. The ROCm image installs srt_hip*, not `all`,
+# so the Dockerfile has to ask for this extra by name.
+fastokens = [
+  "fastokens>=0.3.2",
+]
+
 # Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
 monokernels_hip = [
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@e52803f9d2b7dabff4bfd2f53ec25c03d56af947",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@7113024f8b2e4612b891d330a525a9a7d57de371",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -253,9 +259,9 @@ test = [
   "tabulate",
 ]
 
-all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
-all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm724]", "sglang[tracing]"]
-all_hip_rocm101 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm101]", "sglang[tracing]"]
+all_hip = ["sglang[diffusion_hip]", "sglang[fastokens]", "sglang[srt_hip]", "sglang[tracing]"]
+all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[fastokens]", "sglang[srt_hip_rocm724]", "sglang[tracing]"]
+all_hip_rocm101 = ["sglang[diffusion_hip]", "sglang[fastokens]", "sglang[srt_hip_rocm101]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_sail = ["sglang[srt_sail]"]
 all_mlu = ["sglang[srt_mlu]", "sglang[tracing]"]

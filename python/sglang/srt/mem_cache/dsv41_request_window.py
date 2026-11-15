@@ -264,34 +264,6 @@ class RequestWindowSpec(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("request-window extents must contain whole pages")
 
     @property
-    def request_parts(self):
-        from sglang.srt.mem_cache.kv.decl import RequestPartDecl, TensorPartDecl
-
-        layers = tuple(range(self.layers))
-        return (
-            RequestPartDecl(
-                part=TensorPartDecl(
-                    name="pages",
-                    shape=(
-                        self.capacity // self.page_size,
-                        self.kv_layout.page_bytes(self.page_size),
-                    ),
-                    dtype=torch.uint8,
-                    layer_ids=layers,
-                )
-            ),
-            RequestPartDecl(
-                part=TensorPartDecl(
-                    name="tags",
-                    shape=(self.capacity,),
-                    dtype=torch.int64,
-                    layer_ids=layers,
-                    reset_value=-1,
-                )
-            ),
-        )
-
-    @property
     def state_pages(self):
         # The historical state pool reserves a dummy page in its requested size
         # and another in the backing. PD page numbering includes both.

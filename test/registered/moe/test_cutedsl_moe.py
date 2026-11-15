@@ -426,7 +426,7 @@ class TestCuteDslV2(unittest.TestCase):
       - MMA-layout blockscales (convert_sf_to_mma_layout)
 
     This is the path used with --moe-runner-backend flashinfer_cutedsl and
-    --moe-a2a-backend none or flashinfer (i.e. NOT deepep).
+    --moe-a2a-backend none or flashinfer_nvlink_one_sided (i.e. NOT deepep).
     """
 
     @unittest.skipIf(SKIP_TEST, SKIP_REASON)
