@@ -642,7 +642,9 @@ class TestMooncakeStoreReceiptValidation(unittest.TestCase):
         # A short read must leave no positive mark that a retry could be
         # short-circuited by: the second get re-issues the transfer RPC and,
         # served in full, reads as present.
-        binding = _ReceiptBinding([[4096, 100], [4096, 4096]])
+        # The v1 preprocessing splits every object into its K and V keys, so
+        # one call carries four receipts in [p0_k, p1_k, p0_v, p1_v] order.
+        binding = _ReceiptBinding([[4096, 100, 4096, 100], [4096, 4096, 4096, 4096]])
         store = _make_v1_store(binding)
 
         self.assertEqual(
