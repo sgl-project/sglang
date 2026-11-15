@@ -98,7 +98,7 @@ def index_slots(cache, components: Iterable[ComponentType]) -> None:
 def only_window(cache) -> str:
     """The window sub-pool of a cache keeping one window (the static pools'
     name when the cache keeps no window slot)."""
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.pool.base import BaseSWAKVPool
 
     names = [name for name, _ in cache.window_sub_pools()]
     if not names:

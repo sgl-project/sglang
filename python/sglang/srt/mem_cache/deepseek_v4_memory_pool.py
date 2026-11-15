@@ -40,7 +40,6 @@ from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backe
 from sglang.srt.mem_cache.base_hisparse_memory_pool import (
     HiSparseDevicePoolMappingMixin,
 )
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4CheckpointBufferInfo,
     DSV4CompressedBufferInfo,
@@ -50,7 +49,7 @@ from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.pool.base import KVCache
+from sglang.srt.mem_cache.pool.base import BaseSWAKVPool, KVCache
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 

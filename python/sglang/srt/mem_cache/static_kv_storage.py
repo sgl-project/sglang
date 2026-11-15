@@ -17,7 +17,6 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.advance import (
     TrackingAdvance,
     advance_tracking,
@@ -34,6 +33,7 @@ from sglang.srt.mem_cache.kv.plan import (
 from sglang.srt.mem_cache.kv.requests import RowResets
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
 from sglang.srt.mem_cache.kv.storage import ResumeUnits, SubPoolUsage, window_tail_len
+from sglang.srt.mem_cache.pool.base import BaseSWAKVPool
 from sglang.srt.utils import is_npu
 
 # The static pools' one window pool: `BaseSWAKVPool.WINDOW_SUB_POOL`.

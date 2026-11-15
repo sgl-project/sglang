@@ -192,7 +192,7 @@ def window_sub_pool_of(allocator) -> str:
     """The window pool a reader that sizes one window by reads
     (`target_window_pool`), or the static window pools' name for a pool that
     keeps none."""
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.pool.base import BaseSWAKVPool
 
     return allocator.target_window_pool() or BaseSWAKVPool.WINDOW_SUB_POOL
 
