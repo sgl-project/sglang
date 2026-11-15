@@ -1947,6 +1947,9 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # Encode the caller text of built-in Python chat templates (GLM-5.3)
+    # without matching added tokens; False encodes it like template text.
+    SGLANG_ENABLE_ORDINARY_TEXT_CONTENT = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

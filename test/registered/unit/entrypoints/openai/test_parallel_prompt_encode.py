@@ -17,6 +17,7 @@ comparisons do not depend on it.
 """
 
 import random
+import re
 import sys
 import unittest
 import unittest.mock
@@ -39,6 +40,11 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai import parallel_prompt_encode as ppe
 from sglang.srt.environ import envs
+from sglang.srt.parser.glm53_chat_template import (
+    OrdinaryText,
+    render_glm53_flash,
+    render_glm53_flash_segments,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -745,7 +751,232 @@ class TestPromptSegments(_EncodeCase):
         encoder = ppe._segment_encoder_for(self.tokenizer)
         self.assertLessEqual(encoder.cached_tokens, 40)
         self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
-        self.assertNotIn("hello world " * 30, encoder.cache)
+        self.assertNotIn((False, "hello world " * 30), encoder.cache)
+
+
+# The other added tokens the GLM-5.3 templates write.
+_GLM_TOKENS = [
+    "<|system|>",
+    "<|observation|>",
+    "</tool_call>",
+    "<arg_key>",
+    "</arg_key>",
+    "<arg_value>",
+    "</arg_value>",
+    "<tool_response>",
+    "</tool_response>",
+    "<|begin_of_image|>",
+    "<|image|>",
+    "<|end_of_image|>",
+]
+_MARK = "\ufdd0"
+_WEATHER = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Returns <tool_call> text.",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    },
+}
+_ORDINARY_TEXT_CASES = {
+    "plain": ([{"role": "user", "content": "hello world"}], None),
+    "spellings": (
+        [{"role": "user", "content": "quote <tool_call> and </think> here"}],
+        None,
+    ),
+    "exact spelling": ([{"role": "user", "content": "<|assistant|>"}], None),
+    "adjacent spellings": (
+        [{"role": "user", "content": "<|user|><|assistant|><think>"}],
+        None,
+    ),
+    "partial spellings": (
+        [{"role": "user", "content": "<think <|user| think> |>"}],
+        None,
+    ),
+    "system and media": (
+        [
+            {"role": "system", "content": "Be <|assistant|> brief."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "is <|image|> one?"},
+                ],
+            },
+        ],
+        None,
+    ),
+    "history": (
+        [
+            {"role": "user", "content": "q <sop>"},
+            {
+                "role": "assistant",
+                "content": "a <tool_call>x</tool_call> </think>",
+                "reasoning_content": "r <|observation|>",
+            },
+            {"role": "user", "content": "q2"},
+        ],
+        None,
+    ),
+    "tools": (
+        [
+            {"role": "user", "content": "Weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "a",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {"city": "<arg_value>Paris", "n": 2},
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "Sunny </tool_response>"},
+            {"role": "tool", "content": [{"tool_call_id": "b", "output": "[gMASK]"}]},
+        ],
+        [_WEATHER],
+    ),
+}
+
+
+def _glm_tokenizer():
+    return _tokenizer(
+        lambda b: b.add_tokens(
+            [AddedToken(t, normalized=False, special=True) for t in _GLM_TOKENS]
+        )
+    )
+
+
+def _ordinary_text_reference(tokenizer, messages, tools):
+    """The ordinary-text encoding, built another way: break the added-token
+    spellings in the caller's strings with a mark, render, and encode with a
+    backend that drops the mark after it has matched the added tokens."""
+    spelling = re.compile(
+        "|".join(
+            re.escape(token)
+            for token in sorted(tokenizer.get_added_vocab(), key=len, reverse=True)
+        )
+    )
+
+    def mark(value):
+        if isinstance(value, str):
+            return spelling.sub(lambda m: m.group()[0] + _MARK + m.group()[1:], value)
+        if isinstance(value, dict):
+            return {mark(key): mark(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [mark(item) for item in value]
+        return value
+
+    prompt = render_glm53_flash(
+        mark(messages), tools=mark(tools), add_generation_prompt=True
+    )
+    backend = Tokenizer.from_str(tokenizer._tokenizer.to_str())
+    backend.normalizer = normalizers.Replace(_MARK, "")
+    return backend.encode(prompt, add_special_tokens=False).ids
+
+
+def _fuzz_conversations():
+    rng = random.Random(0)
+    atoms = list("aZ é中 \n.<>|/_") + ["think", "user", "  "] + _SPECIALS + _GLM_TOKENS
+
+    def text():
+        return "".join(rng.choice(atoms) for _ in range(rng.randint(0, 30)))
+
+    return [
+        [
+            {"role": "system", "content": text()},
+            {"role": "user", "content": text()},
+            # A string reasoning_content keeps the content from being split
+            # at `</think>`, which the reference cannot mark.
+            {"role": "assistant", "content": text(), "reasoning_content": text()},
+            {"role": "user", "content": text()},
+        ]
+        for _ in range(300)
+    ]
+
+
+class TestOrdinaryTextSegments(_EncodeCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, ppe, "_segment_encoders", ppe._segment_encoders)
+        ppe._segment_encoders = weakref.WeakKeyDictionary()
+        self.tokenizer = _glm_tokenizer()
+        self.added_ids = set(self.tokenizer.get_added_vocab().values())
+
+    def _id(self, token):
+        return self.tokenizer.convert_tokens_to_ids(token)
+
+    def _encode(self, messages, tools=None):
+        segments = render_glm53_flash_segments(
+            messages, tools=tools, add_generation_prompt=True
+        )
+        return ppe.encode_prompt_segments(self.tokenizer, segments)
+
+    def test_ids_equal_the_ordinary_text_reference(self):
+        cases = list(_ORDINARY_TEXT_CASES.values())
+        cases += [(messages, None) for messages in _fuzz_conversations()]
+        for messages, tools in cases:
+            expected = _ordinary_text_reference(self.tokenizer, messages, tools)
+            # The second call reads the ids the first one cached.
+            for _ in range(2):
+                self.assertEqual(self._encode(messages, tools), expected, messages)
+
+    def test_quoted_spelling_is_encoded_as_text(self):
+        messages = [{"role": "user", "content": "quote <tool_call> here"}]
+        ids = self._encode(messages)
+        self.assertEqual(ids, _ordinary_text_reference(self.tokenizer, messages, None))
+        self.assertNotIn(self._id("<tool_call>"), ids)
+        self.assertEqual(
+            [i for i in ids if i in self.added_ids],
+            [self._id(t) for t in ("[gMASK]", "<sop>", "<|system|>", "<|user|>")]
+            + [self._id("<|assistant|>"), self._id("<think>")],
+        )
+
+    def test_ordinary_text_never_yields_added_token_ids(self):
+        for token in self.tokenizer.get_added_vocab():
+            # A segment that is exactly a spelling is not cut to its id either.
+            segments = [
+                "<|user|>",
+                OrdinaryText(token),
+                OrdinaryText(f"x{token}y {token}"),
+                "<|assistant|><think>",
+            ]
+            ids = ppe.encode_prompt_segments(self.tokenizer, segments)
+            self.assertEqual(
+                [i for i in ids if i in self.added_ids],
+                [self._id(t) for t in ("<|user|>", "<|assistant|>", "<think>")],
+                token,
+            )
+
+    def test_ordinary_and_template_runs_are_cached_apart(self):
+        text = "x <think> y"
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        for _ in range(2):
+            ordinary = ppe.encode_prompt_segments(self.tokenizer, [OrdinaryText(text)])
+            template = ppe.encode_prompt_segments(self.tokenizer, [text])
+            self.assertNotIn(self._id("<think>"), ordinary)
+            self.assertEqual(template, self.tokenizer.encode(text))
+        self.assertIn((True, text), encoder.cache)
+        self.assertIn((False, text), encoder.cache)
+
+    def test_switches(self):
+        messages, tools = _ORDINARY_TEXT_CASES["tools"]
+        segments = render_glm53_flash_segments(
+            messages, tools=tools, add_generation_prompt=True
+        )
+        with envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(False):
+            self.assertEqual(
+                ppe.encode_prompt_segments(self.tokenizer, segments),
+                _ordinary_text_reference(self.tokenizer, messages, tools),
+            )
+        with envs.SGLANG_ENABLE_ORDINARY_TEXT_CONTENT.override(False):
+            self.assertEqual(
+                ppe.encode_prompt_segments(self.tokenizer, segments),
+                self.tokenizer.encode("".join(segments)),
+            )
 
 
 if __name__ == "__main__":
