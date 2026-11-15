@@ -100,6 +100,15 @@ impl ThinkDetector {
             Self::KimiK3(detector) => detector.finish(),
         }
     }
+
+    /// `in_reasoning`: whether the stream is still inside the think channel.
+    #[cfg(feature = "openai")]
+    pub(crate) fn in_reasoning(&self) -> bool {
+        match self {
+            Self::Tags(detector) => detector.in_reasoning,
+            Self::KimiK3(detector) => detector.in_reasoning(),
+        }
+    }
 }
 
 /// The tokens one `--reasoning-parser` configures the base detector with.
