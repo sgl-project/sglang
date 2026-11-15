@@ -81,13 +81,11 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "enable_dp_attention_local_control_broadcast": "Fans Python's control requests out to DP ranks; each Rust listener serves its own rank.",
     # The Python HTTP server.
     "SGLANG_HTTP_SERVER_APP_PATH": "Python HTTP server (Granian) setting.",
-    "SGLANG_TIMEOUT_KEEP_ALIVE": "Python HTTP server idle timeout; axum::serve sets none, which keeps the router's >50 s idle connections.",
+    "SGLANG_TIMEOUT_KEEP_ALIVE": "Python HTTP server idle timeout; the Rust listener sets none, which keeps the router's >50 s idle connections.",
     "SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT": "Python HTTP server (uvicorn) setting.",
     "fastapi_root_path": "Python HTTP server (FastAPI) setting.",
     "enable_http_worker_reuseport": "Python HTTP server (multi-worker) setting.",
     "grpc_worker_threads": "Python gRPC server thread pool.",
-    "http2_initial_connection_window_size": "Only with --enable-http2, which is refused.",
-    "http2_max_concurrent_streams": "Only with --enable-http2, which is refused.",
     # Routes the Rust server does not serve: their clients get a 404.
     "SGLANG_OLLAMA_ROOT_ROUTE": "Ollama routes are not served.",
     "SGLANG_OLLAMA_CHAT_ROUTE": "Ollama routes are not served.",
