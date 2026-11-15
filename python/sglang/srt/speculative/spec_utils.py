@@ -281,6 +281,28 @@ def sample_draft_proposal(
     return probs, topk_p, topk_index
 
 
+def scatter_draft_probs_to_target_vocab(
+    draft_probs: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    target_vocab_size: int,
+) -> torch.Tensor:
+    """Map reduced-vocabulary probabilities onto target token ids.
+
+    ``hot_token_id`` maps the draft head's columns to target vocabulary columns.
+    Columns outside the hot vocabulary have zero probability. The result is fp32,
+    and the caller owns it independently of later calls.
+    """
+    out = torch.zeros(
+        (*draft_probs.shape[:-1], target_vocab_size),
+        dtype=torch.float32,
+        device=draft_probs.device,
+    )
+    # hot_token_id must contain unique target IDs.
+    # index_copy_ accepts the 1-D vocabulary map directly.
+    out.index_copy_(-1, hot_token_id, draft_probs.to(torch.float32))
+    return out
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
