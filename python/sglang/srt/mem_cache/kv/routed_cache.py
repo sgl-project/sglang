@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.mem_cache.kv.decl import INDEX_K_PART
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv.sizing import check_bs1_floor
@@ -233,4 +234,102 @@ class RoutedKVCache(KVCache):
         raise NotImplementedError(
             "a unified pool's retraction copies go through its allocator, "
             "which maps the ids per sub-pool"
+        )
+
+    # -- latent row format and the indexer keys a layer keeps beside its KV --
+
+    def _index_view(self):
+        """The view of the indexer keys token layers keep beside their KV, or
+        None when no layer keeps any."""
+        return self.layer_router.part_view(INDEX_K_PART)
+
+    @property
+    def use_dsa(self) -> bool:
+        return self._index_view() is not None
+
+    @property
+    def dsa_kv_cache_store_fp8(self) -> bool:
+        return bool(getattr(self._owner_view, "dsa_kv_cache_store_fp8", False))
+
+    @property
+    def kv_scale_ue8m0(self) -> bool:
+        return bool(getattr(self._owner_view, "kv_scale_ue8m0", False))
+
+    @property
+    def kv_cache_dim(self):
+        return getattr(self._owner_view, "kv_cache_dim", None)
+
+    @property
+    def quant_block_size(self):
+        return getattr(self._owner_view, "quant_block_size", None)
+
+    def _index_attr(self, name: str, default=None):
+        view = self._index_view()
+        return default if view is None else getattr(view, name)
+
+    @property
+    def index_head_dim(self):
+        return self._index_attr("index_head_dim")
+
+    @property
+    def index_kpool(self) -> int:
+        return self._index_attr("index_kpool", 1)
+
+    @property
+    def index_kpool_compress(self) -> bool:
+        return self._index_attr("index_kpool_compress", False)
+
+    @property
+    def tail_extra_slots(self) -> int:
+        return self._index_attr("tail_extra_slots", 0)
+
+    @property
+    def index_page_size(self) -> int:
+        return self._index_attr("index_page_size", self.page_size)
+
+    @property
+    def use_fp4_indexer(self) -> bool:
+        return self._index_attr("use_fp4_indexer", False)
+
+    @property
+    def index_bytes_per_token(self):
+        return self._index_attr("index_bytes_per_token")
+
+    @property
+    def index_key_bytes_per_token(self):
+        return self._index_attr("index_key_bytes_per_token")
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        route = self.layer_router.read(layer_id, INDEX_K_PART)
+        return route.view.get_index_k_with_scale_buffer(route.view_layer_id)
+
+    def get_broadcastable_index_k_with_scale_buffer(self, layer_id: int):
+        return self.get_index_k_with_scale_buffer(layer_id)
+
+    def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
+        return None
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        route = self.layer_router.read(layer_id, INDEX_K_PART)
+        return route.view.get_index_k_scale_buffer(
+            route.view_layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+        )
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        route = self.layer_router.layer(layer_id, INDEX_K_PART)
+        route.view.set_index_k_scale_buffer(
+            route.view_layer_id, loc, index_k, index_k_scale
         )

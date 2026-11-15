@@ -166,6 +166,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                     ):
                         controller = HiCacheController.__new__(HiCacheController)
                         controller.mem_pool_device = view_type.__new__(view_type)
+                        controller.mem_pool_device.dtype = torch.float16
                         controller.mem_pool_host = SimpleNamespace(
                             layout="page_first", storage_format_tag=None
                         )
