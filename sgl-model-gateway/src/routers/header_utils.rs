@@ -213,6 +213,7 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
+        || name.eq_ignore_ascii_case("x-override-priority")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
@@ -278,6 +279,8 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-123"));
         assert!(should_forward_request_header("x-smg-routing-key"));
         assert!(should_forward_request_header("X-SMG-Routing-Key"));
+        assert!(should_forward_request_header("x-override-priority"));
+        assert!(should_forward_request_header("X-Override-Priority"));
     }
 
     #[test]
@@ -295,5 +298,7 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+        assert!(!should_forward_request_header("x-override-rid"));
+        assert!(!should_forward_request_header("x-override-bootstrap-host"));
     }
 }
