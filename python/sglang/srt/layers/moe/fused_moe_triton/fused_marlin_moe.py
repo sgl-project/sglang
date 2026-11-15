@@ -136,7 +136,6 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
-@register_custom_op(out_shape="hidden_states")
 def _scale_up_half(
     gemm1_out: torch.Tensor,
     up_scale_ratio: torch.Tensor,
@@ -161,6 +160,7 @@ def _scale_up_half(
     up.copy_((up.float() * ratio.unsqueeze(1)).to(up.dtype))
 
 
+@register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,

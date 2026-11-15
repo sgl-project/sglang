@@ -613,7 +613,7 @@ class TestFusedMarlinMoe(CustomTestCase):
                     global_num_experts=e,
                     expert_map=e_map,
                 )
-                marlin_output = fused_marlin_moe(
+                marlin_args = (
                     a,
                     qweight1,
                     qweight2,
@@ -622,12 +622,15 @@ class TestFusedMarlinMoe(CustomTestCase):
                     score,
                     topk_weights,
                     kernel_topk_ids,
+                )
+                marlin_kwargs = dict(
                     global_num_experts=e,
                     expert_map=e_map,
                     w1_up_scale_ratio=ratio,
                     num_bits=4,
                     is_k_full=True,
                 )
+                marlin_output = fused_marlin_moe(*marlin_args, **marlin_kwargs)
                 # The same MoE without the ratio: how far a kernel that drops
                 # it would be off. The kernel must be far closer than that.
                 plain_output = torch_moe(
@@ -643,6 +646,16 @@ class TestFusedMarlinMoe(CustomTestCase):
                 effect = (plain_output.float() - torch_output.float()).norm()
                 self.assertGreater(effect, 0.3 * torch_output.float().norm())
                 self.assertLess(err, 0.1 * effect)
+
+                # Under torch.compile fused_marlin_moe is one custom op, with the
+                # rescale inside it, and gives the eager output.
+                compiled = torch.compile(fused_marlin_moe, fullgraph=True)
+                torch.testing.assert_close(
+                    compiled(*marlin_args, **marlin_kwargs),
+                    marlin_output,
+                    atol=0,
+                    rtol=0,
+                )
 
 
 if __name__ == "__main__":
