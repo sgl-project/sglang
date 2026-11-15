@@ -99,6 +99,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
         return SimpleNamespace(
             rid="test-req",
+            kv_cache_limited_output=False,
             origin_input_ids=[0] * input_len,
             sampling_params=SimpleNamespace(
                 max_new_tokens=max_new_tokens, min_new_tokens=min_new_tokens
@@ -183,6 +184,15 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 self._init_and_check(scheduler, req),
                 max_total_num_tokens - paged_input_len - page_size - 1,
             )
+
+    def test_only_kv_budget_clip_marks_finite_output_limit(self):
+        scheduler = self._new_scheduler(max_total_num_tokens=24, page_size=4)
+        scheduler.max_new_tokens_limit = None
+        for requested, expected in ((12, True), (11, False), (None, False)):
+            with self.subTest(requested=requested):
+                req = self._new_req(max_new_tokens=requested)
+                self.assertEqual(self._init_and_check(scheduler, req), 11)
+                self.assertIs(req.kv_cache_limited_output, expected)
 
     def test_dcp_budget_is_already_in_logical_tokens(self):
         with get_parallel().override(attn_dcp_size=4):
