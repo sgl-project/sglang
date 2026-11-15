@@ -414,7 +414,12 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     accessors instead).
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        npu_window_generation: Optional[str] = None,
+        **kwargs,
+    ):
         c128_page_size = get_schedule().c128_page_size
         if c128_page_size <= 0 or c128_page_size % 16 != 0:
             raise ValueError(
@@ -422,9 +427,22 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 f"sparse-attention operator, got {c128_page_size}"
             )
         self.c128_page_size = c128_page_size
+        # Pin the window / compressed row generation instead of inferring it
+        # from ``compression_ratios``: a draft worker's rows must stay V4 (its
+        # forward runs the V4 sparse-attention op) even though its ratio list is
+        # emptied to ``[0] * layers`` by the pool builder.
+        if npu_window_generation not in (None, "v4", "v41"):
+            raise ValueError(
+                "npu_window_generation must be None, 'v4' or 'v41', got "
+                f"{npu_window_generation!r}"
+            )
+        self._npu_window_generation = npu_window_generation
         super().__init__(*args, **kwargs)
 
     def _is_v41_model(self) -> bool:
+        pinned = getattr(self, "_npu_window_generation", None)
+        if pinned is not None:
+            return pinned == "v41"
         return any(
             r in NPUDSV4KVLayout.COMPRESSED_RATIOS for r in self.compression_ratios
         )
@@ -440,7 +458,13 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def _window_kv_layout(self):
         """Row format of the non-compressed (full/swa/window) pools, resolved
-        from the generation and the part; see the shared default."""
+        from the generation and the part; see the shared default.
+
+        A draft worker keeps the V4 row format on purpose: its forward runs the
+        V4 sparse-attention op, so the pool must stay V4 even when the target is
+        V4.1. ``_build_dsv4_kv_pool`` pins that through
+        ``npu_window_generation="v4"``; do not "fix" it to ``V41_SWA_FP8``.
+        """
         if self._is_v41_model():
             return NPUDSV4KVLayout.V41_SWA_FP8
         return NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16

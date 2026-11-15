@@ -2609,6 +2609,8 @@ class DeepseekV4AscendAttnBackend(
             and self._is_dspark_algorithm
         )
         self._validate_spec_support(model_runner.spec_algorithm)
+        if getattr(model_runner, "is_draft_worker", False):
+            self._validate_draft_window_rows()
         self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
         self._dsv4_state_pools_by_ratio = {
             pool.ratio: pool
@@ -2655,6 +2657,37 @@ class DeepseekV4AscendAttnBackend(
                 "DeepSeek-V4.1 on NPU supports only DSpark speculative"
                 f"decoding(static mode), got {spec_algorithm!r}."
             )
+
+    def _validate_draft_window_rows(self) -> None:
+        """The draft pool and the V4 sparse-attention op must agree on the row.
+
+        The pool builder pins a draft worker to the V4 generation while the
+        dispatch above infers it from the emptied ratio list; if the two drift,
+        the op rejects the row width only at the first graph capture. Check it
+        at init so the failure names both sides.
+        """
+        if not is_npu_arch35():
+            return
+        swa_pool = getattr(self.token_to_kv_pool, "swa_kv_pool", None)
+        if swa_pool is None:
+            return
+        from sgl_kernel_npu.operators.mem_cache import get_npu_kv_quant_path
+        from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import (
+            NPUDSV4KVLayout,
+        )
+
+        expected = get_npu_kv_quant_path().packed_dim(
+            self.token_to_kv_pool.qk_nope_head_dim,
+            self.token_to_kv_pool.qk_rope_head_dim,
+        )
+        layout = getattr(swa_pool, "layout", None)
+        rows = getattr(swa_pool, "kv_cache_total_dim", None)
+        assert layout is NPUDSV4KVLayout.V4_FP8 and rows == expected, (
+            "the draft SWA pool must keep the V4 row format its forward reads "
+            f"(V4_FP8/{expected}B), got {layout} rows={rows}B: the pool "
+            "generation is pinned in _build_dsv4_kv_pool, so a mismatch means "
+            "it was tagged with the target's V4.1 row format"
+        )
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm

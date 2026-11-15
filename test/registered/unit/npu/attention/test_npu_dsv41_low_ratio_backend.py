@@ -345,6 +345,31 @@ class TestPoolFactory(unittest.TestCase):
                 NPUDSV4KVLayout.V4_BF16,
             )
 
+    def test_pinned_generation_overrides_the_ratio_list(self):
+        # A draft worker pins the V4 generation while its ratio list is empty:
+        # its forward still runs the V4 sparse-attention op.
+        draft = SimpleNamespace(
+            compression_ratios=(0,),
+            _npu_window_generation="v4",
+        )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
+            self.assertIs(
+                DSV4NPUTokenToKVPool._window_kv_layout(draft),
+                NPUDSV4KVLayout.V4_FP8,
+            )
+            self.assertIs(
+                DSV4NPUTokenToKVPool.compressed_kv_layout(draft, 1),
+                NPUDSV4KVLayout.V4_FP8,
+            )
+        pinned_v41 = SimpleNamespace(
+            compression_ratios=(0,),
+            _npu_window_generation="v41",
+        )
+        self.assertIs(
+            DSV4NPUTokenToKVPool._window_kv_layout(pinned_v41),
+            NPUDSV4KVLayout.V41_SWA_FP8,
+        )
+
     def test_compressed_kv_layout_tags_every_ratio(self):
         fake = SimpleNamespace(
             compression_ratios=(0, 1, 2),
