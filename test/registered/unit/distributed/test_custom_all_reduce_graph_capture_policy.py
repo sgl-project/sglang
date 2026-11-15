@@ -1,18 +1,21 @@
 import sys
 import types
+from contextlib import contextmanager
 from functools import partial
 from unittest import mock
 
 import pytest
 import torch
 
+from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.device_communicators import custom_all_reduce
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def test_registered_graph_inputs_enabled_by_default():
+@contextmanager
+def _published_policy_inputs(*, decode_backend, attn_dp_enabled):
     with (
         mock.patch.object(
             custom_all_reduce.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH,
@@ -20,47 +23,87 @@ def test_registered_graph_inputs_enabled_by_default():
             return_value=False,
         ),
         mock.patch(
-            "sglang.srt.runtime_context.attention_backends",
-            return_value=("tilelang", "tilelang"),
+            "sglang.srt.runtime_context.get_context",
+            return_value=types.SimpleNamespace(
+                is_config_namespace_published=lambda name: True
+            ),
         ),
-        mock.patch("sglang.srt.runtime_context.get_parallel") as get_parallel,
+        mock.patch(
+            "sglang.srt.runtime_context.attention_backends",
+            return_value=("aiter", decode_backend),
+        ),
+        mock.patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=types.SimpleNamespace(attn_dp_enabled=attn_dp_enabled),
+        ),
     ):
-        get_parallel.return_value = types.SimpleNamespace(attn_dp_enabled=True)
+        yield
+
+
+@pytest.mark.parametrize(
+    "decode_backend, attn_dp_enabled, expected",
+    [
+        ("tilelang", True, True),
+        ("dsa", True, False),
+        # The deprecated alias builds the same per-lane dense/sparse graphs.
+        ("nsa", True, False),
+        ("dsa", False, True),
+    ],
+)
+def test_registered_graph_inputs_policy(decode_backend, attn_dp_enabled, expected):
+    with _published_policy_inputs(
+        decode_backend=decode_backend, attn_dp_enabled=attn_dp_enabled
+    ):
+        assert custom_all_reduce._enable_register_for_capturing() is expected
+
+
+def test_unpublished_config_keeps_registered_graph_inputs():
+    """Dispatch before publish must not raise: the caller turns any exception
+    into "custom all-reduce disabled" for the whole group."""
+    with (
+        mock.patch.object(
+            custom_all_reduce.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH,
+            "get",
+            return_value=False,
+        ),
+        mock.patch(
+            "sglang.srt.runtime_context.get_context",
+            return_value=types.SimpleNamespace(
+                is_config_namespace_published=lambda name: False
+            ),
+        ),
+        mock.patch(
+            "sglang.srt.runtime_context.attention_backends",
+            side_effect=ValueError("config namespace 'exec' not published"),
+        ),
+    ):
         assert custom_all_reduce._enable_register_for_capturing()
 
 
-def test_registered_graph_inputs_disabled_for_dsa_dp_attention():
+@pytest.mark.parametrize(
+    "ca_registers, copy_in_env, expected",
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_aiter_all_gather_and_reduce_scatter_follow_capture_policy(
+    ca_registers, copy_in_env, expected
+):
+    """A communicator built for copy-in must not register all-gather or
+    reduce-scatter inputs either; DP lanes replaying different graphs then read
+    another graph's peer buffers."""
+    ca_comm = types.SimpleNamespace(enable_register_for_capturing=ca_registers)
     with (
         mock.patch.object(
-            custom_all_reduce.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH,
+            parallel_state.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH,
             "get",
             return_value=False,
         ),
-        mock.patch(
-            "sglang.srt.runtime_context.attention_backends",
-            return_value=("aiter", "dsa"),
-        ),
-        mock.patch("sglang.srt.runtime_context.get_parallel") as get_parallel,
-    ):
-        get_parallel.return_value = types.SimpleNamespace(attn_dp_enabled=True)
-        assert not custom_all_reduce._enable_register_for_capturing()
-
-
-def test_registered_graph_inputs_remain_enabled_for_dsa_without_dp_attention():
-    with (
         mock.patch.object(
-            custom_all_reduce.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH,
+            parallel_state.envs.SGLANG_AITER_CAPTURE_COPY_IN,
             "get",
-            return_value=False,
+            return_value=copy_in_env,
         ),
-        mock.patch(
-            "sglang.srt.runtime_context.attention_backends",
-            return_value=("tilelang", "dsa"),
-        ),
-        mock.patch("sglang.srt.runtime_context.get_parallel") as get_parallel,
     ):
-        get_parallel.return_value = types.SimpleNamespace(attn_dp_enabled=False)
-        assert custom_all_reduce._enable_register_for_capturing()
+        assert parallel_state._aiter_capture_registered(ca_comm) is expected
 
 
 def test_memory_saver_always_uses_copy_in():

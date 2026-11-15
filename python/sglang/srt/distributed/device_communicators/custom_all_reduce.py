@@ -445,8 +445,6 @@ def dispatch_custom_allreduce(
             )
 
             logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
-            if not enable_register_for_capturing:
-                logger.info("[AR] Using copy-in buffers during CUDA graph capture")
             return partial(
                 AiterCustomAllreduce,
                 enable_register_for_capturing=enable_register_for_capturing,
@@ -481,10 +479,26 @@ def _enable_register_for_capturing() -> bool:
     if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
         return False
 
-    from sglang.srt.runtime_context import attention_backends, get_parallel
+    from sglang.srt.runtime_context import (
+        attention_backends,
+        get_context,
+        get_parallel,
+    )
+
+    # Before publish there is no backend to check; raising here would make the
+    # caller drop custom AR for the group.
+    if not get_context().is_config_namespace_published("exec"):
+        return True
 
     _prefill_backend, decode_backend = attention_backends()
-    return not (get_parallel().attn_dp_enabled and decode_backend == "dsa")
+    # "nsa" is the deprecated alias for "dsa".
+    if get_parallel().attn_dp_enabled and decode_backend in ("dsa", "nsa"):
+        logger.info(
+            "[AR] DSA with DP attention: custom all-reduce, all-gather and "
+            "reduce-scatter use copy-in buffers during CUDA graph capture"
+        )
+        return False
+    return True
 
 
 def _use_amd_deterministic_impl() -> bool:
