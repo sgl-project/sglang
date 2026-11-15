@@ -9,6 +9,7 @@ from transformers import AutoConfig, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImageEditPipelineConfig,
     LongCatImagePipelineConfig,
@@ -731,7 +732,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             model = initialize_model(
                 model_cls, {"config": model_config}, param_dtype, model_device
             )
-            if component_starts_on_cpu:
+            if component_starts_on_cpu and isinstance(model_config, Qwen3TextConfig):
                 _build_rope_caches_on(model, local_torch_device)
 
             if not isinstance(model, EncoderTensorParallelMixin):
