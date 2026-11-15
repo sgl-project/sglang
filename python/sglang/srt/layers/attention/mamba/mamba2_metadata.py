@@ -31,6 +31,9 @@ class ForwardStateSlots(NamedTuple):
 
     working: torch.Tensor  # one slot per request
     track: Optional[torch.Tensor] = None  # prefix-cache checkpoint slots
+    # A request-scoped ReplaySSM ring's row per request: the request row, or its
+    # request sub-pool unit under unified memory.
+    ring: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)

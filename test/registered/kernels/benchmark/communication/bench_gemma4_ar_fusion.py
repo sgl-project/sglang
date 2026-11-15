@@ -63,7 +63,7 @@ def _init():
     # fused kernel borrows this plane's barriers, as it does in the model.
     comm = CustomAllReduceV2(coord.cpu_group, torch.device(f"cuda:{local_rank}"))
     assert not comm.disabled and comm.has_multicast, "needs NVLink multicast"
-    gemma4_ar_fusion.register_comm(comm.obj)
+    gemma4_ar_fusion.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return coord, comm
 

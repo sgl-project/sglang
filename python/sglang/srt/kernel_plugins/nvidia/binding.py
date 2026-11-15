@@ -68,6 +68,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
     get_exec,
+    get_memory,
     get_model,
     get_parallel,
     get_schedule,
@@ -741,6 +742,7 @@ def install_megakernel(
     tokens = _tokens_per_request()
     tensor_verify = tokens > 1 and spec.tensor_verify_build is not None
     reasons = _requirement_reasons(spec=spec, hf_config=hf_config)
+    reasons += _layout_reasons()
     if not tensor_verify:
         reasons += _model_disable_reasons(spec=spec, model=model, hf_config=hf_config)
     _refuse(_gather_reasons(reasons))
@@ -1111,6 +1113,23 @@ def _requirement_reasons(
         f"{what} {v!r} is not {want!r}" for what, v, want in exactly if v != want
     ]
     return reasons
+
+
+def _layout_reasons() -> list[str]:
+    """Pool layouts no megakernel can address, whichever steps or entries it
+    offers: a target step reads the same pools as the draft entries."""
+    if (
+        get_memory().enable_unified_memory
+        and get_exec().mamba.enable_linear_replayssm_spec
+    ):
+        # A megakernel addresses the ReplaySSM speculative ring by request slot and
+        # its cursors with unit stride; unified memory keeps the ring in units of its
+        # request sub-pool and the cursors strided inside each unit.
+        return [
+            "the ReplaySSM speculative ring of --enable-linear-replayssm-spec is "
+            "not addressable under --enable-unified-memory"
+        ]
+    return []
 
 
 def _model_disable_reasons(

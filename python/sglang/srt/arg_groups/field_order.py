@@ -571,6 +571,8 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
     "hybrid_cache_checkpoints_level",
+    "disaggregation_max_top_logprobs_num",
+    "shortest_prefill_aging_factor",
     # Kimi-K3.1 additions, appended to keep existing positional slots
     "enable_flashmla_prefill_token_packing",
 )
