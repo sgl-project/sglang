@@ -1,10 +1,9 @@
 """Blackwell GDN prefix-cache replay must match the same eager workload.
 
-Uses Qwen3.5-9B BF16 weights with NVFP4 KV (not modelopt-quantized weights).
-With mixed chunk enabled, isolated requests are still ordinary EXTEND batches:
-16/20-token extends must replay, while 17 tokens must not pad to the 20 bucket.
-Both eager-written and graph-written recurrent checkpoints are reused, alongside
-uncached extends. Run on 4 B200s:
+BF16 Qwen3.5-9B weights must fall back on 17-token extends; the qualified
+ModelOpt Qwen3.8-27B checkpoint must replay them padded to 20. Both compare
+against eager execution with mixed chunk enabled, reusing eager-written and
+graph-written recurrent checkpoints alongside uncached extends. Run on B200:
 
     python3 test/registered/cuda_graph/breakable/test_qwen35_prefix_cache_sm100.py
 """
@@ -30,21 +29,30 @@ from sglang.test.test_utils import (
 )
 
 # Match the existing 9B NVFP4-KV test: there is no single-GPU SM100 CI pool.
-register_cuda_ci(est_time=600, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1200, stage="nightly", runner_config="4-gpu-b200")
 
-MODEL = "Qwen/Qwen3.5-9B"
 TRACK_INTERVAL = 128
 BUCKETS = [16, 20, TRACK_INTERVAL]
 
 
 class TestQwen35PrefixCacheSM100(CustomTestCase):
+    model = "Qwen/Qwen3.5-9B"
+    revision = None
+    tp_size = 4
+    allow_padded = False
+
     @classmethod
     def setUpClass(cls):
-        if not is_sm100_supported() or torch.cuda.device_count() < 4:
-            raise unittest.SkipTest("requires 4 SM100 GPUs with CUDA 12.8+")
+        if not is_sm100_supported() or torch.cuda.device_count() < cls.tp_size:
+            raise unittest.SkipTest(f"requires {cls.tp_size} SM100 GPUs")
         cls.base_url = DEFAULT_URL_FOR_TEST
 
     def _graph_counts(self):
+        # A generate response is streamed before report_prefill_stats updates the
+        # scheduler counters. Round-trip through the scheduler before scraping,
+        # including before a baseline so seed requests cannot leak into its delta.
+        response = requests.get(self.base_url + "/server_info", timeout=30)
+        response.raise_for_status()
         response = requests.get(self.base_url + "/metrics", timeout=30)
         response.raise_for_status()
         counts = {}
@@ -61,7 +69,7 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
 
     def _assert_forward_counts(self, before, backend, extend_len):
         after = self._graph_counts()
-        replay = backend == "breakable" and extend_len in BUCKETS
+        replay = backend == "breakable" and (self.allow_padded or extend_len in BUCKETS)
         active_mode = "prefill_cuda_graph" if replay else "prefill_none"
         inactive_mode = "prefill_none" if replay else "prefill_cuda_graph"
         self.assertGreater(after[active_mode], before[active_mode])
@@ -91,12 +99,12 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
             "prefill": {"backend": backend, "bs": BUCKETS},
         }
         process = popen_launch_server(
-            MODEL,
+            self.model,
             self.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                "4",
+                str(self.tp_size),
                 "--dtype",
                 "bfloat16",
                 "--kv-cache-dtype",
@@ -127,9 +135,8 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
                 "42",
                 "--cuda-graph-config",
                 json.dumps(graph_config),
-            ],
-            # Never inherit the explicit unsafe padded-GDN opt-in from CI.
-            env={"SGLANG_ENABLE_PADDED_GDN_PREFILL_GRAPH": "0"},
+            ]
+            + (["--revision", self.revision] if self.revision is not None else []),
         )
         try:
             response = requests.get(self.base_url + "/server_info", timeout=30)
@@ -222,8 +229,8 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
             with self.subTest(prefix=key[0], extend=key[1]):
                 actual = graph[key]
                 self.assertEqual([x[1] for x in actual], [x[1] for x in expected])
-                # Same tokens, cached state, and GEMM M must not acquire the
-                # numerical drift of padding 17 live rows to a captured 20.
+                # Padded replay and exact-bucket fallback must both preserve
+                # real-token logprobs and subsequently restored recurrent state.
                 np.testing.assert_allclose(
                     [x[0] for x in actual],
                     [x[0] for x in expected],
@@ -231,6 +238,16 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
                     atol=1e-5,
                     err_msg=f"prefix={key[0]}, extend={key[1]}",
                 )
+
+
+class TestQwen38NVFP4PrefixCacheSM100(TestQwen35PrefixCacheSM100):
+    """Keep padded replay for the effective FP8/FP4 paths of the reproducer."""
+
+    model = "nvidia/Qwen3.8-27B-NVFP4"
+    revision = "482ca0f3832238542f8f5295dde86b5f22711d80"
+    # Preserve the TP1 projection dimensions reported in #49133.
+    tp_size = 1
+    allow_padded = True
 
 
 if __name__ == "__main__":

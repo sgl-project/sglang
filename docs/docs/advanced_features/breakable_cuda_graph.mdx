@@ -95,22 +95,24 @@ python -m sglang.launch_server \
 
 ### Gated-DeltaNet Prefill Buckets
 
-Gated-DeltaNet (GDN) models replay prefill graphs only at exact captured token
-counts by default. For example, with buckets `[16, 20]`, a 20-token extend can
-replay, while a 17-token extend runs eagerly instead of padding to 20.
-This restriction also applies with `--enable-mixed-chunk`, including batches
-containing no decode requests, and on Blackwell GPUs.
+For CUDA Gated-DeltaNet (GDN) models, prefill graph eligibility is determined
+from the loaded projection methods, not the checkpoint's quantization label.
+On SM100/SM103, padded replay remains enabled when the transformer's remaining
+linear projections use the supported static ModelOpt FP8 FlashInfer BMM or
+ModelOpt NVFP4 W4A4 FlashInfer paths. The BF16 `in_proj_ba` is exempt only when
+it uses the batch-invariant prefill matmul; the convolution weight is not a GEMM.
 
-A checkpoint's FP8/FP4 quantization label does not guarantee that every
-projection is batch-invariant: mixed checkpoints can retain BF16 projections
-whose reduction order changes with the token count. Exact buckets avoid adding
-this source of numerical drift to prefill outputs and cached recurrent states.
-The tradeoff is less graph coverage for non-bucket prefills.
+If a remaining projection (including `in_proj_qkvz`, `out_proj`, attention or
+MLP projections) stays BF16 or selects another kernel path, prefill replay
+requires an exact captured token count. The same restriction applies on other
+CUDA architectures, including SM120 where FP8 projections can also vary with
+token count. For example, with buckets `[16, 20]`, an affected model can replay
+20-token extends but runs 17-token extends eagerly instead of padding to 20.
 
-`SGLANG_ENABLE_PADDED_GDN_PREFILL_GRAPH=1` explicitly opts into padded replay.
-Use it only after validating the actual model, kernels, and GPU configuration;
-it can reintroduce logprob and cached-state differences. It is not enabled
-automatically by a scheduling flag or quantization name.
+`--enable-mixed-chunk` does not override this numerical check, even for batches
+containing only prefill requests. Non-GDN models and non-CUDA backends retain
+their existing eligibility rules. Exact-bucket fallbacks trade graph coverage
+for avoiding additional projection drift in logits and cached recurrent states.
 
 ### Server Args
 

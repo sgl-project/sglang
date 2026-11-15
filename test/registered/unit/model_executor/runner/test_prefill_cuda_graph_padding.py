@@ -1,16 +1,30 @@
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    LinearBase,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.layers.quantization import fp4_utils
+from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
+    ModelOptFp8LinearMethod,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.managers.scheduler_components.dp_attn import (
     _local_prefill_cuda_graph_vote,
 )
@@ -26,7 +40,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     _requires_exact_gdn_prefill_bucket,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_context, override_platform
+from sglang.srt.runtime_context import get_context, get_flags, override_platform
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -312,68 +326,316 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         self.assertIsNone(runner.max_context_size)
         self.assertIn("fixed metadata extent", "\n".join(logs.output))
 
-    def test_requires_exact_gdn_prefill_bucket_policy(self):
-        """Scheduling flags and checkpoint labels must not enable padded GDN
-        replay: an FP4/mixed checkpoint can retain BF16 projections."""
-        gdn_leaf = GDNAttnBackend.__new__(GDNAttnBackend)
-        hybrid_gdn = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
-        hybrid_gdn.linear_attn_backend = gdn_leaf
-        hybrid_non_gdn = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
-        hybrid_non_gdn.linear_attn_backend = SimpleNamespace()
-        non_gdn = SimpleNamespace()
+    @contextmanager
+    def _gdn_platform(self, *, is_cuda=True, is_sm100=True, sequence_parallel=False):
+        with (
+            mock.patch.object(runner_module, "is_cuda", return_value=is_cuda),
+            override_platform(is_cuda=is_cuda, is_sm100=is_sm100),
+            get_flags().sp.override(enabled=sequence_parallel),
+        ):
+            yield
 
-        cases = (
-            # The scheduling flag applies even when this batch has no decode rows.
-            (hybrid_gdn, False, "modelopt_fp4", False, True, True),
-            # Blackwell quantization labels do not describe each projection.
-            (hybrid_gdn, True, "modelopt_fp4", False, False, True),
-            (hybrid_gdn, True, "modelopt_mixed", False, True, True),
-            (gdn_leaf, False, None, False, False, True),
-            # Non-GDN attention backends keep normal bucket padding.
-            (non_gdn, False, None, False, False, False),
-            (hybrid_non_gdn, True, "modelopt_mixed", False, True, False),
-            # Only an explicit numerical-risk opt-in disables the guard.
-            (hybrid_gdn, True, "modelopt_mixed", True, False, False),
+    def _make_projection(
+        self,
+        method_cls=ModelOptFp8LinearMethod,
+        linear_cls=LinearBase,
+    ):
+        # Inspect real post-load module/method types without allocating GPU
+        # weights or running distributed model initialization in CPU policy tests.
+        projection = linear_cls.__new__(linear_cls)
+        torch.nn.Module.__init__(projection)
+        projection.quant_method = method_cls.__new__(method_cls)
+        projection.quant_method.use_marlin = False
+        projection.quant_method.quant_mode = "w4a4"
+        projection.use_flashinfer_bmm = True
+        projection.input_scale = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+        projection.params_dtype = torch.bfloat16
+        weight_dtype = {
+            ModelOptFp8LinearMethod: torch.float8_e4m3fn,
+            ModelOptFp4LinearMethod: torch.uint8,
+        }.get(method_cls, torch.bfloat16)
+        projection.weight = torch.nn.Parameter(
+            torch.empty(8, 8, dtype=weight_dtype), requires_grad=False
         )
-        for (
-            attn_backend,
-            is_sm100,
-            quantization,
-            allow_padded_env,
-            mixed_chunk,
-            expected,
-        ) in cases:
+        projection.bias = None
+        projection.gather_output = False
+        return projection
+
+    def _make_gdn_policy_runner(self, method_cls=ModelOptFp8LinearMethod, gdn_cls=None):
+        if gdn_cls is None:
+            from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+
+            gdn_cls = Qwen3_5GatedDeltaNet
+        gdn = gdn_cls.__new__(gdn_cls)
+        torch.nn.Module.__init__(gdn)
+        gdn.in_proj_qkvz = self._make_projection(method_cls, MergedColumnParallelLinear)
+        gdn.in_proj_ba = self._make_projection(
+            UnquantizedLinearMethod, MergedColumnParallelLinear
+        )
+        gdn.out_proj = self._make_projection(method_cls, RowParallelLinear)
+        # Both remain BF16 in otherwise quantized checkpoints: conv1d consumes
+        # weights directly, and in_proj_ba uses the row-invariant prefill helper.
+        gdn.conv1d = self._make_projection(
+            UnquantizedLinearMethod, ColumnParallelLinear
+        )
+        gdn._fused_in_proj_weight = None
+        layer = torch.nn.Module()
+        layer.linear_attn = gdn
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.qkv_proj = self._make_projection(method_cls)
+        layer.self_attn.o_proj = self._make_projection(method_cls)
+        layer.mlp = torch.nn.Module()
+        layer.mlp.gate_up_proj = self._make_projection(method_cls)
+        layer.mlp.down_proj = self._make_projection(method_cls)
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList([layer])
+        backend = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        backend.linear_attn_backend = GDNAttnBackend.__new__(GDNAttnBackend)
+        return SimpleNamespace(
+            attn_backend=backend,
+            model=model,
+            model_config=SimpleNamespace(quantization="modelopt_mixed"),
+        )
+
+    def _assert_gdn_bucket_policy(self, model_runner, *, exact):
+        self.assertEqual(_requires_exact_gdn_prefill_bucket(model_runner), exact)
+        runner = self._make_runner()
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.capture_num_tokens = [16, 20]
+        runner.max_num_tokens = 20
+        runner._requires_exact_prefill_bucket = _requires_exact_gdn_prefill_bucket(
+            model_runner
+        )
+        # Exercise admission of a real EXTEND shape, not just the stored flag.
+        self.assertEqual(runner.can_run_graph(self._make_forward_batch(17)), not exact)
+        for num_tokens in (16, 20):
+            self.assertTrue(runner.can_run_graph(self._make_forward_batch(num_tokens)))
+
+    def test_effective_fp8_methods_allow_padding_independent_of_checkpoint_label(self):
+        model_runner = self._make_gdn_policy_runner()
+        for quantization in (None, "modelopt_fp4", "modelopt_mixed", "fp8"):
+            for mixed_chunk in (False, True):
+                with (
+                    self.subTest(quantization=quantization, mixed_chunk=mixed_chunk),
+                    self._gdn_platform(),
+                    get_context().override_server_args(enable_mixed_chunk=mixed_chunk),
+                ):
+                    model_runner.model_config.quantization = quantization
+                    self._assert_gdn_bucket_policy(model_runner, exact=False)
+
+    def test_bf16_in_each_remaining_projection_requires_exact_buckets(self):
+        projection_paths = (
+            "linear_attn.in_proj_qkvz",
+            "linear_attn.out_proj",
+            "self_attn.qkv_proj",
+            "self_attn.o_proj",
+            "mlp.gate_up_proj",
+            "mlp.down_proj",
+        )
+        for path in projection_paths:
+            for mixed_chunk in (False, True):
+                with (
+                    self.subTest(projection=path, mixed_chunk=mixed_chunk),
+                    self._gdn_platform(),
+                    get_context().override_server_args(enable_mixed_chunk=mixed_chunk),
+                ):
+                    model_runner = self._make_gdn_policy_runner()
+                    # Keep the FP4 checkpoint label while changing only the
+                    # effective method of one loaded projection.
+                    model_runner.model_config.quantization = "modelopt_fp4"
+                    projection = model_runner.model.model.layers[0].get_submodule(path)
+                    projection.quant_method = UnquantizedLinearMethod()
+                    projection.weight = torch.nn.Parameter(
+                        torch.empty_like(projection.weight, dtype=torch.bfloat16),
+                        requires_grad=False,
+                    )
+                    self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_effective_fp4_w4a4_flashinfer_allows_padding(self):
+        for backend in (
+            Fp4GemmRunnerBackend.FLASHINFER_CUDNN,
+            Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+            Fp4GemmRunnerBackend.FLASHINFER_TRTLLM,
+            Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL,
+        ):
+            with (
+                self.subTest(backend=backend),
+                self._gdn_platform(),
+                mock.patch.object(fp4_utils, "FP4_GEMM_RUNNER_BACKEND", backend),
+            ):
+                model_runner = self._make_gdn_policy_runner(ModelOptFp4LinearMethod)
+                model_runner.model_config.quantization = None
+                self._assert_gdn_bucket_policy(model_runner, exact=False)
+
+    def test_fp8_kernel_fallback_requires_exact_buckets(self):
+        for use_marlin, use_flashinfer_bmm in ((True, True), (False, False)):
             with (
                 self.subTest(
-                    backend=type(attn_backend).__name__,
-                    is_sm100=is_sm100,
-                    quantization=quantization,
-                    allow_padded_env=allow_padded_env,
-                    mixed_chunk=mixed_chunk,
+                    use_marlin=use_marlin, use_flashinfer_bmm=use_flashinfer_bmm
                 ),
-                override_platform(is_sm100=is_sm100),
-                envs.SGLANG_ENABLE_PADDED_GDN_PREFILL_GRAPH.override(allow_padded_env),
-                get_context().override_server_args(enable_mixed_chunk=mixed_chunk),
+                self._gdn_platform(),
             ):
-                model_runner = SimpleNamespace(
-                    attn_backend=attn_backend,
-                    model_config=SimpleNamespace(quantization=quantization),
+                model_runner = self._make_gdn_policy_runner()
+                projection = model_runner.model.model.layers[0].linear_attn.out_proj
+                projection.quant_method.use_marlin = use_marlin
+                projection.use_flashinfer_bmm = use_flashinfer_bmm
+                self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_fp4_kernel_fallback_requires_exact_buckets(self):
+        for backend, quant_mode in (
+            (Fp4GemmRunnerBackend.AUTO, "w4a4"),
+            (Fp4GemmRunnerBackend.MARLIN, "w4a4"),
+            (Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL, "w4a16"),
+        ):
+            with (
+                self.subTest(backend=backend, quant_mode=quant_mode),
+                self._gdn_platform(),
+                mock.patch.object(fp4_utils, "FP4_GEMM_RUNNER_BACKEND", backend),
+            ):
+                model_runner = self._make_gdn_policy_runner(ModelOptFp4LinearMethod)
+                projection = model_runner.model.model.layers[0].linear_attn.out_proj
+                projection.quant_method.quant_mode = quant_mode
+                self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_gdn_padding_policy_is_scoped_to_cuda_and_sm100(self):
+        for is_cuda, is_sm100, exact in (
+            (False, False, False),
+            (True, False, True),
+            (True, True, False),
+        ):
+            with (
+                self.subTest(is_cuda=is_cuda, is_sm100=is_sm100),
+                self._gdn_platform(is_cuda=is_cuda, is_sm100=is_sm100),
+            ):
+                model_runner = self._make_gdn_policy_runner()
+                self._assert_gdn_bucket_policy(model_runner, exact=exact)
+
+    def test_non_gdn_attention_keeps_padding(self):
+        hybrid_non_gdn = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        hybrid_non_gdn.linear_attn_backend = SimpleNamespace()
+        for backend in (SimpleNamespace(), hybrid_non_gdn):
+            with (
+                self.subTest(backend=type(backend).__name__),
+                self._gdn_platform(is_sm100=False),
+            ):
+                # Non-GDN models need neither a checkpoint label nor a loaded
+                # GDN projection hierarchy to retain ordinary graph admission.
+                self._assert_gdn_bucket_policy(
+                    SimpleNamespace(attn_backend=backend), exact=False
                 )
-                self.assertEqual(
-                    _requires_exact_gdn_prefill_bucket(model_runner), expected
+
+    def test_fp8_without_static_input_scale_or_with_bias_requires_exact_buckets(self):
+        for fallback in ("dynamic_scale", "bias"):
+            with self.subTest(fallback=fallback), self._gdn_platform():
+                model_runner = self._make_gdn_policy_runner()
+                projection = model_runner.model.model.layers[0].linear_attn.out_proj
+                if fallback == "dynamic_scale":
+                    projection.input_scale = None
+                else:
+                    projection.bias = torch.nn.Parameter(
+                        torch.zeros(8, dtype=torch.bfloat16), requires_grad=False
+                    )
+                self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_quant_method_without_quantized_weights_requires_exact_buckets(self):
+        for method_cls in (ModelOptFp8LinearMethod, ModelOptFp4LinearMethod):
+            with (
+                self.subTest(method=method_cls.__name__),
+                self._gdn_platform(),
+                mock.patch.object(
+                    fp4_utils,
+                    "FP4_GEMM_RUNNER_BACKEND",
+                    Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+                ),
+            ):
+                model_runner = self._make_gdn_policy_runner(method_cls)
+                projection = model_runner.model.model.layers[0].linear_attn.out_proj
+                projection.weight = torch.nn.Parameter(
+                    torch.empty(8, 8, dtype=torch.bfloat16), requires_grad=False
                 )
-                runner = self._make_runner()
-                runner.prefill_backend_name = Backend.BREAKABLE
-                runner.capture_num_tokens = [16, 20]
-                runner.max_num_tokens = 20
-                runner._requires_exact_prefill_bucket = (
-                    _requires_exact_gdn_prefill_bucket(model_runner)
-                )
-                # Ordinary prefill with no decode rows, even with mixed-chunk on.
-                self.assertEqual(
-                    runner.can_run_graph(self._make_forward_batch(17)), not expected
-                )
-                self.assertTrue(runner.can_run_graph(self._make_forward_batch(20)))
+                self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_ba_exemption_requires_the_actual_persistent_helper_path(self):
+        class WrappedMergedLinear(MergedColumnParallelLinear):
+            pass
+
+        for fallback in (
+            "wrapped_linear",
+            "params_dtype",
+            "weight_dtype",
+            "bias",
+            "gather_output",
+            "sequence_parallel",
+        ):
+            with (
+                self.subTest(fallback=fallback),
+                self._gdn_platform(sequence_parallel=fallback == "sequence_parallel"),
+            ):
+                model_runner = self._make_gdn_policy_runner()
+                gdn = model_runner.model.model.layers[0].linear_attn
+                if fallback == "wrapped_linear":
+                    gdn.in_proj_ba = self._make_projection(
+                        UnquantizedLinearMethod, WrappedMergedLinear
+                    )
+                elif fallback == "params_dtype":
+                    gdn.in_proj_ba.params_dtype = torch.float16
+                elif fallback == "weight_dtype":
+                    gdn.in_proj_ba.weight = torch.nn.Parameter(
+                        torch.empty(8, 8, dtype=torch.float16), requires_grad=False
+                    )
+                elif fallback == "bias":
+                    gdn.in_proj_ba.bias = torch.nn.Parameter(
+                        torch.zeros(8, dtype=torch.bfloat16), requires_grad=False
+                    )
+                elif fallback == "gather_output":
+                    gdn.in_proj_ba.gather_output = True
+                self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_unknown_effective_projection_method_requires_exact_buckets(self):
+        # Native FP8 has additional block/MX/Marlin/fallback dispatch branches;
+        # its class alone does not certify the qualified ModelOpt BMM path.
+        native_fp8 = Fp8LinearMethod.__new__(Fp8LinearMethod)
+        for method in (None, object(), native_fp8):
+            with self.subTest(method=type(method).__name__), self._gdn_platform():
+                model_runner = self._make_gdn_policy_runner()
+                projection = model_runner.model.model.layers[0].mlp.down_proj
+                projection.quant_method = method
+                self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_remaining_decoder_layers_are_inspected(self):
+        with self._gdn_platform():
+            model_runner = self._make_gdn_policy_runner()
+            later_layer = self._make_gdn_policy_runner().model.model.layers[0]
+            later_layer.mlp.down_proj = self._make_projection(UnquantizedLinearMethod)
+            model_runner.model.model.layers.append(later_layer)
+            self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_only_language_transformer_projections_affect_padding(self):
+        with self._gdn_platform():
+            model_runner = self._make_gdn_policy_runner()
+            model_runner.model.lm_head = self._make_projection(UnquantizedLinearMethod)
+            wrapper = torch.nn.Module()
+            wrapper.language_model = model_runner.model
+            wrapper.visual = self._make_projection(UnquantizedLinearMethod)
+            model_runner.model = wrapper
+            self._assert_gdn_bucket_policy(model_runner, exact=False)
+
+    def test_gdn_backend_without_recognized_gdn_module_requires_exact_buckets(self):
+        with self._gdn_platform():
+            model_runner = self._make_gdn_policy_runner()
+            layer = model_runner.model.model.layers[0]
+            layer.linear_attn = torch.nn.Module()
+            layer.linear_attn.in_proj_qkvz = self._make_projection()
+            self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_qwen_next_and_direct_gdn_backend_allow_safe_padding(self):
+        from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
+
+        with self._gdn_platform():
+            model_runner = self._make_gdn_policy_runner(gdn_cls=Qwen3GatedDeltaNet)
+            model_runner.attn_backend = GDNAttnBackend.__new__(GDNAttnBackend)
+            self._assert_gdn_bucket_policy(model_runner, exact=False)
 
     def test_exact_prefill_bucket_guard_and_dp_vote_consensus(self):
         """When exact GDN prefill buckets are required, padded token counts run

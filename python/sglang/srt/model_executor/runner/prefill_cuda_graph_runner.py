@@ -54,7 +54,6 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -175,6 +174,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_memory,
     get_parallel,
+    get_platform,
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
@@ -208,12 +208,73 @@ def _uses_gdn_linear_attention(attn_backend: Any) -> bool:
     )
 
 
-def _requires_exact_gdn_prefill_bucket(model_runner: ModelRunner) -> bool:
-    # Quantization labels and GPU architecture do not establish row invariance:
-    # mixed checkpoints can retain BF16 projections outside in_proj_ba.
-    return _uses_gdn_linear_attention(model_runner.attn_backend) and not (
-        envs.SGLANG_ENABLE_PADDED_GDN_PREFILL_GRAPH.get()
+def _gdn_projection_is_m_invariant(projection: torch.nn.Module) -> bool:
+    """Loaded SM100 projection paths qualified for padded GDN prefills."""
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptFp4LinearMethod,
+        ModelOptFp8LinearMethod,
     )
+
+    method = projection.quant_method
+    if projection.bias is not None:
+        return False
+    if type(method) is ModelOptFp8LinearMethod:
+        return (
+            not method.use_marlin
+            and projection.use_flashinfer_bmm
+            and projection.input_scale is not None
+            and projection.weight.dtype == torch.float8_e4m3fn
+        )
+    if type(method) is ModelOptFp4LinearMethod:
+        return (
+            method.quant_mode == "w4a4"
+            and get_fp4_gemm_runner_backend().is_flashinfer()
+            and projection.weight.dtype == torch.uint8
+        )
+    return False
+
+
+def _requires_exact_gdn_prefill_bucket(model_runner: ModelRunner) -> bool:
+    if not is_cuda() or not _uses_gdn_linear_attention(model_runner.attn_backend):
+        return False
+    # SM120's per-tensor FP8 projections can also vary with M. The qualified
+    # SM100 paths below must not be generalized from a checkpoint's label.
+    if not get_platform().is_sm100 or get_flags().sp.enabled:
+        return True
+
+    from sglang.srt.layers.linear import LinearBase, MergedColumnParallelLinear
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+    from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
+
+    layer_model = _resolve_transformer_layer_model(model_runner.model)
+    skipped = set()
+    found_gdn = False
+    for module in layer_model.modules():
+        if isinstance(module, (Qwen3_5GatedDeltaNet, Qwen3GatedDeltaNet)):
+            found_gdn = True
+            # conv1d stores a convolution weight in a LinearBase wrapper.
+            skipped.add(module.conv1d)
+            ba = module.in_proj_ba
+            if (
+                type(ba) is MergedColumnParallelLinear
+                and isinstance(ba.quant_method, UnquantizedLinearMethod)
+                and ba.params_dtype == torch.bfloat16
+                and ba.weight.dtype == torch.bfloat16
+                and ba.bias is None
+                and not ba.gather_output
+            ):
+                # _forward_ba_proj uses the persistent, row-invariant matmul.
+                skipped.add(ba)
+        if (
+            isinstance(module, LinearBase)
+            and module not in skipped
+            and not _gdn_projection_is_m_invariant(module)
+        ):
+            return True
+    # Includes MHA and FFN projections, but not the eager LM head or vision tower.
+    return not found_gdn
 
 
 def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int]:
