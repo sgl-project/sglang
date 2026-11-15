@@ -11,7 +11,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +69,21 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 # a decode-side prefix shorter than the prefill report must not
                 # subtract from cached_tokens.
                 delta = max(0, pre_len - req.already_computed)
-                req.cached_tokens += delta
-                req.cached_tokens_device += delta
+                if delta:
+                    storage_end = req.fulfilled_storage_hit_len(pre_len)
+                    storage = storage_end - req.fulfilled_storage_hit_len(
+                        pre_len - delta
+                    )
+                    host_tail = min(delta, req.host_loaded_length)
+                    # An L3 hit can also be part of this request's host load.
+                    storage_in_host = storage_end - req.fulfilled_storage_hit_len(
+                        pre_len - host_tail
+                    )
+                    host = host_tail - storage_in_host
+                    req.cached_tokens += delta
+                    req.cached_tokens_device += delta - host - storage
+                    req.cached_tokens_host += host
+                    req.cached_tokens_storage += storage
                 req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)

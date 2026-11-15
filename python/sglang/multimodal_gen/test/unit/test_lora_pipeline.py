@@ -5,9 +5,11 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 from prometheus_client import CollectorRegistry
 from safetensors.torch import save_file
 
+import sglang.multimodal_gen.runtime.layers.linear as linear
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
@@ -26,6 +28,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
+from sglang.srt.layers import amx_utils
+from sglang.srt.utils import cpu_has_amx_support
 
 _RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.dist.get_rank"
 
@@ -217,6 +221,136 @@ def test_quantized_base_uses_dynamic_lora_in_auto_mode():
         pipeline._should_merge_lora_for_layers(
             "transformer", {"linear": layer}, "merge"
         )
+
+
+@pytest.fixture(params=["reference", "native"])
+def amx_lora_pipeline(request, monkeypatch):
+    if request.param == "native" and not cpu_has_amx_support():
+        pytest.skip("Native packed GEMM requires the CPU AMX backend")
+    if request.param == "reference":
+
+        def pack(weight):
+            n, k = weight.shape
+            return (
+                weight.view(n, k // 2, 2).transpose(0, 1).contiguous().view_as(weight)
+            )
+
+        def packed_linear(x, weight, bias, is_vnni):
+            n, k = weight.shape
+            dense = weight.view(k // 2, n, 2).transpose(0, 1).reshape(n, k)
+            return F.linear(x, dense, bias)
+
+        monkeypatch.setattr(
+            torch.ops.sgl_kernel, "convert_weight_packed", pack, raising=False
+        )
+        monkeypatch.setattr(
+            torch.ops.sgl_kernel,
+            "weight_packed_linear",
+            packed_linear,
+            raising=False,
+        )
+    monkeypatch.setattr(linear, "USE_CPU_AMX", True)
+    monkeypatch.setattr(amx_utils, "cpu_has_amx_support", lambda: True)
+    base = ReplicatedLinear(
+        input_size=32, output_size=16, bias=False, params_dtype=torch.bfloat16
+    )
+    dense = torch.zeros_like(base.weight)
+    dense[2, 7] = 0.5
+    dense[3, 5] = 1.0
+    with torch.no_grad():
+        base.weight.copy_(dense)
+    base.quant_method.process_weights_after_loading(base)
+    layer = wrap_with_lora_layer(base, lora_rank=1, lora_alpha=1)
+    pipeline = _make_pipeline(layer)
+    pipeline.auto_merge_rounding_loss = {}
+    pipeline.server_args.lora_merge_mode = "auto"
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    a = torch.zeros(1, 32, dtype=torch.bfloat16)
+    b = torch.zeros(16, 1, dtype=torch.bfloat16)
+    a[0, 7] = 1.0
+    b[2, 0] = 1.0
+    pipeline.lora_adapters["adapter"]["linear.lora_A"] = a
+    pipeline.lora_adapters["adapter"]["linear.lora_B"] = b
+    return pipeline, layer, dense, a, b
+
+
+def test_amx_lora_lifecycle_preserves_packed_base(amx_lora_pipeline):
+    """AMX LoRA activation and unmerge must not write dense deltas into packed storage."""
+    pipeline, layer, dense, a, b = amx_lora_pipeline
+    packed = layer.weight.detach().clone()
+    x = torch.eye(32, dtype=dense.dtype).view(2, 16, 32)
+    baseline = F.linear(x, dense)
+    delta = F.linear(F.linear(x, a), b)
+    with (
+        patch(_RANK_PATCH, return_value=0),
+        torch.compiler.set_stance("force_eager"),
+        torch.inference_mode(),
+    ):
+        pipeline.set_lora("adapter", strength=0.75, merge_mode="auto")
+        actual, _ = layer(x)
+        torch.testing.assert_close(actual, baseline + 0.75 * delta, rtol=0, atol=0)
+        assert not layer.merged
+        assert not pipeline.is_lora_merged["transformer"]
+        torch.testing.assert_close(layer.weight, packed, rtol=0, atol=0)
+
+        pipeline.merge_lora_weights(strength=0.5)
+        actual, _ = layer(x)
+        torch.testing.assert_close(actual, baseline + 0.5 * delta, rtol=0, atol=0)
+        assert not layer.merged
+        torch.testing.assert_close(layer.weight, packed, rtol=0, atol=0)
+
+        pipeline.unmerge_lora_weights()
+        pipeline.unmerge_lora_weights()
+        actual, _ = layer(x)
+        torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+        torch.testing.assert_close(layer.weight, packed, rtol=0, atol=0)
+
+        pipeline.set_lora("adapter", strength=0.25, merge_mode="auto")
+        actual, _ = layer(x)
+        torch.testing.assert_close(actual, baseline + 0.25 * delta, rtol=0, atol=0)
+        torch.testing.assert_close(layer.weight, packed, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("amx_lora_pipeline", ["reference"], indirect=True)
+def test_amx_lora_pipeline_rejects_explicit_merge(amx_lora_pipeline):
+    """Pipeline merge requests must reject AMX storage without corrupting the active adapter."""
+    pipeline, layer, dense, a, b = amx_lora_pipeline
+    packed = layer.weight.detach().clone()
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", strength=0.5, merge_mode="dynamic")
+        with pytest.raises(ValueError, match="use merge mode 'dynamic'"):
+            pipeline.set_lora("adapter", merge_mode="merge")
+    pipeline.server_args.lora_merge_mode = "merge"
+    with pytest.raises(ValueError, match="use merge mode 'dynamic'"):
+        pipeline.merge_lora_weights()
+    torch.testing.assert_close(layer.weight, packed, rtol=0, atol=0)
+    assert not layer.merged
+    x = torch.eye(32, dtype=dense.dtype)
+    with torch.compiler.set_stance("force_eager"), torch.inference_mode():
+        actual, _ = layer(x)
+    expected = F.linear(x, dense) + 0.5 * F.linear(F.linear(x, a), b)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_amx_ineligible_dense_layer_still_merges_and_unmerges(monkeypatch):
+    """An AMX-capable host must not disable LoRA merging for weights left dense."""
+    monkeypatch.setattr(linear, "USE_CPU_AMX", True)
+    monkeypatch.setattr(amx_utils, "cpu_has_amx_support", lambda: True)
+    base = ReplicatedLinear(
+        input_size=31, output_size=16, bias=False, params_dtype=torch.bfloat16
+    )
+    with torch.no_grad():
+        base.weight.zero_()
+    base.quant_method.process_weights_after_loading(base)
+    layer = wrap_with_lora_layer(base, lora_rank=1, lora_alpha=1)
+    a = torch.ones(1, 31, dtype=torch.bfloat16)
+    b = torch.ones(16, 1, dtype=torch.bfloat16)
+    layer.set_lora_weights(A=a, B=b, merge_weights=True)
+    torch.testing.assert_close(layer.weight, b @ a, rtol=0, atol=0)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(
+        layer.weight, torch.zeros_like(layer.weight), rtol=0, atol=0
+    )
 
 
 def test_dynamic_lora_reactivates_cached_layers_without_weight_update_context():

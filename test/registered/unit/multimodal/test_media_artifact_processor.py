@@ -207,7 +207,7 @@ class TestMediaArtifactProcessor(CustomTestCase):
 
         processor._run_preprocess_and_build_artifact_batch = wrong_identity
         try:
-            with self.assertRaisesRegex(ValueError, "changed the media artifact key"):
+            with self.assertRaisesRegex(RuntimeError, "changed the media artifact key"):
                 asyncio.run(processor.prepare_media_artifacts([b"image"]))
         finally:
             processor.close()

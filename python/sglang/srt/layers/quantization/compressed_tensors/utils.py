@@ -18,6 +18,7 @@ def is_activation_quantization_format(format: str) -> bool:
         CompressionFormat.nvfp4_pack_quantized.value,
         CompressionFormat.mxfp4_pack_quantized.value,
         CompressionFormat.pack_quantized.value,
+        CompressionFormat.mxfp8_quantized.value,
     ]
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 
@@ -53,6 +54,10 @@ def should_ignore_layer(
             should_ignore_shard = check_equal_or_regex_match(
                 layer_name=shard_name, targets=ignore
             )
+            if not should_ignore_shard:
+                should_ignore_shard = check_equal_or_regex_match(
+                    layer_name=f"{shard_name}.linear", targets=ignore
+                )
 
             # If shard_idx=0, set layer ignore to match shard.
             if should_ignore_layer is None:

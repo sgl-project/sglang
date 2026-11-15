@@ -6,8 +6,8 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.device import is_sm120_supported
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

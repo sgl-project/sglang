@@ -221,6 +221,9 @@ class RustMmProcessor:
         # SGLANG_RUST_SERVER.
         from sglang.srt.managers.multimodal_processor import import_processors
         from sglang.srt.managers.tokenizer_manager import get_processor_wrapper
+        from sglang.srt.multimodal.token_space_mm_process.registry import (
+            register_token_space_models,
+        )
 
         self.server_args = server_args
         self.model_config = model_config
@@ -231,6 +234,7 @@ class RustMmProcessor:
         # init_tokenizer_and_processor. The caller's already-loaded HF
         # AutoProcessor is reused when available (identical construction args).
         import_processors("sglang.srt.multimodal.processors")
+        register_token_space_models()
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper()
@@ -338,14 +342,15 @@ class RustMmProcessor:
         The buffers are ``mm.feature.{i}`` per item (shaped ``[rows,
         feature_dim]`` f32, inline or shm), ``mm.mrope`` (``[3, seq_len]``
         int64), and ``mm.meta``, a msgpack sidecar decoding to ``{"items":
-        [{"modality", "hash", "offsets", "model_specific_data"}, ...],
+        [{"modality", "hash", "identity", "offsets", "model_specific_data"}, ...],
         "token_ids", "mrope_delta"}`` with the items in buffer order. External
         model packages receive the same layout and wrap it their own way.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         the inline numpy arrays own the Rust buffers, ``torch.from_numpy`` just
-        views them, and each item's ``hash`` is worker-precomputed so
-        ``set_pad_value`` skips ``hash_feature``. Any per-byte work here — memcpy,
+        views them, and each item's full ``identity`` is worker-precomputed so
+        ``set_pad_value`` never rereads feature bytes. The drain boundary binds
+        these short digests to the serving configuration. Any feature-sized work here — memcpy,
         sha256, tens of MB per image-heavy request — measurably inflates every
         running request's inter-token latency."""
         import msgspec
@@ -423,6 +428,7 @@ class RustMmProcessor:
             modality=_MODALITIES[item["modality"]],
             feature=feature,
             hash=item["hash"],
+            identity=bytes(item["identity"]),
             offsets=[tuple(span) for span in item["offsets"]],
             model_specific_data={
                 "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)

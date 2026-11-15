@@ -11,6 +11,7 @@ import argparse
 import glob
 import json
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime
@@ -18,8 +19,7 @@ from datetime import datetime
 import requests
 
 from sglang.benchmark.utils import set_ulimit
-from sglang.srt.utils.common import safe_pickle_load
-from sglang.utils import get_exception_traceback
+from sglang.srt.utils.serialization import safe_pickle_load
 
 
 def normalize_mm_data_item(item):
@@ -113,8 +113,7 @@ def run_one_request(record):
         # success_ct += 1
     except Exception:
         # error_ct += 1
-        traceback = get_exception_traceback()
-        print(f"Hit an exception: {traceback}")
+        print(f"Hit an exception: {traceback.format_exc()}")
 
 
 def main(records):

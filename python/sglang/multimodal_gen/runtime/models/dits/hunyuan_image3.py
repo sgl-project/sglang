@@ -1193,16 +1193,8 @@ class HunyuanImage3ForCausalMM(CachableDiT):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set = set()
-        _ckpt_dtype_logged = False
 
         for name, loaded_weight in weights:
-            if not _ckpt_dtype_logged:
-                logger.info(
-                    "  checkpoint weight dtype: %s (param dtype: %s)",
-                    loaded_weight.dtype,
-                    next(iter(params_dict.values())).dtype if params_dict else "?",
-                )
-                _ckpt_dtype_logged = True
             if any(keyword in name for keyword in UNEXPECTED_KEYWORDS):
                 continue
             if "rotary_emb.inv_freq" in name:
@@ -1284,9 +1276,6 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             is_found = False
             found_num = 0
             if _is_moe(self.config) and "mlp.experts" in name:
-                if not getattr(self, "_expert_ckpt_logged", False):
-                    logger.info("  expert ckpt key sample: %s", name)
-                    self._expert_ckpt_logged = True
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     offset = 0
@@ -1352,36 +1341,6 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
-
-        all_param_names = set(params_dict.keys())
-        missing = all_param_names - loaded_params
-        if missing:
-            significant_missing = [
-                n for n in missing if not any(k in n for k in ["rotary_emb", "lm_head"])
-            ]
-            if significant_missing:
-                logger.warning(
-                    "Weight loading: %d/%d params loaded, %d MISSING:",
-                    len(loaded_params),
-                    len(all_param_names),
-                    len(significant_missing),
-                )
-                for n in sorted(significant_missing)[:30]:
-                    logger.warning("  MISSING: %s", n)
-                if len(significant_missing) > 30:
-                    logger.warning("  ... and %d more", len(significant_missing) - 30)
-            else:
-                logger.info(
-                    "Weight loading: %d/%d params loaded (all accounted for)",
-                    len(loaded_params),
-                    len(all_param_names),
-                )
-        else:
-            logger.info(
-                "Weight loading: %d/%d params loaded (complete)",
-                len(loaded_params),
-                len(all_param_names),
-            )
 
         return loaded_params
 
