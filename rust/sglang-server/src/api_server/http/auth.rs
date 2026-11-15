@@ -43,6 +43,16 @@ fn level(path: &str) -> AuthLevel {
     ROUTE_LEVELS.get(path).copied().unwrap_or(AuthLevel::Normal)
 }
 
+pub(super) fn is_admin_force(path: &str) -> bool {
+    level(path) == AuthLevel::AdminForce
+}
+
+/// Whether `auth_levels.json` declares `path` as `level` looks it up.
+#[cfg(test)]
+pub(super) fn has_level(path: &str) -> bool {
+    ROUTE_LEVELS.contains_key(path)
+}
+
 /// The declared level of the route `path`, its parameters written as axum's
 /// `{name}` / `{*name}` or FastAPI's `{name}` / `{name:path}`.
 fn declared_level(path: &str) -> Option<AuthLevel> {
@@ -374,6 +384,14 @@ mod tests {
         assert_eq!(forced.status(), StatusCode::FORBIDDEN);
         let error: serde_json::Value = serde_json::from_slice(&body(forced).await).unwrap();
         assert_eq!(error["error"], ADMIN_KEY_MISSING);
+
+        // A wrong method is refused at the route's level before the 405, as in Python.
+        let wrong_method = Request::post("/start_profile")
+            .header(AUTHORIZATION, format!("Bearer {API}"))
+            .body(Body::empty())
+            .unwrap();
+        let wrong_method = app.clone().oneshot(wrong_method).await.unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::FORBIDDEN);
 
         // Python's admin route, not served here: NORMAL, so the API key gets the 404.
         let unserved = send("/pause_generation", Some(format!("Bearer {API}")))
