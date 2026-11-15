@@ -1208,6 +1208,20 @@ class TestFlashinferMoeA2AAlias(CustomTestCase):
         self.assertIsNone(resolution_result(server_args, "speculative_moe_a2a_backend"))
 
 
+class TestTokenSpaceProcessorArgs(CustomTestCase):
+    def test_rejects_encoder_disaggregation(self):
+        for role in ("encoder_only", "language_only"):
+            with self.subTest(role=role):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_token_space_processor=True,
+                    **{role: True},
+                )
+
+                with self.assertRaisesRegex(ValueError, "encoder disaggregation"):
+                    pd_disaggregation_hook.handle_encoder_disaggregation(server_args)
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @staticmethod
     def _set_model_type(server_args, *, is_multimodal):
