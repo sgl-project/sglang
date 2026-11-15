@@ -18,7 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 
 @contextlib.contextmanager
 def _platform(*, is_hip: bool, is_gfx95: bool = False):
-    """gfx95 is read straight from utils.common, not through the platform
+    """gfx95 is read straight from utils.device, not through the platform
     probes, so it is patched where overrides.py imported it."""
     with override_platform(is_hip=is_hip, is_npu=False):
         with patch(

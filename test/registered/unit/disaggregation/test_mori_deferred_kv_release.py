@@ -1,57 +1,18 @@
 """Deferred decode-side KV release on the Mori backend."""
 
-import importlib
-import sys
 import threading
-import types
 import unittest
 from collections import defaultdict
-from enum import IntEnum
 from queue import Queue
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 
+from sglang.test.mori_stub import mori_stub
 
-def _install_mori_stubs() -> None:
-    try:
-        importlib.import_module("mori.cpp")
-        importlib.import_module("mori.io")
-        return
-    except (ImportError, OSError):
-        pass
-
-    mori = types.ModuleType("mori")
-    mori.__path__ = []
-    mori_cpp = types.ModuleType("mori.cpp")
-    mori_io = types.ModuleType("mori.io")
-
-    class FakeStatusCode(IntEnum):
-        SUCCESS = 0
-        IN_PROGRESS = 1
-        FAILED = 2
-
-    mori_cpp.TransferStatus = object
-    for name in (
-        "BackendType",
-        "EngineDesc",
-        "IOEngine",
-        "IOEngineConfig",
-        "MemoryDesc",
-        "MemoryLocationType",
-        "PollCqMode",
-        "RdmaBackendConfig",
-    ):
-        setattr(mori_io, name, object)
-    mori_io.StatusCode = FakeStatusCode
-    mori.cpp = mori_cpp
-    mori.io = mori_io
-    sys.modules["mori"] = mori
-    sys.modules["mori.cpp"] = mori_cpp
-    sys.modules["mori.io"] = mori_io
-
-
-_install_mori_stubs()
+_mori_stub = mori_stub()
+if _mori_stub is not None:
+    _mori_stub.start()
 
 from mori.io import StatusCode
 from test_deferred_decode_kv_release import (

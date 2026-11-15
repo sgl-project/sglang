@@ -41,7 +41,7 @@ def build_ascend_quant_info(layer):
 
 
 def reshape_w4a8_mxfp_weight_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
-    """Pack MXFP4 scales from ``[E, N, K/32]`` to the A5 GMM layout."""
+    """Pack MXFP4 scales from ``[E, N, K/32]`` to the Ascend 950 GMM layout."""
     if scale.dim() != 3:
         return scale
     num_experts, n, k32 = scale.shape

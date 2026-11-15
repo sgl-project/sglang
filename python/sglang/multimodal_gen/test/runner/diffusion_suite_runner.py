@@ -5,7 +5,6 @@ using LPT so each CI shard has a similar total runtime.
 """
 
 import argparse
-import copy
 import json
 import os
 import random
@@ -91,24 +90,6 @@ def get_standalone_file_est_time(
     if standalone_file not in suite_est_times:
         return DEFAULT_STANDALONE_EST_TIME_SECONDS, True
     return suite_est_times[standalone_file], False
-
-
-def get_all_standalone_file_est_times() -> dict[str, dict[str, float]]:
-    return copy.deepcopy(STANDALONE_FILE_EST_TIMES)
-
-
-def validate_standalone_file_est_times() -> dict[str, list[str]]:
-    missing_by_suite: dict[str, list[str]] = {}
-    for suite, standalone_files in STANDALONE_FILES.items():
-        suite_est_times = STANDALONE_FILE_EST_TIMES.get(suite, {})
-        missing = [
-            standalone_file
-            for standalone_file in standalone_files
-            if standalone_file not in suite_est_times
-        ]
-        if missing:
-            missing_by_suite[suite] = missing
-    return missing_by_suite
 
 
 def get_suite_files_rel(suite: str, parametrized_only: bool = False) -> list[str]:
@@ -642,7 +623,6 @@ def _run_partition_assignment(
 
 def main():
     args = parse_args()
-    validate_standalone_file_est_times()
     test_root_dir = Path(__file__).resolve().parents[1]
     target_dir = test_root_dir / args.base_dir
 

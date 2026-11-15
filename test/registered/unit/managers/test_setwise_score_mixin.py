@@ -9,9 +9,11 @@ as nested ``scores`` ``[num_items][Nᵢ x num_labels]``. These tests cover the
 grouping, validation, anchor bucketing, and the serialization round-trip on CPU.
 """
 
+import asyncio
 import math
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import torch
 
@@ -129,6 +131,109 @@ class TestSingleItemScoringResults(CustomTestCase):
         self.assertEqual(len(res.pooled_hidden_states), 2)
         torch.testing.assert_close(res.pooled_hidden_states[0], phs[1])
         torch.testing.assert_close(res.pooled_hidden_states[1], phs[2])
+
+    def test_mis_rejects_misaligned_pooled_hidden_state_rows(self):
+        """Requested non-null hidden states must not silently disappear on a row mismatch."""
+        for actual_count in (0, 2, 4):
+            with self.subTest(actual_count=actual_count):
+                result = self._result(
+                    [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                    phs=torch.zeros(actual_count, 4),
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    rf"Expected 3 pooled hidden state rows.*got {actual_count}.*"
+                    r"Request ID: rid-1",
+                ):
+                    self.h._process_multi_item_scoring_results(
+                        [result],
+                        items=["item0", "item1"],
+                        label_token_ids=None,
+                        apply_softmax=False,
+                        return_pooled_hidden_states=True,
+                    )
+
+    def test_mis_returns_no_pooled_hidden_states_when_absent_or_unrequested(self):
+        for fields, requested in (
+            ({}, True),
+            ({"pooled_hidden_state": None}, True),
+            ({"pooled_hidden_state": torch.zeros(1, 4)}, False),
+        ):
+            with self.subTest(fields=fields, requested=requested):
+                result = self._result([[0.0], [1.0], [2.0]])
+                result.update(fields)
+                res = self.h._process_multi_item_scoring_results(
+                    [result],
+                    items=["item0", "item1"],
+                    label_token_ids=None,
+                    apply_softmax=False,
+                    return_pooled_hidden_states=requested,
+                )
+                self.assertEqual(res.scores, [[1.0], [2.0]])
+                self.assertIsNone(res.pooled_hidden_states)
+
+    def test_score_request_text_item_embed_overrides(self):
+        """A bare string is one item, including tokenization and embedding injection."""
+        for enable_mis in (False, True):
+            for items in ("item", ["item", "next"]):
+                with self.subTest(enable_mis=enable_mis, items=items):
+                    self._publish(enable_mis=enable_mis)
+                    num_items = 1 if isinstance(items, str) else len(items)
+                    self.h.tokenizer = MagicMock(spec=["encode"])
+                    self.h.tokenizer.encode.side_effect = [
+                        [10, 11],
+                        *[[42, 12 + i] for i in range(num_items)],
+                    ]
+                    rows = [[float(i), 1.0] for i in range(num_items)]
+                    results = (
+                        [self._result([[0.0, 0.0], *rows])]
+                        if enable_mis
+                        else [self._result(row) for row in rows]
+                    )
+                    self.h.generate_request = MagicMock(
+                        return_value=SimpleNamespace(
+                            __anext__=AsyncMock(return_value=results)
+                        )
+                    )
+                    overrides = [torch.full((1, 4), float(i)) for i in range(num_items)]
+                    res = asyncio.run(
+                        self.h.score_request(
+                            query="query",
+                            items=items,
+                            embed_override_token_id=42,
+                            item_embed_overrides=[[tensor] for tensor in overrides],
+                        )
+                    )
+                    self.assertEqual(res.scores, rows)
+                    batch_request = self.h.generate_request.call_args.args[0]
+                    positional = batch_request.positional_embed_overrides
+                    self.assertEqual(len(positional), 1 if enable_mis else num_items)
+                    torch.testing.assert_close(
+                        torch.cat([override.embeds for override in positional]),
+                        torch.cat(overrides),
+                    )
+
+    def test_score_request_rejects_wrong_item_embed_override_count(self):
+        """Override count follows item count, not the character count of a bare string."""
+        for items, num_items, count in (
+            ("item", 1, 0),
+            ("item", 1, 4),
+            (["item", "next"], 2, 1),
+        ):
+            with self.subTest(items=items, count=count):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"item_embed_overrides length \({count}\) "
+                    rf"must match items length \({num_items}\)",
+                ):
+                    asyncio.run(
+                        self.h.score_request(
+                            query="query",
+                            items=items,
+                            embed_override_token_id=42,
+                            item_embed_overrides=[None] * count,
+                        )
+                    )
 
     # ---- setwise: per_item_matrix=True ----------------------------------
 
@@ -622,12 +727,13 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
         from sglang.srt.managers.scheduler_components.output_streamer import (
             SchedulerOutputStreamer,
         )
+        from sglang.test.scheduler_test_utils import FakeReq
 
         captured = []
         reqs = []
         for idx, phs in enumerate(phs_per_req):
             reqs.append(
-                SimpleNamespace(
+                FakeReq(
                     finished=lambda: True,
                     rid=f"rid-{idx}",
                     http_worker_ipc=None,
