@@ -118,6 +118,81 @@ class TestPrometheusMetricStyle(unittest.TestCase):
             collector_underscore.prefetched_tokens_total._name.startswith("sglang_")
         )
 
+    def test_cli_and_environment_select_one_metric_style(self):
+        from prometheus_client import Counter, Gauge
+
+        from sglang.srt.environ import envs
+        from sglang.srt.observability.http_request_metrics import _HttpRequestMetrics
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.server_args import prepare_server_args
+
+        cases = (
+            ("colon", None, "colon"),
+            ("underscore", None, "underscore"),
+            ("colon", "underscore", "underscore"),
+            ("underscore", "colon", "colon"),
+        )
+        for env_style, cli_style, expected in cases:
+            with self.subTest(env=env_style, cli=cli_style), patch.dict(os.environ):
+                with envs.SGLANG_PROMETHEUS_METRIC_STYLE.override(env_style):
+                    argv = ["--model-path", "dummy"]
+                    if cli_style is not None:
+                        argv.extend(["--prometheus-metric-style", cli_style])
+                    server_args = prepare_server_args(argv)
+                    with get_context().override_server_args(
+                        prometheus_metric_style=server_args.prometheus_metric_style
+                    ):
+                        prefix = "sglang_" if expected == "underscore" else "sglang:"
+                        counter, *_ = _StatLoggerDIMixin()._resolve_metric_classes(
+                            server_args
+                        )
+                        metric = counter(
+                            "sglang:test", "Test", registry=CollectorRegistry()
+                        )
+                        self.assertEqual(metric._name, prefix + "test")
+                        registry = CollectorRegistry()
+                        with (
+                            patch(
+                                "prometheus_client.Counter",
+                                side_effect=lambda **kwargs: Counter(
+                                    registry=registry, **kwargs
+                                ),
+                            ),
+                            patch(
+                                "prometheus_client.Gauge",
+                                side_effect=lambda **kwargs: Gauge(
+                                    registry=registry, **kwargs
+                                ),
+                            ),
+                        ):
+                            http_metrics = _HttpRequestMetrics()
+                        self.assertEqual(
+                            http_metrics.requests_active._name,
+                            prefix + "http_requests_active",
+                        )
+                        self.assertEqual(
+                            format_metric_name("sglang:cpu_percent"),
+                            prefix + "cpu_percent",
+                        )
+                        self.assertEqual(server_args.prometheus_metric_style, expected)
+
+    def test_collectors_follow_published_metric_style(self):
+        from sglang.srt.runtime_context import get_context
+
+        with get_context().override_server_args(
+            prometheus_metric_style="colon"
+        ) as args:
+            get_context().override(
+                "test metric style", prometheus_metric_style="underscore"
+            )
+            counter, *_ = _StatLoggerDIMixin()._resolve_metric_classes(args)
+            metric = counter("sglang:test", "Test", registry=CollectorRegistry())
+            self.assertEqual(metric._name, "sglang_test")
+            self.assertEqual(format_metric_name("sglang:test"), "sglang_test")
+            self.assertEqual(
+                format_metric_name("sglang:test", style="colon"), "sglang:test"
+            )
+
     def test_http_request_metrics_style(self):
         from sglang.srt.observability.http_request_metrics import _HttpRequestMetrics
 

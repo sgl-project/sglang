@@ -318,15 +318,24 @@ def resolve_collector_class(role: str, default_cls: type) -> type:
     return stat_loggers.get(role, default_cls)
 
 
+def _resolve_metric_style(server_args=None) -> str:
+    from sglang.srt.environ import envs
+
+    if get_context().is_config_namespace_published("observability"):
+        return get_observability().prometheus_metric_style
+    return (
+        getattr(server_args, "prometheus_metric_style", None)
+        or envs.SGLANG_PROMETHEUS_METRIC_STYLE.get()
+    )
+
+
 def format_metric_name(name: str, style: Optional[str] = None) -> str:
     """Format a Prometheus metric name according to the configured metric style.
 
     Translates 'sglang:...' prefix to 'sglang_...' when style is 'underscore'.
     """
-    from sglang.srt.environ import envs
-
     if style is None:
-        style = envs.SGLANG_PROMETHEUS_METRIC_STYLE.get()
+        style = _resolve_metric_style()
     if style == "underscore" and isinstance(name, str) and name.startswith("sglang:"):
         return "sglang_" + name[len("sglang:") :]
     return name
@@ -372,16 +381,11 @@ class _StatLoggerDIMixin:
         from prometheus_client import Histogram as _PromHistogram
         from prometheus_client import Summary as _PromSummary
 
-        from sglang.srt.environ import envs
         from sglang.srt.utils.gauge_histogram import (
             GaugeHistogram as _PromGaugeHistogram,
         )
 
-        metric_style = (
-            getattr(server_args, "prometheus_metric_style", None)
-            or envs.SGLANG_PROMETHEUS_METRIC_STYLE.get()
-        )
-        use_underscore = metric_style == "underscore"
+        use_underscore = _resolve_metric_style(server_args) == "underscore"
 
         Counter = self._wrap_metric_factory(
             self._counter_cls or _PromCounter, use_underscore

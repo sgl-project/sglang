@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     json_list_type,
 )
+from sglang.srt.environ import envs
 
 
 class Observability(msgspec.Struct):
@@ -95,7 +96,7 @@ class Observability(msgspec.Struct):
             help="Style for Prometheus metric names: 'colon' (legacy: sglang:...) or 'underscore' (standard: sglang_...). Defaults to 'colon' (or SGLANG_PROMETHEUS_METRIC_STYLE env var).",
             choices=["colon", "underscore"],
         ),
-    ] = "colon"
+    ] = msgspec.field(default_factory=envs.SGLANG_PROMETHEUS_METRIC_STYLE.get)
     load_snapshot_publish_interval: A[
         int,
         "Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
