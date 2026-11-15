@@ -52,7 +52,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_SERVICE_URL = "http://127.0.0.1:30000"
 
 COCO_URLS = {
@@ -113,10 +112,14 @@ class RemoteEmbeddingClient:
                     f"Retrying in {sleep_s}s..."
                 )
                 time.sleep(sleep_s)
-        raise RuntimeError(f"Embedding request failed after {self.max_retries} attempts: {last_error}")
+        raise RuntimeError(
+            f"Embedding request failed after {self.max_retries} attempts: {last_error}"
+        )
 
 
-def parse_embedding_response(body: dict[str, Any], *, expected_count: int) -> list[list[float]]:
+def parse_embedding_response(
+    body: dict[str, Any], *, expected_count: int
+) -> list[list[float]]:
     data = body.get("data")
     if not isinstance(data, list):
         raise ValueError(f"Embedding response has no list field 'data': {body}")
@@ -142,72 +145,178 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate a MultiModal Embedding service on MS COCO Captions retrieval."
     )
     data = parser.add_argument_group("COCO data")
-    data.add_argument("--coco-root", type=Path, default=None,
-                      help="COCO root containing <split>/ and annotations/. Used to infer paths.")
-    data.add_argument("--images-dir", type=Path, default=None,
-                      help="Directory containing COCO images, e.g. /data/coco/val2017.")
-    data.add_argument("--annotations", type=Path, default=None,
-                      help="COCO captions JSON, e.g. /data/coco/annotations/captions_val2017.json.")
-    data.add_argument("--split", default="val2017", choices=["val2017", "train2017"],
-                      help="COCO split to evaluate/download. Default: val2017.")
-    data.add_argument("--download", action="store_true",
-                      help="Download official COCO split images and train/val annotations into --coco-root.")
-    data.add_argument("--max-images", type=int, default=None,
-                      help="Limit the number of images for a quick run/debug. Default: all images in split.")
-    data.add_argument("--captions-per-image", type=int, default=None,
-                      help="Optional cap on captions per image. Default: use all available captions.")
-    data.add_argument("--seed", type=int, default=0,
-                      help="Seed used only when --shuffle is set.")
-    data.add_argument("--shuffle", action="store_true",
-                      help="Shuffle images before applying --max-images.")
-    data.add_argument("--allow-missing-images", action="store_true",
-                      help="Skip annotations whose image file is missing instead of failing.")
+    data.add_argument(
+        "--coco-root",
+        type=Path,
+        default=None,
+        help="COCO root containing <split>/ and annotations/. Used to infer paths.",
+    )
+    data.add_argument(
+        "--images-dir",
+        type=Path,
+        default=None,
+        help="Directory containing COCO images, e.g. /data/coco/val2017.",
+    )
+    data.add_argument(
+        "--annotations",
+        type=Path,
+        default=None,
+        help="COCO captions JSON, e.g. /data/coco/annotations/captions_val2017.json.",
+    )
+    data.add_argument(
+        "--split",
+        default="val2017",
+        choices=["val2017", "train2017"],
+        help="COCO split to evaluate/download. Default: val2017.",
+    )
+    data.add_argument(
+        "--download",
+        action="store_true",
+        help="Download official COCO split images and train/val annotations into --coco-root.",
+    )
+    data.add_argument(
+        "--max-images",
+        type=int,
+        default=None,
+        help="Limit the number of images for a quick run/debug. Default: all images in split.",
+    )
+    data.add_argument(
+        "--captions-per-image",
+        type=int,
+        default=None,
+        help="Optional cap on captions per image. Default: use all available captions.",
+    )
+    data.add_argument(
+        "--seed", type=int, default=0, help="Seed used only when --shuffle is set."
+    )
+    data.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Shuffle images before applying --max-images.",
+    )
+    data.add_argument(
+        "--allow-missing-images",
+        action="store_true",
+        help="Skip annotations whose image file is missing instead of failing.",
+    )
 
     model = parser.add_argument_group("remote embedding service")
-    model.add_argument("--service-url", default=DEFAULT_SERVICE_URL,
-                       help=f"Embedding service base URL. Default: {DEFAULT_SERVICE_URL}.")
-    model.add_argument("--model", default="qwen3-vl-embedding-2b",
-                       help="Model string sent in the /v1/embeddings payload.")
-    model.add_argument("--request-timeout", type=float, default=300.0,
-                       help="Per-request timeout in seconds. Default: 300.")
-    model.add_argument("--max-retries", type=int, default=3,
-                       help="Embedding request retries. Default: 3.")
-    model.add_argument("--batch-size-text", type=int, default=32,
-                       help="Batch size for caption/text embedding requests. Default: 32.")
-    model.add_argument("--batch-size-image", type=int, default=4,
-                       help="Batch size for image embedding requests. Default: 4.")
-    model.add_argument("--query-prompt", default=None,
-                       help="Optional prefix added to every caption before remote embedding.")
-    model.add_argument("--image-prompt", default=None,
-                       help="Optional text included with every image object, e.g. 'Represent this image in embedding space.'.")
-    model.add_argument("--image-transport", choices=["path", "data-url"], default="path",
-                       help="How to send local COCO images to the remote service. Default: path, using absolute paths.")
-    model.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=True,
-                       help="L2-normalize embeddings before dot product. Default: true.")
-    model.add_argument("--cache-npz", type=Path, default=None,
-                       help="Optional .npz path for saving/loading computed embeddings.")
-    model.add_argument("--reuse-cache", action="store_true",
-                       help="If --cache-npz exists, load embeddings from it instead of calling the service.")
+    model.add_argument(
+        "--service-url",
+        default=DEFAULT_SERVICE_URL,
+        help=f"Embedding service base URL. Default: {DEFAULT_SERVICE_URL}.",
+    )
+    model.add_argument(
+        "--model",
+        default="qwen3-vl-embedding-2b",
+        help="Model string sent in the /v1/embeddings payload.",
+    )
+    model.add_argument(
+        "--request-timeout",
+        type=float,
+        default=300.0,
+        help="Per-request timeout in seconds. Default: 300.",
+    )
+    model.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="Embedding request retries. Default: 3.",
+    )
+    model.add_argument(
+        "--batch-size-text",
+        type=int,
+        default=32,
+        help="Batch size for caption/text embedding requests. Default: 32.",
+    )
+    model.add_argument(
+        "--batch-size-image",
+        type=int,
+        default=4,
+        help="Batch size for image embedding requests. Default: 4.",
+    )
+    model.add_argument(
+        "--query-prompt",
+        default=None,
+        help="Optional prefix added to every caption before remote embedding.",
+    )
+    model.add_argument(
+        "--image-prompt",
+        default=None,
+        help="Optional text included with every image object, e.g. 'Represent this image in embedding space.'.",
+    )
+    model.add_argument(
+        "--image-transport",
+        choices=["path", "data-url"],
+        default="path",
+        help="How to send local COCO images to the remote service. Default: path, using absolute paths.",
+    )
+    model.add_argument(
+        "--normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="L2-normalize embeddings before dot product. Default: true.",
+    )
+    model.add_argument(
+        "--cache-npz",
+        type=Path,
+        default=None,
+        help="Optional .npz path for saving/loading computed embeddings.",
+    )
+    model.add_argument(
+        "--reuse-cache",
+        action="store_true",
+        help="If --cache-npz exists, load embeddings from it instead of calling the service.",
+    )
 
     eval_group = parser.add_argument_group("evaluation")
-    eval_group.add_argument("--k", type=int, nargs="+", default=[1, 5, 10],
-                            help="Recall@K values. Default: 1 5 10.")
-    eval_group.add_argument("--score-chunk-size", type=int, default=256,
-                            help="Number of queries per similarity chunk. Lower if memory is tight. Default: 256.")
-    eval_group.add_argument("--output-json", type=Path, default=None,
-                            help="Optional path to write metrics and run metadata as JSON.")
-    eval_group.add_argument("--save-ranks", type=Path, default=None,
-                            help="Optional .npz path to save per-query rank arrays.")
-    eval_group.add_argument("--text-to-image-only", action="store_true",
-                            help="Only run caption -> image retrieval.")
-    eval_group.add_argument("--image-to-text-only", action="store_true",
-                            help="Only run image -> caption retrieval.")
+    eval_group.add_argument(
+        "--k",
+        type=int,
+        nargs="+",
+        default=[1, 5, 10],
+        help="Recall@K values. Default: 1 5 10.",
+    )
+    eval_group.add_argument(
+        "--score-chunk-size",
+        type=int,
+        default=256,
+        help="Number of queries per similarity chunk. Lower if memory is tight. Default: 256.",
+    )
+    eval_group.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Optional path to write metrics and run metadata as JSON.",
+    )
+    eval_group.add_argument(
+        "--save-ranks",
+        type=Path,
+        default=None,
+        help="Optional .npz path to save per-query rank arrays.",
+    )
+    eval_group.add_argument(
+        "--text-to-image-only",
+        action="store_true",
+        help="Only run caption -> image retrieval.",
+    )
+    eval_group.add_argument(
+        "--image-to-text-only",
+        action="store_true",
+        help="Only run image -> caption retrieval.",
+    )
 
     misc = parser.add_argument_group("misc")
-    misc.add_argument("--print-requirements", action="store_true",
-                      help="Print Python packages required for an actual evaluation run and exit.")
-    misc.add_argument("--self-test", action="store_true",
-                      help="Run a tiny metric/response-parser self-test that requires numpy only, then exit.")
+    misc.add_argument(
+        "--print-requirements",
+        action="store_true",
+        help="Print Python packages required for an actual evaluation run and exit.",
+    )
+    misc.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run a tiny metric/response-parser self-test that requires numpy only, then exit.",
+    )
     return parser.parse_args()
 
 
@@ -256,7 +365,9 @@ def download_file(url: str, dst: Path) -> None:
             done += len(chunk)
             now = time.time()
             if total and now - last_report > 2:
-                print(f"  {done / total * 100:5.1f}% ({done / 1e9:.2f}/{total / 1e9:.2f} GB)")
+                print(
+                    f"  {done / total * 100:5.1f}% ({done / 1e9:.2f}/{total / 1e9:.2f} GB)"
+                )
                 last_report = now
     tmp.replace(dst)
 
@@ -293,9 +404,13 @@ def infer_coco_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     annotations = args.annotations
     if args.coco_root is not None:
         images_dir = images_dir or (args.coco_root / args.split)
-        annotations = annotations or (args.coco_root / "annotations" / f"captions_{args.split}.json")
+        annotations = annotations or (
+            args.coco_root / "annotations" / f"captions_{args.split}.json"
+        )
     if images_dir is None or annotations is None:
-        raise SystemExit("Provide either --coco-root or both --images-dir and --annotations.")
+        raise SystemExit(
+            "Provide either --coco-root or both --images-dir and --annotations."
+        )
     return images_dir, annotations
 
 
@@ -325,11 +440,14 @@ def load_coco_eval_data(
         if caption:
             captions_by_image_id.setdefault(image_id, []).append(caption)
 
-    image_ids = [image_id for image_id in images_by_id if image_id in captions_by_image_id]
+    image_ids = [
+        image_id for image_id in images_by_id if image_id in captions_by_image_id
+    ]
     image_ids.sort()
 
     if shuffle:
         import random
+
         rng = random.Random(seed)
         rng.shuffle(image_ids)
     if max_images is not None:
@@ -404,7 +522,9 @@ def image_to_data_url(path: str) -> str:
     return f"data:{mime};base64,{payload}"
 
 
-def make_text_inputs(texts: list[str], *, query_prompt: str | None) -> list[dict[str, str]]:
+def make_text_inputs(
+    texts: list[str], *, query_prompt: str | None
+) -> list[dict[str, str]]:
     if query_prompt:
         return [{"text": f"{query_prompt}\n{text}"} for text in texts]
     return [{"text": text} for text in texts]
@@ -418,7 +538,11 @@ def make_image_inputs(
 ) -> list[dict[str, str]]:
     inputs: list[dict[str, str]] = []
     for path in image_paths:
-        image_value = image_to_data_url(path) if image_transport == "data-url" else str(Path(path).resolve())
+        image_value = (
+            image_to_data_url(path)
+            if image_transport == "data-url"
+            else str(Path(path).resolve())
+        )
         item = {"image": image_value}
         if image_prompt:
             item["text"] = image_prompt
@@ -454,7 +578,9 @@ def encode_remote_batches(
     return out
 
 
-def load_or_compute_embeddings(args: argparse.Namespace, data: CocoEvalData) -> tuple[Any, Any, Any]:
+def load_or_compute_embeddings(
+    args: argparse.Namespace, data: CocoEvalData
+) -> tuple[Any, Any, Any]:
     np, tqdm = require_packages()
     cache = args.cache_npz
     if args.reuse_cache and cache is not None and cache.exists():
@@ -463,8 +589,12 @@ def load_or_compute_embeddings(args: argparse.Namespace, data: CocoEvalData) -> 
         text_embeddings = loaded["text_embeddings"]
         image_embeddings = loaded["image_embeddings"]
         if args.normalize:
-            text_embeddings = l2_normalize(text_embeddings, np).astype("float32", copy=False)
-            image_embeddings = l2_normalize(image_embeddings, np).astype("float32", copy=False)
+            text_embeddings = l2_normalize(text_embeddings, np).astype(
+                "float32", copy=False
+            )
+            image_embeddings = l2_normalize(image_embeddings, np).astype(
+                "float32", copy=False
+            )
         return np, text_embeddings, image_embeddings
 
     print(f"Remote embedding service: {args.service_url}/v1/embeddings")
@@ -477,7 +607,9 @@ def load_or_compute_embeddings(args: argparse.Namespace, data: CocoEvalData) -> 
     )
 
     text_inputs = make_text_inputs(data.captions, query_prompt=args.query_prompt)
-    print(f"Embedding {len(text_inputs)} captions remotely with batch size {args.batch_size_text}")
+    print(
+        f"Embedding {len(text_inputs)} captions remotely with batch size {args.batch_size_text}"
+    )
     text_embeddings = encode_remote_batches(
         client,
         text_inputs,
@@ -515,7 +647,9 @@ def load_or_compute_embeddings(args: argparse.Namespace, data: CocoEvalData) -> 
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
             image_ids=np.array(data.image_ids, dtype=np.int64),
-            caption_to_image_index=np.array(data.caption_to_image_index, dtype=np.int64),
+            caption_to_image_index=np.array(
+                data.caption_to_image_index, dtype=np.int64
+            ),
         )
     return np, text_embeddings, image_embeddings
 
@@ -561,7 +695,9 @@ def image_to_text_ranks(
     tqdm: Any,
 ) -> Any:
     ranks = np.empty(len(image_to_caption_indices), dtype=np.int64)
-    for start in tqdm(range(0, len(image_to_caption_indices), chunk_size), desc="Scoring image->text"):
+    for start in tqdm(
+        range(0, len(image_to_caption_indices), chunk_size), desc="Scoring image->text"
+    ):
         end = min(start + chunk_size, len(image_to_caption_indices))
         scores = image_embeddings[start:end] @ text_embeddings.T
         for row, image_index in enumerate(range(start, end)):
@@ -575,10 +711,17 @@ def run_self_test() -> None:
     try:
         import numpy as np
     except ImportError as exc:
-        raise SystemExit("--self-test requires numpy. Install it with: uv pip install numpy") from exc
+        raise SystemExit(
+            "--self-test requires numpy. Install it with: uv pip install numpy"
+        ) from exc
 
     parsed = parse_embedding_response(
-        {"data": [{"index": 1, "embedding": [0.0, 1.0]}, {"index": 0, "embedding": [1.0, 0.0]}]},
+        {
+            "data": [
+                {"index": 1, "embedding": [0.0, 1.0]},
+                {"index": 0, "embedding": [1.0, 0.0]},
+            ]
+        },
         expected_count=2,
     )
     assert parsed == [[1.0, 0.0], [0.0, 1.0]], parsed
@@ -593,12 +736,20 @@ def run_self_test() -> None:
     caption_to_image_index = [0, 0, 1, 1, 2]
     image_to_caption_indices = [[0, 1], [2, 3], [4]]
     t2i = text_to_image_ranks(
-        text_embeddings, image_embeddings, caption_to_image_index,
-        chunk_size=2, np=np, tqdm=lambda x, **_: x,
+        text_embeddings,
+        image_embeddings,
+        caption_to_image_index,
+        chunk_size=2,
+        np=np,
+        tqdm=lambda x, **_: x,
     )
     i2t = image_to_text_ranks(
-        image_embeddings, text_embeddings, image_to_caption_indices,
-        chunk_size=2, np=np, tqdm=lambda x, **_: x,
+        image_embeddings,
+        text_embeddings,
+        image_to_caption_indices,
+        chunk_size=2,
+        np=np,
+        tqdm=lambda x, **_: x,
     )
     assert t2i.tolist() == [1, 1, 1, 1, 1], t2i.tolist()
     assert i2t.tolist() == [1, 1, 1], i2t.tolist()
@@ -614,7 +765,9 @@ def main() -> int:
         run_self_test()
         return 0
     if args.text_to_image_only and args.image_to_text_only:
-        raise SystemExit("Choose at most one of --text-to-image-only and --image-to-text-only.")
+        raise SystemExit(
+            "Choose at most one of --text-to-image-only and --image-to-text-only."
+        )
     if args.score_chunk_size <= 0:
         raise SystemExit("--score-chunk-size must be positive.")
     if args.max_retries <= 0:
