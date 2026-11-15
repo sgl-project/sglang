@@ -132,58 +132,57 @@ class StateStorage:
         """Gives each request of newly bound ``rows`` its state slot and, with
         the extra buffer, its ping-pong tracking slots, and writes them into
         the table's columns. A request that already holds a slot (a radix hit,
-        a continuing chunk) keeps it."""
-        mamba_indices: list[torch.Tensor] = []
-        mamba_ping_pong_track_buffers: list[torch.Tensor] = []
-        # What this call hands out, given back if a later request finds no slot.
-        given_state: list[Req] = []
-        given_tracking: list[Req] = []
-        # The requests holding no slot (a radix hit or a continuing chunk keeps
-        # its own) take theirs in one allocation.
+        a continuing chunk) keeps it, and one that holds tracking slots keeps
+        those. Every slot taken comes from one allocation, so a shortfall
+        hands out nothing."""
+        assert len(rows) == len(reqs)
+        tracking = table.enable_mamba_extra_buffer
         needing = [req for req in reqs if not req.kv.holds_mamba]
-        if needing:
-            mids = self.slots.alloc(len(needing))
-            if mids is None:
+        untracked = (
+            [req for req in reqs if req.kv.mamba_ping_pong_track_buffer is None]
+            if tracking
+            else []
+        )
+        per_request = table.mamba_initial_tracking_slots if untracked else 0
+        count = len(needing) + per_request * len(untracked)
+        mids = buffers = None
+        if count:
+            slots = self.slots.alloc(count)
+            if slots is None:
                 raise StateSlotsExhausted(
-                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {self.pool.size=}, {self.slots.available_size()=}, {len(needing)=}"
+                    "Not enough space for mamba cache or its ping pong idx, try to "
+                    "increase --mamba-full-memory-ratio or --max-mamba-cache-size. "
+                    f"{self.pool.size=}, {self.slots.available_size()=}, "
+                    f"{len(needing)=}, {len(untracked)=}, {per_request=}"
                 )
+            mids = slots[: len(needing)]
             for req, mid in zip(needing, mids):
                 req.kv.mamba_pool_idx = mid
                 req.kv.mamba_needs_clear = True
-            given_state.extend(needing)
             # A zero write_pos empties the ReplaySSM ring;
             # decode then reads only the checkpoint written by prefill.
-            if self.pool.replayssm_write_pos is not None:
+            if needing and self.pool.replayssm_write_pos is not None:
                 self.pool.replayssm_write_pos.index_fill_(
                     0, self.slots.translate(mids).to(torch.int64), 0
                 )
-        for req in reqs:
-            mamba_indices.append(req.kv.mamba_pool_idx)
-            if table.enable_mamba_extra_buffer:
-                if req.kv.mamba_ping_pong_track_buffer is None:
-                    if not self.alloc_ping_pong_buffer(table, req):
-                        self._give_back(given_state, given_tracking)
-                        raise StateSlotsExhausted(
-                            "Not enough space for mamba ping pong idx, "
-                            "try to increase --mamba-full-memory-ratio."
-                        )
-                    given_tracking.append(req)
-                mamba_ping_pong_track_buffers.append(
-                    req.kv.mamba_ping_pong_track_buffer
+            if untracked:
+                buffers = self._hand_out_tracking(
+                    table, untracked, slots[len(needing) :]
                 )
-        assert len(rows) == len(mamba_indices), (
-            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
-        )
-        if table.enable_mamba_extra_buffer:
-            assert len(rows) == len(mamba_ping_pong_track_buffers), (
-                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-            )
         # Device rows: indexing a device tensor with a Python list syncs the host.
         row_ids = async_h2d(rows, dtype=torch.int64, device=table.device)
-        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
+        mamba_index_tensor = (
+            mids
+            if mids is not None and len(needing) == len(reqs)
+            else torch.stack([req.kv.mamba_pool_idx for req in reqs])
+        ).to(dtype=torch.int32)
         table.req_index_to_mamba_index_mapping[row_ids] = mamba_index_tensor
-        if table.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
+        if tracking:
+            ping_pong_tensor = (
+                buffers
+                if buffers is not None and len(untracked) == len(reqs)
+                else torch.stack([req.kv.mamba_ping_pong_track_buffer for req in reqs])
+            )
             table.req_index_to_mamba_ping_pong_track_buffer_mapping[row_ids] = (
                 ping_pong_tensor
             )
@@ -204,46 +203,36 @@ class StateStorage:
         """Return False if slots are exhausted. Lazy mode starts with one slot
         and a -1 sentinel for the second; normal mode allocates all slots.
         """
-        n = table.mamba_initial_tracking_slots
-        slots = self.slots.alloc(n)
+        slots = self.slots.alloc(table.mamba_initial_tracking_slots)
         if slots is None:
             return False
-        buf = torch.full(
-            (table.mamba_ping_pong_track_buffer_size,),
-            -1,
-            dtype=slots.dtype,
-            device=slots.device,
-        )
-        buf[:n] = slots
-        req.kv.mamba_ping_pong_track_buffer = buf
-        req.kv.mamba_ping_pong_empty = [False] * n + [True] * (
-            table.mamba_ping_pong_track_buffer_size - n
-        )
-        req.kv.mamba_prev_track_seqlen = None
-        req.kv.mamba_next_track_idx = 0
-        req.kv.mamba_last_track_idx = (
+        self._hand_out_tracking(table, [req], slots)
+        return True
+
+    def _hand_out_tracking(
+        self, table, reqs: List[Req], slots: torch.Tensor
+    ) -> torch.Tensor:
+        """Give each of ``reqs`` its ping-pong buffer, the next
+        `mamba_initial_tracking_slots` of ``slots`` in request order, and
+        return the buffers as one ``[len(reqs), buffer_size]`` tensor whose
+        rows the requests hold. Lazy mode leaves the rest of each buffer at
+        the -1 sentinel."""
+        n = table.mamba_initial_tracking_slots
+        size = table.mamba_ping_pong_track_buffer_size
+        buffers = slots.new_full((len(reqs), size), -1)
+        buffers[:, :n] = slots.reshape(len(reqs), n)
+        last_track_idx = (
             0
             if table.enable_mamba_extra_buffer_lazy
             else table.get_mamba_ping_pong_other_idx(0)
         )
-        return True
-
-    def _give_back(self, given_state: List[Req], given_tracking: List[Req]) -> None:
-        """Undo a failed `acquire`: the state and tracking slots it handed out."""
-        for req in given_state:
-            self.slots.free(req.kv.mamba_pool_idx.unsqueeze(0))
-            req.kv.mamba_pool_idx = None
-            req.kv.mamba_needs_clear = False
-        for req in given_tracking:
-            buf = req.kv.mamba_ping_pong_track_buffer
-            for position, empty in enumerate(req.kv.mamba_ping_pong_empty):
-                if not empty:
-                    self.slots.free(buf[position : position + 1])
-            req.kv.mamba_ping_pong_track_buffer = None
-            req.kv.mamba_ping_pong_empty = None
-            req.kv.mamba_next_track_idx = None
-            req.kv.mamba_last_track_idx = None
+        for req, buf in zip(reqs, buffers):
+            req.kv.mamba_ping_pong_track_buffer = buf
+            req.kv.mamba_ping_pong_empty = [False] * n + [True] * (size - n)
             req.kv.mamba_prev_track_seqlen = None
+            req.kv.mamba_next_track_idx = 0
+            req.kv.mamba_last_track_idx = last_track_idx
+        return buffers
 
     def release(
         self,
@@ -252,10 +241,11 @@ class StateStorage:
         mamba_ping_pong_track_buffer_to_keep: Optional[int] = None,
     ) -> None:
         """Gives back the request's state slot and its ping-pong slots, except
-        the one kept for the radix cache."""
+        the one kept for the radix cache. The request drops the slot tensors
+        it frees here, so an open free group holds them without a copy."""
         mamba_index = req.kv.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
-        self.slots.free(mamba_index.unsqueeze(0))
+        self.slots.free(mamba_index.unsqueeze(0), owned=True)
         req.kv.mamba_pool_idx = None
 
         if table.enable_mamba_extra_buffer:
@@ -266,14 +256,13 @@ class StateStorage:
             )
             empty = req.kv.mamba_ping_pong_empty
             positions = [p for p in range(size) if p != keep and not empty[p]]
-            row = table.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                req.kv.req_pool_idx
-            ]
+            # The request's buffer, which its table row mirrors.
+            buffer = req.kv.mamba_ping_pong_track_buffer
             if len(positions) == size:
-                self.slots.free(row)
+                self.slots.free(buffer, owned=True)
             else:
                 for p in positions:
-                    self.slots.free(row[p : p + 1])
+                    self.slots.free(buffer[p : p + 1], owned=True)
             # Clear freed references so the next acquire allocates new slots.
             req.kv.mamba_ping_pong_track_buffer = None
             req.kv.mamba_ping_pong_empty = None

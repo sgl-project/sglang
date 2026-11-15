@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::app::AppState;
+use super::auth::DeclaredRoute;
 use super::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateTerminal,
 };
@@ -489,7 +490,7 @@ impl serde::Serialize for NativeFrame {
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/generate", post(generate))
+        .declared_route("/generate", post(generate))
         .merge(health_routes())
 }
 
@@ -539,8 +540,8 @@ fn health_routes() -> Router<Arc<AppState>> {
     };
     let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout, true));
     Router::new()
-        .route("/health", health)
-        .route("/health_generate", probe)
+        .declared_route("/health", health)
+        .declared_route("/health_generate", probe)
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
