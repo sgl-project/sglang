@@ -3058,6 +3058,7 @@ class Scheduler(
         retirement = window_retirement(
             shares_prefixes=self.tree_cache.supports_prefix_sharing()
         )
+        max_new_tokens_before_kv = max_new_tokens
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
@@ -3076,6 +3077,12 @@ class Scheduler(
                 f"Request prompt exceeds the KV memory budget: input_len={input_len}."
             )
             max_new_tokens = 0
+
+        elif (
+            req.sampling_params.max_new_tokens is not None
+            and max_new_tokens < max_new_tokens_before_kv
+        ):
+            req.kv_cache_limited_output = True
 
         req.sampling_params.max_new_tokens = max(0, max_new_tokens)
         # Clipping above can push max_new_tokens below min_new_tokens, which
