@@ -70,6 +70,14 @@ on:
         description: 'GitHub token for API calls'
         type: string
         default: ${{ github.token }}
+      reply_comment_id:
+        description: '/rerun-test reply comment to mark running when a runner picks the job up; empty skips the mark. Needs issues: write.'
+        type: string
+        default: ''
+      reply_marker:
+        description: "The marker of this run's line in that reply comment."
+        type: string
+        default: ''
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -98,10 +106,36 @@ jobs:
           # Pin to the event SHA (not the branch name) so every job in this run
           # checks out the same commit even if the branch advances mid-run.
           ref: ${{ inputs.ref || github.sha }}
+          # /rerun-test passes a fork's commit as `ref`; the token would stay
+          # in .git/config, readable by its code.
+          persist-credentials: false
 
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      # github.sha is the caller's commit, so this script is not the fork's.
+      - name: Checkout rerun status script
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-ci
+          sparse-checkout: scripts/ci/utils/update_rerun_test_status.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 trusted-ci/scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
 
       - name: Check PR test health
         uses: actions/github-script@v8
