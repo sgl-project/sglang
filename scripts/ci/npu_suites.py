@@ -50,17 +50,23 @@ def load_suites():
                 raise ValueError(
                     f"{name} job `{job_name}`: non-literal suite or runner"
                 )
-            suites[suite] = NpuSuite(
+            entry = NpuSuite(
                 runs_on,
                 inputs.get("sgl_router", False),
                 inputs.get("is_nightly_pipeline_job", False),
             )
+            if suites.setdefault(suite, entry) != entry:
+                raise ValueError(
+                    f"NPU suite `{suite}` runs as {suites[suite]} in one job but "
+                    f"as {entry} in {name} job `{job_name}`"
+                )
     return suites
 
 
 def a3_pr_image():
-    text = (WORKFLOWS_DIR / "pr-test-npu.yml").read_text(encoding="utf-8")
-    return re.search(r'CANN_image_a3=([^"\s]+)', text).group(1)
+    """The CANN image pr-test-npu.yml installs the PR into on a3 runners."""
+    with open(WORKFLOWS_DIR / "pr-test-npu.yml", encoding="utf-8") as f:
+        return yaml.safe_load(f)["env"]["NPU_A3_PR_IMAGE"]
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.modules.setdefault("github", types.SimpleNamespace(Auth=object(), Github=object()))
@@ -32,6 +33,20 @@ class TestNpuSuites(unittest.TestCase):
         # Run by _npu-single-node-test-stage.yml.
         self.assertNotIn("base-c-test-acc-2-npu-a3", suites)
         self.assertRegex(handler._npu_suites.a3_pr_image(), r"^[\w./:-]+-a3-[\w.-]+$")
+
+    def test_one_suite_on_two_runners_is_an_error(self):
+        job = "{{uses: {}, with: {{self_name: s, runner_config: {}}}}}"
+        stage = handler._npu_suites.STAGE
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, runner in zip(handler._npu_suites.WORKFLOWS, ("r1", "r2", "r1")):
+                with open(os.path.join(tmp, name), "w") as f:
+                    f.write(f"jobs:\n  j: {job.format(stage, runner)}\n")
+            load = handler._npu_suites.load_suites
+            load.cache_clear()
+            self.addCleanup(load.cache_clear)
+            with mock.patch.object(handler._npu_suites, "WORKFLOWS_DIR", Path(tmp)):
+                with self.assertRaisesRegex(ValueError, "NPU suite `s`"):
+                    load()
 
 
 class _TempRepo(unittest.TestCase):
