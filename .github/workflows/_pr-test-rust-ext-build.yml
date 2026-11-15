@@ -198,7 +198,10 @@ jobs:
           LIBTORCH="$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"
           export LIBTORCH
           export LD_LIBRARY_PATH="${LIBTORCH}/lib:${LD_LIBRARY_PATH:-}"
-          cargo clean --release --manifest-path rust/sglang-radix-tree/Cargo.toml \
+          # Thin-LTO profile from rust/Cargo.toml; setuptools-rust uses it instead of --release.
+          export SETUPTOOLS_RUST_CARGO_PROFILE=ci
+          cargo clean --profile "${SETUPTOOLS_RUST_CARGO_PROFILE}" \
+              --manifest-path rust/sglang-radix-tree/Cargo.toml \
               -p torch-sys -p sglang-radix-tree 2>/dev/null || true
           (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
           python - <<'PY'
@@ -230,11 +233,13 @@ jobs:
               torch_module=torch,
               include_absolute_rpath=False,
           )
+          profile = os.environ["SETUPTOOLS_RUST_CARGO_PROFILE"]
           subprocess.run(
               [
                   "cargo",
                   "build",
-                  "--release",
+                  "--profile",
+                  profile,
                   "--locked",
                   "--manifest-path",
                   "rust/sglang-radix-tree/Cargo.toml",
@@ -244,10 +249,10 @@ jobs:
               env=build.environment,
               check=True,
           )
-          release_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / "release"
+          profile_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / profile
           if target := os.environ.get("CARGO_BUILD_TARGET"):
-              release_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / target / "release"
-          shutil.copy2(release_dir / "libmem_cache.so", inspection_path)
+              profile_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / target / profile
+          shutil.copy2(profile_dir / "libmem_cache.so", inspection_path)
 
           def load(name, path):
               spec = importlib.util.spec_from_file_location(name, path)
