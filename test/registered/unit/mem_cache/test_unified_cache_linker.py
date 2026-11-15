@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     TransferReady,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
+    _PendingOffload,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_disagg
@@ -80,6 +81,86 @@ from sglang.test.tree_slots import FAMILY_OF, index_slots
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
+
+
+class TestOffloadCompletionQueue(CustomTestCase):
+    def setUp(self):
+        self.events = []
+        cache = SimpleNamespace(
+            window_slots=lambda: (),
+            tree_components=(),
+            components={},
+            _components_tuple=(),
+            tree_core=SimpleNamespace(
+                finish_external_linker_offload=lambda nodes, node, success: (
+                    self.events.append(("finish", nodes, node, success))
+                )
+            ),
+            dec_lock_ref=lambda node, params: self.events.append(
+                ("unlock", node, params)
+            ),
+        )
+        self.wrapper = UnifiedCacheLinkerWrapper(
+            cache, SimpleNamespace(load_mode="layer_wise", pools={})
+        )
+
+    def enqueue(self, node):
+        self.wrapper.pending_offloads.append(
+            _PendingOffload(node, f"lock-{node}", [node])
+        )
+
+    def test_partial_completion_preserves_fifo_and_releases_each_lock(self):
+        for node in range(4):
+            self.enqueue(node)
+        self.wrapper.commit_completed_offloads([True, False])
+        self.assertEqual(
+            [p.lock_node_id for p in self.wrapper.pending_offloads], [2, 3]
+        )
+        self.enqueue(4)
+        self.wrapper.commit_completed_offloads([])
+        self.wrapper.commit_completed_offloads([False, True, True])
+        expected = []
+        for node, success in enumerate([True, False, False, True, True]):
+            expected.extend(
+                [("finish", [node], node, success), ("unlock", node, f"lock-{node}")]
+            )
+        self.assertEqual(self.events, expected)
+        self.assertFalse(self.wrapper.pending_offloads)
+
+    def test_split_updates_non_head_offload_before_completion(self):
+        for node in range(3):
+            self.enqueue(node)
+        self.wrapper.replace_pending_offload_node(1, 1, [10, 1])
+        self.wrapper.replace_pending_offload_node(1, 10, [11, 10])
+        self.wrapper.commit_completed_offloads([True, False])
+        self.assertEqual(
+            self.events,
+            [
+                ("finish", [0], 0, True),
+                ("unlock", 0, "lock-0"),
+                ("finish", [11, 10, 1], 1, False),
+                ("unlock", 1, "lock-1"),
+            ],
+        )
+        self.assertEqual(self.wrapper.pending_offloads[0].lock_node_id, 2)
+
+    def test_clear_after_partial_completion_releases_only_remaining_locks(self):
+        for node in range(3):
+            self.enqueue(node)
+        self.wrapper.commit_completed_offloads([True])
+        self.events.clear()
+        self.wrapper._clear_state()
+        self.wrapper._clear_state()
+        self.assertEqual(
+            self.events,
+            [
+                ("finish", [1], 1, False),
+                ("unlock", 1, "lock-1"),
+                ("finish", [2], 2, False),
+                ("unlock", 2, "lock-2"),
+            ],
+        )
+        self.assertFalse(self.wrapper.pending_offloads)
 
 
 class _FakeLinker(UnifiedCacheLinker):
@@ -1214,7 +1295,7 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
 
         cache.linker.reset()
-        self.assertEqual(cache.linker.pending_offloads, [])
+        self.assertFalse(cache.linker.pending_offloads)
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(pending_node))
         self.assertEqual(
             node_device_lock_ref(cache, pending_node, ComponentType.FULL), 0
@@ -2016,7 +2097,7 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
 
     assert events == ["backend", ("unlock", node.id)]
     assert wrapper.inflight_load_rids == []
-    assert wrapper.pending_offloads == []
+    assert not wrapper.pending_offloads
     assert not node.external_cache_stored
     assert node.write_through_pending_id is None
 
