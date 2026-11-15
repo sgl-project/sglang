@@ -135,49 +135,77 @@ def _solve_ipm_schur(
     aux_r = tl.sum(tl.where(v[None, :] == NV - 1, ar, 0.0), 1)
     expert_base = tl.where(v[None, :] < NV - 2, ae, 0.0)
     rank_base = tl.where(v[None, :] < NV - 2, ar, 0.0)
-    c = tl.where(v == NV - 1, 1000.0, tl.where(v == NV - 2, 1.0, 0.0))
-    x = tl.where(v < NV, 1.0, 0.0)
+    copies = tl.sum(expert_base, 1)
+    uniform_scale = be / tl.maximum(copies, 1.0)
+    uniform = tl.sum(expert_base * uniform_scale[:, None], 0)
+    uniform_load = tl.sum(rank_base * uniform[None, :], 1) - br
+    uniform_max = tl.max(uniform_load, 0)
+    needs_solve = uniform_max > tl.max(-br, 0)
     dmax = 0.0
-    for _ in range(ITERATIONS):
-        x2 = x * x
-        diagonal_e = tl.sum(expert_base * x2[None, :], 1)
-        inv_e = tl.where(diagonal_e > 0.0, 1.0 / tl.maximum(diagonal_e, 1.0e-20), 0.0)
-        cross = tl.dot(
-            expert_base * x2[None, :], tl.trans(rank_base), input_precision="ieee"
-        )
-        diagonal_r = tl.sum(rank_base * x2[None, :], 1)
-        t2 = tl.sum(tl.where(v == NV - 2, x2, 0.0), 0)
-        z2 = tl.sum(tl.where(v == NV - 1, x2, 0.0), 0)
-        beta = z2 / (1.0 + z2 * tl.sum(aux_e * aux_e * inv_e, 0))
-        w = aux_r - tl.sum(cross * (inv_e * aux_e)[:, None], 0)
-        normal = -tl.dot(
-            tl.trans(cross), cross * inv_e[:, None], input_precision="ieee"
-        )
-        normal += t2 + beta * w[:, None] * w[None, :]
-        normal += tl.where(r[:, None] == r[None, :], diagonal_r[:, None], 0.0)
-        real = r < G
-        normal = tl.where(real[:, None] & real[None, :], normal, 0.0)
-        normal += tl.where((r[:, None] == r[None, :]) & ~real[:, None], 1.0, 0.0)
-        rhs = tl.where(real, -t2 + 1000.0 * beta * w, 0.0)
-        for k in range(G):
-            column = tl.sum(tl.where(r[None, :] == k, normal, 0.0), 1)
-            pivot = tl.maximum(tl.sum(tl.where(r == k, column, 0.0), 0), 1.0e-12)
-            row = tl.sum(tl.where(r[:, None] == k, normal, 0.0), 0) / pivot
-            value = tl.sum(tl.where(r == k, rhs, 0.0), 0) / pivot
-            normal = tl.where(
-                r[:, None] == k, row[None, :], normal - column[:, None] * row[None, :]
+    # Single-copy experts cannot move. If their load already matches uniform's
+    # maximum, uniform reaches a lower bound and no LP can improve that maximum.
+    if needs_solve:
+        c = tl.where(v == NV - 1, 1000.0, tl.where(v == NV - 2, 1.0, 0.0))
+        x = tl.where(v < NV, 1.0, 0.0)
+        for _ in range(ITERATIONS):
+            x2 = x * x
+            diagonal_e = tl.sum(expert_base * x2[None, :], 1)
+            inv_e = tl.where(
+                diagonal_e > 0.0, 1.0 / tl.maximum(diagonal_e, 1.0e-20), 0.0
             )
-            rhs = tl.where(r == k, value, rhs - column * value)
-        dual_r = rhs
-        auxiliary_scale = beta * (1000.0 - tl.sum(w * dual_r, 0))
-        dual_e = inv_e * (aux_e * auxiliary_scale - tl.sum(cross * dual_r[None, :], 1))
-        reduced_cost = (
-            c - tl.sum(ae * dual_e[:, None], 0) - tl.sum(ar * dual_r[:, None], 0)
+            cross = tl.dot(
+                expert_base * x2[None, :], tl.trans(rank_base), input_precision="ieee"
+            )
+            diagonal_r = tl.sum(rank_base * x2[None, :], 1)
+            t2 = tl.sum(tl.where(v == NV - 2, x2, 0.0), 0)
+            z2 = tl.sum(tl.where(v == NV - 1, x2, 0.0), 0)
+            beta = z2 / (1.0 + z2 * tl.sum(aux_e * aux_e * inv_e, 0))
+            w = aux_r - tl.sum(cross * (inv_e * aux_e)[:, None], 0)
+            normal = -tl.dot(
+                tl.trans(cross), cross * inv_e[:, None], input_precision="ieee"
+            )
+            normal += t2 + beta * w[:, None] * w[None, :]
+            normal += tl.where(r[:, None] == r[None, :], diagonal_r[:, None], 0.0)
+            real = r < G
+            normal = tl.where(real[:, None] & real[None, :], normal, 0.0)
+            normal += tl.where((r[:, None] == r[None, :]) & ~real[:, None], 1.0, 0.0)
+            rhs = tl.where(real, -t2 + 1000.0 * beta * w, 0.0)
+            for k in range(G):
+                column = tl.sum(tl.where(r[None, :] == k, normal, 0.0), 1)
+                pivot = tl.maximum(tl.sum(tl.where(r == k, column, 0.0), 0), 1.0e-12)
+                row = tl.sum(tl.where(r[:, None] == k, normal, 0.0), 0) / pivot
+                value = tl.sum(tl.where(r == k, rhs, 0.0), 0) / pivot
+                normal = tl.where(
+                    r[:, None] == k,
+                    row[None, :],
+                    normal - column[:, None] * row[None, :],
+                )
+                rhs = tl.where(r == k, value, rhs - column * value)
+            dual_r = rhs
+            auxiliary_scale = beta * (1000.0 - tl.sum(w * dual_r, 0))
+            dual_e = inv_e * (
+                aux_e * auxiliary_scale - tl.sum(cross * dual_r[None, :], 1)
+            )
+            reduced_cost = (
+                c - tl.sum(ae * dual_e[:, None], 0) - tl.sum(ar * dual_r[:, None], 0)
+            )
+            direction = x * reduced_cost
+            dmax = tl.maximum(tl.max(direction, 0), 0.0)
+            alpha = tl.where(dmax > 1.0e-9, 0.999 / dmax, 1.0)
+            x *= 1.0 - alpha * direction
+    else:
+        # Build a feasible LP state for the existing probability validation:
+        # uniform replica masses, unused rank capacity, max load, and zero aux.
+        slack = tl.maximum(uniform_max - uniform_load, 0.0)
+        rank_slack = tl.sum(
+            tl.where(
+                (r[:, None] < G) & (v[None, :] == NV - G - 2 + r[:, None]),
+                slack[:, None],
+                0.0,
+            ),
+            0,
         )
-        direction = x * reduced_cost
-        dmax = tl.maximum(tl.max(direction, 0), 0.0)
-        alpha = tl.where(dmax > 1.0e-9, 0.999 / dmax, 1.0)
-        x *= 1.0 - alpha * direction
+        x = uniform + rank_slack + tl.where(v == NV - 2, uniform_max, 0.0)
     residual = tl.maximum(
         tl.max(tl.abs(tl.sum(ae * x[None, :], 1) - be), 0),
         tl.max(tl.abs(tl.sum(ar * x[None, :], 1) - br), 0),
@@ -190,9 +218,7 @@ def _solve_ipm_schur(
     # LP iterations can satisfy constraints yet balance worse than uniform.
     positive_x = tl.maximum(x, 0.0)
     expert_mass = tl.sum(expert_base * positive_x[None, :], 1)
-    copies = tl.sum(expert_base, 1)
     scale = be / tl.maximum(expert_mass, 1.0e-20)
-    uniform_scale = be / tl.maximum(copies, 1.0)
     candidate = tl.sum(
         expert_base
         * tl.where(
@@ -202,10 +228,8 @@ def _solve_ipm_schur(
         ),
         0,
     )
-    uniform = tl.sum(expert_base * uniform_scale[:, None], 0)
     candidate_load = tl.sum(rank_base * candidate[None, :], 1) - br
-    uniform_load = tl.sum(rank_base * uniform[None, :], 1) - br
-    improvement = tl.max(uniform_load, 0) - tl.max(candidate_load, 0)
+    improvement = tl.where(needs_solve, uniform_max - tl.max(candidate_load, 0), 0.0)
     tl.store(Diagnostics + 3, improvement)
 
 
