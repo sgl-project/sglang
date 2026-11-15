@@ -52,12 +52,39 @@ def get_model_config(
         and "config_groups" in config.quantization_config
     ):
         config_groups = config.quantization_config["config_groups"]
-        # Get group_size from the first group's weights config
         first_group = next(iter(config_groups.values()), {})
         weights_config = first_group.get("weights", {})
         group_size = weights_config.get("group_size")
-        block_shape = [0, group_size]
-        assert len(block_shape) == 2
+        strategy = weights_config.get("strategy")
+        # Legacy compressed-tensors recipes infer the strategy from group_size.
+        if strategy is None:
+            if group_size is None:
+                strategy = "tensor"
+            elif type(group_size) is int and group_size == -1:
+                strategy = "channel"
+            else:
+                strategy = "group"
+        if strategy == "group":
+            if type(group_size) is not int or group_size <= 0:
+                raise ValueError(
+                    "Grouped weights require a positive integer group_size"
+                )
+            block_shape = [0, group_size]
+        elif strategy == "block":
+            block_shape = weights_config.get("block_structure")
+            if (
+                not isinstance(block_shape, (list, tuple))
+                or len(block_shape) != 2
+                or any(type(size) is not int or size <= 0 for size in block_shape)
+            ):
+                raise ValueError(
+                    "Block weights require block_structure with two positive integers"
+                )
+        elif strategy in ("channel", "tensor"):
+            # Channel/tensor weights have no quantization block shape.
+            block_shape = None
+        else:
+            raise ValueError(f"Unsupported weight quantization strategy: {strategy}")
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
         text_config = config.get_text_config()
