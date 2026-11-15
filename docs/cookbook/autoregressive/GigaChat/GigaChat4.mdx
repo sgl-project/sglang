@@ -1,0 +1,43 @@
+---
+title: GigaChat 4
+description: "Deploy GigaChat 4 with SGLang — the 708B-A41B Mixture-of-Experts model combining sparse and linear attention. Deployment recipes and OpenAI-compatible API examples cover instant and reasoning modes, tool calling, and multi-turn conversations."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all installation methods and hardware platforms, see the [SGLang installation guide](/docs/get-started/install).
+
+GigaChat 4 support is introduced in [PR #50613](https://github.com/sgl-project/sglang/pull/50613). Until it is merged and included in a release, install the PR branch from source:
+
+```bash Command
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git fetch origin pull/50613/head:gigachat4
+git checkout gigachat4
+pip install --upgrade pip
+pip install -e python
+```
+
+The command panel shows the Python run mode. For Docker, use an image built from a checkout containing GigaChat 4 support, then run the generated command inside the container. See [installation with Docker](/docs/get-started/install#method-3-using-docker).
+
+</Accordion>
+
+GigaChat 4 supports both **instant** and **reasoning** modes within a single checkpoint. Pick your hardware and serving strategy to generate the launch command:
+
+- **Low-Latency** — enables speculative decoding with the model’s built-in Multi-Token Prediction (MTP) layer to reduce time between output tokens. Start here for chat and agent loops.
+- **High-Throughput** — target-only inference, with speculative decoding off. Use it as your baseline when tuning concurrency.
+- **DFlash2** — a separate BF16 draft with a learned path selector. Set **DFlash2 draft path** in the command placeholders to a draft trained for the same target checkpoint.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/ai-sage/gigachat4.jsx";
+
+<Deployment config={config} />
+
+<Note>
+The H100 recipes use two nodes with eight H100 80 GB GPUs each and tensor parallelism across all 16 GPUs (TP16). Run the generated command on both nodes, with rank 0 on the head node and rank 1 on the worker. Send API requests to the head node. The single-node H200 recipes use eight H200 141 GB GPUs and TP8; they have not been validated.
+</Note>

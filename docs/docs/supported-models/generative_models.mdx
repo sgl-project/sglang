@@ -323,5 +323,10 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ai-sage/GigaChat3.5-432B-A28B</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GigaChat's hybrid MoE model: per-layer mix of DeepSeek-style MLA full attention and Qwen3 Gated-Delta-Net (GDN) linear attention, DeepSeek-style routed + shared experts, and multiple multi-token-prediction (MTP) heads for speculative decoding. Emits tool calls in GCML format.</td>
     </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>GigaChat 4</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ai-sage/GigaChat4-708B-A41B</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GigaChat's hybrid MoE model: per-layer mix of MLA with DeepSeek Sparse Attention (DSA) and Qwen3 Gated-Delta-Net (GDN) linear attention, DeepSeek-style routed + shared experts, multi-token prediction (MTP) and DFlash2 for speculative decoding. Supports per-request reasoning and emits tool calls in GCML format.</td>
+    </tr>
 </tbody>
 </table>
