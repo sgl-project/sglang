@@ -65,7 +65,8 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
     for turn in merge_turns(turns)? {
         match turn.role {
             "user" => convert_user(&turn.blocks, turn.at, &mut messages)?,
-            _ => convert_assistant(&turn.blocks, turn.at, &mut messages)?,
+            "assistant" => convert_assistant(&turn.blocks, turn.at, &mut messages)?,
+            _ => convert_system(&turn.blocks, turn.at, &mut messages)?,
         }
     }
     // A final assistant turn is a prefill the reply continues.
@@ -256,10 +257,10 @@ fn merge_turns(turns: &[Value]) -> Result<Vec<Turn<'_>>, String> {
     let mut out: Vec<Turn> = Vec::new();
     for (i, turn) in turns.iter().enumerate() {
         let role = match turn.get("role").and_then(Value::as_str) {
-            Some(r @ ("user" | "assistant")) => r,
+            Some(r @ ("user" | "assistant" | "system")) => r,
             Some(other) => {
                 return Err(format!(
-                    "messages.{i}.role: expected user or assistant, got `{other}`"
+                    "messages.{i}.role: expected user, assistant or system, got `{other}`"
                 ))
             }
             None => return Err(format!("messages.{i}.role: field required")),
@@ -426,6 +427,26 @@ fn convert_assistant(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> R
         m.insert("tool_calls".into(), Value::Array(tool_calls));
     }
     messages.push(Value::Object(m));
+    Ok(())
+}
+
+/// Inline system turns (e.g. Claude Code's env blocks and `<total_tokens>`
+/// reminders) are emitted in place as chat `system` messages: the router
+/// cannot see the chat template, so it cannot fold them into the leading
+/// system block the way the engine does.
+fn convert_system(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> Result<(), String> {
+    let mut texts: Vec<&str> = Vec::new();
+    for (j, block) in blocks.iter().enumerate() {
+        match block.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text" => texts.push(block.get("text").and_then(Value::as_str).unwrap_or("")),
+            other => {
+                return Err(format!(
+                    "messages.{i}.content.{j}.type: `{other}` is not supported in a system turn"
+                ))
+            }
+        }
+    }
+    messages.push(json!({"role": "system", "content": texts.join("\n")}));
     Ok(())
 }
 
@@ -966,11 +987,66 @@ mod tests {
     }
 
     #[test]
+    fn inline_system_messages_are_accepted() {
+        // #50348: Claude Code sends inline system turns (env blocks,
+        // `<total_tokens>` reminders); the router must not 400 on them.
+        let c = chat(req(json!([
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [{"type": "text", "text": "env"}]},
+            {"role": "user", "content": "go"},
+        ])));
+        assert_eq!(
+            c["messages"],
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "env"},
+                {"role": "user", "content": "go"},
+            ])
+        );
+        // Consecutive system turns merge, like any other role.
+        let c = chat(req(json!([
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": [{"type": "text", "text": "b"}]},
+            {"role": "user", "content": "q"},
+        ])));
+        assert_eq!(
+            c["messages"],
+            json!([
+                {"role": "system", "content": "a\nb"},
+                {"role": "user", "content": "q"},
+            ])
+        );
+        // A system turn after the leading `system` field is kept in place.
+        let mut r = req(json!([
+            {"role": "user", "content": "q"},
+            {"role": "system", "content": "reminder"},
+        ]));
+        r["system"] = json!("be brief");
+        assert_eq!(
+            chat(r)["messages"],
+            json!([
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "q"},
+                {"role": "system", "content": "reminder"},
+            ])
+        );
+        // Non-text blocks are still rejected in a system turn.
+        let err = to_chat(
+            req(json!([{"role": "user", "content": "q"},
+                       {"role": "system", "content": [
+                           {"type": "image", "source": {"type": "url", "url": "https://x/a.png"}}]}])),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not supported in a system turn"), "{err}");
+    }
+
+    #[test]
     fn rejects_inputs_outside_the_spec() {
         for (messages, needle) in [
             (
-                json!([{"role": "system", "content": "s"}]),
-                "expected user or assistant",
+                json!([{"role": "developer", "content": "s"}]),
+                "expected user, assistant or system",
             ),
             (
                 json!([{"role": "user", "content": []}]),
