@@ -504,9 +504,13 @@ ARG MORI_COMMIT="f39fa765e897c95995957d0518908cc982a88fc2"
 # Enabled by default; disable with --build-arg ENABLE_NIXL=0.
 ARG ENABLE_NIXL=1
 ARG UCX_REPO="https://github.com/openucx/ucx.git"
-ARG UCX_BRANCH="v1.19.x"
+# UCX master: ROCm PD needs openucx/ucx#12150, #12178 and #12228, none in a UCX release yet.
+ARG UCX_COMMIT="929abbbae5f925189282c9147949e6bb77c02914"
+# Optional: build this UCX branch or tag instead of UCX_COMMIT.
+ARG UCX_BRANCH=""
 ARG NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
-ARG NIXL_COMMIT="c28061f9782e099f975bcc79198b7b5a1a36cc40"
+# NIXL main: needs ai-dynamo/nixl#2371 (ROCM_IPC_MIN_ZCOPY=0, XGMI for GPU RMA); not in v1.5.2.
+ARG NIXL_COMMIT="c656976fcd6d3b10e34ecae01bfbc399b275f574"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5-a-38
@@ -763,7 +767,7 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
 ARG BUILD_TYPE=all
 
 # Set version for setuptools_scm if provided (for nightly builds). Only pass in the SGLang
-# pip install RUN so it does not affect AITER, sgl-model-gateway, TileLang, FHT, MORI, etc.
+# pip install RUN so it does not affect AITER, sgl-router, TileLang, FHT, MORI, etc.
 ARG SETUPTOOLS_SCM_PRETEND_VERSION
 
 RUN pip install IPython \
@@ -772,8 +776,9 @@ RUN pip install IPython \
     && pip install pybind11
 
 # Rust toolchain — needed by setuptools-rust to build the sglang-mm extension
-# (sglang.srt.rust_extensions._multimodal) during the sglang pip install below
-# and later by sgl-model-gateway. Must precede the sglang install.
+# (sglang.srt.rust_extensions._multimodal) during the sglang pip install below,
+# and by CI jobs that reinstall sglang or build sgl-router from their checkout.
+# Must precede the sglang install.
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-delay 3 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version
@@ -863,17 +868,14 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
-# Rust toolchain already installed above (before the sglang install).
-
-# Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir "maturin<1.14" \
-    && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
-           /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
-    && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
-    && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
-    && python3 -m pip install --force-reinstall dist/*.whl \
-    && rm -rf /root/.cache
+# sgl-router, the PD router. Built at the toolchain sgl-router pins, which is
+# removed with the target and the crate cache; the default toolchain above stays.
+RUN cd /sgl-workspace/sglang/sgl-router \
+    && rustup toolchain install \
+    && CARGO_TARGET_DIR=/tmp/sgl-router-target cargo build --locked --release --bin sgl-router \
+    && install -m 0755 /tmp/sgl-router-target/release/sgl-router /usr/local/bin/sgl-router \
+    && rustup toolchain uninstall "$(rustup show active-toolchain | cut -d' ' -f1)" \
+    && rm -rf /tmp/sgl-router-target /root/.cargo/registry /root/.cargo/git
 
 # -----------------------
 # TileLang
@@ -1119,7 +1121,12 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     case "${GPU_ARCH}" in *-rocm724|*-rocm1000) apt-get remove -y libabsl-dev ;; esac; \
   fi; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
-  git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
+  if [ -n "${UCX_BRANCH}" ]; then \
+    git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
+  else \
+    git clone "${UCX_REPO}" /sgl-workspace/ucx; \
+    git -C /sgl-workspace/ucx checkout -f "${UCX_COMMIT}"; \
+  fi; \
   cd /sgl-workspace/ucx && ./autogen.sh && mkdir build && cd build && \
   ../configure --prefix=/opt/ucx --enable-shared --disable-static --disable-doxygen-doc \
       --enable-optimizations --enable-devel-headers \

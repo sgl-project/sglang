@@ -61,6 +61,11 @@ class BaseGrammarObject:
         self.grammar_stats = None
         self.current_token = None
 
+    def __repr__(self):
+        # Req.__repr__ prints the grammar, and rank consensus checks compare
+        # those reprs across ranks; the default repr carries a per-process address.
+        return f"{type(self).__name__}()"
+
     def maybe_init_reasoning(self, reasoning: bool):
         pass
 
@@ -115,34 +120,6 @@ class BaseGrammarObject:
     @finished.setter
     def finished(self, finished):
         self._finished = finished
-
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        """
-        Try to jump forward in the grammar.
-
-        Returns:
-            A jump forward helper which may be used in `jump_forward_str_state`.
-            None if the jump forward is not possible.
-        """
-        raise NotImplementedError()
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        """
-        Jump forward for the grammar.
-
-        Returns:
-            A tuple of the jump forward string and the next state of the grammar
-            (which can be used in `jump_and_retokenize` if needed).
-        """
-        raise NotImplementedError()
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ) -> None:
-        """
-        Jump forward occurs, and update the grammar state if needed.
-        """
-        raise NotImplementedError()
 
 
 class GrammarMask(NamedTuple):
@@ -349,19 +326,6 @@ def register_vocab_mask_buffer(
 
     buffers[name] = vocab_mask
     return vocab_mask
-
-
-def get_vocab_mask_buffer(name: str, rows: int) -> Optional[torch.Tensor]:
-    """Return the active rows of a registered mask buffer, if available."""
-    vocab_mask = get_resources().buffers.get(name)
-    if vocab_mask is None:
-        return None
-    if rows > vocab_mask.shape[0]:
-        raise ValueError(
-            f"Grammar batch needs {rows} mask rows, exceeding initialized "
-            f"capacity {vocab_mask.shape[0]} for {name!r}"
-        )
-    return vocab_mask[:rows]
 
 
 def register_grammar_backend(name, init_func):
