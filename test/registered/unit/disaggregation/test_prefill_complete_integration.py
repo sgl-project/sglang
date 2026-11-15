@@ -108,6 +108,7 @@ class TestAllocationIntegration(CustomTestCase):
     def manager(self, ip, port):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
         mgr.local_ip, mgr.rank_port = ip, port
         mgr.kv_args = SimpleNamespace(aux_data_ptrs=[], aux_item_lens=[])
         mgr.request_status = {}
@@ -398,7 +399,6 @@ class TestAllocationIntegration(CustomTestCase):
             with get_context().override_server_args(
                 disaggregation_decode_allocation_policy="early"
             ):
-                scheduler.waiting_queue._drop_all()
                 move([req], launched)
                 SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
                     scheduler, req
@@ -482,6 +482,8 @@ class TestAllocationIntegration(CustomTestCase):
                             owner_list=None,
                             finished_reason=None,
                             to_finish=None,
+                            prefix_len=0,
+                            extend_end=64,
                             inflight_steps=inflight_steps,
                         )
                         scheduler = _ChunkedSlot(
@@ -521,6 +523,28 @@ class TestAllocationIntegration(CustomTestCase):
                             self.assertEqual(list(launched), [req])
                     finally:
                         override.restore()
+
+    def test_parked_chunk_is_neither_checkpointed_nor_sent(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                # add_chunked_req parked it: extend_end stayed at prefix_len.
+                req = Mock(prefix_len=64, extend_end=64, tmp_end_idx=None)
+                scheduler = SimpleNamespace(
+                    chunked_req=req,
+                    enable_overlap=overlap,
+                    check_bootstrap=Mock(return_value=True),
+                    checkpoint_disagg_prefill=Mock(),
+                    send_kv_chunk=Mock(),
+                )
+                running = SimpleNamespace(batch_is_full=True)
+                SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+                    scheduler, None, running
+                )
+                scheduler.checkpoint_disagg_prefill.assert_not_called()
+                scheduler.send_kv_chunk.assert_not_called()
+                self.assertIsNone(req.tmp_end_idx)
+                self.assertIs(scheduler.chunked_req, req)
+                self.assertFalse(running.batch_is_full)
 
     def test_yielded_request_requeues_after_its_chunk_once_bootstrap_completes(self):
         # The yield is decided before its chunk in flight is processed; a bootstrap
@@ -625,11 +649,11 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler = self.inflight_scheduler(reqs)
         pool = scheduler.req_to_token_pool = ReqToTokenPool(2, 2, "cpu", False)
         pool.alloc(reqs)
-        scheduler.waiting_queue = []
+        waiting = scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        # The requeue moves the request out of the transfer queue.
+        # The requeue frees the request's slot and moves it to the waiting queue.
         scheduler.optimistic_release_and_requeue = Mock(
-            side_effect=lambda req: (pool.free(req), req.owner_list._leave([req]))
+            side_effect=lambda req: (pool.free(req), move([req], waiting, at=0))
         )
         with get_context().override_server_args(
             disaggregation_decode_allocation_policy="early"
@@ -637,7 +661,7 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler.process_disagg_prefill_transfer_queue()
             self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), reqs)
 
-            scheduler.waiting_queue.append(object())
+            move([FakeReq(rid="waiting")], waiting)
             scheduler.process_disagg_prefill_transfer_queue()
             self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), reqs[1:])
             self.assertEqual(pool.available_size(), 1)

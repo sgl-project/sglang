@@ -774,7 +774,7 @@ fn one_way_control_bypasses_request_ring_capacity() {
 #[test]
 fn oversized_rid_is_rejected() {
     let mut req = generate_req(51, SamplingParams::default());
-    req.rid = "x".repeat(MAX_RID_LEN + 1).into();
+    req.rid = Rid::from_client(&"x".repeat(MAX_RID_LEN + 1));
     let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
     assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("over the"), "{err}");
@@ -783,6 +783,47 @@ fn oversized_rid_is_rejected() {
     let mut req = generate_req(52, SamplingParams::default());
     req.rid = "0123456789abcdef0123456789abcdef".into();
     assert!(validate(&mut req, &test_limits()).is_ok());
+}
+
+#[test]
+fn namespaced_rids_are_accepted_without_rewriting() {
+    for byte_len in [32, 128, 129, 200, MAX_RID_LEN] {
+        let public_id = format!("caller_namespace_{}", "x".repeat(byte_len - 17));
+        assert_eq!(public_id.len(), byte_len);
+        let mut req = generate_req(53, SamplingParams::default());
+        req.rid = Rid::from_client(&public_id);
+        assert!(validate(&mut req, &test_limits()).is_ok(), "{byte_len}");
+        assert_eq!(req.rid.client_facing(), public_id);
+    }
+}
+
+#[test]
+fn rid_limit_counts_client_utf8_bytes_not_private_suffix() {
+    let public_id = "é".repeat(MAX_RID_LEN / 2);
+    let mut req = generate_req(54, SamplingParams::default());
+    req.rid = Rid::from_client(&public_id);
+    assert!(req.rid.len() > MAX_RID_LEN);
+    assert!(validate(&mut req, &test_limits()).is_ok());
+    assert_eq!(req.rid.client_facing(), public_id);
+
+    let oversized = format!("{public_id}x");
+    req.rid = Rid::from_client(&oversized);
+    let error = validate(&mut req, &test_limits()).expect_err("one extra byte exceeds the cap");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("rid is {} bytes", MAX_RID_LEN + 1))
+    );
+}
+
+#[test]
+fn oversized_client_rid_never_registers_or_reaches_scheduler() {
+    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let mut req = generate_req(55, SamplingParams::default());
+    req.rid = Rid::from_client(&"x".repeat(MAX_RID_LEN + 1));
+    intake.drive(req);
+    assert!(detok_rx.try_recv().is_err());
+    assert!(consumer.drain(8).is_empty());
 }
 
 /// A request rejected BEFORE `register_detok` must not send `Deregister`: the
@@ -863,6 +904,49 @@ fn out_of_vocab_input_ids_rejected() {
         Err(_) => {}
         Ok(DetokMsg::Deregister { .. }) => {}
         Ok(_) => panic!("out-of-vocab request must not be admitted"),
+    }
+}
+
+/// A request refused as the client's fault logs why once, with its rid, as
+/// Python's `[http_server] Error:` line does, and the client reads the bare
+/// message, as Python's `ValueError` text: an intake check, and media the MM
+/// pool refused (which hands the request back failed, unlogged).
+#[test]
+fn client_rejection_logs_its_reason_and_answers_unprefixed() {
+    let (mut intake, _detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
+    let mut out_of_vocab = generate_req(23, SamplingParams::default());
+    if let RequestKind::Generate(g) = &mut out_of_vocab.kind {
+        g.input_ids = Some(vec![2_000_000_000]);
+    }
+    let mut refused_media = generate_req(24, SamplingParams::default());
+    refused_media.state =
+        RequestState::Failed(Error::Encode(MediaError::Client("bad media".into())));
+    for (mut req, rid, reason) in [
+        (
+            out_of_vocab,
+            "rid=23",
+            "input_ids contains out-of-vocabulary",
+        ),
+        (refused_media, "rid=24", "bad media"),
+    ] {
+        let (tx, mut rx) = mpsc::channel(8);
+        req.sink = ResponseSink::Local(tx);
+        let logs = crate::utils::logging::capture_logs();
+        intake.drive(req);
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+            panic!("the client must get the rejection");
+        };
+        let message = err.client_fault_reason().expect("the client's fault");
+        assert!(message.starts_with(reason), "{message}");
+        let rejections = logs.rejections();
+        assert!(
+            matches!(
+                rejections.as_slice(),
+                [line] if line.contains("WARN") && line.contains(rid)
+                    && line.ends_with(&format!("error={message}"))
+            ),
+            "{rejections:?}"
+        );
     }
 }
 
@@ -1015,6 +1099,79 @@ fn tokenize_pool_gone_deregisters() {
         "pool-gone hand-off must deregister rid 21",
     );
     assert!(detok_rx.try_recv().is_err(), "no further shard messages");
+}
+
+/// A full tokenizer pool queue rejects instead of parking intake, as a full
+/// mm pool does: a text generate request (registered, so deregistered) and a
+/// `Tokenize` request (never registered) both fail with `QueueFull`.
+#[test]
+fn full_tokenizer_pool_rejects_without_blocking_intake() {
+    let (tok_tx, tok_rx) = flume::bounded(1);
+    tok_tx
+        .send(generate_req(1, SamplingParams::default()))
+        .unwrap();
+    let (detok_tx, detok_rx) = flume::unbounded();
+    let (to_scheduler_tx, consumer) = to_scheduler(16);
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let mut intake = Intake::new(
+        flume::unbounded().1,
+        flume::unbounded().1,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: tok_tx,
+            detokenizer_tx: vec![detok_tx],
+        },
+        to_scheduler_tx,
+        test_limits(),
+        test_mm(flume::unbounded().0, true),
+        sd_rx,
+    );
+    let (generate_tx, mut generate_rx) = mpsc::channel(8);
+    let mut generate = generate_req(2, SamplingParams::default());
+    generate.sink = ResponseSink::Local(generate_tx);
+    if let RequestKind::Generate(g) = &mut generate.kind {
+        g.input_ids = None;
+        g.text = Some("hi".into());
+    }
+    let (tokenize_tx, mut tokenize_rx) = mpsc::channel(8);
+    let tokenize = Request {
+        rid: "3".into(),
+        state: RequestState::Received,
+        sink: ResponseSink::Local(tokenize_tx),
+        kind: RequestKind::Tokenize(TokenizeInput::Text {
+            text: "hi".into(),
+            add_special_tokens: false,
+        }),
+    };
+    // On its own thread, so a blocking hand-off fails the test, not hangs it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        intake.drive(generate);
+        intake.drive(tokenize);
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("intake must not wait on a full tokenizer pool");
+
+    for rx in [&mut generate_rx, &mut tokenize_rx] {
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+            panic!("expected a terminal error frame");
+        };
+        assert!(matches!(err, Error::QueueFull), "{err}");
+    }
+    assert!(
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "2")
+    );
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "2"));
+    assert!(
+        detok_rx.try_recv().is_err(),
+        "the tokenize request was never registered"
+    );
+    assert_eq!(tok_rx.len(), 1, "only the filler reached the pool");
+    assert!(consumer.drain(16).is_empty(), "nothing queued");
 }
 
 /// The mm pool gone (receiver dropped) hands the request back: rejected with
@@ -1170,6 +1327,37 @@ fn abort_while_in_mm_pool_drops_on_return() {
     );
     assert!(rx.try_recv().is_err(), "no frame for a client that left");
     assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
+}
+
+/// A request whose client left while it was in the mm pool, and whose media
+/// then failed as the server's fault, is dropped on return without a log line:
+/// the client's abort is not a server failure (the worker logs nothing either).
+#[test]
+fn abort_while_in_mm_pool_then_server_fault_is_not_logged() {
+    let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = mm_pretokenized_req("mm-left");
+    req.sink = ResponseSink::Local(tx);
+    intake.drive(req);
+    let mut req = mm_rx.try_recv().expect("sent to the mm pool");
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    intake.on_abort(AbortSource::Guard("mm-left".to_string().into()));
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Deregister { .. })
+    ));
+
+    req.state
+        .apply(Event::Error(Error::Encode(MediaError::Server(
+            "video decode: out of memory".into(),
+        ))))
+        .unwrap();
+    let logs = crate::utils::logging::capture_logs();
+    intake.drive(req);
+    assert_eq!(logs.text(), "");
+    assert!(rx.try_recv().is_err(), "no frame for a client that left");
+    assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
+    assert!(consumer.drain(16).is_empty());
 }
 
 /// The same for the tokenizer stage: an abort while the request is in the

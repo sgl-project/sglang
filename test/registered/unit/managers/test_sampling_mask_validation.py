@@ -114,6 +114,30 @@ class TestSamplingMaskValidation(CustomTestCase):
         req = GenerateReqInput(text="x", sampling_params={}, token_indices_to_pool=[0])
         self.manager._validate_one_request(req, None)
 
+    def test_logprob_start_len_must_be_at_least_minus_one(self):
+        for logprob_start_len, return_logprob, accepted in (
+            (None, True, True),
+            (-1, True, True),
+            (0, True, True),
+            (2, True, True),
+            (-2, True, False),
+            (-5, True, False),
+            ([0], True, False),
+            (-5, False, True),
+        ):
+            with self.subTest(logprob_start_len=logprob_start_len, rl=return_logprob):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params={},
+                    return_logprob=return_logprob,
+                    logprob_start_len=logprob_start_len,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "logprob_start_len"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
     def test_mixed_batch_forwards_zero_count_for_logprob_disabled_items(self):
         """Disabled items must not contribute their raw count to a shared topk.
 
