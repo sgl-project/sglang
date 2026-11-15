@@ -115,6 +115,35 @@ class VAEProcessor:
                 pixel_norm_type, inplace=True
             )
         self.use_3d_conv = use_3d_conv
+        self._normalize_constants = {}
+
+    def _normalize(self, transform, tensor):
+        """``transform(tensor)`` with a ``Normalize``'s mean/std built on the device
+        once: torchvision rebuilds them from Python floats and checks ``std`` on
+        the host per call, blocking the host until the device queue drains."""
+        if not (
+            isinstance(transform, Normalize)
+            and tensor.is_floating_point()
+            and tensor.ndim >= 3
+        ):
+            return transform(tensor)
+        key = (transform, tensor.device, tensor.dtype)
+        constants = self._normalize_constants.get(key)
+        if constants is None:
+            mean, std = (
+                torch.as_tensor(v, dtype=tensor.dtype, device=tensor.device)
+                for v in (transform.mean, transform.std)
+            )
+            if (std == 0).any():
+                raise ValueError(f"std contains a zero: {transform.std}")
+            constants = tuple(
+                v.view(-1, 1, 1) if v.ndim == 1 else v for v in (mean, std)
+            )
+            self._normalize_constants[key] = constants
+        mean, std = constants
+        if not transform.inplace:
+            tensor = tensor.clone()
+        return tensor.sub_(mean).div_(std)
 
     def _ensure_list(self, data):
         return data if isinstance(data, list) else [data]
@@ -273,7 +302,7 @@ class VAEProcessor:
             if runtime_owned and self._runtime_owned_transform is not None
             else self.transform
         )
-        tensor = transform(tensor)
+        tensor = self._normalize(transform, tensor)
 
         if B is not None and T is not None:
             tensor = rearrange(tensor, "(b t) c h w -> b c t h w", b=B, t=T)
@@ -326,7 +355,7 @@ class VAEProcessor:
             if runtime_owned and self.transform_rev_inplace is not None
             else self.transform_rev
         )
-        tensor_rev = transform_rev(tensor).clamp_(0, 1)
+        tensor_rev = self._normalize(transform_rev, tensor).clamp_(0, 1)
         if B is not None:
             tensor_rev = rearrange(tensor_rev, "(b t) c h w -> b c t h w", b=B, t=T)
         return tensor_rev.contiguous()
