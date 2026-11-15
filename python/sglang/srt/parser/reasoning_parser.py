@@ -412,6 +412,47 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
+class GigaChat4Detector(BaseReasoningFormatDetector):
+    """Split the template-prefilled think block according to the request's mode."""
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="reasoning",
+            force_nonempty_content=force_nonempty_content,
+        )
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        if not self._in_reasoning:
+            return StreamingParseResult(normal_text=text)
+        return super()._detect_and_parse_impl(text)
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        # The template prefills the think block; answer text cannot reopen it.
+        if not self._in_reasoning:
+            return StreamingParseResult(normal_text=new_text)
+        pending = self._buffer + new_text
+        if not (
+            pending.startswith(self.think_start_token)
+            or self.think_start_token.startswith(pending)
+        ):
+            self.stripped_think_start = True
+        return super()._parse_streaming_increment_impl(new_text)
+
+
 class IQuestQ1ReasoningDetector(BaseReasoningFormatDetector):
     @staticmethod
     def thinking_enabled(chat_kwargs):
@@ -2390,6 +2431,7 @@ class ReasoningParser:
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
         "gigachat35": DeepSeekR1Detector,
+        "gigachat4": GigaChat4Detector,
         "inkling": InklingDetector,
         "iquest_q1": IQuestQ1ReasoningDetector,
         "flint": _FlintDetector,

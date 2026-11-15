@@ -49,6 +49,7 @@ TOOL_CALL_PARSER_NAMES = [
     "hunyuan",
     "gigachat3",
     "gigachat35",
+    "gigachat4",
     "gemma4",
     "inkling",
     "iquest_q1",
