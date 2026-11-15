@@ -5,6 +5,10 @@ from typing import Optional
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
+from sglang.srt.configs.linear_attn_model_registry import (
+    LinearAttnModelSpec,
+    register_linear_attn_model,
+)
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateShape,
@@ -232,11 +236,6 @@ class GigaChat35Config(PretrainedConfig):
             dtype=mamba2_state_dtype(self),
         )
 
-
-from sglang.srt.configs.linear_attn_model_registry import (  # noqa: E402
-    LinearAttnModelSpec,
-    register_linear_attn_model,
-)
 
 register_linear_attn_model(
     LinearAttnModelSpec(

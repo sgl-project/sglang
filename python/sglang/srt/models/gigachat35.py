@@ -41,6 +41,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator
 
@@ -50,7 +51,7 @@ _GATED_NORM_LOW_RANK = 16
 class GigaChat35GatedRMSNorm(nn.Module):
     """RMSNorm (optionally zero-centered) followed by a low-rank sigmoid gate.
 
-    ``scale`` folds the optional MLA ``alpha`` factor into the q/kv a-norms.
+    ``scale`` applies the optional MLA ``alpha`` factor after the gated norm.
     Supports the fused residual-add convention used by sglang decoder layers:
     ``forward(x, residual)`` returns ``(normed, residual + x)``.
     """
@@ -116,10 +117,21 @@ def build_norm(
     """Construct the configured norm for a GigaChat 3.5 module."""
     norm_type = getattr(config, "norm_type", "LlamaRMSNorm")
     eps = config.rms_norm_eps
-    if norm_type == "LlamaRMSNorm":
-        return RMSNorm(hidden_size, eps=eps)
-    if norm_type == "ZeroCenteredRMSNorm":
-        return GemmaRMSNorm(hidden_size, eps=eps)
+    if norm_type in ("LlamaRMSNorm", "ZeroCenteredRMSNorm"):
+        norm = (
+            RMSNorm(hidden_size, eps=eps)
+            if norm_type == "LlamaRMSNorm"
+            else GemmaRMSNorm(hidden_size, eps=eps)
+        )
+        if scale != 1.0:
+
+            def _scale_output(module, args, output):
+                if isinstance(output, tuple):
+                    return output[0] * scale, output[1]
+                return output * scale
+
+            norm.register_forward_hook(_scale_output)
+        return norm
     if norm_type in ("ZeroCenteredGatedNorm", "GatedNorm"):
         return GigaChat35GatedRMSNorm(
             hidden_size,
@@ -181,19 +193,17 @@ class GigaChat35MlpPrepNorm(nn.Module):
         return self.pre_layernorm(merged), merged
 
 
-_GIGACHAT_WEIGHT_NAME_REMAP = (
-    (".gate_up_projection.", ".gate_up_lowrank."),
-    (".gate_down_projection.", ".gate_down_lowrank."),
-    (".self_attn.gate_proj.", ".self_attn.attn_gate."),
+_GIGACHAT_WEIGHT_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "gate_up_projection": "gate_up_lowrank",
+        "gate_down_projection": "gate_down_lowrank",
+        "self_attn.gate_proj": "self_attn.attn_gate",
+    }
 )
 
 
 def _remap_gigachat_weight_names(weights):
-    for name, loaded_weight in weights:
-        for src, dst in _GIGACHAT_WEIGHT_NAME_REMAP:
-            if src in name:
-                name = name.replace(src, dst)
-        yield name, loaded_weight
+    return _GIGACHAT_WEIGHT_MAPPER.apply(weights)
 
 
 class GigaChat35GatedDeltaNet(Qwen3GatedDeltaNet):
@@ -277,17 +287,9 @@ class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
         alpha_q = (hidden_size / q_hidden) ** 0.5 if use_scaling else 1.0
         alpha_kv = (hidden_size / kv_hidden) ** 0.5 if use_scaling else 1.0
 
-        if self._norm_type != "LlamaRMSNorm":
-            if q_lora_rank is not None and hasattr(self, "q_a_layernorm"):
-                self.q_a_layernorm = build_norm(config, q_lora_rank, scale=alpha_q)
-            self.kv_a_layernorm = build_norm(config, kv_lora_rank, scale=alpha_kv)
-        else:
-            if use_scaling:
-                if q_lora_rank is not None and hasattr(self, "q_a_layernorm"):
-                    with torch.no_grad():
-                        self.q_a_layernorm.weight.mul_(alpha_q)
-                with torch.no_grad():
-                    self.kv_a_layernorm.weight.mul_(alpha_kv)
+        if q_lora_rank is not None and hasattr(self, "q_a_layernorm"):
+            self.q_a_layernorm = build_norm(config, q_lora_rank, scale=alpha_q)
+        self.kv_a_layernorm = build_norm(config, kv_lora_rank, scale=alpha_kv)
 
         self.gated_attention = bool(getattr(config, "gated_attention", False))
         self._gate_input: Optional[torch.Tensor] = None
@@ -609,6 +611,8 @@ class GigaChat35Model(nn.Module):
 
 
 class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
+    hf_to_sglang_mapper = _GIGACHAT_WEIGHT_MAPPER
+
     def __init__(
         self,
         config: GigaChat35Config,

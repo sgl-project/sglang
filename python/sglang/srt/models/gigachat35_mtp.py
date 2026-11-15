@@ -13,6 +13,7 @@ standalone from the GigaChat modules.
 
 from __future__ import annotations
 
+import copy
 from typing import Iterable, Optional
 
 import torch
@@ -35,6 +36,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     NextNEnabledConfig,
 )
 from sglang.srt.models.gigachat35 import (
+    _GIGACHAT_WEIGHT_MAPPER,
     GigaChat35DecoderLayer,
     _remap_gigachat_weight_names,
     build_norm,
@@ -133,6 +135,8 @@ class GigaChat35ModelNextN(nn.Module):
 
 
 class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
+    hf_to_sglang_mapper = _GIGACHAT_WEIGHT_MAPPER
+
     def __init__(
         self,
         config: GigaChat35Config,
@@ -142,10 +146,11 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
+        quant_config = self._resolve_nextn_quant_config(quant_config)
+        self.quant_config = quant_config
 
         self.model = GigaChat35ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -205,6 +210,48 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
             nextn_layer_prefix=f"model.layers.{nextn_layer_id}",
             nextn_spec_weight_names=["shared_head.norm", "eh_proj", "enorm", "hnorm"],
         )
+
+    def _resolve_nextn_quant_config(self, quant_config):
+        if (
+            quant_config is None
+            or quant_config.get_name() not in ("fp8", "mxfp8")
+            or not quant_config.ignored_layers
+        ):
+            return quant_config
+
+        nextn_conf = self._initialize_nextn_conf(is_nextn=True)
+        prefixes = (
+            nextn_conf.nextn_layer_prefix,
+            nextn_conf.nextn_layer_prefix.removeprefix("model."),
+        )
+        nextn_roots = ("shared_head", "eh_proj", "enorm", "hnorm")
+        runtime_roots = ["model.decoder", *(f"model.{root}" for root in nextn_roots)]
+
+        def map_name(name):
+            name = _GIGACHAT_WEIGHT_MAPPER._map_name(name).rstrip(".")
+            if name in ("layers", "model.layers"):
+                return runtime_roots
+            for prefix in prefixes:
+                if name == prefix:
+                    return runtime_roots
+                if name.startswith(prefix + "."):
+                    suffix = name[len(prefix) + 1 :]
+                    root = suffix.split(".", 1)[0]
+                    if root in nextn_roots:
+                        return ["model." + suffix]
+                    return ["model.decoder." + suffix]
+            return [name]
+
+        # Each MTP head has its own checkpoint layer but the same runtime prefix.
+        quant_config = copy.copy(quant_config)
+        quant_config.ignored_layers = list(
+            dict.fromkeys(
+                mapped
+                for name in quant_config.ignored_layers
+                for mapped in map_name(name)
+            )
+        )
+        return quant_config
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         self.do_load_weights(_remap_gigachat_weight_names(weights), is_nextn=True)

@@ -1320,6 +1320,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "GigaChat35ForCausalLM",
+        "GigaChat4ForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",

@@ -2,8 +2,6 @@
 
 The GigaChat 3.5 NextN block built from the GigaChat 4 decoder layer: the
 NextN layer is DSA like the target, with its own indexer and per-step top-k.
-The constructors mirror their 3.5 counterparts with the GigaChat 4 classes
-swapped in.
 """
 
 from __future__ import annotations
@@ -17,18 +15,18 @@ from sglang.srt.configs.gigachat4 import GigaChat4Config
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.models.gigachat4 import GigaChat4DecoderLayer
 from sglang.srt.models.gigachat35 import build_norm
 from sglang.srt.models.gigachat35_mtp import (
     GigaChat35ForCausalLMNextN,
     GigaChat35ModelNextN,
 )
-from sglang.srt.models.gigachat4 import GigaChat4DecoderLayer
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 
 class GigaChat4ModelNextN(GigaChat35ModelNextN):
@@ -78,10 +76,11 @@ class GigaChat4ForCausalLMNextN(GigaChat35ForCausalLMNextN):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
+        quant_config = self._resolve_nextn_quant_config(quant_config)
+        self.quant_config = quant_config
 
         self.model = GigaChat4ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)

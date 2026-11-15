@@ -10,9 +10,6 @@ from sglang.srt.configs.linear_attn_model_registry import (
 
 
 class GigaChat4Config(GigaChat35Config):
-    """GigaChat 3.5 plus DSA sparse attention (enabled by ``index_topk``,
-    MTP/NextN layer included) and final-logit soft-capping."""
-
     model_type = "gigachat4"
 
     def __init__(
@@ -25,6 +22,9 @@ class GigaChat4Config(GigaChat35Config):
         dense_attention_layers: Optional[list[int]] = None,
         nextn_is_linear: bool = False,
         final_logit_softcapping: Optional[float] = None,
+        norm_type: str = "GatedNorm",
+        swiglu_limit: Optional[float] = 10.0,
+        num_nextn_predict_layers: int = 1,
         **kwargs,
     ):
         self.index_topk = index_topk
@@ -35,9 +35,8 @@ class GigaChat4Config(GigaChat35Config):
                 f"Unsupported indexer_norm_type {indexer_norm_type!r} for GigaChat 4; "
                 "its DSA indexer keys are normalized with a plain RMSNorm."
             )
-        # Translate GigaChat's indexer field names for the shared DSA Indexer.
         self.index_k_norm_type = "rms"
-        self.index_rotate_activation = bool(indexer_rotate_activation_enabled)
+        self.index_apply_hadamard = bool(indexer_rotate_activation_enabled)
         if dense_attention_layers:
             raise NotImplementedError(
                 "dense_attention_layers is not supported yet: every GigaChat 4 "
@@ -49,7 +48,12 @@ class GigaChat4Config(GigaChat35Config):
                 "state init and rollback are not wired up."
             )
         self.final_logit_softcapping = final_logit_softcapping
-        super().__init__(**kwargs)
+        super().__init__(
+            norm_type=norm_type,
+            swiglu_limit=swiglu_limit,
+            num_nextn_predict_layers=num_nextn_predict_layers,
+            **kwargs,
+        )
 
 
 register_linear_attn_model(
@@ -62,5 +66,6 @@ register_linear_attn_model(
         ],
         uses_mamba_radix_cache=True,
         support_mamba_cache=True,
+        support_mamba_cache_extra_buffer=True,
     )
 )
