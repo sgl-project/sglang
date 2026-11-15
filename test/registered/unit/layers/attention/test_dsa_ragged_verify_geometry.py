@@ -22,7 +22,7 @@ def _layout(lengths, tier):
     )
 
 
-class TestDSARaggedVerifyGeometry(unittest.TestCase):
+class TestDSARaggedVerifyGeometry(CustomTestCase):
     def _check(self, prefix, requests, verify, tier):
         seq = torch.tensor(prefix, dtype=torch.int64)
         req = torch.tensor(requests, dtype=torch.int64)

@@ -184,8 +184,9 @@ def test_compact_plan_on_the_full_block_graph_verifies_every_draft(monkeypatch):
     runner = types.SimpleNamespace(
         ragged_verify_mode=True, capture_num_tokens=[4, 8, 12, 16], max_bs=4
     )
-    with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
-        planner = dspark_planner.DSparkVerifyPlanner(
+
+    def make_planner(*, verify_every_draft_on_full_tier):
+        return dspark_planner.DSparkVerifyPlanner(
             draft_model=types.SimpleNamespace(),
             gamma=3,
             model_runner=types.SimpleNamespace(decode_cuda_graph_runner=runner),
@@ -194,30 +195,40 @@ def test_compact_plan_on_the_full_block_graph_verifies_every_draft(monkeypatch):
             verify_num_draft_tokens=4,
             tp_sync=types.SimpleNamespace(sync=lambda site, tensor: tensor),
             online_confidence=True,
+            verify_every_draft_on_full_tier=verify_every_draft_on_full_tier,
         )
 
-        def plan(bs, budget):
-            return planner.schedule_layout(
-                req_pool_indices=torch.arange(1, bs + 1),
-                prefix_lens=torch.full((bs,), 5),
-                device=torch.device("cpu"),
-                confidence=torch.tensor([[0.9, 0.5, 0.1]] * bs),
-                budget=budget,
-            )
+    def plan(planner, bs, budget):
+        return planner.schedule_layout(
+            req_pool_indices=torch.arange(1, bs + 1),
+            prefix_lens=torch.full((bs,), 5),
+            device=torch.device("cpu"),
+            confidence=torch.tensor([[0.9, 0.5, 0.1]] * bs),
+            budget=budget,
+        )
+
+    with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+        planner = make_planner(verify_every_draft_on_full_tier=True)
 
         # Any plan of a single request replays the 4-token graph of its block.
         assert not planner.plans_verify_budget(num_reqs=1)
-        single = plan(1, 0)
-        assert single.is_full_block(4) and plan(1, 2) is single
+        single = plan(planner, 1, 0)
+        assert single.is_full_block(4) and plan(planner, 1, 2) is single
 
         # Three requests: 9 planned tokens replay the 12-token graph of the
         # full blocks, so every draft is verified; 7 fit the 8-token graph.
         assert planner.plans_verify_budget(num_reqs=3)
-        full = plan(3, 6)
+        full = plan(planner, 3, 6)
         assert full.is_full_block(4) and full.verify_lens.tolist() == [4, 4, 4]
-        trimmed = plan(3, 4)
+        trimmed = plan(planner, 3, 4)
         assert not trimmed.is_full_block(4)
         assert trimmed.graph_num_tokens == 8 and int(trimmed.verify_lens.sum()) == 7
+
+        # Off (DSpark's default), the same plans keep their budget-exact lengths.
+        exact = make_planner(verify_every_draft_on_full_tier=False)
+        assert exact.plans_verify_budget(num_reqs=1)
+        padded = plan(exact, 3, 6)
+        assert padded.graph_num_tokens == 12 and int(padded.verify_lens.sum()) == 9
 
 
 def test_observe_counts_the_drafts_the_target_verified():
@@ -233,15 +244,15 @@ def test_observe_counts_the_drafts_the_target_verified():
     worker = types.SimpleNamespace(
         _acceptance_estimator=estimator, _draft_feature=feature, block_size=5
     )
-    accept_len = torch.tensor([2, 4, 0], dtype=torch.int32)
+    num_correct_drafts = torch.tensor([2, 4, 0], dtype=torch.int32)
     worker_mod.DFlashWorkerV2._observe_acceptance(
-        worker, accept_len=accept_len, layout=None
+        worker, num_correct_drafts=num_correct_drafts, layout=None
     )
     layout = types.SimpleNamespace(
         verify_lens=torch.tensor([3, 5, 1], dtype=torch.int32)
     )
     worker_mod.DFlashWorkerV2._observe_acceptance(
-        worker, accept_len=accept_len, layout=layout
+        worker, num_correct_drafts=num_correct_drafts, layout=layout
     )
     # Without a layout every draft was verified; with one, verify_lens - 1.
     assert [call[1:] for call in estimator.calls] == [

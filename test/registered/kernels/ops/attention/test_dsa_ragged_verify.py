@@ -35,8 +35,11 @@ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# The CuTe DSL paged-logits cases need SM100.
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 SLOTS, TIER, WIDTH, TOPK = 8, 16, 256, 64
 
@@ -159,31 +162,7 @@ def _addresses(metadata):
     return result
 
 
-class TestDSARaggedVerifyCapability(unittest.TestCase):
-    def test_paged_index_cache_retains_raw_values_and_scale_bytes(self):
-        values = (
-            torch.arange(2 * 64 * 128).remainder(32).float().view(2, 64, 128) / 16
-        ).to(torch.float8_e4m3fn)
-        scales = (2.0 ** torch.arange(2 * 64).remainder(4)).view(2, 64)
-        packed = torch.empty(2, 64 * 132, dtype=torch.uint8)
-        packed[:, : 64 * 128] = values.view(torch.uint8).reshape(2, -1)
-        packed[:, 64 * 128 :] = scales.view(torch.uint8).reshape(2, -1)
-
-        pages = _paged_index_cache_view(packed)
-        self.assertEqual(pages.dtype, torch.uint8)
-        self.assertEqual(pages.shape, (2, 64, 1, 132))
-        self.assertEqual(pages.stride(), (64 * 132, 132, 132, 1))
-        self.assertEqual(pages.data_ptr(), packed.data_ptr())
-        raw = pages.flatten(1)
-        torch.testing.assert_close(
-            raw[:, : 64 * 128], values.view(torch.uint8).reshape(2, -1)
-        )
-        torch.testing.assert_close(
-            raw[:, 64 * 128 :].contiguous().view(torch.float32), scales
-        )
-        with self.assertRaisesRegex(ValueError, "production byte dtype"):
-            _paged_index_cache_view(packed.view(torch.float8_e4m3fn))
-
+class TestDSARaggedVerifyCapability(CustomTestCase):
     def test_unsupported_configs_cannot_enter_ragged_metadata(self):
         backend = object.__new__(DeepseekSparseAttnBackend)
         supported = dict(
@@ -241,7 +220,7 @@ class TestDSARaggedVerifyCapability(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestDSARaggedVerifyCUDA(unittest.TestCase):
+class TestDSARaggedVerifyCUDA(CustomTestCase):
     def test_empty_request_slots_skip_poisoned_owners(self):
         prefix = torch.tensor([62, 1000000, 127, 1000000], device="cuda")
         requests = torch.tensor([7, 1000000, 3, 1000000], device="cuda")

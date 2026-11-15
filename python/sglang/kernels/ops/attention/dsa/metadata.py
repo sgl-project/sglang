@@ -51,7 +51,18 @@ def fused_dsa_ragged_query_rows(
     query_seq_lens: torch.Tensor,
     query_req_pool_indices: torch.Tensor,
 ) -> None:
-    """Expand packed verify ownership/causal lengths into preallocated buffers."""
+    """Causal KV length and owning request slot of each packed verify token.
+
+    seq_lens / req_pool_indices: [num_slots]. qo_indptr: [num_requests + 1]
+    int32, num_requests <= num_slots, repeated boundaries allowed. Token t of
+    request r (qo_indptr[r] <= t < qo_indptr[r + 1]) gets
+    query_seq_lens[t] = seq_lens[r] + (t - qo_indptr[r]) + 1 and
+    query_req_pool_indices[t] = req_pool_indices[r]; a token at or past
+    qo_indptr[-1] gets 0 in both. Outputs are contiguous [num_tokens] buffers
+    written in place: int32 lengths, owners in req_pool_indices' dtype.
+
+    CUDA only and unchecked; the caller validates shapes and dtypes.
+    """
     if query_seq_lens.numel() == 0:
         return
     _dsa_ragged_query_rows_kernel[(triton.cdiv(query_seq_lens.numel(), 128),)](

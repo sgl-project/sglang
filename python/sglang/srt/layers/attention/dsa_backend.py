@@ -1531,16 +1531,17 @@ class DeepseekSparseAttnBackend(
             # The graph's page table is shared across tiers exactly like the
             # uniform decode tables; all per-row lengths/schedules belong to
             # this (request slots, token tier) capture and retain their address.
-            page_table = (
-                self.decode_cuda_graph_metadata["page_table"][:num_tokens]
-                if cuda_graph
-                else torch.zeros(
+            if cuda_graph:
+                wide_page_table = self.decode_cuda_graph_metadata["page_table"]
+                # Spec decoding never drops it (dsa_drop_wide_page_table).
+                assert wide_page_table is not None
+                page_table = wide_page_table[:num_tokens]
+            else:
+                page_table = torch.zeros(
                     (num_tokens, self.req_to_token.shape[1]),
                     dtype=torch.int32,
                     device=self.device,
                 )
-            )
-            assert page_table is not None
             assert page_table.shape[0] == num_tokens
             query_seq_lens = torch.empty(
                 num_tokens, dtype=torch.int32, device=self.device

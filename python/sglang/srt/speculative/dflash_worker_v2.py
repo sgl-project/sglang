@@ -772,6 +772,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=int(self.block_size),
             tp_sync=self._tp_sync,
             online_confidence=True,
+            verify_every_draft_on_full_tier=True,
         )
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self._target_worker,
@@ -926,7 +927,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
         )
-        target_attn_backend = self.model_runner.attn_backend
         if read_ragged_verify_mode() is RaggedVerifyMode.COMPACT:
             features = get_exec().features
             if (
@@ -938,16 +938,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "routed experts or indexer top-k captures; use "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-        if (
-            read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
-            and not target_attn_backend.supports_ragged_verify_graph
-        ):
-            raise ValueError(
-                "SGLANG_RAGGED_VERIFY_MODE=compact verifies packed per-request "
-                "token runs, which the target attention backend "
-                f"{type(target_attn_backend).__name__} does not support; use "
-                "SGLANG_RAGGED_VERIFY_MODE=cap-accept or static."
-            )
+            target_attn_backend = self.model_runner.attn_backend
+            if not target_attn_backend.supports_ragged_verify_graph:
+                raise ValueError(
+                    "SGLANG_RAGGED_VERIFY_MODE=compact verifies packed per-request "
+                    "token runs, which the target attention backend "
+                    f"{type(target_attn_backend).__name__} does not support; use "
+                    "SGLANG_RAGGED_VERIFY_MODE=cap-accept or static."
+                )
 
     def init_cuda_graphs(self):
         target_dp_enabled = get_parallel().attn_dp_enabled
@@ -3399,7 +3397,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
         if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
-            self._observe_acceptance(accept_len=accept_len, layout=layout)
+            self._observe_acceptance(num_correct_drafts=accept_len, layout=layout)
         if batch.hisparse_coordinator is not None:
             batch.hisparse_coordinator.commit_spec_accept_tokens(
                 batch=batch,
@@ -3455,9 +3453,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_token_budget=verify_token_budget,
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
-                accept_len=accept_len,
+                num_correct_drafts=accept_len,
                 cap_trim_lens=cap_trim_lens,
-                bonus=bonus,
+                bonus_tokens=bonus,
                 commit_lens=commit_lens,
             )
 
@@ -3522,7 +3520,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._verify_planner.note_non_decode_step()
 
     def _observe_acceptance(
-        self, *, accept_len: torch.Tensor, layout: Optional[RaggedVerifyLayout]
+        self,
+        *,
+        num_correct_drafts: torch.Tensor,
+        layout: Optional[RaggedVerifyLayout],
     ) -> None:
         """Teach the acceptance estimator this step's outcome: the drafts the
         target verified (every draft without a layout) and how many of them
@@ -3530,13 +3531,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._acceptance_estimator.observe(
             features=self._draft_feature,
             num_graded_drafts=(
-                torch.full_like(accept_len, int(self.block_size) - 1)
+                torch.full_like(num_correct_drafts, int(self.block_size) - 1)
                 if layout is None
-                else (layout.verify_lens[: accept_len.shape[0]] - 1).clamp(
+                else (layout.verify_lens[: num_correct_drafts.shape[0]] - 1).clamp(
                     min=0, max=int(self.block_size) - 1
                 )
             ),
-            num_correct_drafts=accept_len,
+            num_correct_drafts=num_correct_drafts,
         )
 
     def _plan_verify(
@@ -3600,9 +3601,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_token_budget: Optional[int],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
-        accept_len: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
         cap_trim_lens: Optional[torch.Tensor],
-        bonus: torch.Tensor,
+        bonus_tokens: torch.Tensor,
         commit_lens: torch.Tensor,
     ) -> None:
         planner = self._verify_planner
@@ -3635,8 +3636,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
-                bonus_tokens=bonus,
-                correct_len=accept_len,
+                bonus_tokens=bonus_tokens,
+                correct_len=num_correct_drafts,
                 cap_trim_lens=(
                     torch.zeros_like(commit_lens)
                     if cap_trim_lens is None
