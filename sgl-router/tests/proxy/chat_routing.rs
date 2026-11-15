@@ -8,9 +8,9 @@ use sgl_router::config::{
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
-use sgl_router::server::app::build_router;
+use sgl_router::server::app::{build_router, build_router_with_body_limit};
 use sgl_router::server::app_context::AppContext;
-use sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES;
+use sgl_router::server::routes::chat::max_chat_body_bytes;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 
@@ -775,8 +775,8 @@ async fn oversized_request_body_returns_413() {
     let app = build_router(ctx);
 
     // One byte over the configured cap, so the test tracks the cap
-    // (`MAX_CHAT_BODY_BYTES`) instead of a hardcoded size.
-    let big = vec![b'x'; MAX_CHAT_BODY_BYTES + 1];
+    // (`max_chat_body_bytes()`) instead of a hardcoded size.
+    let big = vec![b'x'; max_chat_body_bytes() + 1];
     let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -796,6 +796,62 @@ async fn oversized_request_body_returns_413() {
         captured.last_body.is_none(),
         "router must not forward oversized body to upstream; got body of {} bytes",
         captured.last_body.as_ref().map(|b| b.len()).unwrap_or(0),
+    );
+}
+
+#[tokio::test]
+async fn configured_body_cap_applies_to_every_inference_route() {
+    // A cap set at startup (SGLANG_ROUTER_MAX_BODY_BYTES) replaces the default
+    // on every inference route: one byte over it is 413 and never reaches the
+    // worker, and a chat exactly at it is forwarded.
+    const CAP: usize = 4096;
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let app = build_router_with_body_limit(build_ctx_with_worker(&worker.url), CAP);
+
+    for path in [
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/generate",
+        "/v1/embeddings",
+        "/v1/classify",
+        "/v1/rerank",
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b' '; CAP + 1]))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
+
+    let empty = serde_json::json!({
+        "model": "tiny",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": ""}],
+    });
+    let pad = CAP - serde_json::to_vec(&empty).unwrap().len();
+    let mut at_cap = empty;
+    at_cap["messages"][0]["content"] = "x".repeat(pad).into();
+    let body = serde_json::to_vec(&at_cap).unwrap();
+    assert_eq!(body.len(), CAP);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        worker.captured_json().await["messages"][0]["content"]
+            .as_str()
+            .map(str::len),
+        Some(pad)
     );
 }
 

@@ -26,7 +26,11 @@ use crate::server::routes::chat::{
 };
 use crate::server::routes::tokenize::served_tokenizer;
 
-/// Upstream replies are buffered up to the same cap as requests.
+/// Cap on a buffered non-streaming upstream reply. Pinned to the compiled-in
+/// request default, not the configured request cap: a reply grows with the
+/// generated output, not with the prompt, so raising the request cap for large
+/// prompts should not raise per-reply memory, and lowering it should not start
+/// failing large replies.
 const MAX_REPLY_BYTES: usize = MAX_CHAT_BODY_BYTES;
 
 pub(crate) async fn messages(

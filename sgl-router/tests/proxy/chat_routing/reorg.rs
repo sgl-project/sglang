@@ -441,7 +441,7 @@ async fn reorg_route_keeps_chat_body_limit() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
-        .body(Body::from(vec![b' '; MAX_CHAT_BODY_BYTES + 1]))
+        .body(Body::from(vec![b' '; max_chat_body_bytes() + 1]))
         .unwrap();
     assert_eq!(
         app.oneshot(request).await.unwrap().status(),

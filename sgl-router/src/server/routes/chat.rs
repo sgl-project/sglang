@@ -39,9 +39,80 @@ use std::time::Instant;
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
-/// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
-/// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
+/// Default cap on a buffered inference request body, including base64
+/// multimodal inputs (32 MiB). [`SGLANG_ROUTER_MAX_BODY_BYTES`] overrides it;
+/// [`max_chat_body_bytes`] is the value actually enforced.
 pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
+
+/// Env var that overrides [`MAX_CHAT_BODY_BYTES`]: a positive decimal byte
+/// count. A deployment that accepts larger multimodal requests (several base64
+/// images or audio clips) raises it without rebuilding the router.
+pub const SGLANG_ROUTER_MAX_BODY_BYTES: &str = "SGLANG_ROUTER_MAX_BODY_BYTES";
+
+/// The request-body cap every inference route enforces, through the
+/// `DefaultBodyLimit` layer in app.rs (413 past it). Read from
+/// [`SGLANG_ROUTER_MAX_BODY_BYTES`] once, on first use (`build_router` at
+/// startup), and logged then; an unset or empty variable gives
+/// [`MAX_CHAT_BODY_BYTES`], and an unparsable or zero value gives the same
+/// default with a WARN rather than failing startup. The value is bytes: `256`
+/// is a 256-byte cap, not 256 MiB.
+pub fn max_chat_body_bytes() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var_os(SGLANG_ROUTER_MAX_BODY_BYTES);
+        let (bytes, source) = resolve_max_body_bytes(raw.as_deref());
+        match source {
+            BodyCapSource::Default | BodyCapSource::Env => tracing::info!(
+                max_body_bytes = bytes,
+                source = if source == BodyCapSource::Env {
+                    SGLANG_ROUTER_MAX_BODY_BYTES
+                } else {
+                    "default"
+                },
+                "request body cap"
+            ),
+            BodyCapSource::Invalid(reason) => tracing::warn!(
+                value = ?raw,
+                reason,
+                max_body_bytes = bytes,
+                "ignoring {SGLANG_ROUTER_MAX_BODY_BYTES}; using the default request body cap"
+            ),
+        }
+        bytes
+    })
+}
+
+/// Where the resolved request-body cap came from.
+#[derive(Debug, PartialEq)]
+enum BodyCapSource {
+    Default,
+    Env,
+    /// The variable was set but unusable; the default applies.
+    Invalid(String),
+}
+
+/// Resolve a raw [`SGLANG_ROUTER_MAX_BODY_BYTES`] value to the cap. Unset,
+/// empty or whitespace-only gives the default. A positive decimal integer
+/// (surrounding whitespace allowed, no unit suffix) is the cap. Anything else,
+/// zero, overflow and non-UTF-8 included, gives the default and the reason.
+fn resolve_max_body_bytes(raw: Option<&std::ffi::OsStr>) -> (usize, BodyCapSource) {
+    let Some(raw) = raw else {
+        return (MAX_CHAT_BODY_BYTES, BodyCapSource::Default);
+    };
+    let invalid = |reason: String| (MAX_CHAT_BODY_BYTES, BodyCapSource::Invalid(reason));
+    let Some(raw) = raw.to_str() else {
+        return invalid("not valid UTF-8".to_string());
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return (MAX_CHAT_BODY_BYTES, BodyCapSource::Default);
+    }
+    match raw.parse::<usize>() {
+        Ok(0) => invalid("must be greater than zero".to_string()),
+        Ok(bytes) => (bytes, BodyCapSource::Env),
+        Err(e) => invalid(format!("not a byte count: {e}")),
+    }
+}
 
 /// An inference route. HTTP and gRPC calls prepare and select for it alike.
 #[derive(Clone, Copy)]
@@ -753,6 +824,46 @@ mod tests {
     use crate::off_worker::test_support::{slow_chat_body, slow_template_dir, time_beside_a_timer};
     use crate::tokenizer::TokenizerRegistry;
     use std::time::Duration;
+
+    #[test]
+    fn max_body_bytes_resolves_from_the_env_value() {
+        use std::ffi::OsStr;
+        let resolve = |v: Option<&str>| resolve_max_body_bytes(v.map(OsStr::new));
+        // Unset or empty: the default, no warning.
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                resolve(unset),
+                (MAX_CHAT_BODY_BYTES, BodyCapSource::Default),
+                "{unset:?}"
+            );
+        }
+        // A positive byte count, larger or smaller than the default.
+        assert_eq!(resolve(Some("268435456")), (256 << 20, BodyCapSource::Env));
+        assert_eq!(resolve(Some(" 1024\n")), (1024, BodyCapSource::Env));
+        // Zero and unparsable values keep the default and say why.
+        for bad in [
+            "0",
+            "-1",
+            "256MiB",
+            "1.5",
+            "0x100",
+            "99999999999999999999999",
+        ] {
+            let (bytes, source) = resolve(Some(bad));
+            assert_eq!(bytes, MAX_CHAT_BODY_BYTES, "{bad:?}");
+            assert!(
+                matches!(source, BodyCapSource::Invalid(_)),
+                "{bad:?}: {source:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let (bytes, source) = resolve_max_body_bytes(Some(OsStr::from_bytes(b"\xff")));
+            assert_eq!(bytes, MAX_CHAT_BODY_BYTES);
+            assert!(matches!(source, BodyCapSource::Invalid(_)));
+        }
+    }
 
     #[test]
     fn aliases_match_whole_names_and_the_longest_lora_prefix() {

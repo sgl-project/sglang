@@ -277,6 +277,24 @@ to the whole pool rather than rejecting every request, and failures reopen
 them. `--disable-circuit-breaker` turns it off; a worker that stops answering
 then keeps its share of traffic.
 
+### Request body size
+
+The router buffers each inference request body in full before routing it, so
+it caps the body: `/v1/chat/completions`, `/v1/completions`, `/generate`,
+`/v1/embeddings`, `/v1/classify`, `/v1/rerank` and `/v1/messages` (with
+`count_tokens`) answer `413` past it. The cap is 32 MiB by default; set
+`SGLANG_ROUTER_MAX_BODY_BYTES` to a positive byte count (for example
+`268435456` for 256 MiB) to accept larger multimodal requests carrying several
+base64 images or audio clips. Raising it raises the router's worst-case memory
+too: the body is held in full and parsed (and often rebuilt) while the request
+is prepared, so peak memory per in-flight request is a few times its size. The
+value is bytes, so `256` is a 256-byte cap, not 256 MiB. An empty value keeps
+the default; zero or a value that is not a plain decimal integer (no unit
+suffix) keeps the default and logs a warning. The router logs the effective cap
+at startup. The cap does not change the native gRPC server's inbound message
+limit (half of the 64 MiB engine channel), or the 32 MiB cap on a buffered
+non-streaming Anthropic Messages reply.
+
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its
