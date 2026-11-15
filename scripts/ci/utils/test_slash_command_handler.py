@@ -7,7 +7,7 @@ requests and PyYAML):
 
 Test files are written into a temporary repo root, so each case pins its own
 registrations; runner and suite settings come from the real
-scripts/ci/runner_configs.yml and NPU workflows.
+scripts/ci/runner_configs.yml and the NPU and AMD workflows.
 """
 
 import json
@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import slash_command_handler as handler  # noqa: E402
 
 npu_suites = handler._npu_suites
+amd_suites = handler._amd_suites
 A3_PR_IMAGE = npu_suites.a3_pr_image()
 
 
@@ -73,6 +74,63 @@ class TestNpuSuites(unittest.TestCase):
                 npu_suites.load_suites(Path(tmp))
 
 
+class TestAmdSuites(unittest.TestCase):
+    def test_reads_the_real_workflows(self):
+        suites = amd_suites.load_suites()
+        self.assertEqual(
+            suites["stage-b-test-1-gpu-small-amd"],
+            amd_suites.AmdSuite(
+                runs_on="linux-mi300-1gpu-sglang",
+                rocm_version="rocm10",
+                sgl_router=False,
+                exec_env=(),
+            ),
+        )
+        # The PR runner, not the Spur one that accepts only main.
+        self.assertEqual(
+            suites["stage-c-test-large-8-gpu-amd-mi35x"].runs_on, "linux-mi35x-gpu-8"
+        )
+        self.assertEqual(
+            suites["stage-c-test-4-gpu-amd"].exec_env,
+            (
+                "NCCL_CUMEM_ENABLE=0",
+                "NCCL_NVLS_ENABLE=0",
+                "RCCL_MSCCL_ENABLE=0",
+                "SGLANG_USE_ROCM700A=1",
+            ),
+        )
+        extra = suites["extra-a-test-2-gpu-large-amd"]
+        self.assertEqual(
+            (extra.runs_on, extra.rocm_version, extra.sgl_router),
+            ("linux-mi300-2gpu-sglang", "rocm10", True),
+        )
+        disagg = "stage-b-test-large-8-gpu-mi35x-disaggregation-amd"
+        self.assertNotIn(disagg, suites)
+        self.assertIn(disagg, amd_suites.own_setup_jobs())
+
+    def test_conflicting_jobs_fail(self):
+        def job(runner):
+            return {
+                "runs-on": runner,
+                "steps": [
+                    {
+                        "uses": amd_suites.SETUP_ACTION,
+                        "with": {"rocm_version": "rocm10"},
+                    },
+                    {
+                        "run": "bash scripts/ci/amd/amd_ci_exec.sh -w /x "
+                        "python3 run_suite.py --hw amd --suite s-amd"
+                    },
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, runner in zip(amd_suites.WORKFLOWS, ("r-1gpu", "r-2gpu")):
+                Path(tmp, name).write_text(yaml.safe_dump({"jobs": {"j": job(runner)}}))
+            with self.assertRaisesRegex(ValueError, "`s-amd` runs with"):
+                amd_suites.load_suites(Path(tmp))
+
+
 class _TempRepo(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -114,6 +172,7 @@ class TestResolveNpu(_TempRepo):
                 "install_script": "",
                 "install_timeout": "",
                 "rdma_devices": "",
+                **handler._MODE_INPUTS,
                 "npu_suite": "base-b-test-4-npu-a3",
                 "npu_image": A3_PR_IMAGE,
                 "npu_sgl_router": True,
@@ -237,6 +296,116 @@ class TestResolveNpu(_TempRepo):
         self.assertIn("Disallowed NPU suite or image `x;curl`", entry["error"])
 
 
+class TestResolveAmd(_TempRepo):
+    def test_amd_only_file_resolves_to_amd(self):
+        path = self.write_test(
+            "registered/amd/test_amd.py",
+            'register_amd_ci(est_time=60, stage="stage-c", runner_config="4-gpu-amd")',
+        )
+        [entry] = handler._resolve_test_spec(f"{path}::TestA.test_b")
+        self.assertEqual(
+            entry,
+            {
+                "spec": f"{path}::TestA.test_b",
+                "test_command": f"{path} TestA.test_b",
+                "mode": "amd",
+                "stage": "stage-c-test-4-gpu-amd",
+                "runs_on": "linux-mi300-4gpu-sglang",
+                "install_script": "",
+                "install_timeout": "",
+                "rdma_devices": "",
+                **handler._MODE_INPUTS,
+                "amd_rocm_version": "rocm10",
+                "amd_sgl_router": False,
+                "amd_exec_env": "NCCL_CUMEM_ENABLE=0 NCCL_NVLS_ENABLE=0 "
+                "RCCL_MSCCL_ENABLE=0 SGLANG_USE_ROCM700A=1",
+                "error": None,
+            },
+        )
+
+    def test_one_entry_per_registration(self):
+        path = self.write_test(
+            "registered/amd/test_two.py",
+            """
+            register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+            register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+            register_amd_ci(est_time=60, stage="extra-a", runner_config="2-gpu-large-amd")
+            """,
+        )
+        self.assertEqual(
+            [
+                (e["stage"], e["runs_on"], e["amd_sgl_router"])
+                for e in handler._resolve_test_spec(path)
+            ],
+            [
+                ("stage-b-test-1-gpu-small-amd", "linux-mi300-1gpu-sglang", False),
+                ("stage-b-test-1-gpu-small-amd-mi35x", "linux-mi35x-gpu-1", False),
+                ("extra-a-test-2-gpu-large-amd", "linux-mi300-2gpu-sglang", True),
+            ],
+        )
+
+    def test_disabled_registration_still_runs_directly(self):
+        path = self.write_test(
+            "registered/amd/test_disabled.py",
+            'register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd", '
+            'disabled="flaky")',
+        )
+        [entry] = handler._resolve_test_spec(path)
+        self.assertEqual(entry["mode"], "amd")
+
+    def test_nightly_registration_is_rejected(self):
+        path = self.write_test(
+            "registered/amd/test_nightly.py",
+            'register_amd_ci(est_time=600, suite="nightly-amd-1-gpu", nightly=True)',
+        )
+        [entry] = handler._resolve_test_spec(path)
+        self.assertIn("AMD nightly suite `nightly-amd-1-gpu`", entry["error"])
+
+    def test_disaggregation_suite_is_rejected(self):
+        suite = "stage-b-test-large-8-gpu-mi35x-disaggregation-amd"
+        path = self.write_test(
+            "registered/amd/test_disagg.py",
+            f'register_amd_ci(est_time=600, suite="{suite}")',
+        )
+        [entry] = handler._resolve_test_spec(path)
+        self.assertIn(f"pr-test-amd.yml job `{suite}`", entry["error"])
+        self.assertIn("sets up its own container", entry["error"])
+
+    def test_suite_without_pr_job_is_rejected(self):
+        path = self.write_test(
+            "registered/amd/test_orphan.py",
+            'register_amd_ci(est_time=60, suite="stage-z-test-amd")',
+        )
+        [entry] = handler._resolve_test_spec(path)
+        self.assertIn("`stage-z-test-amd`", entry["error"])
+        self.assertIn("run by no job in pr-test-amd.yml", entry["error"])
+
+    def test_over_step_limit_is_rejected(self):
+        path = self.write_test(
+            "registered/amd/test_long.py",
+            'register_amd_ci(est_time=7200, suite="stage-b-test-1-gpu-small-amd")',
+        )
+        [entry] = handler._resolve_test_spec(path)
+        self.assertIn("on `linux-mi300-1gpu-sglang`, longer than", entry["error"])
+
+    def test_shell_unsafe_value_is_rejected(self):
+        path = self.write_test(
+            "registered/amd/test_unsafe.py",
+            'register_amd_ci(est_time=60, suite="s-amd")',
+        )
+        suites = {
+            "s-amd": amd_suites.AmdSuite(
+                "linux-mi300-1gpu-sglang", "rocm10", False, ("A=$(id)",)
+            )
+        }
+        with mock.patch.object(amd_suites, "load_suites", return_value=suites):
+            [entry] = handler._resolve_test_spec(path)
+        self.assertIn(
+            "Disallowed AMD runner, ROCm version, or container env `A=$(id)`",
+            entry["error"],
+        )
+
+
 class TestResolveUnchanged(_TempRepo):
     def test_cuda_registration(self):
         path = self.write_test(
@@ -255,7 +424,7 @@ class TestResolveUnchanged(_TempRepo):
                 "install_script": "scripts/ci/cuda/ci_install_dependency.sh",
                 "install_timeout": "20",
                 "rdma_devices": "",
-                **handler._NO_NPU_INPUTS,
+                **handler._MODE_INPUTS,
                 "error": None,
             },
         )
@@ -283,13 +452,14 @@ class TestResolveUnchanged(_TempRepo):
         self.assertEqual(entry["stage"], "base-a")
         self.assertEqual(entry["npu_suite"], "")
 
-    def test_amd_only_is_rejected(self):
+    def test_xpu_only_is_rejected(self):
         path = self.write_test(
-            "registered/amd/test_amd.py",
-            'register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")',
+            "registered/xpu/test_xpu.py",
+            'register_xpu_ci(est_time=60, suite="per-commit-xpu")',
         )
         [entry] = handler._resolve_test_spec(path)
-        self.assertIn("registered for AMD", entry["error"])
+        self.assertIn("registered for XPU", entry["error"])
+        self.assertIn("not for CUDA, CPU, NPU, or AMD", entry["error"])
 
 
 class TestHwFlag(_TempRepo):
@@ -344,6 +514,49 @@ class TestHwFlag(_TempRepo):
         [entry] = handler._resolve_test_spec(path, hw="cuda")
         self.assertIn("drop `--hw cuda`", entry["error"])
 
+    def write_cuda_and_amd(self):
+        return self.write_test(
+            "registered/core/test_cuda_amd.py",
+            """
+            register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+            register_amd_ci(est_time=60, stage="stage-b", runner_config="1-gpu-small-amd")
+            """,
+        )
+
+    def test_cuda_wins_over_amd_without_flag(self):
+        self.assertEqual(
+            [e["mode"] for e in handler._resolve_test_spec(self.write_cuda_and_amd())],
+            ["cuda"],
+        )
+
+    def test_hw_amd_picks_amd_over_cuda(self):
+        entries = handler._resolve_test_spec(self.write_cuda_and_amd(), hw="amd")
+        self.assertEqual(
+            [(e["mode"], e["runs_on"]) for e in entries],
+            [("amd", "linux-mi300-1gpu-sglang")],
+        )
+
+    def test_hw_amd_without_amd_registration_is_rejected(self):
+        [entry] = handler._resolve_test_spec(self.write_both(), hw="amd")
+        self.assertIn("has no `register_amd_ci(...)`", entry["error"])
+
+    def test_hw_cuda_never_falls_back_to_amd(self):
+        path = self.write_test(
+            "registered/amd/test_amd.py",
+            'register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")',
+        )
+        [entry] = handler._resolve_test_spec(path, hw="cuda")
+        self.assertIn("registered for AMD, not CUDA or CPU", entry["error"])
+        self.assertIn("drop `--hw cuda`", entry["error"])
+
+    def test_hw_amd_rejects_multimodal(self):
+        os.makedirs("python/sglang/multimodal_gen/test")
+        Path("python/sglang/multimodal_gen/test/test_gen.py").write_text("")
+        [entry] = handler._resolve_test_spec(
+            "python/sglang/multimodal_gen/test/test_gen.py", hw="amd"
+        )
+        self.assertIn("`register_amd_ci(...)`; multimodal_gen", entry["error"])
+
     def test_pop_hw_flag(self):
         self.assertEqual(
             handler._pop_hw_flag(["a.py", "--hw", "npu", "-c"]), ("npu", ["a.py", "-c"])
@@ -353,8 +566,8 @@ class TestHwFlag(_TempRepo):
 
     def test_unsupported_hw_is_rejected_before_dispatch(self):
         for hw, reply in (
-            ("amd", "⛔ AMD is not supported by /rerun-test yet."),
-            ("", "⛔ `--hw` takes one of `cuda`, `npu`."),
+            ("rocm", "⛔ `--hw` takes one of `cuda`, `npu`, `amd`."),
+            ("", "⛔ `--hw` takes one of `cuda`, `npu`, `amd`."),
         ):
             pr = mock.MagicMock()
             with mock.patch.object(handler.requests, "post") as post:
@@ -372,7 +585,7 @@ class TestHwFlag(_TempRepo):
             post.assert_not_called()
 
 
-class TestDispatchNpu(_TempRepo):
+class TestDispatch(_TempRepo):
     def _run(self, specs):
         gh_repo = mock.MagicMock(full_name="o/r")
         gh_repo.get_workflows.return_value = [
@@ -443,7 +656,29 @@ class TestDispatchNpu(_TempRepo):
             },
         )
 
-    def test_cuda_dispatch_sends_empty_npu_inputs(self):
+    def test_amd_dispatch_inputs(self):
+        path = self.write_test(
+            "registered/amd/test_pd.py",
+            'register_amd_ci(est_time=60, stage="extra-a", runner_config="2-gpu-large-amd")',
+        )
+        [inputs] = self._run([path])
+        self.assertEqual(
+            {
+                k: inputs[k]
+                for k in ("mode", "runs_on", "test_command", *handler._MODE_INPUTS)
+            },
+            {
+                "mode": "amd",
+                "runs_on": "linux-mi300-2gpu-sglang",
+                "test_command": path,
+                **{k: str(v).lower() for k, v in handler._MODE_INPUTS.items()},
+                "amd_rocm_version": "rocm10",
+                "amd_sgl_router": "true",
+                "amd_exec_env": "",
+            },
+        )
+
+    def test_cuda_dispatch_sends_empty_mode_inputs(self):
         path = self.write_test(
             "registered/core/test_cuda.py",
             'register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")',
@@ -451,14 +686,46 @@ class TestDispatchNpu(_TempRepo):
         [inputs] = self._run([path])
         self.assertEqual(inputs["mode"], "cuda")
         self.assertEqual(
-            {k: inputs[k] for k in handler._NO_NPU_INPUTS},
+            {k: inputs[k] for k in handler._MODE_INPUTS},
             {
                 "npu_suite": "",
                 "npu_image": "",
                 "npu_sgl_router": "false",
                 "npu_collect_nightly_tests": "false",
+                "amd_rocm_version": "",
+                "amd_sgl_router": "false",
+                "amd_exec_env": "",
             },
         )
+
+
+class TestRerunWorkflowAmd(unittest.TestCase):
+    def test_fork_reruns_get_no_docker_hub_secrets(self):
+        workflow = yaml.safe_load(
+            (amd_suites.WORKFLOWS_DIR / "rerun-test.yml").read_text()
+        )
+        env = workflow["jobs"]["rerun-test-amd"]["env"]
+        for name in ("DOCKERHUB_AMD_USERNAME", "DOCKERHUB_AMD_TOKEN"):
+            self.assertEqual(
+                env[name],
+                f"${{{{ inputs.pr_head_sha == '' && secrets.{name} || '' }}}}",
+            )
+
+
+class TestAmdEstimates(_TempRepo):
+    def test_estimate_matches_the_runner(self):
+        path = self.write_test(
+            "registered/amd/test_est.py",
+            """
+            register_amd_ci(est_time=100, stage="stage-b", runner_config="1-gpu-small-amd")
+            register_amd_ci(est_time=900, suite="stage-c-test-large-8-gpu-amd-mi35x")
+            """,
+        )
+        estimate = handler._partition.estimate_seconds
+        self.assertEqual(
+            estimate(path, Path("."), "amd", "linux-mi300-1gpu-sglang"), 100
+        )
+        self.assertEqual(estimate(path, Path("."), "amd", "linux-mi35x-gpu-8"), 900)
 
 
 class TestNpuStageInputs(unittest.TestCase):

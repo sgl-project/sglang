@@ -58,8 +58,19 @@ def _npu_suite_labels():
     return {name: suite.runs_on for name, suite in npu_suites.load_suites().items()}
 
 
+@functools.cache
+def _amd_suite_labels():
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "scripts/ci"))
+        import amd_suites
+    except ImportError:  # no PyYAML: fall back to the largest registration
+        return {}
+    return {name: suite.runs_on for name, suite in amd_suites.load_suites().items()}
+
+
 def _registrations(path, register_name):
-    """Return [(est_time, runner_config, suite)] or None if any estimate is unusable."""
+    """Return [(est_time, runner_config, suite, stage)] or None if any estimate is
+    unusable."""
     try:
         tree = ast.parse(path.read_text())
     except (OSError, SyntaxError):
@@ -85,7 +96,7 @@ def _registrations(path, register_name):
         ):
             return None
         tags = []
-        for key in ("runner_config", "suite"):
+        for key in ("runner_config", "suite", "stage"):
             try:
                 tags.append(ast.literal_eval(kwargs[key]))
             except (KeyError, ValueError, TypeError):
@@ -129,6 +140,7 @@ def estimate_seconds(command, root, mode, runs_on=""):
         "cuda": "register_cuda_ci",
         "cpu": "register_cpu_ci",
         **{npu_mode: "register_npu_ci" for npu_mode in NPU_MODES},
+        "amd": "register_amd_ci",
     }.get(mode)
     if register_name is None:
         return None
@@ -138,14 +150,21 @@ def estimate_seconds(command, root, mode, runs_on=""):
         return None
     if mode == "cuda":
         labels = _runner_config_labels()
-        matching = [est for est, rc, _ in found if rc and labels.get(rc) == runs_on]
+        matching = [est for est, rc, *_ in found if rc and labels.get(rc) == runs_on]
     elif mode in NPU_MODES:
         labels = _npu_suite_labels()
-        matching = [est for est, _, suite in found if labels.get(suite) == runs_on]
+        matching = [est for est, _, suite, _ in found if labels.get(suite) == runs_on]
+    elif mode == "amd":
+        labels = _amd_suite_labels()
+        matching = [
+            est
+            for est, rc, suite, stage in found
+            if labels.get(f"{stage}-test-{rc}" if stage and rc else suite) == runs_on
+        ]
     else:
-        matching = [est for est, _, suite in found if suite in UBUNTU_CPU_SUITES]
+        matching = [est for est, _, suite, _ in found if suite in UBUNTU_CPU_SUITES]
     # A file may register on multiple pools; without a match, stay conservative.
-    return max(matching or [est for est, _, _ in found])
+    return max(matching or [est for est, *_ in found])
 
 
 def _pack(items):

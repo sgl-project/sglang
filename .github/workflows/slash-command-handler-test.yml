@@ -10,6 +10,7 @@ on:
       - "scripts/ci/runner_configs.py"
       - "scripts/ci/runner_configs.yml"
       - "scripts/ci/npu_suites.py"
+      - "scripts/ci/amd_suites.py"
       - "python/sglang/test/ci/ci_register.py"
       - ".github/workflows/rerun-test.yml"
       - ".github/workflows/pr-test-npu.yml"
@@ -17,6 +18,9 @@ on:
       - ".github/workflows/full-test-npu.yml"
       - ".github/workflows/_npu-pr-test-stage.yml"
       - ".github/workflows/_npu-single-node-test-stage.yml"
+      - ".github/workflows/pr-test-amd.yml"
+      - ".github/workflows/pr-test-amd-extra.yml"
+      - ".github/actions/setup-amd-ci/action.yml"
   workflow_dispatch:
 
 permissions: {}

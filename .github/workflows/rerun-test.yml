@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Dispatch mode: cuda | multimodal_gen | cpu | npu | npu_single_node"
+        description: "Dispatch mode: cuda | multimodal_gen | cpu | npu | npu_single_node | amd"
         required: true
         type: choice
         options:
@@ -14,6 +14,7 @@ on:
           - cpu
           - npu
           - npu_single_node
+          - amd
       test_command:
         description: "Test command(s) to run, one per line (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
         required: true
@@ -58,6 +59,21 @@ on:
         required: false
         type: boolean
         default: false
+      amd_rocm_version:
+        description: "ROCm image variant of the AMD CI container, e.g. rocm10 (amd only)"
+        required: false
+        type: string
+        default: ""
+      amd_sgl_router:
+        description: "Fetch sgl-router for PD tests (amd only)"
+        required: false
+        type: boolean
+        default: false
+      amd_exec_env:
+        description: "Space-separated KEY=VALUE env for amd_ci_exec.sh (amd only)"
+        required: false
+        type: string
+        default: ""
       pr_head_sha:
         description: "PR head SHA to checkout (for /rerun-test on fork PRs)"
         required: false
@@ -532,6 +548,101 @@ jobs:
       only_tests: ${{ fromJson(needs.prepare-partitions.outputs.only_tests) }}
       collect_nightly_tests: ${{ inputs.npu_collect_nightly_tests }}
 
+  # Runs each file directly, as rerun-test-cuda does, in the AMD CI container
+  # set up as the suite's job in pr-test-amd.yml or pr-test-amd-extra.yml
+  # sets it up (scripts/ci/amd_suites.py).
+  rerun-test-amd:
+    name: rerun-test-amd (partition ${{ matrix.partition }})
+    needs: prepare-partitions
+    if: inputs.mode == 'amd'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
+    runs-on: ${{ inputs.runs_on }}
+    # The 60-minute Run test step plus the image pull and install.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      issues: write
+    env:
+      # Fork code runs on this runner, so a fork PR's rerun pulls anonymously.
+      DOCKERHUB_AMD_USERNAME: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_AMD_USERNAME || '' }}
+      DOCKERHUB_AMD_TOKEN: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_AMD_TOKEN || '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
+      - uses: ./.github/actions/check-maintenance
+
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ inputs.amd_rocm_version }}
+          sgl_router: ${{ inputs.amd_sgl_router }}
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
+          AMD_EXEC_ENV: ${{ inputs.amd_exec_env }}
+        run: |
+          exec_env=()
+          for kv in $AMD_EXEC_ENV; do
+            exec_env+=(-e "$kv")
+          done
+          cmds=()
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            cmds+=("$cmd")
+          done <<< "$TEST_COMMAND"
+          total=${#cmds[@]}
+          failed=()
+          suite_start=$SECONDS
+          for idx in "${!cmds[@]}"; do
+            i=$((idx + 1))
+            cmd="${cmds[$idx]}"
+            echo ""
+            echo "."
+            echo "Begin ($i/$total): python3 $cmd"
+            echo "."
+            file_start=$SECONDS
+            if ! bash scripts/ci/amd/amd_ci_exec.sh "${exec_env[@]}" -w /sglang-checkout/test python3 $cmd -f; then
+              failed+=("$cmd")
+            fi
+            elapsed=$(( SECONDS - file_start ))
+            echo "."
+            echo "End ($i/$total): elapsed=${elapsed}s"
+            echo "."
+            echo ""
+          done
+          total_elapsed=$(( SECONDS - suite_start ))
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
+            printf '  %s\n' "${failed[@]}"
+            {
+              echo "### Failed tests (partition ${{ matrix.partition }})"
+              printf -- '- `%s`\n' "${failed[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "All $total test(s) passed in ${total_elapsed}s"
+
   write-back-result:
     needs:
       - prepare-partitions
@@ -540,6 +651,7 @@ jobs:
       - rerun-test-cpu
       - rerun-test-npu
       - rerun-test-npu-single-node
+      - rerun-test-amd
     if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
     runs-on: ubuntu-latest
     permissions:
@@ -565,7 +677,8 @@ jobs:
              || "${{ needs.rerun-test-multimodal-gen.result }}" == "success" \
              || "${{ needs.rerun-test-cpu.result }}" == "success" \
              || "${{ needs.rerun-test-npu.result }}" == "success" \
-             || "${{ needs.rerun-test-npu-single-node.result }}" == "success" ]]; then
+             || "${{ needs.rerun-test-npu-single-node.result }}" == "success" \
+             || "${{ needs.rerun-test-amd.result }}" == "success" ]]; then
             STATUS=success
           else
             STATUS=failure
