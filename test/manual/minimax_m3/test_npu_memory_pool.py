@@ -101,6 +101,8 @@ def _load_npu_memory_pool_module():
         "sglang.srt.constants",
         "sglang.srt.mem_cache",
         "sglang.srt.mem_cache.memory_pool",
+        "sglang.srt.mem_cache.pool",
+        "sglang.srt.mem_cache.pool.base",
         "sglang.srt.utils",
         "sglang.srt.utils.device",
     ):
@@ -116,7 +118,9 @@ def _load_npu_memory_pool_module():
     memory_pool.MLATokenToKVPool = _FakeMLATokenToKVPool
     memory_pool.get_tensor_size_bytes = lambda tensor: tensor.nbytes
     memory_pool.maybe_detect_oob = lambda *args, **kwargs: None
-    memory_pool.unwrap_write_loc = lambda loc_info: (loc_info, None, None)
+
+    pool_base = sys.modules["sglang.srt.mem_cache.pool.base"]
+    pool_base.unwrap_write_loc = lambda loc_info: (loc_info, None, None)
 
     utils = sys.modules["sglang.srt.utils"]
     utils.get_bool_env_var = lambda _name, default: default == "True"
