@@ -88,7 +88,7 @@ SGL_DEVICE CacheDType load_cache_value(const CacheDType* ptr, int64_t idx) {
 
 template <typename T>
 SGL_DEVICE T rotary_mul_rn(T lhs, T rhs) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1030 || __CUDA_ARCH__ >= 1200)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
   uint16_t lhs_bits;
   uint16_t rhs_bits;
   if constexpr (std::is_same_v<T, bf16_t>) {
@@ -116,8 +116,8 @@ SGL_DEVICE T rotary_mul_rn(T lhs, T rhs) {
 
 template <typename T>
 SGL_DEVICE T rotary_add(T x, T cos, T y, T sin) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1030 || __CUDA_ARCH__ >= 1200)
-  // nvcc may contract the packed local expression on Blackwell SM103/SM120
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  // nvcc may contract the packed local expression on Blackwell (SM100 and newer)
   // even though the reference RoPE kernel rounds both products to the
   // activation dtype first.
   const T lhs = rotary_mul_rn(x, cos);
@@ -149,7 +149,7 @@ SGL_DEVICE T rotary_add(T x, T cos, T y, T sin) {
 
 template <typename T>
 SGL_DEVICE T rotary_sub(T x, T cos, T y, T sin) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1030 || __CUDA_ARCH__ >= 1200)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
   const T lhs = rotary_mul_rn(x, cos);
   const T rhs = rotary_mul_rn(y, sin);
   uint16_t lhs_bits;

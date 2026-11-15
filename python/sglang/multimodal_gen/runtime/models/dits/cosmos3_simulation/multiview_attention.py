@@ -750,28 +750,6 @@ def get_multiview_attention_plan(
     return plan, geometry
 
 
-def get_multiview_block_mask(
-    context: MultiviewAttentionContext,
-    *,
-    real_und_len: int,
-    real_q_len: int,
-    device: torch.device,
-) -> tuple[BlockMask, PaddedAttentionGeometry]:
-    """Request-local ``BlockMask`` for the Triton FlexAttention backend."""
-    plan, geometry = get_multiview_attention_plan(
-        context,
-        real_und_len=real_und_len,
-        real_q_len=real_q_len,
-        device=device,
-    )
-    if not isinstance(plan, BlockMask):
-        raise TypeError(
-            "Cosmos3 multiview get_multiview_block_mask requires backend='triton', "
-            f"got {context.layout.backend!r}; use get_multiview_attention_plan instead."
-        )
-    return plan, geometry
-
-
 def _packing_buffer(
     cache: MutableMapping[tuple[Any, ...], torch.Tensor] | None,
     slot: str,

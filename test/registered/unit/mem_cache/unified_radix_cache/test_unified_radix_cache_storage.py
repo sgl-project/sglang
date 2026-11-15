@@ -1324,6 +1324,36 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             source.host_pool.free(indices)
 
     @requires_hicache
+    @requires_swa
+    def test_buffer_only_kv_short_prefetch_heals_swa_window_beliefs(self):
+        """A rank whose KV read falls short skips the SWA read; its discard must
+        still drop the window beliefs that a peer which read the window drops."""
+        storage_dir = self._make_storage_dir()
+        seq = self._buffer_swa_seq()
+        prod, prod_alloc, prod_rtp = self._build_buffer_hicache_fixture(storage_dir)
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        leaf = match_prefix(prod, seq).last_device_node
+        self._buffer_backup_and_wait(prod, leaf)
+        page_hashes = self._all_page_hashes(prod, leaf)
+
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+        swa_beliefs = cons.storage_existence_cache.pool(PoolName.SWA)
+        swa_beliefs.add(page_hashes)
+        req_id = CacheRequestHandle("kv-short", 0)
+        with mock.patch.object(cons.cache_controller, "page_get_func", return_value=0):
+            cons.prefetch_from_storage(
+                req_id, cons.root_node_handle(), array("q", seq), None, None
+            )
+            self._pump_hicache_until(
+                cons,
+                lambda: cons.check_prefetch_progress(req_id),
+                "short prefetch did not finish",
+            )
+        self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
+        self.assertFalse(swa_beliefs.contains(page_hashes[-1]))
+        cons.sanity_check()
+
+    @requires_hicache
     def test_buffer_only_read_path_roundtrip(self):
         """Read path end to end: prefetch -> staged -> load-back that evicts before
         alloc and publishes pre-ack -> ack frees the bounce."""

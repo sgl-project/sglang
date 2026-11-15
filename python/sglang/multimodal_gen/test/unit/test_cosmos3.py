@@ -20,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     is_nano_checkpoint,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
+    CosmosDreamsConfig,
+)
 from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
@@ -38,6 +41,7 @@ from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_metadata,
     build_action_sampling_params,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     VideoGenerationsRequest,
@@ -65,6 +69,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     sequence_shard_padding,
     shard_sequence,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
@@ -82,6 +87,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
+from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
 from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
@@ -613,6 +619,80 @@ class TestCosmos3EdgeSamplingDefaults(unittest.TestCase):
         sp = Cosmos3SamplingParams(prompt="t", num_frames=81, width=1024, height=576)
         sp._resolve_variant_defaults(is_edge=True)
         self.assertEqual((sp.width, sp.height), (1024, 576))
+
+
+def _cosmos3_size_server_args(config=None):
+    server_args = _cosmos3_server_args(config)
+    server_args.backend = "sglang"
+    server_args.performance_mode = "manual"
+    server_args.enable_cfg_parallel = False
+    server_args.enable_breakable_cuda_graph = False
+    server_args.enable_torch_compile = False
+    server_args.enable_trace = False
+    server_args.attention_backend_config = {}
+    server_args.warmup_steps = 1
+    server_args.warmup_num_frames = None
+    return server_args
+
+
+def _build_cosmos3_sampling(server_args, data_type, fields):
+    with (
+        mock.patch.object(
+            openai_utils, "get_global_server_args", return_value=server_args
+        ),
+        mock.patch.object(
+            SamplingParams, "from_pretrained", return_value=Cosmos3SamplingParams()
+        ),
+    ):
+        return openai_utils.build_sampling_params(
+            "size", prompt="a cat", request_data_type=data_type, **fields
+        )
+
+
+class TestCosmos3RequestSizeAlignment(unittest.TestCase):
+    """Requested sizes reach the latent stage as multiples of 16."""
+
+    def _assert_latent_stage_accepts(self, sampling, server_args):
+        stage = Cosmos3LatentPreparationStage(vae=None, transformer=None)
+        result = stage.verify_input(Req(sampling_params=sampling), server_args)
+        self.assertTrue(result.is_valid(), result.get_failure_summary())
+
+    def test_http_size_aligns_to_the_latent_grid(self):
+        server_args = _cosmos3_size_server_args()
+        for data_type, fields, expected in (
+            (DataType.IMAGE, {"size": "1920x1080", "num_frames": 1}, (1920, 1072)),
+            (DataType.IMAGE, {"size": "854x480", "num_frames": 1}, (848, 480)),
+            (DataType.VIDEO, {"size": "1920x1080", "num_frames": 17}, (1920, 1072)),
+            (DataType.VIDEO, {"width": 854, "height": 480}, (848, 480)),
+            (DataType.IMAGE, {"size": "1280x720", "num_frames": 1}, (1280, 720)),
+            (DataType.VIDEO, {"size": "832x480", "num_frames": 17}, (832, 480)),
+            (DataType.VIDEO, {}, (1280, 720)),
+        ):
+            with self.subTest(data_type=data_type, fields=fields):
+                sampling = _build_cosmos3_sampling(server_args, data_type, fields)
+                self.assertEqual((sampling.width, sampling.height), expected)
+                self._assert_latent_stage_accepts(sampling, server_args)
+
+    def test_simulation_configs_keep_requested_size(self):
+        server_args = _cosmos3_size_server_args(CosmosDreamsConfig())
+        sampling = _build_cosmos3_sampling(
+            server_args, DataType.VIDEO, {"size": "854x480", "num_frames": 17}
+        )
+        self.assertEqual((sampling.width, sampling.height), (854, 480))
+
+    def test_warmup_resolution_aligns_to_the_latent_grid(self):
+        server_args = _cosmos3_size_server_args()
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=Cosmos3SamplingParams(),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["1920x1080"],
+                warmup_input_path="warmup.png",
+                server_based_warmup=True,
+            )
+        self.assertEqual([(r.width, r.height) for r in reqs], [(1920, 1072)])
 
 
 class TestCosmos3SamplingParamsDataType(unittest.TestCase):

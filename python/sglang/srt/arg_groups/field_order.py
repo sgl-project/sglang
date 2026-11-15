@@ -570,6 +570,7 @@ POSITIONAL_FIELD_ORDER = (
     "layernorm_sp_min_tokens",
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
+    "hybrid_cache_checkpoints_level",
     # Kimi-K3.1 additions, appended to keep existing positional slots
     "enable_flashmla_prefill_token_packing",
 )

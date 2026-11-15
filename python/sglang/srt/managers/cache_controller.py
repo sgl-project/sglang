@@ -1156,7 +1156,7 @@ class HiCacheController:
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
         elif self.io_backend == "kernel_ascend":
-            from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+            from sglang.srt.mem_cache.pool_host.npu_host_memory import (
                 ascendc_io_enabled,
                 to_device_no_sync,
             )
