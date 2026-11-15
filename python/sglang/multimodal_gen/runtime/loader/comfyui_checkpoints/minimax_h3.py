@@ -25,9 +25,16 @@ def _build_dit_config(server_args: ServerArgs) -> MiniMaxH3DiTConfig:
     # ``sglang serve`` keeps the default grouped HF reorder.
     dit_config.arch_config.qkv_checkpoint_grouped = False
     # FastH3 single files (FastVideo's Comfy release) are the base layout plus
-    # the VSA compression gate on every block's attention.
-    if has_vsa_gate(getattr(server_args, "model_path", None)):
-        dit_config.arch_config.has_gate_compress = True
+    # the VSA compression gate on every block's attention. Quantized exports can
+    # drop those gates (the Comfy int8 convrot video file has none), so probe the
+    # single file actually loaded instead of the pipeline default; the dense
+    # backends never read `to_gate_compress` (see `_attend`).
+    component_weights_paths = getattr(server_args, "component_weights_paths", {})
+    weights_path = component_weights_paths.get("transformer")
+    if not weights_path:
+        weights_path = getattr(server_args, "model_path", None)
+    if weights_path and str(weights_path).endswith(".safetensors"):
+        dit_config.arch_config.has_gate_compress = has_vsa_gate(str(weights_path))
     return dit_config
 
 
