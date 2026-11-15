@@ -41,19 +41,26 @@ except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash 
     flash_attn_func = None  # type: ignore
     _HAS_FLASH_ATTN = False
 
+XPU_FLASH_ATTN_SUPPORTED = False
+XPU_FLASH_ATTN_HEAD_SIZES = ()
 if current_platform.is_xpu():
-    import sgl_kernel.flash_attn as xpu_flash_attn
+    # An XPU install whose sgl_kernel lacks flash_attn (or is_fa3_supported)
+    # falls back to SDPA instead of failing to import this module.
+    try:
+        import sgl_kernel.flash_attn as xpu_flash_attn
 
-    from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_backend import (
-        XPUAttentionBackend,
-    )
+        from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_backend import (
+            XPUAttentionBackend,
+        )
 
-    # sgl-kernel-xpu flash attention needs BMG or later.
-    XPU_FLASH_ATTN_SUPPORTED = xpu_flash_attn.is_fa3_supported()
-    XPU_FLASH_ATTN_HEAD_SIZES = tuple(XPUAttentionBackend.get_supported_head_sizes())
-else:
-    XPU_FLASH_ATTN_SUPPORTED = False
-    XPU_FLASH_ATTN_HEAD_SIZES = ()
+        # sgl-kernel-xpu flash attention needs BMG or later.
+        XPU_FLASH_ATTN_SUPPORTED = xpu_flash_attn.is_fa3_supported()
+        XPU_FLASH_ATTN_HEAD_SIZES = tuple(
+            XPUAttentionBackend.get_supported_head_sizes()
+        )
+    except (ImportError, AttributeError):
+        XPU_FLASH_ATTN_SUPPORTED = False
+        XPU_FLASH_ATTN_HEAD_SIZES = ()
 
 
 # Attention backend dispatch.
