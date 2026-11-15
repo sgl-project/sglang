@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.mem_cache.kv.alloc import band as band_module
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -49,7 +50,8 @@ def _cuda(values):
 
 class _Step:
     """One scheduling step's allocator calls on a two-request batch: extend,
-    decode, a window's tail-only extend, window retirement and release."""
+    decode, a window's tail-only extend, window retirement, a fresh request's
+    state clear and release."""
 
     def __init__(self, allocator):
         self.allocator = allocator
@@ -71,6 +73,10 @@ class _Step:
         self.tail_prefix = torch.zeros(1, dtype=torch.int64)
         self.tail_prefix_d = _cuda([0])
         self.tail_last = _cuda([-1])
+        if self.has_state:
+            name = allocator.mamba_allocator.sub_pool_name
+            first = allocator.arena.first_entry(name)
+            self.state_entries = _cuda([first, first + 1])
 
     def extend(self):
         self.out = self.allocator.alloc_extend(
@@ -126,6 +132,9 @@ class _Step:
         assert slots is not None
         self.allocator.mamba_allocator.free(slots)
 
+    def clear_state(self):
+        self.allocator.state.pool.clear_slots(self.state_entries)
+
 
 class TestUnifiedSchedulingNoHostSync(CustomTestCase):
     def _allocator(self, chain):
@@ -152,6 +161,7 @@ class TestUnifiedSchedulingNoHostSync(CustomTestCase):
             errors["decode"] = check(lambda: decoded.append(decode()))
             if step.has_state:
                 errors["state slots"] = check(step.state_slots)
+                errors["state clear"] = check(step.clear_state)
             if step.has_window:
                 tail = []
                 errors["window tail extend"] = check(
@@ -169,6 +179,33 @@ class TestUnifiedSchedulingNoHostSync(CustomTestCase):
             with self.subTest(chain=chain):
                 errors = self._run(_Step(self._allocator(chain)))
                 self.assertEqual(errors, {}, f"{chain} synchronized: {errors}")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_a_checked_state_copy_does_not_synchronize(self):
+        """A prefill's copy-on-write of prefix-hit states with invariant checks
+        on: 32 pairs, several of them copying one cached source."""
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                **CHAINS["full+state"],
+                page_size=PAGE_SIZE,
+                full_tokens=64 * PAGE_SIZE,
+                swa_tokens=64 * PAGE_SIZE,
+                state_slots=40,
+                device="cuda",
+            )
+        ).token_to_kv_pool_allocator
+        name = allocator.mamba_allocator.sub_pool_name
+        self.assertGreaterEqual(allocator.arena.num_entries(name), 36)
+        first = allocator.arena.first_entry(name)
+        src = torch.tensor(
+            [first + i % 4 for i in range(32)], dtype=torch.int32, device="cuda"
+        )
+        dst = torch.arange(first + 4, first + 36, dtype=torch.int32, device="cuda")
+        pool = allocator.state.pool
+        with envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.WARN)):
+            pool.copy_from(src, dst)
+            self.assertIsNone(_sync_error(lambda: pool.copy_from(src, dst)))
 
 
 class TestNoHostReadAfterAStreamWait(CustomTestCase):
