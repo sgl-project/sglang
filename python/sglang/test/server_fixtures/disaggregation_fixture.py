@@ -288,19 +288,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         time.sleep(5)
 
 
-def popen_launch_sgl_router(
-    model: str,
-    worker_urls: list[str],
-    *,
-    host: str,
-    port: str,
-    request_timeout_secs: int = SGL_ROUTER_REQUEST_TIMEOUT_SECS,
-) -> subprocess.Popen:
-    """Launch sgl-router in front of `worker_urls` and wait until it is ready.
-
-    The router reads each worker's PD role from its `/server_info`, so prefill
-    and decode URLs go in one list.
-    """
+def find_sgl_router_binary() -> str:
     name = envs.SGLANG_TEST_PD_ROUTER_BINARY.get()
     binary = shutil.which(name)
     if binary is None:
@@ -309,7 +297,25 @@ def popen_launch_sgl_router(
             "`cargo build --release --bin sgl-router` in sgl-router/, then put it "
             "on PATH or set SGLANG_TEST_PD_ROUTER_BINARY to its path."
         )
-    command = [
+    return binary
+
+
+def sgl_router_command(
+    binary: str,
+    model: str,
+    worker_urls: list[str],
+    *,
+    host: str,
+    port: str,
+    request_timeout_secs: int,
+    extra_args: list[str],
+) -> list[str]:
+    """Build the sgl-router command line for `worker_urls`.
+
+    The router reads each worker's PD role and bootstrap port from its
+    `/server_info`, so prefill and decode URLs go in one list.
+    """
+    return [
         binary,
         "--model-id",
         model,
@@ -324,12 +330,34 @@ def popen_launch_sgl_router(
         "--no-tokenizer",
         "--request-timeout-secs",
         str(request_timeout_secs),
+        # The stale-request reaper (600s by default) would cut a request the
+        # request timeout still allows.
         "--stale-request-timeout-secs",
         str(request_timeout_secs),
+        *extra_args,
+    ]
+
+
+def popen_launch_sgl_router(
+    model: str,
+    worker_urls: list[str],
+    *,
+    host: str,
+    port: str,
+    request_timeout_secs: int = SGL_ROUTER_REQUEST_TIMEOUT_SECS,
+) -> subprocess.Popen:
+    """Launch sgl-router in front of `worker_urls` and wait until it is ready."""
+    command = sgl_router_command(
+        find_sgl_router_binary(),
+        model,
+        worker_urls,
+        host=host,
+        port=port,
+        request_timeout_secs=request_timeout_secs,
         # Tests inject transfer failures on purpose; with one worker per role an
         # open breaker would turn the requests after them into 503s.
-        "--disable-circuit-breaker",
-    ]
+        extra_args=["--disable-circuit-breaker"],
+    )
     print("Starting sgl-router:", shlex.join(command))
     process = popen_with_error_check(command)
     # /health answers 200 as soon as the process listens; /readiness waits for
