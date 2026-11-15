@@ -1,0 +1,286 @@
+name: NVIDIA GB300 Qwen cache probe
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: ['.github/workflows/nvidia-gb300-qwen-cache-probe.yml']
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: nvidia-gb300-qwen-cache-probe-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  call-gate:
+    if: github.repository == 'sgl-project/sglang'
+    uses: sgl-project/sglang/.github/workflows/pr-gate.yml@40c2faa94d4ca7772da4de72beffd8e7802ece5b
+    with:
+      require-run-ci: true
+
+  qwen-cache-probe:
+    needs: call-gate
+    permissions: {}
+    runs-on: nvoss-sg-l-gb300-4-a
+    # Startup allowance; this does not measure cold-image-pull time.
+    timeout-minutes: 20
+    container:
+      image: lmsysorg/sglang@sha256:9b524a335866163c89d28652f1c9a0fc603bc386143e47659fb5dfcb611479b3
+      options: --user 1001
+    env:
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+      HF_HUB_DISABLE_XET: '1'
+      DO_NOT_TRACK: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      PROBE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PROBE_IMAGE: lmsysorg/sglang@sha256:9b524a335866163c89d28652f1c9a0fc603bc386143e47659fb5dfcb611479b3
+    steps:
+      - name: Inspect read-only Qwen cache and offline model-ID lookup
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B <<'PYTHON'
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          import platform
+          import re
+          import stat
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          MODEL = "Qwen/Qwen3-8B"
+          MAX_METADATA = 16 * 1024 * 1024
+
+
+          class ProbeError(Exception):
+              def __init__(self, category, message):
+                  self.category = category
+                  super().__init__(message)
+
+
+          def emit(event, **values):
+              print(json.dumps({"event": event, **values}, sort_keys=True), flush=True)
+
+
+          def require(condition, message):
+              if not condition:
+                  raise ProbeError("UNSAFE_CACHE", message)
+
+
+          def readonly(path):
+              require(bool(os.statvfs(path).f_flag & os.ST_RDONLY),
+                      f"Filesystem is not read-only: {path}")
+
+
+          def checked(path, repository):
+              try:
+                  resolved = path.resolve(strict=True)
+              except FileNotFoundError:
+                  if path.is_symlink():
+                      raise ProbeError("BROKEN_LINK", f"Broken selected snapshot/blob link: {path}") from None
+                  raise
+              require(resolved.is_relative_to(repository), f"Escaping cache path: {path}")
+              readonly(resolved)
+              return resolved
+
+
+          def manifest(root, repository=None):
+              # Observe only this model repository; never hash or read weight contents.
+              result = {}
+              def walk_error(error):
+                  raise error
+              for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
+                  for path in [Path(directory), *(Path(directory) / n for n in dirs + files)]:
+                      require(len(result) < 10000, "Qwen inventory exceeds 10000 entries")
+                      info = path.lstat()
+                      require(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+                              or stat.S_ISLNK(info.st_mode), f"Unsupported cache entry: {path}")
+                      if repository is not None:
+                          resolved = checked(path, repository)
+                          if path.is_symlink():
+                              require(resolved.is_file() and resolved.is_relative_to(repository / "blobs"),
+                                      f"Snapshot link does not resolve to an in-repository blob: {path}")
+                      result[str(path.relative_to(root))] = [
+                          info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+                          info.st_dev, info.st_ino, os.readlink(path) if path.is_symlink() else None,
+                      ]
+              return result
+
+
+          def read_asset(path, repository, limit):
+              target = checked(path, repository)
+              require(target.is_file(), f"Not a regular asset: {path}")
+              with target.open("rb") as stream:
+                  size = os.fstat(stream.fileno()).st_size
+                  if size == 0 or (limit > 1 and size > limit):
+                      raise ProbeError("INVALID_ASSET", f"Empty or oversized metadata: {path}")
+                  data = stream.read(limit + 1 if limit > 1 else 1)
+              if not data or (limit > 1 and len(data) > limit):
+                  raise ProbeError("INVALID_ASSET", f"Unreadable or oversized asset: {path}")
+              return data, size
+
+
+          def run():
+              require(os.getuid() == 1001 and platform.system() == "Linux"
+                      and platform.machine() == "aarch64", "Expected UID1001 on Linux aarch64")
+              emit("runtime", uid=os.getuid(), gid=os.getgid(), platform=platform.platform(),
+                   provenance={k: os.environ.get(k) for k in (
+                       "RUNNER_NAME", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA",
+                       "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA", "PROBE_HEAD_SHA", "PROBE_IMAGE")})
+              versions = {}
+              for package in ("sglang", "huggingface_hub", "transformers", "tokenizers", "torch", "safetensors"):
+                  try:
+                      versions[package] = importlib.metadata.version(package)
+                  except importlib.metadata.PackageNotFoundError:
+                      versions[package] = "not installed"
+              emit("image_library_versions", python=platform.python_version(), versions=versions,
+                   scope="Published image diagnostic; not the native suite environment")
+
+              # Separate process: observe the installed Hub's inherited constants before
+              # redirecting private generated state or importing libraries in this process.
+              discovery = subprocess.run([
+                  sys.executable, "-B", "-c",
+                  "import json; from huggingface_hub import constants as c; "
+                  "print(json.dumps({k: str(getattr(c, k)) for k in "
+                  "('HF_HOME', 'HF_HUB_CACHE', 'HUGGINGFACE_HUB_CACHE')}))",
+              ], capture_output=True, text=True, timeout=20, check=True)
+              inherited = json.loads(discovery.stdout)
+              emit("inherited_hub_paths", paths=inherited)
+              hub = Path(inherited["HF_HUB_CACHE"]).expanduser().resolve(strict=True)
+              readonly(hub)
+              repository = (hub / "models--Qwen--Qwen3-8B").resolve(strict=True)
+              require(repository.is_relative_to(hub), "Model repository escapes inherited Hub root")
+              readonly(repository)
+              emit("read_only_cache", hub=str(hub), repository=str(repository), method="statvfs ST_RDONLY")
+              before = manifest(repository)
+              try:
+                  reference = repository / "refs" / "main"
+                  revision = read_asset(reference, repository, 128)[0].decode("ascii").strip()
+                  if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                      raise ProbeError("INVALID_ASSET", "refs/main is not a full cached commit SHA")
+                  snapshot = repository / "snapshots" / revision
+                  require(stat.S_ISDIR(snapshot.stat().st_mode) and not snapshot.is_symlink(), "Invalid snapshot directory")
+                  checked(snapshot, repository)
+                  # Validate all links the selected tokenizer could use, not abandoned revisions.
+                  manifest(snapshot, repository)
+                  emit("cached_revision", model=MODEL, revision=revision, hub=str(hub), snapshot=str(snapshot))
+
+                  # A complete fast tokenizer can use tokenizer.json without separate vocab/merges.
+                  required = ("config.json", "tokenizer_config.json", "tokenizer.json",
+                              "model.safetensors.index.json")
+                  optional = []
+                  for name in ("vocab.json", "merges.txt"):
+                      if (snapshot / name).exists():
+                          optional.append(name)
+                      else:
+                          emit("optional_asset_absent", name=name)
+                  metadata = {}
+                  for name in (*required, *optional):
+                      data, size = read_asset(snapshot / name, repository, MAX_METADATA)
+                      if name.endswith(".json"):
+                          metadata[name] = json.loads(data)
+                      emit("metadata_asset", name=name, bytes=size, sha256=hashlib.sha256(data).hexdigest())
+                  if metadata["config.json"].get("model_type") != "qwen3":
+                      raise ProbeError("INVALID_ASSET", "Cached config is not a Qwen3 configuration")
+                  weight_map = metadata["model.safetensors.index.json"].get("weight_map")
+                  if not isinstance(weight_map, dict) or not 1 <= len(weight_map) <= 100000:
+                      raise ProbeError("INVALID_ASSET", "Missing, empty or oversized safetensors weight_map")
+                  shards = set()
+                  for name in weight_map.values():
+                      require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_-]+\.safetensors", name),
+                              "Unsafe shard name in weight_map")
+                      shards.add(name)
+                  require(len(shards) <= 128, "Unexpectedly large shard count")
+                  for name in sorted(shards):
+                      _, size = read_asset(snapshot / name, repository, 1)
+                      emit("weight_shard", name=name, bytes=size, readable=True)
+                  emit("structural_assets_pass", shards=len(shards),
+                       scope="Presence, size and one-byte readability; not full weight integrity")
+
+                  with tempfile.TemporaryDirectory(prefix="qwen-cache-probe-", dir="/tmp") as scratch:
+                      private = Path(scratch)
+                      for key, subdir in {
+                          "HF_HOME": "hf", "HF_MODULES_CACHE": "modules", "HF_DATASETS_CACHE": "datasets",
+                          "HF_ASSETS_CACHE": "assets", "HF_XET_CACHE": "xet", "XDG_CACHE_HOME": "xdg",
+                          "TORCH_HOME": "torch", "TRITON_CACHE_DIR": "triton", "TMPDIR": "tmp",
+                      }.items():
+                          path = private / subdir
+                          path.mkdir(mode=0o700)
+                          os.environ[key] = str(path)
+                      tempfile.tempdir = os.environ["TMPDIR"]
+                      for key in ("TRANSFORMERS_CACHE", "PYTORCH_TRANSFORMERS_CACHE", "PYTORCH_PRETRAINED_BERT_CACHE",
+                                  "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+                          os.environ.pop(key, None)
+                      os.environ.update(HF_HUB_CACHE=str(hub), HUGGINGFACE_HUB_CACHE=str(hub),
+                                        HF_TOKEN_PATH=str(private / "no-token"), USE_TORCH="0", USE_TF="0", USE_FLAX="0")
+
+                      def offline_guard(event, args):
+                          if event in ("socket.connect", "socket.getaddrinfo"):
+                              raise ProbeError("NETWORK_BLOCKED", "Network access attempted during offline lookup")
+                      sys.addaudithook(offline_guard)
+                      from huggingface_hub import constants, try_to_load_from_cache
+                      from transformers import AutoConfig, AutoTokenizer
+
+                      require(Path(constants.HF_HUB_CACHE) == hub, "Effective Hub root changed unexpectedly")
+                      emit("lookup_paths", hf_home=constants.HF_HOME, hub=constants.HF_HUB_CACHE,
+                           temporary=os.environ["TMPDIR"], revision=revision, offline=True,
+                           library_sources={name: sys.modules[name].__file__ for name in ("huggingface_hub", "transformers")})
+                      for name in required:
+                          located = try_to_load_from_cache(MODEL, name, revision=revision)
+                          require(isinstance(located, str) and Path(located) == snapshot / name,
+                                  f"Model-ID lookup did not select the verified snapshot: {name}")
+                      options = dict(revision=revision, local_files_only=True, trust_remote_code=False, token=False)
+                      try:
+                          config = AutoConfig.from_pretrained(MODEL, **options)
+                          tokenizer = AutoTokenizer.from_pretrained(MODEL, **options)
+                      except ProbeError:
+                          raise
+                      except Exception as error:
+                          raise ProbeError("OFFLINE_LOOKUP_ERROR", type(error).__name__) from None
+                      require(config.model_type == "qwen3", "AutoConfig did not load Qwen3")
+                      emit("offline_lookup_pass", config_class=type(config).__name__,
+                           tokenizer_class=type(tokenizer).__name__, revision=revision)
+                  if read_asset(reference, repository, 128)[0].decode("ascii").strip() != revision:
+                      raise ProbeError("REVISION_CHANGED", "Cached refs/main changed; result is inconclusive")
+              finally:
+                  after = manifest(repository)
+                  if before != after:
+                      raise ProbeError("CACHE_CHANGED", "Qwen repository metadata changed during the probe")
+                  emit("cache_unchanged", entries=len(after),
+                       scope="Qwen repository names, links and stat metadata; excludes access time")
+              emit("PASS", model=MODEL, revision=revision,
+                   scope="Read-only cache structure and offline config/tokenizer lookup only; no inference")
+
+
+          if __name__ == "__main__":
+              try:
+                  run()
+              except FileNotFoundError:
+                  emit("FAIL", category="CACHE_MISSING", detail="Missing cache root, Qwen repository, ref, asset or blob")
+                  sys.exit(2)
+              except PermissionError:
+                  emit("FAIL", category="CACHE_PERMISSION", detail="UID1001 cannot read a required cache path")
+                  sys.exit(3)
+              except (json.JSONDecodeError, UnicodeError):
+                  emit("FAIL", category="INVALID_ASSET", detail="Malformed cached JSON or revision text")
+                  sys.exit(4)
+              except ProbeError as error:
+                  emit("FAIL", category=error.category, detail=str(error))
+                  sys.exit(4)
+              except Exception as error:
+                  # Avoid dumping tokens or arbitrary library exception payloads to public logs.
+                  emit("FAIL", category="PROBE_ERROR", error_type=type(error).__name__)
+                  sys.exit(5)
+          PYTHON
