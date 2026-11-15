@@ -283,7 +283,7 @@ class InklingOutputParser:
 
     def _tool_call(self, message: Any) -> InklingToolCall:
         chat = self._tml.chat
-        oss = chat.OpenAIMessage.to_oss_messages(
+        oss = chat.OpenAIMessage.to_openai_chat_dicts(
             chat.OpenAIMessage.from_messages([message])
         )
         function = oss[0]["tool_calls"][0]["function"]
