@@ -504,9 +504,13 @@ ARG MORI_COMMIT="f39fa765e897c95995957d0518908cc982a88fc2"
 # Enabled by default; disable with --build-arg ENABLE_NIXL=0.
 ARG ENABLE_NIXL=1
 ARG UCX_REPO="https://github.com/openucx/ucx.git"
-ARG UCX_BRANCH="v1.19.x"
+# UCX master: ROCm PD needs openucx/ucx#12150, #12178 and #12228, none in a UCX release yet.
+ARG UCX_COMMIT="929abbbae5f925189282c9147949e6bb77c02914"
+# Optional: build this UCX branch or tag instead of UCX_COMMIT.
+ARG UCX_BRANCH=""
 ARG NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
-ARG NIXL_COMMIT="c28061f9782e099f975bcc79198b7b5a1a36cc40"
+# NIXL main: needs ai-dynamo/nixl#2371 (ROCM_IPC_MIN_ZCOPY=0, XGMI for GPU RMA); not in v1.5.2.
+ARG NIXL_COMMIT="c656976fcd6d3b10e34ecae01bfbc399b275f574"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5-a-38
@@ -812,23 +816,23 @@ RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 RUN cd sglang \
     && cp python/pyproject_other.toml python/pyproject.toml \
     && case "${GPU_ARCH}" in \
-         *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip"; \
+         *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip,fastokens"; \
                      all_extras="all_hip_rocm724" ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
-         *-rocm1010) srt_extras="srt_hip_rocm101,diffusion_hip"; \
+         *-rocm1010) srt_extras="srt_hip_rocm101,diffusion_hip,fastokens"; \
                      all_extras="all_hip_rocm101" ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
-         *-rocm724) srt_extras="srt_hip_rocm724,diffusion_hip"; \
+         *-rocm724) srt_extras="srt_hip_rocm724,diffusion_hip,fastokens"; \
                     all_extras="all_hip_rocm724" ; \
                     CONS="-c /tmp/constraints.txt" ; \
                     ;; \
-         *-rocm720) srt_extras="srt_hip,diffusion_hip"; \
+         *-rocm720) srt_extras="srt_hip,diffusion_hip,fastokens"; \
                     all_extras="all_hip" ; \
                     CONS="-c /tmp/constraints.txt" ; \
                     ;; \
-         *) srt_extras="srt_hip,diffusion_hip"; \
+         *) srt_extras="srt_hip,diffusion_hip,fastokens"; \
             all_extras="all_hip" ; \
             CONS="-c /tmp/constraints.txt" ; \
             echo 'diffusers==0.37.0' >> /tmp/constraints.txt ; \
@@ -1119,7 +1123,12 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     case "${GPU_ARCH}" in *-rocm724|*-rocm1000) apt-get remove -y libabsl-dev ;; esac; \
   fi; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
-  git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
+  if [ -n "${UCX_BRANCH}" ]; then \
+    git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
+  else \
+    git clone "${UCX_REPO}" /sgl-workspace/ucx; \
+    git -C /sgl-workspace/ucx checkout -f "${UCX_COMMIT}"; \
+  fi; \
   cd /sgl-workspace/ucx && ./autogen.sh && mkdir build && cd build && \
   ../configure --prefix=/opt/ucx --enable-shared --disable-static --disable-doxygen-doc \
       --enable-optimizations --enable-devel-headers \

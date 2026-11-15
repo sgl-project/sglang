@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -55,6 +56,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
+from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -63,7 +65,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
-from sglang.srt.mem_cache.capacity import create_prefill_budget
+from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -190,13 +192,28 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        shortest_prefill_aging_factor: float = 0.0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
+        if not math.isfinite(shortest_prefill_aging_factor) or (
+            shortest_prefill_aging_factor < 0
+        ):
+            raise ValueError(
+                f"shortest_prefill_aging_factor must be finite and >= 0, got {shortest_prefill_aging_factor}"
+            )
+        if (
+            shortest_prefill_aging_factor
+            and self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        ):
+            raise ValueError(
+                "shortest_prefill_aging_factor requires schedule_policy=shortest-prefill-first"
+            )
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
 
@@ -244,8 +261,10 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-                SchedulePolicy._sort_by_shortest_prefill(
-                    waiting_queue, temporary_deprioritized
+                self._sort_by_shortest_prefill(
+                    waiting_queue,
+                    temporary_deprioritized,
+                    processed_tokens=processed_tokens,
                 )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
@@ -401,28 +420,59 @@ class SchedulePolicy:
                     )
         return temporary_deprioritized
 
-    @staticmethod
-    def _shortest_prefill_work(r: Req) -> int:
-        return max(
-            1,
-            len(r.origin_input_ids) + len(r.output_ids) - r.num_matched_prefix_tokens,
+    def poll_storage_prefetches(self, waiting_queue: Iterable[Req]) -> None:
+        """Observe finished storage prefetches before ranking. Completion is
+        otherwise observed only when admission reaches a request, which a
+        request still ranked by its unloaded prefix may never do."""
+        if (
+            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            or not self.tree_cache.can_poll_prefetch_progress()
+        ):
+            return
+        self.tree_cache.poll_prefetch_progress(
+            [req.cache_request_handle for req in waiting_queue]
         )
 
-    @staticmethod
+    def _shortest_prefill_work(self, r: Req) -> int:
+        cached = max(
+            r.num_matched_prefix_tokens,
+            self.tree_cache.staged_storage_prefix_end(r.cache_request_handle),
+        )
+        return max(1, len(r.origin_input_ids) + len(r.output_ids) - cached)
+
+    def _shortest_prefill_rank(self, r: Req, processed_tokens: int) -> float:
+        # Aging lowers the rank by the prefill work done while the request
+        # waited, bounding its wait to about work / factor processed tokens.
+        waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
+        return (
+            self._shortest_prefill_work(r)
+            - self.shortest_prefill_aging_factor * waited_tokens
+        )
+
     def _sort_by_shortest_prefill(
-        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+        self,
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        *,
+        processed_tokens: int,
     ) -> None:
         # Prioritize short uncached prefills while deferring duplicate prefixes.
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
-                SchedulePolicy._shortest_prefill_work(r),
+                self._shortest_prefill_rank(r, processed_tokens),
                 r.time_stats.wait_queue_entry_time,
             )
         )
 
     def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        *,
+        processed_tokens: int,
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
@@ -431,11 +481,16 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        chunked_waited = max(0, processed_tokens - chunked_req.arrival_processed_tokens)
+        chunked_rank = remaining - self.shortest_prefill_aging_factor * chunked_waited
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if (
+                self._shortest_prefill_rank(req, processed_tokens) >= chunked_rank
+                or reserved + charge > budget - page_size
+            ):
                 break
             reserved += charge
         if not reserved:
@@ -478,7 +533,7 @@ class SchedulePolicy:
           - Maintain a monotonically increasing counter of prefill tokens processed so far
             (accumulate batch.extend_num_tokens per forward). Pass it in as `processed_tokens`.
           - Snapshot `req.arrival_processed_tokens = counter` when the req enters waiting_queue
-            (pop_bootstrapped for disagg prefill, _add_request_to_queue for unified).
+            (move_bootstrapped for disagg prefill, _add_request_to_queue for unified).
 
         Call sites that omit `processed_tokens` (dllm, disagg decode)
         degrade to rid-lexicographic order; those queues carry no prefill work.
@@ -851,6 +906,7 @@ class PrefillAdder:
             extend_input_len=extend_input_len,
             total_tokens=total_tokens,
             state_slots=state_slots,
+            request_rows=self._request_rows_for_req(req),
             max_new_tokens=self._swa_new_tokens(req),
             input_tokens=len(req.full_untruncated_fill_ids),
             chunk_limit=chunk_limit,
@@ -886,6 +942,9 @@ class PrefillAdder:
         if include_host_hit:
             slots += req.mamba_host_hit_length
         return slots
+
+    def _request_rows_for_req(self, req: Req) -> int:
+        return self.memory_budget.request_rows(req)
 
     def _request_slot_reserve_for_req(
         self, req: Req, *, extend_input_len: Optional[int] = None
@@ -925,6 +984,7 @@ class PrefillAdder:
         grid = self.mamba_chunk_grid
         return max(limit // grid * grid, min(grid, remaining))
 
+    @capacity_decision
     def budget_state(self):
         no_token = (
             self.chunked_req_waits
@@ -953,6 +1013,7 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         state_slots: int = 0,
+        request_rows: int = 0,
         request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
         replay_len: int = 0,
@@ -960,6 +1021,7 @@ class PrefillAdder:
         deferred_max_new_tokens: int = 0,
         admitted_chunk_limit: Optional[int] = None,
         cached_tokens: Optional[int] = None,
+        reuses_kv: bool = False,
     ):
         """Charge one admitted request against the prefill budgets.
 
@@ -971,7 +1033,8 @@ class PrefillAdder:
         `replay_len` cached tokens that encoder replay recomputes. The KV
         budgets take only the page-ceiled extend. Exact-chunk-fill bills the
         compute budgets the raw extend instead, all alike, so none runs out
-        first with rounding slack unspent.
+        first with rounding slack unspent. An extend that ``reuses_kv`` rows it
+        holds takes compute alone.
         """
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         raw_extend_input_len = extend_input_len
@@ -987,7 +1050,7 @@ class PrefillAdder:
             extend_input_len = rounded_extend_input_len
 
         self.memory_budget.reserve(
-            extend_input_len,
+            0 if reuses_kv else extend_input_len,
             max_new_tokens,
             # reserve() already charges one page; add the remaining shard pages.
             extra_tokens=(
@@ -997,6 +1060,7 @@ class PrefillAdder:
             ),
             # Debit only working/tracking state that still awaits allocation.
             state_slots=state_slots,
+            request_rows=request_rows,
             chunk_limit=self.rem_chunk_tokens,
             is_chunked_continuation=is_chunked_continuation,
             unfinished_input_len=unfinished_input_len,
@@ -1073,7 +1137,11 @@ class PrefillAdder:
             reason=reason,
         )
 
-    def _get_dllm_remain_tokens(self, req: Optional[Req] = None) -> int:
+    def _get_dllm_remain_tokens(
+        self, req: Optional[Req] = None, *, reuses_kv: bool = False
+    ) -> int:
+        if self.memory_budget.prices_by_demand:
+            return self._get_dllm_remain_tokens_by_demand(req, reuses_kv=reuses_kv)
         _rem_tokens = min(self.rem_dllm_tokens, int(self.rem_total_tokens))
         if not (
             self.dllm_config.requires_separate_context_encoding
@@ -1091,6 +1159,41 @@ class PrefillAdder:
                     _rem_tokens,
                     int(self.memory_budget.remaining_window_tokens) - self.page_size,
                 )
+        return _rem_tokens
+
+    def _get_dllm_remain_tokens_by_demand(
+        self, req: Optional[Req] = None, *, reuses_kv: bool = False
+    ) -> int:
+        """`_get_dllm_remain_tokens` over a budget that prices demands: the largest
+        block it admits (beside this pass's writes, for separate context encoding).
+        A block that ``reuses_kv`` takes no new rows, so only compute bounds it.
+        Without separate context encoding a cut chunk is a whole block or none:
+        its rows are checkpointed, and a later match must end on the block grid."""
+        separate = self.dllm_config.requires_separate_context_encoding
+        cap = self.rem_dllm_tokens
+        if not (separate and req is not None and req.is_dllm_prefill()):
+            cap = min(cap, self.dllm_block_size)
+        if reuses_kv:
+            return max(0, cap)
+        # Priced as the block's own take: the pages past those its prefix fills,
+        # with no rounding page (`per_req_token_overhead`) beyond them.
+        block = dict(
+            prefix_tokens=req.prefix_len if req is not None else 0,
+            extra_tokens=(
+                self._request_slot_reserve_for_req(req) if req is not None else 0
+            ),
+        )
+        _rem_tokens = self.memory_budget.largest_block_tokens(
+            cap, granule=1 if separate else self.dllm_block_size, **block
+        )
+        if _rem_tokens <= 0:
+            # No block fits: the request waits (`NO_TOKEN`).
+            return 0
+        if separate:
+            _rem_tokens = min(
+                _rem_tokens,
+                self.memory_budget.largest_block_tokens(_rem_tokens, now=True, **block),
+            )
         return _rem_tokens
 
     def _get_dllm_extend_len(self, req: Req, prefix_len: int) -> int:
@@ -1126,6 +1229,7 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             replay_len=self._replay_len(req, prefix_len),
         )
         self._account_prefill_cache_admission(req, prefix_len)
@@ -1162,9 +1266,26 @@ class PrefillAdder:
         self.kv_shard_chunk_pages = chunk
         return True
 
+    @capacity_decision
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
-        _rem_tokens = self._get_dllm_remain_tokens(req)
+        # A retained incomplete block runs on the rows it holds (the extend
+        # allocation reuses them), so it is priced and charged no new rows.
+        reuses_kv = (
+            bool(req.dllm_incomplete_ids)
+            and req.kv.holds_kv
+            and self.memory_budget.prices_by_demand
+        )
+        if (
+            self.memory_budget.prices_by_demand
+            and self.tree_cache.supports_swa()
+            and not self.tree_cache.supports_prefix_sharing()
+        ):
+            # The extend retires the window rows behind its prefix before it
+            # allocates (`ScheduleBatch.maybe_evict_swa`, dLLM runs without
+            # overlap); retire them first, so the block is priced on what it holds.
+            retire_window(req, req.prefix_len, self.tree_cache)
+        _rem_tokens = self._get_dllm_remain_tokens(req, reuses_kv=reuses_kv)
 
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
@@ -1192,27 +1313,44 @@ class PrefillAdder:
         req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
 
-        # Update budget: reserve max_new_tokens only if not truncated
-        max_new_tokens = (
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            if not truncated
-            else 0
-        )
+        # Update budget: reserve max_new_tokens only if not truncated. A budget
+        # pricing demands reserves only the rows past this block the request may
+        # still write: rows up to extend_end are this block's or held already.
+        if truncated:
+            max_new_tokens = 0
+        elif self.memory_budget.prices_by_demand:
+            max_new_tokens = min(
+                max(
+                    len(req.origin_input_ids)
+                    + req.sampling_params.max_new_tokens
+                    - req.extend_end,
+                    0,
+                ),
+                CLIP_MAX_NEW_TOKENS,
+            )
+        else:
+            max_new_tokens = min(
+                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            )
         self._update_prefill_budget(
             0,
             req.extend_len,
             max_new_tokens,
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
+            reuses_kv=reuses_kv,
         )
 
-        # Return based on remaining token availability
-        return (
-            AddReqResult.NO_TOKEN
-            if self._get_dllm_remain_tokens(req) <= 0
-            else AddReqResult.CONTINUE
-        )
+        if self.memory_budget.prices_by_demand:
+            # Only compute stops the pass: each next request prices its own
+            # demand, and a retained block takes no fresh rows.
+            exhausted = self.rem_dllm_tokens <= 0
+        else:
+            exhausted = self._get_dllm_remain_tokens(req) <= 0
+        return AddReqResult.NO_TOKEN if exhausted else AddReqResult.CONTINUE
 
+    @capacity_decision
     def add_chunked_req(self, req: Req):
         """Add the unfinished chunked request's next chunk; returns it while it is
         unfinished. Returned but not added, it waits and closes this pass."""
@@ -1232,12 +1370,17 @@ class PrefillAdder:
                 return req
             if self.kv_shard_granule:
                 # Align the absolute boundary to keep pages within one scratch region.
-                # If no budget remains, use a full chunk to make progress.
                 prefix_len = req.prefix_len
                 floored = (
                     prefix_len + _rem_tokens
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
-                _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
+                if floored > 0:
+                    _rem_tokens = floored
+                elif _rem_tokens < self.rem_chunk_tokens:
+                    # Memory holds less than one aligned step: wait for it.
+                    return req
+                # Otherwise the chunk itself is shorter than one aligned step;
+                # take it unaligned to make progress.
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1285,6 +1428,7 @@ class PrefillAdder:
         # slot reserve, which it does not see, is checked again.
         if request_slot_reserve and not self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             paged_input=(
                 self.ceil_paged_tokens(new_len)
                 + self.per_req_token_overhead
@@ -1315,6 +1459,7 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
             # Its window rows behind the chunk are held, as its shape check
@@ -1349,6 +1494,7 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
+    @capacity_decision
     def add_one_req_ignore_eos(
         self, req: Req, truncation_align_size: Optional[int] = None
     ):
@@ -1388,6 +1534,7 @@ class PrefillAdder:
                 return self._refused()
         fits = self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             paged_input=paged_input,
             extend_input_len=cand_extend_input_len,
             max_new_tokens=self._swa_new_tokens(req),
@@ -1431,19 +1578,20 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid_swa:
-            # Skip this logic for swa. The SWA has different memory management, and
-            # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - paged_input
-            tokens_freed = 0
-            for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
-                # tokens_left gives a reservative calculation as the last token is not stored
-                bs = len(self.req_states) - i
-                min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
-                # reserve tokens for corner cases
-                if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
-                    return AddReqResult.NO_TOKEN
-                tokens_freed += tokens_occupied
+        # Window pools skip it: they admit a prompt in chunks it cannot hold whole,
+        # which this check, charging the whole prompt now, would refuse forever.
+        if not self.is_hybrid_swa and not self.memory_budget.ignore_eos_decode_fits(
+            self.req_states,
+            paged_input=paged_input,
+            reserve_tokens=IGNORE_EOS_RESERVE_TOKENS,
+            extend_input_len=cand_extend_input_len,
+            max_new_tokens=self._swa_new_tokens(req),
+            chunk_limit=chunk_limit,
+            state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
+            cached_tokens=req.prefix_len,
+        ):
+            return AddReqResult.NO_TOKEN
 
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -1489,6 +1637,7 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 state_slots=self._state_slots_for_req(req),
+                request_rows=self._request_rows_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
                 admitted_chunk_limit=chunk_limit,
                 cached_tokens=req.prefix_len,
@@ -1517,6 +1666,7 @@ class PrefillAdder:
                 0,
                 req.retracted_stain,
                 state_slots=self._state_slots_for_req(req),
+                request_rows=self._request_rows_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(
                     req, extend_input_len=trunc_len
                 ),
@@ -1556,6 +1706,7 @@ class PrefillAdder:
         """whether running work must finish before another admission attempt"""
         return bool(self.can_run_list) or not self.running_batch.is_empty()
 
+    @capacity_decision
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
@@ -1568,18 +1719,8 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, truncation_align_size)
 
-        # Reserve page_size for page-alignment overhead: the paged allocator may
-        # consume one extra page per request (see alloc_extend), which
-        # _update_prefill_budget also deducts.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
-        total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
-        # Reserve request and load-back state slots before init_load_back binds
-        # the request slot. Once loaded, only unallocated state remains pending.
-        state_slots = self._state_slots_for_req(req, include_host_hit=True)
+        max_new = self._swa_new_tokens(req)
+        total_tokens, state_slots = self._prefill_charge(req)
         if not self.memory_budget.state_slots_fit(state_slots):
             if (
                 isinstance(self.tree_cache, UnifiedRadixCache)
@@ -1587,8 +1728,6 @@ class PrefillAdder:
             ):
                 self.tree_cache.buffer_pipeline.defer_staged_admission(req, "mamba")
             return AddReqResult.NO_TOKEN
-        request_slot_reserve = self._request_slot_reserve_for_req(req)
-        total_tokens += request_slot_reserve
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
@@ -1656,6 +1795,7 @@ class PrefillAdder:
                         )
                     load_budget = dict(
                         state_slots=state_slots,
+                        request_rows=self._request_rows_for_req(req),
                         full_tokens=(
                             full_load_tokens
                             + admission.extend_len
@@ -1751,6 +1891,22 @@ class PrefillAdder:
 
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
+
+    def _prefill_charge(self, req: Req) -> tuple[int, int]:
+        """The total tokens and state slots `add_one_req` prices ``req`` at."""
+        # Reserve page_size for page-alignment overhead: the paged allocator may
+        # consume one extra page per request (see alloc_extend), which
+        # _update_prefill_budget also deducts.
+        total_tokens = (
+            len(req.full_untruncated_fill_ids)
+            - req.prefix_len
+            + self._swa_new_tokens(req)
+            + self.per_req_token_overhead
+            + self._request_slot_reserve_for_req(req)
+        )
+        # Reserve request and load-back state slots before init_load_back binds
+        # the request slot. Once loaded, only unallocated state remains pending.
+        return total_tokens, self._state_slots_for_req(req, include_host_hit=True)
 
     def _select_prefill_admission(
         self,
@@ -1857,6 +2013,7 @@ class PrefillAdder:
                 max_new_tokens=0 if is_chunked else self._swa_new_tokens(req),
                 chunk_limit=chunk_limit,
                 state_slots=state_slots,
+                request_rows=self._request_rows_for_req(req),
                 window_host_hit_lengths=window_host_hit_lengths,
                 admitted_chunk_limit=chunk_tokens_limit,
                 cached_tokens=prefix_len,
@@ -1891,6 +2048,7 @@ class PrefillAdder:
             admission.max_new_tokens,
             req.retracted_stain,
             state_slots=state_slots,
+            request_rows=self._request_rows_for_req(req),
             request_slot_reserve=self._request_slot_reserve_for_req(
                 req, extend_input_len=admission.extend_len
             ),

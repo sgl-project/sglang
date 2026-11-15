@@ -11,7 +11,7 @@ import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3-image.jsx";
 
 ## 1. Quick start
 
-Use the [integration branch](https://github.com/mickqian/sglang/tree/codex/h3-image-day0)
+Use the [SGLang main branch](https://github.com/sgl-project/sglang/tree/main)
 with the [diffusion installation guide](/docs/sglang-diffusion/installation),
 then install its diffusion dependencies from the repository root:
 
@@ -19,14 +19,18 @@ then install its diffusion dependencies from the repository root:
 python3 -m pip install -e 'python[diffusion]'
 ```
 
-Use an authenticated Hugging Face environment with access to both
-`MiniMaxAI/MiniMax-H3-Image` and its `MiniMaxAI/MiniMax-H3` text encoder.
+The public checkpoints are `MiniMaxAI/MiniMax-H3-Image` and its
+`MiniMaxAI/MiniMax-H3` text encoder.
 Run the commands from the same checkout and Python environment. The picker
-saves the returned image as `generated.png`. These recipes use a source
-installation; a stock container image has not been verified for this branch.
-These are Linux CUDA recipes.
+saves the returned image as `generated.png`. These recipes use Linux CUDA and
+a source installation; DGX Spark uses the [ARM64 environment below](#dgx-spark-128-gb),
+and AMD Instinct GPUs use the [ROCm environment below](#amd-instinct-mi300x-mi325x-mi350x-mi355x).
 
 <Deployment config={config} />
+
+For the lowest measured latency, see the [recipe summary](#measured-text-to-image-summary):
+two B300s generate a 4K image in 2.654 s at native precision or 2.065 s with
+opt-in MXFP8. These are warm pipeline times; quantization can change image quality.
 
 Server warmup runs a valid prefix of the PDD schedule; real requests always
 run all six steps. With online AdaLN and enough cache slots, warmup prepares
@@ -99,10 +103,12 @@ and precision all matter when reproducing an edit.
 DiT and text-encoder weights use BF16. The VAE checkpoint uses FP32; its
 decoder weights are prepared in BF16 for BF16 autocast. The DiT uses dense
 FlashAttention. Keep these precision and attention settings when reproducing
-the release.
+the release. ROCm has no FA3 build, so on AMD GPUs the DiT runs the same dense
+packed attention through AITER. It is selected automatically and `fa` is
+rejected there. Ring parallelism requires FA; use Ulysses or TP on AMD.
 
 On discrete GPUs, Auto keeps all components resident when each GPU has at least
-130 GiB available at startup, as tested on H200 and B300. Otherwise it retains
+130 GiB available at startup, as tested on H200, B300, MI325X and MI350X. Otherwise it retains
 component offload. GB10 uses the shared-memory policy in the Spark recipe below.
 Explicit placement overrides take precedence. Resident mode requires
 space for all weights and request activations; sequence parallelism still
@@ -167,7 +173,7 @@ streaming. Eager remains the default.
 
 ### Hardware recommendations
 
-The picker provides measured recipes for H200/B300, single-card RTX PRO 6000 and DGX Spark,
+The picker provides measured recipes for H200/B300, AMD Instinct, single-card RTX PRO 6000 and DGX Spark,
 and **Derived** recipes for other listed GPUs. A derived recipe estimates placement and
 parallel layout for the selected GPU count from checkpoint sizes and measured
 H200 memory use. It has no hardware latency measurement or capacity guarantee.
@@ -177,6 +183,7 @@ AdaLN together. Start with 2048 × 2048.
 | GPU class | Default shape | Recommended placement and layout |
 | --- | --- | --- |
 | B200, GB200, GB300 | 1 GPU | Auto resident; Ulysses as GPU count grows |
+| MI355X / MI350X, MI325X / MI300X | 1 GPU; Ulysses as GPU count grows | Measured Auto resident recipes on 1, 2, 4 and 8 GPUs; Ulysses is faster, TP uses less memory |
 | H100 / H800, 80 GB | 1 GPU, or 2 for resident serving | Component offload on one; resident Ulysses2 with encoder fold on two |
 | RTX PRO 6000 Blackwell, 96 GB | 1 GPU | Measured resident recipe with AdaLN precomputation; component offload saves memory |
 | DGX Spark, 128 GB shared | 1 GB10 | Measured Auto resident recipe with native AdaLN precomputation; requires at least 106 GiB available |
@@ -190,6 +197,41 @@ and minimum generation canvas. The capacity validation uses a constrained B300
 allocator: native 2K/4K generation and editing, including two-reference 4K,
 passed with an 8 GiB allocator limit and a 10.01 GiB measured whole-GPU peak.
 It is not a latency measurement on the listed consumer GPUs.
+
+### AMD Instinct (MI300X, MI325X, MI350X, MI355X)
+
+Select an AMD GPU in the picker for single-node recipes on 1, 2, 4 and 8 GPUs.
+MI355X and MI350X (gfx950) share one recipe; MI325X and MI300X (gfx942) share
+another. The recipes were run on MI350X and MI325X. No attention flag is
+needed: the DiT selects AITER on ROCm. Auto placement keeps every component
+resident, and AdaLN projections keep their weights. Ring is not available; use
+Ulysses or TP. At each GPU count, Ulysses has the lowest measured latency and
+TP the lowest memory per GPU.
+
+Install this checkout over the SGLang in an SGLang ROCm image for your GPU:
+
+| GPU | Tested image | Python, PyTorch |
+| --- | --- | --- |
+| MI355X, MI350X | `lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261109` | 3.10, 2.9.1+rocm7.2.0 |
+| MI325X, MI300X | `lmsysorg/sglang-rocm:v0.5.23-rocm10-mi30x-20261107` | 3.12, 2.11.0+rocm10.0.0 |
+
+```bash
+docker run -it --network host --ipc host --shm-size 32g \
+  --device /dev/kfd --device /dev/dri --group-add video \
+  --security-opt seccomp=unconfined \
+  -v "$PWD":/workspace/sglang -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -e HF_TOKEN \
+  lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261109 bash
+
+# Inside the container, from the SGLang checkout:
+cd /workspace/sglang
+python3 -m pip install -e python --no-deps --no-build-isolation
+# On the Python 3.10 MI35x image, add --ignore-requires-python.
+```
+
+The image already provides the ROCm builds of PyTorch, AITER and the
+diffusion dependencies, so `--no-deps` keeps them in place. Then run the
+picker's serving and request commands in this environment.
 
 ### DGX Spark (128 GB)
 
@@ -227,7 +269,7 @@ docker run --platform linux/arm64 --gpus all \
   -e HF_TOKEN -it \
   lmsysorg/sglang@sha256:d4a56f6f9356539957974bb4008161b4c08d14a712805ff63eae526f36dbda71 bash
 
-# Inside the container, from the integration checkout:
+# Inside the container, from the SGLang checkout:
 cd /workspace/sglang
 export CARGO_TARGET_DIR=/tmp/h3-image-spark-build
 python3 -m pip install setuptools-rust setuptools-scm wheel
@@ -248,6 +290,38 @@ serving/request commands in this environment. The measured container uses 12
 CPU cores; the host's 128 GB is a shared pool, not 128 GB of additional VRAM.
 
 ## 4. Measured recipes
+
+### Measured text-to-image summary
+
+The native rows keep the checkpoint's release precision. FP8 and MXFP8 quantize
+the DiT and text encoder; they can change image details and reference identity.
+Here, 2K is 2048 × 2048 and 4K is 4736 × 3552.
+
+| Hardware | Precision | 2K | 4K |
+| --- | --- | --- | --- |
+| 2 × B300 | Native | 0.604 s | 2.654 s |
+| 2 × B300 | MXFP8 | 0.451 s | 2.065 s |
+| 2 × H200 | Native | 1.123 s | 5.465 s |
+| 1 × H200 | Native | 1.934 s | 10.133 s |
+| 1 × RTX PRO 6000 Blackwell | Native | 3.434 s | 18.544 s |
+| 1 × RTX PRO 6000 Blackwell | FP8 | 2.338 s | 14.445 s |
+| 1 × DGX Spark | Native | 16.21 s | 84.96 s |
+| 8 × MI350X | Native | 0.490 s | 2.110 s |
+| 4 × MI325X | Native | 0.890 s | 3.680 s |
+| 1 × MI325X | Native | 2.190 s | 10.750 s |
+
+In the picker, use **Ulysses2** and encoder **Fold** for two GPUs. Choose **Auto**
+placement for native two-GPU, Spark and AMD recipes, or **Resident** for the other rows.
+The MI350X row uses TP8 and the four-MI325X row Ulysses4; MI355X and MI300X use
+the MI350X and MI325X recipes.
+Select **FP8 DiT + encoder** or **MXFP8 DiT + encoder** only for the quantized rows.
+
+All rows run the full six-step schedule with lossless quality, eager execution,
+native AdaLN precomputation and warm conditioning caches. Times are medians of
+warm server pipeline requests, excluding startup, HTTP transport, PNG encoding
+and client saving; they are not first-request or end-to-end latency.
+See the sections below for source revisions, checkpoints, sample counts and
+environments.
 
 ### DGX Spark at 2K and 4K
 
@@ -448,6 +522,41 @@ about 93 GiB on one H200, or a maximum across ranks of 50 GiB for TP2,
 70 GiB for Ulysses2 and 70 GiB for Ring2. These allocator measurements do not
 include all CUDA process memory. Other 4K sizes, multiple-reference 4K edits
 remain unmeasured on H200.
+
+### AMD Instinct at 2K and 4K
+
+MI325X (gfx942) and MI350X (gfx950), one node each, in the images listed
+[above](#amd-instinct-mi300x-mi325x-mi350x-mi355x), at `2dcc93b624` with the
+ROCm attention selection described in [Deployment options](#3-deployment-options).
+The image revision is `7b3d20b4659f5d4b3ad7205daa008e47d6b1e868`, with
+text-encoder weights identical to revision `42ed227ee7df40d41602854ae760620d6eb651fe`.
+The server ran plain `sglang serve` with startup warmup, Auto placement and no
+attention flag; requests used lossless quality.
+
+| GPUs and layout | T2I, 4736 × 3552 | Editing, 4096 × 4096 | T2I, 6272 × 2688 | T2I, 2048 × 2048 | Editing, 2048 × 2048 | Peak GiB/GPU |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 × MI325X | 10.750 s | 12.700 s | 10.730 s | 2.190 s | 3.360 s | 117 |
+| 2 × MI325X, TP2 | 8.680 s | 10.060 s | 8.690 s | 1.890 s | 2.940 s | 62 |
+| 2 × MI325X, Ulysses2 | 7.570 s | 8.460 s | 7.640 s | 1.710 s | 2.460 s | 93 |
+| 4 × MI325X, TP4 | 4.960 s | 5.620 s | 4.960 s | 1.080 s | 1.600 s | 33 |
+| 4 × MI325X, Ulysses4 | 3.680 s | 4.620 s | 3.610 s | 0.890 s | 1.350 s | 80 |
+| 8 × MI350X, TP8 | 2.110 s | 2.290 s | 2.050 s | 0.490 s | 0.740 s | 19 |
+
+Each cell is the median of five warm requests on one server, excluding the
+first request per task. T2I uses seed 42; editing uses seed 1234 and one
+reference image, with warm conditioning caches. These
+are server pipeline times, excluding HTTP transfer, PNG encoding and client
+saving. All 180 requests completed without errors. The MI350X GPUs were shared
+with an idle process, so that server passed `--component-residency all=resident`
+to keep the resident placement Auto selects on a free 288 GB GPU.
+
+The 1-GPU, TP2, Ulysses2, Ulysses8 and TP8 recipes on both GPUs also served the
+three 4K workloads without errors at the earlier day-0 revision `e1ab33200` with
+the same attention change. Their latency at `2dcc93b624` is not yet measured.
+The guide's T2I and editing examples match the release reference images
+visually; outputs are not byte-identical to CUDA or across layouts. MI355X and
+MI300X use the same gfx950 and gfx942 recipes and were not measured separately.
+Multiple-reference, exact-quality and quantized AMD workloads remain unmeasured.
 
 ### PNG encoding at 4K
 

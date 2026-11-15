@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.kv_shard_hook import kv_shard_storage_backend_supported
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -67,6 +68,19 @@ class StorageAttachment:
         )
         if invalid is not None:
             return False, invalid
+        if (
+            hicache_write_policy == "write_back"
+            and cache.host_memory_mode == "buffer_only"
+        ):
+            # Startup resolves write_back to write_through in buffer_only mode:
+            # there is no host tier to write back to, so an eviction would only
+            # queue a backup it then drops.
+            return (
+                False,
+                "hicache_write_policy write_back is not supported with "
+                "--hicache-host-memory-mode buffer_only: host memory is only a "
+                "staging buffer. Use write_through.",
+            )
 
         controller = cache.cache_controller
         if controller is None:
@@ -75,7 +89,9 @@ class StorageAttachment:
                 "HiCache is not initialized (no cache controller); "
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
-        if page_interleave_shard_size(cache.token_to_kv_pool_allocator) > 1:
+        if page_interleave_shard_size(
+            cache.token_to_kv_pool_allocator
+        ) > 1 and not kv_shard_storage_backend_supported(storage_backend):
             # Runtime attach bypasses kv_shard_hook.py's startup validation.
             return (
                 False,
@@ -440,6 +456,7 @@ class StorageAttachment:
                 cache.dec_host_lock_ref(node_id, lock_params)
             except Exception:
                 logger.exception("Failed to release host lock for backup op %s", ack_id)
+        cache._backup_requested_tokens.clear()
 
         for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):
             cache.discard_storage_prefetch_accounting(handle)

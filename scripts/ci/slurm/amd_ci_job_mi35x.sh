@@ -37,6 +37,10 @@ remove_job() {  # remove_job CONTAINER WORKSPACE
 
 finish() {
     local rc=$?
+    # Hand the suite's artifacts to the launcher before the checkout goes.
+    if [[ -n "${CI_ARTIFACT_RUN_DIR:-}" && -d "$WS/ci_artifacts" ]]; then
+        mkdir -p "$CI_ARTIFACT_RUN_DIR" && cp -r "$WS/ci_artifacts/." "$CI_ARTIFACT_RUN_DIR/" || true
+    fi
     remove_job "$CI_CONTAINER_NAME" "$WS"
     echo "$rc" > "$CI_EXIT_FILE"
     echo "[amd-ci-job] exit $rc"
@@ -105,6 +109,9 @@ check_gpus_free() {  # check_gpus_free DEVICE...
 mkdir -p "$WS" "$CI_NODE_SCRATCH/sglang-data"
 cp -a "$CI_SRC/." "$WS/"
 cd "$WS"
+# What a suite writes to $CI_ARTIFACT_DIR (this directory, in the container)
+# reaches the runner's $GITHUB_WORKSPACE/ci_artifacts; see the launcher.
+rm -rf ci_artifacts && mkdir ci_artifacts
 
 # The scripts read these instead of an ARC pod hostname and /home/runner.
 export GITHUB_WORKSPACE="$WS"
@@ -129,7 +136,10 @@ fi
 bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$CI_ROCM_VERSION"
 bash scripts/ci/amd/amd_ci_install_dependency.sh
 # --env pairs from the launcher, one KEY=VAL per line.
-EXEC_ENV_ARGS=()
+# CI_IMAGE: the image amd_ci_start_container.sh picked, which can be an older
+# day's when today's is not out yet.
+EXEC_ENV_ARGS=(-e CI_ARTIFACT_DIR=/sglang-checkout/ci_artifacts
+               -e "CI_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CI_CONTAINER_NAME")")
 while IFS= read -r kv; do
     [[ -n "$kv" ]] && EXEC_ENV_ARGS+=(-e "$kv")
 done <<< "${CI_EXEC_ENV:-}"

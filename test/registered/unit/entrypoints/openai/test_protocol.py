@@ -923,6 +923,41 @@ class TestValidationEdgeCases(CustomTestCase):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
 
+class TestAssistantToolCallNames(unittest.TestCase):
+    """A tool call in the conversation history must name its function."""
+
+    def _request(self, function):
+        return ChatCompletionRequest(
+            model="m",
+            messages=[
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": function}
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            ],
+        )
+
+    def test_named_tool_call_accepted(self):
+        request = self._request({"name": "get_weather", "arguments": "{}"})
+        self.assertEqual(request.messages[1].tool_calls[0].function.name, "get_weather")
+
+    def test_nameless_tool_call_rejected(self):
+        for label, function in {
+            "missing": {"arguments": "{}"},
+            "null": {"name": None, "arguments": "{}"},
+            "empty": {"name": "", "arguments": "{}"},
+        }.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValidationError) as ctx:
+                    self._request(function)
+                self.assertIn("'function.name' is required", str(ctx.exception))
+
+
 class TestThinkingObject(unittest.TestCase):
     MESSAGES = [{"role": "user", "content": "hi"}]
 

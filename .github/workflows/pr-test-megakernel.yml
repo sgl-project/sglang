@@ -1,0 +1,82 @@
+name: PR Test (Megakernel)
+run-name: "Megakernel: sgl-nvidia-mega#${{ inputs.mega_pr }} ${{ inputs.mega_sha }} (${{ inputs.dispatch_id }})"
+
+# Runs an sgl-nvidia-mega PR's end-to-end tests against SGLang main on GB300.
+# A maintainer starts it by adding the run-ci-sglang label to the PR in
+# sgl-project/sgl-nvidia-mega, whose run-ci-sglang.yml dispatches this workflow,
+# waits for this run and reports its outcome on the PR. This workflow uses no
+# secrets; the run name carries dispatch_id so the caller can find this run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mega_repo:
+        description: "Repository holding the sgl-nvidia-mega PR's head (owner/name)"
+        type: string
+        required: true
+      mega_sha:
+        description: "Full commit SHA of the PR's head"
+        type: string
+        required: true
+      mega_pr:
+        description: "sgl-nvidia-mega PR number"
+        type: string
+        required: true
+      dispatch_id:
+        description: "Caller's ID for this dispatch, shown in the run name"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-test-megakernel-${{ inputs.mega_pr }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: 4-gpu-gb300
+    timeout-minutes: 210
+    steps:
+      - name: Validate inputs
+        env:
+          MEGA_REPO: ${{ inputs.mega_repo }}
+          MEGA_SHA: ${{ inputs.mega_sha }}
+          MEGA_PR: ${{ inputs.mega_pr }}
+        run: |
+          [[ "$MEGA_REPO" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || { echo "bad mega_repo: $MEGA_REPO"; exit 1; }
+          [[ "$MEGA_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad mega_sha: $MEGA_SHA"; exit 1; }
+          [[ "$MEGA_PR" =~ ^[0-9]+$ ]] || { echo "bad mega_pr: $MEGA_PR"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Check out the sgl-nvidia-mega PR
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.mega_repo }}
+          ref: ${{ inputs.mega_sha }}
+          path: sgl-nvidia-mega
+          persist-credentials: false
+
+      - name: Install sgl-nvidia-mega
+        run: |
+          python3 -m pip install --no-deps -e ./sgl-nvidia-mega
+
+      # End-to-end tests only for now, and DeepSeek-V4.1-Flash only: it runs TP4
+      # on one 4-GPU runner. The Qwen3.5 tests need TP8 across two GB300 trays.
+      # sgl-nvidia-mega runs its unit tests in its own CI.
+      - name: Run end-to-end tests
+        timeout-minutes: 180
+        working-directory: sgl-nvidia-mega
+        run: |
+          python3 -m pytest -v -rfE \
+            test/e2e/test_deepseek_v41_server.py \
+            test/e2e/test_deepseek_v41_switch.py

@@ -859,6 +859,46 @@ def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, eps, rows):
     assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight, eps), expected)
 
 
+@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
+@pytest.mark.parametrize(
+    "batch,seq,heads,packed",
+    [(1, 1, 16, False), (1, 17, 4, True), (2, 2000, 16, False)],
+)
+@pytest.mark.parametrize("amplitude", [1.0, 1e-38, 1e19])
+def test_head128_mean_square_exact(batch, seq, heads, packed, amplitude):
+    from sglang.kernels.ops.diffusion.norm.rmsnorm_cast_before_weight_bitexact import (
+        rmsnorm_mean_square_bitexact,
+    )
+
+    x = (
+        torch.randn(batch, seq, 3 if packed else 1, heads, 128, device="cuda")
+        * amplitude
+    ).bfloat16()
+    x = x[:, :, 1 if packed else 0]
+    expected = x.float().square().mean(-1, keepdim=True)
+    assert torch.equal(rmsnorm_mean_square_bitexact(x), expected)
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
+def test_head128_mean_square_capture_replay_and_compile():
+    from sglang.kernels.ops.diffusion.norm.rmsnorm_cast_before_weight_bitexact import (
+        rmsnorm_mean_square_bitexact,
+    )
+
+    x = torch.randn(1, 31, 4, 128, device="cuda", dtype=torch.bfloat16)
+    rmsnorm_mean_square_bitexact(x)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = rmsnorm_mean_square_bitexact(x)
+    compiled = torch.compile(rmsnorm_mean_square_bitexact, fullgraph=True)
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        expected = x.float().square().mean(-1, keepdim=True)
+        assert torch.equal(captured, expected)
+        assert torch.equal(compiled(x), expected)
+
+
 def _moss_image_norm_eager(x, weight):
     normalized = x.float() * torch.rsqrt(
         x.float().square().mean(-1, keepdim=True) + 1e-6

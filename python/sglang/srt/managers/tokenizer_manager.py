@@ -146,6 +146,7 @@ from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     is_health_check_generate_req,
 )
+from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
@@ -1327,6 +1328,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             if mm_inputs and mm_inputs.mm_items:
                 self.mm_processor.finalize_cache_identities(mm_inputs)
+            if mm_inputs and isinstance(obj, GenerateReqInput):
+                attach_mm_routing_labels(
+                    mm_inputs.mm_items, obj.mm_routing_labels_by_modality()
+                )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -1460,6 +1465,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
             self._validate_top_logprobs_num(obj)
+            self._validate_logprob_start_len(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1612,6 +1618,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"got {top_logprobs_num!r}."
             )
 
+    def _validate_logprob_start_len(self, obj: GenerateReqInput) -> None:
+        # -1 means output tokens only; a lower value slices the prompt from its
+        # end and fails an assert in the scheduler.
+        logprob_start_len = obj.logprob_start_len
+        if not obj.return_logprob or logprob_start_len is None:
+            return
+        if type(logprob_start_len) is not int or logprob_start_len < -1:
+            raise ValueError(
+                "logprob_start_len must be an integer >= -1, "
+                f"got {logprob_start_len!r}."
+            )
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1713,6 +1731,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
+                mm_routing_labels=obj.mm_routing_labels_by_modality(),
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
