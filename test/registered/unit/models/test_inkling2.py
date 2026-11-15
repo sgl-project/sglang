@@ -181,7 +181,10 @@ def test_public_config_load_and_roundtrip(tmp_path, release_config):
     assert reloaded.mtp_config == release_config["mtp_config"]
 
 
-def test_precision_file_is_detected_without_launch_flag(tmp_path, release_config):
+@pytest.mark.parametrize("hub_stub", [None, "NVFP4", "MXFP8"])
+def test_precision_file_is_detected_without_launch_flag(
+    tmp_path, release_config, hub_stub
+):
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.model_loader.weight_utils import get_quant_config
@@ -194,10 +197,16 @@ def test_precision_file_is_detected_without_launch_flag(tmp_path, release_config
             ]
         ),
     )
+    if hub_stub:
+        # The published checkpoints add this stub so the Hub counts parameters.
+        release_config["quantization_config"] = dict(
+            quant_method="modelopt", quant_algo=hub_stub
+        )
     (tmp_path / "config.json").write_text(json.dumps(release_config))
     (tmp_path / "hf_quant_config.json").write_text(json.dumps(precision))
     config = ModelConfig(str(tmp_path), trust_remote_code=False)
     assert config.quantization == "inkling2"
+    assert config.hf_quant_config == {}
     assert config.is_hybrid_swa
     assert config.is_hybrid_swa_compress
     assert not config.is_multimodal

@@ -109,6 +109,11 @@ class Inkling2MMConfig(InklingMMConfig):
         )
         self.vision_config = vision_config
         self.mtp_config = mtp_config
+        # The Hub config.json carries a modelopt quantization_config stub only so
+        # the Hub counts parameters; the precision lives in hf_quant_config.json.
+        stub = kwargs.get("quantization_config")
+        if isinstance(stub, dict) and stub.get("quant_method") == "modelopt":
+            del kwargs["quantization_config"]
         PretrainedConfig.__init__(self, **kwargs)
 
 
