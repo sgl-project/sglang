@@ -210,16 +210,26 @@ class StorageCacheReads:
         if len(self.demands) >= self.executor.config.max_prepared_prefixes:
             self.stats["demand_limit_declined"] += 1
             return False
-        prefix_length = len(prefix or ())
-        if (
-            prefix_length + len(suffix)
-            > self.cache.kv_control_service.config.limits.max_scope_tokens
-        ):
+        if not (self._joinable or self.cache.ongoing_prefetch):
             return False
-        tokens = tuple(prefix or ()) + tuple(suffix.token_ids)
+        prefix_length = len(prefix or ())
+        demand_length = prefix_length + len(suffix)
+        scope_limit = self.cache.kv_control_service.config.limits.max_scope_tokens
+        lookup_suffix_length = scope_limit - prefix_length
+        if lookup_suffix_length <= 0:
+            return False
+        # The control limit bounds the shared read, not the inference request.
+        # Compare only a bounded prefix; keep the full tail only after a join.
+        truncated = demand_length > scope_limit
+        suffix_ids = suffix.token_ids
+        tokens = tuple(prefix or ()) + tuple(
+            suffix_ids[:lookup_suffix_length] if truncated else suffix_ids
+        )
         key = self._demand_key(tokens, extra_key, cache_salt)
         job = self._joinable.get(key)
-        resume_tokens = None
+        if truncated and job is not None and job.operation is None:
+            # A match at the limit is still an ancestor of the full request.
+            job = None
         if job is None:
             # Join only submitted reads. A speculative ancestor still waiting
             # for admission must not block an ordinary request.
@@ -239,8 +249,6 @@ class StorageCacheReads:
                 key=lambda candidate: len(candidate.tokens),
                 default=None,
             )
-            if job is not None:
-                resume_tokens = tokens
         if (
             job is None
             and len(self.demands) + 1 < self.executor.config.max_prepared_prefixes
@@ -250,11 +258,10 @@ class StorageCacheReads:
                 tokens,
                 CacheCompatibility(extra_key=extra_key, cache_salt=cache_salt),
                 demand_prefix_length=prefix_length,
+                demand_length=demand_length,
             )
-            if job is not None:
-                if len(job.tokens) < len(tokens):
-                    resume_tokens = tokens
-                    key = self._demand_key(job.tokens, extra_key, cache_salt)
+            if job is not None and len(job.tokens) < demand_length:
+                key = self._demand_key(job.tokens, extra_key, cache_salt)
                 self._joinable[key] = job
         if job is None or job.cancel_requested or job.failure or job.retired:
             return False
@@ -270,6 +277,11 @@ class StorageCacheReads:
                 # fallback) and retire the hint so it cannot issue a late GET.
                 self._retire(job, status=Status.DEFERRED, code="ordinary_restore")
                 return False
+        resume_tokens = None
+        if len(job.tokens) < demand_length:
+            resume_tokens = tokens
+            if truncated:
+                resume_tokens += tuple(suffix_ids[lookup_suffix_length:])
         self.demands[request] = _Demand(
             job, max(prefix_length, self._host_length(job)), resume_tokens=resume_tokens
         )
@@ -396,9 +408,12 @@ class StorageCacheReads:
             and node.write_through_pending_id is None
         )
 
-    def _borrow_ordinary(self, tokens, compatibility, *, demand_prefix_length=None):
+    def _borrow_ordinary(
+        self, tokens, compatibility, *, demand_prefix_length=None, demand_length=None
+    ):
         end = len(tokens)
         for_demand = demand_prefix_length is not None
+        full_end = end if demand_length is None else demand_length
         minimum_end = demand_prefix_length or 0
         selected = None
         for request, info in self.cache.ongoing_prefetch.items():
@@ -417,7 +432,7 @@ class StorageCacheReads:
                         not minimum_end < suffix_end <= end
                         # A longer request may wait for an already admitted
                         # ordinary prefix, but should not wait for its query.
-                        or (suffix_end < end and op.host_indices is None)
+                        or (suffix_end < full_end and op.host_indices is None)
                     )
                 )
                 or suffix.cache_salt != compatibility.cache_salt

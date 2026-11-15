@@ -15,6 +15,7 @@ import test_kv_control_cache as cache_fixtures
 import torch
 
 from sglang.srt.managers.kv_control.contracts import (
+    Limits,
     Status,
 )
 from sglang.srt.managers.kv_control.service import (
@@ -1082,10 +1083,13 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
     def test_queued_native_host_job_coalesces_demand_before_any_io(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
+        config = ServiceConfig(
+            namespace="ns", engine_id="engine", limits=Limits(max_scope_tokens=4)
+        )
         for finish in ("complete", "cancel", "expire"):
             with (
                 self.subTest(finish=finish),
-                hicache(self, namespace_keys=True) as owner,
+                hicache(self, config, namespace_keys=True) as owner,
             ):
                 _, cache, service, _ = owner
                 # The two reads share the first radix page.
@@ -1133,6 +1137,12 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         self.assertEqual(job.waiting, "shared_prefix_serialization")
                         # Queuing changes no exact-scope/namespace/stop-policy rule.
                         for values, salt, extra_key, policy in (
+                            (
+                                (1, 2, 3, 4, 5, 6),
+                                service.cache_salt(scopes[1].cache_salt),
+                                None,
+                                "wait_complete",
+                            ),
                             (
                                 (1, 2),
                                 service.cache_salt(scopes[1].cache_salt),
@@ -2675,15 +2685,24 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
     def test_tool_resume_shares_issued_prefix_and_fetches_only_its_tail(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
-        for source, tail_stored in (
-            ("hint", False),
-            ("hint", True),
-            ("ordinary", False),
-            ("ordinary", True),
+        for source, tail_stored, scope_limit in (
+            ("hint", False, 8),
+            ("hint", True, 8),
+            ("ordinary", False, 8),
+            ("ordinary", True, 8),
+            ("hint", True, 4),
+            ("ordinary", True, 4),
         ):
+            config = ServiceConfig(
+                namespace="ns",
+                engine_id="engine",
+                limits=Limits(max_scope_tokens=scope_limit),
+            )
             with (
-                self.subTest(source=source, tail_stored=tail_stored),
-                hicache(self, namespace_keys=True) as owner,
+                self.subTest(
+                    source=source, tail_stored=tail_stored, scope_limit=scope_limit
+                ),
+                hicache(self, config, namespace_keys=True) as owner,
             ):
                 _, cache, service, _ = owner
                 ancestor = cache_fixtures.target()
@@ -2751,9 +2770,12 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         if tail_stored:
                             self.assertFalse(cache.check_prefetch_progress(demand))
                             self.assertIn(demand, cache.ongoing_prefetch)
-                            late = self._restore(service, resume, "late-during-tail")
+                            if len(resume.token_ids) <= scope_limit:
+                                late = self._restore(
+                                    service, resume, "late-during-tail"
+                                )
+                                self.assertEqual(late.status, Status.DEFERRED)
                             self.assertIs(reads.demands[demand].job, prefix_read)
-                            self.assertEqual(late.status, Status.DEFERRED)
                             self.assertFalse(
                                 cache.check_prefetch_progress(sibling_demand)
                             )
