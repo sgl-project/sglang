@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.pool.base import KVCache
 
 
 class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):

@@ -312,7 +312,7 @@ class SWAPrefillBudget(PrefillBudget):
 
     def _window_evictable(self) -> int:
         """Evictable tokens of the static pools' one window."""
-        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+        from sglang.srt.mem_cache.pool.base import BaseSWAKVPool
 
         return self.tree_cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL)
 

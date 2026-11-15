@@ -74,7 +74,6 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
-    KVCache,
     MHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
@@ -99,6 +98,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
 )
+from sglang.srt.mem_cache.pool.base import KVCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform

@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.kv.decl import INDEX_K_PART
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv.sizing import check_bs1_floor
-from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.pool.base import KVCache
 
 
 class RoutedKVCache(KVCache):

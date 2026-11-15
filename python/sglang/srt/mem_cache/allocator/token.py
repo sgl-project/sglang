@@ -22,7 +22,7 @@ import torch
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.pool.base import KVCache
 
 
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):

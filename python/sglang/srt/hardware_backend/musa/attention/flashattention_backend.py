@@ -22,7 +22,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
+from sglang.srt.mem_cache.pool.base import KVWriteLoc, window_write_locs
 from sglang.srt.runtime_context import get_parallel, get_schedule
 
 if TYPE_CHECKING:

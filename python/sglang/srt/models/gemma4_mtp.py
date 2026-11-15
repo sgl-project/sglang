@@ -29,7 +29,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
-from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.pool.base import KVCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM, Gemma4TextModel
 from sglang.srt.runtime_context import get_parallel

@@ -3388,7 +3388,7 @@ class TestDeclaredParts(CustomTestCase):
             PlacementContext,
             place_fused_draft,
         )
-        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+        from sglang.srt.mem_cache.pool.base import KVWriteLoc
 
         placement = place_fused_draft(
             profile=DraftKVProfile(

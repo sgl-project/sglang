@@ -21,7 +21,8 @@ from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.pool.base import GB
 
 logger = logging.getLogger(__name__)
 

@@ -11,8 +11,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
-    unwrap_write_loc,
 )
+from sglang.srt.mem_cache.pool.base import unwrap_write_loc
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob

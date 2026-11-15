@@ -21,7 +21,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_ut
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.pool.base import KVCache
 
 _capture: ContextVar[HiCacheGraphEvents | None] = ContextVar(
     "hicache_graph_events", default=None

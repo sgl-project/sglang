@@ -36,9 +36,8 @@ from sglang.srt.mem_cache.memory_pool import (
     _set_kv_buffer_impl,
     _set_mha_kv_buffer_prefix_valid,
     masked_set_kv_buffer_kernel,
-    unwrap_write_loc,
-    write_loc_is_physical,
 )
+from sglang.srt.mem_cache.pool.base import unwrap_write_loc, write_loc_is_physical
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.async_probe import maybe_detect_oob

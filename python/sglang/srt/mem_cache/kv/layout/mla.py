@@ -33,11 +33,8 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_dense_views,
     replicated_token_layout,
 )
-from sglang.srt.mem_cache.memory_pool import (
-    _prefix_valid_mla_write_loc,
-    unwrap_write_loc,
-    write_loc_is_physical,
-)
+from sglang.srt.mem_cache.memory_pool import _prefix_valid_mla_write_loc
+from sglang.srt.mem_cache.pool.base import unwrap_write_loc, write_loc_is_physical
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.async_probe import maybe_detect_oob
 

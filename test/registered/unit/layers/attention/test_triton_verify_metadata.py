@@ -262,7 +262,7 @@ def test_replicated_draft_metadata_and_writes_share_physical_ids():
     from sglang.srt.configs.attention_execution import attention_dcp_size
     from sglang.srt.mem_cache.kv.alloc.id_space import ReplicatedTokenIds, UnitIds
     from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+    from sglang.srt.mem_cache.pool.base import KVWriteLoc
 
     owner = UnitIds(
         num_virtual_ids=4,

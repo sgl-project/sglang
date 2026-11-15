@@ -48,7 +48,6 @@ from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -70,6 +69,8 @@ if TYPE_CHECKING:
 import logging
 
 import numpy as np
+
+from sglang.srt.mem_cache.pool.base import KVWriteLoc, window_write_locs
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647

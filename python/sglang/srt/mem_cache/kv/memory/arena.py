@@ -27,7 +27,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
-from sglang.srt.mem_cache.memory_pool import KvBufferDesc
+from sglang.srt.mem_cache.pool.base import KvBufferDesc
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
