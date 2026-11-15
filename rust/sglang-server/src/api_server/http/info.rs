@@ -55,11 +55,18 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 /// encoded output. Errors are plain text so the relaying side can carry the
 /// message into its own merged error.
 async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let Some(routes) = forwarded_tag(&body).and_then(|tag| relayed_by(&tag)) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "not a control message a peer listener relays",
+        )
+            .into_response();
+    };
     // Without an admin key the forced admin routes refuse before relaying,
     // so only a request sent straight to this route carries their message;
     // refuse it too, or the peer route would bypass that refusal.
     if state.server_args.api_keys.admin_api_key.is_none()
-        && forwarded_tag(&body).is_some_and(|tag| ADMIN_FORCE_TAGS.contains(&tag.as_str()))
+        && routes.iter().copied().any(super::auth::is_admin_force)
     {
         return super::auth::admin_key_missing();
     }
@@ -74,14 +81,31 @@ async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) ->
     }
 }
 
-/// The forwarded control messages of the served `admin_force` routes, kept by
-/// hand: a forced route added to this server adds its message here.
-const ADMIN_FORCE_TAGS: &[&str] = &[
-    "AttachHiCacheStorageReqInput",
-    "DetachHiCacheStorageReqInput",
-    "CheckWeightsReqInput",
-    "ProfileReq",
+/// Each control message a peer listener relays, with the HTTP routes that fan it
+/// out; a relayed message is held to their levels in `auth_levels.json`.
+const RELAYED_BY: &[(&str, &[&str])] = &[
+    ("AbortReq", &["/abort_request"]),
+    ("GetInternalStateReq", &["/server_info"]),
+    ("FlushCacheReqInput", &["/flush_cache"]),
+    ("CheckWeightsReqInput", &["/weights_checker"]),
+    ("ClearHiCacheReqInput", &["/hicache/storage-backend/clear"]),
+    (
+        "DetachHiCacheStorageReqInput",
+        &["/hicache/storage-backend"],
+    ),
+    (
+        "AttachHiCacheStorageReqInput",
+        &["/hicache/storage-backend"],
+    ),
+    ("ProfileReq", &["/start_profile", "/stop_profile"]),
 ];
+
+fn relayed_by(tag: &str) -> Option<&'static [&'static str]> {
+    RELAYED_BY
+        .iter()
+        .find(|(relayed, _)| *relayed == tag)
+        .map(|(_, routes)| *routes)
+}
 
 /// A forwarded control message's type tag, the first element of its array.
 fn forwarded_tag(body: &[u8]) -> Option<String> {
@@ -1903,6 +1927,41 @@ mod tests {
         let _ = response.await;
     }
 
+    #[test]
+    fn relayed_by_covers_every_control_message() {
+        use crate::message::io_struct::ControlRequest;
+        let mut relayed: Vec<&str> = RELAYED_BY.iter().map(|(tag, _)| *tag).collect();
+        relayed.push("FreezeGCReq");
+        relayed.sort_unstable();
+        let mut tags = ControlRequest::TAGS.to_vec();
+        tags.sort_unstable();
+        assert_eq!(relayed, tags);
+        for route in RELAYED_BY.iter().flat_map(|(_, routes)| *routes) {
+            assert!(super::super::auth::has_level(route), "{route}");
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_route_refuses_a_message_no_listener_relays() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        for tag in ["FreezeGCReq", "UpdateWeightFromDiskReqInput"] {
+            let body = rmp_serde::to_vec(&(tag, "sender-rid", ())).unwrap();
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(FORWARD_PEER_PATH)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{tag}");
+        }
+        assert!(intake_rx.is_empty());
+    }
+
     /// A forwarded control request reaches the local scheduler under the rid
     /// its sender encoded, and the scheduler's bytes come back as the body.
     #[tokio::test]
@@ -1943,13 +2002,14 @@ mod tests {
         assert_eq!(body.as_ref(), b"scheduler-reply");
 
         // A body without a rid cannot be routed back: rejected before intake.
+        let no_rid = rmp_serde::to_vec(&("FlushCacheReqInput", (), ())).unwrap();
         let response = routes()
             .with_state(state)
             .oneshot(
                 HttpRequest::builder()
                     .method("POST")
                     .uri(FORWARD_PEER_PATH)
-                    .body(Body::from(Bytes::from_static(b"\xc0")))
+                    .body(Body::from(no_rid))
                     .unwrap(),
             )
             .await

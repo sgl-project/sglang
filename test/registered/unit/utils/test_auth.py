@@ -453,6 +453,18 @@ class TestApiKeyMiddleware(CustomTestCase):
             self.assertEqual(self.client.post(path, headers=user).status_code, 401)
             self.assertEqual(self.client.post(path, headers=admin).status_code, 200)
 
+    def test_a_wrong_method_is_checked_at_the_routes_level(self):
+        self.assertEqual(self.client.get("/start_profile").status_code, 403)
+        self.keys = ("user", "admin")
+        user = {"Authorization": "Bearer user"}
+        admin = {"Authorization": "Bearer admin"}
+        self.assertEqual(
+            self.client.get("/start_profile", headers=user).status_code, 401
+        )
+        self.assertEqual(
+            self.client.get("/start_profile", headers=admin).status_code, 405
+        )
+
     def test_websocket_requires_the_api_key(self):
         self.keys = ("user", None)
         with self.assertRaises(WebSocketDisconnect):
