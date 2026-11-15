@@ -1620,8 +1620,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if batch_tensors is None:
             raise ValueError("GDN MIS batch tensors must be prepared before execution")
 
-        conv_states[cache_indices] = 0
-        ssm_states[cache_indices] = 0
+        reset_indices = cache_indices.to(torch.int64)
+        conv_states.index_fill_(0, reset_indices, 0)
+        ssm_states.index_fill_(0, reset_indices, 0)
         output = mixed_qkv.new_zeros(
             1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
         )
