@@ -5,7 +5,12 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_hip, is_npu, is_xpu, print_warning_once
+
+_is_hip = is_hip()
+
+if _is_hip:
+    from sglang.kernels.ops.attention import gdn_packed_decode_aiter_hip
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -121,6 +126,37 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 use_qk_l2norm_in_kernel=True,
             )
             return out.transpose(0, 1)
+
+        if _is_hip and gdn_packed_decode_aiter_hip.available(mixed_qkv.device):
+            if gdn_packed_decode_aiter_hip.covered(
+                mixed_qkv,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                scale,
+                ssm_states,
+                cache_indices,
+                num_v_heads,
+                head_v_dim,
+            ):
+                return gdn_packed_decode_aiter_hip.run(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    num_v_heads=num_v_heads,
+                    head_v_dim=head_v_dim,
+                ).transpose(0, 1)
+            print_warning_once(
+                "AITER FlyDSL GDN decode does not cover this launch "
+                f"(qkv width {mixed_qkv.shape[-1]} {mixed_qkv.dtype}, state "
+                f"{ssm_states.dtype}, dt_bias {dt_bias.dtype}, indices "
+                f"{cache_indices.dtype}); decode runs the Triton packed kernel"
+            )
 
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv,
