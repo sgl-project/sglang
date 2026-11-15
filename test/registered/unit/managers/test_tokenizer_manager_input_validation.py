@@ -24,7 +24,9 @@ class TestTokenizerManagerInputValidation(CustomTestCase):
         self.manager.allow_auto_truncate = False
         self.manager.validate_total_tokens = False
         self.manager.is_generation = True
-        self.manager.model_config = SimpleNamespace(joint_head_config=None)
+        self.manager.model_config = SimpleNamespace(
+            joint_head_config=None, pointer_head=None
+        )
         self.manager._validate_token_ids_logprob = Mock()
 
     def test_prompt_without_tokens_is_rejected(self):
