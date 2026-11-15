@@ -11,15 +11,16 @@ use axum::{
 };
 use sglang_api_types::api::v1 as api;
 
+use super::auth::DeclaredRoute;
 use crate::api_server::handlers::{HiCacheError, HiCacheManager};
 
 pub(super) fn routes(manager: Arc<HiCacheManager>) -> Router {
     Router::new()
-        .route(
+        .declared_route(
             "/hicache/storage-backend",
             get(status).put(attach).delete(detach),
         )
-        .route("/hicache/storage-backend/clear", post(clear))
+        .declared_route("/hicache/storage-backend/clear", post(clear))
         .with_state(manager)
 }
 

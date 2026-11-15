@@ -12,10 +12,11 @@ from sglang.srt.environ import envs
 from sglang.srt.utils.auth import (
     AuthDecision,
     AuthLevel,
+    _unique_keys,
     add_api_key_middleware,
     admin_auth_headers,
-    auth_level,
     decide_request_auth,
+    undeclared_routes,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,14 +42,10 @@ class TestAuthLevel(CustomTestCase):
         # str mixin allows direct comparison with string values
         self.assertEqual(AuthLevel.NORMAL, "normal")
 
-
-class TestAuthLevelDecorator(CustomTestCase):
-    def test_decorator_sets_auth_level(self):
-        @auth_level(AuthLevel.ADMIN_FORCE)
-        def my_endpoint():
-            pass
-
-        self.assertEqual(my_endpoint._auth_level, AuthLevel.ADMIN_FORCE)
+    def test_a_route_declared_twice_is_refused(self):
+        # serde_json keeps the last of two keys silently; this load is the guard.
+        with self.assertRaisesRegex(ValueError, "/x"):
+            _unique_keys([("/x", "normal"), ("/x", "admin_force")])
 
 
 class TestDecideRequestAuth(CustomTestCase):
@@ -409,58 +406,65 @@ class TestRustAuthDecisionsFixture(CustomTestCase):
 
 
 class TestApiKeyMiddleware(CustomTestCase):
+    """Routes take their levels from `auth_levels.json`; `/undeclared` is NORMAL."""
+
     def setUp(self):
         app = FastAPI()
         self.keys = (None, None)
 
-        @app.get("/normal")
+        @app.get("/generate")
         async def normal():
             return {}
 
-        @app.post("/force")
-        @auth_level(AuthLevel.ADMIN_FORCE)
+        @app.post("/start_profile")
         async def force():
             return {}
 
-        @app.post("/force/{name}")
-        @auth_level(AuthLevel.ADMIN_FORCE)
-        async def force_by_name(name: str):
+        @app.post("/dumper/{method}")
+        async def force_by_method(method: str):
             return {}
 
-        @app.post("/force/shadowed")
-        async def shadowed():
+        @app.post("/undeclared")
+        async def undeclared():
             return {}
 
-        @app.websocket("/ws")
+        @app.websocket("/v1/realtime")
         async def ws(websocket: WebSocket):
             await websocket.accept()
             await websocket.close()
 
         add_api_key_middleware(app, get_keys=lambda: self.keys)
+        self.app = app
         self.client = TestClient(app)
 
     def test_keys_are_read_per_request(self):
-        self.assertEqual(self.client.get("/normal").status_code, 200)
-        self.assertEqual(self.client.post("/force").status_code, 403)
-        self.assertEqual(self.client.post("/force/shadowed").status_code, 403)
+        self.assertEqual(self.client.get("/generate").status_code, 200)
+        self.assertEqual(self.client.post("/undeclared").status_code, 200)
+        for path in ("/start_profile", "/dumper/x"):
+            self.assertEqual(self.client.post(path).status_code, 403, path)
         self.keys = ("user", "admin")
         admin = {"Authorization": "Bearer admin"}
         user = {"Authorization": "Bearer user"}
-        self.assertEqual(self.client.get("/normal").status_code, 401)
-        self.assertEqual(self.client.get("/normal", headers=user).status_code, 200)
-        for path in ("/force", "/force/x"):
+        for normal in (self.client.get("/generate"), self.client.post("/undeclared")):
+            self.assertEqual(normal.status_code, 401)
+        self.assertEqual(self.client.get("/generate", headers=user).status_code, 200)
+        self.assertEqual(self.client.post("/undeclared", headers=user).status_code, 200)
+        for path in ("/start_profile", "/dumper/x"):
             self.assertEqual(self.client.post(path, headers=user).status_code, 401)
             self.assertEqual(self.client.post(path, headers=admin).status_code, 200)
 
     def test_websocket_requires_the_api_key(self):
         self.keys = ("user", None)
         with self.assertRaises(WebSocketDisconnect):
-            with self.client.websocket_connect("/ws"):
+            with self.client.websocket_connect("/v1/realtime"):
                 pass
         with self.client.websocket_connect(
-            "/ws", headers={"Authorization": "Bearer user"}
+            "/v1/realtime", headers={"Authorization": "Bearer user"}
         ):
             pass
+
+    def test_undeclared_routes_lists_the_extra_route(self):
+        self.assertEqual(undeclared_routes(self.app), ["/undeclared"])
 
 
 class TestAdminAuthHeaders(CustomTestCase):

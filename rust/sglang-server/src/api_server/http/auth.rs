@@ -12,10 +12,10 @@ use axum::{
     http::{Method, StatusCode, header::AUTHORIZATION},
     middleware::Next,
     response::{IntoResponse, Response},
+    routing::MethodRouter,
 };
 use serde::Deserialize;
 
-use crate::api_server::core::FORWARD_PEER_PATH;
 use crate::api_server::handlers::ADMIN_KEY_MISSING;
 use crate::message::config::ApiKeys;
 
@@ -28,22 +28,62 @@ enum AuthLevel {
     AdminForce,
 }
 
-/// Every route of Python's HTTP server and its auth level, as
-/// `test_http_server_auth_levels.py` reads them off the app.
+/// Every HTTP route sglang serves and its auth level, the table the Python
+/// server reads too.
 static ROUTE_LEVELS: LazyLock<HashMap<String, AuthLevel>> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("auth_levels.json")).expect("auth_levels.json")
+    serde_json::from_str(include_str!(
+        "../../../../../python/sglang/srt/utils/auth_levels.json"
+    ))
+    .expect("auth_levels.json")
 });
 
-/// The level Python resolves for `path`; a path no route matches is `NORMAL`.
-/// The admin routes take no path parameters (`test_http_server_auth_levels.py`
-/// checks), so an exact match finds them.
+/// The level of a served `path`. A served admin route takes no path
+/// parameters (`declared_route` checks), so an exact match finds it.
 fn level(path: &str) -> AuthLevel {
-    // The DP control relay, a Rust-only route, carries the operations of both
-    // admin levels and refuses the forced ones itself.
-    if path == FORWARD_PEER_PATH {
-        return AuthLevel::AdminOptional;
-    }
     ROUTE_LEVELS.get(path).copied().unwrap_or(AuthLevel::Normal)
+}
+
+/// The declared level of the route `path`, its parameters written as axum's
+/// `{name}` / `{*name}` or FastAPI's `{name}` / `{name:path}`.
+fn declared_level(path: &str) -> Option<AuthLevel> {
+    fn bare_params(path: &str) -> String {
+        path.split('/')
+            .map(|segment| match segment.strip_prefix('{') {
+                Some(param) => {
+                    let name = param.trim_start_matches('*').trim_end_matches('}');
+                    format!("{{{}}}", name.split(':').next().unwrap_or(name))
+                }
+                None => segment.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+    let path = bare_params(path);
+    ROUTE_LEVELS
+        .iter()
+        .find(|(route, _)| bare_params(route) == path)
+        .map(|(_, level)| *level)
+}
+
+/// `Router::route` for one of sglang's own routes, which `auth_levels.json`
+/// must declare: an undeclared one panics as the router is built, so the tests
+/// that build it fail. Routes an embedding package adds (`HttpLayer`) skip this
+/// and are `NORMAL`, as an undeclared route is in Python.
+pub(super) trait DeclaredRoute<S> {
+    fn declared_route(self, path: &str, method_router: MethodRouter<S>) -> Self;
+}
+
+impl<S: Clone + Send + Sync + 'static> DeclaredRoute<S> for Router<S> {
+    fn declared_route(self, path: &str, method_router: MethodRouter<S>) -> Self {
+        let level = declared_level(path).unwrap_or_else(|| {
+            panic!("route {path} has no auth level in python/sglang/srt/utils/auth_levels.json")
+        });
+        assert!(
+            level == AuthLevel::Normal || !path.contains('{'),
+            "admin route {path} takes a path parameter, which `level` cannot match"
+        );
+        self.route(path, method_router)
+    }
 }
 
 /// Wrap `app` in the key check. It applies without keys too: the forced
@@ -230,12 +270,28 @@ mod tests {
     }
 
     #[test]
-    fn levels_follow_the_python_routes() {
+    fn levels_come_from_the_shared_table() {
         assert_eq!(level("/start_profile"), AuthLevel::AdminForce);
         assert_eq!(level("/flush_cache"), AuthLevel::AdminOptional);
         assert_eq!(level("/generate"), AuthLevel::Normal);
-        assert_eq!(level(FORWARD_PEER_PATH), AuthLevel::AdminOptional);
+        assert_eq!(
+            level(crate::api_server::core::FORWARD_PEER_PATH),
+            AuthLevel::AdminOptional
+        );
         assert_eq!(level("/nope"), AuthLevel::Normal);
+        // axum's parameter syntax finds FastAPI's.
+        assert_eq!(
+            declared_level("/v1/models/{model}"),
+            Some(AuthLevel::Normal)
+        );
+        assert_eq!(declared_level("/metrics/{*path}"), Some(AuthLevel::Normal));
+        assert_eq!(declared_level("/nope"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no auth level")]
+    fn an_undeclared_route_stops_the_server() {
+        let _: Router = Router::new().declared_route("/nope", get(|| async { "ok" }));
     }
 
     /// A DP control relay passes a keyed peer's check: the relay presents the

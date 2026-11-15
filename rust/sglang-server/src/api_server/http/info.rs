@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use super::app::AppState;
+use super::auth::DeclaredRoute;
 use super::native_api::native_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
 use crate::api_server::handlers::{AbortEnding, ProfileOutcome};
@@ -34,19 +35,19 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         // Control-plane: the core performs the typed operation and this
         // adapter renders its result as one non-streamed JSON response.
-        .route("/server_info", get(server_info))
+        .declared_route("/server_info", get(server_info))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
         // alias).
-        .route("/get_model_info", get(model_info))
-        .route("/model_info", get(model_info))
-        .route("/flush_cache", get(flush_cache).post(flush_cache))
-        .route("/weights_checker", get(check_weights).post(check_weights))
-        .route("/start_profile", get(start_profile).post(start_profile))
-        .route("/stop_profile", get(stop_profile).post(stop_profile))
-        .route("/abort_request", post(abort_request))
+        .declared_route("/get_model_info", get(model_info))
+        .declared_route("/model_info", get(model_info))
+        .declared_route("/flush_cache", get(flush_cache).post(flush_cache))
+        .declared_route("/weights_checker", get(check_weights).post(check_weights))
+        .declared_route("/start_profile", get(start_profile).post(start_profile))
+        .declared_route("/stop_profile", get(stop_profile).post(stop_profile))
+        .declared_route("/abort_request", post(abort_request))
         // Listener-to-listener: another DP rank's control request for this
         // rank's scheduler (see `api_server::core::peer`).
-        .route(FORWARD_PEER_PATH, post(forward_control_req))
+        .declared_route(FORWARD_PEER_PATH, post(forward_control_req))
 }
 
 /// `POST /internal/peer` — the body is a control message's wire bytes,
