@@ -68,8 +68,9 @@ def _rel_l2(a, b):
     return ((a - b).norm() / b.norm()).item()
 
 
-# 1-64 rows run one row tile, 65+ rows several; the reduction's row tile is 1, 2,
-# 4 and 8 rows at 1-8, 9-16, 17-32 and 33+ rows.
+# K_a and K_b run one row tile at 1-64 rows and several at 65+; K_f runs its gate
+# programs in blocks of 8 rows (9, 17 and 65 end in a partial block) and one per
+# row from 129 rows.
 @pytest.mark.parametrize("rows", [1, 9, 17, 64, 65, 193])
 @pytest.mark.parametrize("combine", [True, False])
 def test_hc_seam_matches_fp64_reference(rows, combine):

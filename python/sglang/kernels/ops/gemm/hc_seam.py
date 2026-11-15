@@ -12,8 +12,8 @@ One seam is the work between the TP all-reduce of a block output ``y`` and the n
 Three launches, no atomics and no inter-CTA waits (deterministic, CUDA-graph safe):
   K_a  split-K over the 10240-wide row: combine, branch sum of squares, and the norm-deferred down-projection
        partials (the per-branch rsqrt is a scalar per (row, branch), so it is applied after the dot).
-  K_f  fixed-order (tree) reduction of the partials: rsqrt and t; plus one program per (row, branch) that computes
-       that entry of a' from the exact bf16 xn, as the stock combine does.
+  K_f  fixed-order reduction of the partials: rsqrt and t, one output per thread; plus programs that compute a' from
+       the exact bf16 xn, as the stock combine does.
   K_b  up projection of all HC branches in one dot pair, sigmoid, exact bf16 xn, gated mean.
 ``hc_gated_combine`` (K_c) is the combine alone, for a boundary whose mix runs later.
 Each kernel takes M before its pointers, inside the kernel-argument registers gfx950 preloads; after the pointers it
@@ -39,15 +39,16 @@ LOWRANK = 320
 MAX_ROWS = 256  # rows per call (workspace size)
 _ROW_TILE = 64
 
-# Fixed launch configuration, chosen by a tile sweep on gfx950. K_f and K_b read each operand in a few wide loads;
-# chains of small loads measured slower.
+# Fixed launch configuration, chosen by tile sweeps on gfx950. K_b reads each operand in a few wide loads; chains of
+# small loads measured slower.
 KA_KB = 256  # row chunk per K_a program (divides HS)
 KA_BK = 64
 KA_BN = 64
 KA_WARPS = 4
-KF_BM = 8  # K_f's largest row tile; _kf_bm(rows) picks the tile per call
-KF_BL = 16
+KF_BLOCK = 256  # outputs of t per K_f reduce program, one per thread
 KF_BKG = 512
+KF_ROW_GATES = 129  # from these rows one K_f program computes all of a row's gates
+_XCDS = 8  # gfx950 (SPX mode) dispatches workgroups round-robin over its 8 XCDs by linear id
 KB_BJ = 16
 KB_LA = 256  # LOWRANK = KB_LA + (LOWRANK - KB_LA); both parts powers of two
 KB_WARPS = 4
@@ -149,6 +150,109 @@ def _hc_seam_down_kernel(
 
 
 @triton.jit
+def _gate_rs(
+    ss_ptr, M, m, c, eps, HS_: tl.constexpr, NKC_B: tl.constexpr, NKP: tl.constexpr
+):
+    """rsqrt(mean square) of branch c of row m: its split-K sums of squares, one masked load summed as a tree."""
+    offs_j = tl.arange(0, NKP)
+    ssb = tl.sum(
+        tl.load(ss_ptr + (c * NKC_B + offs_j) * M + m, mask=offs_j < NKC_B, other=0.0),
+        axis=0,
+    )
+    return tl.math.rsqrt(ssb / HS_ + eps)
+
+
+@triton.jit
+def _gate_one(
+    M,
+    ss_ptr,
+    r_ptr,
+    wn_ptr,
+    wi_ptr,
+    aout_ptr,
+    eps,
+    m,
+    cp,
+    HC_: tl.constexpr,
+    HS_: tl.constexpr,
+    NKC_B: tl.constexpr,
+    NKP: tl.constexpr,
+    BKG: tl.constexpr,
+    NQP: tl.constexpr,
+):
+    """Gate cp of row m: the row's exact bf16 xn dotted with W_inject row cp."""
+    D: tl.constexpr = HC_ * HS_
+    offs_q = tl.arange(0, NQP)
+    mask_q = (offs_q < HS_ // BKG)[:, None]
+    offs_k = tl.arange(0, BKG)
+    accv = tl.zeros((NQP, BKG), dtype=tl.float32)
+    for c in tl.static_range(HC_):
+        rs = _gate_rs(ss_ptr, M, m, c, eps, HS_, NKC_B, NKP)
+        k = c * HS_ + offs_q[:, None] * BKG + offs_k[None, :]
+        xr = tl.load(r_ptr + m * D + k, mask=mask_q, other=0.0).to(tl.float32)
+        wn = tl.load(wn_ptr + k, mask=mask_q, other=0.0).to(tl.float32)
+        xn = ((xr * rs) * (1.0 + wn)).to(r_ptr.dtype.element_ty).to(tl.float32)
+        wi = tl.load(wi_ptr + cp * D + k, mask=mask_q, other=0.0).to(tl.float32)
+        accv += xn * wi
+    g = tl.sum(tl.sum(accv, axis=1), axis=0)
+    tl.store(aout_ptr + m * HC_ + cp, 2.0 / (1.0 + tl.exp(-g * (1.0 / HC_))))
+
+
+@triton.jit
+def _gate_row(
+    M,
+    ss_ptr,
+    r_ptr,
+    wn_ptr,
+    wi_ptr,
+    aout_ptr,
+    eps,
+    m,
+    HC_: tl.constexpr,
+    HS_: tl.constexpr,
+    NKC_B: tl.constexpr,
+    NKP: tl.constexpr,
+    BKG: tl.constexpr,
+):
+    """All four gates of row m: its exact bf16 xn, built once in [BKG] chunks, with one [BKG] accumulator per gate in
+    xn's layout (an [HC, BKG] W_inject tile was 4.5 us slower per seam at 129-193 rows on gfx950)."""
+    tl.static_assert(HC_ == 4)
+    D: tl.constexpr = HC_ * HS_
+    offs_k = tl.arange(0, BKG)
+    acc0 = tl.zeros((BKG,), dtype=tl.float32)
+    acc1 = tl.zeros((BKG,), dtype=tl.float32)
+    acc2 = tl.zeros((BKG,), dtype=tl.float32)
+    acc3 = tl.zeros((BKG,), dtype=tl.float32)
+    for c in tl.static_range(HC_):
+        rs = _gate_rs(ss_ptr, M, m, c, eps, HS_, NKC_B, NKP)
+        for q in range(HS_ // BKG):
+            k = c * HS_ + q * BKG + offs_k
+            xr = tl.load(r_ptr + m * D + k).to(tl.float32)
+            wn = tl.load(wn_ptr + k).to(tl.float32)
+            xn = ((xr * rs) * (1.0 + wn)).to(r_ptr.dtype.element_ty).to(tl.float32)
+            acc0 += xn * tl.load(wi_ptr + k).to(tl.float32)
+            acc1 += xn * tl.load(wi_ptr + D + k).to(tl.float32)
+            acc2 += xn * tl.load(wi_ptr + 2 * D + k).to(tl.float32)
+            acc3 += xn * tl.load(wi_ptr + 3 * D + k).to(tl.float32)
+    tl.store(
+        aout_ptr + m * HC_ + 0,
+        2.0 / (1.0 + tl.exp(-tl.sum(acc0, axis=0) * (1.0 / HC_))),
+    )
+    tl.store(
+        aout_ptr + m * HC_ + 1,
+        2.0 / (1.0 + tl.exp(-tl.sum(acc1, axis=0) * (1.0 / HC_))),
+    )
+    tl.store(
+        aout_ptr + m * HC_ + 2,
+        2.0 / (1.0 + tl.exp(-tl.sum(acc2, axis=0) * (1.0 / HC_))),
+    )
+    tl.store(
+        aout_ptr + m * HC_ + 3,
+        2.0 / (1.0 + tl.exp(-tl.sum(acc3, axis=0) * (1.0 / HC_))),
+    )
+
+
+@triton.jit
 def _hc_seam_reduce_kernel(
     M,
     p_ptr,
@@ -164,94 +268,77 @@ def _hc_seam_reduce_kernel(
     HS_: tl.constexpr,
     L: tl.constexpr,
     KB: tl.constexpr,
-    BM: tl.constexpr,
-    BL: tl.constexpr,
-    BKG: tl.constexpr,
     NKP: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BKG: tl.constexpr,
     NQP: tl.constexpr,
+    XCDS: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+    ROW_GATES: tl.constexpr,
 ):
-    """Programs (pid_m, pid_l < NLT) reduce the down-projection partials of a [BM, BL] tile; programs with
-    pid_l >= NLT (gate grid only) each compute one of a row's next combine gates from the exact bf16 xn.
-    Each branch's split-K chunks are read in one masked load and summed as a tree, so a program issues a few
-    independent loads instead of a chain of small ones."""
-    D: tl.constexpr = HC_ * HS_
+    """The first programs each own BLOCK outputs of t, one per thread: every branch's split-K sums of squares and
+    partials are added in chunk order, so all loads are independent of the sums. With HAS_GATE, gate programs
+    follow: one per (row, gate) in blocks of XCDS rows, so a row's programs share an XCD and read its R' into one
+    L2; with ROW_GATES one per row for all HC gates, which reads R' once."""
     NKC_B: tl.constexpr = HS_ // KB  # split-K chunks per branch (<= NKP)
-    NQ: tl.constexpr = HS_ // BKG  # gate chunks per branch (<= NQP)
-    NLT: tl.constexpr = (L + BL - 1) // BL
-    pid_m = tl.program_id(0)
-    pid_l = tl.program_id(1)
-    offs_j = tl.arange(0, NKP)
-    mask_j = offs_j < NKC_B
-    if pid_l < NLT:
-        offs_m = pid_m * BM + tl.arange(0, BM)
-        mask_m = offs_m < M
-        offs_l = pid_l * BL + tl.arange(0, BL)
-        mask_l = offs_l < L
-        first_l = pid_l == 0
-        t_raw = tl.zeros((BM, BL), dtype=tl.float32)
+    pid = tl.program_id(0)
+    n_red = (M * L + BLOCK - 1) // BLOCK
+    if pid < n_red:
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < M * L
+        m = offs // L
+        t_raw = tl.zeros((BLOCK,), dtype=tl.float32)
         for c in tl.static_range(HC_):
-            kc = c * NKC_B + offs_j
-            ssb = tl.sum(
-                tl.load(
-                    ss_ptr + kc[:, None] * M + offs_m[None, :],
-                    mask=mask_j[:, None] & mask_m[None, :],
-                    other=0.0,
-                ),
-                axis=0,
-            )
-            ub = tl.sum(
-                tl.load(
-                    p_ptr
-                    + kc[:, None, None] * (M * L)
-                    + offs_m[None, :, None] * L
-                    + offs_l[None, None, :],
-                    mask=mask_j[:, None, None]
-                    & mask_m[None, :, None]
-                    & mask_l[None, None, :],
-                    other=0.0,
-                ),
-                axis=0,
-            )
+            ssb = tl.load(ss_ptr + c * NKC_B * M + m, mask=mask, other=0.0)
+            u = tl.load(p_ptr + c * NKC_B * (M * L) + offs, mask=mask, other=0.0)
+            for j in tl.static_range(1, NKC_B):
+                kc = c * NKC_B + j
+                ssb += tl.load(ss_ptr + kc * M + m, mask=mask, other=0.0)
+                u += tl.load(p_ptr + kc * (M * L) + offs, mask=mask, other=0.0)
             rs = tl.math.rsqrt(ssb / HS_ + eps)
-            tl.store(rs_ptr + offs_m * HC_ + c, rs, mask=mask_m & first_l)
-            t_raw += rs[:, None] * ub
+            tl.store(rs_ptr + m * HC_ + c, rs, mask=mask & (offs % L == 0))
+            t_raw += rs * u
         a = t_raw * (1.0 / HC_)
         t = a * tl.sigmoid(a)
-        tl.store(
-            t_ptr + offs_m[:, None] * L + offs_l[None, :],
-            t.to(t_ptr.dtype.element_ty),
-            mask=mask_m[:, None] & mask_l[None, :],
-        )
-    else:
-        # One program per (row, output gate): the row's exact bf16 xn dotted with one W_inject row.
-        q = pid_l - NLT
-        m = pid_m * BM + q // HC_
-        cp = q % HC_
-        if m < M:
-            offs_q = tl.arange(0, NQP)
-            mask_q = offs_q < NQ
-            offs_k = tl.arange(0, BKG)
-            accv = tl.zeros((NQP, BKG), dtype=tl.float32)
-            for c in tl.static_range(HC_):
-                ssb = tl.sum(
-                    tl.load(
-                        ss_ptr + (c * NKC_B + offs_j) * M + m, mask=mask_j, other=0.0
-                    ),
-                    axis=0,
+        tl.store(t_ptr + offs, t.to(t_ptr.dtype.element_ty), mask=mask)
+    elif HAS_GATE:
+        g = pid - n_red
+        if ROW_GATES:
+            _gate_row(
+                M,
+                ss_ptr,
+                r_ptr,
+                wn_ptr,
+                wi_ptr,
+                aout_ptr,
+                eps,
+                g,
+                HC_,
+                HS_,
+                NKC_B,
+                NKP,
+                BKG,
+            )
+        else:
+            row = g // (XCDS * HC_) * XCDS + g % XCDS
+            if row < M:
+                _gate_one(
+                    M,
+                    ss_ptr,
+                    r_ptr,
+                    wn_ptr,
+                    wi_ptr,
+                    aout_ptr,
+                    eps,
+                    row,
+                    g % (XCDS * HC_) // XCDS,
+                    HC_,
+                    HS_,
+                    NKC_B,
+                    NKP,
+                    BKG,
+                    NQP,
                 )
-                rs = tl.math.rsqrt(ssb / HS_ + eps)
-                k = c * HS_ + offs_q[:, None] * BKG + offs_k[None, :]
-                xr = tl.load(r_ptr + m * D + k, mask=mask_q[:, None], other=0.0).to(
-                    tl.float32
-                )
-                wn = tl.load(wn_ptr + k, mask=mask_q[:, None], other=0.0).to(tl.float32)
-                xn = ((xr * rs) * (1.0 + wn)).to(r_ptr.dtype.element_ty).to(tl.float32)
-                wi = tl.load(wi_ptr + cp * D + k, mask=mask_q[:, None], other=0.0).to(
-                    tl.float32
-                )
-                accv += xn * wi
-            g = tl.sum(tl.sum(accv, axis=1), axis=0)
-            tl.store(aout_ptr + m * HC_ + cp, 2.0 / (1.0 + tl.exp(-g * (1.0 / HC_))))
 
 
 @triton.jit
@@ -345,18 +432,6 @@ def _workspace(device: torch.device):
     return ws
 
 
-def _kf_bm(rows: int) -> int:
-    # next_pow2(rows) / 8 rows per program, 1..KF_BM. A fixed 8-row tile ran one to four row programs at 1-32
-    # rows, where the seam call was 1.2-2.0 us slower (gfx950).
-    return min(KF_BM, max(1, triton.next_power_of_2(rows) // 8))
-
-
-def _kf_bl(rows: int) -> int:
-    # Half-width column blocks (twice the reduce programs) for one 64-row tile: 0.5-0.7 us faster per seam at
-    # 33-64 rows, slower or level at the other row counts (gfx950).
-    return KF_BL // 2 if _ROW_TILE // 2 < rows <= _ROW_TILE else KF_BL
-
-
 def hc_seam_supported(rows: int, x: torch.Tensor) -> bool:
     return (
         0 < rows <= MAX_ROWS
@@ -436,12 +511,15 @@ def hc_seam(
         HAS_COMBINE=has_combine,
         num_warps=KA_WARPS,
     )
-    kf_bl = _kf_bl(rows)
-    nlt = triton.cdiv(LOWRANK, kf_bl)
-    kf_bm = _kf_bm(rows)
-    _hc_seam_reduce_kernel[
-        (triton.cdiv(rows, kf_bm), nlt + (kf_bm * HC if has_gate else 0))
-    ](
+    # Gate programs: blocks of _XCDS rows x HC gates (a row's programs _XCDS ids apart), or one per row.
+    row_gates = has_gate and rows >= KF_ROW_GATES
+    if row_gates:
+        n_gate = rows
+    elif has_gate:
+        n_gate = triton.cdiv(rows, _XCDS) * _XCDS * HC
+    else:
+        n_gate = 0
+    _hc_seam_reduce_kernel[(triton.cdiv(rows * LOWRANK, KF_BLOCK) + n_gate,)](
         rows,
         ws["p"],
         ws["ss"],
@@ -456,11 +534,13 @@ def hc_seam(
         HS_=HS,
         L=LOWRANK,
         KB=KA_KB,
-        BM=kf_bm,
-        BL=kf_bl,
-        BKG=KF_BKG,
         NKP=triton.next_power_of_2(HS // KA_KB),
+        BLOCK=KF_BLOCK,
+        BKG=KF_BKG,
         NQP=triton.next_power_of_2(HS // KF_BKG),
+        XCDS=_XCDS,
+        HAS_GATE=has_gate,
+        ROW_GATES=row_gates,
         num_warps=4,
     )
     _hc_seam_up_kernel[(HS // KB_BJ, row_tiles)](
