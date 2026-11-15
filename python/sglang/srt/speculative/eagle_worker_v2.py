@@ -200,11 +200,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.topk = get_spec().speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
-        vocab_size = self.target_worker.model_config.vocab_size
-        self.use_fused_draft_sample = (
-            get_spec().speculative_use_rejection_sampling
-            and use_fused_draft_sample(vocab_size)
-        )
+        # Decided in alloc_memory_pool, once init_lm_head has fixed the draft logits width.
+        self.use_fused_draft_sample = False
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -270,6 +267,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_token_map()
         self.init_lm_head()
         self._init_draft_probs_vocab_scatter()
+        # The draft samples over its own logits: a hot-token map narrows them below the
+        # target vocabulary, to widths the fused kernel may not take.
+        self.use_fused_draft_sample = (
+            get_spec().speculative_use_rejection_sampling
+            and use_fused_draft_sample(self.draft_probs_vocab_size)
+        )
 
         if get_spec().speculative_use_rejection_sampling:
             if (
