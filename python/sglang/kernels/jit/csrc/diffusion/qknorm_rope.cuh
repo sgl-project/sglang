@@ -203,6 +203,37 @@ SGL_DEVICE T rotary_sub_fp32(T x, float cos, T y, float sin) {
 #endif
 }
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1030 || __CUDA_ARCH__ >= 1200)
+#define SGL_QKNORM_ROPE_PACKED_RN 1
+/// \brief `rotary_sub` / `rotary_add` on both halves of a packed pair: the same
+/// rounded products and rounded sum per element, two elements per instruction.
+template <typename P>
+SGL_DEVICE uint32_t packed_bits(P value) {
+  return reinterpret_cast<const uint32_t&>(value);
+}
+
+template <typename P>
+SGL_DEVICE P packed_from_bits(uint32_t bits) {
+  return reinterpret_cast<const P&>(bits);
+}
+
+#define SGL_QKNORM_ROPE_PACKED_OP(NAME, BF16_OP, F16_OP)                                      \
+  template <typename T, typename P>                                                           \
+  SGL_DEVICE P NAME(P lhs, P rhs) {                                                           \
+    uint32_t out;                                                                             \
+    if constexpr (std::is_same_v<T, bf16_t>) {                                                \
+      asm(BF16_OP " %0, %1, %2;" : "=r"(out) : "r"(packed_bits(lhs)), "r"(packed_bits(rhs))); \
+    } else {                                                                                  \
+      asm(F16_OP " %0, %1, %2;" : "=r"(out) : "r"(packed_bits(lhs)), "r"(packed_bits(rhs)));  \
+    }                                                                                         \
+    return packed_from_bits<P>(out);                                                          \
+  }
+SGL_QKNORM_ROPE_PACKED_OP(packed_mul_rn, "mul.rn.bf16x2", "mul.rn.f16x2")
+SGL_QKNORM_ROPE_PACKED_OP(packed_add_rn, "add.rn.bf16x2", "add.rn.f16x2")
+SGL_QKNORM_ROPE_PACKED_OP(packed_sub_rn, "sub.rn.bf16x2", "sub.rn.f16x2")
+#undef SGL_QKNORM_ROPE_PACKED_OP
+#endif
+
 template <
     int64_t kHeadDim,
     int64_t kRopeDim,
@@ -539,31 +570,10 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
                                       : row_lane * (kCacheHasFullWidth ? kElems : kElems / 2);
   constexpr uint32_t kCacheRun = kIsNeox || kCacheHasFullWidth ? kElems : kElems / 2;
 
-  PDLWaitPrimary<kUsePDL>();
-
-  for (uint32_t pair = start_worker_id; pair < num_pairs; pair += num_workers) {
-    // a missing second row recomputes the last one and skips the store
-    const uint32_t wanted_row = 2 * pair + lane_id / kRowLanes;
-    const uint32_t row = wanted_row < num_rows ? wanted_row : num_rows - 1;
-    const uint32_t token_id = row / num_qk_heads;
-    const uint32_t head_id = row % num_qk_heads;
-    const bool load_q = head_id < num_qo_heads;
-    const void* input = load_q ? pointer::offset(q_ptr, token_id * q_stride_bytes, head_id * head_stride_bytes)
-                               : pointer::offset(k_ptr, token_id * k_stride_bytes, head_id * head_stride_bytes);
-    void* output = const_cast<void*>(input);
-    if constexpr (kOutOfPlace) {
-      output =
-          load_q ? pointer::offset(
-                       params.q_out_ptr, token_id * params.q_out_stride_bytes, head_id * params.out_head_stride_bytes)
-                 : pointer::offset(
-                       params.k_out_ptr, token_id * params.k_out_stride_bytes, head_id * params.out_head_stride_bytes);
-    }
-
-    auto vec = load_as<Storage>(input, row_lane);
-    const auto weight_vec = load_as<Storage>(load_q ? q_weight_ptr : k_weight_ptr, row_lane);
-
-    CacheDType cos_vals[kCacheRun];
-    CacheDType sin_vals[kCacheRun];
+  // cache entry of element 2 * p + i of this lane's run
+  const auto cache_at = [](uint32_t p, uint32_t i) { return kIsNeox || kCacheHasFullWidth ? 2 * p + i : p; };
+  const float row_eps = eps;
+  const auto load_cache = [&](uint32_t token_id, CacheDType(&cos_vals)[kCacheRun], CacheDType(&sin_vals)[kCacheRun]) {
     if (row_lane < kRotaryLanes) {
       const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
       const auto cos_ptr = static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
@@ -571,9 +581,27 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
       load_cache_run(cos_ptr + cache_base, cos_vals);
       load_cache_run(sin_ptr + cache_base, sin_vals);
     }
-    // cache entry of element 2 * p + i of this lane's run
-    const auto cache_at = [](uint32_t p, uint32_t i) { return kIsNeox || kCacheHasFullWidth ? 2 * p + i : p; };
-
+  };
+  const auto row_input = [&](uint32_t token_id, uint32_t head_id) -> const void* {
+    return head_id < num_qo_heads ? pointer::offset(q_ptr, token_id * q_stride_bytes, head_id * head_stride_bytes)
+                                  : pointer::offset(k_ptr, token_id * k_stride_bytes, head_id * head_stride_bytes);
+  };
+  const auto row_output = [&](uint32_t token_id, uint32_t head_id) -> void* {
+    if constexpr (kOutOfPlace) {
+      return head_id < num_qo_heads
+                 ? pointer::offset(
+                       params.q_out_ptr, token_id * params.q_out_stride_bytes, head_id * params.out_head_stride_bytes)
+                 : pointer::offset(
+                       params.k_out_ptr, token_id * params.k_out_stride_bytes, head_id * params.out_head_stride_bytes);
+    } else {
+      return const_cast<void*>(row_input(token_id, head_id));
+    }
+  };
+  // QK-norm + RoPE of this lane's part of one row, in place in vec
+  const auto transform = [&](Storage& vec,
+                             const Storage& weight_vec,
+                             const CacheDType(&cos_vals)[kCacheRun],
+                             const CacheDType(&sin_vals)[kCacheRun]) {
     if constexpr (kRoundNormBeforeRope) {
       // part[h] is the sum of warp-kernel lane 2 * row_lane + h, and the shuffles
       // below are that kernel's 16..2 xor steps; its final step adds the pair.
@@ -589,7 +617,7 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
         part[0] += __shfl_xor_sync(0xffffffffu, part[0], mask);
         part[1] += __shfl_xor_sync(0xffffffffu, part[1], mask);
       }
-      const float norm_factor = math::rsqrt((part[0] + part[1]) / kHeadDim + eps);
+      const float norm_factor = math::rsqrt((part[0] + part[1]) / kHeadDim + row_eps);
 
 #pragma unroll
       for (uint32_t j = 0; j < kElems / 2; ++j) {
@@ -607,20 +635,40 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
           reinterpret_cast<uint32_t&>(partner_vec[j]) = bits;
         }
         if (row_lane < kRotaryLanes) {
+#ifdef SGL_QKNORM_ROPE_PACKED_RN
+          if constexpr (std::is_same_v<CacheDType, DType>) {
 #pragma unroll
-          for (uint32_t j = 0; j < kElems / 2; ++j) {
-            auto& values = unpack(vec[j]);
-            const auto& partner_values = unpack(partner_vec[j]);
+            for (uint32_t j = 0; j < kElems / 2; ++j) {
+              Packed cos;
+              Packed sin;
+              unpack(cos)[0] = cos_vals[2 * j];
+              unpack(cos)[1] = cos_vals[2 * j + 1];
+              unpack(sin)[0] = sin_vals[2 * j];
+              unpack(sin)[1] = sin_vals[2 * j + 1];
+              const Packed lhs = packed_mul_rn<DType>(vec[j], cos);
+              const Packed rhs = packed_mul_rn<DType>(partner_vec[j], sin);
+              const Packed diff = packed_sub_rn<DType>(lhs, rhs);
+              const Packed sum = packed_add_rn<DType>(lhs, rhs);
+              vec[j] = row_lane < kHalfRotaryLanes ? diff : sum;
+            }
+          } else
+#endif
+          {
 #pragma unroll
-            for (uint32_t i = 0; i < 2; ++i) {
-              const auto cos = cos_vals[2 * j + i];
-              const auto sin = sin_vals[2 * j + i];
-              if constexpr (std::is_same_v<CacheDType, fp32_t>) {
-                values[i] = row_lane < kHalfRotaryLanes ? rotary_sub_fp32(values[i], cos, partner_values[i], sin)
-                                                        : rotary_add_fp32(values[i], cos, partner_values[i], sin);
-              } else {
-                values[i] = row_lane < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
-                                                        : rotary_add(values[i], cos, partner_values[i], sin);
+            for (uint32_t j = 0; j < kElems / 2; ++j) {
+              auto& values = unpack(vec[j]);
+              const auto& partner_values = unpack(partner_vec[j]);
+#pragma unroll
+              for (uint32_t i = 0; i < 2; ++i) {
+                const auto cos = cos_vals[2 * j + i];
+                const auto sin = sin_vals[2 * j + i];
+                if constexpr (std::is_same_v<CacheDType, fp32_t>) {
+                  values[i] = row_lane < kHalfRotaryLanes ? rotary_sub_fp32(values[i], cos, partner_values[i], sin)
+                                                          : rotary_add_fp32(values[i], cos, partner_values[i], sin);
+                } else {
+                  values[i] = row_lane < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
+                                                          : rotary_add(values[i], cos, partner_values[i], sin);
+                }
               }
             }
           }
@@ -661,7 +709,7 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
         part[0] += __shfl_xor_sync(0xffffffffu, part[0], mask);
         part[1] += __shfl_xor_sync(0xffffffffu, part[1], mask);
       }
-      const float norm_factor = math::rsqrt((part[0] + part[1]) / static_cast<float>(kHeadDim) + eps);
+      const float norm_factor = math::rsqrt((part[0] + part[1]) / static_cast<float>(kHeadDim) + row_eps);
 
 #pragma unroll
       for (uint32_t j = 0; j < kElems / 2; ++j) {
@@ -690,7 +738,46 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
         vec[j] = cast<Packed, fp32x2_t>({elems[2 * j], elems[2 * j + 1]});
       }
     }
-    if (wanted_row < num_rows) store_as<Storage>(output, vec, row_lane);
+  };
+
+  PDLWaitPrimary<kUsePDL>();
+
+  if (num_qk_heads % 2 == 0 && num_tokens >= num_workers) {
+    // rows are token-major, so with an even head count both rows of a warp share a token: walk one
+    // token's heads, loading its position, cos/sin and the weights once and the next row ahead
+    const uint32_t row_half = lane_id / kRowLanes;
+    const uint32_t num_head_pairs = num_qk_heads / 2;
+    const auto q_weight_vec = load_as<Storage>(q_weight_ptr, row_lane);
+    const auto k_weight_vec = load_as<Storage>(k_weight_ptr, row_lane);
+    for (uint32_t token_id = start_worker_id; token_id < num_tokens; token_id += num_workers) {
+      CacheDType cos_vals[kCacheRun];
+      CacheDType sin_vals[kCacheRun];
+      load_cache(token_id, cos_vals, sin_vals);
+      auto vec = load_as<Storage>(row_input(token_id, row_half), row_lane);
+      for (uint32_t head_pair = 0; head_pair < num_head_pairs; ++head_pair) {
+        const uint32_t head_id = 2 * head_pair + row_half;
+        Storage next;
+        if (head_pair + 1 < num_head_pairs) next = load_as<Storage>(row_input(token_id, head_id + 2), row_lane);
+        transform(vec, head_id < num_qo_heads ? q_weight_vec : k_weight_vec, cos_vals, sin_vals);
+        store_as<Storage>(row_output(token_id, head_id), vec, row_lane);
+        vec = next;
+      }
+    }
+  } else {
+    for (uint32_t pair = start_worker_id; pair < num_pairs; pair += num_workers) {
+      // a missing second row recomputes the last one and skips the store
+      const uint32_t wanted_row = 2 * pair + lane_id / kRowLanes;
+      const uint32_t row = wanted_row < num_rows ? wanted_row : num_rows - 1;
+      const uint32_t token_id = row / num_qk_heads;
+      const uint32_t head_id = row % num_qk_heads;
+      auto vec = load_as<Storage>(row_input(token_id, head_id), row_lane);
+      const auto weight_vec = load_as<Storage>(head_id < num_qo_heads ? q_weight_ptr : k_weight_ptr, row_lane);
+      CacheDType cos_vals[kCacheRun];
+      CacheDType sin_vals[kCacheRun];
+      load_cache(token_id, cos_vals, sin_vals);
+      transform(vec, weight_vec, cos_vals, sin_vals);
+      if (wanted_row < num_rows) store_as<Storage>(row_output(token_id, head_id), vec, row_lane);
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
