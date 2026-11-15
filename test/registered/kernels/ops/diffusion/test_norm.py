@@ -880,19 +880,22 @@ def test_head128_mean_square_exact(batch, seq, heads, packed, amplitude):
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
-def test_head128_mean_square_capture_replay_and_compile():
-    from sglang.kernels.ops.diffusion.norm.rmsnorm_cast_before_weight_bitexact import (
-        rmsnorm_mean_square_bitexact,
-    )
+@pytest.mark.parametrize("width", [64, 128, 4096])
+def test_mean_square_capture_replay_and_compile(width):
+    from sglang.kernels.ops.diffusion import rmsnorm_mean_square_bitexact
 
     x = torch.randn(1, 31, 4, 128, device="cuda", dtype=torch.bfloat16)
+    if width == 64:
+        x = x[..., 64:]
+    elif width == 4096:
+        x = torch.randn(17, width, device=DEVICE, dtype=torch.bfloat16)
     rmsnorm_mean_square_bitexact(x)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = rmsnorm_mean_square_bitexact(x)
     compiled = torch.compile(rmsnorm_mean_square_bitexact, fullgraph=True)
-    for _ in range(2):
-        x.normal_()
+    for amplitude in (1.0, 1000.0):
+        x.normal_().mul_(amplitude)
         graph.replay()
         expected = x.float().square().mean(-1, keepdim=True)
         assert torch.equal(captured, expected)
@@ -918,24 +921,6 @@ def test_vae_mean_square_reduction_and_offsets(layout, amplitude):
     x.mul_(amplitude)
     expected = x.float().square().mean(-1, keepdim=True)
     assert torch.equal(rmsnorm_mean_square_bitexact(x), expected)
-
-
-@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
-@pytest.mark.parametrize("width", [64, 4096])
-def test_vae_mean_square_graph_reuses_changed_input(width):
-    from sglang.kernels.ops.diffusion import rmsnorm_mean_square_bitexact
-
-    x = torch.randn(1, 17, 8, 128, device=DEVICE, dtype=torch.bfloat16)[..., 64:]
-    if width == 4096:
-        x = torch.randn(17, width, device=DEVICE, dtype=torch.bfloat16)
-    rmsnorm_mean_square_bitexact(x)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = rmsnorm_mean_square_bitexact(x)
-    for amplitude in (1.0, 1000.0):
-        x.normal_().mul_(amplitude)
-        graph.replay()
-        assert torch.equal(captured, x.float().square().mean(-1, keepdim=True))
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")

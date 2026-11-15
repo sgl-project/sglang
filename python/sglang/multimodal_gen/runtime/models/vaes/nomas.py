@@ -50,7 +50,7 @@ TUBE_DIM = TUBELET[0] * TUBELET[1] * TUBELET[2] * 3
 LATENT_CHANNELS = 32
 # A DCAE latent cell is (4, 32, 32) pixels: 1 tubelet in time, 2 x 2 in space.
 LATENT_TOKEN_GRID = 2
-# Target FP32 bytes per fused Q/K chunk; only the squares are materialised.
+# Bound the FP32 square buffer used by the mean-square fallback per Q/K chunk.
 _QK_FUSED_CHUNK_BYTES = 256 * 2**20
 
 
@@ -316,7 +316,7 @@ class GenAttention(nn.Module):
         return apply_mrope(normalized, cos, sin, self.arch.rope_sections).to(dtype)
 
     def _prepare_qk_fused(self, x, cos, sin, norm_t, norm_hw, dtype):
-        """Keep ATen mean squares and the compiled reference's FP32 rounding."""
+        """Keep ATen's reduction order and the compiled reference's FP32 rounding."""
         half = x.shape[-1] // 2
         result = torch.empty_like(x, dtype=dtype)
         use_fused = (
@@ -332,7 +332,7 @@ class GenAttention(nn.Module):
         if use_fused:
             from sglang.kernels.ops.diffusion import fused_nomas_qk_norm_mrope
 
-        # Only the FP32 squares are materialised now, so far larger chunks fit.
+        # First-use verification and unsupported layouts materialize FP32 squares.
         chunk = max(
             1, _QK_FUSED_CHUNK_BYTES // (x.shape[0] * x.shape[2] * x.shape[3] * 4)
         )
