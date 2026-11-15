@@ -41,6 +41,7 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
     set_custom_all_reduce,
 )
+from sglang.test.test_utils import publish_build_topology
 
 Shape = Tuple[int, int]
 
@@ -337,13 +338,13 @@ def parse_args():
     parser.add_argument(
         "--prefill-shapes",
         type=str,
-        default="2048x8192,8192x8192,16384x8192",
+        default="2048x2880,2048x8192,8192x8192,16384x8192",
         help="Comma-separated MxN shapes for eager mode.",
     )
     parser.add_argument(
         "--decode-shapes",
         type=str,
-        default="1x8192,2x8192,4x8192,8x8192,16x8192",
+        default="1x2880,4x2880,16x2880,1x8192,2x8192,4x8192,8x8192,16x8192",
         help="Comma-separated MxN shapes for graph mode.",
     )
     parser.add_argument("--warmup", type=int, default=10)
@@ -381,7 +382,8 @@ def main():
         distributed_init_method="env://",
         backend="nccl",
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    publish_build_topology(world_rank=rank, tp_size=world_size)
+    initialize_model_parallel()
 
     prefill_shapes = parse_shapes(args.prefill_shapes)
     decode_shapes = parse_shapes(args.decode_shapes)

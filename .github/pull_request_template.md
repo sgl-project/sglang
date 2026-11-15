@@ -1,5 +1,13 @@
 <!-- Thank you for your contribution! Please follow these guidelines to enhance your pull request. If anything is unclear, submit your PR and reach out to maintainers for assistance. Join our Slack community at https://slack.sglang.io to discuss further. -->
 
+<!-- PR title: [Type] scope: title, or [Type] [Hardware] scope: title.
+Type: Feat, Fix, Refactor, Perf, Doc, Test, CI, or Chore.
+Scope: any module or model name (no fixed list or letter-case restriction), e.g. attention, qwen3, or flash-attn.
+Hardware: optional single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend.
+Title: no letter-case restriction.
+Reverts: use GitHub's default title, Revert "original title".
+Examples: [Fix] attention: Fix KV cache indexing; [Perf] [AMD] flash-attn: Optimize decode performance. -->
+
 ## Motivation
 
 <!-- Describe the purpose and goals of this pull request. -->
@@ -12,7 +20,7 @@
 
 <!-- If this pull request affects model outputs (e.g., changes to the kernel or model forward code), provide accuracy test results. -->
 
-## Benchmarking and Profiling
+## Speed Tests and Profiling
 
 <!-- If this pull request impacts inference speed, provide benchmarking and profiling results. -->
 
@@ -24,10 +32,10 @@
 - [ ] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).
 - [ ] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).
 
-## Review Process
+## Review and Merge Process
 
-1. Ping Merge Oncalls to start the PR flow. See the [PR Merge Process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process).
+1. Ping Merge Oncalls to start the process. See the [PR Merge Process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process).
 2. Get approvals from [CODEOWNERS](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and other reviewers.
 3. Trigger CI tests with [comments](https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests) or contact authorized users to do so.
-   - `/tag-run-ci-label`, `/rerun-failed-ci`, `/tag-and-rerun-ci`
-4. After green CI and required approvals, ask Merge Oncalls to merge.
+   - Common commands include `/tag-and-rerun-ci`, `/tag-run-ci-label`, `/rerun-failed-ci`
+4. After green CI and required approvals, ask Merge Oncalls or people with Write permission to merge the PR.

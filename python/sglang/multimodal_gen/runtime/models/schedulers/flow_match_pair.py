@@ -49,7 +49,6 @@ class FlowMatchScheduler(BaseScheduler):
         self,
         num_inference_steps=100,
         denoising_strength=1.0,
-        training=False,
         shift=None,
         dynamic_shift_len=None,
     ):
@@ -82,7 +81,8 @@ class FlowMatchScheduler(BaseScheduler):
         if self.shift_terminal is not None:
             one_minus_z = 1 - self.sigmas
             scale_factor = one_minus_z[-1] / (1 - self.shift_terminal)
-            self.sigmas = 1 - (one_minus_z / scale_factor)
+            if scale_factor != 0:
+                self.sigmas = 1 - (one_minus_z / scale_factor)
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
         self.timesteps = self.sigmas * self.num_train_timesteps
@@ -90,17 +90,6 @@ class FlowMatchScheduler(BaseScheduler):
         if self.train_timesteps is None:
             self.train_timesteps = self.timesteps
             self.train_sigmas = self.sigmas
-        if training:
-            x = self.timesteps
-            y = torch.exp(
-                -2 * ((x - num_inference_steps / 2) / num_inference_steps) ** 2
-            )
-            y_shifted = y - y.min()
-            bsmntw_weighing = y_shifted * (num_inference_steps / y_shifted.sum())
-            self.linear_timesteps_weights = bsmntw_weighing
-            self.training = True
-        else:
-            self.training = False
 
     def scale_model_input(self, sample: torch.Tensor, timestep: int | None = None):
         return sample
@@ -117,14 +106,6 @@ class FlowMatchScheduler(BaseScheduler):
         prev_sample = sample + model_output * (sigma_ - sigma)
         return prev_sample
 
-    def return_to_timestep(self, timestep, sample, sample_stablized):
-        if isinstance(timestep, torch.Tensor):
-            timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep).abs())
-        sigma = self.sigmas[timestep_id]
-        model_output = (sample - sample_stablized) / sigma
-        return model_output
-
     def add_noise(self, original_samples, noise, timestep):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
@@ -132,17 +113,6 @@ class FlowMatchScheduler(BaseScheduler):
         sigma = self.sigmas[timestep_id]
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
-
-    def training_target(self, sample, noise, timestep):
-        target = noise - sample
-        return target
-
-    def training_weight(self, timestep):
-        timestep_id = torch.argmin(
-            (self.timesteps - timestep.to(self.timesteps.device)).abs()
-        )
-        weights = self.linear_timesteps_weights[timestep_id]
-        return weights
 
     def calculate_shift(
         self,
@@ -267,9 +237,9 @@ class FlowMatchPairScheduler(FlowMatchScheduler):
 
             self.set_pair_postprocess(_quadratic_perp_bulge_swap)
             return
-        if name == "v2a_sequential":
+        if name in ("v2a_sequential", "a2v_sequential"):
 
-            def _v2a(pairs: torch.Tensor):
+            def _sequential(pairs: torch.Tensor):
                 if (
                     not isinstance(pairs, torch.Tensor)
                     or pairs.ndim != 2
@@ -280,8 +250,12 @@ class FlowMatchPairScheduler(FlowMatchScheduler):
                 base = pairs[:, 0]
                 seq_half = base[::2]
                 m = int(seq_half.shape[0])
-                col0 = torch.cat([seq_half, seq_half[-1:].repeat(m)], dim=0)[:N]
-                col1 = torch.cat([seq_half[0:1].repeat(m), seq_half], dim=0)[:N]
+                if name == "v2a_sequential":
+                    col0 = torch.cat([seq_half, seq_half[-1:].repeat(m)], dim=0)[:N]
+                    col1 = torch.cat([seq_half[0:1].repeat(m), seq_half], dim=0)[:N]
+                else:
+                    col0 = torch.cat([seq_half[0:1].repeat(m), seq_half], dim=0)[:N]
+                    col1 = torch.cat([seq_half, seq_half[-1:].repeat(m)], dim=0)[:N]
                 return torch.stack(
                     [
                         col0.to(dtype=pairs.dtype, device=pairs.device),
@@ -290,60 +264,25 @@ class FlowMatchPairScheduler(FlowMatchScheduler):
                     dim=1,
                 )
 
-            self.set_pair_postprocess(_v2a)
+            self.set_pair_postprocess(_sequential)
             return
-        if name == "a2v_sequential":
+        if name in ("v2a", "a2v"):
 
-            def _a2v(pairs: torch.Tensor):
+            def _single_modality(pairs: torch.Tensor):
                 if (
                     not isinstance(pairs, torch.Tensor)
                     or pairs.ndim != 2
                     or pairs.shape[1] != 2
                 ):
                     raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
-                N = pairs.shape[0]
-                base = pairs[:, 0]
-                seq_half = base[::2]
-                m = int(seq_half.shape[0])
-                col0 = torch.cat([seq_half[0:1].repeat(m), seq_half], dim=0)[:N]
-                col1 = torch.cat([seq_half, seq_half[-1:].repeat(m)], dim=0)[:N]
-                return torch.stack(
-                    [
-                        col0.to(dtype=pairs.dtype, device=pairs.device),
-                        col1.to(dtype=pairs.dtype, device=pairs.device),
-                    ],
-                    dim=1,
-                )
+                if name == "v2a":
+                    zeros = torch.zeros_like(pairs[:, 0])
+                    return torch.stack([zeros, pairs[:, 1]], dim=1)
+                else:
+                    zeros = torch.zeros_like(pairs[:, 1])
+                    return torch.stack([pairs[:, 0], zeros], dim=1)
 
-            self.set_pair_postprocess(_a2v)
-            return
-        if name == "v2a":
-
-            def _v2a_classic(pairs: torch.Tensor):
-                if (
-                    not isinstance(pairs, torch.Tensor)
-                    or pairs.ndim != 2
-                    or pairs.shape[1] != 2
-                ):
-                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
-                zeros = torch.zeros_like(pairs[:, 0])
-                return torch.stack([zeros, pairs[:, 1]], dim=1)
-
-            self.set_pair_postprocess(_v2a_classic)
-            return
-        if name == "a2v":
-
-            def _a2v_classic(pairs: torch.Tensor):
-                if (
-                    not isinstance(pairs, torch.Tensor)
-                    or pairs.ndim != 2
-                    or pairs.shape[1] != 2
-                ):
-                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
-                zeros = torch.zeros_like(pairs[:, 1])
-                return torch.stack([pairs[:, 0], zeros], dim=1)
-
-            self.set_pair_postprocess(_a2v_classic)
+            self.set_pair_postprocess(_single_modality)
             return
         if name == "dual_sigma_shift":
             visual_shift = float(kwargs.get("visual_shift", self.shift))
@@ -421,7 +360,8 @@ class FlowMatchPairScheduler(FlowMatchScheduler):
                     if self.shift_terminal is not None:
                         one_minus_z = 1 - base
                         scale_factor = one_minus_z[-1] / (1 - self.shift_terminal)
-                        base = 1 - (one_minus_z / scale_factor)
+                        if scale_factor != 0:
+                            base = 1 - (one_minus_z / scale_factor)
 
                     if self.reverse_sigmas:
                         base = 1 - base

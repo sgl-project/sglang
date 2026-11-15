@@ -1,0 +1,432 @@
+import unittest
+from array import array
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import torch
+
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    set_mamba_track_indices_from_reqs,
+)
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import alloc_tracking_slots
+from sglang.srt.mem_cache.kv.advance import advance_tracking
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN
+from sglang.srt.mem_cache.unified_cache.components import (
+    BASE_COMPONENT_TYPE,
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
+
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+# The decode checkpoint grid is lcm(mamba_cache_chunk_size, tree page,
+# interval); keeping all three equal leaves it at the interval under test.
+TRACK_INTERVAL = 4
+
+
+def _make_batch() -> tuple[Req, ScheduleBatch]:
+    sampling_params = SamplingParams(max_new_tokens=32)
+    sampling_params.normalize(None)
+    req = Req(
+        rid="req",
+        origin_input_text="",
+        origin_input_ids=array("q", [1, 2]),
+        sampling_params=sampling_params,
+        vocab_size=128,
+    )
+    req.output_ids.append(3)
+    req.kv.kv_committed_len = 2
+
+    batch = ScheduleBatch(reqs=[req])
+    batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
+    batch.tree_cache = SimpleNamespace(
+        page_size=TRACK_INTERVAL, supports_mamba=lambda: False
+    )
+    batch.device = "cpu"
+    batch.model_config = SimpleNamespace(is_encoder_decoder=False)
+    batch.enable_overlap = True
+    batch.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+    batch.sampling_info = SimpleNamespace(
+        penalizer_orchestrator=SimpleNamespace(is_required=False)
+    )
+    batch.hisparse_coordinator = None
+    batch.seq_lens = torch.tensor([2], dtype=torch.int64)
+    batch.seq_lens_cpu = torch.tensor([2], dtype=torch.int64)
+    batch.orig_seq_lens = torch.tensor([2], dtype=torch.int32)
+    return req, batch
+
+
+def _make_processor() -> SchedulerBatchResultProcessor:
+    metrics_reporter = MagicMock()
+    metrics_reporter.num_generated_tokens = 0
+    metrics_reporter.forward_ct_decode = 0
+    return SchedulerBatchResultProcessor(
+        is_generation=True,
+        disaggregation_mode=None,
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
+        token_to_kv_pool_allocator=MagicMock(),
+        tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
+        hisparse_coordinator=None,
+        beam_coordinator=MagicMock(),
+        request_retirer=release_only_retirer(
+            tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL)
+        ),
+        req_to_token_pool=None,
+        kv_weight_version_tracker=None,
+        decode_offload_manager=None,
+        metrics_collector=None,
+        metrics_reporter=metrics_reporter,
+        draft_worker=None,
+        model_worker=MagicMock(),
+        logprob_result_processor=None,
+        output_streamer=MagicMock(),
+        abort_request=lambda *args, **kwargs: None,
+        still_in_batch=lambda req: True,
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
+    )
+
+
+def _make_result():
+    return GenerationBatchResult(
+        logits_output=SimpleNamespace(
+            hidden_states=None, customized_info=None, sampling_mask_output=None
+        ),
+        next_token_ids=[4],
+        speculative_num_draft_tokens=0,
+    )
+
+
+class TestMambaBoundaryMaskReuse(unittest.TestCase):
+    def test_overlap_scheduler_handles_zero_and_one_batch_lookahead(self):
+        for schedule_next_decode, expected_lookahead in ((False, 0), (True, 1)):
+            with self.subTest(schedule_next_decode=schedule_next_decode):
+                req, batch = _make_batch()
+                processor = _make_processor()
+                result = _make_result()
+
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.gracefully_exit = False
+                scheduler.ingest_requests = MagicMock(
+                    side_effect=[[], [], StopIteration]
+                )
+                scheduler.process_input_requests = MagicMock()
+                scheduler.pause_state = PauseState()
+                scheduler.running_batch = batch
+                scheduler.should_process_last_batch_early = MagicMock(
+                    return_value=False
+                )
+                scheduler.run_batch = MagicMock(return_value=result)
+                scheduler._apply_war_barrier = MagicMock()
+                scheduler.is_generation = False
+                scheduler.last_batch = None
+                scheduler.invariant_checker = MagicMock()
+
+                plan_count = 0
+
+                def get_next_batch_to_run(*, running_batch, last_batch):
+                    nonlocal plan_count
+                    del running_batch, last_batch
+                    plan_count += 1
+                    if plan_count == 1:
+                        batch.prepare_for_decode()
+                        return SimpleNamespace(
+                            running_batch=batch,
+                            batch_to_run=batch,
+                        )
+                    if plan_count == 2 and schedule_next_decode:
+                        batch.prepare_for_decode()
+                        return SimpleNamespace(
+                            running_batch=batch,
+                            batch_to_run=batch,
+                        )
+                    return SimpleNamespace(
+                        running_batch=batch,
+                        batch_to_run=None,
+                    )
+
+                scheduler.get_next_batch_to_run = get_next_batch_to_run
+                observed_lookahead = []
+
+                def process_batch_result(result_batch, batch_result):
+                    observed_lookahead.append(
+                        req.decode_batch_idx
+                        - result_batch.mamba_decode_batch_idx_cpu[0]
+                    )
+                    processor.process_batch_result_decode(result_batch, batch_result)
+
+                scheduler.process_batch_result = process_batch_result
+
+                with (
+                    # The mamba predicates and the track interval read the
+                    # published bags, so publish the configuration under test
+                    # (non-lazy extra buffer, interval 4); observability and
+                    # disagg reads are served by the same publish at their
+                    # defaults.
+                    get_context().override_server_args(
+                        mamba_radix_cache_strategy="extra_buffer",
+                        mamba_track_interval=TRACK_INTERVAL,
+                        _mamba_cache_chunk_size=TRACK_INTERVAL,
+                    ),
+                    patch(
+                        "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                        return_value=torch.tensor([3], dtype=torch.int64),
+                    ),
+                    patch(
+                        "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
+                    ),
+                    patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+                    patch.object(
+                        SchedulerBatchResultProcessor,
+                        "_mamba_prefix_cache_update",
+                    ) as cache_update,
+                ):
+                    with self.assertRaises(StopIteration):
+                        scheduler.event_loop_overlap()
+
+                self.assertEqual(observed_lookahead, [expected_lookahead])
+                if expected_lookahead == 0:
+                    cache_update.assert_not_called()
+                else:
+                    self.assertTrue(cache_update.call_args.kwargs["known_boundary"])
+
+
+class TestMambaPrevTrackSeqlen(unittest.TestCase):
+    def test_flip_names_the_checkpoint_in_the_other_slot(self):
+        req, batch = _make_batch()
+        processor = _make_processor()
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_ping_pong_empty = [False, False]
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = 1
+        batch.mamba_track_buffer_indices = None
+        batch.req_to_token_pool = SimpleNamespace(
+            get_mamba_ping_pong_other_idx=lambda idx: 1 - idx
+        )
+        with (
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer",
+                mamba_track_interval=TRACK_INTERVAL,
+                _mamba_cache_chunk_size=TRACK_INTERVAL,
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor,
+                "_mamba_check_track_boundary",
+                side_effect=[(True, TRACK_INTERVAL), (True, 2 * TRACK_INTERVAL)],
+            ),
+        ):
+            processor._mamba_prefix_cache_update(req, batch, _make_result(), 0)
+            self.assertIsNone(req.kv.mamba_prev_track_seqlen)
+            processor._mamba_prefix_cache_update(req, batch, _make_result(), 0)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 2 * TRACK_INTERVAL)
+        self.assertEqual(req.kv.mamba_prev_track_seqlen, TRACK_INTERVAL)
+
+
+class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
+    def test_freed_rows_are_inert_and_live_rows_preserve_mapping(self):
+        for positions, expected in ((None, [0, 11]), ([1, 1], [0, 12])):
+            with self.subTest(positions=positions):
+                mapping = torch.tensor([[7, 8], [11, 12]], dtype=torch.int64)
+                batch = SimpleNamespace(
+                    reqs=[
+                        SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=p))
+                        for p in (None, 0)
+                    ],
+                    req_pool_indices=torch.arange(2),
+                    req_to_token_pool=SimpleNamespace(
+                        req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+                    ),
+                )
+                set_mamba_track_indices_from_reqs(batch, positions)
+                self.assertEqual(batch.mamba_track_indices.tolist(), expected)
+
+    def test_rows_planned_at_minus_one_point_at_the_reserved_slot(self):
+        mapping = torch.tensor([[7, 8], [11, 12]], dtype=torch.int64)
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=0))
+                for _ in range(2)
+            ],
+            req_pool_indices=torch.arange(2),
+            req_to_token_pool=SimpleNamespace(
+                req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+            ),
+        )
+        set_mamba_track_indices_from_reqs(batch, [1, -1])
+        self.assertEqual(batch.mamba_track_indices.tolist(), [8, 0])
+
+
+class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
+    """A lazy boundary evicts for its second slot first; if it still gets none
+    it skips its snapshot and the keep slot is never written."""
+
+    @staticmethod
+    def _make_lazy_batch(took: bool) -> tuple[Req, ScheduleBatch]:
+        req, batch = _make_batch()
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, -1])
+        req.kv.mamba_ping_pong_empty = [False, True]
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = 0
+        req.kv.mamba_last_track_seqlen = TRACK_INTERVAL
+        req.kv.kv_committed_len = 2 * TRACK_INTERVAL - 1
+        batch.seq_lens = torch.tensor([2 * TRACK_INTERVAL - 1], dtype=torch.int64)
+        batch.seq_lens_cpu = batch.seq_lens.clone()
+        batch.req_to_token_pool = None
+        storage = SimpleNamespace(take_tracking_slot=lambda req, position: took)
+        storage.advance = lambda req, tracking: advance_tracking(storage, req, tracking)
+        batch.token_to_kv_pool_allocator = SimpleNamespace(
+            storage=storage,
+            state=SimpleNamespace(
+                slots=SimpleNamespace(slots_fit=lambda count: count <= int(took))
+            ),
+        )
+        return req, batch
+
+    @staticmethod
+    def _prepare_decode(batch: ScheduleBatch) -> None:
+        with (
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer_lazy",
+                mamba_track_interval=TRACK_INTERVAL,
+                _mamba_cache_chunk_size=TRACK_INTERVAL,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                return_value=torch.tensor([3], dtype=torch.int64),
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
+            ),
+            patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+        ):
+            batch.prepare_for_decode()
+
+    def test_decode_boundary_clears_its_track_mask_bit(self):
+        for took in (True, False):
+            with self.subTest(took=took):
+                req, batch = self._make_lazy_batch(took)
+                self._prepare_decode(batch)
+                self.assertEqual(batch.mamba_track_mask_cpu, [took])
+                self.assertEqual(batch.mamba_track_mask.tolist(), [took])
+                self.assertEqual(req.kv.mamba_next_track_idx, 1 if took else 0)
+                self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
+    def test_spec_crossing_plans_no_write_and_keeps_the_checkpoint(self):
+        req, batch = self._make_lazy_batch(took=False)
+        batch.mamba_lazy_spec_prepare(TRACK_INTERVAL, max_draft_tokens=2)
+        self.assertEqual(batch.mamba_lazy_spec_track_positions_cpu, [-1])
+
+        _make_processor()._mamba_lazy_spec_update(
+            req, batch, 0, crossed=True, track_seqlen=2 * TRACK_INTERVAL
+        )
+        self.assertEqual(req.kv.mamba_ping_pong_track_buffer.tolist(), [10, -1])
+        self.assertEqual(req.kv.mamba_next_track_idx, 0)
+        self.assertEqual(req.kv.mamba_last_track_idx, 0)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
+    def test_eviction_frees_the_slot_before_skipping(self):
+        for spec in (False, True):
+            with self.subTest(spec=spec):
+                req, batch = self._make_lazy_batch(took=False)
+                free_slots = []
+                evicted = []
+                allocator = batch.token_to_kv_pool_allocator
+                allocator.storage.take_tracking_slot = lambda req, position: bool(
+                    free_slots and free_slots.pop()
+                )
+                allocator.state.slots.slots_fit = lambda count: count <= len(free_slots)
+                batch.tree_cache = SimpleNamespace(
+                    page_size=TRACK_INTERVAL,
+                    supports_mamba=lambda: True,
+                    evict_for_alloc=lambda demand: (
+                        evicted.append(demand.state_slots),
+                        free_slots.extend([True] * demand.state_slots),
+                    ),
+                )
+                if spec:
+                    batch.mamba_lazy_spec_prepare(TRACK_INTERVAL, max_draft_tokens=2)
+                    self.assertEqual(batch.mamba_lazy_spec_track_positions_cpu, [1])
+                else:
+                    self._prepare_decode(batch)
+                    self.assertEqual(batch.mamba_track_mask_cpu, [True])
+                    self.assertEqual(req.kv.mamba_next_track_idx, 1)
+                self.assertEqual(evicted, [1])
+
+
+class _StatePoolCache:
+    """A cache with a separate state pool whose `evict_for_alloc` evicts the
+    shortfall by the real `UnifiedRadixCache.evict_pool_shortfalls`."""
+
+    evict_pool_shortfalls = UnifiedRadixCache.evict_pool_shortfalls
+    _demand_by_type = UnifiedRadixCache._demand_by_type
+
+    def __init__(self, free_slots, cached):
+        self.free_slots = free_slots
+        self.cached = cached
+        self.evicted = []
+        self.tree_components = (BASE_COMPONENT_TYPE, ComponentType.MAMBA)
+
+    def supports_mamba(self):
+        return True
+
+    def slot_id(self, kind):
+        if kind is TREE_TOKEN:
+            return BASE_COMPONENT_TYPE
+        return ComponentType.MAMBA if kind is TREE_STATE else None
+
+    def _window_sub_pools_by_slot(self):
+        return {}
+
+    def _pool_available(self, component_type):
+        if component_type == ComponentType.MAMBA:
+            return len(self.free_slots)
+        return 1 << 20
+
+    def _evict(self, params, *, demand):
+        n = min(params.mamba_num, self.cached)
+        self.cached -= n
+        self.evicted.append(n)
+        self.free_slots.extend([True] * n)
+
+    def evict_for_alloc(self, demand):
+        return self.evict_pool_shortfalls(demand)
+
+
+class TestTrackingSlotsAskTheWholeDemand(unittest.TestCase):
+    def test_some_slots_free_evicts_only_the_shortfall_and_takes_all(self):
+        """With two of four slots free, reclaim is asked for all four, evicts
+        the two missing, and every candidate gets a slot."""
+        free_slots = [True, True]
+        cache = _StatePoolCache(free_slots, cached=8)
+        storage = SimpleNamespace(
+            take_tracking_slot=lambda req, pos: bool(free_slots and free_slots.pop())
+        )
+        state = SimpleNamespace(
+            slots=SimpleNamespace(slots_fit=lambda count: count <= len(free_slots))
+        )
+        candidates = [(object(), i) for i in range(4)]
+        taken = alloc_tracking_slots(storage, state, candidates, cache)
+        self.assertEqual(cache.evicted, [2])
+        self.assertEqual(taken, [True, True, True, True])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -16,7 +16,10 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=1200, suite="nightly-amd-8-gpu-deepseek-v3-kv-fp8", nightly=True
+    est_time=1200,
+    suite="nightly-amd-8-gpu-deepseek-v3-kv-fp8",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
@@ -56,7 +59,7 @@ class TestDeepseekV3BasicKvFp8(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -64,7 +67,7 @@ class TestDeepseekV3BasicKvFp8(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3 kv-fp8)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v3 kv-fp8)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.93)
 
@@ -76,7 +79,7 @@ class TestDeepseekV3BasicKvFp8(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v3 kv-fp8)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v3 kv-fp8)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 40)

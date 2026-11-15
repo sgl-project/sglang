@@ -14,12 +14,12 @@ from sglang.srt.function_call.core_types import (
 logger = logging.getLogger(__name__)
 
 REGEX_FUNCTION_CALL = re.compile(
-    r"function call<\|role_sep\|>\n(.*)",
+    r"(?:function call<\|role_sep\|>\n|<\|function_call\|>)(.*)",
     re.DOTALL,
 )
 
 REGEX_CONTENT_PATTERN = re.compile(
-    r"^(.*?)<\|message_sep\|>",
+    r"^(.*?)(?:<\|message_sep\|>|<\|function_call\|>)",
     re.DOTALL,
 )
 
@@ -45,7 +45,7 @@ class GigaChat3Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains a tool call marker"""
-        return "function call<|role_sep|>\n" in text
+        return "function call<|role_sep|>\n" in text or "<|function_call|>" in text
 
     def detect_and_parse(
         self,
@@ -84,10 +84,7 @@ class GigaChat3Detector(BaseFormatDetector):
         if m_content:
             content = m_content.group(1)
         else:
-            if "<|message_sep|>" in model_output:
-                content = model_output.split("<|message_sep|>")[0]
-            else:
-                content = model_output
+            content = model_output
         if not function_call:
             return StreamingParseResult(normal_text=content, calls=[])
         name = function_call["name"]
@@ -121,12 +118,8 @@ class GigaChat3Detector(BaseFormatDetector):
                 content = m_content.group(1)
                 self.end_content = True
             else:
-                if "<|message_sep|>" in delta_text:
-                    content = delta_text.split("<|message_sep|>")[0]
-                    self.end_content = True
-                else:
-                    if not self.end_content:
-                        content = delta_text
+                if not self.end_content:
+                    content = delta_text
             if m_func:
                 self.tool_started = True
                 logger.debug("[GigaChat3] Tool call started")

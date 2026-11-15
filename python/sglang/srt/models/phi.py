@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/phi.py
 from typing import Iterable, Optional
 
@@ -5,7 +7,6 @@ import torch
 from torch import nn
 from transformers import PhiConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -16,17 +17,18 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.runtime_context import get_parallel
 
 
 class PhiAttention(nn.Module):
-
     def __init__(
         self,
         config: PhiConfig,
@@ -39,7 +41,7 @@ class PhiAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.head_size = self.hidden_size // self.total_num_heads
 
-        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
+        tensor_model_parallel_world_size = get_parallel().tp_size
         assert self.total_num_heads % tensor_model_parallel_world_size == 0
         self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
 
@@ -63,7 +65,7 @@ class PhiAttention(nn.Module):
         )
         assert rotary_dim % 2 == 0
 
-        rope_theta = getattr(config, "rope_theta", 10000.0)
+        rope_theta = config.rope_parameters["rope_theta"]
         max_position_embeddings = getattr(config, "max_position_embeddings", 2048)
         self.rotary_emb = get_rope(
             self.head_size,
@@ -96,7 +98,6 @@ class PhiAttention(nn.Module):
 
 
 class PhiMLP(nn.Module):
-
     def __init__(
         self, config: PhiConfig, quant_config: Optional[QuantizationConfig] = None
     ):
@@ -125,7 +126,6 @@ class PhiMLP(nn.Module):
 
 
 class PhiLayer(nn.Module):
-
     def __init__(
         self,
         config: PhiConfig,
@@ -164,7 +164,6 @@ class PhiLayer(nn.Module):
 
 
 class PhiModel(nn.Module):
-
     def __init__(
         self,
         config: PhiConfig,
@@ -177,7 +176,7 @@ class PhiModel(nn.Module):
             config.vocab_size, config.hidden_size
         )
 
-        pp_group = get_pp_group()
+        pp_group = get_parallel().pp_group
         pp_size = pp_group.world_size
         pp_rank = pp_group.rank
 

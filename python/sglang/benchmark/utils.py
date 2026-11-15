@@ -13,6 +13,11 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
+
+# This module loads tokenizers and processors straight from transformers.
+apply_all_hf_patches()
+
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
@@ -48,10 +53,8 @@ def get_tokenizer(
         pretrained_model_name_or_path is not None
         and pretrained_model_name_or_path != ""
     )
-    if pretrained_model_name_or_path.endswith(
-        ".json"
-    ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+    if pretrained_model_name_or_path.endswith((".json", ".model", ".gguf")):
+        from sglang.srt.hf_transformers import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
 
@@ -71,20 +74,14 @@ def get_processor(
         pretrained_model_name_or_path is not None
         and pretrained_model_name_or_path != ""
     )
-    if pretrained_model_name_or_path.endswith(
-        ".json"
-    ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.utils.hf_transformers_utils import get_processor
 
-        return get_processor(pretrained_model_name_or_path)
+    from sglang.srt.hf_transformers import get_processor as _srt_get_processor
 
-    if pretrained_model_name_or_path is not None and not os.path.exists(
-        pretrained_model_name_or_path
-    ):
+    if not pretrained_model_name_or_path.endswith(
+        (".json", ".model")
+    ) and not os.path.exists(pretrained_model_name_or_path):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
-    return AutoProcessor.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
-    )
+    return _srt_get_processor(pretrained_model_name_or_path, trust_remote_code=True)
 
 
 def download_and_cache_hf_file(
@@ -118,13 +115,16 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     chunk_size = 1024  # Download in chunks of 1KB
 
     # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
+    with (
+        open(filename, "wb") as f,
+        tqdm(
+            desc=filename,
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar,
+    ):
         for chunk in response.iter_content(chunk_size=chunk_size):
             f.write(chunk)
             bar.update(len(chunk))

@@ -5,11 +5,11 @@
 Synchronous pipeline executor implementation.
 """
 
-from typing import List
+from typing import Any, Callable, List
 
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
-    SGLDiffusionProfiler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
@@ -21,21 +21,44 @@ class SyncExecutor(PipelineExecutor):
     A simple synchronous executor that runs stages sequentially.
     """
 
+    def _run_profile_all_stages(
+        self,
+        stages: List[PipelineStage],
+        payload: Any,
+        server_args: ServerArgs,
+        run_stage: Callable[[PipelineStage, Any], Any],
+    ) -> Any:
+        """Execute all pipeline stages sequentially and step the profiler."""
+
+        use_nvtx = self._should_use_stage_nvtx(payload, server_args)
+        requests = payload if isinstance(payload, list) else [payload]
+        with self._component_residency_request(stages, payload, server_args):
+            for stage_index, stage in enumerate(stages):
+                raise_if_cancelled(requests)
+                payload = self._run_stage_with_executor_hooks(
+                    stage,
+                    stage_index,
+                    payload,
+                    server_args,
+                    run_stage,
+                    use_nvtx,
+                )
+                self._step_stage_profiler()
+            raise_if_cancelled(requests)
+        return payload
+
     def run_profile_all_stages(
         self,
         stages: List[PipelineStage],
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-        """
-        Execute all pipeline stages sequentially.
-        """
-        for stage in stages:
-            batch = stage(batch, server_args)
-            profiler = SGLDiffusionProfiler.get_instance()
-            if profiler:
-                profiler.step_stage()
-        return batch
+        return self._run_profile_all_stages(
+            stages,
+            batch,
+            server_args,
+            lambda stage, current: stage(current, server_args),
+        )
 
     def execute(
         self,
@@ -50,3 +73,16 @@ class SyncExecutor(PipelineExecutor):
         batch = self.run_profile_all_stages(stages, batch, server_args)
 
         return batch
+
+    def execute_group(
+        self,
+        stages: List[PipelineStage],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        return self._run_profile_all_stages(
+            stages,
+            batches,
+            server_args,
+            lambda stage, current: stage.run_grouped_requests(current, server_args),
+        )

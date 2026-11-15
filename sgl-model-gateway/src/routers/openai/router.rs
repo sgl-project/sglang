@@ -13,10 +13,8 @@ use axum::{
     Json,
 };
 use data_connector::{ConversationId, ListParams, ResponseId, SortOrder};
-use futures_util::{future::join_all, StreamExt};
+use futures_util::future::join_all;
 use serde_json::{json, to_value, Value};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 use super::{
@@ -42,7 +40,10 @@ use crate::{
             ResponsesGetParams, ResponsesRequest,
         },
     },
-    routers::header_utils::{apply_provider_headers, extract_auth_header},
+    routers::{
+        header_utils::{apply_provider_headers, extract_auth_header},
+        streaming_utils::BreakerTrackedStream,
+    },
 };
 
 pub struct OpenAIRouter {
@@ -596,16 +597,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     let status = StatusCode::from_u16(resp.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-                    // Record circuit breaker failure for error status codes
-                    if !status.is_success() {
-                        worker.circuit_breaker().record_failure();
-                    }
-
                     if !is_streaming {
+                        // Non-streaming: record the breaker outcome inline
+                        // once the body is fully read.
+                        if !status.is_success() {
+                            worker.circuit_breaker().record_failure();
+                        }
                         let content_type = resp.headers().get(CONTENT_TYPE).cloned();
                         match resp.bytes().await {
                             Ok(body) => {
-                                // Only record success after body is fully read
                                 if status.is_success() {
                                     worker.circuit_breaker().record_success();
                                 }
@@ -626,30 +626,23 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             }
                         }
                     } else {
-                        // Streaming response - record success when stream starts
-                        if status.is_success() {
-                            worker.circuit_breaker().record_success();
+                        // Streaming response: pass the reqwest byte stream
+                        // through `BreakerTrackedStream`, which records the
+                        // circuit-breaker outcome exactly once on drop (success
+                        // on clean end, failure on stream error, neither on
+                        // client disconnect). For non-2xx responses we pre-mark
+                        // the wrapper as Errored — otherwise the small error
+                        // body would stream cleanly to `None` and Drop would
+                        // record a spurious success.
+                        let mut tracked = BreakerTrackedStream::new(
+                            resp.bytes_stream(),
+                            Arc::clone(&worker),
+                            url.clone(),
+                        );
+                        if !status.is_success() {
+                            tracked.mark_errored();
                         }
-                        let stream = resp.bytes_stream();
-                        let (tx, rx) = mpsc::unbounded_channel();
-                        tokio::spawn(async move {
-                            let mut s = stream;
-                            while let Some(chunk) = s.next().await {
-                                match chunk {
-                                    Ok(bytes) => {
-                                        if tx.send(Ok(bytes)).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        let mut response =
-                            Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+                        let mut response = Response::new(Body::from_stream(tracked));
                         *response.status_mut() = status;
                         response
                             .headers_mut()

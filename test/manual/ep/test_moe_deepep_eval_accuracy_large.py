@@ -1,14 +1,8 @@
-"""
-Usage:
-python -m unittest test_moe_deepep_eval_accuracy_large.TestMoEDeepEPEvalAccuracyLarge.test_mmlu
-"""
-
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -33,7 +27,7 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
                 "8",
                 "--moe-a2a-backend",
                 "deepep",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "128",
             ],
         )
@@ -44,18 +38,17 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=8,
-            data_path=None,
-            num_questions=200,
-            parallel=64,
-            max_new_tokens=512,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=64,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_sgl_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreater(metrics["score"], 0.93)
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -66,7 +59,7 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Eval accuracy of MMLU: {metrics=}")
         self.assertGreater(metrics["score"], 0.87)
 

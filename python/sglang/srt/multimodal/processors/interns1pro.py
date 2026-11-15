@@ -1,13 +1,16 @@
+import logging
 import time
 from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.interns1pro import InternS1ProForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImageProcessor,
     preprocess_video,
 )
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 class InternS1_1ImageProcessor(QwenVLImageProcessor):
@@ -22,19 +25,19 @@ class InternS1_1ImageProcessor(QwenVLImageProcessor):
             MultimodalDataItem(
                 modality=Modality.IMAGE,
                 offsets=offsets,
-                precomputed_embeddings=embeddings,
+                precomputed_embeddings=embeddings[Modality.IMAGE],
             )
         ]
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.video_token_id,
-            "audio_token_id": self.mm_tokens.audio_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+        )
 
     async def process_mm_data_async(
         self,
@@ -45,7 +48,7 @@ class InternS1_1ImageProcessor(QwenVLImageProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
@@ -65,7 +68,7 @@ class InternS1_1ImageProcessor(QwenVLImageProcessor):
 
         preprocess_time = time.perf_counter()
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output,
             self.mm_tokens,
             video_metadata=video_metadata,
@@ -107,12 +110,12 @@ class InternS1_1ImageProcessor(QwenVLImageProcessor):
             f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_start_id": self.vision_start_token_id,
-            "im_end_id": self.vision_end_token_id,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.video_token_id,
-            "audio_token_id": self.mm_tokens.audio_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+        )

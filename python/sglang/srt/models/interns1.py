@@ -1,3 +1,5 @@
+import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -8,21 +10,19 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.internvl import InternVisionModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
-from sglang.utils import logger
+from sglang.srt.multimodal.modality import Modality
+
+logger = logging.getLogger(__name__)
 
 
 class InternS1ForConditionalGeneration(nn.Module):
@@ -154,15 +154,16 @@ class InternS1ForConditionalGeneration(nn.Module):
 
         return hs
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
-        helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
-        return helper.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_token_pairs(
+            input_ids, mm_inputs, data_token_pairs=media_token_pairs
+        )
 
     def _mapping_interns1_name(self, name):
         names_map = {
@@ -186,7 +187,6 @@ class InternS1ForConditionalGeneration(nn.Module):
             name = "vision_model." + name[len("model.vision_tower.") :]
 
         if name.startswith("vision_model.encoder.layer"):
-
             name = name.replace(r".layer.", r".layers.")
             name = name.replace(r".attention.", r".attn.attn.")
             name = name.replace(r".projection_layer.", r".proj.")
@@ -211,7 +211,7 @@ class InternS1ForConditionalGeneration(nn.Module):
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
+                num_experts=self.config.text_config.num_experts,
             )
 
         params_dict = dict(self.named_parameters())

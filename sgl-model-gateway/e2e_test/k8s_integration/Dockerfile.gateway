@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1.6
+# Lightweight Dockerfile for integration testing.
+# Builds the smg binary directly (no Python/maturin/wheel overhead).
+# Uses the "ci" cargo profile (thin LTO, 16 codegen units) for fast builds.
+#
+# The repo's docker/gateway.Dockerfile builds a Python wheel via maturin for
+# production. This Dockerfile builds just the Rust binary in ~5 min on a
+# warm cache.
+
+FROM rust:1.90-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    libssl-dev pkg-config protobuf-compiler cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --profile ci --bin smg --features vendored-openssl \
+    && cp target/ci/smg /usr/local/bin/smg
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/smg /usr/local/bin/smg
+
+ENTRYPOINT ["smg"]

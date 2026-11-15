@@ -19,12 +19,17 @@ import torch
 from torch import nn
 from transformers import Qwen2Config  # Qwen3 uses Qwen2Config
 
-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.layers.pooler import (
+    EmbeddingPoolerOutput,
+    Pooler,
+    PoolingType,
+    score_and_pool,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,9 @@ class Qwen3ForPooledOutput(nn.Module):
         self.eos_token_id = config.eos_token_id
         # Subclasses must set self.score and self.pooler
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.get_input_embeddings()
+
     @torch.no_grad()
     def forward(
         self,
@@ -62,10 +70,9 @@ class Qwen3ForPooledOutput(nn.Module):
         assert get_embedding, f"{self.__class__.__name__} is only used for embedding"
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        logits = self.score(hidden_states)
-        pooled_logits = self.pooler(logits, forward_batch).embeddings
-
-        return EmbeddingPoolerOutput(pooled_logits)
+        return score_and_pool(
+            self.score, self.pooler, hidden_states, forward_batch, input_ids
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -79,6 +86,11 @@ class Qwen3ForPooledOutput(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            if name == "score.bias" and name not in params_dict:
+                raise ValueError(
+                    "Checkpoint has score.bias, but the sequence-classification "
+                    "score head is bias-free (as in HF transformers)."
+                )
             # Skip lm_head weights (pooled output models don't have lm_head)
             if name.startswith("lm_head"):
                 continue
@@ -126,7 +138,8 @@ class Qwen3ForSequenceClassification(Qwen3ForPooledOutput):
         prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config, prefix)
-        self.score = nn.Linear(config.hidden_size, config.num_labels)
+        # Matches HF GenericForSequenceClassification, whose score head has no bias.
+        self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
         # Use normalize=True for qwen3 embedding based on official implementation
         # Reference: https://github.com/QwenLM/Qwen3-Embedding/blob/main/examples/qwen3_embedding_transformers.py#L55
         # Official code: output = F.normalize(output, p=2, dim=1)

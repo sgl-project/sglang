@@ -1,28 +1,86 @@
 # Adapted from
 # https://github.com/huggingface/transformers/blob/af9b2eaa54c150741f298d6db939af6328e1dc38/src/transformers/models/clip/modeling_clip.py
 
+from array import array
 from functools import partial
-from typing import Iterable, List, Optional, Tuple, Type, Union
+from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
-from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
 
-from sglang.srt.layers.activation import QuickGELU
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.activation import QuickGELU, get_act_fn
 from sglang.srt.layers.conv import Conv2dLayer
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.model_executor.model_runner import ForwardBatch
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.managers.req_types import MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import flatten_nested_list
+
+
+def load_clip_weights(
+    params_dict: Dict[str, torch.nn.Parameter],
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> None:
+    stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        ("qkv_proj", "q_proj", "q"),
+        ("qkv_proj", "k_proj", "k"),
+        ("qkv_proj", "v_proj", "v"),
+    ]
+    for name, loaded_weight in weights:
+        if "position_ids" in name:
+            continue
+        if "out_proj" in name:
+            name = name.replace("out_proj", "proj")
+        for param_name, shard_name, shard_id in stacked_params_mapping:
+            if shard_name not in name:
+                continue
+            name = name.replace(shard_name, param_name)
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            weight_loader(param, loaded_weight, shard_id)
+            break
+        else:
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+
+
+def prepare_clip_attention_mask(
+    input_shape: torch.Size,
+    dtype: torch.dtype,
+    device: torch.device,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    if attention_mask is None:
+        return None
+    batch_size, sequence_length = input_shape
+    causal_mask = torch.full(
+        (sequence_length, sequence_length),
+        torch.finfo(dtype).min,
+        dtype=dtype,
+        device=device,
+    )
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    causal_mask = causal_mask[None, None].expand(batch_size, 1, -1, -1)
+    if attention_mask.dim() == 2:
+        attention_mask = attention_mask[:, None, None, :].to(dtype=dtype)
+        attention_mask = (1.0 - attention_mask) * torch.finfo(dtype).min
+    return causal_mask + attention_mask
 
 
 class CLIPVisionEmbeddings(nn.Module):
-
     def __init__(self, config: CLIPVisionConfig):
         super().__init__()
         self.config = config
@@ -88,9 +146,18 @@ class CLIPTextEmbeddings(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ) -> torch.Tensor:
-        seq_length = (
-            input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
-        )
+        if input_ids is not None:
+            seq_length = input_ids.shape[-1]
+        elif inputs_embeds is not None:
+            seq_length = inputs_embeds.shape[-2]
+        else:
+            raise ValueError("Either input_ids or inputs_embeds must be provided.")
+
+        max_positions = self.position_embedding.weight.shape[0]
+        if seq_length > max_positions:
+            raise ValueError(
+                f"Sequence length {seq_length} exceeds the maximum {max_positions}."
+            )
 
         if position_ids is None:
             position_ids = self.position_ids[:, :seq_length]
@@ -105,11 +172,10 @@ class CLIPTextEmbeddings(nn.Module):
 
 
 class CLIPMLP(nn.Module):
-
     def __init__(
         self,
         config,
-        act_layer: Type[nn.Module] = QuickGELU,
+        act_layer: Optional[Type[nn.Module]] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -120,7 +186,12 @@ class CLIPMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
         )
-        self.act = act_layer()
+        if act_layer is not None:
+            self.act = act_layer()
+        elif config.hidden_act == "quick_gelu":
+            self.act = QuickGELU()
+        else:
+            self.act = get_act_fn(config.hidden_act)
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
@@ -135,29 +206,96 @@ class CLIPMLP(nn.Module):
         return x
 
 
-class CLIPEncoderLayer(nn.Module):
+class CLIPAttention(nn.Module):
+    def __init__(
+        self,
+        config: Union[CLIPTextConfig, CLIPVisionConfig],
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        causal: bool = False,
+    ) -> None:
+        super().__init__()
+        parallel = get_parallel()
+        self.num_heads = config.num_attention_heads // parallel.attn_tp_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.causal = causal
+        self.dropout = config.attention_dropout
+        self.scale = self.head_dim**-0.5
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=config.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=config.num_attention_heads,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
+            parallel_group="attn_tp",
+        )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=parallel.attn_tp_size,
+            reduces_over_attn_tp=False,
+            multimodal_encoder=True,
+        )
+        self.proj = RowParallelLinear(
+            input_size=config.hidden_size,
+            output_size=config.hidden_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("proj", prefix),
+            parallel_group="attn_tp",
+        )
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, sequence_length, _ = hidden_states.shape
+        qkv, _ = self.qkv_proj(hidden_states)
+        query, key, value = qkv.chunk(3, dim=-1)
+        qkv_shape = (batch_size, sequence_length, self.num_heads, self.head_dim)
+        query = query.view(qkv_shape).transpose(1, 2)
+        key = key.view(qkv_shape).transpose(1, 2)
+        value = value.view(qkv_shape).transpose(1, 2)
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=self.causal and attention_mask is None,
+            scale=self.scale,
+        )
+        output = output.transpose(1, 2).reshape(
+            batch_size, sequence_length, self.num_heads * self.head_dim
+        )
+        output, _ = self.proj(output)
+        return output
+
+
+class CLIPEncoderLayer(nn.Module):
     def __init__(
         self,
         config: CLIPVisionConfig,
-        act_layer: Type[nn.Module] = QuickGELU,
+        act_layer: Optional[Type[nn.Module]] = None,
         norm_layer: Type[nn.Module] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        causal: bool = False,
     ) -> None:
         super().__init__()
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=config.layer_norm_eps)
         self.layer_norm1 = norm_layer(config.hidden_size)
         self.layer_norm2 = norm_layer(config.hidden_size)
-        self.self_attn = VisionAttention(
-            embed_dim=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            projection_size=config.hidden_size,
-            use_qkv_parallel=True,
-            flatten_batch=True,
+        self.self_attn = CLIPAttention(
+            config,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            causal=causal,
         )
         self.mlp = CLIPMLP(
             config,
@@ -210,20 +348,29 @@ class CLIPEncoder(nn.Module):
         config: CLIPVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        num_hidden_layers_override: Optional[int] = None,
+        act_layer: Optional[Type[nn.Module]] = None,
+        causal: bool = False,
     ) -> None:
         super().__init__()
 
         self.config = config
 
-        num_hidden_layers = config.num_hidden_layers
+        num_hidden_layers = (
+            config.num_hidden_layers
+            if num_hidden_layers_override is None
+            else num_hidden_layers_override
+        )
         norm_layer = partial(nn.LayerNorm, eps=config.layer_norm_eps)
         self.layers = nn.ModuleList(
             [
                 CLIPEncoderLayer(
                     config=config,
+                    act_layer=act_layer,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_idx}", prefix),
+                    causal=causal,
                 )
                 for layer_idx in range(num_hidden_layers)
             ]
@@ -265,6 +412,7 @@ class CLIPTextTransformer(nn.Module):
             config=config,
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
+            causal=True,
         )
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
@@ -281,12 +429,13 @@ class CLIPTextTransformer(nn.Module):
         input_shape = input_ids.size()
         input_ids = input_ids.view(-1, input_shape[-1])
         hidden_states = self.embeddings(input_ids, position_ids)
-        causal_attention_mask = _create_4d_causal_attention_mask(
-            input_ids.shape, hidden_states.dtype, device=hidden_states.device
+        attention_mask = prepare_clip_attention_mask(
+            input_ids.shape,
+            hidden_states.dtype,
+            hidden_states.device,
+            attention_mask,
         )
-        encoder_outputs = self.encoder(
-            hidden_states, attention_mask, causal_attention_mask
-        )
+        encoder_outputs = self.encoder(hidden_states, attention_mask=attention_mask)
         last_hidden_state = self.final_layer_norm(encoder_outputs)
         return last_hidden_state
 
@@ -311,11 +460,10 @@ class CLIPTextModel(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
     ):
-        return self.text_model(input_ids, position_ids)
+        return self.text_model(input_ids, position_ids=position_ids)
 
 
 class CLIPVisionTransformer(nn.Module):
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -346,6 +494,8 @@ class CLIPVisionTransformer(nn.Module):
                 f"layers, but you requested {len(self.encoder.layers)} layers."
             )
 
+        # As in HF, applied only to the pooled CLS token (CLIPModel.forward);
+        # forward() returns the un-normed encoder states.
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
     @property
@@ -355,23 +505,29 @@ class CLIPVisionTransformer(nn.Module):
     def forward(
         self,
         pixel_values: torch.Tensor,
-    ) -> torch.Tensor:
+        output_hidden_states: bool = False,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         hidden_states = self.embeddings(pixel_values.to(self.device))
         hidden_states = self.pre_layrnorm(hidden_states)
 
-        return_all_hidden_states = False
-
-        last_hidden_state = self.encoder(
+        # Matches HF's `last_hidden_state`, or with output_hidden_states its
+        # `hidden_states`: entry 0 is the pre_layrnorm'd embedding, entry i layer i.
+        return self.encoder(
             inputs_embeds=hidden_states,
-            return_all_hidden_states=return_all_hidden_states,
+            return_all_hidden_states=output_hidden_states,
         )
 
-        last_hidden_state = self.post_layernorm(last_hidden_state)
 
-        return last_hidden_state
+class CLIPVisionOutput(NamedTuple):
+    """HF-shaped vision tower output, for callers selecting an interior layer."""
+
+    last_hidden_state: torch.Tensor
+    hidden_states: List[torch.Tensor]
 
 
 class CLIPVisionModel(nn.Module):
+    """CLIP vision tower, standalone or as a `LlavaForConditionalGeneration` tower."""
+
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -379,6 +535,7 @@ class CLIPVisionModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.config = config
         self.vision_model = CLIPVisionTransformer(
             config, quant_config, prefix=add_prefix("vision_model", prefix)
         )
@@ -387,8 +544,23 @@ class CLIPVisionModel(nn.Module):
     def device(self) -> torch.device:
         return self.vision_model.device
 
-    def forward(self, pixel_values: torch.Tensor):
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        image_sizes: Optional[List[Tuple[int, int]]] = None,
+        output_hidden_states: bool = False,
+    ) -> Union[torch.Tensor, CLIPVisionOutput]:
+        # `image_sizes` is accepted for signature parity with the variable-resolution
+        # towers (Pixtral); CLIP always sees square `config.image_size` crops.
+        if output_hidden_states:
+            hidden_states = self.vision_model(pixel_values, output_hidden_states=True)
+            return CLIPVisionOutput(
+                last_hidden_state=hidden_states[-1], hidden_states=hidden_states
+            )
         return self.vision_model(pixel_values)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        load_clip_weights(dict(self.named_parameters()), weights)
 
 
 class CLIPModel(nn.Module):
@@ -459,7 +631,7 @@ class CLIPModel(nn.Module):
         if len(pixel_values_list) != 0:
             pixel_values = torch.concat(pixel_values_list)
             vision_outputs = self.vision_model(pixel_values)
-            pooled_output = vision_outputs[:, 0, :]
+            pooled_output = self.vision_model.post_layernorm(vision_outputs[:, 0, :])
             image_embeds = self.visual_projection(pooled_output)
             image_embeds = nn.functional.normalize(image_embeds, p=2, dim=1)
             return EmbeddingPoolerOutput(embeddings=image_embeds)
@@ -471,35 +643,12 @@ class CLIPModel(nn.Module):
                 embeddings=self.text_projection(pooled_output.embeddings)
             )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Clip embeddings models handle text/image separately, so we don't need to pad input ids
         return input_ids
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "position_ids" in name:
-                continue
-            if "out_proj" in name:
-                name = name.replace("out_proj", "proj")
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        load_clip_weights(dict(self.named_parameters()), weights)
 
 
 # monkey patch weight loader to remove open_clip file
@@ -514,7 +663,13 @@ def monkey_patch_weight_loader():
     )
 
     def prepare_weights(
-        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+        self,
+        model_name_or_path: str,
+        revision: Optional[str],
+        fall_back_to_pt: bool,
+        # Must mirror DefaultModelLoader._prepare_weights; the override pins
+        # allow_patterns to *.bin, so the caller's patterns are ignored.
+        allow_patterns_overrides: Optional[List[str]] = None,
     ) -> Tuple[str, List[str], bool]:
         model_name_or_path = (
             self._maybe_download_from_modelscope(model_name_or_path, revision)
@@ -557,4 +712,4 @@ def monkey_patch_weight_loader():
     setattr(DefaultModelLoader, "_prepare_weights", prepare_weights)
 
 
-EntryClass = CLIPModel
+EntryClass = [CLIPModel, CLIPVisionModel]

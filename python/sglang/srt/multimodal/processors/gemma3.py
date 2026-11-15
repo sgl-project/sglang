@@ -1,11 +1,14 @@
 import re
 from typing import Dict, List, Union
 
-from sglang.srt.managers.multimodal_processor import (
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 # Copied from: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/image_processing_gemma3_fast.py
 # will be removed in the future
@@ -36,19 +39,19 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
             discard_alpha_channel=True,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+        )

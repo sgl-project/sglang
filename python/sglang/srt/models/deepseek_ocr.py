@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 The SwissAI Initiative
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +21,7 @@
 
 import copy
 import logging
-import math
+from array import array
 from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple, Type, TypeAlias, Union
 
@@ -29,18 +31,31 @@ import transformers
 from torch import Tensor, nn
 from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
-from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+from sglang.kernels.ops.elementwise.sam_rel_pos_bias import (
+    can_use_sam_rel_pos_bias,
+    sam_rel_pos_bias,
+)
+from sglang.kernels.ops.elementwise.window_unpartition_add import (
+    can_use_window_unpartition_add,
+    window_unpartition_add,
+)
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config, is_ocr2_config
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
+from sglang.srt.models.step3_vl import get_abs_pos
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.utils import cdiv, cpu_has_amx_support, get_compiler_backend, is_cpu
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
@@ -177,7 +192,6 @@ def merge_multimodal_embeddings(
 
 
 class MlpProjector(nn.Module):
-
     def __init__(
         self,
         projector_type,
@@ -385,6 +399,24 @@ class MLPBlock(nn.Module):
         return self.lin2(self.act(self.lin1(x)))
 
 
+_REL_POS_CACHE: dict = {}
+
+
+def clear_sam_rel_pos_cache() -> None:
+    # sampled tables contain weight values, so in-place checkpoint reloads invalidate them
+    _REL_POS_CACHE.clear()
+
+
+def _cached_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
+    """Cache immutable relative-position tables by storage and geometry."""
+    key = (rel_pos.data_ptr(), tuple(rel_pos.shape), rel_pos.dtype, q_size, k_size)
+    hit = _REL_POS_CACHE.get(key)
+    if hit is None:
+        hit = get_rel_pos(q_size, k_size, rel_pos)
+        _REL_POS_CACHE[key] = hit
+    return hit
+
+
 def add_decomposed_rel_pos(
     q: torch.Tensor,
     rel_pos_h: torch.Tensor,
@@ -406,8 +438,8 @@ def add_decomposed_rel_pos(
     """
     q_h, q_w = q_size
     k_h, k_w = k_size
-    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
-    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
+    Rh = _cached_rel_pos(q_h, k_h, rel_pos_h)
+    Rw = _cached_rel_pos(q_w, k_w, rel_pos_w)
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
@@ -452,31 +484,31 @@ class Attention(nn.Module):
 
         self.use_rel_pos = use_rel_pos
         if self.use_rel_pos:
-            assert (
-                input_size is not None
-            ), "Input size must be provided if using relative positional encoding."
+            assert input_size is not None, (
+                "Input size must be provided if using relative positional encoding."
+            )
             # initialize relative positional embeddings
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
-        # qkv with shape (3, B, nHead, H * W, C)
-        qkv = (
-            self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        )
-        # q, k, v with shape (B * nHead, H * W, C)
-        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
+        # q, k, v with shape (B, nHead, H * W, C), views of the qkv output.
+        qkv = self.qkv(x).view(B, H * W, 3, self.num_heads, -1)
+        q, k, v = qkv.unbind(2)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
 
         rel_h, rel_w = None, None
         if self.use_rel_pos:
             rel_h, rel_w = add_decomposed_rel_pos(
-                q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
+                q.reshape(B * self.num_heads, H * W, -1),
+                self.rel_pos_h,
+                self.rel_pos_w,
+                (H, W),
+                (H, W),
             )
-
-        q = q.view(B, self.num_heads, H * W, -1)
-        k = k.view(B, self.num_heads, H * W, -1)
-        v = v.view(B, self.num_heads, H * W, -1)
 
         if self.use_rel_pos:
             rel_h = rel_h.view(
@@ -485,13 +517,7 @@ class Attention(nn.Module):
             rel_w = rel_w.view(
                 B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3)
             )
-            attn_bias = (rel_h + rel_w).view(
-                B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4)
-            )
-            x = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_bias
-            )
-            # x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
+            x = self._attend_with_rel_pos_bias(q, k, v, rel_h, rel_w)
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
@@ -504,6 +530,40 @@ class Attention(nn.Module):
         x = self.proj(x)
 
         return x
+
+    # A batch-8 1024px bias is 3 GiB; past this cap the query axis is chunked.
+    # 64 MiB keeps the peak allocation low on long multi-page batches.
+    _REL_POS_BIAS_MAX_BYTES = 64 * 1024 * 1024
+    # Do not go below this many query rows per chunk; launch overhead dominates.
+    _REL_POS_MIN_Q_CHUNK = 256
+
+    def _attend_with_rel_pos_bias(self, q, k, v, rel_h, rel_w):
+        """Chunked SDPA over the query axis; every chunk attends to all keys."""
+        B, heads, q_len, _ = q.shape
+        k_h, k_w = rel_h.size(3), rel_w.size(4)
+        bias_bytes = B * heads * q_len * k_h * k_w * rel_h.element_size()
+
+        def bias_for(s: int, e: int) -> torch.Tensor:
+            rel_h_chunk = rel_h[:, :, s:e]
+            rel_w_chunk = rel_w[:, :, s:e]
+            if can_use_sam_rel_pos_bias(rel_h_chunk, rel_w_chunk):
+                return sam_rel_pos_bias(rel_h_chunk, rel_w_chunk)
+            return (rel_h_chunk + rel_w_chunk).view(B, heads, e - s, k_h * k_w)
+
+        if bias_bytes <= self._REL_POS_BIAS_MAX_BYTES:
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=bias_for(0, q_len)
+            )
+
+        n_chunks = cdiv(bias_bytes, self._REL_POS_BIAS_MAX_BYTES)
+        q_chunk = max(self._REL_POS_MIN_Q_CHUNK, cdiv(q_len, n_chunks))
+        out = torch.empty_like(q)
+        for s in range(0, q_len, q_chunk):
+            e = min(s + q_chunk, q_len)
+            out[:, :, s:e] = torch.nn.functional.scaled_dot_product_attention(
+                q[:, :, s:e], k, v, attn_mask=bias_for(s, e)
+            )
+        return out
 
 
 def window_partition(
@@ -614,17 +674,19 @@ class Block(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
         x = self.norm1(x)
-        # Window partition
         if self.window_size > 0:
             H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, self.window_size)
 
         x = self.attn(x)
-        # Reverse window partition
-        if self.window_size > 0:
-            x = window_unpartition(x, self.window_size, pad_hw, (H, W))
-
-        x = shortcut + x
+        if self.window_size > 0 and can_use_window_unpartition_add(
+            x, shortcut, self.window_size
+        ):
+            x = window_unpartition_add(x, shortcut, self.window_size)
+        else:
+            if self.window_size > 0:
+                x = window_unpartition(x, self.window_size, pad_hw, (H, W))
+            x = shortcut + x
         x = x + self.mlp(self.norm2(x))
 
         return x
@@ -826,7 +888,7 @@ def _build_sam(
     )
     image_encoder.eval()
     if checkpoint is not None:
-        state_dict = torch.load(checkpoint)
+        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
         image_encoder.load_state_dict(
             {k[30:]: v for k, v in state_dict.items() if "vision_tower_high" in k},
             strict=True,
@@ -843,41 +905,6 @@ def build_sam_vit_b(checkpoint=None, net_3_out_channels: int = 1024):
         checkpoint=checkpoint,
         net_3_out_channels=net_3_out_channels,
     )
-
-
-def get_abs_pos(abs_pos, tgt_size):
-    # abs_pos: L, C
-    # tgt_size: M
-    # return: M, C
-    dim = abs_pos.size(-1)
-    abs_pos_new = abs_pos.squeeze(0)
-    cls_token, old_pos_embed = abs_pos_new[:1], abs_pos_new[1:]
-
-    src_size = int(math.sqrt(abs_pos_new.shape[0] - 1))
-    tgt_size = int(math.sqrt(tgt_size))
-    dtype = abs_pos.dtype
-
-    if src_size != tgt_size:
-        old_pos_embed = (
-            old_pos_embed.view(1, src_size, src_size, dim)
-            .permute(0, 3, 1, 2)
-            .contiguous()
-        )
-        old_pos_embed = old_pos_embed.to(torch.float32)
-        new_pos_embed = F.interpolate(
-            old_pos_embed,
-            size=(tgt_size, tgt_size),
-            mode="bicubic",
-            antialias=True,
-            align_corners=False,
-        ).to(dtype)
-        new_pos_embed = new_pos_embed.permute(0, 2, 3, 1)
-        new_pos_embed = new_pos_embed.view(tgt_size * tgt_size, dim)
-        vision_pos_embed = torch.cat([cls_token, new_pos_embed], dim=0)
-        vision_pos_embed = vision_pos_embed.view(1, tgt_size * tgt_size + 1, dim)
-        return vision_pos_embed
-    else:
-        return abs_pos
 
 
 class CLIPVisionEmbeddings(nn.Module):
@@ -952,7 +979,6 @@ class NoTPAttention(torch.nn.Module):
         xqkv = xqkv.view(bsz, seqlen, 3, self.num_heads, self.head_dim)
 
         if self.use_flash_attention:
-
             xq, xk, xv = torch.split(xqkv, 1, dim=2)
             xq = xq.squeeze(2)
             xk = xk.squeeze(2)
@@ -984,7 +1010,7 @@ class NoTPAttention(torch.nn.Module):
         return output
 
 
-@torch.jit.script
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
 
@@ -1289,31 +1315,34 @@ class CustomQwen2Decoder(nn.Module):
                 token_type_ids,
             ):
                 min_dtype = torch.finfo(dtype).min
-                masks = []
-                for b in range(batch_size):
-                    mask = torch.full(
-                        (sequence_length, sequence_length),
-                        fill_value=min_dtype,
-                        dtype=dtype,
-                        device=device,
-                    )
 
-                    type_ids = token_type_ids[b]
-                    image_positions = (type_ids == 0).nonzero(as_tuple=True)[0]
-                    text_positions = (type_ids == 1).nonzero(as_tuple=True)[0]
+                is_image = token_type_ids == 0  # [B, S]
+                is_text = token_type_ids == 1  # [B, S]
 
-                    if len(image_positions) > 0:
-                        mask[image_positions[:, None], image_positions] = 0.0
+                mask = torch.full(
+                    (batch_size, sequence_length, sequence_length),
+                    fill_value=min_dtype,
+                    dtype=dtype,
+                    device=device,
+                )
 
-                    for i, text_pos in enumerate(text_positions):
-                        if len(image_positions) > 0:
-                            mask[text_pos, image_positions] = 0.0
-                        mask[text_pos, text_positions[: i + 1]] = 0.0
+                img_outer = is_image.unsqueeze(2) & is_image.unsqueeze(1)  # [B, S, S]
 
-                    masks.append(mask)
+                idx = torch.arange(sequence_length, device=device)
+                causal = idx.unsqueeze(0) <= idx.unsqueeze(1)  # [S, S]
 
-                mask = torch.stack(masks, dim=0).unsqueeze(1)
-                return mask
+                text_causal = (
+                    is_text.unsqueeze(2)  # [B, S, 1]
+                    & is_text.unsqueeze(1)  # [B, 1, S]
+                    & causal.unsqueeze(0)  # [1, S, S]
+                )  # [B, S, S]
+
+                text_to_img = is_text.unsqueeze(2) & is_image.unsqueeze(1)  # [B, S, S]
+
+                allow = img_outer | text_causal | text_to_img  # [B, S, S]
+                mask.masked_fill_(allow, 0.0)
+
+                return mask.unsqueeze(1)  # [B, 1, S, S]
 
         return CustomQwen2ModelInner(config)
 
@@ -1408,12 +1437,38 @@ def build_qwen2_decoder_as_encoder(
         max_query=max_query,
     )
     if checkpoint is not None:
-        state_dict = torch.load(checkpoint)
+        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
         decoder_as_encoder.load_state_dict(state_dict, strict=True)
     return decoder_as_encoder
 
 
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    text_config = hf_config.text_config
+    if is_ocr2_config(hf_config) or not (
+        text_config.topk_method == "noaux_tc" or text_config.use_mla
+    ):
+        return None
+    return text_config
+
+
 class DeepseekOCRForCausalLM(nn.Module):
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return None
+        return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
+            text_config, quant_config
+        )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return DeepseekV2ForCausalLM.num_fusable_shared_experts(text_config)
+
     def __init__(
         self,
         *,
@@ -1428,11 +1483,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         self.vision_config = config.vision_config
         self.projector_config = config.projector_config
         self.text_config = config.text_config
-        self.is_ocr2 = (
-            str(getattr(self.vision_config, "model_name", "")).lower()
-            == "deepencoderv2"
-            or getattr(self.projector_config, "input_dim", None) == 896
-        )
+        self.is_ocr2 = is_ocr2_config(config)
         n_embed = getattr(self.projector_config, "n_embed", 1280)
 
         self.tile_tag = config.tile_tag
@@ -1577,7 +1628,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         if pixel_values is not None:
             if not isinstance(pixel_values, (torch.Tensor, list)):
                 raise ValueError(
-                    "Incorrect type of pixel values. " f"Got type: {type(pixel_values)}"
+                    f"Incorrect type of pixel values. Got type: {type(pixel_values)}"
                 )
 
             if not isinstance(images_spatial_crop, (torch.Tensor, list)):
@@ -1588,7 +1639,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
             if not isinstance(images_crop, (torch.Tensor, list)):
                 raise ValueError(
-                    "Incorrect type of image crop. " f"Got type: {type(images_crop)}"
+                    f"Incorrect type of image crop. Got type: {type(images_crop)}"
                 )
 
             return [pixel_values, images_crop, images_spatial_crop]
@@ -1680,30 +1731,41 @@ class DeepseekOCRForCausalLM(nn.Module):
             else self.vision_model.dtype
         )
         has_local_crops = self._collect_mm_flag(mm_items, "has_local_crops")
-        pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
-            target_dtype
-        )
 
-        images_crop = (
-            torch.stack([item.images_crop for item in mm_items], dim=0)
-            .type(target_dtype)
-            .to(device=pixel_values.device)
-        )
-        images_spatial_crop = (
-            torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
-            .type(torch.long)
-            .to(device=pixel_values.device)
-        )
+        # Different images may have a different number of local crop patches
+        # (images_crop shape [1, num_patches, 3, H, W] varies per item), so we
+        # cannot stack them into a single tensor. Process each item separately
+        # and concatenate the resulting feature sequences.
+        vision_feature_lists: List[torch.Tensor] = []
+        for idx, item in enumerate(mm_items):
+            pixel_values = item.feature.unsqueeze(0).type(target_dtype)
+            images_crop = (
+                item.images_crop.unsqueeze(0)
+                .type(target_dtype)
+                .to(device=pixel_values.device)
+            )
+            images_spatial_crop = item.images_spatial_crop.type(torch.long).to(
+                device=pixel_values.device
+            )
+            if images_spatial_crop.dim() == 2:
+                images_spatial_crop = images_spatial_crop.unsqueeze(0)
 
-        assert images_crop.dim() == 6
-        assert images_spatial_crop.dim() == 3
+            assert images_crop.dim() == 6
+            assert images_spatial_crop.dim() == 3
 
-        vision_feature_lists = self._pixel_values_to_embedding(
-            pixel_values=pixel_values,
-            images_crop=images_crop,
-            images_spatial_crop=images_spatial_crop,
-            has_local_crops=has_local_crops,
-        )
+            item_has_local_crops = (
+                [has_local_crops[idx]] if has_local_crops is not None else None
+            )
+
+            vision_feature_lists.extend(
+                self._pixel_values_to_embedding(
+                    pixel_values=pixel_values,
+                    images_crop=images_crop,
+                    images_spatial_crop=images_spatial_crop,
+                    has_local_crops=item_has_local_crops,
+                )
+            )
+
         vision_features = torch.cat(vision_feature_lists, dim=0).type(target_dtype)
 
         return vision_features
@@ -1735,9 +1797,8 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         return inputs_embeds
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vision_embeddings = self._process_image_input(items)
@@ -1761,6 +1822,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        clear_sam_rel_pos_cache()
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -1772,7 +1834,6 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1852,6 +1913,36 @@ class DeepseekOCRForCausalLM(nn.Module):
             raise RuntimeError(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        if _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+
+            layer_ids = int(self.config.num_hidden_layers)
+            first_k_dense_replace_id = (
+                self.config.first_k_dense_replace
+                if hasattr(self.config, "first_k_dense_replace")
+                else -1
+            )
+            moe_layer_freq_id = (
+                self.config.moe_layer_freq
+                if hasattr(self.config, "moe_layer_freq")
+                else 1
+            )
+            for layer_id in range(0, layer_ids):
+                if (
+                    layer_id >= first_k_dense_replace_id
+                    and layer_id % moe_layer_freq_id == 0
+                ):
+                    if (
+                        hasattr(self.model, "model")
+                        and hasattr(self.model.model, "layers")
+                        and hasattr(self.model.model.layers[layer_id], "mlp")
+                    ):
+                        self_moe = self.model.model.layers[layer_id].mlp
+                        if hasattr(self_moe, "w1") and hasattr(self_moe, "w2"):
+                            _amx_process_weight_after_loading(self_moe, ["w1", "w2"])
 
 
 EntryClass = [DeepseekOCRForCausalLM]

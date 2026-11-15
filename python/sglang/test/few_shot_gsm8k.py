@@ -1,6 +1,10 @@
 """
 Run few-shot GSM-8K evaluation.
 
+.. deprecated::
+    This module is deprecated. Use ``sgl-eval run gsm8k`` or
+    ``sglang.test.sgl_eval_utils.run_sgl_eval`` instead.
+
 Usage:
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 """
@@ -9,6 +13,7 @@ import argparse
 import ast
 import re
 import time
+import warnings
 
 import numpy as np
 
@@ -50,6 +55,12 @@ def get_answer_value(answer_str):
 
 
 def run_eval(args):
+    warnings.warn(
+        "sglang.test.few_shot_gsm8k is deprecated. "
+        "Use `sgl-eval run gsm8k` or sglang.test.sgl_eval_utils.run_sgl_eval instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     # Select backend
     set_default_backend(RuntimeEndpoint(normalize_base_url(args.host, args.port)))
 
@@ -106,9 +117,25 @@ def run_eval(args):
     )
     latency = time.perf_counter() - tic
 
+    # Request errors are fatal unless the caller opts into a bounded tolerance;
+    # tolerated failures are scored as invalid.
+    max_request_errors = getattr(args, "max_request_errors", 0)
+    errors = [s.error() for s in states if s.error() is not None]
+    num_errors = len(errors)
+    if num_errors > max_request_errors:
+        raise RuntimeError(
+            f"{num_errors}/{len(states)} requests failed "
+            f"(max_request_errors={max_request_errors}): {errors[0]}"
+        ) from errors[0]
+    if num_errors:
+        warnings.warn(f"{num_errors}/{len(states)} requests failed; scored as invalid")
+
     preds = []
-    for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
+    for s in states:
+        if s.error() is not None:
+            preds.append(INVALID)
+        else:
+            preds.append(get_answer_value(s["answer"]))
 
     # print(f"{preds=}")
     # print(f"{labels=}")
@@ -119,7 +146,9 @@ def run_eval(args):
 
     # Compute speed
     num_output_tokens = sum(
-        s.get_meta_info("answer")["completion_tokens"] for s in states
+        s.get_meta_info("answer")["completion_tokens"]
+        for s in states
+        if s.error() is None
     )
     output_throughput = num_output_tokens / latency
 
@@ -135,6 +164,7 @@ def run_eval(args):
     return {
         "accuracy": acc,
         "invalid": invalid,
+        "num_errors": num_errors,
         "latency": latency,
         "output_throughput": output_throughput,
     }

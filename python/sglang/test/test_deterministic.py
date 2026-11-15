@@ -45,6 +45,7 @@ class BenchArgs:
     profile: bool = False
     profile_steps: int = 3
     profile_by_stage: bool = False
+    admin_api_key: Optional[str] = None
     test_mode: str = "single"
     n_trials: int = 50
     n_start: int = 1
@@ -86,6 +87,12 @@ class BenchArgs:
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
         parser.add_argument("--profile-by-stage", action="store_true")
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=BenchArgs.admin_api_key,
+            help="The server's --admin-api-key, which --profile requires (default: SGLANG_ADMIN_API_KEY).",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -104,6 +111,7 @@ def send_single(
     max_new_tokens: int = None,
     extra_params: Optional[Dict[str, Any]] = None,
     pick_first_result: bool = True,
+    admin_api_key: Optional[str] = None,
 ):
     base_url = f"http://{args.host}:{args.port}"
 
@@ -155,6 +163,7 @@ def send_single(
             num_steps=profile_steps,
             activities=["CPU", "GPU"],
             profile_by_stage=profile_by_stage,
+            admin_api_key=admin_api_key,
         )
 
     response = requests.post(
@@ -463,7 +472,12 @@ def test_deterministic(args):
         texts = []
         for i in range(1, args.n_trials + 1):
             batch_size = i
-            text = send_single(args, args.profile, prompt=[PROMPT_1] * batch_size)
+            text = send_single(
+                args,
+                args.profile,
+                prompt=[PROMPT_1] * batch_size,
+                admin_api_key=args.admin_api_key,
+            )
             text = text.replace("\n", " ")
             print(f"Trial {i} with batch size {batch_size}: {text}")
             texts.append(text)
@@ -510,7 +524,7 @@ def test_deterministic(args):
 
         # If logprobs are enabled, compare them across different batch sizes
         if args.return_logprob:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print("Logprobs Comparison Across Batch Sizes")
             print("=" * 60)
 
@@ -536,7 +550,7 @@ def test_deterministic(args):
                     match, msg = compare_logprobs(ref_logprobs, resp_logprobs)
 
                     if not match:
-                        print(f"  ✗ Sample {j+1}: {msg}")
+                        print(f"  ✗ Sample {j + 1}: {msg}")
                         mismatches.append((j + 1, msg))
                         all_match = False
 
@@ -549,7 +563,7 @@ def test_deterministic(args):
                     )
                     logprob_results.append(0)
 
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             if all(r == 1 for r in logprob_results):
                 print("✓✓✓ Logprobs are identical across all batch sizes! ✓✓✓")
             else:
@@ -653,7 +667,7 @@ def test_deterministic(args):
         print(f"  Logprob:  {uncached_logprob:.10f}")
 
         # Step 6: Compare results
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Comparison 1: Decode (Request 1) vs Prefill with Cache (Request 2)")
         print("=" * 60)
 
@@ -679,7 +693,7 @@ def test_deterministic(args):
             print(f"  Logprob difference: {diff:.10e}")
         print(f"  Note: We expect these to be DIFFERENT (decode vs prefill kernels)")
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(
             "Comparison 2: Cached Prefill (Request 2) vs Uncached Prefill (Request 3)"
         )
@@ -708,7 +722,7 @@ def test_deterministic(args):
             print(f"    Difference: {diff:.10e}")
         print(f"  Note: We expect these to be IDENTICAL (both prefill kernels)")
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         if token_match and logprob_match:
             print("✓✓✓ TEST PASSED - Radix cache is consistent! ✓✓✓")
             return [1]

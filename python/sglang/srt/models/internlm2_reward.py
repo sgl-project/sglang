@@ -20,9 +20,9 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM, InternLM2Model
-from sglang.srt.utils import add_prefix
 
 
 class InternLM2ForRewardModel(nn.Module):
@@ -55,7 +55,12 @@ class InternLM2ForRewardModel(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
         scores = self.v_head(last_token_hidden)
-        return EmbeddingPoolerOutput(scores)
+        return EmbeddingPoolerOutput(
+            embeddings=scores,
+            pooled_hidden_states=(
+                last_token_hidden if forward_batch.return_pooled_hidden_states else None
+            ),
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         return InternLM2ForCausalLM.load_weights(self, weights)

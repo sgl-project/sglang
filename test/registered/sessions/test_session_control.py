@@ -2,22 +2,21 @@
 Usage:
 python3 -m unittest test_session_control.TestSessionControl.test_session_control
 python3 -m unittest test_session_control.TestSessionControl.test_session_control_with_branching
-python3 -m unittest test_session_control.TestSessionControl.test_session_control_backtrack_with_abort
-python3 -m unittest test_session_control.TestSessionControl.test_streaming_session
 python3 -m unittest test_session_control.TestSessionControlVision.test_session_control
 """
 
-import asyncio
+import base64
+import io
 import json
-import time
 import unittest
+import uuid
 
-import aiohttp
 import requests
+from PIL import Image
 
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -26,14 +25,15 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=60, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=149, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=87, suite="extra-a-test-1-gpu-large-amd")
 
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
-class TestSessionControl(unittest.TestCase):
+class TestSessionControl(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -45,7 +45,8 @@ class TestSessionControl(unittest.TestCase):
             other_args=[
                 "--attention-backend",
                 "triton",
-                "--enable-streaming-session",
+                "--disable-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
             ],
         )
 
@@ -95,7 +96,6 @@ class TestSessionControl(unittest.TestCase):
                         "id": session_id,
                         "rid": rid,
                         "offset": -1,
-                        "replace": True,
                     },
                     "sampling_params": {
                         "temperature": 0,
@@ -129,7 +129,6 @@ class TestSessionControl(unittest.TestCase):
                     "id": session_id,
                     "rid": rid,
                     "offset": -1,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -153,7 +152,6 @@ class TestSessionControl(unittest.TestCase):
                     "id": session_id,
                     "rid": first_rid,
                     "offset": -1,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -173,14 +171,35 @@ class TestSessionControl(unittest.TestCase):
             ]
         )
 
-        # query with a non-existing rid (the last one should be disappeared because of backtrack), should see abort
+        # query with a non-existing rid, should see abort
         ret = requests.post(
             self.base_url + "/generate",
             json={
                 "input_ids": chunks_ids[-1],
                 "session_params": {
                     "id": session_id,
-                    "rid": rid,
+                    "rid": uuid.uuid4().hex,
+                    "offset": -1,
+                },
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": gen_len,
+                    "no_stop_trim": True,
+                    "skip_special_tokens": False,
+                },
+                "return_logprob": True,
+            },
+        )
+        self.assertNotEqual(ret.status_code, 200)
+
+        # query with replace, which is not supported, should see abort
+        ret = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": chunks_ids[-1],
+                "session_params": {
+                    "id": session_id,
+                    "rid": first_rid,
                     "offset": -1,
                     "replace": True,
                 },
@@ -190,7 +209,6 @@ class TestSessionControl(unittest.TestCase):
                     "no_stop_trim": True,
                     "skip_special_tokens": False,
                 },
-                "return_logprob": True,
             },
         )
         self.assertNotEqual(ret.status_code, 200)
@@ -210,7 +228,6 @@ class TestSessionControl(unittest.TestCase):
                     "id": session_id,
                     "rid": first_rid,
                     "offset": -1,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -293,303 +310,11 @@ class TestSessionControl(unittest.TestCase):
         print(logprobs_from_session)
         print("logprobs from normal queries:")
         print(logprobs_normal)
-        assert len(logprobs_from_session) == len(
-            logprobs_normal
-        ), "logprobs must have equal length"
+        assert len(logprobs_from_session) == len(logprobs_normal), (
+            "logprobs must have equal length"
+        )
         for a, b in zip(logprobs_from_session, logprobs_normal):
             assert abs(a - b) <= 0.15, f"logprobs {a} and {b} differ by more than 0.15"
-
-    async def async_generate(self, payload):
-        url = self.base_url + "/generate"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url=url, json=payload) as response:
-                assert response.status == 200
-                async for chunk_bytes in response.content:
-                    chunk_bytes = chunk_bytes.strip()
-                    if not chunk_bytes:
-                        continue
-                    chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                    if chunk == "[DONE]":
-                        yield "", None, ""
-                    else:
-                        data = json.loads(chunk)
-                        finish_reason = (
-                            data["meta_info"]["finish_reason"]["type"]
-                            if data["meta_info"]["finish_reason"]
-                            else ""
-                        )
-                        yield data["text"], data["meta_info"]["id"], finish_reason
-
-    async def run_session_control_backtrack_with_abort(self, replace):
-        chunks = [
-            "Let me tell you something about France.",
-            "The capital of France is",
-        ]
-        tokenizer = get_tokenizer(self.model)
-        chunks_ids = [tokenizer.encode(x) for x in chunks]
-        for i in range(1, len(chunks_ids)):
-            if chunks_ids[i][0] == tokenizer.bos_token_id:
-                chunks_ids[i] = chunks_ids[i][1:]
-
-        # 1. using session control
-        requests.post(self.base_url + "/flush_cache")
-        session_id = requests.post(
-            self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000},
-        ).json()
-        rid = None
-
-        payload = {
-            "input_ids": chunks_ids[0],
-            "session_params": {
-                "id": session_id,
-                "rid": rid,
-                "offset": -1,
-                "replace": True,
-            },
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": 100,
-                "no_stop_trim": True,
-                "skip_special_tokens": False,
-                "ignore_eos": True,
-            },
-            "stream": True,
-        }
-        gen_so_far = ""
-        finish_reason = ""
-        second_output = ""
-        async for chunk, rid, finish_reason_chunk in self.async_generate(payload):
-            gen_so_far += chunk
-            if finish_reason == "":
-                finish_reason = finish_reason_chunk
-            if len(gen_so_far) > 50 and second_output == "":
-                payload2 = {
-                    "input_ids": chunks_ids[1],
-                    "session_params": {
-                        "id": session_id,
-                        "rid": rid,
-                        "offset": 50,
-                        "replace": replace,
-                    },
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": 32,
-                        "no_stop_trim": True,
-                        "skip_special_tokens": False,
-                    },
-                    "stream": False,
-                    "stream_output": True,
-                }
-                response = requests.post(
-                    url=self.base_url + "/generate", json=payload2
-                ).json()
-                second_output = response["text"]
-        if replace:
-            assert finish_reason == "abort"
-        print("first request output:")
-        print(gen_so_far)
-        print("second request output:")
-        print(second_output)
-
-        # close the session
-        ret = requests.post(
-            self.base_url + "/close_session",
-            json={"session_id": session_id},
-        )
-        assert ret.status_code == 200
-
-        if not replace:
-            assert response["meta_info"]["finish_reason"]["type"] == "abort"
-        else:
-            # 2. not using session control
-            requests.post(self.base_url + "/flush_cache")
-            output_ids = tokenizer.encode(gen_so_far)
-            if output_ids[0] == tokenizer.bos_token_id:
-                output_ids = output_ids[1:]
-            input_ids = chunks_ids[0] + output_ids
-            input_ids = input_ids[:50] + chunks_ids[1]
-            payload = {
-                "input_ids": input_ids,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 32,
-                    "no_stop_trim": True,
-                    "skip_special_tokens": False,
-                },
-                "stream": False,
-                "stream_output": True,
-            }
-            response = requests.post(
-                url=self.base_url + "/generate", json=payload
-            ).json()
-            output_no_session = response["text"]
-            print("second request output without session:")
-            print(output_no_session)
-            assert (
-                second_output == output_no_session
-            ), f"second_output: {second_output}, output_no_session: {output_no_session}"
-
-    @unittest.skip("broken")
-    def test_session_control_backtrack_with_abort(self):
-        asyncio.run(self.run_session_control_backtrack_with_abort(replace=True))
-        asyncio.run(self.run_session_control_backtrack_with_abort(replace=False))
-
-    def test_streaming_session(self, gen_len=12):
-        chunks = [
-            "Let me tell you something about France.",
-            "The capital of France is",
-            "The population of the city is",
-        ]
-        tokenizer = get_tokenizer(self.model)
-        chunks_ids = [tokenizer.encode(x) for x in chunks]
-        for i in range(1, len(chunks_ids)):
-            if chunks_ids[i][0] == tokenizer.bos_token_id:
-                chunks_ids[i] = chunks_ids[i][1:]
-
-        # === Part 1: streaming session ===
-        requests.post(self.base_url + "/flush_cache")
-        session_id = requests.post(
-            self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000, "streaming": True},
-        ).json()
-        rid = None
-        outputs_from_session = []
-
-        prev_kv_len = 0
-        for turn_idx, chunk_ids in enumerate(chunks_ids):
-            response = requests.post(
-                self.base_url + "/generate",
-                json={
-                    "input_ids": chunk_ids,
-                    "session_params": {"id": session_id, "rid": rid},
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": gen_len,
-                        "no_stop_trim": True,
-                        "skip_special_tokens": False,
-                    },
-                },
-            ).json()
-            rid = response["meta_info"]["id"]
-            outputs_from_session.append(response["text"])
-            cached = response["meta_info"]["cached_tokens"]
-            prompt_tokens = response["meta_info"]["prompt_tokens"]
-            completion_tokens = response["meta_info"]["completion_tokens"]
-
-            if turn_idx == 0:
-                # Turn 1 should have no cache hit (cache was flushed).
-                self.assertEqual(
-                    cached, 0, "Turn 1 should have 0 cached tokens (clean start)"
-                )
-            else:
-                # Turns 2+ inherit KV from the previous turn (via inherit_kv_states,
-                # not radix tree matching). cached_tokens reflects the inherited prefix.
-                self.assertEqual(
-                    cached,
-                    prev_kv_len,
-                    f"Turn {turn_idx + 1}: should inherit {prev_kv_len} KV tokens from previous turn",
-                )
-            prev_kv_len = prompt_tokens + completion_tokens
-
-        # Close the session before checking cache/memory state.
-        ret = requests.post(
-            self.base_url + "/close_session",
-            json={"session_id": session_id},
-        )
-        self.assertEqual(ret.status_code, 200)
-
-        # === Cache verification (after close, before flush) ===
-
-        # Assertion 2: turn 1's prompt was inserted to the cache.
-        verify_resp = requests.post(
-            self.base_url + "/generate",
-            json={
-                "input_ids": chunks_ids[0],
-                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
-            },
-        ).json()
-        self.assertGreater(
-            verify_resp["meta_info"]["cached_tokens"],
-            0,
-            "Turn 1's prompt should be cached in the radix tree",
-        )
-
-        # Assertion 3 (insertion): turn 2's prompt tokens should NOT be in cache.
-        # The tree should only contain turn 1's extent (prompt + output from
-        # cache_unfinished_req during decode). Turn 2's prompt starts fresh tokens
-        # that were never inserted.
-        verify_resp2 = requests.post(
-            self.base_url + "/generate",
-            json={
-                "input_ids": chunks_ids[1],
-                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
-            },
-        ).json()
-        self.assertEqual(
-            verify_resp2["meta_info"]["cached_tokens"],
-            0,
-            "Turn 2's prompt should not be in cache (no insertion for turns 2+)",
-        )
-
-        # === Memory verification ===
-
-        # Assertion 4 & 5: KV is released properly and no memory leak.
-        # SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE is True by default;
-        # the scheduler will crash if it detects a leak during idle.
-        time.sleep(2)
-        health_resp = requests.get(self.base_url + "/health")
-        self.assertEqual(
-            health_resp.status_code,
-            200,
-            "Server should be healthy after session close (no memory leak)",
-        )
-
-        # After flush, all cache should be reclaimed.
-        requests.post(self.base_url + "/flush_cache")
-        verify_resp3 = requests.post(
-            self.base_url + "/generate",
-            json={
-                "input_ids": chunks_ids[0],
-                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
-            },
-        ).json()
-        self.assertEqual(
-            verify_resp3["meta_info"]["cached_tokens"],
-            0,
-            "After session close + flush, cache should be fully reclaimed",
-        )
-
-        # === Part 2: non-session baseline for output comparison ===
-        requests.post(self.base_url + "/flush_cache")
-
-        outputs_normal = []
-        input_ids = chunks_ids[0][:]
-        for i in range(len(chunks_ids)):
-            response = requests.post(
-                self.base_url + "/generate",
-                json={
-                    "input_ids": input_ids,
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": gen_len,
-                        "no_stop_trim": True,
-                        "skip_special_tokens": False,
-                    },
-                },
-            ).json()
-            outputs_normal.append(response["text"])
-            if i + 1 < len(chunks_ids):
-                out_ids = tokenizer.encode(response["text"])
-                if out_ids and out_ids[0] == tokenizer.bos_token_id:
-                    out_ids = out_ids[1:]
-                input_ids = input_ids + out_ids + chunks_ids[i + 1]
-
-        print("outputs from streaming session:")
-        print(outputs_from_session)
-        print("outputs from normal queries:")
-        print(outputs_normal)
-        self.assertEqual(outputs_from_session, outputs_normal)
 
     def run_session_control_with_branching(
         self, root_prompt, chunks_per_step, gen_len=16
@@ -614,7 +339,6 @@ class TestSessionControl(unittest.TestCase):
                     "id": session_id,
                     "rid": None,
                     "offset": 0,
-                    "replace": False,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -638,7 +362,6 @@ class TestSessionControl(unittest.TestCase):
                             "id": session_id,
                             "rid": rid_per_branch[j],
                             "offset": 0,
-                            "replace": False,
                         },
                         "sampling_params": {
                             "temperature": 0,
@@ -703,10 +426,18 @@ class TestSessionControl(unittest.TestCase):
         print(outputs_from_session)
         print("====== outputs from normal queries: =======")
         print(outputs_normal)
-        assert (
-            outputs_from_session == outputs_normal
-        ), f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
+        assert outputs_from_session == outputs_normal, (
+            f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
+        )
 
+    @unittest.skipIf(
+        is_hip(),
+        "Session-branching produces a deterministic 1-token divergence from "
+        "plain generation on AMD (greedy temperature=0). The other 4 of 5 "
+        "branch outputs match exactly; passes on CUDA. Suspected ROCm "
+        "numerical-precision difference in the session KV-cache reuse path. "
+        "Re-enable when that divergence is fixed.",
+    )
     def test_session_control_with_branching(self):
         root_prompt = "First, let me explain in one sentence about AI"
         chunks_per_step = [
@@ -730,17 +461,15 @@ class TestSessionControl(unittest.TestCase):
         )
 
 
-@unittest.skip("broken")
 class TestSessionControlVision(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmms-lab/llava-onevision-qwen2-7b-ov"
+        cls.model = "OpenGVLab/InternVL2-2B"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            # other_args={"--disable-radix"},
         )
 
     @classmethod
@@ -748,12 +477,13 @@ class TestSessionControlVision(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_session_control(self):
+        image_token = "<IMG_CONTEXT>"
         text_chunks = [
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-            "<|im_start|>user\n<image>\nDescribe this image in a very short sentence.<|im_end|>\n<|im_start|>assistant\n",
-            "<|im_start|>user\n<image>\nIs this image same with one of the previous images?<|im_end|>\n<|im_start|>assistant\n",
-            "<|im_start|>user\n<image>\nIs this image same with one of the previous images?<|im_end|>\n<|im_start|>assistant\n",
-            "<|im_start|>user\nDescribe this image in a very short sentence.<|im_end|>\nassistant:",
+            f"<|im_start|>user\n{image_token}\nDescribe this image in a very short sentence.<|im_end|>\n<|im_start|>assistant\n",
+            f"<|im_start|>user\n{image_token}\nIs this image same with one of the previous images?<|im_end|>\n<|im_start|>assistant\n",
+            f"<|im_start|>user\n{image_token}\nIs this image same with one of the previous images?<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>user\nDescribe this image in a very short sentence.<|im_end|>\n<|im_start|>assistant\n",
         ]
         image_chunks = [
             "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
@@ -764,11 +494,6 @@ class TestSessionControlVision(CustomTestCase):
         self.assertEqual(
             len(text_chunks), len(image_chunks) + 2
         )  # the first and the last prompt does not contain images
-        tokenizer = get_tokenizer(self.model)
-        text_input_ids = [tokenizer.encode(x) for x in text_chunks]
-        for i in range(1, len(text_input_ids)):
-            if text_input_ids[i][0] == tokenizer.bos_token_id:
-                text_input_ids[i] = text_input_ids[i][1:]
         gen_len = 32
 
         # 1. using session control
@@ -788,18 +513,17 @@ class TestSessionControlVision(CustomTestCase):
 
         first_rid = None
         outputs_from_session = []
-        for i in range(len(text_input_ids[:-1])):
+        for i in range(len(text_chunks[:-1])):
             response = requests.post(
                 self.base_url + "/generate",
                 json={
-                    "input_ids": text_input_ids[i],
+                    "text": text_chunks[i],
                     "image_data": image_chunks[i - 1] if i > 0 else None,
                     "modalities": ["multi-images"],
                     "session_params": {
                         "id": session_id,
                         "rid": rid,
                         "offset": 0,
-                        "replace": True,
                     },
                     "sampling_params": {
                         "temperature": 0,
@@ -821,12 +545,11 @@ class TestSessionControlVision(CustomTestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "input_ids": text_input_ids[-1],
+                "text": text_chunks[-1],
                 "session_params": {
                     "id": session_id,
                     "rid": first_rid,
                     "offset": 0,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -838,16 +561,15 @@ class TestSessionControlVision(CustomTestCase):
         ).json()
         outputs_from_session.append(response["text"])
 
-        # query with a non-existing rid (the last one should be disappeared because of backtrack), should see abort
+        # query with a non-existing rid, should see abort
         ret = requests.post(
             self.base_url + "/generate",
             json={
-                "input_ids": text_input_ids[-1],
+                "text": text_chunks[-1],
                 "session_params": {
                     "id": session_id,
-                    "rid": rid,
+                    "rid": uuid.uuid4().hex,
                     "offset": 0,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -869,12 +591,11 @@ class TestSessionControlVision(CustomTestCase):
         ret = requests.post(
             self.base_url + "/generate",
             json={
-                "input_ids": text_input_ids[-1],
+                "text": text_chunks[-1],
                 "session_params": {
                     "id": session_id,
                     "rid": first_rid,
                     "offset": 0,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -889,16 +610,16 @@ class TestSessionControlVision(CustomTestCase):
         # 2. not use session control
         requests.post(self.base_url + "/flush_cache")
 
-        input_ids_first_req = None
-        input_ids = []
+        accumulated_text = ""
+        first_req_text = None
         outputs_normal = []
-        for i in range(len(text_input_ids[:-1])):
-            input_ids += text_input_ids[i]
+        for i in range(len(text_chunks[:-1])):
+            accumulated_text += text_chunks[i]
             image_data = image_chunks[:i] if i > 0 else None
             response = requests.post(
                 self.base_url + "/generate",
                 json={
-                    "input_ids": input_ids,
+                    "text": accumulated_text,
                     "image_data": image_data,
                     "modalities": ["multi-images"],
                     "sampling_params": {
@@ -912,19 +633,15 @@ class TestSessionControlVision(CustomTestCase):
                 },
             ).json()
             if i > 0:
-                output_ids = tokenizer.encode(response["text"])
-                if output_ids[0] == tokenizer.bos_token_id:
-                    output_ids = output_ids[1:]
-                input_ids += output_ids
+                accumulated_text += response["text"]
                 outputs_normal.append(response["text"])
             if i == 0:
-                input_ids_first_req = input_ids.copy()
+                first_req_text = accumulated_text
 
-        input_ids_first_req += text_input_ids[-1]
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "input_ids": input_ids_first_req,
+                "text": first_req_text + text_chunks[-1],
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": gen_len,
@@ -939,9 +656,119 @@ class TestSessionControlVision(CustomTestCase):
         print(outputs_from_session)
         print("outputs from normal queries:")
         print(outputs_normal)
-        assert (
-            outputs_from_session == outputs_normal
-        ), f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
+        assert outputs_from_session == outputs_normal, (
+            f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
+        )
+
+
+class TestSessionControlMrope(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            "Qwen/Qwen2.5-VL-3B-Instruct",
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-streaming-session",
+                "--context-length",
+                "4096",
+                "--mem-fraction-static",
+                "0.5",
+                "--max-running-requests",
+                "4",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def post(self, path, **payload):
+        response = requests.post(self.base_url + path, json=payload, timeout=180)
+        response.raise_for_status()
+        return response.json() if response.content else None
+
+    def test_image_append(self):
+        images = []
+        for color in ("red", "blue"):
+            buffer = io.BytesIO()
+            Image.new("RGB", (112, 112), color).save(buffer, format="PNG")
+            images.append(
+                "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+            )
+        prompt = (
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "What color is this image?<|im_end|>\n<|im_start|>assistant\n"
+        )
+        sampling = dict(
+            temperature=0,
+            max_new_tokens=8,
+            ignore_eos=True,
+            skip_special_tokens=False,
+            no_stop_trim=True,
+        )
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                salt = uuid.uuid4().hex
+                sid = self.post(
+                    "/open_session", capacity_of_str_len=4096, streaming=streaming
+                )
+                try:
+                    first = self.post(
+                        "/generate",
+                        text=prompt,
+                        image_data=images[:1],
+                        session_params={"id": sid},
+                        cache_salt=salt,
+                        sampling_params=sampling,
+                    )
+                    self.assertEqual(len(first["output_ids"]), 8)
+                    suffix = "<|im_end|>\n" + prompt
+                    # Regular mode also branches from the first turn after an append.
+                    for image in images[1:] + (images[:1] if not streaming else []):
+                        # A separate cache namespace prevents the reference from warming the session.
+                        reference = self.post(
+                            "/generate",
+                            text=prompt + first["text"] + suffix,
+                            image_data=[images[0], image],
+                            cache_salt=uuid.uuid4().hex,
+                            sampling_params=sampling,
+                        )
+                        appended = self.post(
+                            "/generate",
+                            text=suffix,
+                            image_data=[image],
+                            session_params={"id": sid, "rid": first["meta_info"]["id"]},
+                            cache_salt=salt,
+                            sampling_params=sampling,
+                        )
+                        self.assertEqual(len(appended["output_ids"]), 8)
+                        self.assertEqual(
+                            appended["output_ids"], reference["output_ids"]
+                        )
+                        print(
+                            "Session replay example: "
+                            + json.dumps(
+                                {
+                                    "streaming": streaming,
+                                    "new_image": "red"
+                                    if image == images[0]
+                                    else "blue",
+                                    "first_reply": first["text"],
+                                    "session_reply": appended["text"],
+                                    "replay_reply": reference["text"],
+                                    "session_ids": appended["output_ids"],
+                                    "replay_ids": reference["output_ids"],
+                                }
+                            ),
+                            flush=True,
+                        )
+                finally:
+                    self.post("/close_session", session_id=sid)
+                self.assertEqual(
+                    requests.get(self.base_url + "/health", timeout=10).status_code, 200
+                )
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ use smg::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
         PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
-        TraceConfig,
+        TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+        DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
     },
     core::ConnectionMode,
     observability::{
@@ -210,6 +211,10 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
+    /// Max requests per prefill worker in flight to decode; the rest pick their decode worker when sent
+    #[arg(long, help_heading = "PD Disaggregation")]
+    decode_dispatch_limit: Option<usize>,
+
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     worker_startup_timeout_secs: u64,
@@ -297,6 +302,43 @@ struct CliArgs {
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
+
+    // ==================== HTTP Client ====================
+    /// Idle timeout in seconds for pooled upstream HTTP connections
+    #[arg(
+        long,
+        env = "SMG_POOL_IDLE_TIMEOUT_SECS",
+        default_value_t = DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+        help_heading = "HTTP Client"
+    )]
+    pool_idle_timeout_secs: u64,
+
+    /// Timeout in seconds for new upstream HTTP connections
+    #[arg(
+        long,
+        env = "SMG_CONNECT_TIMEOUT_SECS",
+        default_value_t = DEFAULT_CONNECT_TIMEOUT_SECS,
+        help_heading = "HTTP Client"
+    )]
+    connect_timeout_secs: u64,
+
+    /// Maximum idle upstream HTTP connections to keep per host
+    #[arg(
+        long,
+        env = "SMG_POOL_MAX_IDLE_PER_HOST",
+        default_value_t = DEFAULT_POOL_MAX_IDLE_PER_HOST,
+        help_heading = "HTTP Client"
+    )]
+    pool_max_idle_per_host: usize,
+
+    /// TCP keepalive idle time in seconds for upstream HTTP connections
+    #[arg(
+        long,
+        env = "SMG_TCP_KEEPALIVE_SECS",
+        default_value_t = DEFAULT_TCP_KEEPALIVE_SECS,
+        help_heading = "HTTP Client"
+    )]
+    tcp_keepalive_secs: u64,
 
     // ==================== Rate Limiting ====================
     /// Maximum concurrent requests (-1 to disable)
@@ -972,6 +1014,10 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
+            .connect_timeout_secs(self.connect_timeout_secs)
+            .pool_max_idle_per_host(self.pool_max_idle_per_host)
+            .tcp_keepalive_secs(self.tcp_keepalive_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -1014,6 +1060,7 @@ impl CliArgs {
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .maybe_decode_dispatch_limit(self.decode_dispatch_limit)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -1047,9 +1094,11 @@ impl CliArgs {
                 })
                 .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
 
-            Some(ServiceDiscoveryConfig {
+            let selector = Self::parse_selector(&self.selector);
+
+            let service_discovery_config = ServiceDiscoveryConfig {
                 enabled: true,
-                selector: Self::parse_selector(&self.selector),
+                selector,
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
@@ -1059,7 +1108,10 @@ impl CliArgs {
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 router_selector,
                 router_mesh_port_annotation,
-            })
+                igw_mode: self.enable_igw,
+            };
+            service_discovery_config.warn_if_misconfigured();
+            Some(service_discovery_config)
         } else {
             None
         };

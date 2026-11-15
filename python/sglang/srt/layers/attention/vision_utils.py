@@ -2,12 +2,12 @@
 
 import torch
 
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.runtime_context import get_parallel
 
 
 def update_vit_attn_dummy_heads_config(config):
     """Update HF config to ensure vision attention num_attention_heads is divisible by tp_size"""
-    tp_size = get_attention_tp_size()
+    tp_size = get_parallel().attn_tp_size
     num_heads = getattr(
         config.vision_config,
         "num_heads",
@@ -60,6 +60,8 @@ def pad_vit_attn_dummy_heads(config, name: str, loaded_weight: torch.Tensor):
         )
         loaded_weight = torch.cat([loaded_weight, padded_weight], dim=-1)
     elif "attn.q_norm.weight" in name or "attn.k_norm.weight" in name:
+        if loaded_weight.numel() == head_dim:
+            return loaded_weight
         padded_weight = loaded_weight.new_zeros(head_dim * num_dummy_heads)
         loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
     return loaded_weight

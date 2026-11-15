@@ -1,0 +1,695 @@
+import asyncio
+import pickle
+import threading
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import numpy as np
+import torch
+
+import sglang.srt.disaggregation.encoder.server as encoder_server
+from sglang.srt.disaggregation.encoder import http_server
+from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
+from sglang.srt.disaggregation.encoder.preprocessor import (
+    EncoderPreprocessor,
+    EncoderPreprocessResult,
+)
+from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
+from sglang.srt.disaggregation.encoder.runtime import (
+    _DP_RELEASE_AFTER_ENCODE,
+    DPDispatcher,
+    _retire_abandoned_encode,
+)
+from sglang.srt.disaggregation.encoder.server import (
+    EncodeContext,
+    EncoderMetaRegistry,
+    MMEncoder,
+    MMError,
+    meta_registry,
+)
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
+from sglang.srt.managers.io_struct import unwrap_from_pickle
+from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.utils.serialization import safe_pickle_loads
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+class TestEncoderDPErrorHandling(CustomTestCase):
+    @staticmethod
+    async def _run_registration_error(error):
+        encoder = SimpleNamespace(
+            register_embedding_destinations=AsyncMock(side_effect=error)
+        )
+        send = AsyncMock()
+        request = {
+            "req_id": "req",
+            "receive_count": 1,
+            "receive_url": "tcp://127.0.0.1:1",
+        }
+        with patch.object(encoder_runtime, "async_sock_send", send):
+            await encoder_runtime._dp_worker_handle_request(
+                encoder,
+                None,
+                object(),
+                asyncio.Lock(),
+                0,
+                request,
+                "register_destinations",
+            )
+        return unwrap_from_pickle(send.await_args.args[1])
+
+    def test_worker_reports_third_party_exception_with_callable_code(self):
+        class RpcLikeError(Exception):
+            def code(self):
+                return "INTERNAL"
+
+        envelope = asyncio.run(
+            self._run_registration_error(RpcLikeError("registration failed"))
+        )
+        self.assertEqual(envelope["_error"], "registration failed")
+        self.assertEqual(envelope["_error_code"], 500)
+
+    def test_worker_preserves_mm_error_status(self):
+        envelope = asyncio.run(
+            self._run_registration_error(MMError("bad destination", code=400))
+        )
+        self.assertEqual(envelope["_error_code"], 400)
+
+    def test_dispatcher_drops_malformed_result_without_stopping_listener(self):
+        async def run():
+            dispatcher = encoder_runtime.DPDispatcher(
+                dp_size=1,
+                dispatch_sockets=[object()],
+                release_sockets=[object()],
+                result_socket=object(),
+                worker_processes=[],
+            )
+            future = asyncio.get_running_loop().create_future()
+            dispatcher.pending_futures[0]["req"] = future
+            dispatcher.req_id_to_rank["req"] = 0
+            valid = {"req_id": "req", "_dp_type": "encode", "content": None}
+            recv = AsyncMock(
+                side_effect=[
+                    ["not", "an", "envelope"],
+                    valid,
+                    asyncio.CancelledError(),
+                ]
+            )
+
+            with patch.object(encoder_runtime, "async_sock_recv", recv):
+                listener = asyncio.create_task(dispatcher._result_listener())
+                await asyncio.wait_for(future, timeout=1)
+                listener.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await listener
+
+            self.assertEqual(future.result(), valid)
+
+        asyncio.run(run())
+
+
+class TestEncoderCacheIdentity(CustomTestCase):
+    def test_direct_embedding_reuses_combined_identity(self):
+        """A prefix-cache hit returns the embedding without re-encoding or rebuilding its key."""
+
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.model_type = "qwen3_vl"
+            encoder.cache_namespace = "sha256:" + "12" * 32
+            encoder.preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+            encoder.preprocessor.model_type = encoder.model_type
+            encoder.mm_cache = MultiModalStaticCache(4096)
+            encoder.mm_cache_lock = asyncio.Lock()
+            features = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+            grids = torch.tensor([[1, 2, 4], [1, 4, 2]])
+            expected = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+            forward = Mock(return_value=expected)
+            ctx = EncodeContext(
+                req_id="cache-key-test",
+                modality=Modality.IMAGE,
+                preprocess_result=EncoderPreprocessResult(
+                    mm_inputs={"pixel_values": features, "image_grid_thw": grids},
+                    grid_thw=grids,
+                    token_counts=[2, 2],
+                ),
+                get_feature_fn=forward,
+                mm_feature=features,
+                num_items=2,
+                items_per_req=[2],
+                aux_data={},
+                str_mm_hashes=None,
+                use_global_cache=False,
+                is_health_check=False,
+            )
+            with patch.object(
+                MultiModalStaticCache,
+                "combine_hashes",
+                wraps=MultiModalStaticCache.combine_hashes,
+            ) as combine:
+                for _ in range(2):
+                    actual = await encoder._compute_direct_embedding(
+                        ctx, keep_on_gpu=False
+                    )
+                    torch.testing.assert_close(actual, expected)
+                self.assertEqual(combine.call_count, 2)
+            forward.assert_called_once()
+            self.assertEqual(len(encoder.mm_cache), 1)
+
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(enable_prefix_mm_cache=True)
+        override.install()
+        try:
+            asyncio.run(run())
+        finally:
+            override.restore()
+
+    def test_grid_content_and_namespace_identify_each_embedding(self):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.model_type = "qwen3_vl"
+        encoder.cache_namespace = "sha256:" + "12" * 32
+        encoder.preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        encoder.preprocessor.model_type = encoder.model_type
+        features = torch.zeros(16, 2)
+        grids = torch.tensor([[1, 2, 4], [1, 4, 2]])
+        result = EncoderPreprocessResult(
+            mm_inputs={"pixel_values": features, "image_grid_thw": grids},
+            grid_thw=grids,
+            token_counts=[2, 2],
+        )
+
+        def keys():
+            return encoder._calculate_hashes_from_features(
+                features, result, Modality.IMAGE
+            )
+
+        original = keys()
+        self.assertEqual([len(key) for key in original], [32, 32])
+        self.assertNotEqual(original[0], original[1])
+        self.assertEqual(original, keys())
+        features[-1] = 1
+        changed = keys()
+        self.assertEqual(original[0], changed[0])
+        self.assertNotEqual(original[1], changed[1])
+        encoder.cache_namespace = "sha256:" + "34" * 32
+        self.assertTrue(all(a != b for a, b in zip(changed, keys())))
+
+
+class TestEncoderMetaRegistry(CustomTestCase):
+    def test_stale_releases_do_not_block_each_other(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            blocked_started = asyncio.Event()
+            unblock = asyncio.Event()
+            fast_released = asyncio.Event()
+
+            async def release(req_id):
+                if req_id == "blocked":
+                    blocked_started.set()
+                    await unblock.wait()
+                else:
+                    fast_released.set()
+
+            registry.on_release = release
+            registry._pending_at.update(blocked=0, fast=0)
+
+            blocked_task = registry._schedule_stale_release("blocked")
+            await asyncio.wait_for(blocked_started.wait(), timeout=1)
+            fast_task = registry._schedule_stale_release("fast")
+            await asyncio.wait_for(fast_released.wait(), timeout=1)
+            await fast_task
+
+            self.assertIn("blocked", registry._pending_at)
+            self.assertNotIn("fast", registry._pending_at)
+
+            unblock.set()
+            await blocked_task
+            self.assertNotIn("blocked", registry._pending_at)
+
+        asyncio.run(run())
+
+    def test_failed_stale_release_is_retried(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            attempts = 0
+
+            async def release(_req_id):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("transient cleanup failure")
+
+            registry.on_release = release
+            registry._pending_at["req"] = 0
+
+            await registry._release_stale("req")
+            self.assertIn("req", registry._pending_at)
+            retry_at = registry._pending_at["req"]
+            self.assertGreater(retry_at, 0)
+
+            await registry._release_stale("req")
+            self.assertNotIn("req", registry._pending_at)
+            self.assertEqual(attempts, 2)
+
+        asyncio.run(run())
+
+    def test_send_retries_do_not_release_before_all_destinations_finish(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            released = AsyncMock()
+            registry.on_release = released
+
+            await registry.note_send_done("req", 2, "10.0.0.1:5000")
+            await registry.note_send_done("req", 2, "10.0.0.1:5000")
+            released.assert_not_awaited()
+
+            await registry.note_send_done("req", 2, "10.0.0.2:5000")
+            released.assert_awaited_once_with("req")
+
+        asyncio.run(run())
+
+    def test_http_send_counts_the_normalized_destination(self):
+        async def run():
+            send = AsyncMock(return_value=True)
+            note_send_done = AsyncMock()
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 5000,
+                "session_id": "session",
+                "buffer_address": 1234,
+                "receive_count": 2,
+            }
+            with (
+                patch.object(http_server, "dp_dispatcher", None),
+                patch.object(http_server, "encoder", SimpleNamespace(send=send)),
+                patch.object(
+                    encoder_server.meta_registry,
+                    "note_send_done",
+                    note_send_done,
+                ),
+            ):
+                response = await http_server.handle_send_request(request)
+
+            self.assertEqual(response.status_code, 200)
+            note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
+
+        asyncio.run(run())
+
+    def test_dp_send_counts_the_normalized_destination(self):
+        async def run():
+            encoder = SimpleNamespace(send=AsyncMock(return_value=True))
+            note_send_done = AsyncMock()
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 5000,
+                "session_id": "session",
+                "buffer_address": 1234,
+                "receive_count": 2,
+            }
+            with (
+                patch.object(encoder_runtime, "async_sock_send", AsyncMock()),
+                patch.object(
+                    encoder_server.meta_registry,
+                    "note_send_done",
+                    note_send_done,
+                ),
+            ):
+                await encoder_runtime._dp_worker_handle_request(
+                    encoder,
+                    None,
+                    object(),
+                    asyncio.Lock(),
+                    0,
+                    request,
+                    "send",
+                )
+
+            note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
+
+        asyncio.run(run())
+
+
+class TestEncoderPreprocessorOffEventLoop(CustomTestCase):
+    @staticmethod
+    def _make_preprocessor():
+        preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        preprocessor.model_type = "minimax_m3_vl"
+        preprocessor.image_processor = None
+        preprocessor.use_image_processor_gpu = False
+        preprocessor.vision_config = {"image": {}, "video": {}}
+        preprocessor.encoder_media_processor_config = EncoderMediaProcessorConfig(
+            preserve_media_metadata=True, preprocess_off_event_loop=True
+        )
+        preprocessor.io_executor = ThreadPoolExecutor(max_workers=2)
+        preprocessor.preproc_executor = ThreadPoolExecutor(max_workers=1)
+        return preprocessor
+
+    @staticmethod
+    def _run_with_loop_handshake(make_awaitable):
+        """The hook blocks until a coroutine on the event loop answers it, so a hook
+        that holds the loop thread starves that coroutine and times out."""
+        started, answered = threading.Event(), threading.Event()
+
+        def wait_for_loop():
+            started.set()
+            if not answered.wait(timeout=5):
+                raise TimeoutError("the preprocess hook blocked the event loop")
+
+        async def answer():
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+            answered.set()
+
+        async def run():
+            responder = asyncio.create_task(answer())
+            result = await make_awaitable(wait_for_loop)
+            await asyncio.wait_for(responder, timeout=5)
+            return result
+
+        return asyncio.run(run())
+
+    def test_video_hook_runs_off_the_event_loop(self):
+        preprocessor = self._make_preprocessor()
+        preprocessor._load_single_item = lambda data, modality: "decoded"
+
+        def process(wait_for_loop):
+            def hook(videos, modality, config):
+                wait_for_loop()
+                return {"videos": videos}
+
+            return preprocessor._process_video_items([{"url": "a.mp4"}], hook)
+
+        output = self._run_with_loop_handshake(process)
+        self.assertEqual(output, {"videos": ["decoded"]})
+
+    def test_image_hook_runs_off_the_event_loop(self):
+        preprocessor = self._make_preprocessor()
+        preprocessor._flatten_and_load_images = AsyncMock(
+            return_value=[torch.zeros(3, 4, 4)]
+        )
+        grid = torch.tensor([[1, 2, 2]])
+
+        def process(wait_for_loop):
+            def hook(images, modality, config):
+                wait_for_loop()
+                return {"image_grid_thw": grid}
+
+            return preprocessor._process_image_items(["img"], hook)
+
+        output = self._run_with_loop_handshake(process)
+        self.assertIs(output["image_grid_thw"], grid)
+
+
+class TestEncoderPreprocessorKimiGrid(CustomTestCase):
+    @staticmethod
+    def _make_preprocessor(model_type="kimi_vl"):
+        preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        preprocessor.model_type = model_type
+        preprocessor.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
+            )
+        )
+        preprocessor.image_processor = SimpleNamespace(merge_size=2)
+        preprocessor._model_preprocessor = None
+        return preprocessor
+
+    @staticmethod
+    def _make_encoder():
+        return MMEncoder.__new__(MMEncoder)
+
+    def test_kimi_vl_prefers_and_normalizes_hw_grid(self):
+        mm_inputs = {
+            "image_grid_hws": np.array([[40, 60]], dtype=np.int64),
+            "image_grid_thw": torch.tensor([[1, 20, 30]]),
+            "grid_thws": torch.tensor([[1, 10, 15]]),
+        }
+
+        grid = self._make_preprocessor()._get_mm_grid_dim(mm_inputs, Modality.IMAGE)
+
+        self.assertIsInstance(grid, torch.Tensor)
+        torch.testing.assert_close(grid, torch.tensor([[40, 60]]))
+
+    def test_kimi_k25_keeps_thw_grid_preference(self):
+        mm_inputs = {
+            "image_grid_hws": np.array([[40, 60]], dtype=np.int64),
+            "grid_thws": np.array([[1, 10, 15]], dtype=np.int64),
+        }
+
+        grid = self._make_preprocessor("kimi_k25")._get_mm_grid_dim(
+            mm_inputs, Modality.IMAGE
+        )
+
+        torch.testing.assert_close(grid, torch.tensor([[1, 10, 15]]))
+
+    def test_kimi_vl_2d_grid_counting_and_slicing(self):
+        preprocessor = self._make_preprocessor()
+        encoder = self._make_encoder()
+        grids = torch.tensor([[40, 60], [20, 40]])
+        embedding = torch.arange(800 * 2).reshape(800, 2)
+
+        self.assertEqual(
+            preprocessor.get_num_patches(grids[0], Modality.IMAGE),
+            2400,
+        )
+        self.assertEqual(
+            preprocessor.get_num_tokens(grids[0], Modality.IMAGE),
+            600,
+        )
+
+        slices = encoder.slice_embedding(embedding, [600, 200])
+
+        self.assertEqual([item.shape for item in slices], [(600, 2), (200, 2)])
+        torch.testing.assert_close(slices[0], embedding[:600])
+        torch.testing.assert_close(slices[1], embedding[600:])
+
+    def test_kimi_3d_grid_remains_supported(self):
+        preprocessor = self._make_preprocessor()
+        grid = torch.tensor([1, 40, 60])
+
+        self.assertEqual(preprocessor.get_num_patches(grid, Modality.IMAGE), 2400)
+        self.assertEqual(preprocessor.get_num_tokens(grid, Modality.IMAGE), 600)
+
+    def test_kimi_k25_3d_patch_counting_is_unchanged(self):
+        preprocessor = self._make_preprocessor("kimi_k25")
+        grid = torch.tensor([2, 12, 16])
+
+        self.assertEqual(preprocessor.get_num_patches(grid, Modality.IMAGE), 384)
+        self.assertEqual(preprocessor.get_num_tokens(grid, Modality.IMAGE), 48)
+
+    def test_grid_metadata_is_safe_to_deserialize(self):
+        grid = self._make_preprocessor()._get_mm_grid_dim(
+            {"image_grid_hws": np.array([[40, 60]], dtype=np.int64)},
+            Modality.IMAGE,
+        )
+        embedding_data = EmbeddingData(
+            req_id="test-request",
+            num_parts=1,
+            part_idx=0,
+            grid_dim=grid,
+            modality=Modality.IMAGE,
+            embedding=torch.zeros((600, 4)),
+        )
+
+        restored = safe_pickle_loads(
+            pickle.dumps(embedding_data.copy_without_embedding())
+        )
+
+        torch.testing.assert_close(restored.grid_dim, torch.tensor([[40, 60]]))
+
+
+class TestEncoderDPAbandonedRequest(CustomTestCase):
+    @staticmethod
+    def _make_dispatcher():
+        return DPDispatcher(
+            dp_size=1,
+            dispatch_sockets=[object()],
+            release_sockets=[object()],
+            result_socket=object(),
+            worker_processes=[],
+        )
+
+    def test_dispatch_timeout_notifies_worker_to_release(self):
+        async def run():
+            dispatcher = self._make_dispatcher()
+            sent = []
+            release_sent = asyncio.Event()
+
+            async def send(socket, payload):
+                message = unwrap_from_pickle(payload)
+                sent.append((socket, message))
+                if message.get("_dp_type") == _DP_RELEASE_AFTER_ENCODE:
+                    release_sent.set()
+
+            request = {"req_id": "timed-out", "modality": "image"}
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.runtime.async_sock_send",
+                    side_effect=send,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.encoder.runtime.server_module.ENCODER_REQ_TIMEOUT",
+                    0.01,
+                ),
+            ):
+                result = await dispatcher.dispatch(request)
+                await asyncio.wait_for(release_sent.wait(), timeout=1)
+
+            self.assertEqual(result["_error_type"], "TimeoutError")
+            self.assertIs(sent[0][0], dispatcher.dispatch_sockets[0])
+            self.assertEqual(sent[0][1], request)
+            self.assertIs(sent[1][0], dispatcher.release_sockets[0])
+            self.assertEqual(
+                sent[1][1],
+                {
+                    "_dp_type": _DP_RELEASE_AFTER_ENCODE,
+                    "req_id": "timed-out",
+                },
+            )
+            self.assertEqual(dispatcher.pending_counts, [0])
+            self.assertNotIn("timed-out", dispatcher.req_id_to_rank)
+
+        asyncio.run(run())
+
+    def test_dispatch_cancellation_notifies_worker_to_release(self):
+        async def run():
+            dispatcher = self._make_dispatcher()
+            encode_sent = asyncio.Event()
+            release_sent = asyncio.Event()
+
+            async def send(_socket, payload):
+                message = unwrap_from_pickle(payload)
+                if message.get("_dp_type") == _DP_RELEASE_AFTER_ENCODE:
+                    release_sent.set()
+                else:
+                    encode_sent.set()
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.runtime.async_sock_send",
+                side_effect=send,
+            ):
+                task = asyncio.create_task(
+                    dispatcher.dispatch({"req_id": "cancelled", "modality": "image"})
+                )
+                await encode_sent.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await asyncio.wait_for(release_sent.wait(), timeout=1)
+
+            self.assertEqual(dispatcher.pending_counts, [0])
+            self.assertNotIn("cancelled", dispatcher.req_id_to_rank)
+
+        asyncio.run(run())
+
+    def test_worker_marks_running_encode_abandoned(self):
+        async def run():
+            async def encode():
+                await asyncio.Event().wait()
+
+            encode_task = asyncio.create_task(encode())
+            encoder = SimpleNamespace(
+                abandon_request=AsyncMock(),
+                release_request=AsyncMock(),
+            )
+            await _retire_abandoned_encode(encoder, encode_task, "abandoned")
+
+            encoder.abandon_request.assert_awaited_once_with("abandoned")
+            encoder.release_request.assert_not_awaited()
+            encode_task.cancel()
+            await asyncio.gather(encode_task, return_exceptions=True)
+
+        asyncio.run(run())
+
+    def test_worker_preserves_release_before_encode_task_exists(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            encoder.req_states = {}
+            encoder.abandoned_req_ids = set()
+            encoder.delivery = SimpleNamespace(release=AsyncMock())
+
+            await _retire_abandoned_encode(encoder, None, "abandoned")
+            self.assertIn("abandoned", encoder.abandoned_req_ids)
+
+            state = encoder._acquire_encode_ref("abandoned")
+            self.assertTrue(state.release_requested)
+            with patch.object(meta_registry, "discard", AsyncMock()):
+                await encoder._release_encode_ref(state)
+
+            encoder.delivery.release.assert_awaited_once_with(state)
+            self.assertNotIn("abandoned", encoder.req_states)
+
+        asyncio.run(run())
+
+    def test_worker_release_survives_encode_failure(self):
+        async def run():
+            async def encode():
+                raise RuntimeError("bad image")
+
+            encode_task = asyncio.create_task(encode())
+            await asyncio.sleep(0)
+            encoder = SimpleNamespace(
+                abandon_request=AsyncMock(),
+                release_request=AsyncMock(),
+            )
+            await _retire_abandoned_encode(
+                encoder,
+                encode_task,
+                "failed",
+            )
+
+            encoder.release_request.assert_awaited_once_with("failed")
+            encoder.abandon_request.assert_not_awaited()
+            await asyncio.gather(encode_task, return_exceptions=True)
+
+        asyncio.run(run())
+
+
+class TestMooncakeRegistration(CustomTestCase):
+    def setUp(self):
+        self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
+        self.engine.engine = unittest.mock.Mock()
+        self.engine.ib_device = "mlx5_0"
+
+    def test_register_raises_on_nonzero_status(self):
+        self.engine.engine.register_memory.return_value = -1
+
+        with self.assertRaisesRegex(RuntimeError, "registration failed.*ret=-1"):
+            self.engine.register(1234, 4096)
+
+    def test_deregister_preserves_backend_failure(self):
+        backend_error = OSError("backend failed")
+        self.engine.engine.unregister_memory.side_effect = backend_error
+
+        with self.assertRaisesRegex(RuntimeError, "deregistration failed") as ctx:
+            self.engine.deregister(1234)
+
+        self.assertIs(ctx.exception.__cause__, backend_error)
+
+    def test_batch_register_raises_on_nonzero_status(self):
+        self.engine.engine.batch_register_memory.return_value = -202
+
+        with self.assertRaises(RuntimeError):
+            self.engine.batch_register([0x10000], [0x1000])
+
+    def test_batch_register_tolerates_already_registered(self):
+        self.engine.engine.batch_register_memory.return_value = -7
+
+        with self.assertLogs(level="ERROR"):
+            self.engine.batch_register([0x10000], [0x1000])
+
+
+if __name__ == "__main__":
+    unittest.main()

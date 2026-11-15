@@ -1,0 +1,532 @@
+name: Rerun Test
+run-name: ${{ inputs.pr_head_sha && format('[rerun-test] {0} {1}', inputs.test_command, inputs.pr_head_sha) || format('[rerun-test] {0}', inputs.test_command) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Dispatch mode: cuda | multimodal_gen | cpu | npu | amd"
+        required: true
+        type: choice
+        options:
+          - cuda
+          - multimodal_gen
+          - cpu
+          - npu
+          - amd
+      test_command:
+        description: "Test command(s) to run, one per line (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
+        required: true
+        type: string
+      runs_on:
+        description: "GHA runner label (ignored for cpu)"
+        required: false
+        type: string
+        default: ""
+      install_script:
+        description: "Install script path (cuda only). E.g. scripts/ci/cuda/ci_install_dependency.sh"
+        required: false
+        type: string
+        default: ""
+      install_timeout:
+        description: "Install-step timeout minutes (cuda only)"
+        required: false
+        type: string
+        default: "20"
+      rdma_devices:
+        description: "SGLANG_CI_RDMA_ALL_DEVICES csv (cuda only; empty = unset)"
+        required: false
+        type: string
+        default: ""
+      suite:
+        description: "Registered suite the files belong to (npu and amd only)"
+        required: false
+        type: string
+        default: ""
+      pr_head_sha:
+        description: "PR head SHA to checkout (for /rerun-test on fork PRs)"
+        required: false
+        type: string
+        default: ""
+      reply_comment_id:
+        description: "Reply comment ID to write back result to"
+        required: false
+        type: string
+        default: ""
+      reply_marker:
+        description: "Per-batch marker for locating the line in reply comment"
+        required: false
+        type: string
+        default: ""
+      full_jit_kernel_tests:
+        description: "Sweep jit_kernel tests over their full parameter grids, the way scheduled suites do. Off matches the per-commit stages, which is what a rerun resolves to when a file is registered on both."
+        required: false
+        type: boolean
+        default: false
+      refresh_precision_baseline:
+        description: "Force-refresh the nightly precision baseline. Restricted by the slash-command handler to the precision test on trusted in-repo PRs."
+        required: false
+        type: boolean
+        default: false
+
+# Mirrors _pr-test-stage.yml's env, so a rerun validates what CI actually ran.
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_ENABLE_ASYNC_ASSERT: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  NCCL_NVLS_ENABLE: "0"
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
+  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.full_jit_kernel_tests && '1' || '0' }}
+  IS_H200: ${{ inputs.runs_on == '8-gpu-h200' && '1' || '0' }}
+  SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
+  SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
+  SGLANG_PRECISION_HF_READ_ONLY: ${{ inputs.refresh_precision_baseline && '0' || '1' }}
+  SGLANG_PRECISION_FORCE_UPDATE: ${{ inputs.refresh_precision_baseline && '1' || '0' }}
+  SGLANG_PRECISION_COMMIT: ${{ inputs.pr_head_sha || github.sha }}
+
+# Every job below sets its own `permissions`, which replaces rather than merges
+# with a workflow-level block -- so keep the floor here minimal and grant per job.
+#
+# A fork PR's rerun checks the fork out at inputs.pr_head_sha. Steps that hold
+# a token or secret run code from trusted-ci/, a checkout of github.sha like
+# this workflow, and come before the first step that runs the fork's code.
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  prepare-partitions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.partition.outputs.matrix }}
+      # npu only: the inputs of the suite's _npu-pr-test-stage.yml job.
+      partitions: ${{ steps.partition.outputs.partitions }}
+      only_tests: ${{ steps.partition.outputs.only_tests }}
+      image: ${{ steps.partition.outputs.image }}
+      sgl_router: ${{ steps.partition.outputs.sgl_router }}
+      collect_nightly_tests: ${{ steps.partition.outputs.collect_nightly_tests }}
+      # amd only (and sgl_router above): the setup-amd-ci inputs and container
+      # env of the suite's job in pr-test-amd.yml or pr-test-amd-extra.yml.
+      rocm_version: ${{ steps.partition.outputs.rocm_version }}
+      exec_env: ${{ steps.partition.outputs.exec_env }}
+    steps:
+      - name: Checkout partition script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Checkout test registrations
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          path: partition-source
+          persist-credentials: false
+
+      - name: Partition tests by estimated duration
+        id: partition
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+          TEST_ROOT: partition-source
+          MODE: ${{ inputs.mode }}
+          RUNS_ON: ${{ inputs.runs_on }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          python3 scripts/ci/partition_rerun_tests.py
+          # Fails for a suite no stage or setup-amd-ci job runs, so only those
+          # names reach the later shell steps. This checkout is github.sha, so
+          # the derived values come from the base branch's workflows.
+          if [[ "$MODE" == "npu" || "$MODE" == "amd" ]]; then
+            python3 -c 'import yaml' 2>/dev/null ||
+              python3 -m pip install --disable-pip-version-check pyyaml
+            python3 "scripts/ci/${MODE}_suites.py" "$SUITE" >> "$GITHUB_OUTPUT"
+          fi
+
+  rerun-test-cuda:
+    name: rerun-test-cuda (partition ${{ matrix.partition }})
+    needs: prepare-partitions
+    if: inputs.mode == 'cuda'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
+    env:
+      RUNNER_LABELS: ${{ inputs.runs_on }}
+      SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.rdma_devices }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
+
+      - name: Checkout trusted CI files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-ci
+          sparse-checkout: |
+            .github/actions
+            scripts/ci
+          persist-credentials: false
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          python3 trusted-ci/scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
+      - uses: ./trusted-ci/.github/actions/check-maintenance
+
+      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own.
+      - uses: ./trusted-ci/.github/actions/download-rust-ext
+
+      # Cache-only for the same reason. The PD fixture needs two GPUs.
+      - uses: ./trusted-ci/.github/actions/download-sgl-router
+        if: ${{ !startsWith(inputs.runs_on, '1-gpu') }}
+
+      - name: Install dependencies
+        timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
+        run: |
+          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          # Fail fast on an empty install_script. `bash <empty>` is a silent
+          # no-op that "succeeds" without installing sglang, so the test step
+          # then dies with `ModuleNotFoundError: No module named 'sglang'`.
+          # /rerun-test resolves install_script from runner_configs.yml; a manual
+          # workflow_dispatch must pass it explicitly (it can't be derived from
+          # runs_on, which can be shared across runner configs).
+          if [ -z "${{ inputs.install_script }}" ]; then
+            echo "::error::install_script is required for cuda mode (empty would silently skip installing sglang). Pass e.g. scripts/ci/cuda/ci_install_dependency.sh"
+            exit 1
+          fi
+          bash ${{ inputs.install_script }}
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
+          REQUESTED_TEST_COMMAND: ${{ inputs.test_command }}
+          HF_MUSE_SPARK_TOKEN: ${{ inputs.pr_head_sha == '' && inputs.runs_on == '8-gpu-b300' && (contains(matrix.test_command, 'registered/e2e/models/test_muse_spark_12_b300_pd.py') || contains(matrix.test_command, 'registered/e2e/models/test_muse_spark_unified_memory.py')) && secrets.HF_MUSE_SPARK_TOKEN || '' }}
+          SGLANG_PRECISION_HF_TOKEN: ${{ inputs.refresh_precision_baseline && inputs.mode == 'cuda' && inputs.runs_on == '8-gpu-h200' && inputs.test_command == 'registered/debug_utils/test_nightly_precision_regression.py' && inputs.pr_head_sha == '' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
+        run: |
+          if [[ "${{ inputs.refresh_precision_baseline }}" == "true" ]]; then
+            expected="registered/debug_utils/test_nightly_precision_regression.py"
+            if [[ "${{ inputs.mode }}" != "cuda" \
+               || "${{ inputs.runs_on }}" != "8-gpu-h200" \
+               || -n "${{ inputs.pr_head_sha }}" \
+               || "$REQUESTED_TEST_COMMAND" != "$expected" ]]; then
+              echo "::error::Precision baseline refresh only accepts $expected on 8-gpu-h200"
+              exit 1
+            fi
+          fi
+          bash trusted-ci/scripts/ci/run_rerun_tests.sh cuda "${{ matrix.partition }}"
+
+      - uses: ./trusted-ci/.github/actions/upload-cuda-coredumps
+        if: failure()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
+
+  rerun-test-multimodal-gen:
+    name: rerun-test-multimodal-gen (partition ${{ matrix.partition }})
+    needs: prepare-partitions
+    if: inputs.mode == 'multimodal_gen'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
+    env:
+      RUNNER_LABELS: ${{ inputs.runs_on }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
+
+      - name: Checkout trusted CI files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-ci
+          sparse-checkout: |
+            .github/actions
+            scripts/ci
+          persist-credentials: false
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 trusted-ci/scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
+      - uses: ./trusted-ci/.github/actions/check-maintenance
+
+      - uses: ./trusted-ci/.github/actions/download-rust-ext
+
+      - name: Install dependencies (diffusion)
+        timeout-minutes: 20
+        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
+        run: bash trusted-ci/scripts/ci/run_rerun_tests.sh multimodal_gen "${{ matrix.partition }}"
+
+      - uses: ./trusted-ci/.github/actions/upload-cuda-coredumps
+        if: failure()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
+
+  rerun-test-cpu:
+    name: rerun-test-cpu (partition ${{ matrix.partition }})
+    needs: prepare-partitions
+    if: inputs.mode == 'cpu'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Free disk space
+        run: |
+          # The image ships ~65G free and the suite peaks around 30G; deleting
+          # these trees is ~1M unlinks (~80s), so only pay it when actually low.
+          avail_gb=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          if [ "${avail_gb}" -lt 40 ]; then
+              sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          fi
+          df -h
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
+
+      - name: Checkout trusted CI files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-ci
+          sparse-checkout: |
+            .github/actions
+            scripts/ci
+          persist-credentials: false
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 trusted-ci/scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
+      - uses: ./trusted-ci/.github/actions/check-maintenance
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # Worth the most of the three jobs: this runner is hosted, so it has no
+      # persistent cargo target dir and every dispatch compiled cold. Its
+      # setup-python pins the same 3.12 the modules were built against.
+      - uses: ./trusted-ci/.github/actions/download-rust-ext
+        id: rust_ext
+
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
+      - name: Install protoc + Rust toolchain
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
+        run: bash trusted-ci/scripts/ci/run_rerun_tests.sh cpu "${{ matrix.partition }}"
+
+  # The NPU stage runs the files through run_suite.py with the suite's own
+  # install. A reusable workflow's jobs get this job's token permissions.
+  rerun-test-npu:
+    needs: prepare-partitions
+    if: inputs.mode == 'npu'
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/_npu-pr-test-stage.yml
+    with:
+      self_name: ${{ inputs.suite }}
+      runner_config: ${{ inputs.runs_on }}
+      image: ${{ needs.prepare-partitions.outputs.image }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '3600'
+      partitions: ${{ needs.prepare-partitions.outputs.partitions }}
+      ref: ${{ inputs.pr_head_sha || github.sha }}
+      skip_pr_test_health_check: 'true'
+      only_tests: ${{ fromJson(needs.prepare-partitions.outputs.only_tests) }}
+      collect_nightly_tests: ${{ needs.prepare-partitions.outputs.collect_nightly_tests == 'true' }}
+      sgl_router: ${{ needs.prepare-partitions.outputs.sgl_router == 'true' }}
+      reply_comment_id: ${{ inputs.reply_comment_id }}
+      reply_marker: ${{ inputs.reply_marker }}
+
+  # Runs each file directly, as rerun-test-cuda does, in the AMD CI container
+  # set up as the suite's job sets it up (scripts/ci/amd_suites.py).
+  rerun-test-amd:
+    name: rerun-test-amd (partition ${{ matrix.partition }})
+    needs: prepare-partitions
+    if: inputs.mode == 'amd'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
+    runs-on: ${{ inputs.runs_on }}
+    # The 60-minute Run test step plus the image pull and install.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      issues: write
+    env:
+      # Fork code runs on this runner, so a fork PR's rerun pulls anonymously.
+      DOCKERHUB_AMD_USERNAME: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_AMD_USERNAME || '' }}
+      DOCKERHUB_AMD_TOKEN: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_AMD_TOKEN || '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
+
+      - name: Checkout trusted CI files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-ci
+          sparse-checkout: |
+            .github/actions
+            scripts/ci
+          persist-credentials: false
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 trusted-ci/scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
+      - uses: ./trusted-ci/.github/actions/check-maintenance
+
+      # Not through setup-amd-ci's sgl_router input: a local action that
+      # another action uses resolves against the workspace, the PR checkout.
+      - uses: ./trusted-ci/.github/actions/download-sgl-router
+        if: needs.prepare-partitions.outputs.sgl_router == 'true'
+
+      - uses: ./trusted-ci/.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ needs.prepare-partitions.outputs.rocm_version }}
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
+          EXEC_ENV: ${{ needs.prepare-partitions.outputs.exec_env }}
+        run: bash trusted-ci/scripts/ci/run_rerun_tests.sh amd "${{ matrix.partition }}"
+
+  write-back-result:
+    needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu, rerun-test-npu, rerun-test-amd]
+    if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    concurrency:
+      group: rerun-test-writeback-${{ inputs.reply_comment_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Write back result to reply comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ needs.rerun-test-cuda.result }}" == "success" \
+             || "${{ needs.rerun-test-multimodal-gen.result }}" == "success" \
+             || "${{ needs.rerun-test-cpu.result }}" == "success" \
+             || "${{ needs.rerun-test-npu.result }}" == "success" \
+             || "${{ needs.rerun-test-amd.result }}" == "success" ]]; then
+            STATUS=success
+          else
+            STATUS=failure
+          fi
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status "$STATUS" \
+            --repo "${{ github.repository }}"

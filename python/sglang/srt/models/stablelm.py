@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,7 +28,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -36,15 +38,18 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 
 class StablelmMLP(nn.Module):
@@ -92,7 +97,7 @@ class StablelmAttention(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = config.num_attention_heads
         self.num_heads = self.total_num_heads // tp_size
 
@@ -139,19 +144,19 @@ class StablelmAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        if not _is_npu:
+        if not _is_npu and not _is_xpu:
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
-                base=self.config.rope_theta,
+                base=self.config.rope_parameters["rope_theta"],
             )
         else:
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
-                base=self.config.rope_theta,
+                base=self.config.rope_parameters["rope_theta"],
                 dtype=torch.float32,
             )
         self.attn = RadixAttention(
@@ -172,7 +177,7 @@ class StablelmAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if not _is_npu:
+        if not _is_npu and not _is_xpu:
             q, k = self.rotary_emb(positions, q, k)
         else:
             odtype = q.dtype

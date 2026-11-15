@@ -6,12 +6,6 @@ completion benchmark on MI35x.
 Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-mtp suite
 """
 
-import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from types import SimpleNamespace
 
@@ -34,6 +28,7 @@ register_amd_ci(
     est_time=5400,
     suite="nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-mtp",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
@@ -59,9 +54,9 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
             "--speculative-algorithm",
             "EAGLE",
@@ -102,13 +97,13 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             num_questions=200,
             parallel=64,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

@@ -12,19 +12,34 @@ from einops import rearrange
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.dac import DacVAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
 )
 
 
-# Scripting this brings model speed up 1.4x
-@torch.jit.script
-def snake(x, alpha):
+def _snake(x, alpha):
     shape = x.shape
     x = x.reshape(shape[0], shape[1], -1)
     x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
     x = x.reshape(shape)
     return x
+
+
+# Scripting this brings model speed up 1.4x
+snake = torch.jit.script(_snake)
+
+
+# ROCm HIPRTC can fail to compile the scripted bf16 Snake kernel.
+def _should_use_eager_snake_on_rocm_bf16(x: torch.Tensor, alpha: torch.Tensor) -> bool:
+    return (
+        torch.version.hip is not None
+        and (x.is_cuda or alpha.is_cuda)
+        and (x.dtype == torch.bfloat16 or alpha.dtype == torch.bfloat16)
+    )
 
 
 class Snake1d(nn.Module):
@@ -33,6 +48,8 @@ class Snake1d(nn.Module):
         self.alpha = nn.Parameter(torch.ones(1, channels, 1))
 
     def forward(self, x):
+        if _should_use_eager_snake_on_rocm_bf16(x, self.alpha):
+            return _snake(x, self.alpha)
         return snake(x, self.alpha)
 
 
@@ -353,7 +370,6 @@ class Encoder(nn.Module):
 
         # Wrap black into nn.Sequential
         self.block = nn.Sequential(*self.block)
-        self.enc_dim = d_model
 
     def forward(self, x):
         return self.block(x)
@@ -413,7 +429,10 @@ class Decoder(nn.Module):
         return self.model(x)
 
 
-class DAC(nn.Module):
+class DAC(nn.Module, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["encoder.block", "decoder.model"]
+
     def __init__(
         self,
         config: DacVAEConfig,
@@ -487,6 +506,7 @@ class DAC(nn.Module):
 
         return audio_data
 
+    @cached_vae_encode
     def encode(
         self,
         audio_data: torch.Tensor,

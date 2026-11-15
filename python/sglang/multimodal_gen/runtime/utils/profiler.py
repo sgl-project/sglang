@@ -1,12 +1,16 @@
+import contextlib
 import gzip
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs as srt_envs
+from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if current_platform.is_npu():
     import torch_npu
@@ -15,9 +19,35 @@ if current_platform.is_npu():
         ["profiler.profile", torch_npu.profiler.profile],
         ["profiler.schedule", torch_npu.profiler.schedule],
     ]
-    torch_npu._apply_patches(patches)
+    apply_torch_npu_patches(torch_npu, patches)
 
 logger = init_logger(__name__)
+
+
+@contextlib.contextmanager
+def maybe_record_function(name: str, enabled: bool = True) -> Iterator[None]:
+    """Named ``torch.profiler`` span, near-free when no profiler is active.
+    ``enabled`` mirrors :func:`maybe_nvtx_range` for per-request gates such
+    as warmup exclusion.
+    """
+    # Gate on the process-wide module flag; the thread-local _profiler_enabled()
+    # is False under profile_all_threads=True and on non-initiating threads.
+    if not enabled or not torch.autograd.profiler._is_profiler_enabled:
+        yield
+        return
+    with torch.profiler.record_function(name):
+        yield
+
+
+def _resolve_profiler_log_dir(log_dir: str | None) -> str:
+    if log_dir is not None:
+        return log_dir
+
+    diffusion_profiler_dir = envs.SGLANG_DIFFUSION_TORCH_PROFILER_DIR
+    if diffusion_profiler_dir:
+        return diffusion_profiler_dir
+
+    return os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
 
 
 class SGLDiffusionProfiler:
@@ -49,10 +79,10 @@ class SGLDiffusionProfiler:
         self.full_profile = full_profile
         self.is_host = is_host
 
-        self.log_dir = log_dir or envs.SGLANG_TORCH_PROFILER_DIR.get()
+        self.log_dir = _resolve_profiler_log_dir(log_dir)
 
-        env_with_stack = envs.SGLANG_PROFILE_WITH_STACK.get()
-        env_record_shapes = envs.SGLANG_PROFILE_RECORD_SHAPES.get()
+        env_with_stack = srt_envs.SGLANG_PROFILE_WITH_STACK.get()
+        env_record_shapes = srt_envs.SGLANG_PROFILE_RECORD_SHAPES.get()
 
         self.with_stack = with_stack if with_stack is not None else env_with_stack
         self.record_shapes = (
@@ -64,11 +94,17 @@ class SGLDiffusionProfiler:
         except OSError:
             pass
 
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if current_platform.is_cuda_alike():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-        if current_platform.is_npu():
-            activities.append(torch_npu.profiler.ProfilerActivity.NPU)
+        if activities:
+            activities = self._resolve_activities(activities)
+        else:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if current_platform.is_cuda_alike():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            if current_platform.is_npu():
+                activities.append(torch_npu.profiler.ProfilerActivity.NPU)
+
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                activities.append(torch.profiler.ProfilerActivity.XPU)
 
         common_torch_profiler_args = dict(
             activities=activities,
@@ -92,7 +128,7 @@ class SGLDiffusionProfiler:
             self.profile_mode_id = "full stages"
         else:
             # profile denoising stage only
-            warmup = 1
+            warmup = 0 if num_steps == -1 else 1
             num_actual_steps = num_inference_steps if num_steps == -1 else num_steps
             self.num_active_steps = num_actual_steps + warmup
             self.profiler = torch.profiler.profile(
@@ -101,7 +137,7 @@ class SGLDiffusionProfiler:
                     skip_first=0,
                     wait=0,
                     warmup=warmup,
-                    active=self.num_active_steps,
+                    active=num_actual_steps,
                     repeat=1,
                 ),
             )

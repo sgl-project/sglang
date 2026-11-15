@@ -9,12 +9,21 @@ from typing import List
 
 import requests
 
+from sglang.srt.runtime_context import get_serving
+from sglang.srt.utils.auth import bearer_auth_headers
+
 logger = logging.getLogger(__name__)
+
+
+def _seed_admin_headers() -> dict:
+    # The seed instance's weight-send endpoints take its admin key; a deployment shares one.
+    return bearer_auth_headers(get_serving().admin_api_key)
 
 
 class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     NCCL = "nccl"
     TRANSFER_ENGINE = "transfer_engine"
+    MODELEXPRESS = "modelexpress"
 
 
 def trigger_init_weights_send_group_for_remote_instance_request(
@@ -44,7 +53,8 @@ def trigger_init_weights_send_group_for_remote_instance_request(
                 "group_name": f"send_weights_{remote_instance_weight_loader_client_id}",
                 "backend": "nccl",
             },
-        )
+            headers=_seed_admin_headers(),
+        ).raise_for_status()
     except Exception as e:
         logger.error(
             f"Failed to trigger init_weights_send_group_for_remote_instance_request to seed instance {seed_instance_service_url}: {e}."
@@ -72,7 +82,8 @@ def trigger_transferring_weights_request(
                 ),
                 "group_name": f"send_weights_{remote_instance_weight_loader_client_id}",
             },
-        )
+            headers=_seed_admin_headers(),
+        ).raise_for_status()
     except Exception as e:
         logger.error(f"Failed to trigger send weights to remote instance request: {e}")
         raise
@@ -81,10 +92,11 @@ def trigger_transferring_weights_request(
 def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
     try:
         response = requests.get(
-            f"{seed_url}/get_remote_instance_transfer_engine_info",
+            f"{seed_url}/remote_instance_transfer_engine_info",
             params={
                 "rank": rank,
             },
+            headers=_seed_admin_headers(),
         )
 
         if response.status_code == 200:
@@ -103,21 +115,6 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
     except Exception as e:
         logger.error(f"Exception: {e}")
         return None, None
-
-
-def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos):
-    remote_instance_transfer_engine_info = {}
-    for data in scheduler_infos:
-        if (
-            "tp_rank" in data
-            and "remote_instance_transfer_engine_session_id" in data
-            and "remote_instance_transfer_engine_weights_info_dict" in data
-        ):
-            remote_instance_transfer_engine_info[data["tp_rank"]] = (
-                data["remote_instance_transfer_engine_session_id"],
-                data["remote_instance_transfer_engine_weights_info_dict"],
-            )
-    return remote_instance_transfer_engine_info
 
 
 def register_memory_region(model, transfer_engine):

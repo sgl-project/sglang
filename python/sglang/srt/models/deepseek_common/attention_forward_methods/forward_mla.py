@@ -1,87 +1,407 @@
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
-from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
+from sglang.kernels.ops.attention.mla_qk_prep import absorbed_bmm_concat_cast_q_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
+from sglang.srt.layers.attention.dsa_backend import (
+    prepare_kv_for_attention,
+    uses_raw_fp8_dsa_kv_layout,
+)
+from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
+from sglang.srt.layers.cp.interleave import (
+    DSAInterleaveCPIndexerOverlap,
+    is_interleave_extend,
+)
+from sglang.srt.layers.dcp import (
+    all_gather_kv_cache_for_mla_extend,
+    all_gather_q_for_mla_decode,
+    cp_lse_ag_out_rs_mla,
+    dcp_a2a_lse_reduce,
+    dcp_push_combine_fits,
+    dcp_push_combine_reduce,
+)
+from sglang.srt.layers.dcp.layout import (
+    dsa_shards_index_k,
+    is_mla_dcp_lse_base_on_e,
+)
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.lora.utils import kv_b_lora_correction
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+    _is_cpu,
     _is_cublas_ge_129,
     _is_cuda,
-    _is_gfx95_supported,
     _is_hip,
-    _use_aiter,
-    _use_aiter_gfx95,
+    _is_musa,
+    _is_sail,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.state_capturer.indexer_topk import (
+    maybe_capture_indexer_topk,
+)
 from sglang.srt.utils import BumpAllocator
+
+logger = logging.getLogger(__name__)
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+_ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
+_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_full_prefill_graph,
+    is_in_prefill_graph_scope,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+
+def is_kv_b_lora_active(attn_module: DeepseekV2AttentionMLA) -> bool:
+    return getattr(getattr(attn_module, "kv_b_proj", None), "set_lora", False)
+
+
+@dataclass(frozen=True)
+class MlaBmmFusionPlan:
+    q_nope_t: torch.Tensor
+    q_nope_out_buf: torch.Tensor
+    q_nope_out_view: torch.Tensor
+    attn_output_buf: torch.Tensor
+
+
+def _select_local_dcp_heads_for_autotune(
+    attn_output: torch.Tensor, num_local_heads: int
+) -> torch.Tensor:
+    """Select this rank's head shard without communicating dummy outputs."""
+    rank = get_parallel().attn_dcp_rank
+    return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
+
+
+@eager_on_graph(True)
+def bcg_dcp_extend_kv_gather(
+    token_to_kv_pool,
+    attn_mqa,
+    forward_batch: ForwardBatch,
+    kv_lora_rank: int,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> None:
+    """Assemble the DCP extend KV buffer; an eager break under breakable graphs.
+    Under a prefill graph, read the live batch: replay re-supplies the capture-time arg."""
+    if is_in_prefill_graph_scope():
+        forward_batch = get_forward_batch()
+    metadata = forward_batch.attn_dcp_metadata
+    if metadata.dcp_extend_prefix_lens_sum == 0:
+        # No prefix KV on any DCP rank: skip the collective. The buffer holds the
+        # real tokens; a replayed k_nope/k_pe is padded to the bucket.
+        num_tokens = metadata.dcp_kv_buffer.shape[0]
+        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope[:num_tokens]
+        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe[:num_tokens]
+        return
+    all_gather_kv_cache_for_mla_extend(
+        token_to_kv_pool,
+        attn_mqa,
+        forward_batch.extend_prefix_lens_cpu,
+        metadata.dcp_local_prefix_kv_indices,
+        metadata.dcp_extend_prefix_lens_sum,
+        metadata.dcp_kv_buffer,
+        kv_lora_rank,
+        k_nope,
+        k_pe,
+    )
+
+
 if _is_cuda:
-    from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
-
-    from sglang.srt.utils.custom_op import register_custom_op
-
-    # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
-    # Wrap bmm_fp8 as a custom op so torch.compile does not trace into
-    # torch.cuda.current_blas_handle() (which returns a non-Tensor).
-    @register_custom_op(mutates_args=["out"])
-    def _bmm_fp8_op(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        out: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-    ) -> None:
-        _raw_bmm_fp8(A, B, A_scale, B_scale, out.dtype, out)
-
-    def bmm_fp8(A, B, A_scale, B_scale, dtype, out=None):
-        if out is None:
-            out = torch.empty(
-                (A.shape[0], A.shape[1], B.shape[2]),
-                device=A.device,
-                dtype=dtype,
-            )
-        _bmm_fp8_op(A, B, out, A_scale, B_scale)
-        return out
+    from sglang.kernels.ops.gemm import bmm_fp8
 
 
-if _use_aiter:
-    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
-    )
-if _use_aiter_gfx95:
-    from aiter.ops.triton.fused_fp8_quant import (
-        fused_flatten_fp8_group_quant,
-        fused_rms_fp8_group_quant,
+def _apply_attention_output_gate(module, attn_output, gate):
+    apply_gate = getattr(module, "apply_attention_output_gate", None)
+    if apply_gate is not None:
+        return apply_gate(attn_output, gate)
+    if hasattr(module, "_apply_gated"):
+        return module._apply_gated(attn_output, gate)
+    raise RuntimeError(
+        "Prepared MLA attention gates are unsigmoided and require a "
+        "model-specific application hook"
     )
 
-    from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
-        batched_gemm_afp4wfp4_pre_quant,
-        fused_flatten_mxfp4_quant,
-        fused_rms_mxfp4_quant,
-    )
-    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
+def _finish_absorb_output(module, attn_bmm_output, attention_output_gate, topk_indices):
+    if attention_output_gate is not None:
+        attn_bmm_output = _apply_attention_output_gate(
+            module, attn_bmm_output, attention_output_gate
+        )
+    output, _ = module.o_proj(attn_bmm_output)
+    if module.next_skip_topk is None:
+        return output
+    return output, topk_indices if module.next_skip_topk else None
 
 
 class DeepseekMLAForwardMixin:
+    # Set by subclasses whose prepare_mla_qkv needs the absorbed query
+    # materialized: disables deferred BMM fusion and born-FP8 query packing.
+    # Applies only to this mixin's absorbed path, not MLA_ROCM.
+    needs_unfused_mla_qkv = False
+    # Apply W_UV to the DCP decode partials before the reduce (DSA layers only)
+    dcp_v_preproject = False
+    _dcp_v_weights: Optional[torch.Tensor] = None
+
+    def _prepare_dcp_v_weights(self, group):
+        weights = group.all_gather(self.w_vc.contiguous(), dim=0)
+        cached = self._dcp_v_weights
+        if cached is None:
+            self._dcp_v_weights = weights
+        else:
+            # Captured graphs keep the gathered buffer's address on weight reload.
+            cached.copy_(weights)
+        return self._dcp_v_weights
+
+    def is_dcp_mla_decode_phase(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        if self.dcp_size == 1:
+            return False
+        mode = forward_batch.forward_mode
+        return (
+            mode.is_decode()
+            or mode.is_target_verify()
+            or (
+                self.use_dsa
+                # ROCm only: the draft shards its KV like the target, so its
+                # extend merges per-rank partials the same way the target does.
+                and mode.is_extend(include_draft_extend_v2=_is_hip)
+                and not dsa_shards_index_k()
+            )
+        )
+
+    def is_dcp_q_replicate_phase(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        if not get_parallel().dcp_replicate_q_proj or self.dcp_size == 1:
+            return False
+        mode = forward_batch.forward_mode
+        if mode.is_decode() or mode.is_target_verify():
+            return True
+        # DSA extend on HIP merges owned partials like decode, so replicating
+        # q_b_proj replaces the per-layer [T, H, 576] Q all-gather there too.
+        return self.use_dsa and _is_hip and mode.is_extend(include_draft_extend_v2=True)
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
-            get_global_server_args().flashinfer_mla_disable_ragged
+            get_exec().kernel.flashinfer_mla_disable_ragged
         )
+
+    def should_run_indexer(
+        self: DeepseekV2AttentionMLA,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Whether this layer runs its own indexer vs reusing carried topk.
+
+        skip_topk (shared) layers carry no indexer weights in the checkpoint,
+        so they must reuse the carried topk and never run the indexer. Do NOT
+        widen this to `or prev_topk_indices is None` (the upstream gate): that
+        recomputes with an uninitialized indexer whenever cross-layer
+        propagation is unavailable (e.g. the TBO op path drops topk_indices),
+        reintroducing the >index_topk garbling. The is_nextn clause is the
+        sole intentional fallback (the NextN layer has its own weights).
+
+        Eager-MHA prefill calls this with no argument: it needs no topk for
+        the current forward, but producer layers must still fill their indexer
+        K cache for later MLA/decode; shared layers' cache is never read, so
+        filling it is dead work.
+        """
+        return not self.skip_topk or (self.is_nextn and prev_topk_indices is None)
+
+    def _can_fuse_bmm_into_attention(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        if self.needs_unfused_mla_qkv:
+            return False
+        if getattr(self, "_kimi_split_gguf_kv_b", False):
+            return False
+        if self.dcp_size > 1:
+            return False
+        # Like the DSA indexer eager region, this fusion is enabled for
+        # non-speculative CUDA BCG prefill.
+        if not is_in_prefill_graph_scope() or not is_graph_dsa_split_op_surface(
+            forward_batch
+        ):
+            return False
+        if not self.use_dsa:
+            return False
+        if self.use_deep_gemm_bmm:
+            return False
+        if is_kv_b_lora_active(self):
+            return False
+        if getattr(self, "learnable_sink_param", None) is not None:
+            return False
+        # The isolated 1-kernel graph is the bf16 fallback BMM. The fp8 and
+        # DeepGEMM branches already use different fused paths.
+        if self.w_kc.dtype == torch.float8_e4m3fn:
+            return False
+        if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+            return False
+        return True
+
+    def _split_q_nope_pe(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        return q_nope, q_pe, k_pe
+
+    def _make_mla_bmm_fusion_plan(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        q_nope: torch.Tensor,
+    ) -> MlaBmmFusionPlan:
+        q_nope_out_buf = q.new_empty(
+            (
+                self.num_local_heads,
+                q.shape[0],
+                self.kv_lora_rank,
+            )
+        )
+        q_nope_out_view = q_nope_out_buf.transpose(0, 1)
+        attn_output_buf = q.new_empty(
+            (
+                q.shape[0],
+                self.num_local_heads * self.kv_lora_rank,
+            )
+        )
+        return MlaBmmFusionPlan(
+            q_nope_t=q_nope.transpose(0, 1),
+            q_nope_out_buf=q_nope_out_buf,
+            q_nope_out_view=q_nope_out_view,
+            attn_output_buf=attn_output_buf,
+        )
+
+    def _q8kv8_born_fp8_q_backend(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+        llama_4_scaling: Optional[torch.Tensor],
+    ):
+        """Return the DSA backend iff the born-fp8 q fast path can run.
+
+        Gated by SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q (checked by the caller).
+        When this returns a backend, the bf16 absorbed bmm + the standalone
+        concat_and_cast_q_fp8_pad are replaced by one fused kernel that writes
+        the fp8 q directly into the backend's q8kv8 buffer; q_nope_out becomes
+        a NaN sentinel.  Every condition here must therefore guarantee that
+        forward_extend consumes q via _forward_flashmla_sparse_q8kv8 and that
+        nothing else reads q_nope_out's payload.
+        """
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if self.needs_unfused_mla_qkv:
+            return None
+        if llama_4_scaling is not None:
+            return None
+        if _is_hip or _is_cpu:
+            return None
+        if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+            return None
+        if self.use_deep_gemm_bmm:
+            return None
+        w_kc = self.w_kc
+        if w_kc is None or w_kc.dtype != torch.bfloat16:
+            return None
+        if is_kv_b_lora_active(self) or _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            return None
+        # The fused kernel consumes the post-rope q_pe, so the eager rope
+        # apply below must run (mirror of its condition).
+        if self.rotary_emb is None:
+            return None
+        if self._fuse_rope_for_trtllm_mla(forward_batch):
+            return None
+        # Graph/compile surfaces run their own dispatch; the python-side
+        # stash handshake is eager-only.
+        if is_in_breakable_cuda_graph() or is_in_full_prefill_graph():
+            return None
+        if get_is_capture_mode():
+            return None
+        if self.dcp_size > 1:
+            return None
+        # Kernel shape constraints (tl.arange / tl.dot / block tiling).  K
+        # (qk_nope_head_dim) needs only K % 16 == 0 and K <= 256: power-of-2
+        # K (DeepSeek 128) takes the kernel's preload-once path, other K
+        # (GLM-5 192) its split-K loop.
+        k_dim = self.qk_nope_head_dim
+        rope_dim = self.qk_rope_head_dim
+        if k_dim < 16 or k_dim > 256 or k_dim % 16 != 0:
+            return None
+        if rope_dim <= 0 or (rope_dim & (rope_dim - 1)) != 0:
+            return None
+        if self.kv_lora_rank % 128 != 0:
+            return None
+        if tuple(w_kc.shape) != (self.num_local_heads, k_dim, self.kv_lora_rank):
+            return None
+        backend = get_attn_backend()
+        eligible = getattr(backend, "q8kv8_born_fp8_q_eligible", None)
+        if eligible is None or not eligible(forward_batch, self.num_local_heads):
+            return None
+        return backend
+
+    def run_mla_indexer(
+        self: DeepseekV2AttentionMLA,
+        hidden_states: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """Run the shared MLA / dense MHA indexer; MLA_ROCM bypasses this hook."""
+        return self.indexer(
+            x=hidden_states,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+            return_indices=return_indices,
+        )
+
+    def prepare_mla_qkv(
+        self: DeepseekV2AttentionMLA,
+        positions: torch.Tensor,
+        q: Optional[torch.Tensor],
+        q_pe: torch.Tensor,
+        k: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare absorbed Q and normalized KV on the unfused rotary path.
+
+        Overrides that transform ``q`` must set ``needs_unfused_mla_qkv``.
+        MLA_ROCM and fused rotary paths bypass this hook.
+        """
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        return q, q_pe, k, k_pe
 
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
@@ -90,11 +410,50 @@ class DeepseekMLAForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        # Q8KV8 q-prep/indexer overlap handshake (see the fork site below):
+        # True between the alt-stream fork and its consumption in the born
+        # block; also suppresses the duplicate split/rope on that path.
+        self._q8kv8_qprep_overlap_pending = False
+        attention_output_gate = (
+            self.prepare_attention_output_gate(hidden_states)
+            if hasattr(self, "prepare_attention_output_gate")
+            else None
+        )
+
+        cp_overlap = (
+            DSAInterleaveCPIndexerOverlap(self, forward_batch)
+            if self.use_dsa
+            and is_interleave_extend(forward_batch)
+            # The overlap helper calls the native indexer CUDA entry directly.
+            and getattr(self.run_mla_indexer, "__func__", None)
+            is DeepseekMLAForwardMixin.run_mla_indexer
+            else None
+        )
+        fuse_bmm_attention = (
+            self.q_lora_rank is not None
+            and self._can_fuse_bmm_into_attention(forward_batch)
+            and (cp_overlap is None or cp_overlap.can_fuse_bmm)
+        )
+        # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
+        # weights and skip the per-layer Q all-gather.
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+        )
+        if q_replicate_active:
+            # force standard absorb so the full-head w_kc bmm runs
+            fuse_bmm_attention = False
         q_lora = None
         topk_indices = None
+        q_nope = None
+        q_pe = None
+        k_pe = None
+        fusion_plan: Optional[MlaBmmFusionPlan] = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -115,55 +474,11 @@ class DeepseekMLAForwardMixin:
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             else:
-                if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, _, k_nope, *_ = fused_rms_mxfp4_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        k_nope,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.variance_epsilon,
-                    )
-                else:
-                    q_lora = None
-                    if (
-                        _use_aiter_gfx95
-                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                    ):
-                        if self.use_nsa:
-                            q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
-                                q,
-                                self.q_a_layernorm.weight,
-                                self.q_a_layernorm.variance_epsilon,
-                                k_nope,
-                                self.kv_a_layernorm.weight,
-                                self.kv_a_layernorm.variance_epsilon,
-                                group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
-                                res1=None,
-                                output_unquantized_inp1=True,
-                            )
-                            q = q_quanted
-                        else:
-                            q, _, k_nope, _ = fused_rms_fp8_group_quant(
-                                q,
-                                self.q_a_layernorm.weight,
-                                self.q_a_layernorm.variance_epsilon,
-                                k_nope,
-                                self.kv_a_layernorm.weight,
-                                self.kv_a_layernorm.variance_epsilon,
-                                group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
-                                res1=None,
-                                output_unquantized_inp1=False,
-                            )
-
-                    else:
-                        q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
+                q = self.q_a_layernorm(q)
+                k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
-            if self.use_nsa:
+            if self.use_dsa:
                 if q_lora is None:
                     q_lora = q
 
@@ -173,130 +488,313 @@ class DeepseekMLAForwardMixin:
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
+                and not q_replicate_active
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj(q)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
+                k_nope = k_nope.unsqueeze(1)
+                if self.should_run_indexer(prev_topk_indices):
+                    topk_indices = self.run_mla_indexer(
+                        hidden_states, q_lora, positions, forward_batch
                     )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
+                else:
+                    # skip_topk reuses prev layer's indices; mirror into this
+                    # layer's slot so the captured buffer matches what's used.
+                    topk_indices = maybe_capture_indexer_topk(
+                        self.layer_id, prev_topk_indices
+                    )
+                # Issued after the indexer so the join stays on the main lane at graph replay.
+                with torch.cuda.stream(self.alt_stream):
+                    q = self.q_b_proj_forward(q)
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-                if q_lora is not None:
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
+                if q_replicate_active:
+                    # full-head Q from the gathered weight (skips Q all-gather)
+                    q = self.q_b_proj_replicated_forward(q)
+                else:
+                    q = self.q_b_proj_forward(q)
+
+                # Hoist these above the DSA indexer split op so the indexer
+                # and the composite bmm+attention split op are adjacent in FX.
+                if fuse_bmm_attention:
+                    q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+                    fusion_plan = self._make_mla_bmm_fusion_plan(q, q_nope)
+
+                # Q8KV8 q-prep/indexer overlap (opt-in): the born-fp8 q-prep
+                # chain (split -> rope -> fused absorbed-bmm+cast, ~173us)
+                # and the indexer chain both fork from the q_a_layernorm
+                # output and never touch each other's tensors, so the q-prep
+                # can run on alt_stream underneath the indexer.  The fork
+                # must be enqueued BEFORE the indexer (a later wait_stream
+                # would serialize behind it).  The born predicate itself
+                # guarantees eager-only and the plain-rope branch (all fused
+                # /skip-rope variants make it return None), so applying rope
+                # here is exactly what the skipped block below would do.
+                if (
+                    _ENABLE_DSA_Q8KV8_QPREP_OVERLAP
+                    and _ENABLE_DSA_Q8KV8_BORN_FP8_Q
+                    and fusion_plan is None
+                    and self.alt_stream is not None
+                    and q_lora is not None
+                    and self.rotary_emb is not None
+                    and getattr(self.prepare_mla_qkv, "__func__", None)
+                    is DeepseekMLAForwardMixin.prepare_mla_qkv
+                ):
+                    _born_backend_early = self._q8kv8_born_fp8_q_backend(
+                        forward_batch, llama_4_scaling
                     )
+                    if _born_backend_early is not None:
+                        q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+                        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                        _q_fp8 = _born_backend_early.q8kv8_acquire_born_q_buffer(
+                            q_nope.shape[0],
+                            self.num_local_heads,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                            q_nope.device,
+                        )
+                        self.alt_stream.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(self.alt_stream):
+                            absorbed_bmm_concat_cast_q_fp8(
+                                _q_fp8,
+                                q_nope,
+                                self.w_kc,
+                                q_pe,
+                                self.num_local_heads,
+                            )
+                        self._q8kv8_qprep_overlap_pending = True
+
+                if q_lora is not None:
+                    if self.should_run_indexer(prev_topk_indices):
+                        if cp_overlap is not None:
+                            topk_indices = cp_overlap.run_indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                                k_nope=k_nope,
+                                latent_cache=latent_cache,
+                            )
+                        else:
+                            topk_indices = self.run_mla_indexer(
+                                hidden_states, q_lora, positions, forward_batch
+                            )
+                    else:
+                        topk_indices = maybe_capture_indexer_topk(
+                            self.layer_id, prev_topk_indices
+                        )
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
+            if q_replicate_active:
+                q = self.q_b_proj_replicated_forward(hidden_states)
+            else:
+                q = self.q_proj(hidden_states)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        if q_nope is None:
+            q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
-        if self.use_deep_gemm_bmm:
-            q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
+        _kvb_q = None
+        born_q_backend = None
+        if (
+            _ENABLE_DSA_Q8KV8_BORN_FP8_Q
+            and fusion_plan is None
+            and q_nope.dtype == torch.bfloat16
+        ):
+            born_q_backend = self._q8kv8_born_fp8_q_backend(
+                forward_batch, llama_4_scaling
             )
-            q_nope_out = q_nope.new_empty(
-                (self.num_local_heads, aligned_m, self.kv_lora_rank)
+        if q_replicate_active:
+            # full-head absorb with the pre-gathered w_kc (q_nope already full-head)
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep).transpose(
+                0, 1
             )
-            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                (q_nope_val, q_nope_scale),
-                (self.w_kc, self.w_scale_k),
-                q_nope_out,
-                masked_m,
-                expected_m,
+        elif getattr(self, "_kimi_split_gguf_kv_b", False):
+            from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+            k_type = int(self.k_b_qweight_type.weight_type)
+            q_nope_out = torch.stack(
+                [
+                    fused_mul_mat_gguf(q_nope[:, head], self.k_b_qweight[head], k_type)
+                    for head in range(self.num_local_heads)
+                ],
+                dim=1,
             )
-            q_nope_out = q_nope_out[:, :expected_m, :]
-        elif _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
-                x = q_nope.transpose(0, 1)
-                q_nope_out = torch.empty(
-                    x.shape[0],
-                    x.shape[1],
-                    self.w_kc.shape[2],
-                    device=x.device,
-                    dtype=torch.bfloat16,
+        elif fusion_plan is not None:
+            # The composite split op fills q_nope_out_buf and attention reads
+            # this transposed alias directly.
+            q_nope_out = fusion_plan.q_nope_out_view
+        elif born_q_backend is not None:
+            # Born-fp8 q: skip the bf16 absorbed bmm entirely; the fused
+            # bmm+concat+cast kernel (launched after rope below) writes the
+            # fp8 q directly into the q8kv8 backend buffer.
+            q_nope_out = None
+        else:
+            kv_b_lora = kv_b_lora_correction(self)
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
+                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                    kv_b_lora_q_prepare,
                 )
-                batched_gemm_afp4wfp4_pre_quant(
-                    x,
-                    self.w_kc.transpose(-2, -1),
-                    self.w_scale_k.transpose(-2, -1),
-                    torch.bfloat16,
+
+                _kvb_q = kv_b_lora_q_prepare(self, q_nope)
+            elif kv_b_lora == "v2":
+                from sglang.srt.lora.dense import mla_correction
+
+                _kvb_q = mla_correction.prepare_q_correction(self, q_nope)
+
+            if self.use_deep_gemm_bmm:
+                (
+                    q_nope_val,
+                    q_nope_scale,
+                    masked_m,
+                    expected_m,
+                    aligned_m,
+                ) = per_token_group_quant_mla_deep_gemm_masked_fp8(
+                    q_nope.transpose(0, 1)
+                )
+                q_nope_out = q_nope.new_empty(
+                    (self.num_local_heads, aligned_m, self.kv_lora_rank)
+                )
+                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (q_nope_val, q_nope_scale),
+                    (self.w_kc, self.w_scale_k),
                     q_nope_out,
+                    masked_m,
+                    expected_m,
                 )
-            else:
-                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
-                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
-                ):
-                    # fp8 Triton kernel: always on gfx950,
-                    # cudagraph-only on gfx942 (hides launch overhead)
-                    q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                        X=q_nope,
-                        WQ=self.w_kc.transpose(-1, -2),
-                        w_scale=self.w_scale,
-                        group_size=128,
-                        YQ=None,  # allocate (B, M, N)
-                        transpose_bm=False,  # (B, M, N)
-                        transpose_bm_in=True,  # (M, B, K)
-                        dtype=torch.bfloat16,
-                    )
-
-                else:
+                q_nope_out = q_nope_out[:, :expected_m, :]
+            elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_sail:
+                if _is_cpu:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
                         self.w_kc.to(torch.bfloat16) * self.w_scale,
                     )
+                else:
+                    # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
+                    q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                        q_nope.transpose(0, 1),
+                        (
+                            torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                            if _is_cublas_ge_129
+                            else zero_allocator.allocate(1)
+                        ),
+                    )
+                    q_nope_out = bmm_fp8(
+                        q_nope_val,
+                        self.w_kc,
+                        q_nope_scale,
+                        self.w_scale,
+                        torch.bfloat16,
+                    )
+            else:
+                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-        elif self.w_kc.dtype == torch.float8_e4m3fn:
-            # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
-            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                q_nope.transpose(0, 1),
-                (
-                    torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
-                    if _is_cublas_ge_129
-                    else zero_allocator.allocate(1)
-                ),
-            )
-            q_nope_out = bmm_fp8(
-                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-            )
-        else:
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+            q_nope_out = q_nope_out.transpose(0, 1)
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                    kv_b_lora_q_apply,
+                )
 
-        q_nope_out = q_nope_out.transpose(0, 1)
+                q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
+            elif kv_b_lora == "v2":
+                q_nope_out = mla_correction.apply_correction(_kvb_q, q_nope_out)
+            elif kv_b_lora == "legacy":
+                from sglang.srt.lora import deepseek_mla_correction
 
+                q_nope_out = deepseek_mla_correction.apply_q_correction(
+                    self, q_nope, q_nope_out
+                )
+
+        fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         if (
             self.rotary_emb is not None
-            and (not self._fuse_rope_for_trtllm_mla(forward_batch))
-            and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
+            and not fuse_rope_for_trtllm_mla
+            # Already applied at the q-prep/indexer overlap fork.
+            and not self._q8kv8_qprep_overlap_pending
         ):
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-        if nsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
+            q_nope_out, q_pe, k_nope, k_pe = self.prepare_mla_qkv(
+                positions, q_nope_out, q_pe, k_nope, k_pe, forward_batch
             )
+
+        if born_q_backend is not None:
+            # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
+            # kernel replaces bmm -> bf16 q_nope_out ->
+            # concat_and_cast_q_fp8_pad.  q_nope is the pre-absorb bf16 view
+            # (rope only touched the disjoint q_pe columns) and q_pe carries
+            # the post-rope values.  The stash is consumed by
+            # _forward_flashmla_sparse_q8kv8; q_nope_out becomes a
+            # NaN-poisoned shape-only sentinel.
+            num_tokens = q_nope.shape[0]
+            if self._q8kv8_qprep_overlap_pending:
+                # q_fp8 was produced on alt_stream at the fork above; join so
+                # everything downstream (incl. the next layer's fork, which
+                # reuses the single born-q slot) orders after it.
+                torch.cuda.current_stream().wait_stream(self.alt_stream)
+                self._q8kv8_qprep_overlap_pending = False
+            else:
+                q_fp8 = born_q_backend.q8kv8_acquire_born_q_buffer(
+                    num_tokens,
+                    self.num_local_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    q_nope.device,
+                )
+                absorbed_bmm_concat_cast_q_fp8(
+                    q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
+                )
+            born_q_backend.q8kv8_stash_born_q(
+                padded_extend_real_tokens(q_nope.shape[0], forward_batch) or num_tokens,
+                self.attn_mqa.layer_id,
+            )
+            q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
+                num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
+            )
+
+        if cp_overlap is not None:
+            q_nope_out, q_pe, k_nope, k_pe, topk_indices = cp_overlap.prepare_qkv(
+                q_nope_out,
+                q_pe,
+                k_nope,
+                k_pe,
+                topk_indices,
+                defer_materialization=fuse_rope_for_trtllm_mla,
+            )
+        else:
+            k_nope, k_pe = prepare_kv_for_attention(
+                self,
+                forward_batch,
+                k_nope,
+                k_pe,
+                defer_materialization=fuse_rope_for_trtllm_mla,
+            )
+
+        # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
+        if self.dcp_size > 1:
+            if self.is_dcp_mla_decode_phase(forward_batch):
+                if not q_replicate_active:
+                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                        q_nope_out=q_nope_out,
+                        q_pe=q_pe,
+                    )
+            elif forward_batch.forward_mode.is_extend():
+                # for extend, gather kv
+                if not self.use_dsa:
+                    bcg_dcp_extend_kv_gather(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
+            else:
+                logger.warning(
+                    f"not supported forward_mode {forward_batch.forward_mode}"
+                )
 
         return (
             q_pe,
@@ -308,6 +806,14 @@ class DeepseekMLAForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+            fusion_plan,
+            # Bailing's DsV3MLA appends its own gate to inner_state, so this
+            # slot is emitted only for models owning the gate hook.
+            *(
+                (attention_output_gate,)
+                if hasattr(self, "prepare_attention_output_gate")
+                else ()
+            ),
         )
 
     def forward_absorb_core(
@@ -321,58 +827,82 @@ class DeepseekMLAForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        fusion_plan: Optional[MlaBmmFusionPlan] = None,
+        attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
-            if self._fuse_rope_for_trtllm_mla(forward_batch):
-                extra_args = {
-                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
-                    "is_neox": self.rotary_emb.is_neox_style,
-                    "llama_4_scaling": llama_4_scaling,
-                }
-
-            attn_output = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-                **extra_args,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
-        else:
-            if _use_aiter_gfx95:
-                cos = self.rotary_emb.cos_cache
-                sin = self.rotary_emb.sin_cache
-
-                kv_cache_dtype = (
-                    fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
+            if getattr(self, "learnable_sink_param", None) is not None:
+                extra_args["attn_sink"] = self.learnable_sink_param
+            if q_pe is not None and self._fuse_rope_for_trtllm_mla(forward_batch):
+                extra_args.update(
+                    cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                    is_neox=self.rotary_emb.is_neox_style,
+                    llama_4_scaling=llama_4_scaling,
                 )
-
-                q, _, _, k = fused_qk_rope_cat_and_cache_mla(
+            # SailFlashMLABackend consumes the split q/k and has no
+            # llama_4_scaling argument of its own, so scale both halves before
+            # dispatch. The concat branch below scales the joined q instead.
+            if (
+                llama_4_scaling is not None
+                and self.current_attention_backend == "flashmla"
+            ):
+                q_nope_out *= llama_4_scaling
+                if q_pe is not None:
+                    q_pe *= llama_4_scaling
+            if fusion_plan is not None:
+                self._eager_bmm_attention(
+                    fusion_plan.q_nope_t,
+                    self.w_kc,
+                    fusion_plan.q_nope_out_buf,
                     q_nope_out,
-                    q_pe,
                     k_nope,
+                    fusion_plan.attn_output_buf,
+                    save_kv_cache,
+                    q_pe,
                     k_pe,
-                    forward_batch.token_to_kv_pool.get_key_buffer(
-                        self.attn_mqa.layer_id
-                    ),
-                    forward_batch.out_cache_loc,
-                    positions,
-                    cos,
-                    sin,
-                    self.attn_mqa.k_scale,
-                    self.rotary_emb.is_neox_style,
-                    q_out_dtype=kv_cache_dtype,
+                    cos_sin_cache=extra_args.get("cos_sin_cache"),
+                    is_neox=extra_args.get("is_neox"),
+                    llama_4_scaling=extra_args.get("llama_4_scaling"),
+                    topk_indices=topk_indices,
                 )
-
-                save_kv_cache = False
+                attn_output = fusion_plan.attn_output_buf
+            elif self.is_dcp_mla_decode_phase(forward_batch):
+                # set return_lse=True to correct attn_output
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
             else:
-                q = torch.cat([q_nope_out, q_pe], dim=-1)
-                k = torch.cat([k_nope, k_pe], dim=-1)
+                attn_output = self.attn_mqa(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+        else:
+            q = torch.cat([q_nope_out, q_pe], dim=-1)
+            k = torch.cat([k_nope, k_pe], dim=-1)
 
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
@@ -386,13 +916,167 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+
+        dcp_v_projected = False
+        # correct attn_output with respect to lse from other ranks
+        if self.is_dcp_mla_decode_phase(forward_batch):
+            attn_output = attn_output.view(
+                -1,
+                self.num_local_heads * self.dcp_size,
+                self.kv_lora_rank,
+            )
+            if get_in_autotune_dummy_run():
+                # The synthetic FlashInfer MoE autotune pass discards model
+                # outputs. Avoid an unnecessary cross-node MNNVL exchange of
+                # zero attention partials.
+                attn_output = _select_local_dcp_heads_for_autotune(
+                    attn_output, self.num_local_heads
+                )
+            else:
+                dcp_comm_backend = get_parallel().dcp_comm_backend
+                is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
+                    self.current_attention_backend
+                )
+                if dcp_comm_backend in ("a2a", "fi_a2a"):
+                    # A head's linear V projection commutes with its LSE-weighted
+                    # reduction. Exchange the narrower projected partials.
+                    if (
+                        self.dcp_v_preproject
+                        and self.use_dsa
+                        and (
+                            attn_output.shape[0] >= 512
+                            # the push-combine reduce wins at any batch size
+                            or dcp_push_combine_fits(
+                                attn_output.shape[0] * self.num_local_heads
+                            )
+                        )
+                        and self.w_vc is not None
+                        and self.w_vc.dtype == torch.bfloat16
+                        and not self.use_deep_gemm_bmm
+                        and self.v_head_dim < self.kv_lora_rank
+                        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                        and not is_kv_b_lora_active(self)
+                    ):
+                        weights = self._dcp_v_weights
+                        if (
+                            weights is None
+                            and not torch.cuda.is_current_stream_capturing()
+                        ):
+                            weights = self._prepare_dcp_v_weights(
+                                get_parallel().dcp_group
+                            )
+                        if weights is not None:
+                            attn_output = torch.bmm(
+                                attn_output.transpose(0, 1), weights
+                            ).transpose(0, 1)
+                            dcp_v_projected = True
+                    reduced = None
+                    if dcp_v_projected:
+                        # One kernel pushes the peers' heads over NVLink and
+                        # combines this rank's by LSE.
+                        reduced = dcp_push_combine_reduce(
+                            attn_output,
+                            lse,
+                            get_parallel().dcp_group,
+                            is_lse_base_on_e=is_lse_base_on_e,
+                        )
+                    if reduced is not None:
+                        attn_output = reduced.view(
+                            -1, self.num_local_heads, self.v_head_dim
+                        )
+                    else:
+                        # A2A exchange of head partials + LSE, then local Triton combine.
+                        if not (self.use_dsa and dsa_shards_index_k()):
+                            # K3.1's DSA partials are strided views the pack reads as is
+                            attn_output = attn_output.contiguous()
+                            lse = lse.contiguous()
+                        attn_output = dcp_a2a_lse_reduce(
+                            attn_output,
+                            lse,
+                            get_parallel().dcp_group,
+                            is_lse_base_on_e=is_lse_base_on_e,
+                            comm_backend=dcp_comm_backend,
+                        )
+                else:
+                    attn_output = cp_lse_ag_out_rs_mla(
+                        attn_output,
+                        lse,
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                    )
+                    attn_output = attn_output.transpose(0, 1)
+        if dcp_v_projected:
+            return _finish_absorb_output(
+                self, attn_output.flatten(1, 2), attention_output_gate, topk_indices
+            )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.use_deep_gemm_bmm:
-            attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(
-                    attn_output.transpose(0, 1)
-                )
+        _kvb_v = None
+        kv_b_lora = kv_b_lora_correction(self)
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
+            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                kv_b_lora_v_prepare,
+            )
+
+            _kvb_v = kv_b_lora_v_prepare(self, attn_output)
+        elif kv_b_lora == "v2":
+            from sglang.srt.lora.dense import mla_correction
+
+            _kvb_v = mla_correction.prepare_v_correction(self, attn_output)
+
+        attn_bmm_output = self.project_mla_values(attn_output, zero_allocator)
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                kv_b_lora_v_apply,
+            )
+
+            attn_bmm_output = kv_b_lora_v_apply(
+                self, attn_output, attn_bmm_output, _kvb_v
+            )
+        elif kv_b_lora == "v2":
+            attn_bmm_output = mla_correction.apply_correction(_kvb_v, attn_bmm_output)
+        elif kv_b_lora == "legacy":
+            from sglang.srt.lora import deepseek_mla_correction
+
+            attn_bmm_output = deepseek_mla_correction.apply_v_correction(
+                self, attn_output, attn_bmm_output
+            )
+        return _finish_absorb_output(
+            self, attn_bmm_output, attention_output_gate, topk_indices
+        )
+
+    def project_mla_values(
+        self: DeepseekV2AttentionMLA,
+        attn_output: torch.Tensor,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
+        """Expand latent values before LoRA correction and output gating.
+
+        MLA_ROCM uses its own projection and bypasses this hook.
+        """
+        if getattr(self, "_kimi_split_gguf_kv_b", False):
+            from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+            v_type = int(self.v_b_qweight_type.weight_type)
+            attn_bmm_output = torch.stack(
+                [
+                    fused_mul_mat_gguf(
+                        attn_output[:, head], self.v_b_qweight[head], v_type
+                    )
+                    for head in range(self.num_local_heads)
+                ],
+                dim=1,
+            ).flatten(1, 2)
+        elif self.use_deep_gemm_bmm:
+            (
+                attn_output_val,
+                attn_output_scale,
+                masked_m,
+                expected_m,
+                aligned_m,
+            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(
+                attn_output.transpose(0, 1)
             )
             attn_bmm_output = attn_output.new_empty(
                 (self.num_local_heads, aligned_m, self.v_head_dim)
@@ -407,94 +1091,51 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
-        elif _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
-                x = attn_output.transpose(0, 1)
-                attn_bmm_output = torch.empty(
-                    x.shape[0],
-                    x.shape[1],
-                    self.w_vc.shape[2],
-                    device=x.device,
-                    dtype=torch.bfloat16,
+        elif self.w_vc.dtype == torch.float8_e4m3fn and not _is_sail:
+            if _is_cpu:
+                attn_bmm_output = torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    self.w_vc.to(torch.bfloat16) * self.w_scale,
                 )
-                batched_gemm_afp4wfp4_pre_quant(
-                    x,
-                    self.w_vc.transpose(-2, -1),
-                    self.w_scale_v.transpose(-2, -1),
-                    torch.bfloat16,
-                    attn_bmm_output,
-                )
-            else:
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
-                    attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                        X=attn_output,
-                        WQ=self.w_vc.transpose(-1, -2),
-                        w_scale=self.w_scale,
-                        group_size=128,
-                        YQ=None,
-                        transpose_bm=False,
-                        transpose_bm_in=True,
-                        dtype=torch.bfloat16,
-                    )
-                else:
-                    attn_bmm_output = torch.bmm(
-                        attn_output.to(torch.bfloat16).transpose(0, 1),
-                        self.w_vc.to(torch.bfloat16) * self.w_scale,
-                    )
-
-            if self.o_proj.weight.dtype == torch.uint8:
-                attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
-                attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                attn_bmm_output = fused_flatten_fp8_group_quant(
-                    attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
-                )
-            else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
-            attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
-                attn_output.transpose(0, 1),
-                (
-                    torch.zeros((1,), dtype=torch.float32, device=attn_output.device)
-                    if _is_cublas_ge_129
-                    else zero_allocator.allocate(1)
-                ),
-            )
-            attn_bmm_output = bmm_fp8(
-                attn_output_val,
-                self.w_vc,
-                attn_output_scale,
-                self.w_scale,
-                torch.bfloat16,
+            else:
+                attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+                    attn_output.transpose(0, 1),
+                    (
+                        torch.zeros(
+                            (1,), dtype=torch.float32, device=attn_output.device
+                        )
+                        if _is_cublas_ge_129
+                        else zero_allocator.allocate(1)
+                    ),
+                )
+                attn_bmm_output = bmm_fp8(
+                    attn_output_val,
+                    self.w_vc,
+                    attn_output_scale,
+                    self.w_scale,
+                    torch.bfloat16,
+                )
+                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif _is_musa:
+            attn_bmm_output = torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            if is_in_piecewise_cuda_graph():
-                # torch dynamo requires out= op was called where output tensor was non-contiguous
-                attn_bmm_output = (
-                    torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-                    .transpose(0, 1)
-                    .flatten(1, 2)
-                )
-            else:
-                attn_bmm_output = torch.empty(
-                    (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
-                    dtype=attn_output.dtype,
-                    device=attn_output.device,
-                )
-                torch.bmm(
-                    attn_output.transpose(0, 1),
-                    self.w_vc,
-                    out=attn_bmm_output.view(
-                        -1, self.num_local_heads, self.v_head_dim
-                    ).transpose(0, 1),
-                )
-        output, _ = self.o_proj(attn_bmm_output)
-
-        return output
+            attn_bmm_output = torch.empty(
+                (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            torch.bmm(
+                attn_output.transpose(0, 1),
+                self.w_vc,
+                out=attn_bmm_output.view(
+                    -1, self.num_local_heads, self.v_head_dim
+                ).transpose(0, 1),
+            )
+        return attn_bmm_output
 
     def _fuse_rope_for_trtllm_mla(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
@@ -502,17 +1143,52 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
-        if self.current_attention_backend == "nsa":
+        if self.rotary_emb is None:
+            return False
+        if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_global_server_args().nsa_decode_backend == "trtllm"
-                or get_global_server_args().nsa_prefill_backend == "trtllm"
-            ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
+                uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
+                or uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_prefill_backend)
+            ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
-            self.current_attention_backend == "trtllm_mla"
+            self.rotary_emb is not None
+            and self.current_attention_backend in ("trtllm_mla", "cutedsl_mla")
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
             )
-            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+            and get_attn_backend().data_type == torch.float8_e4m3fn
+        )
+
+    @eager_on_graph
+    def _eager_bmm_attention(
+        self,
+        q_nope_t: torch.Tensor,
+        w_kc: torch.Tensor,
+        q_nope_out_buf: torch.Tensor,
+        q_nope_out_view: torch.Tensor,
+        k_nope: torch.Tensor,
+        attn_output_buf: torch.Tensor,
+        save_kv_cache: bool,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
+        self.attn_mqa._eager_attention.run_eager(
+            q_nope_out_view,
+            k_nope,
+            k_nope,
+            attn_output_buf,
+            save_kv_cache,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox,
+            llama_4_scaling=llama_4_scaling,
+            topk_indices=topk_indices,
         )

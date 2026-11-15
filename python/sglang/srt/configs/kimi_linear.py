@@ -1,11 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/transformers_utils/configs/kimi_linear.py
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
+from sglang.srt.runtime_context import linear_attn_tp_size
 
 
 class KimiLinearConfig(PretrainedConfig):
     model_type = "kimi_linear"
+    # Shared MoE utilities use the abbreviated name; checkpoints keep the original.
+    attribute_map = {"num_experts_per_tok": "num_experts_per_token"}
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -40,6 +45,7 @@ class KimiLinearConfig(PretrainedConfig):
         use_grouped_topk: bool = True,
         num_expert_group: int = 1,
         topk_group: int = 1,
+        topk_method: str = "noaux_tc",
         q_lora_rank: int | None = None,
         kv_lora_rank: int | None = None,
         qk_nope_head_dim: int | None = None,
@@ -48,6 +54,14 @@ class KimiLinearConfig(PretrainedConfig):
         mla_use_nope: bool | None = False,
         num_nextn_predict_layers: int = 0,
         linear_attn_config: dict | None = None,
+        attn_res_block_size: int | None = None,
+        routed_expert_hidden_size: int | None = None,
+        latent_moe_use_norm: bool = False,
+        activation_situ_beta: float | None = None,
+        activation_situ_linear_beta: float | None = None,
+        mla_use_output_gate: bool = False,
+        max_position_embeddings: int = 4096,
+        dsa_config: dict | None = None,
         **kwargs,
     ):
         self.model_type = model_type
@@ -80,6 +94,7 @@ class KimiLinearConfig(PretrainedConfig):
         self.mla_use_nope = mla_use_nope
         # moe config
         self.n_routed_experts = self.num_experts = num_experts
+        self.topk_method = topk_method
         self.num_experts_per_token = num_experts_per_token
         self.moe_renormalize = moe_renormalize
         self.num_shared_experts = num_shared_experts
@@ -94,10 +109,22 @@ class KimiLinearConfig(PretrainedConfig):
         self.topk_group = topk_group
         self.num_nextn_predict_layers = num_nextn_predict_layers
 
+        self.attn_res_block_size = attn_res_block_size
+        self.routed_expert_hidden_size = routed_expert_hidden_size
+        self.latent_moe_use_norm = latent_moe_use_norm
+        self.activation_situ_beta = activation_situ_beta
+        self.activation_situ_linear_beta = activation_situ_linear_beta
+        self.mla_use_output_gate = mla_use_output_gate
+        self.max_position_embeddings = max_position_embeddings
+
         if linear_attn_config is not None:
             assert linear_attn_config["kda_layers"] is not None
             assert linear_attn_config["full_attn_layers"] is not None
         self.linear_attn_config = linear_attn_config
+
+        self.dsa_config = dsa_config
+        if dsa_config is not None:
+            self._init_dsa(dsa_config)
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -106,6 +133,44 @@ class KimiLinearConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def _init_dsa(self, dsa_config: dict) -> None:
+        index_topk_freq = dsa_config.get("index_topk_freq", 1)
+        if index_topk_freq != 1:
+            raise ValueError(
+                "Kimi-K3.1 DSA only supports index_topk_freq == 1 (every DSA "
+                f"layer runs its own indexer), got {index_topk_freq}."
+            )
+        index_rope_dim = dsa_config.get("index_rope_dim", 0)
+        if index_rope_dim != 0:
+            raise ValueError(
+                "Kimi-K3.1 DSA only supports index_rope_dim == 0 (NoPE "
+                f"indexer), got {index_rope_dim}."
+            )
+        index_k_norm_type = dsa_config.get("index_k_norm_type", "layernorm")
+        if index_k_norm_type != "layernorm":
+            raise ValueError(
+                "Kimi-K3.1 DSA only supports index_k_norm_type == 'layernorm', "
+                f"got {index_k_norm_type!r}."
+            )
+        dsa_layers = dsa_config.get("dsa_layers")
+        full_attn_layers = (self.linear_attn_config or {}).get("full_attn_layers")
+        if dsa_layers is None or sorted(dsa_layers) != sorted(full_attn_layers or []):
+            raise ValueError(
+                "Kimi-K3.1 DSA requires dsa_layers == full_attn_layers, got "
+                f"dsa_layers={dsa_layers}, full_attn_layers={full_attn_layers}."
+            )
+        self.index_topk = dsa_config["index_topk"]
+        self.index_n_heads = dsa_config["index_num_heads"]
+        self.index_head_dim = dsa_config["index_head_dim"]
+        self.index_topk_freq = index_topk_freq
+        self.index_skip_topk_offset = dsa_config.get("index_skip_topk_offset")
+        self.index_rope_dim = index_rope_dim
+        self.index_k_norm_type = index_k_norm_type
+        self.index_k_norm_eps = self.rms_norm_eps
+        self.index_k_norm_fp32 = True
+        self.index_apply_hadamard = False
+        self.index_bf16_head_gate = True
 
     @property
     def is_mla(self):
@@ -149,10 +214,9 @@ class KimiLinearConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = KimiLinearStateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=linear_attn_tp_size(),
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

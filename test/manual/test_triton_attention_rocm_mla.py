@@ -3,10 +3,10 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
+from sglang.kernels.ops.attention.decode_attention import (
     decode_attention_fwd_grouped,
 )
-from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
+from sglang.kernels.ops.attention.rocm_mla_decode_rope import (
     decode_attention_fwd_grouped_rope,
 )
 from sglang.srt.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
@@ -14,7 +14,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestTritonAttentionMLA(CustomTestCase):
-
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)

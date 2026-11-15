@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/backend_request_func.py
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
 
@@ -5,10 +7,10 @@
 Benchmark online serving with dynamic requests.
 
 Usage:
-python3 -m sglang.bench_serving --backend sglang --num-prompt 10
+python3 -m sglang.benchmark.serving --backend sglang --num-prompt 10
 
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --request-rate-range 1,2,4,8,16,32 --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --multi
+python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
+python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --request-rate-range 1,2,4,8,16,32 --random-input 4096 --random-output 1024 --random-range-ratio 0.125 --multi
 """
 
 import argparse
@@ -33,6 +35,7 @@ from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
+from sglang.srt.utils.auth import admin_auth_headers
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
@@ -73,9 +76,9 @@ async def async_request_openai_completions(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "completions"
-    ), "OpenAI Completions API URL must end with 'completions'."
+    assert api_url.endswith("completions"), (
+        "OpenAI Completions API URL must end with 'completions'."
+    )
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -203,7 +206,9 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            async with session.post(
+                url=api_url, headers=admin_auth_headers(args.admin_api_key)
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -442,7 +447,9 @@ async def benchmark(
 
     # Flush cache
     if "sglang" in backend:
-        requests.post(base_url + "/flush_cache")
+        requests.post(
+            base_url + "/flush_cache", headers=admin_auth_headers(args.admin_api_key)
+        )
 
     time.sleep(1.0)
 
@@ -617,14 +624,6 @@ async def benchmark(
             "std_itl_ms": metrics.std_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
-            "input_throughput": metrics.input_throughput,
-            "output_throughput": metrics.output_throughput,
-            "fixed_output_len": args.fixed_output_len,
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "random_range_ratio": args.random_range_ratio,
-            "duration": benchmark_duration,
-            "completed": metrics.completed,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -972,6 +971,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires (default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--lora-name",

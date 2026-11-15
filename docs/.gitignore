@@ -1,0 +1,30 @@
+# Node
+node_modules/
+.env
+.DS_Store
+.cache/
+dist/
+.next/
+*.log
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# VSCode
+.vscode/
+
+# Mintlify
+.mintlify/
+
+# Python (if any)
+__pycache__/
+*.pyc
+
+# Misc
+*.swp
+*.swo
+
+.agents
+.claude
+skills-lock.json

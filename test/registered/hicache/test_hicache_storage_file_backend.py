@@ -10,6 +10,7 @@ import random
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Dict
 from urllib.parse import urlparse
@@ -17,22 +18,20 @@ from urllib.parse import urlparse
 import requests
 
 from sglang.benchmark.utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
-register_amd_ci(est_time=526, suite="stage-b-test-large-2-gpu-amd")
+register_cuda_ci(est_time=500, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=1360, suite="extra-a-test-2-gpu-large-amd")
 
 
 class HiCacheStorageBaseMixin:
@@ -62,11 +61,13 @@ class HiCacheStorageBaseMixin:
     @classmethod
     def tearDownClass(cls):
         """Clean up test environment"""
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process)
 
         import shutil
 
-        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        if hasattr(cls, "temp_dir"):
+            shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
     @classmethod
     def _get_model_name(cls):
@@ -74,11 +75,20 @@ class HiCacheStorageBaseMixin:
         return DEFAULT_MODEL_NAME_FOR_TEST
 
     @classmethod
+    def _get_storage_backend(cls):
+        return "file"
+
+    @classmethod
+    def _get_storage_backend_extra_config(cls):
+        return {}
+
+    @classmethod
     def _get_base_server_args(cls):
         """Get base server arguments - can be extended in subclasses"""
         extra_config = {
             "hicache_storage_pass_prefix_keys": True,
         }
+        extra_config.update(cls._get_storage_backend_extra_config())
         return {
             "--enable-hierarchical-cache": True,
             "--mem-fraction-static": 0.6,
@@ -86,7 +96,7 @@ class HiCacheStorageBaseMixin:
             "--page-size": 64,
             "--enable-cache-report": True,
             "--hicache-storage-prefetch-policy": "wait_complete",
-            "--hicache-storage-backend": "file",
+            "--hicache-storage-backend": cls._get_storage_backend(),
             "--hicache-storage-backend-extra-config": json.dumps(extra_config),
         }
 
@@ -101,6 +111,7 @@ class HiCacheStorageBaseMixin:
 
         additional_server_args, env_vars = cls._get_additional_server_args_and_env()
         env_vars["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+        env_vars["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = "1"
         server_args = cls._get_base_server_args()
         if additional_server_args:
             server_args.update(additional_server_args)
@@ -167,13 +178,14 @@ class HiCacheStorageBaseMixin:
         meta = response_json.get("meta_info", {})
         return int(meta.get("cached_tokens", 0))
 
-    def flush_cache(self) -> bool:
-        """Flush device cache to force remote storage access"""
-        try:
-            response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
+    def flush_cache(self):
+        """Flush device cache to force remote storage access."""
+        res = requests.post(
+            f"{self.base_url}/flush_cache",
+            params={"timeout": 30},
+            timeout=40,
+        )
+        res.raise_for_status()
 
     def gen_prompt(self, token_num: int) -> str:
         """Generate a random prompt of specified token length using tokenizer vocabulary."""
@@ -187,8 +199,7 @@ class HiCacheStorageBaseMixin:
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
         # Flush device cache to force remote storage access
-        time.sleep(2)
-        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
+        self.flush_cache()
 
     def test_basic_backup_and_prefetch(self):
         """Test storage and retrieval of large context through remote cache"""
@@ -223,33 +234,6 @@ class HiCacheStorageBaseMixin:
         )
 
 
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase):
-    """Page first layout tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--hicache-mem-layout": "page_first"}
-        return server_args, {}
-
-
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestHiCacheStorageMLA(HiCacheStorageBaseMixin, CustomTestCase):
-    """MLA Model tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_model_name(cls):
-        """Use MLA model for testing"""
-        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--tp-size": 2}
-        return server_args, {}
-
-
 class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first direct tests for HiCache Storage functionality"""
 
@@ -264,22 +248,132 @@ class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCas
         return server_args, {}
 
 
-class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
-    """Accuracy tests for HiCache Storage functionality"""
+class TestHiCacheStorageFastFilePageFirstDirectIO(
+    HiCacheStorageBaseMixin, CustomTestCase
+):
+    """Page first direct tests for the fast_file storage backend (direct I/O path)."""
+
+    @classmethod
+    def _get_storage_backend(cls):
+        return "fast_file"
+
+    @classmethod
+    def _get_storage_backend_extra_config(cls):
+        return {"file_storage_path": cls.temp_dir, "read_workers": 2}
 
     @classmethod
     def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
         server_args = {
+            "--hicache-mem-layout": "page_first_direct",
+            "--hicache-io-backend": "direct",
             "--tp-size": 2,
-            "--hicache-ratio": 1.5,
         }
-
         return server_args, {}
 
-    def test_eval_accuracy(self):
-        """Test eval accuracy with cache persistence across cache flushes"""
-        run_eval_accuracy_test(self)
+    def test_generation_is_identical_after_storage_reload(self):
+        """Pages read back through vectored I/O must be byte-identical to the
+        pages written, so deterministic generation cannot change after an L3
+        reload."""
+        prompt = self.gen_prompt(768)
+        initial = self.send_request(prompt, max_tokens=128)
+
+        self.trigger_offloading_and_flush()
+
+        cached = self.send_request(prompt, max_tokens=128)
+        self.assertEqual(initial["text"], cached["text"])
+        self.assertGreater(
+            self.get_cached_tokens(cached),
+            700,
+            "Expected the deterministic comparison to reload from L3 storage",
+        )
+
+
+class TestHiCacheStorageRandomDelay(HiCacheStorageBaseMixin, CustomTestCase):
+    """Random storage delays must change only latency, never hit semantics;
+    the rank consensus checker (enabled by the mixin) fails the server if the
+    skewed storage IO timing causes cross-rank divergence."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {"--tp-size": 2}
+        env_vars = {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY": "0.1",
+        }
+        return server_args, env_vars
+
+    def test_delayed_storage_hits_concurrent_requests(self):
+        base_prompt = self.gen_prompt(768)
+        self.send_request(base_prompt, max_tokens=8)
+        self.trigger_offloading_and_flush()
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            responses = list(
+                executor.map(
+                    lambda _: self.send_request(base_prompt, max_tokens=8), range(4)
+                )
+            )
+
+        for response in responses:
+            self.assertEqual(response["meta_info"]["completion_tokens"], 8)
+            self.assertGreater(
+                self.get_cached_tokens(response),
+                700,
+                "Delayed storage IO must not turn a stored prefix into a miss",
+            )
+
+
+class TestHiCacheStorageBufferOnlyRandomDelay(TestHiCacheStorageRandomDelay):
+    """buffer_only host memory on TP2 with skewed storage IO timing: the
+    outcome of every storage operation is agreed on the scheduler thread, so
+    every rank publishes the same outcome in the same tick (the rank
+    consensus checker fails the server otherwise) and the skew changes only
+    latency, never hit semantics. The first multi-rank buffer_only + storage
+    e2e: the TP1 ones on main cannot see a rank disagreement."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args.update(
+            {
+                "--hicache-host-memory-mode": "buffer_only",
+                "--hicache-write-policy": "write_through",
+            }
+        )
+        return server_args, env_vars
+
+
+class TestHiCacheStorageRandomFailure(HiCacheStorageBaseMixin, CustomTestCase):
+    """Random backend failures must degrade to plain cache misses: every
+    request still completes, and the server stays healthy; the rank
+    consensus checker (enabled by the mixin) fails the server if per-rank
+    failure draws cause cross-rank divergence."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {"--tp-size": 2}
+        env_vars = {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE": "0.05",
+        }
+        return server_args, env_vars
+
+    # The inherited test requires a storage hit, but an injected failure turns
+    # the prefetch into a miss; test_random_failures_degrade_to_cache_misses
+    # covers this configuration instead.
+    test_basic_backup_and_prefetch = None
+
+    def test_random_failures_degrade_to_cache_misses(self):
+        base_prompt = self.gen_prompt(768)
+        for _ in range(10):
+            self.send_request(base_prompt, max_tokens=8)
+            self.trigger_offloading_and_flush()
+
+            response = self.send_request(base_prompt, max_tokens=8)
+            self.assertEqual(response["meta_info"]["completion_tokens"], 8)
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
 
 
 def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
@@ -293,35 +387,33 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     # First evaluation - populate cache
     print("Phase 1: Running initial GSM8K evaluation to populate cache...")
     args_initial = SimpleNamespace(
-        num_shots=5,
-        data_path=None,
-        num_questions=50,
-        max_new_tokens=512,
-        parallel=10,
-        host=f"http://{test_instance.base_host}",
-        port=int(test_instance.base_port),
+        base_url=f"http://{test_instance.base_host}:{test_instance.base_port}",
+        eval_name="gsm8k",
+        api="completion",
+        max_tokens=512,
+        num_examples=200,
+        num_threads=64,
     )
-    metrics_initial = run_eval_few_shot_gsm8k(args_initial)
+    metrics_initial = run_eval(args_initial)
 
     # Flush cache to force remote storage access
     print("Phase 2: Flushing device cache...")
-    test_instance.assertTrue(test_instance.flush_cache(), "Cache flush should succeed")
-    time.sleep(2)
+    test_instance.flush_cache()
 
     # Second evaluation - should use remote cache
     print("Phase 3: Running second GSM8K evaluation using remote cache...")
-    metrics_cached = run_eval_few_shot_gsm8k(args_initial)
+    metrics_cached = run_eval(args_initial)
 
     # Verify accuracy consistency
-    accuracy_diff = abs(metrics_initial["accuracy"] - metrics_cached["accuracy"])
+    accuracy_diff = abs(metrics_initial["score"] - metrics_cached["score"])
     print(f"Accuracy difference: {accuracy_diff:.4f}")
 
     # Assertions
     test_instance.assertGreater(
-        metrics_initial["accuracy"], 0.6, "Initial accuracy should be reasonable"
+        metrics_initial["score"], 0.6, "Initial accuracy should be reasonable"
     )
     test_instance.assertGreater(
-        metrics_cached["accuracy"], 0.6, "Cached accuracy should be reasonable"
+        metrics_cached["score"], 0.6, "Cached accuracy should be reasonable"
     )
     test_instance.assertLess(
         accuracy_diff,

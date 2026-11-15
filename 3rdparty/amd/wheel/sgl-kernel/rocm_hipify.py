@@ -17,15 +17,16 @@ sources = [
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
+    "csrc/elementwise/deepseek_v4_topk.cu",
+    "csrc/elementwise/dsv4_norm_rope.cu",
     "csrc/elementwise/pos_enc.cu",
-    "csrc/elementwise/topk.cu",
+    # topk.hip is maintained as native HIP instead of being generated from topk.cu.
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/kvcacheio/transfer.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
-    "csrc/speculative/eagle_utils.cu",
 ]
 
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]

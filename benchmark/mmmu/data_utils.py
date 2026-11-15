@@ -75,22 +75,6 @@ CAT_SHORT2LONG = {
 }
 
 
-def get_multi_choice_info(options):
-    """
-    Given the list of options for multiple choice question
-    Return the index2ans and all_choices
-    """
-
-    start_chr = "A"
-    all_choices = []
-    index2ans = {}
-    for i, option in enumerate(options):
-        index2ans[chr(ord(start_chr) + i)] = option
-        all_choices.append(chr(ord(start_chr) + i))
-
-    return index2ans, all_choices
-
-
 def load_yaml(file_path):
     with open(file_path, "r") as stream:
         try:
@@ -140,33 +124,6 @@ def save_json(filename, ds):
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "w") as f:
         json.dump(ds, f, indent=4)
-
-
-def save_jsonl(filename, data):
-    """
-    Save a dictionary of data to a JSON Lines file with the filename as key and caption as value.
-
-    Args:
-        filename (str): The path to the file where the data should be saved.
-        data (dict): The dictionary containing the data to save where key is the image path and value is the caption.
-    """
-    with open(filename, "w", encoding="utf-8") as f:
-        for img_path, caption in data.items():
-            # Extract the base filename without the extension
-            base_filename = os.path.basename(img_path)
-            # Create a JSON object with the filename as the key and caption as the value
-            json_record = json.dumps({base_filename: caption}, ensure_ascii=False)
-            # Write the JSON object to the file, one per line
-            f.write(json_record + "\n")
-
-
-def save_args(args, path_dir):
-    argsDict = args.__dict__
-    with open(path_dir + "setting.txt", "w") as f:
-        f.writelines("------------------ start ------------------" + "\n")
-        for eachArg, value in argsDict.items():
-            f.writelines(eachArg + " : " + str(value) + "\n")
-        f.writelines("------------------- end -------------------")
 
 
 # DATA PROCESSING

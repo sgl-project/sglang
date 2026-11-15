@@ -1,0 +1,607 @@
+# Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/layernorm_gated.py
+# Copyright (c) 2024, Tri Dao.
+# Based on the Triton LayerNorm tutorial: https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
+# For the backward pass, we keep weight_grad and bias_grad in registers and accumulate.
+# This backward pass is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
+# The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
+
+
+from contextlib import nullcontext
+from functools import lru_cache
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+from einops import rearrange
+
+from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from sglang.srt.utils import (
+    cdiv,
+    cpu_has_amx_support,
+    device_context,
+    is_npu,
+    next_power_of_2,
+)
+
+_is_npu = is_npu()
+
+# Maximum rows per Triton block for layernorm gated kernel
+MAX_ROWS_PER_BLOCK = 4
+
+_GATE_ACTIVATION_FNS = {
+    "swish": F.silu,
+    "silu": F.silu,
+    "sigmoid": torch.sigmoid,
+}
+
+
+def _apply_gate(x, z, activation):
+    activation_fn = _GATE_ACTIVATION_FNS.get(activation)
+    if activation_fn is None:
+        raise ValueError(f"Unsupported gated RMSNorm activation: {activation}")
+    return x * activation_fn(z)
+
+
+def _reshape_native_input_for_gate(x, z):
+    if z is None:
+        return x, None
+    if x.ndim == z.ndim:
+        for x_size, z_size in zip(x.shape, z.shape):
+            torch._check(
+                x_size == z_size,
+                lambda: "Gated RMSNorm inputs must have matching shapes",
+            )
+        return x, None
+    if x.ndim != 2 or z.ndim != 3:
+        raise ValueError(f"Unsupported gated RMSNorm shapes: x={x.shape}, z={z.shape}")
+    torch._check(
+        z.shape[0] * z.shape[1] == x.shape[0],
+        lambda: "Gated RMSNorm gate rows must match the flattened input",
+    )
+    torch._check(
+        z.shape[2] == x.shape[1],
+        lambda: "Gated RMSNorm inputs must have the same hidden dimension",
+    )
+    return x.reshape(z.shape), x.shape
+
+
+def rms_norm_ref(
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    upcast=True,
+    activation="swish",
+):
+    dtype = x.dtype
+    N = x.shape[-1]
+    weight = weight.float()
+    bias = bias.float() if bias is not None else None
+    if upcast:
+        x = x.float()
+        z = z.float() if z is not None else z
+    if z is not None and not norm_before_gate:
+        x = _apply_gate(x, z, activation)
+    if group_size is None:
+        rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
+        out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
+    else:
+        x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
+        rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
+        out = rearrange(x_group * rstd, "... g d -> ... (g d)") * weight
+        if bias is not None:
+            out = out + bias
+    if z is not None and norm_before_gate:
+        out = _apply_gate(out, z, activation)
+    return out.to(dtype)
+
+
+@triton.jit
+def _layer_norm_fwd_1pass_kernel(
+    X,  # pointer to the input
+    Y,  # pointer to the output
+    W,  # pointer to the weights
+    B,  # pointer to the biases
+    Z,  # pointer to the other branch
+    Mean,  # pointer to the mean
+    Rstd,  # pointer to the 1/std
+    stride_x_row,  # how much to increase the pointer when moving by 1 row
+    stride_y_row,
+    stride_z_row,
+    stride_z_token,
+    stride_z_head,
+    M,  # number of rows in X
+    N: tl.constexpr,  # number of columns in X
+    eps,  # epsilon to avoid division by zero
+    BLOCK_N: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    Z_IS_3D: tl.constexpr,
+    Z_HEADS: tl.constexpr,
+    NORM_BEFORE_GATE: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+    Q=None,
+    S=None,
+    QUANT: tl.constexpr = False,
+):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
+    # Map the program id to the starting row of X and Y it should compute.
+    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    group = tl.program_id(1)
+
+    # Create 2D tile: [ROWS_PER_BLOCK, BLOCK_N]
+    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    cols = tl.arange(0, BLOCK_N)
+
+    # Compute offsets for 2D tile
+    row_offsets = rows[:, None] * stride_x_row
+    col_offsets = cols[None, :] + group * N
+
+    # Base pointers
+    X_base = X + row_offsets + col_offsets
+    Y_base = Y + rows[:, None] * stride_y_row + col_offsets
+
+    # Create mask for valid rows and columns
+    row_mask = rows[:, None] < M
+    col_mask = cols[None, :] < N
+    mask = row_mask & col_mask
+
+    # Load input data with 2D tile
+    x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
+
+    if HAS_Z and not NORM_BEFORE_GATE:
+        if Z_IS_3D:
+            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                rows[:, None] % Z_HEADS
+            ) * stride_z_head
+        else:
+            z_row_offsets = rows[:, None] * stride_z_row
+        Z_base = Z + z_row_offsets + col_offsets
+        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            x *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            x *= tl.sigmoid(z)
+
+    # Compute mean and variance per row (reduce along axis 1)
+    if not IS_RMS_NORM:
+        mean = tl.sum(x, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
+        # Store mean for each row
+        mean_offsets = group * M + rows
+        mean_mask = rows < M
+        tl.store(Mean + mean_offsets, mean, mask=mean_mask)
+        # Broadcast mean back to 2D for subtraction
+        xbar = tl.where(mask, x - mean[:, None], 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
+    else:
+        xbar = tl.where(mask, x, 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
+        mean = 0.0  # Placeholder for RMS norm
+
+    rstd = tl.rsqrt(var + eps)  # Shape: [ROWS_PER_BLOCK]
+
+    # Store rstd for each row
+    rstd_offsets = group * M + rows
+    rstd_mask = rows < M
+    tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
+
+    # Load weights and biases (broadcast across rows)
+    w_offsets = cols + group * N
+    w_mask = cols < N
+    w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+
+    if HAS_BIAS:
+        b = tl.load(B + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+
+    # Normalize and apply linear transformation
+    if not IS_RMS_NORM:
+        x_hat = (x - mean[:, None]) * rstd[:, None]
+    else:
+        x_hat = x * rstd[:, None]
+
+    y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
+
+    if HAS_Z and NORM_BEFORE_GATE:
+        if Z_IS_3D:
+            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                rows[:, None] % Z_HEADS
+            ) * stride_z_head
+        else:
+            z_row_offsets = rows[:, None] * stride_z_row
+        Z_base = Z + z_row_offsets + col_offsets
+        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            y *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            y *= tl.sigmoid(z)
+
+    if QUANT:  # the block is one token: per-token FP8 as _per_token_group_quant_8bit
+        y = tl.where(mask, y.to(Y.dtype.element_ty).to(tl.float32), 0.0)
+        y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
+        y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
+        tl.store(Q + rows[:, None] * N + col_offsets, y_q, mask=mask)
+        tl.store(S + tl.program_id(0), y_s)
+    else:
+        # Write output
+        tl.store(Y_base, y, mask=mask)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@lru_cache
+def _get_sm_count(device: torch.device) -> int:
+    """Get and cache the SM count for a given device."""
+    if device.type == "xpu":
+        assert torch.xpu.is_available(), "XPU device is not available"
+        return torch.xpu.get_device_properties(device).gpu_subslice_count
+    props = torch.cuda.get_device_properties(device)
+    return props.multi_processor_count
+
+
+def calc_rows_per_block(M: int, device: torch.device) -> int:
+    # Use a constant value when the row count must not affect kernel numerics.
+    if is_batch_invariant_mode_enabled() or check_cuda_graph_backend(
+        Phase.PREFILL, Backend.TC_PIECEWISE
+    ):
+        return MAX_ROWS_PER_BLOCK
+    sm_count = _get_sm_count(device)
+    rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
+    rows_per_block = min(rows_per_block, MAX_ROWS_PER_BLOCK)
+    return rows_per_block
+
+
+def _layer_norm_fwd(
+    x,
+    weight,
+    bias,
+    eps,
+    z=None,
+    out=None,
+    group_size=None,
+    norm_before_gate=True,
+    is_rms_norm=False,
+    activation: str = "swish",
+    quant_heads: int = 0,
+):
+    M, N = x.shape
+    if group_size is None:
+        group_size = N
+    assert N % group_size == 0
+    ngroups = N // group_size
+    assert x.stride(-1) == 1
+    z_is_3d = z is not None and z.ndim == 3
+    if z is not None:
+        assert z.stride(-1) == 1
+        if z_is_3d:
+            assert z.shape[0] * z.shape[1] == M
+            assert z.shape[2] == N
+        else:
+            assert z.shape == (M, N)
+    assert weight.shape == (N,)
+    assert weight.stride(-1) == 1
+    if bias is not None:
+        assert bias.stride(-1) == 1
+        assert bias.shape == (N,)
+    # allocate output
+    if out is not None:
+        assert out.shape == x.shape
+    else:
+        out = torch.empty_like(x)
+    assert out.stride(-1) == 1
+    mean = (
+        torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+        if not is_rms_norm
+        else None
+    )
+    rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+    # Less than 64KB per feature: enqueue fused kernel
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
+    if group_size > BLOCK_N:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    # heuristics for number of warps
+    num_warps = min(max(BLOCK_N // 256, 1), 8)
+    # Calculate rows per block based on SM count
+    rows_per_block = calc_rows_per_block(M, x.device)
+    quant = {}
+    # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
+    if quant_heads:
+        assert ngroups == 1 and M % quant_heads == 0
+        # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
+        num_warps = min(num_warps * quant_heads // rows_per_block, 16)
+        rows_per_block = quant_heads
+        q = torch.empty(
+            (M // quant_heads, quant_heads * N),
+            dtype=torch.float8_e4m3fn,
+            device=x.device,
+        )
+        s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
+        quant = {"Q": q, "S": s, "QUANT": True}
+    # Update grid to use rows_per_block
+    grid = (cdiv(M, rows_per_block), ngroups)
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
+    # in that release — it creates a DynamoConfigPatchProxy that
+    # SourcelessBuilder cannot wrap, causing a hard error under
+    # torch.compile(fullgraph=True).  The device context is a functional no-op
+    # for Triton kernel launches (device is determined by the tensor, not the
+    # surrounding context), so we simply skip it when Dynamo is tracing.
+    # PyTorch main already has the proper fix (XPUDeviceVariable registered in
+    # torch/_dynamo/variables/ctx_manager.py analogous to CUDADeviceVariable).
+    # TODO: remove this branch once we upgrade from PyTorch 2.12.
+    device_ctx = (
+        nullcontext()
+        if x.device.type == "xpu" and torch.compiler.is_compiling()
+        else device_context(x.device)
+    )
+    with device_ctx:
+        _layer_norm_fwd_1pass_kernel[grid](
+            x,
+            out,
+            weight,
+            bias,
+            z,
+            mean,
+            rstd,
+            x.stride(0),
+            out.stride(0),
+            z.stride(0) if z is not None and not z_is_3d else 0,
+            z.stride(0) if z_is_3d else 0,
+            z.stride(1) if z_is_3d else 0,
+            M,
+            group_size,
+            eps,
+            BLOCK_N=BLOCK_N,
+            ROWS_PER_BLOCK=rows_per_block,
+            HAS_BIAS=bias is not None,
+            HAS_Z=z is not None,
+            Z_IS_3D=z_is_3d,
+            Z_HEADS=z.shape[1] if z_is_3d else 1,
+            NORM_BEFORE_GATE=norm_before_gate,
+            IS_RMS_NORM=is_rms_norm,
+            num_warps=num_warps,
+            ACTIVATION=activation,
+            **pdl_kwargs,
+            **quant,
+        )
+    return ((q, s) if quant_heads else out), mean, rstd
+
+
+if _is_npu:
+    from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
+
+
+def rms_norm_gated(
+    *,
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    is_rms_norm=False,
+    activation: str = "swish",
+):
+    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+
+    x_shape_og = x.shape
+    # reshape input data into 2D tensor
+    x = x.reshape(-1, x.shape[-1])
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if z is not None:
+        if z.shape == x_shape_og:
+            z = z.reshape(-1, z.shape[-1])
+            if z.stride(-1) != 1:
+                z = z.contiguous()
+        else:
+            assert len(x_shape_og) == 2
+            assert z.ndim == 3
+            assert z.shape[0] * z.shape[1] == x.shape[0]
+            assert z.shape[2] == x.shape[1]
+            assert z.stride(-1) == 1
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+    if _is_npu:
+        assert activation == "swish", "NPU only supports swish activation"
+    y, mean, rstd = _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        z=z,
+        group_size=group_size,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=is_rms_norm,
+        activation=activation,
+    )
+    return y.reshape(x_shape_og)
+
+
+class LayerNormFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        weight,
+        bias,
+        z=None,
+        eps=1e-6,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+        activation: str = "swish",
+    ):
+        return rms_norm_gated(
+            x=x,
+            weight=weight,
+            bias=bias,
+            eps=eps,
+            z=z,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            is_rms_norm=is_rms_norm,
+            activation=activation,
+        )
+
+
+def layernorm_fn(
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    is_rms_norm=False,
+    activation: str = "swish",
+):
+    return LayerNormFn.apply(
+        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm, activation
+    )
+
+
+class LayerNorm(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-5,
+        group_size=None,
+        norm_before_gate=True,
+        device=None,
+        dtype=None,
+    ):
+        """If group_size is not None, we do GroupNorm with each group having group_size elements.
+        group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
+        """
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.bias = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.group_size = group_size
+        self.norm_before_gate = norm_before_gate
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.ones_(self.weight)
+        torch.nn.init.zeros_(self.bias)
+
+    def forward(self, x, z=None):
+        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        return layernorm_fn(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            group_size=self.group_size,
+            eps=self.eps,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=False,
+        )
+
+
+class RMSNorm(BaseFusedOp):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-5,
+        group_size=None,
+        norm_before_gate=True,
+        device=None,
+        dtype=None,
+        activation: str = "swish",
+    ):
+        """If group_size is not None, we do GroupNorm with each group having group_size elements.
+        group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
+        """
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.eps = eps
+        self.activation = activation
+        self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.register_parameter("bias", None)
+        self.group_size = group_size
+        self.norm_before_gate = norm_before_gate
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.ones_(self.weight)
+
+    def forward_native(self, x, z=None):
+        x, output_shape = _reshape_native_input_for_gate(x, z)
+
+        out = rms_norm_ref(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            activation=self.activation,
+        )
+        return out.reshape(output_shape) if output_shape is not None else out
+
+    def _torch_compile_forward(self, num_tokens: int) -> None:
+        return None
+
+    def forward_cpu(self, x, z=None):
+        if not cpu_has_amx_support():
+            return self.forward_native(x, z)
+        assert (
+            self.norm_before_gate
+            and self.group_size is None
+            and self.activation == "swish"
+        ), (
+            "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
+        )
+        return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(x, self.weight, z, self.eps)
+
+    def forward_triton(self, x, z=None):
+        return layernorm_fn(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.activation,
+        )
+
+    def forward_cuda(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_hip(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_npu(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_xpu(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_musa(self, x, z=None):
+        return self.forward_triton(x, z)

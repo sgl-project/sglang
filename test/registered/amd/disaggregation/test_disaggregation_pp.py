@@ -3,19 +3,39 @@ import time
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
     try_cached_model,
 )
 
-register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-35x-disaggregation-amd")
+register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
+
+_aux_tcp_ctx = None
+
+
+def setUpModule():
+    # Send aux data over TCP. Mooncake routes the host-memory aux buffers over
+    # RDMA between the two same-node servers, and that path intermittently
+    # stalls for 30 s under PP (#45849). KV still goes through Mooncake.
+    global _aux_tcp_ctx
+    _aux_tcp_ctx = envs.SGLANG_MOONCAKE_SEND_AUX_TCP.override(True)
+    _aux_tcp_ctx.__enter__()
+
+
+def tearDownModule():
+    _aux_tcp_ctx.__exit__(None, None, None)
+
+
+# Mooncake's same-node RDMA aux send stalls about once per run and 500s a few
+# requests; drop once https://github.com/sgl-project/sglang/issues/45849 is fixed.
+MAX_REQUEST_ERRORS = 5
 
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
@@ -33,7 +53,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = try_cached_model("Qwen/Qwen3-8B")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -51,6 +71,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -73,6 +95,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--base-gpu-id",
@@ -95,7 +119,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            max_request_errors=MAX_REQUEST_ERRORS,
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval(args)
@@ -122,7 +147,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = try_cached_model("Qwen/Qwen3-8B")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -140,6 +165,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -163,6 +190,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--base-gpu-id",
@@ -185,7 +214,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            max_request_errors=MAX_REQUEST_ERRORS,
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval(args)
@@ -212,7 +242,7 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = try_cached_model("Qwen/Qwen3-8B")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -230,6 +260,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -252,6 +284,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -276,7 +310,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            max_request_errors=MAX_REQUEST_ERRORS,
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval(args)

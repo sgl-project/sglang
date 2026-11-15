@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: Apache-2.0
+
+COSMOS3_LIDAR_VALIDITY_THRESHOLD = 0.5

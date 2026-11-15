@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -71,7 +72,7 @@ class TestFp8KvcacheLlama(TestFp8KvcacheBase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
 
 
@@ -106,7 +107,7 @@ class TestFp8KvcacheQwen(TestFp8KvcacheBase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.3)
 
 

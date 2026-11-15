@@ -72,9 +72,9 @@ def rpd_to_chrome_trace(
         raise Exception("Trace file is empty.")
 
     print("Timestamps:")
-    print(f"\t    first: \t{min_time/1000} us")
-    print(f"\t     last: \t{max_time/1000} us")
-    print(f"\t duration: \t{(max_time-min_time) / 1000000000} seconds")
+    print(f"\t    first: \t{min_time / 1000} us")
+    print(f"\t     last: \t{max_time / 1000} us")
+    print(f"\t duration: \t{(max_time - min_time) / 1000000000} seconds")
 
     start_time = min_time / 1000
     end_time = max_time / 1000
@@ -114,7 +114,7 @@ def rpd_to_chrome_trace(
         )
 
     print("\nFilter: %s" % (rangeStringApi))
-    print(f"Output duration: {(end_time-start_time)/1000000} seconds")
+    print(f"Output duration: {(end_time - start_time) / 1000000} seconds")
 
     # Output Ops
 
@@ -314,37 +314,6 @@ def rpd_to_chrome_trace(
     except:
         print("Did not find SMI data")
 
-    # Create the (global) memory counter
-    """
-    sizes = {}    # address -> size
-    totalSize = 0
-    exp = re.compile("^ptr\((.*)\)\s+size\((.*)\)$")
-    exp2 = re.compile("^ptr\((.*)\)$")
-    for row in connection.execute("SELECT rocpd_api.end/1000.0 as ts, B.string, '1'  FROM rocpd_api INNER JOIN rocpd_string A ON A.id=rocpd_api.apiName_id INNER JOIN rocpd_string B ON B.id=rocpd_api.args_id WHERE A.string='hipFree' UNION ALL SELECT rocpd_api.start/1000.0, B.string, '0' FROM rocpd_api INNER JOIN rocpd_string A ON A.id=rocpd_api.apiName_id INNER JOIN rocpd_string B ON B.id=rocpd_api.args_id WHERE A.string='hipMalloc' ORDER BY ts asc"):
-        try:
-            if row[2] == '0':  #malloc
-                m = exp.match(row[1])
-                if m:
-                    size = int(m.group(2), 16)
-                    totalSize = totalSize + size
-                    sizes[m.group(1)] = size
-                    outfile.write(',{"pid":"0","name":"Allocated Memory","ph":"C","ts":%s,"args":{"depth":%s}}\n'%(row[0],totalSize))
-            else:              #free
-                m = exp2.match(row[1])
-                if m:
-                    try:    # Sometimes free addresses are not valid or listed
-                        size = sizes[m.group(1)]
-                        sizes[m.group(1)] = 0
-                        totalSize = totalSize - size;
-                        outfile.write(',{"pid":"0","name":"Allocated Memory","ph":"C","ts":%s,"args":{"depth":%s}}\n'%(row[0],totalSize))
-                    except KeyError:
-                        pass
-        except ValueError:
-            outfile.write("")
-    if T_end > 0:
-        outfile.write(',{"pid":"0","name":"Allocated Memory","ph":"C","ts":%s,"args":{"depth":%s}}\n'%(T_end,totalSize))
-    """
-
     # Create "faux calling stack frame" on gpu ops traceS
     stacks = {}  # Call stacks built from UserMarker entres.     Key is 'pid,tid'
     currentFrame = {}  # "Current GPU frame" (id, name, start, end).    Key is 'pid,tid'
@@ -368,11 +337,11 @@ def rpd_to_chrome_trace(
             if row[0] == "0":  # Frame start
                 if key not in stacks:
                     stacks[key] = []
-                stack = stacks[key].append((row[1], row[4]))
+                stacks[key].append((row[1], row[4]))
                 # print(f"0: new api frame: pid_tid={key} -> stack={stacks}")
 
             elif row[0] == "1":  # Frame end
-                completed = stacks[key].pop()
+                stacks[key].pop()
                 # print(f"1: end api frame: pid_tid={key} -> stack={stacks}")
 
             elif row[0] == "2":  # API + Op
@@ -400,8 +369,6 @@ def rpd_to_chrome_trace(
                                 or abs(gpuFrame.start - row[8]) < 200
                             )
                         ):
-                            # if gpuFrame.id == frame[0] and gpuFrame.name == frame[1]:    # Another op under the same frame -> union them
-                            # if False:   # Turn off frame joining
                             if row[7] < gpuFrame.start:
                                 gpuFrame.start = row[7]
                             if row[8] > gpuFrame.end:

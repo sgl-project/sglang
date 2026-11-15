@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Callable, Optional
+from multiprocessing import Process
+from typing import Callable, List, Optional
 
 import psutil
 
-from sglang.srt.utils.common import pyspy_dump_schedulers
+from sglang.srt.environ import envs
+from sglang.srt.utils.cudacore_pyspy_dump_utils import (
+    allow_pyspy_attach,
+    pyspy_dump_schedulers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +30,9 @@ class Watchdog:
         test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
-            assert (
-                test_stuck_time == 0
-            ), f"stuck tester can be enabled only if soft watchdog is enabled."
+            assert test_stuck_time == 0, (
+                "stuck tester can be enabled only if soft watchdog is enabled."
+            )
             return _WatchdogNoop()
         return _WatchdogReal(
             debug_name=debug_name,
@@ -107,6 +113,7 @@ class WatchdogRaw:
         watchdog_timeout: float,
         soft: bool = False,
         dump_info: Optional[Callable[[], str]] = None,
+        before_crash: Optional[Callable[[], None]] = None,
     ):
         self.debug_name = debug_name
         self.get_counter = get_counter
@@ -114,8 +121,15 @@ class WatchdogRaw:
         self.watchdog_timeout = watchdog_timeout
         self.soft = soft
         self.dump_info = dump_info
+        # Runs on a (non-soft) timeout before the parent is told to kill the
+        # process tree; this thread runs even while the stuck main thread is
+        # blocked in C with the GIL released.
+        self.before_crash = before_crash
 
         self.parent_process = psutil.Process().parent()
+        # CI containers lack CAP_SYS_PTRACE, so py-spy cannot attach without this.
+        if envs.SGLANG_IS_IN_CI.get():
+            allow_pyspy_attach()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
         t.start()
 
@@ -156,6 +170,74 @@ class WatchdogRaw:
         print(file=sys.stdout, flush=True)
 
         if not self.soft:
+            if self.before_crash is not None:
+                try:
+                    self.before_crash()
+                except BaseException:  # e.g. a Rust panic; SIGQUIT must still go
+                    logger.exception(f"{self.debug_name} watchdog: before_crash failed")
             # Wait for some time so that the parent process can print the error.
             time.sleep(5)
             self.parent_process.send_signal(signal.SIGQUIT)
+
+
+class SubprocessWatchdog:
+    """Monitors subprocess liveness and triggers SIGQUIT when a crash is detected.
+
+    When a subprocess crashes (e.g., NCCL timeout causing C++ std::terminate()),
+    Python exception handlers never run, leaving the main process as a zombie
+    service. This watchdog polls subprocess liveness in a daemon thread and
+    sends SIGQUIT to trigger proper cleanup.
+
+    See: https://github.com/sgl-project/sglang/issues/18421
+    """
+
+    def __init__(
+        self,
+        processes: List[Process],
+        process_names: Optional[List[str]] = None,
+        interval: float = 1.0,
+    ):
+        self._processes = processes
+        self._names = process_names or [f"process_{i}" for i in range(len(processes))]
+        self._interval = interval
+        self._stop_event = threading.Event()
+        self._stop_lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None or not self._processes:
+            return
+        self._thread = threading.Thread(
+            target=self._monitor_loop, daemon=True, name="subprocess-watchdog"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop monitoring; safe to call from several threads at once."""
+        self._stop_event.set()
+        with self._stop_lock:
+            thread, self._thread = self._thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self._interval * 2)
+
+    def _monitor_loop(self) -> None:
+        try:
+            while not self._stop_event.wait(self._interval):
+                if self._check_processes():
+                    return
+        except Exception as e:
+            logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
+
+    def _check_processes(self) -> bool:
+        for proc, name in zip(self._processes, self._names):
+            if proc.is_alive() or proc.exitcode == 0:
+                continue
+
+            logger.error(
+                f"Subprocess {name} (pid={proc.pid}) crashed "
+                f"with exit code {proc.exitcode}. "
+                f"Triggering SIGQUIT for cleanup..."
+            )
+            os.kill(os.getpid(), signal.SIGQUIT)
+            return True
+        return False

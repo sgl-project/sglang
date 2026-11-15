@@ -85,7 +85,7 @@ def sample_openai_requests(
         # This includes the messages but not the tools
         prompt_len = len(
             tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
+                messages, tokenize=True, add_generation_prompt=True, return_dict=False
             )
         )
 
@@ -97,7 +97,7 @@ def sample_openai_requests(
             tools_tokens = len(tokenizer.encode(tools_str))
             prompt_len += tools_tokens
 
-        # Pass messages list directly - bench_serving handles List[Dict] prompts
+        # Pass messages list directly - the serving benchmark handles List[Dict] prompts
         filtered_dataset.append(
             DatasetRow(
                 prompt=messages,

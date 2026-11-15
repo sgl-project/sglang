@@ -58,9 +58,9 @@ completion_templates: dict[str, CompletionTemplate] = {}
 def register_completion_template(template: CompletionTemplate, override: bool = False):
     """Register a new completion template."""
     if not override:
-        assert (
-            template.name not in completion_templates
-        ), f"{template.name} has been registered."
+        assert template.name not in completion_templates, (
+            f"{template.name} has been registered."
+        )
 
     completion_templates[template.name] = template
 
@@ -73,11 +73,6 @@ def set_completion_template(template_name: str) -> None:
     global completion_template_name
     if completion_template_name is None:
         completion_template_name = template_name
-
-
-def is_completion_template_defined() -> bool:
-    global completion_template_name
-    return completion_template_name is not None
 
 
 def generate_completion_prompt_from_request(request: CompletionRequest) -> str:
