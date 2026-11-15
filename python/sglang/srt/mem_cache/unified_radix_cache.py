@@ -3545,12 +3545,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def _drain_backup():
             drained = 0
+            native_acks = []
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
                 if operation.id in self._native_storage_write_results:
-                    self._native_storage_write_results[operation.id] = (
-                        operation.completed_tokens
-                    )
+                    native_acks.append((operation.id, operation.completed_tokens))
                 if buffer_mode:
                     # Storage write acked: free the staging.
                     self.buffer_pipeline.finish_storage_write_ack(operation.id)
@@ -3567,6 +3566,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+            if native_acks:
+                # The queue drain already agrees on the number and order of
+                # backup ACKs. Before allowing a host move to reclaim pages,
+                # agree on the prefix written by every shard.
+                completed = [tokens for _, tokens in native_acks]
+                if log_metrics and self.tp_world_size > 1:
+                    coverage = torch.tensor(completed, dtype=torch.int64, device="cpu")
+                    self._all_reduce(coverage, torch.distributed.ReduceOp.MIN)
+                    completed = coverage.tolist()
+                for (operation_id, _), tokens in zip(native_acks, completed):
+                    self._native_storage_write_results[operation_id] = tokens
             return drained
 
         def _drain_release():
