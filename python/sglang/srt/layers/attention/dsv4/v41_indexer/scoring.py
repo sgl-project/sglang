@@ -25,10 +25,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
-from sglang.kernels.ops.attention.dsv4.topk import (
-    plan_topk_v2,
-    topk_transform_paged_v2,
-)
+from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import async_h2d
@@ -38,6 +35,8 @@ from .types import DecodeInputs, PrefillInputs, RowShard
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    from .selector import TopKSelector
 
 # TODO: use a per-forward mqa_logits_budget_bytes() budget that also
 # leaves room for candidate block ids and block-selection scratch.
@@ -316,32 +315,6 @@ def score_tiles(
     )
 
 
-def topk_ragged(
-    logits: torch.Tensor,
-    lens: torch.Tensor,
-    *,
-    out: torch.Tensor,
-    offsets: torch.Tensor,
-) -> None:
-    """Top-k of each row's first ``lens`` columns plus ``offsets`` into ``out``,
-    ``-1`` padded, unordered: DeepSelect for bf16 logits, top-k v2 for fp32."""
-    if logits.dtype == torch.bfloat16:
-        from sglang.kernels.ops.attention.deep_select import topk
-
-        topk(
-            logits,
-            out.shape[1],
-            end=lens,
-            output_idx=out,
-            output_idx_offset=offsets,
-            idx_oob_fill_value=-1,
-        )
-        return
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
-
-    topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
-
-
 def select_prefill_block_ids(
     logits: torch.Tensor,
     lens: torch.Tensor,
@@ -349,6 +322,7 @@ def select_prefill_block_ids(
     out: torch.Tensor,
     *,
     offsets: torch.Tensor,
+    selector: TopKSelector,
 ) -> None:
     """Select size-8 blocks by their maximum score, keeping the newest block."""
     width = (logits.shape[1] + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
@@ -356,7 +330,7 @@ def select_prefill_block_ids(
         (logits.shape[0], (width + 3) // 4 * 4), dtype=torch.float32
     )
     amax8_varlen(logits, lens, out=keys)
-    topk_ragged(keys, nblocks, out=out, offsets=offsets)
+    selector.ragged(keys, nblocks, out=out, offsets=offsets)
 
 
 def dense_prefill_topk(
@@ -364,6 +338,7 @@ def dense_prefill_topk(
     kv: Tuple[torch.Tensor, torch.Tensor],
     *,
     out: torch.Tensor,
+    selector: TopKSelector,
 ) -> None:
     """Request-local compressed positions of the data's query rows into
     ``out``, one ``out`` row per scored row, ``-1`` padded, unordered."""
@@ -371,7 +346,7 @@ def dense_prefill_topk(
     # Score columns are request-relative, so a zero offset emits request-local positions.
     zero_offsets = torch.zeros_like(lens)
     for tile, logits in score_tiles(data, kv):
-        topk_ragged(logits, lens[tile], out=out[tile], offsets=zero_offsets[tile])
+        selector.ragged(logits, lens[tile], out=out[tile], offsets=zero_offsets[tile])
         # Free this tile's logits before the generator scores the next one.
         del logits
 
@@ -382,12 +357,15 @@ def sharded_dense_prefill_topk(
     *,
     out: torch.Tensor,
     shard: RowShard,
+    selector: TopKSelector,
 ) -> None:
     """``dense_prefill_topk`` over this rank's share of the rows, all-gathered
     into ``out`` for every row."""
     num_rows = data.num_rows
     local = out.new_full((shard.rows_per_rank(num_rows), out.shape[1]), -1)
-    dense_prefill_topk(data.narrow(shard.local_rows(num_rows)), kv, out=local)
+    dense_prefill_topk(
+        data.narrow(shard.local_rows(num_rows)), kv, out=local, selector=selector
+    )
     out.copy_(shard.gather(local, num_rows))
 
 
@@ -673,13 +651,16 @@ def decode_scores(
 
 
 def select_decode(
-    inputs: DecodeInputs, d: DecodeScores | PagedDecodeScores, topk: int
+    inputs: DecodeInputs,
+    d: DecodeScores | PagedDecodeScores,
+    topk: int,
+    *,
+    selector: TopKSelector,
 ) -> None:
     k = min(topk, d.lmax)
     if isinstance(d, PagedDecodeScores):
-        assert d.plan is not None, "paged select_decode needs the top-k v2 plan"
         idx = torch.empty((d.bs, k), dtype=torch.int32, device=d.scores.device)
-        topk_transform_paged_v2(d.scores, d.lens, None, idx, 1, d.plan)
+        selector.raw(d.scores, d.lens, out=idx, plan=d.plan)
         finish_paged_indexer_topk(
             idx,
             d.scores,
@@ -692,7 +673,7 @@ def select_decode(
             d.has_candidate_mask,
         )
     else:
-        write_decode(inputs, d, d.scores.topk(k, dim=-1, sorted=False).indices)
+        write_decode(inputs, d, selector.dense(d.scores, k)[1])
 
 
 def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> None:

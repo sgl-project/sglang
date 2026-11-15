@@ -19,7 +19,10 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
 from sglang.kernels.ops.quantization.fp4_to_fp8 import widen_fp4_to_fp8
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.v41_indexer import (
+    TopKSelector,
     dense_blocks,
     scoring,
     sparse_table,
@@ -82,9 +85,11 @@ def prefill_data(inputs):
     )
 
 
-def run_dense(inputs, *, publish_candidates, candidates):
+def run_dense(inputs, *, publish_candidates, candidates, selector=None):
     """The plain top-k, or the CP source's own top-k plus its candidate blocks
     (`publish_candidates`), or a CP consumer's top-k among `candidates`."""
+    if selector is None:
+        selector = TopKSelector(DSATopKBackend.SGL_KERNEL)
     data = prefill_data(inputs)
     if publish_candidates:
         selected, blocks = dense_blocks._publish_prefill_blocks(
@@ -93,9 +98,11 @@ def run_dense(inputs, *, publish_candidates, candidates):
             topk=inputs["topk"],
             topk_blocks=inputs["candidate_topk_blocks"],
             block_size=inputs["candidate_block_size"],
+            selector=selector,
         )
         return selected, dense_blocks.BlockIds(
-            blocks=blocks, rows_per_request=data.rows_per_request
+            blocks=selector.order_candidates(blocks),
+            rows_per_request=data.rows_per_request,
         )
     if candidates is not None:
         selected = dense_blocks._consume_prefill_blocks(
@@ -104,6 +111,7 @@ def run_dense(inputs, *, publish_candidates, candidates):
             topk=inputs["topk"],
             blocks=candidates.blocks,
             block_size=inputs["candidate_block_size"],
+            topk_op=selector.dense,
         )
         return selected, None
     # The plain top-k writes request-local positions into a -1 filled buffer;
@@ -114,7 +122,7 @@ def run_dense(inputs, *, publish_candidates, candidates):
         dtype=torch.int32,
         device="cuda",
     )
-    scoring.dense_prefill_topk(data, inputs["kv"], out=local)
+    scoring.dense_prefill_topk(data, inputs["kv"], out=local, selector=selector)
     starts = data.request_starts[:, None]
     return torch.where(local >= 0, local + starts, local), None
 
@@ -258,114 +266,163 @@ class TestDensePrefillIndexer(CustomTestCase):
             ).all()
         )
 
+    def assert_first_positions(self, inputs, selected):
+        """With every score tied, a small tie-break keeps each row's first positions."""
+        rows = zip(
+            selected.tolist(), inputs["lengths"].tolist(), inputs["starts"].tolist()
+        )
+        for r, (picked, length, start) in enumerate(rows):
+            want = {start + p for p in range(min(inputs["topk"], length))}
+            self.assertEqual(set(picked) - {-1}, want, f"row {r}")
+
+    def assert_first_blocks(self, inputs, candidates):
+        """With every score tied, a small tie-break keeps the newest block and the
+        lowest-numbered others."""
+        block, topk_blocks = (
+            inputs["candidate_block_size"],
+            inputs["candidate_topk_blocks"],
+        )
+        rows = zip(candidates.blocks.tolist(), inputs["lengths"].tolist())
+        for r, (picked, length) in enumerate(rows):
+            nblocks = -(-length // block)
+            kept = min(topk_blocks, nblocks)
+            want = set(range(kept - 1)) | {nblocks - 1} if kept else set()
+            self.assertEqual(set(picked) - {-1}, want, f"row {r}")
+
+    def check_source_consumer_and_replay(
+        self, *, ratio, zero_queries, selector, ties_keep_first=False
+    ):
+        inputs = make_inputs(
+            [(0, 0), (1, 1), (33, 511), (257, 4097)],
+            ratio=ratio,
+            zero_queries=zero_queries,
+        )
+        inputs["candidate_topk_blocks"] = 128
+        scores = dense_scores(inputs)
+        consumer_inputs = make_inputs(
+            inputs["request_lengths"],
+            ratio=ratio,
+            zero_queries=zero_queries,
+            seed=29,
+        )
+        consumer_inputs["kv"] = inputs["kv"]
+        consumer_inputs["candidate_topk_blocks"] = 128
+        consumer_scores = dense_scores(consumer_inputs)
+        with patch.object(scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", 128 << 10):
+            selected, candidates = run_dense(
+                inputs, publish_candidates=True, candidates=None, selector=selector
+            )
+            self.assert_topk(inputs, selected, scores)
+            if ties_keep_first:
+                self.assert_first_positions(inputs, selected)
+                self.assert_first_blocks(inputs, candidates)
+            row = 0
+            for (queries, context), blocks in zip(
+                inputs["request_lengths"],
+                request_blocks(inputs, candidates),
+            ):
+                local = scores[row : row + queries, :context]
+                if queries and context:
+                    padded = torch.nn.functional.pad(
+                        local, (0, -context % 8), value=-torch.inf
+                    )
+                    block_scores = padded.unflatten(-1, (-1, 8)).amax(-1)
+                    last = (inputs["lengths"][row : row + queries] - 1) // 8
+                    block_scores.masked_fill_(
+                        torch.arange(block_scores.shape[1], device="cuda")[None, :]
+                        == last[:, None],
+                        torch.inf,
+                    )
+                    chosen_scores = block_scores.gather(
+                        1, blocks.long().clamp_min(0)
+                    ).masked_fill(blocks < 0, -torch.inf)
+                    torch.testing.assert_close(
+                        chosen_scores.sort(descending=True).values,
+                        block_scores.topk(blocks.shape[1]).values,
+                        rtol=1e-5,
+                        atol=1e-5,
+                    )
+                    columns = torch.arange(context, device="cuda")
+                    member = (columns[None, :, None] // 8 == blocks[:, None, :]).any(-1)
+                    consumer_scores[row : row + queries, :context].masked_fill_(
+                        ~member,
+                        -torch.inf,
+                    )
+                row += queries
+            self.assertGreater(
+                torch.isfinite(consumer_scores[-1]).sum().item(),
+                inputs["topk"],
+            )
+            self.assertLess(
+                torch.isfinite(consumer_scores[-1]).sum().item(),
+                inputs["lengths"][-1].item(),
+            )
+            selected, published = run_dense(
+                consumer_inputs,
+                publish_candidates=False,
+                candidates=candidates,
+                selector=selector,
+            )
+            self.assertIsNone(published)
+            self.assert_topk(consumer_inputs, selected, consumer_scores)
+            if ties_keep_first:
+                self.assert_first_positions(consumer_inputs, selected)
+            tail_lengths = [0, 0, 7, 31]
+            rows, row = [], 0
+            for (queries, _), tail in zip(inputs["request_lengths"], tail_lengths):
+                rows.extend(range(row + queries - tail, row + queries))
+                row += queries
+            rows = torch.tensor(rows, dtype=torch.int64, device="cuda")
+            tail_inputs = dict(
+                consumer_inputs,
+                q=tuple(t[rows] for t in consumer_inputs["q"]),
+                weights=consumer_inputs["weights"][rows],
+                starts=inputs["starts"][rows],
+                lengths=inputs["lengths"][rows],
+                request_lengths=list(
+                    zip(
+                        tail_lengths,
+                        [n for _, n in inputs["request_lengths"]],
+                    )
+                ),
+            )
+            selected, _ = run_dense(
+                tail_inputs,
+                publish_candidates=False,
+                candidates=candidates.tail(tail_lengths),
+                selector=selector,
+            )
+            self.assert_topk(tail_inputs, selected, consumer_scores[rows])
+            if ties_keep_first:
+                self.assert_first_positions(tail_inputs, selected)
+
     def test_ragged_source_consumer_and_replay(self):
         for ratio in (1, 2):
             for zero_queries in (False, True):
                 with self.subTest(ratio=ratio, zero_queries=zero_queries):
-                    inputs = make_inputs(
-                        [(0, 0), (1, 1), (33, 511), (257, 4097)],
+                    self.check_source_consumer_and_replay(
                         ratio=ratio,
                         zero_queries=zero_queries,
+                        selector=TopKSelector(DSATopKBackend.SGL_KERNEL),
                     )
-                    inputs["candidate_topk_blocks"] = 128
-                    scores = dense_scores(inputs)
-                    consumer_inputs = make_inputs(
-                        inputs["request_lengths"],
-                        ratio=ratio,
+
+    def test_flashinfer_source_consumer_and_replay(self):
+        """The same protocol under FlashInfer's fused and unfused top-k with a small
+        index tie-break; zero queries tie every score, so the source's blocks and
+        every top-k must be the lowest logical ones."""
+        for fused in (True, False):
+            for zero_queries in (False, True):
+                with (
+                    self.subTest(fused=fused, zero_queries=zero_queries),
+                    envs.SGLANG_DSA_FUSE_TOPK.override(fused),
+                    envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
+                ):
+                    self.check_source_consumer_and_replay(
+                        ratio=1,
                         zero_queries=zero_queries,
-                        seed=29,
+                        selector=TopKSelector(DSATopKBackend.FLASHINFER),
+                        ties_keep_first=zero_queries,
                     )
-                    consumer_inputs["kv"] = inputs["kv"]
-                    consumer_inputs["candidate_topk_blocks"] = 128
-                    consumer_scores = dense_scores(consumer_inputs)
-                    with patch.object(
-                        scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", 128 << 10
-                    ):
-                        selected, candidates = run_dense(
-                            inputs, publish_candidates=True, candidates=None
-                        )
-                        self.assert_topk(inputs, selected, scores)
-                        row = 0
-                        for (queries, context), blocks in zip(
-                            inputs["request_lengths"],
-                            request_blocks(inputs, candidates),
-                        ):
-                            local = scores[row : row + queries, :context]
-                            if queries and context:
-                                padded = torch.nn.functional.pad(
-                                    local, (0, -context % 8), value=-torch.inf
-                                )
-                                block_scores = padded.unflatten(-1, (-1, 8)).amax(-1)
-                                last = (inputs["lengths"][row : row + queries] - 1) // 8
-                                block_scores.masked_fill_(
-                                    torch.arange(block_scores.shape[1], device="cuda")[
-                                        None, :
-                                    ]
-                                    == last[:, None],
-                                    torch.inf,
-                                )
-                                chosen_scores = block_scores.gather(
-                                    1, blocks.long().clamp_min(0)
-                                ).masked_fill(blocks < 0, -torch.inf)
-                                torch.testing.assert_close(
-                                    chosen_scores.sort(descending=True).values,
-                                    block_scores.topk(blocks.shape[1]).values,
-                                    rtol=1e-5,
-                                    atol=1e-5,
-                                )
-                                columns = torch.arange(context, device="cuda")
-                                member = (
-                                    columns[None, :, None] // 8 == blocks[:, None, :]
-                                ).any(-1)
-                                consumer_scores[
-                                    row : row + queries, :context
-                                ].masked_fill_(
-                                    ~member,
-                                    -torch.inf,
-                                )
-                            row += queries
-                        self.assertGreater(
-                            torch.isfinite(consumer_scores[-1]).sum().item(),
-                            inputs["topk"],
-                        )
-                        self.assertLess(
-                            torch.isfinite(consumer_scores[-1]).sum().item(),
-                            inputs["lengths"][-1].item(),
-                        )
-                        selected, published = run_dense(
-                            consumer_inputs,
-                            publish_candidates=False,
-                            candidates=candidates,
-                        )
-                        self.assertIsNone(published)
-                        self.assert_topk(consumer_inputs, selected, consumer_scores)
-                        tail_lengths = [0, 0, 7, 31]
-                        rows, row = [], 0
-                        for (queries, _), tail in zip(
-                            inputs["request_lengths"], tail_lengths
-                        ):
-                            rows.extend(range(row + queries - tail, row + queries))
-                            row += queries
-                        rows = torch.tensor(rows, dtype=torch.int64, device="cuda")
-                        tail_inputs = dict(
-                            consumer_inputs,
-                            q=tuple(t[rows] for t in consumer_inputs["q"]),
-                            weights=consumer_inputs["weights"][rows],
-                            starts=inputs["starts"][rows],
-                            lengths=inputs["lengths"][rows],
-                            request_lengths=list(
-                                zip(
-                                    tail_lengths,
-                                    [n for _, n in inputs["request_lengths"]],
-                                )
-                            ),
-                        )
-                        selected, _ = run_dense(
-                            tail_inputs,
-                            publish_candidates=False,
-                            candidates=candidates.tail(tail_lengths),
-                        )
-                        self.assert_topk(tail_inputs, selected, consumer_scores[rows])
 
     def test_unfiltered_and_zero_length_requests(self):
         for request_lengths in ([(257, 8192)], [(1, 0), (1, 1), (0, 7)]):
@@ -430,6 +487,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                 nblocks=nblocks,
                 out_positions=positions,
                 out_blocks=blocks,
+                selector=TopKSelector(DSATopKBackend.SGL_KERNEL),
             )
         selected = torch.where(
             positions >= 0, positions + data.request_starts[:, None], -1
@@ -501,6 +559,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                     use_deep_gemm_publish=True,
                     use_deep_gemm_consume=False,
                     use_sm90_deep_gemm_consume=True,
+                    selector=TopKSelector(DSATopKBackend.SGL_KERNEL),
                 )
                 with patch.object(
                     scoring,

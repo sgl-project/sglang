@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 from sglang.srt.environ import envs
 
 from .full_topk import FullTopKIndexer
+from .selector import TopKSelector
 from .types import (
     CandidateMetadata,
     CapturedPrefillInputs,
@@ -41,6 +42,7 @@ __all__ = [
     "PrefillCandidates",
     "PrefillInputs",
     "RowShard",
+    "TopKSelector",
     "has_dense_fp4_indexer",
     "is_sm100",
     "is_sm100_or_newer",
@@ -94,11 +96,14 @@ def make_full_topk_indexer(
     req_to_token: torch.Tensor,
     index_heads: int,
     index_topk: int,
+    selector: TopKSelector,
 ) -> FullTopKIndexer:
     # Prefill top-k from the sampled-threshold fp4 indexer (kernels/ops/attention/dsa/litetopk_prefill) where it
     # reproduces the DeepGEMM path: bf16 head weights, 32 or 64 index heads, a supported top-k.
+    # It fuses its own selection, so another top-k backend keeps the dense path.
     use_prefill_lite_topk = (
-        envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
+        selector.backend.is_sgl_kernel()
+        and envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
         and _use_deep_gemm_prefill()
         and is_fp4_indexer_supported()
         and index_weights_dtype() == torch.bfloat16
@@ -110,6 +115,7 @@ def make_full_topk_indexer(
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill() or _use_sm90_prefill_scores(),
         use_deep_gemm_decode=is_sm100_or_newer(),
+        selector=selector,
         use_prefill_lite_topk=use_prefill_lite_topk,
     )
 
@@ -121,6 +127,7 @@ def make_candidate_indexer(
     page_size: int,
     candidate_topk_blocks: int,
     candidate_block_size: int,
+    selector: TopKSelector,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
     from sglang.srt.runtime_context import get_parallel
 
@@ -140,6 +147,7 @@ def make_candidate_indexer(
             and candidate_block_size == CANDIDATE_BLOCK_SIZE
             and envs.SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL.get()
         ),
+        selector=selector,
     )
     # Without candidate blocks no layer is a candidate source or consumer.
     # Stays strict SM100 on purpose: the sparse-table path needs DeepGEMM's
@@ -165,6 +173,7 @@ def make_candidate_indexer(
         page_size=page_size,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
+        selector=selector,
     )
     # A CP rank's rows are an interleaved subset of the batch, and without the dense
     # fp4 indexer prefill scores on torch: both keep the sparse table on decode only.

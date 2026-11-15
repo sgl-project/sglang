@@ -10,7 +10,6 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-    amax_topk_blocks,
     candidate_row_lens,
 )
 from sglang.kernels.ops.attention.dsv4.candidate_table import (
@@ -21,14 +20,6 @@ from sglang.kernels.ops.attention.dsv4.candidate_table import (
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
     sparse_logits,
-)
-from sglang.kernels.ops.attention.dsv4.topk import (
-    topk_transform_paged_v2,
-    topk_transform_sparse,
-)
-from sglang.srt.layers.attention.dsv4.indexer import (
-    topk_transform_paged_bf16,
-    topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.utils.device import async_h2d
@@ -42,7 +33,6 @@ from .scoring import (
     quantize_index_q,
     score_tiles,
     select_prefill_block_ids,
-    topk_ragged,
 )
 from .types import (
     CandidateMetadata,
@@ -55,6 +45,8 @@ from .types import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    from .selector import TopKSelector
 
 
 class _SparseTable(CandidateMetadata, msgspec.Struct):
@@ -123,11 +115,13 @@ class SparseTableBackend:
         page_size: int,
         candidate_topk_blocks: int,
         candidate_block_size: int,
+        selector: TopKSelector,
     ) -> None:
         assert candidate_block_size == CANDIDATE_BLOCK_SIZE
         self.token_to_kv_pool = token_to_kv_pool
         self.page_size = page_size
         self.topk_blocks = candidate_topk_blocks
+        self.selector = selector
         self.alt_stream = torch.cuda.Stream()
         self._cached_row_ids: Optional[torch.Tensor] = None
         # captured graphs keep reading the buffers they saw
@@ -157,6 +151,7 @@ class SparseTableBackend:
             index_page_size=index_page_size,
             topk_blocks=self.topk_blocks,
             out_positions=inputs.out_raw_indices[: data.num_rows],
+            selector=self.selector,
             row_shard=inputs.row_shard,
         )
         data.write_page_indices(inputs)
@@ -183,6 +178,7 @@ class SparseTableBackend:
                 ),
             ),
             out_positions=inputs.out_raw_indices[: data.num_rows],
+            selector=self.selector,
         )
         data.write_page_indices(inputs)
 
@@ -205,19 +201,29 @@ class SparseTableBackend:
         )
         logits = _prefill_table_logits(published, q_fp4, q_sf, inputs.weights, k_cache)
         topk = min(indexer.index_topk, published.blocks.shape[1] * CANDIDATE_BLOCK_SIZE)
-
-        def transform(blocks: torch.Tensor, out: torch.Tensor) -> None:
-            target = out[:rows, :topk]
-            if target.is_contiguous():
-                topk_transform_sparse(logits, published.valid_lens, blocks, target)
-                return
-            tmp = torch.empty((rows, topk), dtype=torch.int32, device=out.device)
-            topk_transform_sparse(logits, published.valid_lens, blocks, tmp)
-            target.copy_(tmp)
-
+        targets = [(published.blocks, inputs.out_raw_indices[:rows, :topk])]
         if inputs.out_page_indices is not None:
-            transform(published.phys_blocks, inputs.out_page_indices)
-        transform(published.blocks, inputs.out_raw_indices)
+            targets.append(
+                (published.phys_blocks, inputs.out_page_indices[:rows, :topk])
+            )
+        # The selector writes contiguous rows; a column cut of a wider buffer is not.
+        outputs = [
+            (
+                blocks,
+                (
+                    target
+                    if target.is_contiguous()
+                    else torch.empty(
+                        target.shape, dtype=torch.int32, device=target.device
+                    )
+                ),
+            )
+            for blocks, target in targets
+        ]
+        self.selector.sparse(logits, published.valid_lens, outputs)
+        for (_, target), (_, out) in zip(targets, outputs):
+            if out is not target:
+                target.copy_(out)
 
     def prefill_graph_table(self, layer_id: int, num_rows: int) -> Optional[tuple]:
         """The layer's newest table buffers cut to ``num_rows`` rows, or None when it
@@ -291,31 +297,20 @@ class SparseTableBackend:
             indices=indices,
         )
         main_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(main_stream)
+        block_stream = (
+            self.alt_stream if self.selector.can_overlap_streams else main_stream
+        )
+        block_stream.wait_stream(main_stream)
         # The block-selection chain reads logits after the main stream moves on.
-        logits.record_stream(self.alt_stream)
+        logits.record_stream(block_stream)
         # TODO(candidate): one kernel for both selections below (dense logits read once)
-        if logits.dtype == torch.bfloat16:
-            topk_transform_paged_bf16(
-                logits,
-                seq_lens,
-                metadata.page_table,
-                inputs.out_page_indices,
-                metadata.compressed_page_size,
-            )
-        else:
-            topk_transform_paged_v2(
-                logits,
-                seq_lens,
-                metadata.page_table,
-                inputs.out_page_indices,
-                metadata.compressed_page_size,
-                metadata.topk_metadata,
-            )
+        self.selector.paged_from_metadata(logits, metadata, inputs.out_page_indices)
         # per row: block count for the block top-k, sparse-row length for the consumers
-        with torch.cuda.stream(self.alt_stream):
+        with torch.cuda.stream(block_stream):
             nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
-            blocks = amax_topk_blocks(logits, seq_lens, nblocks, self.topk_blocks)
+            blocks = self.selector.amax_blocks(
+                logits, seq_lens, nblocks, self.topk_blocks
+            )
             # in place: ascending, INT32_MAX padded, plus the blocks as pool slots / 8
             phys_blocks = sort_candidate_blocks(
                 blocks,
@@ -335,7 +330,7 @@ class SparseTableBackend:
             for t in (blocks, schedule, phys_blocks, row_valid_lens):
                 t.record_stream(main_stream)
             ready = torch.cuda.Event()
-            ready.record(self.alt_stream)
+            ready.record(block_stream)
             return _SparseTable(
                 blocks=blocks,
                 schedule=schedule,
@@ -369,21 +364,20 @@ class SparseTableBackend:
                 metadata.max_compressed_seq_len,
                 indices=indices,
             )
-            topk_transform_paged_from_metadata(
+            self.selector.paged_from_metadata(
                 logits,
                 metadata,
                 inputs.out_page_indices,
-                None,
                 rows=rows,
-                topk_metadata=(
-                    topk_plans[chunk_idx] if topk_plans is not None else None
-                ),
+                plan=topk_plans[chunk_idx] if topk_plans is not None else None,
             )
             chunk_seq_lens = seq_lens[rows]
             nblocks, row_valid_lens = candidate_row_lens(
                 chunk_seq_lens, self.topk_blocks
             )
-            blocks = amax_topk_blocks(logits, chunk_seq_lens, nblocks, self.topk_blocks)
+            blocks = self.selector.amax_blocks(
+                logits, chunk_seq_lens, nblocks, self.topk_blocks
+            )
             phys_blocks = sort_candidate_blocks(
                 blocks,
                 chunk_seq_lens,
@@ -429,8 +423,10 @@ class SparseTableBackend:
             published.schedule,
             published.blocks.shape[1],
         )
-        topk_transform_sparse(
-            logits, published.valid_lens, published.phys_blocks, inputs.out_page_indices
+        self.selector.sparse(
+            logits,
+            published.valid_lens,
+            [(published.phys_blocks, inputs.out_page_indices)],
         )
 
     def _get_request_ids(self, inputs: DecodeInputs, rows: int, device: torch.device):
@@ -509,6 +505,7 @@ def select_prefill_rows(
     nblocks: torch.Tensor,
     out_positions: torch.Tensor,
     out_blocks: torch.Tensor,
+    selector: TopKSelector,
 ) -> None:
     """The source's own top-k (request-local compressed positions) and its top
     blocks from one pass over this query-row view's dense scores; one row of
@@ -517,9 +514,16 @@ def select_prefill_rows(
     zero_offsets = torch.zeros_like(lens_all)
     for tile, logits in score_tiles(data, kv):
         lens = lens_all[tile]
-        topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])
+        selector.ragged(
+            logits, lens, out=out_positions[tile], offsets=zero_offsets[tile]
+        )
         select_prefill_block_ids(
-            logits, lens, nblocks[tile], out_blocks[tile], offsets=zero_offsets[tile]
+            logits,
+            lens,
+            nblocks[tile],
+            out_blocks[tile],
+            offsets=zero_offsets[tile],
+            selector=selector,
         )
 
 
@@ -532,6 +536,7 @@ def publish_prefill_table(
     index_page_size: int,
     topk_blocks: int,
     out_positions: torch.Tensor,
+    selector: TopKSelector,
     row_shard: Optional[RowShard] = None,
 ) -> _SparsePrefillTable:
     """The source's own top-k into ``out_positions`` (request-local compressed
@@ -550,6 +555,7 @@ def publish_prefill_table(
             nblocks=nblocks,
             out_positions=out_positions,
             out_blocks=blocks,
+            selector=selector,
         )
     else:
         local = row_shard.local_rows(rows)
@@ -562,6 +568,7 @@ def publish_prefill_table(
             nblocks=nblocks[local],
             out_positions=local_positions,
             out_blocks=local_blocks,
+            selector=selector,
         )
         out_positions.copy_(row_shard.gather(local_positions, rows))
         blocks = row_shard.gather(local_blocks, rows).contiguous()
@@ -602,7 +609,8 @@ def select_prefill_table(
     data: DeepGEMMPrefillData,
     k_cache: torch.Tensor,
     out_positions: torch.Tensor,
+    selector: TopKSelector,
 ) -> None:
     logits = _prefill_table_logits(table, data.q_fp4, data.q_sf, data.weights, k_cache)
     # request-relative compressed positions, -1 padded
-    topk_transform_sparse(logits, table.valid_lens, table.blocks, out_positions)
+    selector.sparse(logits, table.valid_lens, [(table.blocks, out_positions)])
