@@ -502,12 +502,19 @@ def _high_quality_steps_computation_mask(num_inference_steps: int) -> list[int]:
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
     def __init__(
-        self, transformer, pipeline=None, stochastic_sampling: bool = False
+        self,
+        transformer,
+        pipeline=None,
+        stochastic_sampling: bool = False,
+        transformer_2=None,
     ) -> None:
+        # transformer_2: the Ref2VA DiT of a fl2va+ref2va server, which
+        # denoises the ref2va requests
         super().__init__(
             transformer=transformer,
             scheduler=None,
             pipeline=pipeline,
+            transformer_2=transformer_2,
         )
         # the release's few-step re-noising update (release metadata)
         self.stochastic_sampling = stochastic_sampling
@@ -825,12 +832,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 ring_degree=server_args.ring_degree,
             )
 
+        # reference rows exist exactly for ref2va requests
+        transformer, component_name = (
+            (self.transformer_2, "transformer_2")
+            if ctx.is_ref2va and self.transformer_2 is not None
+            else (self.transformer, "transformer")
+        )
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
-            self._manage_dit_use_site(self.transformer, "transformer", batch)
+            self._manage_dit_use_site(transformer, component_name, batch)
         try:
             model = _resolve_denoise_model(
-                self.transformer,
+                transformer,
                 device,
                 placement_managed=placement_managed,
             )

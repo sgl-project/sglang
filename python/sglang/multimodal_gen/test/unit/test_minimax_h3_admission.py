@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -261,6 +262,105 @@ def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
         )
     with pytest.raises(ValueError):
         pipeline.release_metadata.canonical_task("unknown")
+
+
+def _write_partition(root, subfolder, partition, tasks, **contract):
+    os.makedirs(os.path.join(root, subfolder, "pika"))
+    os.makedirs(os.path.join(root, subfolder, "transformer"))
+    open(os.path.join(root, subfolder, "pika", "adapter.safetensors"), "w").close()
+    model_index = {
+        "_class_name": "PikaH3FlexPipeline",
+        "_diffusers_version": "0.32.2",
+        "transformer": ["diffusers", "MiniMaxH3DiTModel"],
+        "_minimax_h3": {
+            "schema_version": 1,
+            "partition": partition,
+            "tasks": tasks,
+            "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            "dmd_denoising_steps": [1000, 750, 500, 250, 100, 40],
+            "stochastic_sampling": True,
+            "lora_adapter": "pika/adapter.safetensors",
+            **contract,
+        },
+    }
+    with open(os.path.join(root, subfolder, "model_index.json"), "w") as f:
+        json.dump(model_index, f)
+    return model_index
+
+
+def _dual_pipeline(root):
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    pipeline.server_args = SimpleNamespace(
+        model_variant="fl2va+ref2va",
+        model_subfolder=None,
+        component_weights_paths={},
+        transformer_weights_path=None,
+        component_paths={},
+        lora_path=None,
+    )
+    pipeline.model_path = os.path.join(root, "FL2VA")
+    pipeline._required_config_modules = ["text_encoder", "transformer"]
+    pipeline.dual_variant_lora_adapters = []
+    return pipeline
+
+
+def test_dual_variant_loads_the_ref2va_transformer_and_admits_both(tmp_path):
+    root = str(tmp_path)
+    model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
+    _write_partition(root, "Ref2VA", "ref2va", ["ref2va"])
+    pipeline = _dual_pipeline(root)
+    with patch.object(ComposedPipelineBase, "_load_config", return_value=model_index):
+        pipeline._load_config()
+
+    # the shared components come from FL2VA, the second transformer from Ref2VA
+    assert pipeline.server_args.model_subfolder == "FL2VA"
+    assert pipeline.required_config_modules == [
+        "text_encoder",
+        "transformer",
+        "transformer_2",
+    ]
+    assert model_index["transformer_2"] == model_index["transformer"]
+    assert pipeline.server_args.component_paths == {
+        "transformer_2": os.path.join(root, "Ref2VA", "transformer")
+    }
+    # each transformer merges its own adapter; none applies to both
+    assert pipeline.server_args.lora_path is None
+    assert pipeline.dual_variant_lora_adapters == [
+        ("fl2va", "transformer", os.path.join(root, "FL2VA/pika/adapter.safetensors")),
+        (
+            "ref2va",
+            "transformer_2",
+            os.path.join(root, "Ref2VA/pika/adapter.safetensors"),
+        ),
+    ]
+    stage = MiniMaxH3PartitionAdmissionStage(pipeline.release_metadata)
+    for task in ("t2va", "fl2va", "ref2va"):
+        batch = SimpleNamespace(
+            sampling_params=SimpleNamespace(task=task, quality="exact"),
+            num_inference_steps=6,
+        )
+        assert (
+            stage.forward(batch, SimpleNamespace(minimax_h3_adaln_online=False))
+            is batch
+        )
+    with pytest.raises(ValueError):
+        pipeline.release_metadata.canonical_task("t2i")
+
+
+def test_dual_variant_needs_one_sampling_contract(tmp_path):
+    root = str(tmp_path)
+    model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
+    _write_partition(
+        root,
+        "Ref2VA",
+        "ref2va",
+        ["ref2va"],
+        sigma_shift_scales={"video": 5.0, "audio": 3.0},
+    )
+    pipeline = _dual_pipeline(root)
+    with patch.object(ComposedPipelineBase, "_load_config", return_value=model_index):
+        with pytest.raises(ValueError, match="sampling contract"):
+            pipeline._load_config()
 
 
 def test_synthetic_warmup_target_honors_warmup_flags():
