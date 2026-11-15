@@ -209,6 +209,17 @@ jobs:
           fi
           bash ${{ inputs.install_script }}
 
+      # The run script comes from github.sha, like this workflow, so the PR
+      # checkout whose tests it runs cannot change it.
+      - name: Checkout run script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: rerun-test-script
+          sparse-checkout: scripts/ci/run_rerun_tests.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Run test
         timeout-minutes: 60
         env:
@@ -227,53 +238,7 @@ jobs:
               exit 1
             fi
           fi
-          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
-            source /etc/profile.d/sglang-ci.sh
-          fi
-          cmds=()
-          while IFS= read -r cmd; do
-            [ -z "$cmd" ] && continue
-            cmds+=("$cmd")
-          done <<< "$TEST_COMMAND"
-          total=${#cmds[@]}
-          failed=()
-          suite_start=$SECONDS
-          for idx in "${!cmds[@]}"; do
-            i=$((idx + 1))
-            cmd="${cmds[$idx]}"
-            echo ""
-            echo "."
-            echo "Begin ($i/$total): python3 $cmd"
-            echo "."
-            file_start=$SECONDS
-            # base-a perf tests (fwd_occupancy) need async assert off; match
-            # _pr-test-stage.yml's base-a carve-out.
-            test_file="${cmd%% *}"
-            test_file="${test_file%%::*}"
-            async_assert=true
-            if grep -qE 'register_cuda_ci\(.*stage[[:space:]]*=[[:space:]]*"base-a"' "test/$test_file" 2>/dev/null; then
-              async_assert=false
-            fi
-            if ! (cd test/ && SGLANG_ENABLE_ASYNC_ASSERT=$async_assert python3 $cmd -f); then
-              failed+=("$cmd")
-            fi
-            elapsed=$(( SECONDS - file_start ))
-            echo "."
-            echo "End ($i/$total): elapsed=${elapsed}s"
-            echo "."
-            echo ""
-          done
-          total_elapsed=$(( SECONDS - suite_start ))
-          if [ ${#failed[@]} -gt 0 ]; then
-            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
-            printf '  %s\n' "${failed[@]}"
-            {
-              echo "### Failed tests (partition ${{ matrix.partition }})"
-              printf -- '- `%s`\n' "${failed[@]}"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "All $total test(s) passed in ${total_elapsed}s"
+          bash rerun-test-script/scripts/ci/run_rerun_tests.sh cuda "${{ matrix.partition }}"
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -323,52 +288,22 @@ jobs:
         timeout-minutes: 20
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
+      # The run script comes from github.sha, like this workflow, so the PR
+      # checkout whose tests it runs cannot change it.
+      - name: Checkout run script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: rerun-test-script
+          sparse-checkout: scripts/ci/run_rerun_tests.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Run test
         timeout-minutes: 60
         env:
           TEST_COMMAND: ${{ matrix.test_command }}
-        run: |
-          # Run through the multimodal-gen CI's pytest runner so a rerun gets the
-          # same retries of failed items as CI (performance checks are noisy).
-          # Stop starting retries after 50 minutes, as the CI jobs do.
-          export SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 3000 ))
-          cmds=()
-          while IFS= read -r cmd; do
-            [ -z "$cmd" ] && continue
-            cmds+=("$cmd")
-          done <<< "$TEST_COMMAND"
-          total=${#cmds[@]}
-          failed=()
-          suite_start=$SECONDS
-          for idx in "${!cmds[@]}"; do
-            i=$((idx + 1))
-            cmd="${cmds[$idx]}"
-            echo ""
-            echo "."
-            echo "Begin ($i/$total): pytest $cmd (multimodal-gen runner)"
-            echo "."
-            file_start=$SECONDS
-            if ! python3 -c 'import sys; from sglang.multimodal_gen.test.runner.pytest_runner import run_pytest; sys.exit(run_pytest(sys.argv[2:], junit_xml_path=sys.argv[1])[0])' \
-                "$RUNNER_TEMP/rerun-test-$idx.xml" $cmd; then
-              failed+=("$cmd")
-            fi
-            elapsed=$(( SECONDS - file_start ))
-            echo "."
-            echo "End ($i/$total): elapsed=${elapsed}s"
-            echo "."
-            echo ""
-          done
-          total_elapsed=$(( SECONDS - suite_start ))
-          if [ ${#failed[@]} -gt 0 ]; then
-            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
-            printf '  %s\n' "${failed[@]}"
-            {
-              echo "### Failed tests (partition ${{ matrix.partition }})"
-              printf -- '- `%s`\n' "${failed[@]}"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "All $total test(s) passed in ${total_elapsed}s"
+        run: bash rerun-test-script/scripts/ci/run_rerun_tests.sh multimodal_gen "${{ matrix.partition }}"
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -448,48 +383,22 @@ jobs:
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
 
+      # The run script comes from github.sha, like this workflow, so the PR
+      # checkout whose tests it runs cannot change it.
+      - name: Checkout run script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: rerun-test-script
+          sparse-checkout: scripts/ci/run_rerun_tests.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Run test
         timeout-minutes: 60
         env:
           TEST_COMMAND: ${{ matrix.test_command }}
-        run: |
-          cd test/
-          cmds=()
-          while IFS= read -r cmd; do
-            [ -z "$cmd" ] && continue
-            cmds+=("$cmd")
-          done <<< "$TEST_COMMAND"
-          total=${#cmds[@]}
-          failed=()
-          suite_start=$SECONDS
-          for idx in "${!cmds[@]}"; do
-            i=$((idx + 1))
-            cmd="${cmds[$idx]}"
-            echo ""
-            echo "."
-            echo "Begin ($i/$total): python3 $cmd"
-            echo "."
-            file_start=$SECONDS
-            if ! python3 $cmd -f; then
-              failed+=("$cmd")
-            fi
-            elapsed=$(( SECONDS - file_start ))
-            echo "."
-            echo "End ($i/$total): elapsed=${elapsed}s"
-            echo "."
-            echo ""
-          done
-          total_elapsed=$(( SECONDS - suite_start ))
-          if [ ${#failed[@]} -gt 0 ]; then
-            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
-            printf '  %s\n' "${failed[@]}"
-            {
-              echo "### Failed tests (partition ${{ matrix.partition }})"
-              printf -- '- `%s`\n' "${failed[@]}"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "All $total test(s) passed in ${total_elapsed}s"
+        run: bash rerun-test-script/scripts/ci/run_rerun_tests.sh cpu "${{ matrix.partition }}"
 
   # The NPU stage runs the files through run_suite.py with the suite's own
   # install; its reply line has no "running" mark, only the result.
@@ -559,53 +468,23 @@ jobs:
           rocm_version: ${{ needs.prepare-partitions.outputs.rocm_version }}
           sgl_router: ${{ needs.prepare-partitions.outputs.sgl_router }}
 
+      # The run script comes from github.sha, like this workflow, so the PR
+      # checkout whose tests it runs cannot change it.
+      - name: Checkout run script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: rerun-test-script
+          sparse-checkout: scripts/ci/run_rerun_tests.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Run test
         timeout-minutes: 60
         env:
           TEST_COMMAND: ${{ matrix.test_command }}
           EXEC_ENV: ${{ needs.prepare-partitions.outputs.exec_env }}
-        run: |
-          read -ra kvs <<< "$EXEC_ENV"
-          exec_env=()
-          for kv in "${kvs[@]}"; do
-            exec_env+=(-e "$kv")
-          done
-          cmds=()
-          while IFS= read -r cmd; do
-            [ -z "$cmd" ] && continue
-            cmds+=("$cmd")
-          done <<< "$TEST_COMMAND"
-          total=${#cmds[@]}
-          failed=()
-          suite_start=$SECONDS
-          for idx in "${!cmds[@]}"; do
-            i=$((idx + 1))
-            cmd="${cmds[$idx]}"
-            echo ""
-            echo "."
-            echo "Begin ($i/$total): python3 $cmd"
-            echo "."
-            file_start=$SECONDS
-            if ! bash scripts/ci/amd/amd_ci_exec.sh "${exec_env[@]}" -w /sglang-checkout/test python3 $cmd -f; then
-              failed+=("$cmd")
-            fi
-            elapsed=$(( SECONDS - file_start ))
-            echo "."
-            echo "End ($i/$total): elapsed=${elapsed}s"
-            echo "."
-            echo ""
-          done
-          total_elapsed=$(( SECONDS - suite_start ))
-          if [ ${#failed[@]} -gt 0 ]; then
-            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
-            printf '  %s\n' "${failed[@]}"
-            {
-              echo "### Failed tests (partition ${{ matrix.partition }})"
-              printf -- '- `%s`\n' "${failed[@]}"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "All $total test(s) passed in ${total_elapsed}s"
+        run: bash rerun-test-script/scripts/ci/run_rerun_tests.sh amd "${{ matrix.partition }}"
 
   write-back-result:
     needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu, rerun-test-npu, rerun-test-amd]
