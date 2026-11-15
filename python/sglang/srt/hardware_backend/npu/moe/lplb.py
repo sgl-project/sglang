@@ -31,31 +31,35 @@ class NpuLPLBSolver:
                 "NPU LPLB requires all experts and equal slots per EP rank."
             )
         self._has_redundancy = redundant > 0
-        # With R redundant slots, at most min(R, E) experts have replicas.
-        # Their original copies plus redundant copies occupy at most R + H slots.
-        h = min(redundant, self.num_logical)
-        m = redundant + h
-        self._replica_capacity = m
+        # With R redundant slots, at most H = min(R, E) experts have replicas.
+        # Their original and redundant copies occupy at most M = R + H slots.
+        replicated_expert_capacity = min(redundant, self.num_logical)
+        self._replica_variable_capacity = redundant + replicated_expert_capacity
         # Rows: H expert-demand constraints, then one load constraint per rank.
         # Columns: M replica masses, rank slack, maximum load, and an auxiliary
         # variable that supplies a feasible starting point for the IPM solver.
-        nc, nv = h + num_gpus, m + num_gpus + 2
+        num_constraints = replicated_expert_capacity + num_gpus
+        num_variables = self._replica_variable_capacity + num_gpus + 2
         device = log2phy.device
 
         def zeros(*shape, dtype=torch.float32):
             return torch.zeros(shape, dtype=dtype, device=device)
 
-        self._base = zeros(nc, nv)
-        self._replicated = zeros(h, dtype=torch.int32)
+        self._base_row_sum = zeros(num_constraints)
+        self._replicated = zeros(replicated_expert_capacity, dtype=torch.int32)
         self._single_rank = zeros(self.num_logical, dtype=torch.int32)
         self._replica_index = zeros(self.num_phy, dtype=torch.int32)
         self._mapping = zeros(self.num_logical, redundant + 1, dtype=torch.int32)
         self._counts = zeros(self.num_logical, dtype=torch.int32)
-        self._a, self._b, self._x = zeros(nc, nv), zeros(nc), zeros(nv)
+        self._a = zeros(num_constraints, num_variables)
+        self._b, self._x = zeros(num_constraints), zeros(num_variables)
         # Residual, auxiliary, direction, and predicted max-load improvement.
         self.diagnostics = zeros(4)
         self.fallback_count = zeros(dtype=torch.int32)
         self._probabilities = zeros(*self._mapping.shape)
+        # Build one CDF per expert, reused by every route to that expert.
+        self._cdf = zeros(*self._mapping.shape)
+        self._last_positive_copy = zeros(self.num_logical, dtype=torch.int32)
         self.update_layout(phy2log=phy2log, log2phy=log2phy)
 
     def update_layout(self, *, phy2log, log2phy):
@@ -73,30 +77,34 @@ class NpuLPLBSolver:
         if any(not slots for slots in copies):
             raise ValueError("NPU LPLB placement must contain every logical expert.")
 
-        h = self._replicated.numel()
-        m = self._replica_capacity
-        base = torch.zeros(self._base.shape)
-        replicated = torch.full((h,), -1, dtype=torch.int32)
+        expert_rows = self._replicated.numel()
+        replica_columns = self._replica_variable_capacity
+        slots_per_rank = self.num_phy // self.num_ranks
+        base = torch.zeros(self._a.shape)
+        replicated = torch.full((expert_rows,), -1, dtype=torch.int32)
         single_rank = torch.full((self.num_logical,), -1, dtype=torch.int32)
         replica_index = torch.full((self.num_phy,), -1, dtype=torch.int32)
         row = column = 0
         for expert, slots in enumerate(copies):
             if len(slots) == 1:
-                single_rank[expert] = slots[0] // (self.num_phy // self.num_ranks)
+                single_rank[expert] = slots[0] // slots_per_rank
                 continue
             replicated[row] = expert
             for slot in slots:
                 base[row, column] = 1
-                base[h + slot // (self.num_phy // self.num_ranks), column] = 1
+                base[expert_rows + slot // slots_per_rank, column] = 1
                 replica_index[slot] = column
                 column += 1
             row += 1
-        base[h:, m : m + self.num_ranks] = torch.eye(self.num_ranks)
-        base[h:, -2] = -1
-        # Use metadata's copy order: dispatch consumes that same ordered map.
+        base[expert_rows:, replica_columns : replica_columns + self.num_ranks] = (
+            torch.eye(self.num_ranks)
+        )
+        base[expert_rows:, -2] = -1
+        # Keep the same copy order for probabilities, CDFs and physical IDs.
         mapping = log2phy[:, : self._mapping.shape[1]].to(dtype=torch.int32)
         for destination, value in (
-            (self._base, base),
+            (self._a, base),
+            (self._base_row_sum, base.sum(dim=1)),
             (self._replicated, replicated),
             (self._single_rank, single_rank),
             (self._replica_index, replica_index),
@@ -105,6 +113,7 @@ class NpuLPLBSolver:
             destination.copy_(value)
         if not self._has_redundancy:
             self._probabilities.fill_(1)
+            self._cdf.fill_(1)
 
     def solve(self, topk_ids, num_token_non_padded=None):
         """All target EP ranks call this, including ranks with no valid rows."""
@@ -116,10 +125,17 @@ class NpuLPLBSolver:
             counts = self.ep_group.all_reduce(counts)
         return self.solve_counts(counts)
 
+    def dispatch(self, topk_ids, num_token_non_padded=None):
+        """Solve once, then select physical IDs using this layer's current map."""
+        self.solve(topk_ids, num_token_non_padded)
+        return lplb_kernels.dispatch_cdf(
+            topk_ids, self._cdf, self._mapping, self._last_positive_copy
+        )
+
     def solve_counts(self, global_counts):
         """Solve already-reduced counts; also used to precompile before capture."""
         lplb_kernels.solve_ipm(
-            self._base,
+            self._base_row_sum,
             self._replicated,
             self._single_rank,
             global_counts,
@@ -135,21 +151,21 @@ class NpuLPLBSolver:
             self._x,
             self.diagnostics,
             self._probabilities,
+            self._cdf,
+            self._last_positive_copy,
             self.fallback_count,
         )
         return self._probabilities
 
 
-def solve_npu_lplb(topk_ids, info, layer_id, num_token_non_padded):
-    """Shared entry for ordinary, hash and vision routers after logical top-k."""
-    if info is None or info.ep_dispatch_algorithm != "lp":
-        return None
+def dispatch_npu_lplb(topk_ids, layer_id, num_token_non_padded):
+    """Map logical top-k to physical replicas for NPU LP routing."""
     from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
 
     solver = get_global_lplb_solver(layer_id)
     if solver is None:
         raise RuntimeError(f"NPU LPLB solver was not initialized for layer {layer_id}.")
-    return solver.solve(topk_ids, num_token_non_padded)
+    return solver.dispatch(topk_ids, num_token_non_padded)
 
 
 def _restore_all_replicas(metadata):

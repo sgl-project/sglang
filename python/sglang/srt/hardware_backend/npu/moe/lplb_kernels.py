@@ -60,7 +60,7 @@ def count_routes(ids, valid_rows, counts):
 @triton.jit
 def _prepare_lp(
     Counts,
-    Base,
+    BaseRowSum,
     Replicated,
     SingleRank,
     A,
@@ -71,30 +71,30 @@ def _prepare_lp(
     NV: tl.constexpr,
     BE: tl.constexpr,
     BC: tl.constexpr,
-    BV: tl.constexpr,
 ):
     e = tl.arange(0, BE)
     count = tl.load(Counts + e, e < E, 0).to(tl.float32)
-    count /= tl.maximum(tl.sum(count, 0), 1.0)
+    total = tl.maximum(tl.sum(count, 0), 1.0)
+    count /= total
     single_rank = tl.load(SingleRank + e, e < E, -1)
-    # Bound the two row-by-expert reductions and matrix tile to fit local UB.
+    # Bound the rank-by-expert reduction to fit local UB.
     r = tl.arange(0, BC)
     if NC > BC:
         r += tl.program_id(0) * BC
-    v = tl.arange(0, BV)
     replicated = tl.load(Replicated + r, r < H, -1)
-    demand = tl.sum(tl.where(replicated[:, None] == e[None, :], count[None, :], 0.0), 1)
+    demand = (
+        tl.load(Counts + replicated, (r < H) & (replicated >= 0), 0).to(tl.float32)
+        / total
+    )
     fixed_load = tl.sum(
         tl.where(single_rank[None, :] == (r[:, None] - H), count[None, :], 0.0), 1
     )
     b = tl.where(r < H, demand, -fixed_load)
     b = tl.where(r < NC, b, 0.0)
-    a = tl.load(
-        Base + r[:, None] * NV + v[None, :], (r[:, None] < NC) & (v[None, :] < NV), 0.0
-    )
-    aux = b - tl.sum(a, 1)
-    a = tl.where(v[None, :] == NV - 1, aux[:, None], a)
-    tl.store(A + r[:, None] * NV + v[None, :], a, (r[:, None] < NC) & (v[None, :] < NV))
+    # Placement-dependent columns are filled by update_layout(). Only the
+    # auxiliary column changes with this batch's demand and fixed rank load.
+    aux = b - tl.load(BaseRowSum + r, r < NC, 0.0)
+    tl.store(A + r * NV + NV - 1, aux, r < NC)
     tl.store(B + r, b, r < NC)
 
 
@@ -119,9 +119,11 @@ def _solve_ipm_schur(
     variable's rank-one term. Its Schur complement leaves a G x G system;
     recover the expert dual variables after solving for the rank duals.
 
-    Columns contain replica masses, rank slack, maximum load, and auxiliary.
+    H is the reserved expert-row capacity, G the EP rank count, and NV the
+    variable count. Columns are replica masses, rank slack, max load and aux.
     Five affine-scaling steps use the same feasible start as the CUDA solver.
     """
+    auxiliary_penalty: tl.constexpr = 1000.0
     e = tl.arange(0, BH)
     r = tl.arange(0, BG)
     v = tl.arange(0, BV)
@@ -149,7 +151,7 @@ def _solve_ipm_schur(
     # Single-copy experts cannot move. If their load already matches uniform's
     # maximum, uniform reaches a lower bound and no LP can improve that maximum.
     if needs_solve:
-        c = tl.where(v == NV - 1, 1000.0, tl.where(v == NV - 2, 1.0, 0.0))
+        c = tl.where(v == NV - 1, auxiliary_penalty, tl.where(v == NV - 2, 1.0, 0.0))
         x = tl.where(v < NV, 1.0, 0.0)
         for _ in range(ITERATIONS):
             x2 = x * x
@@ -173,7 +175,7 @@ def _solve_ipm_schur(
             real = r < G
             normal = tl.where(real[:, None] & real[None, :], normal, 0.0)
             normal += tl.where((r[:, None] == r[None, :]) & ~real[:, None], 1.0, 0.0)
-            rhs = tl.where(real, -t2 + 1000.0 * beta * w, 0.0)
+            rhs = tl.where(real, -t2 + auxiliary_penalty * beta * w, 0.0)
             for k in range(G):
                 column = tl.sum(tl.where(r[None, :] == k, normal, 0.0), 1)
                 pivot = tl.maximum(tl.sum(tl.where(r == k, column, 0.0), 0), 1.0e-12)
@@ -186,7 +188,7 @@ def _solve_ipm_schur(
                 )
                 rhs = tl.where(r == k, value, rhs - column * value)
             dual_r = rhs
-            auxiliary_scale = beta * (1000.0 - tl.sum(w * dual_r, 0))
+            auxiliary_scale = beta * (auxiliary_penalty - tl.sum(w * dual_r, 0))
             dual_e = inv_e * (
                 aux_e * auxiliary_scale - tl.sum(cross * dual_r[None, :], 1)
             )
@@ -237,13 +239,15 @@ def _solve_ipm_schur(
     tl.store(Diagnostics + 3, improvement)
 
 
-def solve_ipm(base, replicated, single_rank, counts, a, b, x, diagnostics, iterations):
+def solve_ipm(
+    base_row_sum, replicated, single_rank, counts, a, b, x, diagnostics, iterations
+):
     nc, nv = a.shape
     bc = min(_LP_PREPARE_BLOCK_ROWS, max(16, triton.next_power_of_2(nc)))
     bv = max(16, triton.next_power_of_2(nv))
     _prepare_lp[(triton.cdiv(nc, bc),)](
         counts,
-        base,
+        base_row_sum,
         replicated,
         single_rank,
         a,
@@ -254,7 +258,6 @@ def solve_ipm(base, replicated, single_rank, counts, a, b, x, diagnostics, itera
         nv,
         triton.next_power_of_2(counts.numel()),
         bc,
-        bv,
     )
     h = replicated.numel()
     g = nc - h
@@ -280,11 +283,16 @@ def _extract_probabilities(
     X,
     Diagnostics,
     Prob,
+    CDF,
+    LastPositive,
     Fallbacks,
     E: tl.constexpr,
     C: tl.constexpr,
     BC: tl.constexpr,
 ):
+    residual_tolerance: tl.constexpr = 1.0e-3
+    auxiliary_tolerance: tl.constexpr = 1.0e-4
+    direction_tolerance: tl.constexpr = 0.1
     expert = tl.program_id(0)
     copy = tl.arange(0, BC)
     slot = tl.load(Map + expert * C + copy, copy < C, -1)
@@ -296,10 +304,10 @@ def _extract_probabilities(
     dmax = tl.load(Diagnostics + 2)
     improvement = tl.load(Diagnostics + 3)
     usable = (
-        (residual < 1.0e-3)
+        (residual < residual_tolerance)
         & (auxiliary >= 0.0)
-        & (auxiliary < 1.0e-4)
-        & (dmax < 0.1)
+        & (auxiliary < auxiliary_tolerance)
+        & (dmax < direction_tolerance)
         & (improvement >= 0.0)
     )
     finite = (
@@ -310,12 +318,17 @@ def _extract_probabilities(
     mass = tl.where(total > 0.0, mass, (slot >= 0).to(tl.float32))
     probability = mass / tl.maximum(tl.sum(mass, 0), 1.0e-20)
     tl.store(Prob + expert * C + copy, probability, copy < C)
+    tl.store(CDF + expert * C + copy, tl.cumsum(probability, 0), copy < C)
+    # Preserve the endpoint fallback when the accumulated probability rounds
+    # below one. A trailing zero-probability or padded copy must not be chosen.
+    last = tl.max(tl.where((slot >= 0) & (probability > 0), copy, -1), 0)
+    tl.store(LastPositive + expert, last)
     if expert == 0:
         tl.atomic_add(Fallbacks, (~usable).to(tl.int32), sem="relaxed")
 
 
 def extract_probabilities(
-    mapping, replica_index, x, diagnostics, probabilities, fallbacks
+    mapping, replica_index, x, diagnostics, probabilities, cdf, last_positive, fallbacks
 ):
     e, c = mapping.shape
     _extract_probabilities[(e,)](
@@ -324,6 +337,8 @@ def extract_probabilities(
         x,
         diagnostics,
         probabilities,
+        cdf,
+        last_positive,
         fallbacks,
         e,
         c,
@@ -332,10 +347,11 @@ def extract_probabilities(
 
 
 @triton.jit
-def _dispatch_probability(
+def _dispatch_cdf(
     IDs,
     Map,
-    Prob,
+    CDF,
+    LastPositive,
     Random,
     Out,
     N: tl.constexpr,
@@ -356,19 +372,19 @@ def _dispatch_probability(
     slot = tl.load(Map + expert[:, None] * MAP_STRIDE + copy[None, :], mask, -1).to(
         tl.int32
     )
-    probability = tl.load(Prob + expert[:, None] * C + copy[None, :], mask, 0.0)
-    cumulative = tl.cumsum(probability, 1)
+    cumulative = tl.load(CDF + expert[:, None] * C + copy[None, :], mask, 0.0)
     chosen = tl.min(
         tl.where((slot >= 0) & (u[:, None] < cumulative), copy[None, :], C), 1
     )
-    last = tl.max(tl.where((slot >= 0) & (probability > 0), copy[None, :], -1), 1)
+    last = tl.load(LastPositive + expert, route < N * K, 0)
     chosen = tl.where(chosen < C, chosen, last)
     physical = tl.sum(tl.where(copy[None, :] == chosen[:, None], slot, 0), 1)
     # Rounding at the CDF's upper edge must never select a padded -1 slot.
     tl.store(Out + route, physical, route < N * K)
 
 
-def dispatch_probability(ids, probabilities, mapping):
+def dispatch_cdf(ids, cdf, mapping, last_positive):
+    """Sample this batch's cached CDF without rebuilding it for every route."""
     output = torch.empty_like(ids, memory_format=torch.contiguous_format)
     if ids.numel():
         # Smaller CDF tiles reduce small-batch latency; larger batches benefit
@@ -379,17 +395,18 @@ def dispatch_probability(ids, probabilities, mapping):
             else _DISPATCH_BLOCK_SIZE
         )
         random = torch.rand(ids.numel(), device=ids.device)
-        _dispatch_probability[(triton.cdiv(ids.numel(), block),)](
+        _dispatch_cdf[(triton.cdiv(ids.numel(), block),)](
             ids,
             mapping,
-            probabilities,
+            cdf,
+            last_positive,
             random,
             output,
             *ids.shape,
             *ids.stride(),
             mapping.stride(0),
-            probabilities.shape[1],
+            cdf.shape[1],
             block,
-            triton.next_power_of_2(probabilities.shape[1]),
+            triton.next_power_of_2(cdf.shape[1]),
         )
     return output

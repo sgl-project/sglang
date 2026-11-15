@@ -2714,18 +2714,15 @@ def _post_process_topk_ids(
         and expert_location_dispatch_info is not None
         and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
     ):
-        from sglang.srt.hardware_backend.npu.moe.lplb import solve_npu_lplb
+        from sglang.srt.hardware_backend.npu.moe.lplb import dispatch_npu_lplb
 
         routed_ids = (
             topk_ids[:, :-num_shared_topk_slots]
             if router_wrote_shared_cols
             else topk_ids
         )
-        probabilities = solve_npu_lplb(
-            routed_ids, expert_location_dispatch_info, layer_id, num_token_non_padded
-        )
-        recorder_topk_ids = topk_ids_logical_to_physical(
-            routed_ids, expert_location_dispatch_info, probabilities
+        recorder_topk_ids = dispatch_npu_lplb(
+            routed_ids, layer_id, num_token_non_padded
         )
         topk_ids = (
             torch.cat([recorder_topk_ids, topk_ids[:, -num_shared_topk_slots:]], dim=-1)
