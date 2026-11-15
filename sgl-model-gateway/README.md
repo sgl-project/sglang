@@ -811,6 +811,7 @@ Set `--cors-allowed-origins` for browser access.
 - **Router API key (`--api-key`)** protects client access to router endpoints; all protected routes expect `Authorization: Bearer <key>`.
 - Workers listed in `--worker-urls` inherit the router API key automatically.
 - When adding workers dynamically, provide explicit API keys via payload or query string; they do **not** inherit automatically.
+- When a worker API key is configured, the gateway sends it as `Authorization: Bearer <key>` for both the initial HTTP `/health` probe during registration and periodic HTTP health checks. This also supports workers behind proxies that require authentication for health endpoints.
 
 ```bash
 # Router and initial workers share the same key
