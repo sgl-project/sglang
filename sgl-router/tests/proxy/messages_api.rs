@@ -301,7 +301,8 @@ async fn count_tokens() {
     }
 
     // The worker does not report rendering a later system message, so an
-    // inline system turn is lifted to the front and the template accepts it.
+    // inline system turn's text goes in the user turn before it and the
+    // template accepts it.
     let inline_system = json!({"model": MODEL, "messages": [
         {"role": "user", "content": "hello"},
         {"role": "system", "content": "env"},
@@ -325,8 +326,9 @@ async fn count_tokens() {
     );
 }
 
-/// An inline system turn reaches the engine in place only when every worker
-/// reports a template that renders it there; one that does not lifts it.
+/// An inline system turn reaches the engine as a system message only when
+/// every worker reports a template that renders it there; otherwise its text
+/// goes in the user turn before it.
 #[tokio::test]
 async fn inline_system_turns_follow_every_workers_template() {
     let req = json!({"model": MODEL, "max_tokens": 8, "messages": [
@@ -335,12 +337,11 @@ async fn inline_system_turns_follow_every_workers_template() {
         {"role": "user", "content": "b"},
     ]});
     let in_place = req["messages"].clone();
-    let lifted = json!([
-        {"role": "system", "content": "env"},
-        {"role": "user", "content": "a"},
+    let attached = json!([
+        {"role": "user", "content": "a\n\n<system>env</system>"},
         {"role": "user", "content": "b"},
     ]);
-    for (reports, want) in [(&[true][..], in_place), (&[true, false], lifted)] {
+    for (reports, want) in [(&[true][..], in_place), (&[true, false], attached)] {
         let mut mocks = Vec::new();
         for _ in reports {
             mocks.push(MockWorker::start(vec![]).await);
