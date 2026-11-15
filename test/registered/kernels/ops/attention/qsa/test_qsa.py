@@ -107,16 +107,16 @@ def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
     [((12, 0), True), ((12, 1), False), ((10, 0), False)],
 )
 def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
+    from sglang.srt.utils import device as device_utils
 
-    common.is_sm120.cache_clear()
-    monkeypatch.setattr(common, "is_cuda", lambda: True)
+    device_utils.is_sm120.cache_clear()
+    monkeypatch.setattr(device_utils, "is_cuda", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
 
     try:
-        assert common.is_sm120() is expected
+        assert device_utils.is_sm120() is expected
     finally:
-        common.is_sm120.cache_clear()
+        device_utils.is_sm120.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -124,16 +124,16 @@ def test_is_sm120_matches_exact_capability(monkeypatch, capability, expected):
     [((12, 1), True), ((12, 0), False), ((10, 0), False)],
 )
 def test_is_sm121_matches_exact_capability(monkeypatch, capability, expected):
-    from sglang.srt.utils import common
+    from sglang.srt.utils import device as device_utils
 
-    common.is_sm121.cache_clear()
-    monkeypatch.setattr(common, "is_cuda", lambda: True)
+    device_utils.is_sm121.cache_clear()
+    monkeypatch.setattr(device_utils, "is_cuda", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
 
     try:
-        assert common.is_sm121() is expected
+        assert device_utils.is_sm121() is expected
     finally:
-        common.is_sm121.cache_clear()
+        device_utils.is_sm121.cache_clear()
 
 
 @pytest.mark.parametrize(

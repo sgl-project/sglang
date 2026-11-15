@@ -98,9 +98,10 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
         # decode consumes only target latents, not the condition prefix or its KV cache
         batch.extra.pop("qwen21_positive", None)
         batch.extra.pop("qwen21_negative", None)
-        return latents.transpose(1, 2).reshape(
-            latents.shape[0], -1, 1, batch.height // 16, batch.width // 16
+        height, width = batch.extra.pop(
+            "qwen21_latent_hw", (batch.height // 16, batch.width // 16)
         )
+        return latents.transpose(1, 2).reshape(latents.shape[0], -1, 1, height, width)
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         ac = self.vae_config.arch_config

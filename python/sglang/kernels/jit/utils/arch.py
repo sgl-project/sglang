@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 import subprocess
 from typing import List
 
@@ -23,7 +22,7 @@ from sglang.kernels.jit.utils.common import (
     is_musa_runtime,
     is_sail_runtime,
 )
-from sglang.srt.utils.common import is_cuda
+from sglang.srt.utils.device import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -53,19 +52,13 @@ def _jit_cuda_version() -> tuple[int, ...]:
 
     The target has to match the compiler, not the toolkit PyTorch was built
     against: a cu130 wheel on a CUDA 12.8 toolkit would otherwise select
-    `sm_120f`, which nvcc 12.8 rejects. Resolve nvcc the way tvm-ffi does
-    (`CUDA_HOME` / `CUDA_PATH`, then `$PATH`, then `/usr/local/cuda`) and fall
-    back to `torch.version.cuda` when it cannot be probed.
+    `sm_120f`, which nvcc 12.8 rejects. Falls back to `torch.version.cuda` when
+    nvcc cannot be probed.
     """
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home is None:
-        nvcc_path = shutil.which("nvcc")
-        cuda_home = (
-            os.path.dirname(os.path.dirname(nvcc_path))
-            if nvcc_path is not None
-            else "/usr/local/cuda"
-        )
-    nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    # toolchain imports this module at load time, so its import stays local.
+    from sglang.kernels.jit.utils.compile.toolchain import cuda_home
+
+    nvcc = os.path.join(cuda_home(), "bin", "nvcc")
     try:
         output = subprocess.check_output([nvcc, "--version"], text=True)
         match = re.search(r"release (\d+)\.(\d+)", output)
@@ -74,7 +67,7 @@ def _jit_cuda_version() -> tuple[int, ...]:
         logger.warning("Cannot parse `%s --version` output: %s", nvcc, output)
     except (OSError, subprocess.SubprocessError) as error:
         logger.warning("Cannot run `%s --version`: %s", nvcc, error)
-    from sglang.srt.utils.common import get_cuda_version
+    from sglang.srt.utils.device import get_cuda_version
 
     return get_cuda_version()
 
@@ -109,8 +102,11 @@ def _cuda_arch_suffix(major: int, minor: int) -> str:
     return ""
 
 
+MODULE_USES_CUTLASS = ["deep_select_topk"]
+
+
 @cache_once
-def get_compile_arch() -> CompileArch:
+def get_compile_arch(kernel_name: str = "") -> CompileArch:
     """The target JIT builds compile for: the local GPU, with its a/f suffix.
 
     Only the build pipeline reads this; kernels branch on `sglang.kernels.arch`.
@@ -132,7 +128,7 @@ def get_compile_arch() -> CompileArch:
         suffix = _sail_arch_suffix(major, minor)
     else:
         suffix = _cuda_arch_suffix(major, minor)
-        if (major, minor) == (10, 7):
+        if (major, minor) == (10, 7) and kernel_name in MODULE_USES_CUTLASS:
             from flashinfer.compilation_context import cutlass_supports_sm107
 
             if not cutlass_supports_sm107():

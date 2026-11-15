@@ -20,7 +20,7 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
-Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The default is **B300 / Low Latency / NVFP4**. **Low Latency** keeps unified memory disabled; **High Throughput** removes all speculative decoding parameters and enables unified memory on NVIDIA GPUs (B300, GB300, B200, and H200). Use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
+Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The default is **B300 / Low Latency / NVFP4**. **Low Latency** keeps unified memory disabled; **High Throughput** removes all speculative decoding parameters and enables unified memory on NVIDIA GPUs (B300, GB300, B200, and H200). On **TPU v7** (one host, [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu)), Low Latency keeps DFlash at 2 running requests and High Throughput runs 64 requests without speculative decoding. TPU v7 support is not merged yet: it runs from the SGLang-TorchTPU branch [`haolin/ms-v11`](https://github.com/sgl-project/sglang-torchtpu/tree/haolin/ms-v11), which we are actively upstreaming. Its commands still carry many TPU-specific settings; we will productionize TPU v7 support and remove most of them. Use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
 
 With a current SGLang build, the commands omit settings inferred from the checkpoint and GPU. Muse Spark NVFP4 selects `modelopt_fp4`, with `flashinfer_trtllm` MoE on B200/B300/GB300 or `marlin` on H200. The default static memory fraction is `0.8` on Blackwell and `0.85` on Hopper; recipes with a different budget keep an explicit override. LayerNorm-SP enables MegaMoE automatically for NVFP4 on data-center Blackwell when EP equals TP and is greater than 1, except on PD decode workers. Use `--no-enable-megamoe-for-layernorm-sp` to opt out. Muse Spark DFlash2 drafts default to FA4 on these NVIDIA platforms and eight draft tokens. Explicit settings take precedence.
 
@@ -451,9 +451,9 @@ python3 -m dynamo.sglang \
 
 DFlash V2 on MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) at concurrency 1–40: TP8·EP8 with the AMD monokernels at low concurrency, TP4·EP4 with HiCache at high concurrency.
 
-- **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-1027`.
+- **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-mi355-1106`.
 - **Monokernels.** At low concurrency, add the monokernel flags below.
-- **HiCache.** At high concurrency, add one of the TP4 HiCache blocks below instead. Use the 10–24 block through concurrency 24 and the 28–40 block above it. Within each block, set `--max-running-requests` and `--cuda-graph-max-bs-decode` to the concurrency cap, and select the listed `--prefill-decode-interval`. `--hicache-size` is the host tier in GB per rank: 253 GB needs about 1.01 TB across four ranks, and 310 GB needs about 1.24 TB.
+- **HiCache.** At high concurrency, add the TP4 HiCache flags below instead. `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks.
 
 ```bash Command
 SGLANG_USE_AITER=1 \
@@ -488,45 +488,28 @@ python -m sglang.launch_server \
   --monokernel-backend amd \
   --max-running-requests 2 \
   --cuda-graph-max-bs-decode 2 \
-  --prefill-decode-interval 64
-```
-
-At concurrency 1, set `--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and leave `--prefill-decode-interval` at the base value of 20.
-
-```bash HiCache (concurrency 10-24)
-PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  --tp-size 4 \
-  --ep-size 4 \
-  --mem-fraction-static 0.88 \
-  --chunked-prefill-size 8192 \
-  --max-prefill-tokens 8192 \
   --prefill-decode-interval 64 \
-  --max-running-requests 4 \
-  --cuda-graph-max-bs-decode 4 \
-  --swa-full-tokens-ratio 0.1 \
-  --enable-hierarchical-cache \
-  --hicache-size 253 \
-  --hicache-write-policy write_through \
-  --hicache-io-backend kernel \
-  --hicache-mem-layout page_first
+  --swa-full-tokens-ratio 0.3 \
+  --schedule-policy shortest-prefill-first \
+  --stream-interval 40
 ```
 
-At concurrency 16, also set `--schedule-policy shortest-prefill-first`, `--max-running-requests 12`, `--cuda-graph-max-bs-decode 12`, and `--prefill-decode-interval 96`; leave `--mem-fraction-static` at the base value of 0.85. At concurrency 24, set `--schedule-policy shortest-prefill-first`, `--max-running-requests 48`, `--mem-fraction-static 0.96`, and `--prefill-decode-interval 48`; leave `--cuda-graph-max-bs-decode` at the base value of 128.
-
-```bash HiCache (concurrency 28-40)
+```bash HiCache (high concurrency)
 PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
   --tp-size 4 \
   --ep-size 4 \
+  --page-size 128 \
   --mem-fraction-static 0.86 \
   --chunked-prefill-size 16384 \
   --max-prefill-tokens 16384 \
-  --prefill-decode-interval 80 \
+  --prefill-decode-interval 24 \
   --max-running-requests 80 \
-  --swa-full-tokens-ratio 0.1 \
+  --cuda-graph-max-bs-decode 80 \
+  --swa-full-tokens-ratio 0.2 \
   --schedule-policy shortest-prefill-first \
+  --stream-interval 20 \
   --enable-hierarchical-cache \
   --hicache-size 310 \
   --hicache-write-policy write_through \
@@ -534,7 +517,228 @@ SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
   --hicache-mem-layout page_first
 ```
 
-At concurrency 28, set `--max-running-requests 56` and `--cuda-graph-max-bs-decode 56`. At concurrency 36, set `--max-running-requests 72`, `--cuda-graph-max-bs-decode 72`, and `--prefill-decode-interval 24`. At concurrency 40, leave `--cuda-graph-max-bs-decode` at the base value of 128.
+### TPU v7 deployment measured with SemiAnalysis InferenceX
+
+<Note>
+**TPU v7 support is not merged yet.** The commands below run on the SGLang-TorchTPU branch [`haolin/ms-v11`](https://github.com/sgl-project/sglang-torchtpu/tree/haolin/ms-v11), which we are actively upstreaming. They are the settings used for the InferenceX submission, including many experimental environment variables and flags. We will productionize TPU v7 support and remove most of these settings.
+</Note>
+
+DFlash V2 on one Google Cloud TPU v7 host (2x2x1: 4 chips, 8 TensorCores, `--tp-size 8`) with [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu), measured in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/). The run is not public yet, so it has no link here. The explorer above is generated from public InferenceX data only, which is why TPU v7 is listed in this hand-written section.
+
+- **Container image.** `<public sglang-torchtpu image: TBD>`.
+- **Host.** 960 GiB of RAM. The HiCache host tier is 2.0x the device KV pool per rank through concurrency 10, and 56 GB per rank from concurrency 16 (`--hicache-size 56`, 448 GB across the eight ranks).
+- **Acceptance.** SemiAnalysis measured these points with a synthetic speculative-decoding acceptance length of 4.05 (InferenceX golden AL via `SGLANG_SIMULATE_ACC_LEN`), which is not part of these commands. Where a command sets `SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY=MIN_BS:4:3.06`, steps with at least `MIN_BS` decoding requests verify only the first 4 tokens of the 8-token draft block, and the measurement gave those steps the golden acceptance length for 3 draft tokens, 3.06 (the rule's third field). The engine reads that field only when `SGLANG_SIMULATE_ACC_LEN` is set. Real speed depends on your workload's acceptance.
+- **Settings.** The commands are the submission's server settings, from [`agentx.py`](https://github.com/sgl-project/sglang-torchtpu/blob/haolin/ms-v11/benchmark/tpu/recipe/configs/muse_spark/agentx.py) in SGLang-TorchTPU, without its logging, diagnostics and telemetry settings and without values equal to the engine defaults.
+
+{/* TPU v7 commands: begin */}
+
+```bash Concurrency 1
+LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_latency_hiding_scheduler_rerun=10 --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_enable_sparse_core_collective_offload_all_gather=false" \
+SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+SGLANG_DFLASH_CONV_MATMUL_EXPAND=1 \
+SGLANG_DFLASH_ROW_PARALLEL_FC=1 \
+SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0 \
+SGLANG_INIT_NEW_TOKEN_RATIO=1.0 \
+SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR=1.0 \
+SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE=131072 \
+SGLANG_PLATFORM=tpu \
+SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS=1024 \
+SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE=1 \
+SGLANG_SPEC_TP_SYNC=rng \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+SGLANG_TPU_ALLOW_SPEC_RECOMPILE=1 \
+SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY=4:4:3.06 \
+SGLANG_TPU_DFLASH_FP8_DRAFT=1 \
+SGLANG_TPU_FP4_DEQUANT_VIA_FP8=1 \
+SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE=1 \
+SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS=1 \
+SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE=1 \
+SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO=1 \
+SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE=1 \
+SGLANG_TPU_FUSED_RS_GMM2_ROW_OUT=1 \
+SGLANG_TPU_FUSED_RS_PAIR_LOCAL_RANKS=1 \
+SGLANG_TPU_FUSED_RS_PAIR_RUN_ADD=1 \
+SGLANG_TPU_FUSED_RS_PAIR_RUN_TABLE=1 \
+SGLANG_TPU_FUSED_RS_PAIR_WINDOW_ADD=1 \
+SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL=8 \
+SGLANG_TPU_FUSED_RS_STAGING_SLOTS=10 \
+SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG=1 \
+SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC=1 \
+SGLANG_TPU_HOST_PADDING=1 \
+SGLANG_TPU_KV_PACK_HEADS=1 \
+SGLANG_TPU_MK_FOLD_ATTN_SCALE=1 \
+SGLANG_TPU_MK_SAL_FP8_DOT=2 \
+SGLANG_TPU_MK_Y_EARLY=1 \
+SGLANG_TPU_MUSE_GATHER_COLUMNS_DIM=1 \
+SGLANG_TPU_MUSE_MEGAKERNEL=1 \
+SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE=1 \
+SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED=1 \
+SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE=1 \
+SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS=512 \
+SGLANG_TPU_MUSE_PREFILL_SP=1 \
+SGLANG_TPU_RAIDEN_COALESCE_PAGES=1 \
+SGLANG_TPU_RPA_NO_MAX=1 \
+SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS=1e-05 \
+SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK=1 \
+SGLANG_TPU_RPA_SKIP_PAD_Q=1 \
+SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP=256 \
+SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS=512:512 \
+SGLANG_TPU_RPA_TRANSPOSED=1 \
+SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 \
+TPU_PREMAPPED_BUFFER_SIZE=4294967296 \
+python3 -m sglang.launch_server \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --attention-backend pallas_tpu_rpa_batched \
+  --chunked-prefill-size 4096 \
+  --device tpu \
+  --dtype bfloat16 \
+  --enable-hierarchical-cache \
+  --enable-metrics \
+  --enable-torch-compile \
+  --grammar-backend none \
+  --hicache-io-backend raiden \
+  --hicache-mem-layout page_first_fused \
+  --hicache-ratio 2.0 \
+  --hicache-write-policy write_back \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-prefill-tokens 4096 \
+  --max-running-requests 2 \
+  --mem-fraction-static 0.95 \
+  --moe-runner-backend pallas_tpu_fused_rs \
+  --page-size 256 \
+  --prefill-decode-interval 128 \
+  --quantization modelopt_fp4 \
+  --reasoning-parser muse \
+  --scheduler-recv-interval 8 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-attention-backend pallas_tpu_rpa_v3 \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-num-draft-tokens 8 \
+  --swa-full-tokens-ratio 0.0625 \
+  --tool-call-parser muse \
+  --torch-compile-max-bs 2 \
+  --tp-size 8 \
+  --tpu-compile-bs 1 2 \
+  --tpu-compile-tokens 1024 2048 4096 \
+  --watchdog-timeout 3600
+```
+
+At concurrency 7, set `--max-running-requests 3`, `--torch-compile-max-bs 3`, and `--tpu-compile-bs 1 2 3`.
+
+At concurrency 9, set `--max-running-requests 4`, `--torch-compile-max-bs 4`, and `--tpu-compile-bs 1 2 3 4`.
+
+At concurrency 10, set `--max-running-requests 6`, `--prefill-decode-interval 64`, `--torch-compile-max-bs 6`, and `--tpu-compile-bs 1 2 3 4 5 6`.
+
+From concurrency 16, the host KV pool, the sessions and the 16-request profile change enough that the command is shown in full:
+
+```bash Concurrency 16
+LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_latency_hiding_scheduler_rerun=10 --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_enable_sparse_core_collective_offload_all_gather=false" \
+SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+SGLANG_DFLASH_CONV_MATMUL_EXPAND=1 \
+SGLANG_DFLASH_ROW_PARALLEL_FC=1 \
+SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0 \
+SGLANG_HICACHE_SWA_HOST_EVICT_PASSED_FIRST=1 \
+SGLANG_HICACHE_SWA_HOST_FRACTION=0.3 \
+SGLANG_INIT_NEW_TOKEN_RATIO=1.0 \
+SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR=1.0 \
+SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE=16384 \
+SGLANG_PLATFORM=tpu \
+SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS=1024 \
+SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE=1 \
+SGLANG_SPEC_TP_SYNC=rng \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+SGLANG_TPU_ALLOW_SPEC_RECOMPILE=1 \
+SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY=3:4:3.06 \
+SGLANG_TPU_DFLASH_FP8_DRAFT=1 \
+SGLANG_TPU_FP4_DEQUANT_VIA_FP8=1 \
+SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE=1 \
+SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS=1 \
+SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE=1 \
+SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO=1 \
+SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE=1 \
+SGLANG_TPU_FUSED_RS_GMM2_ROW_OUT=1 \
+SGLANG_TPU_FUSED_RS_PAIR_LOCAL_RANKS=1 \
+SGLANG_TPU_FUSED_RS_PAIR_RUN_ADD=1 \
+SGLANG_TPU_FUSED_RS_PAIR_RUN_TABLE=1 \
+SGLANG_TPU_FUSED_RS_PAIR_WINDOW_ADD=1 \
+SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL=8 \
+SGLANG_TPU_FUSED_RS_STAGING_SLOTS=10 \
+SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG=1 \
+SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC=1 \
+SGLANG_TPU_HOST_PADDING=1 \
+SGLANG_TPU_KV_PACK_HEADS=1 \
+SGLANG_TPU_MK_FOLD_ATTN_SCALE=1 \
+SGLANG_TPU_MK_SAL_FP8_DOT=2 \
+SGLANG_TPU_MK_Y_EARLY=1 \
+SGLANG_TPU_MUSE_GATHER_COLUMNS_DIM=1 \
+SGLANG_TPU_MUSE_MEGAKERNEL=1 \
+SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE=1 \
+SGLANG_TPU_MUSE_MK_EXPERT_SPLIT=4 \
+SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED=1 \
+SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE=1 \
+SGLANG_TPU_MUSE_MK_MAX_ROWS=64 \
+SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS=512 \
+SGLANG_TPU_MUSE_PREFILL_SP=1 \
+SGLANG_TPU_RAIDEN_COALESCE_PAGES=1 \
+SGLANG_TPU_RPA_NO_MAX=1 \
+SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS=1e-05 \
+SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK=1 \
+SGLANG_TPU_RPA_SKIP_PAD_Q=1 \
+SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP=256 \
+SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS=512:512 \
+SGLANG_TPU_RPA_TRANSPOSED=1 \
+SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 \
+TPU_PREMAPPED_BUFFER_SIZE=4294967296 \
+python3 -m sglang.launch_server \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --attention-backend pallas_tpu_rpa_batched \
+  --chunked-prefill-size 4096 \
+  --device tpu \
+  --dtype bfloat16 \
+  --enable-hierarchical-cache \
+  --enable-metrics \
+  --enable-session-radix-cache \
+  --enable-torch-compile \
+  --grammar-backend none \
+  --hicache-io-backend raiden \
+  --hicache-mem-layout page_first_fused \
+  --hicache-ratio 3.0 \
+  --hicache-size 56 \
+  --kv-cache-dtype fp8_e4m3 \
+  --max-prefill-tokens 4096 \
+  --max-running-requests 16 \
+  --mem-fraction-static 0.95 \
+  --moe-runner-backend pallas_tpu_fused_rs \
+  --page-size 256 \
+  --prefill-decode-interval 64 \
+  --quantization modelopt_fp4 \
+  --reasoning-parser muse \
+  --scheduler-recv-interval 8 \
+  --session-coverage-host-only \
+  --session-id-header X-Correlation-ID \
+  --session-leaf-at-prompt-end \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-attention-backend pallas_tpu_rpa_v3 \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-num-draft-tokens 8 \
+  --swa-full-tokens-ratio 0.0625 \
+  --tool-call-parser muse \
+  --torch-compile-max-bs 16 \
+  --tp-size 8 \
+  --tpu-compile-bs 1 2 3 4 5 6 7 8 9 10 11 12 16 \
+  --tpu-compile-tokens 4096 \
+  --watchdog-timeout 3600
+```
+
+At concurrency 22, also set `SGLANG_PREFILL_DECODE_INTERVAL_ADAPTIVE=6:8`.
+
+{/* TPU v7 commands: end */}
 
 ## 1. Model introduction
 
@@ -945,7 +1149,6 @@ export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
 export MC_FORCE_MNNVL=1
 
 SGLANG_FORCE_FUSED_OP_BACKEND=helion \
-SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR=1 \
 SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1 \
 python -m sglang.launch_server \
   --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \

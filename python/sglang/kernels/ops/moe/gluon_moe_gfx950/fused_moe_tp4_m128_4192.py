@@ -7,32 +7,9 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from .common import _add, _encode_groups, _word_bytes
+
 _artifact_next_power_of_2 = triton.constexpr_function(triton.next_power_of_2)
-
-@gluon.jit
-def _add(a, b):
-    return a + b
-
-@gluon.jit
-def _encode_groups(x, shared):
-    peak = gl.max(gl.abs(x), 1)
-    divided = gl.div_rn(peak, 6.0)
-    bits = divided.to(gl.uint32, bitcast=True)
-    exponent = (bits >> 23 & 255).to(gl.int32) - 127 + (bits & 8388607 != 0)
-    peak_bits = peak.to(gl.uint32, bitcast=True)
-    floor_exp = (peak_bits >> 23 & 255).to(gl.int32) - 127
-    threshold = gl.exp2(floor_exp.to(gl.float32)) * 1.75
-    even_exp = floor_exp - 2 + (peak >= threshold).to(gl.int32)
-    exponent = gl.where(shared, even_exp, exponent)
-    exponent = gl.maximum(-127, gl.minimum(127, exponent))
-    scale = gl.exp2(exponent.to(gl.float32))
-    inverse_scale = gl.div_rn(1.0, scale)
-    a = gl.abs(x * inverse_scale[:, None])
-    low, high = gl.split(a.reshape((x.shape[0], 16, 2)))
-    packed = gl.inline_asm_elementwise('v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3;', constraints='=v,v,v,v', args=[low, high, gl.full(low.shape, 1.0, gl.float32, low.type.layout)], dtype=gl.uint32, is_pure=True, pack=1)
-    signs = gl.where(x < 0, 8, 0).to(gl.uint8)
-    low_sign, high_sign = gl.split(signs.reshape((x.shape[0], 16, 2)))
-    return (packed.to(gl.uint8) & 119 | low_sign | high_sign << 4, (exponent + 127).to(gl.uint8))
 
 @gluon.jit
 def _quantize_input(X, Q, QS, M: gl.constexpr, H: gl.constexpr, SX: gl.constexpr, GROUPS: gl.constexpr, CTA_OFFSET: gl.constexpr=0, WARPS: gl.constexpr=1):
@@ -292,14 +269,6 @@ def _load_up_weight_scales(S, expert, column, base, N: gl.constexpr, K: gl.const
     inner = idx % 64
     sw = gl.amd.cdna4.buffer_load(S.to(gl.pointer_type(gl.uint32)), nb * (K // 4) + base * (BK // 4) + kg * 64 + inner)
     return sw & 4278190335 | sw >> 8 & 65280 | sw << 8 & 16711680
-
-@gluon.jit
-def _word_bytes(words):
-    b0 = words.to(gl.uint8)
-    b1 = (words >> 8).to(gl.uint8)
-    b2 = (words >> 16).to(gl.uint8)
-    b3 = (words >> 24).to(gl.uint8)
-    return gl.join(gl.join(b0, b2), gl.join(b1, b3)).reshape((words.shape[0], words.shape[1] * 4))
 
 @gluon.constexpr_function
 def _paired_scale_layout(rows, block_k, weight):

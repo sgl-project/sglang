@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.moe_lora import rel_l2
 
 register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Also exercise the Blackwell implementation in per-PR CI.
@@ -101,10 +102,6 @@ def _gather_pairs(slab_or_rows, pair_to_row, pair_idx):
     return rows[pair_to_row[pair_idx].long()]
 
 
-def _rel_l2(a, b):
-    return (a - b).norm() / b.norm().clamp(min=1e-12)
-
-
 # 7168 is a DeepSeek-V3-class hidden size: not a power of two.
 @pytest.mark.parametrize("hidden_size", [_H, 7168])
 @pytest.mark.parametrize(
@@ -139,7 +136,7 @@ def test_fp8_gateup_and_down_match_reference(vendor, rows, hidden_size):
 
     ref_gateup = torch.einsum("ph,pnh->pn", hidden[tokens].float(), w13_eff[experts])
     got_gateup = _gather_pairs(gateup, pair_to_row, pair_idx).float()
-    assert _rel_l2(got_gateup, ref_gateup) < 4e-2
+    assert rel_l2(got_gateup, ref_gateup) < 4e-2
 
     # Down over a synthetic activation scattered into the provider's layout.
     act_pairs = (torch.randn_like(ref_gateup[:, :_I]) * 0.1).to(torch.bfloat16)
@@ -155,7 +152,7 @@ def test_fp8_gateup_and_down_match_reference(vendor, rows, hidden_size):
 
     ref_down = torch.einsum("pi,phi->ph", act_pairs.float(), w2_eff[experts])
     got_down = _gather_pairs(down, pair_to_row, pair_idx).float()
-    assert _rel_l2(got_down, ref_down) < 4e-2
+    assert rel_l2(got_down, ref_down) < 4e-2
 
     if vendor == "triton":
         from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -169,7 +166,7 @@ def test_fp8_gateup_and_down_match_reference(vendor, rows, hidden_size):
         with get_context().override_server_args():
             provider.down(state, act, down)
         got_down = _gather_pairs(down, pair_to_row, pair_idx).float()
-        assert _rel_l2(got_down, ref_down) < 4e-2
+        assert rel_l2(got_down, ref_down) < 4e-2
 
 
 def test_fp8_admission_rejects_bad_geometry():

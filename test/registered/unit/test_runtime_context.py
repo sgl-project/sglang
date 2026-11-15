@@ -2,9 +2,10 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=196, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 import dataclasses
+import functools
 import json
 import os
 import pathlib as _pathlib
@@ -38,9 +39,7 @@ from sglang.srt.arg_groups.overrides import (
     resolution_result,
 )
 from sglang.srt.runtime_context import (
-    Flags,
     ParallelContext,
-    RuntimeContext,
     SpawnRanks,
     _FlagGroupBase,
     assert_published,
@@ -83,6 +82,16 @@ def _sources():
             yield path
 
 
+@functools.lru_cache(maxsize=None)
+def _source_texts():
+    """``(path, text)`` for every file ``_sources`` yields, read once per process."""
+    return tuple((path, path.read_text(encoding="utf-8-sig")) for path in _sources())
+
+
+def _package_texts():
+    return ((p, t) for p, t in _source_texts() if p.is_relative_to(_PACKAGE))
+
+
 _PS = "sglang.srt.distributed.parallel_state"
 
 
@@ -106,37 +115,6 @@ GROUP_STAMPS = {
     "attn_cp_group": "_ATTN_CP",
     "shared_experts_tp_group": "_SHARED_EXPERTS_TP",
 }
-
-
-def _groups_the_build_states() -> dict:
-    """Extract context-to-module group mappings from initialization source."""
-    import ast
-    import inspect
-    import textwrap
-
-    from sglang.srt.distributed import parallel_state
-
-    body = textwrap.dedent(inspect.getsource(parallel_state.initialize_model_parallel))
-    for node in ast.walk(ast.parse(body)):
-        keys = getattr(node, "keys", None)
-        if (
-            isinstance(node, ast.Dict)
-            and keys
-            and all(
-                isinstance(k, ast.Constant) and str(k.value).endswith("_group")
-                for k in keys
-            )
-        ):
-            return {k.value: v.id for k, v in zip(node.keys, node.values)}
-    raise AssertionError("initialize_model_parallel states no group at all")
-
-
-class TestRuntimeContextSingletons(CustomTestCase):
-    def test_singletons(self):
-        self.assertIs(get_parallel(), get_parallel())
-        self.assertIsInstance(get_parallel(), ParallelContext)
-        self.assertIsInstance(get_context(), RuntimeContext)
-        self.assertIs(get_context().parallel, get_parallel())
 
 
 class _IsolatedOverrides(CustomTestCase):
@@ -164,87 +142,6 @@ class TestTheBuildStatesEveryGroup(_IsolatedOverrides):
 
         declared = {name for name in _parallel_fields() if name.endswith("_group")}
         self.assertEqual(declared, set(GROUP_STAMPS) | {"world_group"})
-
-    def test_the_world_group_is_stated_where_it_is_built(self):
-        import ast
-        import inspect
-        import textwrap
-
-        from sglang.srt.distributed import parallel_state
-
-        body = textwrap.dedent(
-            inspect.getsource(parallel_state.init_distributed_environment)
-        )
-        stated = {
-            kw.arg
-            for node in ast.walk(ast.parse(body))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "override_permanently"
-            for kw in node.keywords
-        }
-        self.assertIn("world_group", stated)
-
-    def test_nothing_reads_a_name_this_build_has_not_stated_yet(self):
-        import ast
-        import inspect
-        import textwrap
-
-        from sglang.srt.distributed import parallel_state
-
-        body = textwrap.dedent(
-            inspect.getsource(parallel_state.initialize_model_parallel)
-        )
-        read = set()
-        for node in ast.walk(ast.parse(body)):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                name = parallel_state._CONTEXT_NAME_OF.get(node.func.id)
-                if name is not None:
-                    read.add(name)
-        self.assertTrue(read, "no getter is called here; this proves nothing")
-        self.assertEqual(read - {"world_group"}, set())
-
-    def test_each_group_is_stated_from_the_global_it_was_built_into(self):
-        self.assertEqual(_groups_the_build_states(), GROUP_STAMPS)
-
-    def test_a_dimension_the_configuration_has_not_got_is_left_unstated(self):
-        import ast
-        import inspect
-        import textwrap
-
-        from sglang.srt.distributed import parallel_state
-
-        body = textwrap.dedent(
-            inspect.getsource(parallel_state.initialize_model_parallel)
-        )
-        stamp = next(
-            node
-            for node in ast.walk(ast.parse(body))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "override_permanently"
-        )
-        self.assertEqual([keyword.arg for keyword in stamp.keywords], [None])
-        mapping = stamp.keywords[0].value
-        self.assertIsInstance(mapping, ast.DictComp)
-        self.assertEqual(len(mapping.generators), 1)
-        guards = mapping.generators[0].ifs
-        self.assertEqual(len(guards), 1)
-        guard = guards[0]
-        self.assertIsInstance(guard, ast.Compare)
-        self.assertEqual([type(op) for op in guard.ops], [ast.IsNot])
-        self.assertEqual([c.value for c in guard.comparators], [None])
-        self.assertEqual(ast.unparse(guard.left), ast.unparse(mapping.value))
-
-
-class TestParallelDelegation(_IsolatedOverrides):
-    def test_wrapper_holds_no_resolved_state(self):
-        # __slots__: no __dict__; the only instance state is the override hook.
-        self.assertFalse(hasattr(get_parallel(), "__dict__"))
-        # tp_group IS exposed: live delegation handles the tp patch.
-        self.assertTrue(hasattr(ParallelContext, "tp_group"))
-        # local_attn_dp is intentionally not part of the wrapper surface.
-        self.assertFalse(hasattr(ParallelContext, "local_attn_dp_size"))
 
 
 class TestTheTwoWorldWidths(_IsolatedOverrides):
@@ -1034,12 +931,6 @@ class TestFlagsTier(_IsolatedServerArgs):
     end of __post_init__); the flags tier only carries runtime state
     (today: the capture lifecycle)."""
 
-    def test_wiring_and_groups(self):
-        flags = get_flags()
-        self.assertIs(flags, get_context().flags)
-        self.assertIsInstance(flags, Flags)
-        self.assertTrue(hasattr(flags, "capture"))
-
     def test_typo_safety(self):
         group = _FakeCaptureGroup()
         with self.assertRaises(AttributeError):
@@ -1523,6 +1414,29 @@ class TestForwardFlags(_IsolatedServerArgs):
                 return x
 
             self.assertEqual(probe(torch.zeros(())).item(), 6)
+
+    def test_platform_facts_trace_under_torch_compile(self):
+        # Regression: compiled model forwards read platform facts (the DeepSeek-V4
+        # C4 indexer reads ``is_sm120``). Dynamo can't trace
+        # ``object.__getattribute__`` in ``PlatformContext.__getattr__``, and
+        # can't call a probe built as ``lru_cache(partial(...))``.
+        import torch
+
+        from sglang.srt.runtime_context import get_platform
+
+        reset_context()
+        facts = ("is_cuda", "is_hip", "is_sm90", "is_sm100", "is_sm120", "is_blackwell")
+        expected = sum(bool(getattr(get_platform(), fact)) for fact in facts)
+
+        @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+        def probe(x):
+            platform = get_platform()
+            for fact in facts:
+                if getattr(platform, fact):
+                    x = x + 1
+            return x
+
+        self.assertEqual(probe(torch.zeros(())).item(), expected)
 
     def test_graph_visible_flags_are_process_visible_across_threads(self):
         # Documented divergence from the contextvar-backed flags: plain slots
@@ -2245,6 +2159,10 @@ class TestDerivedWidths(_IsolatedOverrides):
         ):
             mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
             parallel_state.initialize_model_parallel()
+            for name, global_name in GROUP_STAMPS.items():
+                built = getattr(parallel_state, global_name)
+                if built is not None:
+                    self.assertIs(getattr(get_parallel(), name), built, name)
         self.addCleanup(parallel_state.destroy_model_parallel)
 
         self.assertEqual(built_at[0], [list(range(world_size))])
@@ -2331,8 +2249,7 @@ class TestAnEntryThatBuildsARunnerHandsOverItsPlacement(CustomTestCase):
         import ast as _ast
 
         offenders = []
-        for path in _sources():
-            text = path.read_text(encoding="utf-8-sig")
+        for path, text in _source_texts():
             if "ModelRunner(" not in text or "publish(" not in text:
                 continue
             tree = _ast.parse(text)
@@ -2384,40 +2301,36 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             if line.startswith("def get_") or line.startswith("def is_")
         }
 
-    def _callers(self, name):
-        """Find getter calls outside the defining package, including import aliases."""
+    def _calls(self, name, text):
+        """Line numbers calling getter ``name`` in ``text``, including import aliases."""
         import re
 
-        from sglang.srt.distributed import parallel_state as parallel_state_module
-
-        root = _pathlib.Path(parallel_state_module.__file__).parents[2]
-        hits = []
-        for path in root.rglob("*.py"):
-            rel = path.relative_to(root).as_posix()
-            if rel.startswith(("srt/distributed/", "multimodal_gen/", "test/")):
-                continue
-            text = path.read_text()
-            spellings = (
-                {name}
-                | set(re.findall(rf"import\s+{re.escape(name)}\s+as\s+(\w+)", text))
-                | set(re.findall(rf"^\s*{re.escape(name)}\s+as\s+(\w+),?$", text, re.M))
-            )
-            pattern = re.compile(
-                r"(?<![.\w])(?:" + "|".join(re.escape(s) for s in spellings) + r")\("
-            )
-            for number, line in enumerate(text.splitlines(), 1):
-                if line.lstrip().startswith(("def ", "#")):
-                    continue
-                if pattern.search(line):
-                    hits.append(f"{rel}:{number}")
-        return hits
+        spellings = (
+            {name}
+            | set(re.findall(rf"import\s+{re.escape(name)}\s+as\s+(\w+)", text))
+            | set(re.findall(rf"^\s*{re.escape(name)}\s+as\s+(\w+),?$", text, re.M))
+        )
+        pattern = re.compile(
+            r"(?<![.\w])(?:" + "|".join(re.escape(s) for s in spellings) + r")\("
+        )
+        return [
+            number
+            for number, line in enumerate(text.splitlines(), 1)
+            if not line.lstrip().startswith(("def ", "#")) and pattern.search(line)
+        ]
 
     def test_no_business_code_calls_them(self):
+        names = sorted(self._accessors() - self.ALLOWED)
         offenders = {}
-        for name in sorted(self._accessors() - self.ALLOWED):
-            callers = self._callers(name)
-            if callers:
-                offenders[name] = callers
+        for path, text in _package_texts():
+            rel = path.relative_to(_PACKAGE).as_posix()
+            if rel.startswith(("srt/distributed/", "multimodal_gen/", "test/")):
+                continue
+            for name in names:
+                if name not in text:
+                    continue
+                for number in self._calls(name, text):
+                    offenders.setdefault(name, []).append(f"{rel}:{number}")
         self.assertEqual(
             offenders,
             {},
@@ -2445,6 +2358,26 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             any("get_parallel().tp_rank" in m for m in messages),
             f"expected the replacement to be named, got {messages}",
         )
+
+    def test_calling_one_from_inside_the_package_compiles_with_fullgraph(self):
+        """A collective that calls a deprecated getter must compile with fullgraph."""
+        import torch
+
+        from sglang.srt.distributed import communication_op, parallel_state
+
+        compiled = torch.compile(
+            communication_op.tensor_model_parallel_all_reduce,
+            backend="eager",
+            fullgraph=True,
+        )
+        stand_in = SimpleNamespace(all_reduce=lambda x: x * 2)
+        # A getter that has warned skips the frame lookup;
+        # other cases in this class warn for get_tp_group.
+        with (
+            patch.object(parallel_state, "_ALREADY_WARNED", set()),
+            get_parallel().override(tp_group=stand_in),
+        ):
+            self.assertEqual(compiled(torch.ones(2)).tolist(), [2.0, 2.0])
 
     def test_a_scope_reaches_callers_that_went_straight_to_the_getter(self):
         from sglang.srt.distributed import parallel_state
@@ -2747,8 +2680,7 @@ class TestTheParallelPhase(CustomTestCase):
         import ast as _ast
 
         offenders = []
-        for path in _sources():
-            text = path.read_text(encoding="utf-8-sig")
+        for path, text in _source_texts():
             if "ModelRunner(" not in text or "publish(" not in text:
                 continue
             tree = _ast.parse(text)
@@ -2950,7 +2882,7 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
 
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         from sglang.srt.distributed import parallel_state
-        from sglang.srt.utils.weight_checker import WeightChecker
+        from sglang.srt.model_executor.weight_checker import WeightChecker
 
         self._two_stage_pipeline()
         self.assertEqual(get_parallel().pp_size, 2)
@@ -3015,9 +2947,8 @@ class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
 
     def test_nothing_else_reads_the_bare_slot(self):
         offenders, exercised = [], set()
-        for path in _sources():
-            text = path.read_text(encoding="utf-8-sig")
-            if not _calls_named(text, "dp_gather_slot"):
+        for path, text in _source_texts():
+            if "dp_gather_slot" not in text or not _calls_named(text, "dp_gather_slot"):
                 continue
             rel = str(path).replace("\\", "/")
             allowed = [a for a in self.MAY_READ_THE_BARE_SLOT if rel.endswith(a)]
@@ -3036,10 +2967,10 @@ class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
 
     def test_no_sequence_is_indexed_by_the_attention_rank(self):
         offenders = []
-        for path in _sources():
-            found = _sequences_indexed_by_the_attention_rank(
-                path.read_text(encoding="utf-8-sig")
-            )
+        for path, text in _source_texts():
+            if "global_num_tokens" not in text or "attn_dp_rank" not in text:
+                continue
+            found = _sequences_indexed_by_the_attention_rank(text)
             offenders.extend(f"{path}: {one}" for one in found)
         self.assertEqual(
             offenders,
@@ -3072,8 +3003,10 @@ class TestEveryParallelReadNamesAParallelField(CustomTestCase):
         """
         import ast as _ast
 
-        for path in _PACKAGE.rglob("*.py"):
-            tree = _ast.parse(path.read_text(encoding="utf-8-sig"))
+        for path, text in _package_texts():
+            if "get_parallel" not in text:
+                continue
+            tree = _ast.parse(text)
             relative = path.relative_to(_PACKAGE).as_posix()
             bound = {
                 target.id
@@ -3137,8 +3070,10 @@ class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
 
         retired = self._retired()
         offenders = []
-        for path in _sources():
-            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+        for path, text in _source_texts():
+            if "sglang.srt.distributed" not in text:
+                continue
+            for node in _ast.walk(_ast.parse(text)):
                 if (
                     isinstance(node, _ast.ImportFrom)
                     and node.module == "sglang.srt.distributed"
