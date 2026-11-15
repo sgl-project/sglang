@@ -1256,6 +1256,17 @@ class SchedulerBatchResultProcessor:
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
+        # A speculative step commits a whole verified run at once. Absorb it
+        # into the penalty state right here, while the tokens are known, and
+        # not only on the next prepare_for_decode(): that runs on a batch that
+        # is already on its way to the forward. The cumulation is prefix-based,
+        # so the prepare-time call only picks up whatever is still missing.
+        orchestrator = getattr(batch.sampling_info, "penalizer_orchestrator", None)
+        if not batch.spec_algorithm.is_none() and (
+            orchestrator is not None and orchestrator.is_required
+        ):
+            batch.cumulate_penalty_output_tokens()
+
         if auxiliary_output is not None:
             self.consume_auxiliary_output(
                 batch,

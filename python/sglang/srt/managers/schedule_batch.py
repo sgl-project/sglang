@@ -492,6 +492,10 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # How many entries of `output_ids` the penalty state has absorbed.
+        # Speculative decoding commits several tokens per step, so the
+        # penalizers have to be fed all of them, not just the last one.
+        self.penalty_cumulated_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
         # extend_end, never mutates this array's length.
@@ -3212,24 +3216,62 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
     def cumulate_penalty_output_tokens(self):
-        # Under overlap batch.input_ids is just a placeholder here -- the
-        # real token is relayed via future_map and resolved at forward
-        # entry. So take the last output token from Req directly
-        # (origin_input_ids[-1] on the first decode, before any output).
-        last_tokens = [
-            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
-            for req in self.reqs
-        ]
+        # Under overlap batch.input_ids is just a placeholder here -- the real
+        # tokens are relayed via future_map and resolved at forward entry. Read
+        # them from Req directly.
+        if self.spec_algorithm.is_none():
+            # One token per step: nothing was lost, keep the original path.
+            last_tokens = [
+                req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
+                for req in self.reqs
+            ]
+            # Non-blocking H2D so this per-step copy doesn't sync behind the
+            # forward. pin_memory (matching the prefill-path tensors) keeps the
+            # copy async; is_pin_memory_available falls back to pageable on
+            # unsupported devices.
+            latest_output_ids = torch.tensor(
+                last_tokens,
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(self.device),
+            ).to(self.device, non_blocking=True)
+            self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                latest_output_ids
+            )
+            return
+
+        # A speculative step commits a whole verified run, so feeding only
+        # `output_ids[-1]` leaves the penalty state behind. Feed every token
+        # committed since the last cumulation, per request.
+        token_ids: List[int] = []
+        row_indices: List[int] = []
+        for row, req in enumerate(self.reqs):
+            out_len = len(req.output_ids)
+            if out_len == 0:
+                # First decode after prefill: keep the prompt-tail seed.
+                token_ids.append(int(req.origin_input_ids[-1]))
+                row_indices.append(row)
+                continue
+            # Retraction can shorten output_ids; never read past it.
+            start = min(req.penalty_cumulated_len, out_len)
+            for token_id in req.output_ids[start:out_len]:
+                token_ids.append(int(token_id))
+                row_indices.append(row)
+            req.penalty_cumulated_len = out_len
+
+        if not token_ids:
+            return
         # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
         # pin_memory (matching the prefill-path tensors) keeps the copy async;
         # is_pin_memory_available falls back to pageable on unsupported devices.
-        latest_output_ids = torch.tensor(
-            last_tokens,
-            dtype=torch.int64,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
-        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            latest_output_ids
+        pinned = is_pin_memory_available(self.device)
+        tokens = torch.tensor(token_ids, dtype=torch.int64, pin_memory=pinned).to(
+            self.device, non_blocking=True
+        )
+        rows = torch.tensor(row_indices, dtype=torch.int64, pin_memory=pinned).to(
+            self.device, non_blocking=True
+        )
+        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens_ragged(
+            tokens, rows
         )
 
     def prepare_for_decode(self):

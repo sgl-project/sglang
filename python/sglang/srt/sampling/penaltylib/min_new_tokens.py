@@ -85,6 +85,19 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         self.len_output_tokens += 1
 
+    def _cumulate_output_tokens_ragged(
+        self, token_ids: torch.Tensor, row_indices: torch.Tensor
+    ):
+        # Speculative decoding commits several tokens per step, so the counter
+        # must advance by the number of tokens committed, not by one per step.
+        # len_output_tokens is [bs, 1]; count on a flat view so index_add_ lines
+        # the source up with row_indices.
+        self.len_output_tokens.view(-1).index_add_(
+            0,
+            row_indices,
+            torch.ones_like(row_indices, dtype=self.len_output_tokens.dtype),
+        )
+
     def _apply(self, logits: torch.Tensor):
         # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
         # device-to-host sync every decode step; torch.where is a plain

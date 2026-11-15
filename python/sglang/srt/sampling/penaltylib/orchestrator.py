@@ -52,6 +52,27 @@ class BatchedPenalizerOrchestrator:
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
 
+    def cumulate_output_tokens_ragged(
+        self, token_ids: torch.Tensor, row_indices: torch.Tensor
+    ):
+        """Feed a variable number of output tokens per request.
+
+        ``token_ids[i]`` was produced by batch row ``row_indices[i]``. Needed
+        by speculative decoding, where one step commits several tokens.
+        """
+        for penalizer in self.penalizers.values():
+            penalizer.cumulate_output_tokens_ragged(
+                token_ids=token_ids, row_indices=row_indices
+            )
+
+    def get_repetition_penalties(self) -> Optional[torch.Tensor]:
+        """Per-request repetition penalty values, shape ``[bs, 1]``, or None."""
+        for penalizer in self.penalizers.values():
+            value = getattr(penalizer, "repetition_penalties", None)
+            if value is not None and penalizer.is_prepared():
+                return value
+        return None
+
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
         Apply all penalizers to the logits in-place.
@@ -215,6 +236,16 @@ class _BatchedPenalizer(abc.ABC):
 
         self._cumulate_output_tokens(output_ids=output_ids)
 
+    def cumulate_output_tokens_ragged(
+        self, token_ids: torch.Tensor, row_indices: torch.Tensor
+    ):
+        if not self._is_prepared:
+            return
+
+        self._cumulate_output_tokens_ragged(
+            token_ids=token_ids, row_indices=row_indices
+        )
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
             return
@@ -257,6 +288,12 @@ class _BatchedPenalizer(abc.ABC):
         Orchestrator will call this function to feed the output tokens to the penalizer.
         """
         pass
+
+    def _cumulate_output_tokens_ragged(
+        self, token_ids: torch.Tensor, row_indices: torch.Tensor
+    ):
+        """Default: no-op. Only token-identity penalizers override this."""
+        return
 
     @abc.abstractmethod
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:

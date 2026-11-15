@@ -89,6 +89,9 @@ class SamplingBatchInfo:
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+    # Per-row repetition penalty value, shape [bs, 1]. Speculative decoding
+    # needs it to rebuild each draft position's own penalty row.
+    acc_repetition_penalties: Optional[torch.Tensor] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -422,9 +425,13 @@ class SamplingBatchInfo:
             self.acc_scaling_penalties = (
                 self.penalizer_orchestrator.accumulate_scaling_penalties()
             )
+            self.acc_repetition_penalties = (
+                self.penalizer_orchestrator.get_repetition_penalties()
+            )
         else:
             self.acc_additive_penalties = None
             self.acc_scaling_penalties = None
+            self.acc_repetition_penalties = None
 
     def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
         if self.acc_additive_penalties is not None:

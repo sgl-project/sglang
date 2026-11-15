@@ -735,6 +735,94 @@ def _sharded_sampling_applies(
     )
 
 
+def add_draft_prefix_penalties(
+    scaling_penalties: torch.Tensor,
+    verify_input: EagleVerifyInput,
+    repetition_penalties: Optional[torch.Tensor],
+) -> None:
+    """Give each draft position the penalty row of its own context.
+
+    ``scaling_penalties`` arrives with the batch-level row (the committed
+    prefix B) repeated over every draft position. Position i is verified under
+    B + d_0..d_i, and a repeated draft token has to be scaled there too. Walk
+    the verify tree from each node up to the root and scatter the per-request
+    penalty value into the matching rows. Mutates ``scaling_penalties``.
+
+    Only the multiplicative (repetition) penalty is path-dependent; the
+    additive ones are still applied per request.
+    """
+    if repetition_penalties is None:
+        return
+    draft_token_num = verify_input.draft_token_num
+    draft_token = verify_input.draft_token
+    # Both EAGLE's build_tree_kernel and NGRAM's corpus lookup hand over a flat
+    # (bs * draft_token_num,) tensor in row-major order.
+    bs = draft_token.numel() // draft_token_num
+    draft_token = draft_token.reshape(bs, draft_token_num)
+    device = draft_token.device
+    values = repetition_penalties.reshape(bs, 1).expand(bs, draft_token_num)
+
+    next_token = getattr(verify_input, "retrieve_next_token", None)
+    next_sibling = getattr(verify_input, "retrieve_next_sibling", None)
+    if next_token is None or next_sibling is None:
+        # No tree metadata: the path of a node is unknown, so only its own
+        # token can be marked. Under-penalising is the safe direction -- a
+        # wrong ancestor would add a penalty the non-speculative path never
+        # applies. Neither EAGLE nor NGRAM reaches this branch; both always
+        # hand over the child lists.
+        parent = torch.full((bs, draft_token_num), -1, dtype=torch.long, device=device)
+    else:
+        parent = draft_parents(
+            next_token.reshape(bs, draft_token_num).to(device),
+            next_sibling.reshape(bs, draft_token_num).to(device),
+            draft_token_num,
+        )
+
+    base = torch.arange(draft_token_num, device=device)
+    rows = torch.arange(bs, device=device).unsqueeze(1) * draft_token_num + base
+    vocab = scaling_penalties.size(1)
+    node = base.expand(bs, draft_token_num).clone()
+    # Walk each node up to the root. The assignment is idempotent, so a node
+    # that repeats a token already on its path is penalised exactly once, the
+    # same as the non-speculative path.
+    for _ in range(draft_token_num):
+        live = node >= 0
+        token = draft_token.gather(1, node.clamp(min=0))
+        # Unused tree slots carry -1 or a padding id. A negative id would wrap
+        # to the end of the row and one past the vocabulary would abort the
+        # kernel, so only in-range ids are written.
+        valid = live & (token >= 0) & (token < vocab)
+        scaling_penalties[rows[valid], token[valid]] = values[valid]
+        node = torch.where(live, parent.gather(1, node.clamp(min=0)), node)
+
+
+def draft_parents(
+    next_token: torch.Tensor, next_sibling: torch.Tensor, draft_token_num: int
+) -> torch.Tensor:
+    """Invert the verify tree's child links into a per-node parent pointer.
+
+    ``retrieve_next_token[u]`` heads the child list of node ``u``; the other
+    children are reached through ``retrieve_next_sibling``. Walking every list
+    yields ``parent[c] = u`` for each non-root node, and the root (node 0)
+    keeps -1. Neither a chain nor a fixed branching factor can be assumed:
+    EAGLE honours topk, while NGRAM and DFLASH build irregular trees.
+    """
+    bs = next_token.shape[0]
+    parent = torch.full_like(next_token, -1)
+    child = next_token.clone()
+    owner = (
+        torch.arange(draft_token_num, device=next_token.device)
+        .expand(bs, draft_token_num)
+        .clone()
+    )
+    for _ in range(draft_token_num):
+        live = child >= 0
+        index = child.clamp(min=0)
+        parent.scatter_(1, index, torch.where(live, owner, torch.full_like(owner, -1)))
+        child = torch.where(live, next_sibling.gather(1, index), child)
+    return parent
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -814,12 +902,18 @@ def eagle_sample(
             )
         )
     if sampling_info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(
-            next_token_logits,
-            torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
-            ),
+        # One row per draft position, not one row broadcast to all of them:
+        # position i is verified under B + d_0..d_i, so the draft tokens on its
+        # own tree path must be penalised in that row.
+        scaling_penalties = torch.repeat_interleave(
+            sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
         )
+        add_draft_prefix_penalties(
+            scaling_penalties,
+            verify_input,
+            sampling_info.acc_repetition_penalties,
+        )
+        apply_scaling_penalties(next_token_logits, scaling_penalties)
     if sampling_info.logit_bias is not None:
         next_token_logits.add_(
             torch.repeat_interleave(

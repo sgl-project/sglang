@@ -56,6 +56,13 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             src=self.repetition_penalties,
         )
 
+    def _cumulate_output_tokens_ragged(
+        self, token_ids: torch.Tensor, row_indices: torch.Tensor
+    ):
+        self.cumulated_repetition_penalties[row_indices, token_ids] = (
+            self.repetition_penalties[row_indices, 0]
+        )
+
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         apply_scaling_penalties(logits, self.cumulated_repetition_penalties)
         return logits
