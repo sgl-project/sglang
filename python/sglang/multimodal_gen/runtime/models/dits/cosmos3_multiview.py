@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     Cosmos3OmniTransformer,
     compute_mrope_position_ids_text,
     compute_mrope_position_ids_vision,
+    shard_sequence,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -141,34 +142,6 @@ def unpatchify_lidar(
     x = x.permute(0, 6, 1, 2, 4, 3, 5)
     x = x.reshape(tokens.shape[0], channels, frames, padded_h, padded_w)
     return x[:, :, :, :height, :width]
-
-
-def sequence_shard_padding(seq_len: int, world_size: int) -> int:
-    """Tokens appended so a sequence splits evenly over ``world_size`` ranks."""
-    if world_size <= 1:
-        return 0
-    return (-seq_len) % world_size
-
-
-def shard_sequence(
-    tensor: torch.Tensor, world_size: int, rank: int, *, dim: int, pad_last: bool
-) -> torch.Tensor:
-    """This rank's contiguous shard of ``tensor`` along ``dim``.
-
-    The sequence is first padded to a multiple of ``world_size`` by repeating the
-    last entry (``pad_last``, for positions) or with zeros (for tokens).
-    """
-    if world_size <= 1:
-        return tensor
-    pad = sequence_shard_padding(tensor.shape[dim], world_size)
-    if pad:
-        tail = tensor.narrow(dim, tensor.shape[dim] - 1, 1)
-        filler = tail.expand(*[pad if i == dim else -1 for i in range(tensor.ndim)])
-        if not pad_last:
-            filler = torch.zeros_like(filler)
-        tensor = torch.cat([tensor, filler], dim=dim)
-    local = tensor.shape[dim] // world_size
-    return tensor.narrow(dim, rank * local, local).contiguous()
 
 
 def add_rig_view_rows(

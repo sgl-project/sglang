@@ -18,7 +18,6 @@ from sglang.multimodal_gen.configs.models.vaes.base import (
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
-    ModelTaskType,
     maybe_unpad_latents,
     pack_latents_2x2,
     pad_text_embeddings_with_mask,
@@ -30,11 +29,13 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
 )
-from sglang.multimodal_gen.runtime.utils.vision import resize
+from sglang.multimodal_gen.runtime.utils.vision import preprocess_image, resize
 
 
 def _calculate_dimensions(target_area, ratio):
@@ -489,6 +490,10 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         default_factory=lambda: (qwen_image_edit_postprocess_text,)
     )
 
+    def supports_sequential_multi_output_inference(self):
+        # The edit stages handle one sample per forward; n > 1 runs the outputs one by one.
+        return True
+
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False
     ):
@@ -676,7 +681,11 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         vae_image_sizes = []
         for img in batch.condition_image:
             width, height = self.calculate_vae_image_size(img, img.width, img.height)
-            new_images.append(vae_image_processor.preprocess(img, height, width))
+            new_images.append(
+                preprocess_image(
+                    img, device=get_local_torch_device(), size=(width, height)
+                )
+            )
             vae_image_sizes.append((width, height))
         batch.vae_image = new_images
         batch.vae_image_sizes = vae_image_sizes
@@ -748,6 +757,11 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     # promoting the auxiliary components regresses first-request latency
     supports_auto_residency: bool = False
 
+    def supports_sequential_multi_output_inference(self):
+        # The Layered pipeline's first stage does not split an n > 1 request, so the
+        # worker must not expect one result per output.
+        return False
+
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             keep_resident_min_available_gb=70,
@@ -801,12 +815,17 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
             [noisy_img_complex, img_complex[noisy_img_seq_len:, :]], dim=0
         ).to(device=device)
 
+        # one tensor for both CFG branches, so the DiT's modulation cache hits
+        additional_t_cond = batch.extra.get("qwen_layered_t_cond")
+        if additional_t_cond is None:
+            additional_t_cond = torch.zeros(1, device=device, dtype=torch.long)
+            batch.extra["qwen_layered_t_cond"] = additional_t_cond
         cond_kwargs = {
             "txt_seq_lens": txt_seq_lens,
             "img_shapes": img_shapes,
             "freqs_cis": (img_cache, txt_cache),
             "freqs_complex": (img_complex, txt_complex),
-            "additional_t_cond": torch.tensor([0], device=device, dtype=torch.long),
+            "additional_t_cond": additional_t_cond,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
         return cond_kwargs

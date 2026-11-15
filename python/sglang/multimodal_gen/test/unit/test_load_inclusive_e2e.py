@@ -160,16 +160,19 @@ def test_server_load_clock_excludes_warmup(
         (message % args) + "\n"
     )
 
-    def ready():
-        clock[0] += 1_000_000_000
-        return {"status": "ready"}
+    def ready(payload, ranks, name_prefix):
+        restored_args = payload.materialize()
+        assert isinstance(restored_args, ServerArgs)
+        assert restored_args.num_gpus == workers
+        assert ranks == [(i, i) for i in range(workers)]
+        clock[0] += workers * 1_000_000_000
+        return [Mock() for _ in ranks]
 
-    worker_context = Mock()
-    worker_context.Pipe.side_effect = lambda **kwargs: (Mock(recv=ready), Mock())
-    monkeypatch.setattr(launcher.mp, "get_context", Mock(return_value=worker_context))
+    monkeypatch.setattr(launcher, "_start_scheduler_processes", ready)
     monkeypatch.setattr(launcher, "shutdown_scheduler_processes", Mock())
 
-    def warmup(args):
+    def warmup(args, *, worker_pids):
+        assert len(worker_pids) == workers
         clock[0] += warmup_seconds * 1_000_000_000
 
     monkeypatch.setattr(launcher, "launch_http_server_only", warmup)
@@ -192,12 +195,6 @@ def test_server_load_clock_excludes_warmup(
     manager = utils.ServerManager("test", 1234)
     monkeypatch.setattr(manager, "_wait_for_ready", Mock())
     context = manager.start()
-    launcher.mp.get_context.assert_called_once_with("spawn")
-    assert worker_context.Process.call_count == workers
-    for call in worker_context.Process.call_args_list:
-        restored_args = call.kwargs["args"][0].server_args.materialize()
-        assert isinstance(restored_args, ServerArgs)
-        assert restored_args.num_gpus == workers
     context._log_thread.join(timeout=5)
     assert not context._log_thread.is_alive()
     assert context.load_time_ms == workers * 1000

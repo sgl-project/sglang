@@ -12,10 +12,8 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def sana_video_postprocess_text(

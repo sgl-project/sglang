@@ -200,7 +200,13 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    SLOT_INDICES: tl.constexpr,
 ):
+    """One query row x one KV head group over its ``topk`` selected tokens.
+
+    ``indices`` hold positions relative to row ``cu_k[batch]`` of ``k``/``v``
+    (a packed context), or, with ``SLOT_INDICES``, rows of ``k``/``v`` itself
+    (KV-pool slots; ``cu_k`` is unused)."""
     query_relative = tl.program_id(0).to(tl.int64)
     batch_group = tl.program_id(1)
     group = batch_group % NUM_KV_HEADS
@@ -210,7 +216,10 @@ def _sparse_gqa_chunk_prefill(
     query = (q_start + query_relative).to(tl.int64)
     if query >= q_end:
         return
-    k_start = tl.load(cu_k + batch).to(tl.int64)
+    if SLOT_INDICES:
+        k_start = 0
+    else:
+        k_start = tl.load(cu_k + batch).to(tl.int64)
     kv_len = tl.load(kv_lens + batch).to(tl.int64)
     visible = query_relative + kv_len - (q_end - q_start) + 1
     row_topk = tl.minimum(topk, visible)
@@ -237,6 +246,9 @@ def _sparse_gqa_chunk_prefill(
         current = start + offs_n
         token = tl.load(idx_row + current * si_n, mask=current < topk, other=-1)
         valid = token >= 0
+        if SLOT_INDICES:
+            # 64-bit: slot * sk_n overflows int32 on a pool of a few M tokens.
+            token = token.to(tl.int64)
         keys = tl.load(
             k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
             mask=valid[None, :],
@@ -247,7 +259,7 @@ def _sparse_gqa_chunk_prefill(
             mask=valid[:, None],
             other=0.0,
         )
-        # Direct callers can pass FP8 K/V; production packing uses Q's dtype.
+        # Direct callers and the KV pool can be FP8; packing uses Q's dtype.
         # QSA stores unscaled K/V, so a plain cast supports both callers.
         keys = keys.to(q_values.dtype)
         values = values.to(q_values.dtype)
@@ -370,12 +382,16 @@ def pack_qsa_prefill_kv(
     return packed_k, packed_v
 
 
-def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+def sparse_gqa_fwd_interface_triton_ck(
+    q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q: Optional[int] = None
+):
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    if max_q is None:
+        # Host sync; callers that know the longest entry pass it instead.
+        max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
     out = torch.empty_like(q)
@@ -410,6 +426,7 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        SLOT_INDICES=False,
         num_warps=warps,
         num_stages=stages,
     )
@@ -462,6 +479,119 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        SLOT_INDICES=False,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
+@triton.jit
+def _resolve_prefill_slots(
+    indices,
+    slots,
+    cu_q,
+    slot_table,
+    slot_rows,
+    topk,
+    si_m,
+    ss_m,
+    st_m,
+    BLOCK: tl.constexpr,
+):
+    """``slots[row, j] = slot_table[entry % slot_rows, indices[row, j]]``, -1
+    where the index is; one program per query row of an entry."""
+    entry = tl.program_id(1)
+    q_start = tl.load(cu_q + entry)
+    row = q_start + tl.program_id(0)
+    if row >= tl.load(cu_q + entry + 1):
+        return
+    row = row.to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    token = tl.load(indices + row * si_m + cols, mask=cols < topk, other=-1)
+    valid = token >= 0
+    table_row = slot_table + (entry % slot_rows).to(tl.int64) * st_m
+    slot = tl.load(table_row + token, mask=valid, other=-1)
+    tl.store(slots + row * ss_m + cols, slot, mask=cols < topk)
+
+
+def sparse_gqa_paged_prefill_triton(
+    q, k_cache, v_cache, slot_table, indices, cu_q, kv_lens, scale, *, max_q
+):
+    """Chunk-prefill sparse attention that reads K/V in place from the KV pool.
+
+    Same entry geometry as ``sparse_gqa_fwd_interface_triton_ck`` (``cu_q`` and
+    ``kv_lens`` per entry, ``indices`` are logical positions of the entry's
+    request), but no packed copy of each request's context: entry ``e``'s
+    position ``t`` is read from pool slot
+    ``slot_table[e % slot_table.shape[0], t]``. Prefill CP passes two entries
+    per request (zigzag prev blocks, then next blocks) over one table row per
+    request. ``max_q`` is the longest entry's query count, from host lengths.
+    The selected tokens, the current chunk's included, must already be in the
+    pool.
+
+    The slots are resolved in a pass of their own: looking them up inside the
+    attention loop puts a second dependent load in front of every K/V load and
+    made the kernel 1.5x slower."""
+    total_q, num_q_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[1]
+    group_size = num_q_heads // num_kv_heads
+    num_entries = cu_q.shape[0] - 1
+    out = torch.empty_like(q)
+    if total_q == 0 or num_entries == 0:
+        return out
+    indices = indices[:total_q]
+    topk = indices.shape[-1]
+    assert indices.ndim == 2 and indices.stride(-1) == 1
+    assert slot_table.stride(-1) == 1
+    slots = torch.empty((total_q, topk), dtype=slot_table.dtype, device=indices.device)
+    _resolve_prefill_slots[(max_q, num_entries)](
+        indices,
+        slots,
+        cu_q,
+        slot_table,
+        slot_table.shape[0],
+        topk,
+        indices.stride(0),
+        slots.stride(0),
+        slot_table.stride(0),
+        BLOCK=triton.next_power_of_2(topk),
+        num_warps=4,
+    )
+    block_m = max(16, triton.next_power_of_2(group_size))
+    block_n, warps, stages = _get_best_config(total_q)
+    _sparse_gqa_chunk_prefill[(max_q, num_entries * num_kv_heads)](
+        q,
+        k_cache,
+        v_cache,
+        out,
+        slots,
+        cu_q,
+        cu_q,
+        kv_lens,
+        scale,
+        topk,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        slots.stride(0),
+        0,
+        slots.stride(1),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        SLOT_INDICES=True,
         num_warps=warps,
         num_stages=stages,
     )
@@ -672,4 +802,5 @@ __all__ = [
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
     "sparse_gqa_packed_decode_triton",
+    "sparse_gqa_paged_prefill_triton",
 ]

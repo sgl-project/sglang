@@ -7,17 +7,57 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import ForwardMode
+from sglang.srt.layers.dp_attention import (
+    get_cuda_graph_max_batch_size,
+    get_eager_max_batch_size,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.runtime_context import get_schedule
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import (
+    get_schedule,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
+from sglang.srt.utils.device import async_h2d, is_npu
+
+_is_npu = is_npu()
+
+if _is_npu:
+    import sgl_kernel_npu  # noqa: F401  Registers torch.ops.npu OE operators.
+else:
+    from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram import EngramHasher
+    from sglang.srt.layers.engram_staging import EngramRowStager
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def _update_token_table(tokens, ne_token_table, row_indices, column_starts, req_lens):
+    if _is_npu:
+        if row_indices.numel() == 0 or tokens.numel() == 0:
+            return
+        torch.ops.npu.update_oe_token_table(
+            tokens.contiguous(),
+            req_lens.contiguous(),
+            row_indices.contiguous(),
+            column_starts.contiguous(),
+            tokens.new_empty(0),
+            batch_size=row_indices.numel(),
+            max_context_len=ne_token_table.shape[1],
+            oe_token_table=ne_token_table,
+        )
+    else:
+        update_token_table(
+            tokens=tokens,
+            ne_token_table=ne_token_table,
+            row_indices=row_indices,
+            column_starts=column_starts,
+            req_lens=req_lens,
+            ignore_tokens=None,
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -27,6 +67,7 @@ class NgramEmbeddingManager:
     n: int
     # Draft runners have no hasher even when their config has engram layers.
     engram_hasher: Optional[EngramHasher] = None
+    engram_stager: Optional[EngramRowStager] = None
 
     @classmethod
     def from_model(
@@ -43,10 +84,20 @@ class NgramEmbeddingManager:
         if use_ngram_embedding:
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 
+            if _is_npu:
+                use_ngram_embedding = any(
+                    isinstance(module, NgramEmbedding) for module in model.modules()
+                )
+
+        if use_ngram_embedding:
             # Sized to mirror req_to_token (indexed by req_pool_idx).
             token_table = torch.empty(
                 req_to_token_pool.req_to_token.shape[0],
-                model_config.context_len,
+                (
+                    req_to_token_pool.req_to_token.shape[1]
+                    if _is_npu
+                    else model_config.context_len
+                ),
                 dtype=torch.int32,
                 device=device,
             )
@@ -54,12 +105,21 @@ class NgramEmbeddingManager:
             assert chunked_prefill_size is not None and chunked_prefill_size > 0, (
                 "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
             )
+            buffer_requests = max_running_requests
+            buffer_tokens = chunked_prefill_size
+            if _is_npu and get_spec().speculative_algorithm is not None:
+                buffer_requests = max(
+                    get_cuda_graph_max_batch_size(max_running_requests),
+                    get_eager_max_batch_size(max_running_requests),
+                )
+                buffer_tokens = max(
+                    buffer_tokens,
+                    buffer_requests * max_speculative_num_draft_tokens(),
+                )
             for module in model.modules():
                 if isinstance(module, NgramEmbedding):
-                    module.init_buffers(
-                        max_running_requests, chunked_prefill_size, device
-                    )
-        engram_hasher = None
+                    module.init_buffers(buffer_requests, buffer_tokens, device)
+        engram_hasher = engram_stager = None
         if model_config.use_engram:
             from sglang.srt.layers.engram import EngramHasher
 
@@ -68,11 +128,18 @@ class NgramEmbeddingManager:
                     assert engram_hasher is None, "one engram hasher per model"
                     module.init_history(req_to_token_pool.req_to_token.shape[0], device)
                     engram_hasher = module
+            if engram_hasher is not None:
+                from sglang.srt.layers.engram_staging import EngramRowStager
+
+                engram_stager = EngramRowStager.from_model(
+                    model, engram_hasher, torch.device(device)
+                )
         return cls(
             enabled=use_ngram_embedding,
             table=token_table,
             n=model_config.ngram_embedding_n,
             engram_hasher=engram_hasher,
+            engram_stager=engram_stager,
         )
 
     def update_after_decode(
@@ -90,6 +157,17 @@ class NgramEmbeddingManager:
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             batch_size=forward_batch.batch_size,
+        )
+
+    def prepare_for_verify(self, forward_batch: ForwardBatch) -> None:
+        """Stage a linear verify chain; the next round overwrites its rejected tail."""
+        info = forward_batch.ngram_embedding_info
+        _update_token_table(
+            tokens=forward_batch.input_ids.to(self.table.dtype),
+            ne_token_table=self.table,
+            row_indices=forward_batch.req_pool_indices,
+            column_starts=info.column_starts,
+            req_lens=info.req_lens,
         )
 
     def update_after_verify(
@@ -116,6 +194,8 @@ class NgramEmbeddingManager:
             return batch
         if self.engram_hasher is not None:
             self._prepare_engram_history(batch)
+        if self.engram_stager is not None:
+            batch.engram_staged_rows = self.engram_stager.stage(batch)
         if not self.enabled:
             return batch
         batch.ne_token_table = self.table
@@ -142,7 +222,7 @@ class NgramEmbeddingManager:
                 request_lengths.append(len(tokens))
             dtype = self.table.dtype
             device = self.table.device
-            update_token_table(
+            _update_token_table(
                 ne_token_table=self.table,
                 tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
                 row_indices=batch.req_pool_indices,
@@ -152,7 +232,6 @@ class NgramEmbeddingManager:
                 req_lens=torch.tensor(
                     request_lengths, dtype=torch.int32, device=device
                 ),
-                ignore_tokens=None,
             )
             # Mark the chunked (not-yet-finished) prefill request so sample()
             # skips writing its pseudo next-token into the ngram token table.
@@ -226,7 +305,7 @@ def update_ngram_token_table_after_sampling(
         indices = (~skip_token_table_update).nonzero(as_tuple=True)[0]
         if indices.numel() == 0:
             return False
-        update_token_table(
+        _update_token_table(
             ne_token_table=ngram_embedding_info.token_table,
             tokens=next_token_ids[indices].to(torch.int32),
             row_indices=req_pool_indices[indices],
@@ -234,7 +313,6 @@ def update_ngram_token_table_after_sampling(
             req_lens=torch.ones(
                 indices.numel(), dtype=torch.int32, device=next_token_ids.device
             ),
-            ignore_tokens=None,
         )
         return True
 
@@ -243,12 +321,11 @@ def update_ngram_token_table_after_sampling(
     # batch_size so padded rows don't pollute the token table (and shapes match).
     ngram_embedding_info.out_column_starts[:batch_size] = seq_lens[:batch_size]
     ngram_embedding_info.out_req_lens[:batch_size] = 1
-    update_token_table(
+    _update_token_table(
         ne_token_table=ngram_embedding_info.token_table,
         tokens=next_token_ids[:batch_size].to(torch.int32),
         row_indices=req_pool_indices[:batch_size],
         column_starts=ngram_embedding_info.out_column_starts[:batch_size],
         req_lens=ngram_embedding_info.out_req_lens[:batch_size],
-        ignore_tokens=None,
     )
     return True

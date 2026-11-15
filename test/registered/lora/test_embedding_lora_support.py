@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
-register_cuda_ci(est_time=150, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=150, stage="weekly", runner_config="1-gpu-large")
 
 MODEL_PATH = "meta-llama/Llama-2-7b-hf"
 LORA_PATH = "yushengsu/sglang_lora_logprob_diff_without_tuning"

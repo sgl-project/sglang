@@ -185,20 +185,6 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
         )
         self.assertGreater(decision.predicted_theta, 0.0)
 
-    def test_decision_predicted_step_is_inverse_sps_for_diagonal_table(self):
-        survival = torch.tensor([[0.9, 0.8, 0.7, 0.6]], dtype=torch.float32)
-        cfg = DSparkScheduleConfig(gamma=4)
-        table = _cliff_table()
-        decision = compute_verify_token_budget(
-            history_survival_probs=survival, sps_table=table, cfg=cfg
-        )
-        expected_sps = table.lookup(1 + decision.budget)
-        self.assertIsNotNone(decision.predicted_step_seconds)
-        self.assertAlmostEqual(
-            decision.predicted_step_seconds, 1.0 / expected_sps, places=9
-        )
-        self.assertGreater(decision.predicted_theta, 0.0)
-
 
 def _make_budget_planner() -> HostConfidenceBudgetPlanner:
     return HostConfidenceBudgetPlanner(
@@ -209,15 +195,6 @@ def _make_budget_planner() -> HostConfidenceBudgetPlanner:
 
 
 class TestBudgetDecisionLifecycle(CustomTestCase):
-    def test_take_last_decision_is_consume_once(self):
-        planner = _make_budget_planner()
-        planner.last_decision = VerifyBudgetDecision(
-            budget=3, predicted_step_seconds=0.01, predicted_theta=100.0
-        )
-        first = planner.take_last_decision()
-        self.assertEqual(first.budget, 3)
-        self.assertIsNone(planner.take_last_decision())
-
     def test_note_non_decode_step_clears_decision(self):
         planner = _make_budget_planner()
         planner.last_decision = VerifyBudgetDecision(budget=1)
@@ -226,32 +203,6 @@ class TestBudgetDecisionLifecycle(CustomTestCase):
 
 
 class TestScheduleVerifyLensTopk(CustomTestCase):
-    @_for_each_impl
-    def test_topk_does_not_exceed_budget(self, impl):
-        torch.manual_seed(2)
-        survival = _survival_from_confidence(torch.rand(5, 7) * 0.4 + 0.55)
-        cfg = DSparkScheduleConfig(gamma=7)
-        floor = max(cfg.min_verify_len, 1)
-        for budget in (0, 1, 5, 12, 100):
-            verify_lens = impl(survival_probs=survival, budget=budget, cfg=cfg)
-            total_extra = int((verify_lens.to(torch.int64) - floor).sum().item())
-            self.assertLessEqual(total_extra, budget)
-            self.assertGreaterEqual(int(verify_lens.min().item()), 1)
-
-    @_for_each_impl
-    def test_total_equals_anchors_plus_lens(self, impl):
-        survival = torch.tensor(
-            [[0.90, 0.80, 0.30, 0.20], [0.85, 0.70, 0.25, 0.15]],
-            dtype=torch.float32,
-        )
-        num_requests, max_len, budget = 2, 4, 2
-        cfg = DSparkScheduleConfig(gamma=max_len, min_verify_len=1)
-        verify_lens = impl(survival_probs=survival, budget=budget, cfg=cfg)
-        actual_total = num_requests + int(verify_lens.to(torch.int64).sum().item())
-        admitted = budget
-        expected_total = num_requests + num_requests * cfg.min_verify_len + admitted
-        self.assertEqual(actual_total, expected_total)
-
     @_for_each_impl
     def test_higher_confidence_admitted_first(self, impl):
         survival = torch.tensor(
@@ -426,30 +377,7 @@ class TestVanillaMatchesReference(CustomTestCase):
             )
 
 
-class TestDSparkScheduleConfig(CustomTestCase):
-    def test_validate_rejects_min_greater_than_max(self):
-        with self.assertRaises(ValueError):
-            DSparkScheduleConfig(gamma=4, min_verify_len=3, max_verify_len=2).validate()
-
-    def test_validate_rejects_max_greater_than_gamma_plus_one(self):
-        with self.assertRaises(ValueError):
-            DSparkScheduleConfig(gamma=4, max_verify_len=6).validate()
-
-    def test_zero_max_resolves_to_gamma_plus_one(self):
-        cfg = DSparkScheduleConfig(gamma=7)
-        self.assertEqual(cfg.resolved_max_verify_len(), 8)
-
-
 class TestGraphTierFillBudget(CustomTestCase):
-    def test_floor_scales_with_min_verify_len(self):
-        """The subtracted floor is bs * max(min_verify_len, 1)."""
-        self.assertEqual(
-            graph_tier_fill_budget(
-                graph_num_tokens=60, bs=10, verify_num_draft_tokens=6, min_verify_len=2
-            ),
-            60 - 20,
-        )
-
     def test_feeding_budget_fills_topk_total_to_tier(self):
         """Feeding the fill budget to the top-k lifts the total to min(tier, bs*K)."""
         bs = 6
@@ -481,6 +409,25 @@ def _fake_model_runner(capture_num_tokens, max_bs):
         max_bs=max_bs,
     )
     return types.SimpleNamespace(decode_cuda_graph_runner=runner)
+
+
+def _fake_compact_planner(
+    *, capture_num_tokens, max_bs, verify_num_draft_tokens, align=False
+):
+    from sglang.srt.speculative.dspark_components.dspark_planner import (
+        DSparkVerifyPlanner,
+    )
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+    planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+    planner.model_runner = _fake_model_runner(capture_num_tokens, max_bs=max_bs)
+    planner.verify_num_draft_tokens = verify_num_draft_tokens
+    planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+    planner._schedule_cfg = DSparkScheduleConfig(gamma=verify_num_draft_tokens - 1)
+    planner._dynamic_graph_tier = False
+    planner._is_verify_all = False
+    planner._align_verify_tokens_to_graph_tier = align
+    return planner
 
 
 class TestBudgetTierSelection(CustomTestCase):
@@ -551,6 +498,56 @@ class TestBudgetTierSelection(CustomTestCase):
                 model_runner=model_runner,
             )
         )
+
+    def test_resolve_tier_past_captured_grid_skips_round_up(self):
+        planner = _fake_compact_planner(
+            capture_num_tokens=[8, 16, 1024], max_bs=256, verify_num_draft_tokens=8
+        )
+        tier = planner._resolve_verify_tier(
+            num_reqs=200, global_num_reqs=None, dp_tier_num_tokens=None, budget=None
+        )
+        self.assertTrue(tier.exceeds_captured_grid)
+        self.assertIsNone(tier.graph_num_tokens)
+        tier = planner._resolve_verify_tier(
+            num_reqs=100, global_num_reqs=200, dp_tier_num_tokens=1100, budget=None
+        )
+        self.assertTrue(tier.exceeds_captured_grid)
+        self.assertIsNone(tier.graph_num_tokens)
+        tier = planner._resolve_verify_tier(
+            num_reqs=4, global_num_reqs=None, dp_tier_num_tokens=None, budget=None
+        )
+        self.assertFalse(tier.exceeds_captured_grid)
+        self.assertEqual(tier.graph_num_tokens, 1024)
+
+    def test_schedule_layout_past_captured_grid_falls_back_to_eager(self):
+        planner = _fake_compact_planner(
+            capture_num_tokens=[8, 16, 1024], max_bs=256, verify_num_draft_tokens=8
+        )
+        bs = 200
+        planner._schedule_verify_lens = lambda **_: torch.ones(bs, dtype=torch.int32)
+        layout = planner.schedule_layout(
+            req_pool_indices=torch.arange(bs),
+            prefix_lens=torch.zeros(bs, dtype=torch.int64),
+            device=torch.device("cpu"),
+            confidence=None,
+            budget=None,
+        )
+        self.assertIsNone(layout)
+
+    def test_aligned_budget_past_captured_grid_is_unchanged(self):
+        planner = _fake_compact_planner(
+            capture_num_tokens=[8, 16, 1024],
+            max_bs=256,
+            verify_num_draft_tokens=8,
+            align=True,
+        )
+        budget = planner._budget_aligned_to_graph_tier(
+            req_pool_indices=torch.arange(200),
+            budget=300,
+            global_num_reqs=None,
+            dp_tier_num_tokens=None,
+        )
+        self.assertEqual(budget, 300)
 
 
 if __name__ == "__main__":

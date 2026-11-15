@@ -11,6 +11,8 @@ from .kv_layout import KVLayout
 
 LAYOUT = KVLayout.V4
 MAX_BATCH = 8
+# SM100 row cap, below the ~48-row break-even against FlashMLA.
+MAX_ROWS = 40
 NUM_HEADS = 16
 HEAD_DIM = 512
 SOFTMAX_SCALE = HEAD_DIM**-0.5
@@ -26,7 +28,7 @@ def can_use_swapab_attention(
 ) -> bool:
     """The caller adds the SM100 and single-query forward-mode gates."""
     return (
-        0 < q.shape[0] <= MAX_BATCH
+        0 < q.shape[0] <= MAX_ROWS
         and num_heads in (NUM_HEADS, 2 * NUM_HEADS)
         and q.dtype == torch.bfloat16
         and q.shape[-1] == HEAD_DIM
@@ -119,7 +121,7 @@ def swapab_attention(
 
     block = 64
     assert q.ndim in (3, 4) and (q.ndim == 3 or q.shape[1] == 1)
-    assert 0 < b <= MAX_BATCH and d == HEAD_DIM
+    assert 0 < b <= MAX_ROWS and d == HEAD_DIM
     assert q.dtype == torch.bfloat16 and q.stride(-1) == 1
     assert kv.shape[-1] == LAYOUT.bytes_per_token
     assert kv.dtype in (torch.uint8, torch.float8_e4m3fn)

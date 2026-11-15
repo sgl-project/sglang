@@ -14,12 +14,12 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
@@ -28,7 +28,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-small")
 
 
 def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
@@ -267,9 +267,10 @@ class TestCudaIpcTransport(CustomTestCase):
         self.assertIsNone(proxy._pool_storage)
 
     def test_failed_item_batch_releases_undispatched_pool_slice(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-        from sglang.srt.multimodal.processors.base_processor import (
-            BaseMultimodalProcessor,
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
+        from sglang.srt.multimodal.transport.feature_transport import (
+            MultimodalFeatureTransport,
         )
 
         pool = MmItemMemoryPool(
@@ -278,11 +279,11 @@ class TestCudaIpcTransport(CustomTestCase):
             base_gpu_id=0,
             consumer_count=4,
         )
-        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
-            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
-        processor.use_cuda_ipc = True
-        processor.use_ipc_pool_handle_cache = True
-        processor.cudaipc_mmfeature_pool = pool
+        transport = MultimodalFeatureTransport(
+            "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
+        )
+        transport.use_ipc_pool_handle_cache = True
+        transport.cudaipc_mmfeature_pool = pool
         features = [
             torch.ones(16, device="cuda"),
             torch.empty(0, device="cuda"),
@@ -294,7 +295,7 @@ class TestCudaIpcTransport(CustomTestCase):
 
         try:
             with self.assertRaisesRegex(ValueError, "empty tensor"):
-                processor._prepare_mm_items_for_transport(items)
+                transport.prepare_mm_items_for_transport(items)
 
             deadline = time.monotonic() + 5
             while pool.active_lease_count and time.monotonic() < deadline:

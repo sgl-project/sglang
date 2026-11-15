@@ -18,7 +18,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, stage="jit-kernel-unit", runner_config="amd")
 
 SENTINEL = 0x7EADBEEF
@@ -84,17 +84,28 @@ class TestSpecKvIndicesGrid(CustomTestCase):
                     (4, torch.int64),
                 ]:
                     inputs = _draft_inputs(seqs, topk, steps, "cuda", idx_dtype)
-                    ref = _run_draft(inputs, topk, steps, page_size, 1, {})
-                    for nb in [
-                        1,
-                        kv_indices_num_token_blocks(POOL_LEN, steps * len(seqs) * topk),
-                        triton.cdiv(POOL_LEN, 8192),
-                    ]:
-                        out = _run_draft(
-                            inputs, topk, steps, page_size, nb, {"NUM_STEPS": steps}
-                        )
-                        self.assertTrue(torch.equal(ref[0], out[0]), (seqs, topk, nb))
-                        self.assertTrue(torch.equal(ref[1], out[1]), (seqs, topk, nb))
+                    # window_size > 0: the StreamingLLM draft window, which the
+                    # token-block path must honour exactly like the serial grid
+                    for window_kw in ({}, {"window_size": 4032, "sink_size": 64}):
+                        ref = _run_draft(inputs, topk, steps, page_size, 1, window_kw)
+                        for nb in [
+                            1,
+                            kv_indices_num_token_blocks(
+                                POOL_LEN, steps * len(seqs) * topk
+                            ),
+                            triton.cdiv(POOL_LEN, 8192),
+                        ]:
+                            out = _run_draft(
+                                inputs,
+                                topk,
+                                steps,
+                                page_size,
+                                nb,
+                                {"NUM_STEPS": steps, **window_kw},
+                            )
+                            key = (seqs, topk, nb, window_kw)
+                            self.assertTrue(torch.equal(ref[0], out[0]), key)
+                            self.assertTrue(torch.equal(ref[1], out[1]), key)
 
     def test_draft_reference(self):
         torch.manual_seed(1)

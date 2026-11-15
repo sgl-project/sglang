@@ -27,6 +27,7 @@ import torch
 from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    _compact_c4_loc,
     maybe_write_dsv4_extend,
 )
 from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
@@ -164,8 +165,18 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return int(diff.sum().item())
 
     @staticmethod
-    def _derive_c4_loc_from_full(out_full_loc: torch.Tensor) -> torch.Tensor:
-        """Map full slots closing a 4-token group to their C4 slots."""
+    def _derive_c4_loc_from_full(
+        out_full_loc: torch.Tensor,
+        upper: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Map full slots closing a 4-token group to their C4 slots.
+
+        With ``upper``: compact on device — the boolean index lowers to a
+        host-synchronizing aclnnNonzeroV2. The zero-padded result matches
+        what the decode consumers build from the compact tensor.
+        """
+        if upper is not None:
+            return _compact_c4_loc(out_full_loc, upper)
         completed_group = (out_full_loc >= 0) & ((out_full_loc % 4) == 3)
         return out_full_loc[completed_group] // 4
 
@@ -353,13 +364,14 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc_dtype: torch.dtype,
         req_pool_indices: Optional[torch.Tensor],
+        c4_upper: Optional[int] = None,
     ) -> DSV4OutCacheLoc:
         """Allocate C128 KV and derive C4 KV, then bundle all KV locations."""
         assert req_pool_indices is not None, (
             "DSV4NPUTokenToKVPoolAllocator requires req_pool_indices "
             "(forwarded from batch.req_pool_indices)."
         )
-        out_c4_loc = self._derive_c4_loc_from_full(out_full_loc)
+        out_c4_loc = self._derive_c4_loc_from_full(out_full_loc, c4_upper)
         out_c128_loc = self._alloc_c_extend(
             self.c128_attn_allocator,
             prefix_lens,
@@ -465,6 +477,11 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # seq_len//ratio so _alloc_c_extend anchors on the real c-pool last_loc.
         prefix_lens = (seq_lens - 1).clamp(min=0)
         prefix_lens_cpu = (seq_lens_cpu - 1).clamp(min=0)
+        # Plain decode adds one slot per request, so t also bounds the
+        # group-closing count and fits the consumers' fixed width — compact
+        # on device. Multi-slot shapes (spec reserve) keep the boolean index.
+        t = out_full_loc.numel()
+        c4_upper = t if t <= seq_lens_cpu.numel() else None
         return self._alloc_compressed_kv(
             out_full_loc,
             out_swa_loc,
@@ -474,6 +491,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc.dtype,
             req_pool_indices,
+            c4_upper=c4_upper,
         )
 
     def alloc_extend_swa_tail(

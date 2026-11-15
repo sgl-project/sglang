@@ -16,11 +16,13 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    fp4_quantize,
+    get_fp4_gemm_runner_backend,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
-    fp4_quantize,
 )
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
@@ -137,12 +139,22 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        output_dtype = x.dtype
         w_n, _ = layer.weight_packed.shape
-        output_shape = [x.shape[0], w_n]
-
-        # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
+        if isinstance(x, tuple) and layer._accepts_prequantized_fp4:
+            # Already quantized by the dense MLP's fused SiLU*mul + NVFP4 quant
+            # (models/utils.py): (fp4 [tokens, hidden / 2], swizzled block
+            # scale), the input ModelOptFp4LinearMethod takes.
+            x_fp4, x_blockscale = x
+            output_dtype = layer.params_dtype
+            output_shape = [x_fp4.shape[0], w_n]
+        else:
+            output_dtype = x.dtype
+            # Keep the leading dims (e.g. [batch, seq] from vision towers): the
+            # FP4 quant and GEMM take 2D [tokens, hidden] only.
+            output_shape = [*x.shape[:-1], w_n]
+            x = x.reshape(-1, x.shape[-1])
+            # quantize BF16 or FP16 to (FP4 and interleaved block scale)
+            x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight_packed.dtype == torch.uint8

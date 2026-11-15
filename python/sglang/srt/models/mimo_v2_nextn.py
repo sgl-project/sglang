@@ -36,6 +36,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -50,7 +51,6 @@ from sglang.srt.models.mimo_v2 import (
     load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 MiMoV2Config = None
 
