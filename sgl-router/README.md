@@ -135,6 +135,10 @@ Omitting `--chat-routing` keeps the legacy routing path (default
 `--policy round_robin`). This README and [ARCHITECTURE.md](ARCHITECTURE.md)
 describe `--chat-routing reorg`.
 
+An sgl-model-gateway flag that sgl-router does not define, such as
+`--pd-disaggregation` or `--json-log`, fails at startup with an error that
+names what to use instead or says that the feature is not supported.
+
 ## Routing policies
 
 Each engine group runs one policy, chosen by `--policy` (default `power_of_two`
