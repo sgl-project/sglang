@@ -160,7 +160,6 @@ RUST_SERVER_KNOWN_GAPS: Dict[str, str] = {
     "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Unverified: whether a batch's items are scheduled together.",
     "enable_encoder_swa_bounded_replay": "Unverified: Python refuses image requests off CUDA and warms up with text.",
     "SGLANG_INKLING_DEFAULT_REASONING_EFFORT": "Chat: the Rust chat route has no Inkling renderer.",
-    "trust_request_chat_template": "Chat: the Rust chat route never renders a request's own template.",
     "SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR": "Chat: the Rust chat route builds no per-turn response-template tool grammar.",
     "grammar_backend": "Chat: the Rust chat route builds no per-turn response-template tool grammar.",
 }
