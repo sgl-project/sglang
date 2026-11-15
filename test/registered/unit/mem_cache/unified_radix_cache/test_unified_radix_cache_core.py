@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
+    IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
     MatchResult,
@@ -2430,6 +2431,27 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(
                     cache.window_reprefill_tail_tokens(), 128 if bounded_replay else 0
                 )
                 self.assertEqual(self._matched_len(cache, prompt), matched)
+
+
+class TestIncLockRefActions(CustomTestCase):
+    def test_inc_lock_ref_applies_tree_core_split_actions(self):
+        # A window-only lock walk can split a live node; the tree core returns
+        # the split action instead of applying it, so inc_lock_ref must apply it
+        # before callers use the receipt.
+        cache = object.__new__(UnifiedRadixCache)
+        cache.disable = False
+        action = mock.Mock()
+        cache.tree_core = mock.Mock()
+        cache.tree_core.inc_lock_ref.return_value = IncLockRefResult(
+            cache_actions=[action]
+        )
+        with mock.patch.object(
+            UnifiedRadixCache, "_apply_cache_actions"
+        ) as apply_actions:
+            result = cache.inc_lock_ref(7)
+        cache.tree_core.inc_lock_ref.assert_called_once_with(7, ())
+        apply_actions.assert_called_once_with([action])
+        self.assertEqual(result.cache_actions, [action])
 
 
 if __name__ == "__main__":
