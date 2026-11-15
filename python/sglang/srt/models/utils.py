@@ -41,12 +41,13 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     print_info_once,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -60,6 +61,21 @@ _is_cpu = is_cpu()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
+
+
+def keeps_no_quant_config(hf_config, quant_config) -> None:
+    """``own_quant_config`` of a model class that keeps no ``quant_config``:
+    its layers may still take the loader's config, but its runner reads none
+    off the model, so an ``auto`` KV cache dtype resolves to the model dtype."""
+    return None
+
+
+def npu_draft_quant_config(hf_config, quant_config):
+    """``own_quant_config`` of a draft that runs unquantized on NPU unless a
+    draft quantization is named."""
+    if is_npu() and get_spec().speculative_draft_model_quantization is None:
+        return None
+    return quant_config
 
 
 @dataclass
