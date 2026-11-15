@@ -1352,8 +1352,7 @@ mod tests {
 
     /// Also: an HTTP layer's [`crate::RequestStart`] starts the request's
     /// timing, so `e2e_latency` covers the layer's work too.
-    #[tokio::test]
-    async fn unary_http_generate_round_trips_through_frontend_handle() {
+    async fn assert_native_http_rid_echo(client_rid: &str, stream: bool) {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let core = crate::api_server::handlers::CoreHandle::new(
@@ -1383,6 +1382,7 @@ mod tests {
             openai_chat: None,
         });
 
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let responder = tokio::spawn(async move {
             let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
             else {
@@ -1394,16 +1394,29 @@ mod tests {
             };
             assert_eq!(generate.input_ids.as_deref(), Some([1, 2].as_slice()));
             let rid = request.rid.clone();
+            if stream {
+                request
+                    .sink
+                    .try_send(ResponseItem::Frame(ChunkEvent {
+                        rid: rid.clone(),
+                        text: "o".into(),
+                        prompt_tokens: 2,
+                        completion_tokens: 1,
+                        ..Default::default()
+                    }))
+                    .unwrap();
+                finish_rx.await.unwrap();
+            }
             request
                 .sink
                 .try_send(ResponseItem::Done(ChunkEvent {
                     rid,
-                    text: "ok".into(),
+                    text: if stream { "k" } else { "ok" }.into(),
                     prompt_tokens: 2,
-                    completion_tokens: 1,
+                    completion_tokens: if stream { 1 } else { 2 },
                     finish_reason: serde_json::from_value(serde_json::json!({
                         "type": "length",
-                        "length": 1
+                        "length": 2
                     }))
                     .unwrap(),
                     ..Default::default()
@@ -1420,24 +1433,71 @@ mod tests {
                 Instant::now().checked_sub(layer_work).unwrap(),
             ))
             .body(Body::from(
-                r#"{"rid":"client-rid","input_ids":[1,2],"sampling_params":{"max_new_tokens":1}}"#,
+                serde_json::to_vec(&serde_json::json!({
+                    "rid": client_rid,
+                    "input_ids": [1, 2],
+                    "sampling_params": {"max_new_tokens": 2},
+                    "stream": stream,
+                }))
+                .unwrap(),
             ))
             .unwrap();
         let response = routes().with_state(state).oneshot(request).await.unwrap();
-        responder.await.unwrap();
-
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut body_stream = response.into_body().into_data_stream();
+        let mut body = Vec::new();
+        if stream {
+            // Read the first SSE frame before Done, avoiding cumulative coalescing.
+            body.extend_from_slice(&body_stream.next().await.unwrap().unwrap());
+            finish_tx.send(()).unwrap();
+        }
+        while let Some(chunk) = body_stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        responder.await.unwrap();
+        let values: Vec<serde_json::Value> = if stream {
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect()
+        } else {
+            vec![serde_json::from_slice(&body).unwrap()]
+        };
+        assert!(!values.is_empty());
+        if stream {
+            assert!(
+                values.len() >= 2,
+                "stream must carry intermediate and terminal frames"
+            );
+        }
+        for value in &values {
+            assert_eq!(value["meta_info"]["id"], client_rid);
+        }
+        let value = values.last().unwrap();
         assert_eq!(value["text"], "ok");
-        assert_eq!(value["meta_info"]["id"], "client-rid");
+        assert_eq!(value["meta_info"]["id"], client_rid);
         assert_eq!(value["meta_info"]["prompt_tokens"], 2);
-        assert_eq!(value["meta_info"]["completion_tokens"], 1);
+        assert_eq!(value["meta_info"]["completion_tokens"], 2);
         let e2e_latency = value["meta_info"]["e2e_latency"].as_f64().unwrap();
         assert!(e2e_latency >= layer_work.as_secs_f64(), "{e2e_latency}");
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unary_http_generate_round_trips_through_frontend_handle() {
+        assert_native_http_rid_echo("client-rid", false).await;
+    }
+
+    #[tokio::test]
+    async fn long_rids_round_trip_through_unary_and_streaming_http() {
+        for client_rid in ["x".repeat(200), "é".repeat(128)] {
+            for stream in [false, true] {
+                assert_native_http_rid_echo(&client_rid, stream).await;
+            }
+        }
     }
 
     /// Each item `body` submits under `server_args`: its `max_new_tokens`, and
