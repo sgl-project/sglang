@@ -202,7 +202,10 @@ _MAX_WARPS_PER_CTA = 32
 
 
 def register_naive_module(name: str, module: Any) -> None:
-    _NAIVE_MODULES.append((name, module))
+    # Only modules that include debug/trace.cuh export the hooks; other JIT ops built under the
+    # same SGLANG_JIT_DEBUG_TRACE have nothing to record.
+    if module.implements_function("sgl_trace_set_config"):
+        _NAIVE_MODULES.append((name, module))
 
 
 @contextlib.contextmanager
@@ -217,24 +220,28 @@ def _capture_naive(
             "op once before capture()"
         )
     slot_bytes = _HEADER_BYTES + 8 * records_per_warp
-    buffers = []
-    for name, module in _NAIVE_MODULES:
-        size = (ctas[1] - ctas[0]) * _MAX_WARPS_PER_CTA * slot_bytes
-        buffer = torch.zeros(size, dtype=torch.uint8, device="cuda")
-        module.sgl_trace_set_config(
-            buffer.data_ptr(), records_per_warp, ctas[0], ctas[1]
-        )
-        buffers.append((name, module, buffer))
-    result = Capture()
+    size = (ctas[1] - ctas[0]) * _MAX_WARPS_PER_CTA * slot_bytes
+    # Every installed buffer is uninstalled on every exit path, before it can be freed: a module
+    # left pointing at a freed buffer would write into recycled memory on its next launch.
+    installed = []
     try:
+        for name, module in _NAIVE_MODULES:
+            buffer = torch.zeros(size, dtype=torch.uint8, device="cuda")
+            module.sgl_trace_set_config(
+                buffer.data_ptr(), records_per_warp, ctas[0], ctas[1]
+            )
+            installed.append((name, module, buffer))
+        result = Capture()
         yield result
-    finally:
         torch.cuda.synchronize()
         decoder = _NaiveDecoder(records_per_warp)
-        for name, module, buffer in buffers:
-            module.sgl_trace_set_config(0, 0, 0, 0)
+        for name, module, buffer in installed:
             decoder.decode(name, str(module.sgl_trace_events()), buffer.cpu().numpy())
         result.trace = Trace(decoder.data)
+    finally:
+        torch.cuda.synchronize()
+        for _, module, _ in installed:
+            module.sgl_trace_set_config(0, 0, 0, 0)
 
 
 class _NaiveDecoder:
