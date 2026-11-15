@@ -462,6 +462,8 @@ class QwenImage21ComfyUIConditionStage(PipelineStage):
     def forward(self, batch, server_args):
         _, _, height, width = batch.latents.shape
         batch.latents = batch.latents.flatten(2).transpose(1, 2).contiguous()
+        # Request sizes are rounded to 32 px; ComfyUI latents can have odd sides.
+        batch.extra["qwen21_latent_hw"] = (height, width)
         payload = batch.extra[COMFYUI_COND_EXTRA_KEY]
         conds = get_or_create_run_state(batch, dict)
         key = (batch.extra["comfyui_cond_key"], height, width)

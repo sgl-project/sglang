@@ -39,6 +39,11 @@ def handle_hicache(server_args: Any):
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
+        if cfg.pp_size > 1:
+            raise ValueError(
+                "--enable-unified-cache-external-linker does not support "
+                "pipeline parallelism; use --pp-size 1."
+            )
         if cfg.disable_radix_cache or cfg.radix_cache_backend is not None:
             raise ValueError(
                 "--enable-unified-cache-external-linker requires the default "
@@ -138,11 +143,10 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         raise NotImplementedError(
             "HiCache L3 with DCP does not support buffer_only host memory."
         )
-    if cfg.speculative_algorithm not in (None, "DSPARK"):
+    if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-            "decoding; other draft-model host pools have no DCP index "
-            "translation."
+            "HiCache with --dcp-size > 1 only supports DSPARK and DFLASH "
+            "speculative decoding."
         )
     if cfg.enable_lmcache:
         raise NotImplementedError(

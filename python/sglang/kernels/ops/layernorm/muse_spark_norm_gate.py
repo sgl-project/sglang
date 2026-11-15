@@ -162,6 +162,7 @@ class FusedRMSNormGate(BaseFusedOp):
         KernelBackend.JIT: {CapabilityRequirement.CUDA},
         KernelBackend.TRITON: {
             CapabilityRequirement.CUDA,
+            CapabilityRequirement.HIP,
         },
     }
 

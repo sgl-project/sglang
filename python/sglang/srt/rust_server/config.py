@@ -24,11 +24,14 @@ from sglang.srt.entrypoints.v1_loads import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
 from sglang.srt.observability.request_logger import (
     WHITELISTED_HEADERS,
     RequestLogger,
     _dataclass_to_string_truncated,
+    _transform_data_for_logging,
 )
 from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
@@ -44,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.rust_server.warmups import rust_server_warmup_names
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -51,6 +55,7 @@ from sglang.version import __version__
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.rust_extensions._server import ServerArgs
     from sglang.srt.server_args import ServerArgs as PyServerArgs
 
@@ -65,6 +70,7 @@ def _build_server_args(
     default_max_new_tokens: Optional[int] = SamplingParams().max_new_tokens,
     request_class: Optional[type] = None,
     server_added_custom_params: Tuple[str, ...] = (),
+    port_offset: int = 0,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -111,12 +117,12 @@ def _build_server_args(
         "hicache_ratio": get_memory().hicache_ratio,
         "hicache_size": get_memory().hicache_size,
         "hicache_write_policy": get_memory().hicache_write_policy,
+        "hicache_host_total_tokens": _hicache_host_total_tokens(scheduler.tree_cache),
         # Python's scheduler handshake only computes startup_time after all
         # components have initialized, but the Rust frontend must start earlier
         # to serve the disaggregation bootstrap registry. Read the already-
         # initialized KV publisher directly instead of calling get_init_info()
         # on a partially initialized scheduler.
-        "hicache_host_total_tokens": None,
         "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
             scheduler.page_size * get_parallel().dcp_size
         ),
@@ -144,6 +150,16 @@ def _build_server_args(
         hicache_write_policy=get_memory().hicache_write_policy,
         host=get_serving().host,
         port=get_serving().port,
+        http2=(
+            ext.Http2Config(
+                max_concurrent_streams=get_serving().http2_max_concurrent_streams,
+                initial_connection_window_size=(
+                    get_serving().http2_initial_connection_window_size
+                ),
+            )
+            if get_serving().enable_http2
+            else None
+        ),
         # The shared field is also populated for legacy SMG mode; only forward
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
@@ -159,11 +175,13 @@ def _build_server_args(
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,
+        enable_cache_report=get_serving().enable_cache_report,
         tokenizer_worker_num=get_serving().tokenizer_worker_num,
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
         gc_threshold=get_device().gc_threshold,
+        custom_warmups_pending=bool(rust_server_warmup_names(get_serving().warmups)),
         health_generate_headers=dict(health_generate_headers or {}),
         default_priority_value=(
             get_schedule().default_priority_value
@@ -179,6 +197,7 @@ def _build_server_args(
             vocab_size=mc.vocab_size,
             is_multimodal=mc.is_multimodal,
             model_type=getattr(mc.hf_config, "model_type", None),
+            architectures=mc.hf_config.architectures,
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
@@ -235,7 +254,12 @@ def _build_server_args(
         request_log=(
             ext.RequestLogConfig(
                 **request_log_settings(
-                    get_observability().log_requests_level, request_class
+                    get_observability().log_requests_level,
+                    request_class,
+                    get_observability().log_requests_format,
+                ),
+                **_request_log_targets(
+                    get_observability().log_requests_target, port_offset
                 ),
             )
             if get_observability().log_requests
@@ -246,18 +270,25 @@ def _build_server_args(
     )
 
 
-def request_log_settings(level: int, request_class: Optional[type]) -> Dict[str, Any]:
-    """``RequestLogger``'s settings for ``--log-requests-level`` ``level``, for
-    the Rust server to render the lines ``TokenizerManager`` logs: the level's
-    metadata, and ``request_class``'s fields in declaration order with each
-    default rendered as ``_dataclass_to_string_truncated`` renders a value."""
+def request_log_settings(
+    level: int, request_class: Optional[type], log_format: str = "text"
+) -> Dict[str, Any]:
+    """``RequestLogger``'s settings for ``--log-requests-level`` ``level`` and
+    ``--log-requests-format`` ``log_format``, for the Rust server to render the
+    lines Python logs: the level's metadata, ``request_class``'s fields in
+    declaration order with each default rendered as the format renders a
+    value, and from level 2 the OpenAI request models' fields."""
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        CompletionRequest,
+    )
     from sglang.srt.managers.io_struct import GenerateReqInput
 
     request_class = request_class or GenerateReqInput
     logger = RequestLogger(
         log_requests=True,
         log_requests_level=level,
-        log_requests_format="text",
+        log_requests_format=log_format,
         log_requests_target=None,
     )
     max_length, skip_names, out_skip_names = logger.metadata
@@ -267,20 +298,78 @@ def request_log_settings(level: int, request_class: Optional[type]) -> Dict[str,
             return field.default
         return field.default_factory()
 
+    def render(value: Any) -> str:
+        if log_format == "json":
+            return json.dumps(
+                _transform_data_for_logging(value, max_length), ensure_ascii=False
+            )
+        return _dataclass_to_string_truncated(value, max_length)
+
+    openai_requests = level >= 2
     batch_item_fields, batch_shared_fields = _batch_item_fields(request_class)
     return dict(
         max_length=max_length,
         skip_names=sorted(skip_names or ()),
         out_skip_names=sorted(out_skip_names or ()),
+        json=log_format == "json",
         class_name=request_class.__name__,
         fields=[
-            (field.name, _dataclass_to_string_truncated(default(field), max_length))
+            (field.name, render(default(field)))
             for field in dataclasses.fields(request_class)
         ],
         batch_item_fields=batch_item_fields,
         batch_shared_fields=batch_shared_fields,
         headers=list(WHITELISTED_HEADERS),
         exceeded_ms=logger.log_exceeded_ms,
+        openai_requests=openai_requests,
+        chat_completion_fields=(
+            _openai_model_fields(ChatCompletionRequest) if openai_requests else []
+        ),
+        completion_fields=(
+            _openai_model_fields(CompletionRequest) if openai_requests else []
+        ),
+    )
+
+
+def _openai_model_fields(model: type) -> List[Tuple[str, Optional[str]]]:
+    """What ``model.model_dump(exclude_none=True)`` lists of a request: each
+    dumped field in declaration order, with its default as JSON (``None``
+    when it is required or ``None``)."""
+    from pydantic_core import to_jsonable_python
+
+    fields = []
+    for name, field in model.model_fields.items():
+        if field.exclude:
+            continue
+        default = (
+            None
+            if field.is_required()
+            else field.get_default(call_default_factory=True)
+        )
+        fields.append(
+            (name, None if default is None else json.dumps(to_jsonable_python(default)))
+        )
+    return fields
+
+
+def _request_log_targets(targets: Optional[List[str]], rank: int) -> Dict[str, Any]:
+    """``create_log_targets``' targets for the listener at node-local DP
+    offset ``rank``: stdout, and in each target directory (created here) the
+    file ``{hostname}_{rank}.log``, which the Rust server rotates hourly. A
+    directory listed twice gets one file: two rotators of one file would
+    rename it under each other."""
+    if not targets:
+        return dict(stdout=True, files=[])
+    files = {}
+    for directory in targets:
+        if directory.lower() == "stdout":
+            continue
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"{socket.gethostname()}_{rank}.log")
+        files.setdefault(os.path.realpath(path), path)
+    return dict(
+        stdout=any(target.lower() == "stdout" for target in targets),
+        files=list(files.values()),
     )
 
 
@@ -339,6 +428,20 @@ def _build_metrics_config(ext: ModuleType):
     )
 
 
+def _hicache_host_total_tokens(tree_cache: BasePrefixCache) -> Optional[int]:
+    """The KV host tier's realized token capacity. The tree cache, host pools
+    included, is built before the Rust server launches."""
+    if not get_memory().enable_hierarchical_cache:
+        return None
+    if (
+        not isinstance(tree_cache, UnifiedRadixCache)
+        or tree_cache.host_pool_group is None
+    ):
+        return None
+    kv_entry = tree_cache.host_pool_group.entry_map.get(PoolName.KV)
+    return None if kv_entry is None else kv_entry.host_pool.logical_size
+
+
 def _node_listeners(*, grpc_port: Optional[int]) -> List[Dict[str, Any]]:
     """`DeploymentInfo.node_listeners`: every Rust listener on this listener's
     node, in port-offset order, so each of them reports the same table."""
@@ -392,9 +495,6 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             build_server_info(scheduler.server_args, scheduler_info)
         )
     )
-    # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
-    # router reads this key to pick its protocol.
-    info["enable_http2"] = False
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

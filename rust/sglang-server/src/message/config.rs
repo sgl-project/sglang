@@ -5,7 +5,7 @@
 //! pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] / [`RequestLogConfig`] /
-//! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
+//! [`Http2Config`] / [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
 //! [`MmFamily`] / [`MmResample`] are
 //! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
 //! / `_build_mm_spec`) constructs them directly by keyword and hands them to
@@ -80,6 +80,8 @@ pub struct RuntimeConfig {
     pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
     /// A model package's admission check on every client generation.
     pub generate_validator: Option<Arc<dyn crate::GenerateValidator>>,
+    /// A model package's hook on every abort that names live requests.
+    pub abort_hook: Option<Arc<dyn crate::AbortHook>>,
     /// A model package's own scheduler `internal_state` fields, which
     /// `/server_info` reports by name after its typed ones. No other
     /// scheduler field is reported: the state also carries the launch
@@ -94,6 +96,7 @@ impl Default for RuntimeConfig {
             server_args: Arc::new(ServerArgs::default()),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         }
     }
@@ -143,6 +146,9 @@ pub struct ServerArgs {
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
+    /// `--enable-http2`: the HTTP listener also serves HTTP/2 over cleartext
+    /// (h2c) on the same port; `None` serves HTTP/1.1 only.
+    pub http2: Option<Http2Config>,
     /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
     /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
     pub grpc_port: Option<u16>,
@@ -170,6 +176,9 @@ pub struct ServerArgs {
     pub reasoning_parser: Option<String>,
     /// Python's global default for whether an SSE stream ends with a usage chunk.
     pub stream_response_default_include_usage: bool,
+    /// `--enable-cache-report`: OpenAI responses report the prompt's cached
+    /// tokens in `usage.prompt_tokens_details`.
+    pub enable_cache_report: bool,
     /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
     pub tokenizer_worker_num: usize,
     pub detokenizer_worker_num: usize,
@@ -182,6 +191,9 @@ pub struct ServerArgs {
     /// `--gc-threshold`: the thresholds the scheduler ranks set when they
     /// freeze their garbage collectors after startup; `None` keeps Python's.
     pub gc_threshold: Option<Vec<i64>>,
+    /// Keep health at 503 until Python reports that its `--warmups` finished
+    /// ([`crate::Server::finish_custom_warmups`]).
+    pub custom_warmups_pending: bool,
     /// Extra headers on a successful `/health_generate` response, for a router
     /// that reads deployment metadata off the deep health probe.
     pub health_generate_headers: BTreeMap<String, String>,
@@ -284,6 +296,7 @@ impl ServerArgs {
         hicache_write_policy,
         host,
         port,
+        http2,
         grpc_port,
         grpc_response_timeout_secs,
         api_key,
@@ -295,11 +308,13 @@ impl ServerArgs {
         tool_call_parser,
         reasoning_parser,
         stream_response_default_include_usage,
+        enable_cache_report,
         tokenizer_worker_num,
         detokenizer_worker_num,
         skip_tokenizer_init,
         skip_server_warmup,
         gc_threshold,
+        custom_warmups_pending,
         health_generate_headers,
         default_priority_value,
         enable_request_header_overrides,
@@ -347,6 +362,7 @@ impl ServerArgs {
         hicache_write_policy: Option<String>,
         host: String,
         port: u16,
+        http2: Option<Http2Config>,
         grpc_port: Option<u16>,
         grpc_response_timeout_secs: u64,
         api_key: Option<String>,
@@ -358,11 +374,13 @@ impl ServerArgs {
         tool_call_parser: Option<String>,
         reasoning_parser: Option<String>,
         stream_response_default_include_usage: bool,
+        enable_cache_report: bool,
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
         gc_threshold: Option<Vec<i64>>,
+        custom_warmups_pending: bool,
         health_generate_headers: BTreeMap<String, String>,
         default_priority_value: Option<i64>,
         enable_request_header_overrides: bool,
@@ -408,6 +426,7 @@ impl ServerArgs {
             hicache_write_policy,
             host,
             port,
+            http2,
             grpc_port,
             grpc_response_timeout_secs,
             api_keys: ApiKeys::new(api_key, admin_api_key),
@@ -419,11 +438,13 @@ impl ServerArgs {
             tool_call_parser,
             reasoning_parser,
             stream_response_default_include_usage,
+            enable_cache_report,
             tokenizer_worker_num,
             detokenizer_worker_num,
             skip_tokenizer_init,
             skip_server_warmup,
             gc_threshold,
+            custom_warmups_pending,
             health_generate_headers,
             default_priority_value,
             enable_request_header_overrides,
@@ -477,6 +498,7 @@ impl Default for ServerArgs {
             hicache_write_policy: None,
             host: "127.0.0.1".into(),
             port: 30000,
+            http2: None,
             grpc_port: None,
             grpc_response_timeout_secs: DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
             api_keys: ApiKeys::default(),
@@ -487,11 +509,13 @@ impl Default for ServerArgs {
             tool_call_parser: None,
             reasoning_parser: None,
             stream_response_default_include_usage: false,
+            enable_cache_report: false,
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
             skip_server_warmup: false,
             gc_threshold: None,
+            custom_warmups_pending: false,
             health_generate_headers: BTreeMap::new(),
             default_priority_value: None,
             enable_request_header_overrides: false,
@@ -619,6 +643,30 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
     }
 }
 
+/// HTTP/2 settings, as Python's server (Granian) takes them with
+/// `--enable-http2`.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct Http2Config {
+    /// `--http2-max-concurrent-streams`: the streams one connection may open.
+    pub max_concurrent_streams: u32,
+    /// `--http2-initial-connection-window-size`: the connection-level receive
+    /// window, in bytes.
+    pub initial_connection_window_size: u32,
+}
+
+#[pyo3::pymethods]
+impl Http2Config {
+    #[new]
+    #[pyo3(signature = (*, max_concurrent_streams, initial_connection_window_size))]
+    fn py_new(max_concurrent_streams: u32, initial_connection_window_size: u32) -> Self {
+        Self {
+            max_concurrent_streams,
+            initial_connection_window_size,
+        }
+    }
+}
+
 /// Prometheus metrics, as Python serves them with `--enable-metrics`.
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
@@ -695,12 +743,12 @@ impl MetricsConfig {
     }
 }
 
-/// Python's `RequestLogger` settings for `--log-requests` (text format to
-/// stdout; Rust mode refuses the other formats and targets at startup). Every
-/// value comes from Python so the two servers render the same lines: the
-/// level's metadata (`RequestLogger._compute_metadata`), the request class
-/// with its fields in order and each default as Python renders it, the header
-/// whitelist and `SGLANG_LOG_REQUEST_EXCEEDED_MS`.
+/// Python's `RequestLogger` settings for `--log-requests`. Every value comes
+/// from Python so the two servers render the same lines: the level's metadata
+/// (`RequestLogger._compute_metadata`), the format, the request class with its
+/// fields in order and each default as Python renders it, the OpenAI request
+/// models' fields, the header whitelist, `SGLANG_LOG_REQUEST_EXCEEDED_MS` and
+/// the targets (`--log-requests-target`).
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct RequestLogConfig {
@@ -709,8 +757,12 @@ pub struct RequestLogConfig {
     /// Request fields and output keys left out of the lines at this level.
     pub skip_names: Vec<String>,
     pub out_skip_names: Vec<String>,
+    /// `--log-requests-format json`: each line is the JSON object Python's
+    /// `log_json` writes; otherwise the text line.
+    pub json: bool,
     /// The request class name and its `(field, rendered default)` pairs, in
-    /// declaration order.
+    /// declaration order; the default as the format renders a value (its
+    /// `repr`-style text, or its JSON).
     pub class_name: String,
     pub fields: Vec<(String, String)>,
     /// The fields a batch item's object (Python `obj[i]`) takes from the
@@ -722,6 +774,19 @@ pub struct RequestLogConfig {
     pub headers: Vec<String>,
     /// A finished request faster than this (ms) is not logged; `<= 0` logs all.
     pub exceeded_ms: i64,
+    /// Log each OpenAI request as received, before it is adapted (Python's
+    /// `log_openai_received_request`, from level 2).
+    pub openai_requests: bool,
+    /// `ChatCompletionRequest`'s and `CompletionRequest`'s fields in
+    /// declaration order, each with its default as JSON (`None` when it has
+    /// none or it is `None`), for the OpenAI line's `model_dump`.
+    pub chat_completion_fields: Vec<(String, Option<String>)>,
+    pub completion_fields: Vec<(String, Option<String>)>,
+    /// Write to stdout; and to each of `files`, an hourly-rotated
+    /// `{hostname}_{rank}.log` in a target directory (Python creates the
+    /// directory).
+    pub stdout: bool,
+    pub files: Vec<String>,
 }
 
 #[pyo3::pymethods]
@@ -731,35 +796,53 @@ impl RequestLogConfig {
         max_length,
         skip_names,
         out_skip_names,
+        json = false,
         class_name,
         fields,
         batch_item_fields,
         batch_shared_fields,
         headers,
         exceeded_ms,
+        openai_requests = false,
+        chat_completion_fields = Vec::new(),
+        completion_fields = Vec::new(),
+        stdout = true,
+        files = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
         max_length: usize,
         skip_names: Vec<String>,
         out_skip_names: Vec<String>,
+        json: bool,
         class_name: String,
         fields: Vec<(String, String)>,
         batch_item_fields: Vec<String>,
         batch_shared_fields: Vec<String>,
         headers: Vec<String>,
         exceeded_ms: i64,
+        openai_requests: bool,
+        chat_completion_fields: Vec<(String, Option<String>)>,
+        completion_fields: Vec<(String, Option<String>)>,
+        stdout: bool,
+        files: Vec<String>,
     ) -> Self {
         Self {
             max_length,
             skip_names,
             out_skip_names,
+            json,
             class_name,
             fields,
             batch_item_fields,
             batch_shared_fields,
             headers,
             exceeded_ms,
+            openai_requests,
+            chat_completion_fields,
+            completion_fields,
+            stdout,
+            files,
         }
     }
 }
@@ -834,6 +917,8 @@ pub enum DisaggregationMode {
 pub struct ModelConfig {
     /// Authoritative HF model type, used to select a native chat formatter.
     pub model_type: Option<String>,
+    /// HF `architectures`, reported by model info.
+    pub architectures: Option<Vec<String>>,
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
@@ -856,13 +941,14 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type, architectures))]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
         default_sampling_params: DefaultSamplingParams,
         model_type: Option<String>,
+        architectures: Option<Vec<String>>,
     ) -> Self {
         Self {
             context_len,
@@ -870,6 +956,7 @@ impl ModelConfig {
             is_multimodal,
             default_sampling_params,
             model_type,
+            architectures,
         }
     }
 }
@@ -880,6 +967,7 @@ impl Default for ModelConfig {
         Self {
             context_len: 2048,
             model_type: None,
+            architectures: None,
             vocab_size: 1000,
             is_multimodal: false,
             default_sampling_params: DefaultSamplingParams::default(),

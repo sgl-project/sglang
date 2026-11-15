@@ -1,9 +1,11 @@
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
     draft_is_chain_layout,
     unsupported_reason,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -42,7 +44,6 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
             ("EAGLE", 1): True,
             ("EAGLE3", 1): True,
             ("EAGLE3", 4): False,  # tree draft
-            ("DSPARK", None): False,  # ragged verify lengths
             ("NGRAM", None): False,  # tree lives in the verify mask
             ("DFLASH", None): False,
             ("STANDALONE", 1): False,
@@ -56,6 +57,14 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
                     }
                 )
                 self.assertEqual(reason is None, expected, reason)
+        # ragged verify trims rows per request, which CP would score as whole chains
+        for mode in RaggedVerifyMode:
+            with (
+                self.subTest(algorithm="DSPARK", mode=mode),
+                envs.SGLANG_RAGGED_VERIFY_MODE.override(mode.value),
+            ):
+                chain = draft_is_chain_layout("DSPARK", None)
+                self.assertEqual(chain, mode is RaggedVerifyMode.STATIC)
 
     def test_sm90_enables_only_validated_topologies(self):
         """Each rank must serve exactly one index head of the four; any other split,
@@ -63,8 +72,10 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
         enabled = {
             (4, 4, 1, 1): True,
             (8, 8, 1, 1): True,  # head pairs replicated across ranks
+            (8, 4, 1, 2): True,  # attention DP2: CP over each replica's TP4 group
             (2, 2, 1, 1): False,  # two index heads per rank
-            (8, 4, 1, 2): False,  # DP attention not validated
+            (16, 8, 1, 2): False,  # not validated
+            (8, 2, 1, 4): False,  # two index heads per rank under DP
             (8, 4, 2, 1): False,
         }
         for (tp, attn_tp, attn_cp, attn_dp), expected in enabled.items():

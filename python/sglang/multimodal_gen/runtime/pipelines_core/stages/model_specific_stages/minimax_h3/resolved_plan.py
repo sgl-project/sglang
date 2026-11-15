@@ -6,7 +6,10 @@ request_validation.py) into the data-only plan consumed by stages 1-8.
 Stages never branch on task names; skips must be explicit in the plan.
 
 Scope notes (adapt_shape_v1):
-- all target and material-derived ratios use the single adaptive spatial
+- image targets are generated on the requested width/height, or on the larger
+  32px-aligned canvas of ``min_generation_area`` (image_canvas.py): one visual
+  frame, no audio.
+- all video target and material-derived ratios use the single adaptive spatial
   resolver exported by this module. It starts from a 768px nominal short edge,
   applies the 768x1344 soft area cap, then rounds both axes independently to
   the nearest 32px grid.
@@ -28,6 +31,9 @@ import msgspec
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_SUPPORTED_FPS,
     warn_unverified_short_edge,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.image_canvas import (
+    minimax_h3_image_generation_canvas,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
@@ -57,8 +63,9 @@ class MiniMaxH3MaterialPlanItem(msgspec.Struct, frozen=True):
     frame_index: int | None = None
     # Concrete pixel-frame index after target 17n+5 alignment.
     resolved_frame_index: int | None = None
-    # Per-reference seek applied identically to the visual and audio streams.
-    start_time_seconds: float = 0.0
+    # Per-reference seek applied identically to the visual and audio streams;
+    # None for image-task references, which have no timeline.
+    start_time_seconds: float | None = 0.0
 
 
 class MiniMaxH3ResolvedPlan(msgspec.Struct, frozen=True):
@@ -68,12 +75,13 @@ class MiniMaxH3ResolvedPlan(msgspec.Struct, frozen=True):
     materials: tuple[MiniMaxH3MaterialPlanItem, ...]
     encoders: dict
     branches: tuple[dict, ...]
-    default_flow_shift: float
-    default_audio_flow_shift: float
+    default_flow_shift: float | None
+    default_audio_flow_shift: float | None
     flow_shift: float | None
     audio_flow_shift: float | None
     shape: dict
     condition_mask: dict
+    output_modality: str = "video"
 
 
 def _parse_aspect_ratio(value: str) -> tuple[int, int]:
@@ -255,6 +263,37 @@ def _resolve_spatial(
     return shape
 
 
+def _resolve_image_shape(target: Mapping[str, Any]) -> dict[str, Any]:
+    """Generation canvas; VAE latents are 16x smaller, with no audio.
+
+    ``width``/``height`` are the canvas every stage generates on. With
+    ``min_generation_area`` the canvas is the enlarged, 32px-aligned size and
+    ``output_width``/``output_height`` carry the requested size the decoded
+    image is resized to; both are None when the canvas is the requested size.
+    """
+    width, height = int(target["width"]), int(target["height"])
+    min_area = target.get("min_generation_area")
+    canvas = (
+        (width, height)
+        if min_area is None
+        else minimax_h3_image_generation_canvas(width, height, int(min_area))
+    )
+    resized = canvas != (width, height)
+    return {
+        "geometry": "resolved_v2",
+        "width": canvas[0],
+        "height": canvas[1],
+        "output_width": width if resized else None,
+        "output_height": height if resized else None,
+        "fps": None,
+        "frame_count": 1,
+        "video_latent_t": 1,
+        "video_latent_h": canvas[1] // 16,
+        "video_latent_w": canvas[0] // 16,
+        "audio_latent_t": 0,
+    }
+
+
 def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPlan:
     """Canonical request (already validated) -> ResolvedPlan."""
     if not isinstance(canonical, Mapping):
@@ -269,13 +308,14 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         "flow_shift",
         "audio_flow_shift",
     }
-    unknown = set(canonical) - allowed_keys
-    if unknown:
-        raise ValueError(f"canonical request has unknown fields: {sorted(unknown)}")
     for key in ("schema", "task", "prompt", "conditions", "target"):
         if key not in canonical:
             raise ValueError(f"canonical request missing {key!r}")
     profile = minimax_h3_task_profile(str(canonical["task"]))
+    is_image = profile.output_modality == "image"
+    unknown = set(canonical) - allowed_keys
+    if unknown:
+        raise ValueError(f"canonical request has unknown fields: {sorted(unknown)}")
     conditions = canonical["conditions"]
     keyframe_conditions = (
         [
@@ -311,11 +351,15 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
                 "conditions with frame_index [0], [-1], or [0, -1], got "
                 f"{signatures!r}"
             )
-    shape = _resolve_shape(
-        canonical["target"],
-        geometry_source=profile.geometry_source,
-        auto_aspect_ratio=profile.auto_aspect_ratio,
-        auto_geometry_source=profile.auto_geometry_source,
+    shape = (
+        _resolve_image_shape(canonical["target"])
+        if is_image
+        else _resolve_shape(
+            canonical["target"],
+            geometry_source=profile.geometry_source,
+            auto_aspect_ratio=profile.auto_aspect_ratio,
+            auto_geometry_source=profile.auto_geometry_source,
+        )
     )
 
     materials: list[MiniMaxH3MaterialPlanItem] = []
@@ -364,7 +408,9 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
                 material_chain=rule.material_chain,
                 frame_index=frame_index,
                 resolved_frame_index=resolved_frame_index,
-                start_time_seconds=float(cond.get("start_time_seconds", 0.0)),
+                start_time_seconds=(
+                    None if is_image else float(cond.get("start_time_seconds", 0.0))
+                ),
             )
         )
         if rule.visual_tokenizer_encode:
@@ -403,8 +449,8 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         materials=tuple(materials),
         encoders=encoders,
         branches=profile.branches,
-        default_flow_shift=float(profile.default_flow_shift),
-        default_audio_flow_shift=float(profile.default_audio_flow_shift),
+        default_flow_shift=profile.default_flow_shift,
+        default_audio_flow_shift=profile.default_audio_flow_shift,
         flow_shift=(
             float(canonical["flow_shift"])
             if canonical.get("flow_shift") is not None
@@ -417,6 +463,7 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         ),
         shape=shape,
         condition_mask=condition_mask,
+        output_modality=profile.output_modality,
     )
 
 
