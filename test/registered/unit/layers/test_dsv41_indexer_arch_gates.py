@@ -89,6 +89,9 @@ class TestV41IndexerArchGates(CustomTestCase):
             mock.patch.object(index_logits, "current_arch", return_value=arch)
         )
         stack.enter_context(
+            mock.patch.object(indexer, "uses_sm90_scores", return_value=arch.is_sm(9))
+        )
+        stack.enter_context(
             mock.patch.object(
                 indexer, "has_dense_fp4_indexer", return_value=deep_gemm_present
             )

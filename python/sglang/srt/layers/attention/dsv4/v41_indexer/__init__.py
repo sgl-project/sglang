@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import index_weights_dtype
 from sglang.srt.environ import envs
 
 from .full_topk import FullTopKIndexer
+from .scoring import uses_sm90_scores
 from .types import (
     CandidateMetadata,
     CapturedPrefillInputs,
@@ -82,7 +83,7 @@ def _use_deep_gemm_prefill() -> bool:
 def _use_sm90_prefill_scores() -> bool:
     # DeepGEMM's fp8 mqa-logits on the fp4 operands widened to e4m3
     # (scoring.widen_fp4_to_fp8); fp8_mqa_logits predates fp8_fp4_mqa_logits.
-    return current_arch().is_sm(9) and has_dense_fp4_indexer()
+    return uses_sm90_scores() and has_dense_fp4_indexer()
 
 
 def make_full_topk_indexer(
@@ -130,8 +131,8 @@ def make_candidate_indexer(
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
         use_deep_gemm_publish=use_deep_gemm_prefill or _use_sm90_prefill_scores(),
-        # Hopper consumers stay on torch, whose candidate_scores scores only the
-        # published blocks.
+        # Hopper consumers stay on torch, which scores only the published blocks
+        # when they are narrow enough (can_use_candidate_scores).
         use_deep_gemm_consume=use_deep_gemm_prefill,
     )
     # Without candidate blocks no layer is a candidate source or consumer.

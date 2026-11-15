@@ -223,7 +223,9 @@ class DenseBlocksBackend:
         inputs: PrefillInputs,
         published: Optional[BlockIds],
     ) -> None:
-        assert published is not None
+        if published is None:  # a DeepGEMM publish with no visible position
+            inputs.reset_outputs()
+            return
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,

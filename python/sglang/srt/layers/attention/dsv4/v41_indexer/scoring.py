@@ -376,12 +376,18 @@ def _sm90_score_tiles(
         )
 
 
+def uses_sm90_scores() -> bool:
+    """Whether score_tiles takes _sm90_score_tiles; the Hopper prefill gate reads
+    this, so the two cannot disagree."""
+    return get_platform().is_sm90
+
+
 def score_tiles(
     data: DeepGEMMPrefillData,
     kv: Tuple[torch.Tensor, torch.Tensor],
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
     """Score tiles whose row slices are relative to this data's query-row view."""
-    if get_platform().is_sm90:
+    if uses_sm90_scores():
         yield from _sm90_score_tiles(data, kv)
         return
     yield from flat_index_logits_tiles(

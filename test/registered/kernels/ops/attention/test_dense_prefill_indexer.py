@@ -22,7 +22,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
@@ -62,10 +62,8 @@ def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
     )
 
 
-def run_dense(inputs, *, publish_candidates, candidates):
-    """The plain top-k, or the CP source's own top-k plus its candidate blocks
-    (`publish_candidates`), or a CP consumer's top-k among `candidates`."""
-    data = scoring.DeepGEMMPrefillData(
+def prefill_data(inputs):
+    return scoring.DeepGEMMPrefillData(
         k_slots=torch.arange(inputs["kv"][0].shape[0], device="cuda"),
         request_starts=inputs["starts"],
         lens_per_request=[n for _, n in inputs["request_lengths"]],
@@ -75,6 +73,12 @@ def run_dense(inputs, *, publish_candidates, candidates):
         q_sf=inputs["q"][1],
         weights=inputs["weights"],
     )
+
+
+def run_dense(inputs, *, publish_candidates, candidates):
+    """The plain top-k, or the CP source's own top-k plus its candidate blocks
+    (`publish_candidates`), or a CP consumer's top-k among `candidates`."""
+    data = prefill_data(inputs)
     if publish_candidates:
         selected, blocks = dense_blocks._publish_prefill_blocks(
             data=data,
@@ -247,6 +251,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                     consumer_inputs["kv"] = inputs["kv"]
                     consumer_inputs["candidate_topk_blocks"] = 128
                     consumer_scores = dense_scores(consumer_inputs)
+                    consumer_unmasked = consumer_scores.clone()
                     with patch.object(
                         scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", 128 << 10
                     ):
@@ -307,6 +312,24 @@ class TestDensePrefillIndexer(CustomTestCase):
                             candidates=candidates,
                         )
                         self.assertIsNone(published)
+                        self.assert_topk(consumer_inputs, selected, consumer_scores)
+                        # Hopper's consumer: torch's top-k among these blocks.
+                        selected.fill_(-1)
+                        row = 0
+                        for queries, context in inputs["request_lengths"]:
+                            rows = slice(row, row + queries)
+                            local = topk_among_blocks(
+                                consumer_unmasked[rows, :context],
+                                consumer_inputs["lengths"][rows],
+                                candidates.blocks[rows],
+                                min(inputs["topk"], context),
+                                block_size=8,
+                            )
+                            starts = inputs["starts"][rows, None]
+                            selected[rows, : local.shape[1]] = torch.where(
+                                local >= 0, local + starts, -1
+                            )
+                            row += queries
                         self.assert_topk(consumer_inputs, selected, consumer_scores)
                         tail_lengths = [0, 0, 7, 31]
                         rows, row = [], 0
@@ -385,7 +408,8 @@ class TestDensePrefillIndexer(CustomTestCase):
             torch.arange(k.shape[0], device="cuda")[None, :] - inputs["starts"][:, None]
         )
         visible = (visible >= 0) & (visible < inputs["lengths"][:, None])
-        scores = dense_scores(inputs)
+        tiles = scoring.score_tiles(prefill_data(inputs), inputs["kv"])
+        scores = torch.cat([logits for _, logits in tiles])
         for row in range(q.shape[0]):
             n = inputs["lengths"][row].item()
             torch.testing.assert_close(
