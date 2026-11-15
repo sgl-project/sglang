@@ -17,15 +17,18 @@ from sglang.kernels.ops.speculative.dflash_select import (
     dflash_select_walk,
     get_dflash_select_workspace_request,
 )
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed.device_communicators.symm_workspace import (
     request_group_workspace,
 )
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.runtime_context import get_exec, get_model
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.communication.all_reduce import PushPlane
     from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
     from sglang.srt.models.dflash import CandidateSelector
+    from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
 # Fixed by the select kernels (csrc/speculative/dflash_local_topk.cuh, dflash_select_walk.cuh).
@@ -76,6 +79,9 @@ def _get_fused_select_blocker(
         return "the selector codebooks and the lm_head disagree on the vocabulary"
     if selector.top_k not in _TOP_KS:
         return f"unsupported selector top-k {selector.top_k}"
+    if get_model().weight_cache_mode != "off":
+        # IPC-shared weights are updated in place by their owner; a merged copy would go stale.
+        return "zero-copy IPC weight cache is not supported"
     if gamma > _MAX_GAMMA:
         return f"unsupported gamma {gamma}"
     if final_logit_softcapping is not None:
@@ -88,19 +94,28 @@ def _merge_lmhead_projection(
     target_model: nn.Module,
     lm_head: ParallelLMHead,
     projection: nn.Linear,
+    memory_saver_adapter: TorchMemorySaverAdapter,
 ) -> torch.Tensor:
     """Moves the lm_head shard [Vs, H] and the selector projection [R, H] into one [Vs + R, H] buffer and points both
     parameters at their rows of it, so one GEMM computes the logits and the projection. Every parameter of the target
     sharing the head's storage (a tied embedding) moves too, so the old storage is freed.
 
     Must run after both models load and before the KV cache is sized (the copy needs one more shard for a moment)
-    and before any graph capture (graphs bake the head's address)."""
+    and before any graph capture (graphs bake the head's address). The buffer lives in the memory saver's weights
+    region, like the parameters it replaces, so releasing the weights releases it too."""
     head, proj = lm_head.weight, projection.weight
     assert (
         head.is_contiguous() and proj.is_contiguous() and head.shape[1] == proj.shape[1]
     ), (head.shape, proj.shape)
     num_head_rows = head.shape[0]
-    merged = head.new_empty((num_head_rows + proj.shape[0], head.shape[1]))
+    features = get_exec().features
+    with memory_saver_adapter.region(
+        GPU_MEMORY_TYPE_WEIGHTS,
+        # Back up if either model's weights are backed up: the buffer holds both.
+        enable_cpu_backup=features.enable_weights_cpu_backup
+        or features.enable_draft_weights_cpu_backup,
+    ):
+        merged = head.new_empty((num_head_rows + proj.shape[0], head.shape[1]))
     merged[:num_head_rows].copy_(head)
     merged[num_head_rows:].copy_(proj)
     head_ptr = head.data_ptr()
@@ -185,6 +200,7 @@ def build_fused_select(
     max_bs: int,
     output_multiplier: float,
     final_logit_softcapping: Optional[float],
+    memory_saver_adapter: TorchMemorySaverAdapter,
 ) -> Tuple[Optional[FusedSelect], Optional[str]]:
     """The fused selection, or (None, why not). Collective over the lm_head's TP group (the workspace request).
 
@@ -217,6 +233,7 @@ def build_fused_select(
         target_model=target_model,
         lm_head=lm_head,
         projection=selector.hidden_projection,
+        memory_saver_adapter=memory_saver_adapter,
     )
     push_plane = lease.get_communicator().push
     assert push_plane is not None
