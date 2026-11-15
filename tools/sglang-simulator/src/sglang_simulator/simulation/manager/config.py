@@ -188,6 +188,35 @@ class ConfigManager:
     def get_inference_time_predictor(
         cls, model: ModelInfo, hw: AcceleratorInfo, sched_config: SchedulerConfig
     ) -> InferTimePredictor:
+        energy_config = cls._get_raw_config().get("predictor", {}).get("energy")
+        if energy_config is None:
+            return cls._get_time_predictor(model, hw, sched_config)
+        if (
+            not isinstance(energy_config, dict)
+            or set(energy_config) != {"calibration_path"}
+            or not isinstance(energy_config["calibration_path"], str)
+        ):
+            raise ValueError('predictor.energy must be {"calibration_path": "<path>"}')
+
+        from sglang_simulator.simulation.manager.state import StateManager
+        from sglang_simulator.time_predictor.energy import (
+            EnergyCalibration,
+            EnergyPredictor,
+        )
+
+        calibration = EnergyCalibration.from_file(
+            cls.resolve_config_relative_path(energy_config["calibration_path"])
+        )
+        return EnergyPredictor(
+            inner=cls._get_time_predictor(model, hw, sched_config),
+            calibration=calibration,
+            clock=StateManager.get_global_clock,
+        )
+
+    @classmethod
+    def _get_time_predictor(
+        cls, model: ModelInfo, hw: AcceleratorInfo, sched_config: SchedulerConfig
+    ) -> InferTimePredictor:
         config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
         if predictor_config.get("name") == "aisimulate":

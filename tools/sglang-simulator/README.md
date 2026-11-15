@@ -247,7 +247,10 @@ A simulator configuration has three sections:
 ```
 
 - `platform` describes the simulated accelerator and storage bandwidth.
-- `predictor` selects forward-latency prediction.
+- `predictor` selects forward-latency prediction. An optional
+  `"energy": {"calibration_path": "..."}` entry also estimates energy from a
+  measured power calibration; see
+  [Estimate energy](../../docs/docs/advanced_features/sglang_simulator.mdx#estimate-energy).
 - `scheduler` describes the real target deployment topology and backend metadata.
   `tp_size`, `ep_size`, `dp_size`, `pp_size`, and `cp_size` are modeled values;
   they do not launch physical workers. For the AISimulate predictor, `tp_size`
@@ -311,6 +314,7 @@ python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
 python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
+python3 -m pytest -q tools/sglang-simulator/test/test_energy_predictor.py
 ```
 
 Run each file as a separate pytest command because the runner test installs
