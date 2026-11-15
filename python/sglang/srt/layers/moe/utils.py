@@ -42,6 +42,7 @@ class MoeA2ABackend(Enum):
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_OPS = "ascend_ops"
     FLASHINFER = "flashinfer_nvlink_one_sided"
+    FLASHINFER_RDMA = "flashinfer_rdma"
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
@@ -73,6 +74,9 @@ class MoeA2ABackend(Enum):
 
     def is_flashinfer(self):
         return self == MoeA2ABackend.FLASHINFER
+
+    def is_flashinfer_rdma(self):
+        return self == MoeA2ABackend.FLASHINFER_RDMA
 
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
@@ -869,7 +873,12 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     a2a = get_moe_a2a_backend()
     # The flashinfer and pplx combines, and the megamoe kernel's internal
     # combine, sum each token's expert outputs back to its source rank.
-    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe()
+    return (
+        a2a.is_flashinfer()
+        or a2a.is_flashinfer_rdma()
+        or a2a.is_pplx()
+        or a2a.is_flashinfer_megamoe()
+    )
 
 
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:

@@ -3273,6 +3273,15 @@ def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     from sglang.srt.distributed.bootstrap import reset_parallel_initialised
 
+    # RDMA buffers own communicators using the model process groups. Close
+    # them collectively before those groups are destroyed. The module is
+    # imported only when this backend is selected.
+    rdma_dispatcher = sys.modules.get(
+        "sglang.srt.layers.moe.token_dispatcher.flashinfer_rdma"
+    )
+    if rdma_dispatcher is not None:
+        rdma_dispatcher.close_flashinfer_rdma_buffers()
+
     reset_parallel_initialised()
     get_parallel().clear_stamp()
     dwdp_mgr = get_global_dwdp_manager()

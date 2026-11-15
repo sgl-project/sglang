@@ -505,6 +505,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_pd_role_switch",
     "speculative_domino_candidate_pool_size",
     "flashinfer_a2a_dispatch_type",
+    "flashinfer_rdma_max_tokens_per_rank",
     "cuda_graph_max_seq_len_prefill",
     "prefill_kv_cache_dequant_dtype",
     "dsv4_attn_backend",

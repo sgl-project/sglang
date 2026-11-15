@@ -138,6 +138,52 @@ Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only supp
   </tbody>
 </table>
 
+### FlashInfer RDMA on SM120
+
+Use `--moe-a2a-backend flashinfer_rdma` for NVFP4 expert dispatch and
+weighted combine on SM120 GPUs with RDMA-capable NICs. Non-self decode
+transfers use RDMA, including transfers within a host. The backend reuses
+FlashInfer CUTLASS for expert computation and supports decode CUDA Graphs.
+
+Prerequisites:
+
+- A FlashInfer build containing [FlashInfer PR #9449](https://github.com/flashinfer-ai/flashinfer/pull/9449), which provides `flashinfer.comm.RdmaMoeAlltoAll`.
+- Matching NCCL 2.30.7 headers and runtime with GDAKI, CUDA, and working GPUDirect RDMA. Follow the dependency setup in that FlashInfer change.
+- A gated ModelOpt NVFP4 MoE checkpoint from the GLM or DeepSeek V2/V3 family, with static activation scales and BF16 hidden states. GLM-5.3 Flash is the measured model.
+- Four or eight GPUs, with attention DP and expert parallelism both equal to TP size. CP, DCP, PP, MoE DP and DWDP must each be 1.
+
+For an eight-GPU deployment, set `MODEL_PATH` to your NVFP4 checkpoint:
+
+```bash
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --dtype bfloat16 \
+  --tp-size 8 --attn-dp-size 8 --ep-size 8 \
+  --moe-a2a-backend flashinfer_rdma \
+  --moe-runner-backend flashinfer_cutlass \
+  --flashinfer-rdma-max-tokens-per-rank 256
+```
+
+`--flashinfer-rdma-max-tokens-per-rank` reserves physical decode token rows
+per rank, not requests across the whole instance. Its default is 256. With
+MTP using four verification tokens per request, 16 local requests require
+at least 64 rows. Larger capacities also increase communication and expert
+staging memory. Startup checks both decode graph buckets and the maximum running requests
+against this limit. If you omit `--max-running-requests`, the backend bounds
+it by the communication capacity before memory sizing.
+
+Prefill uses eager BF16 AllGather, local expert computation and ReduceScatter;
+it does not use the fixed decode RDMA workspace. Selecting this backend
+disables prefill CUDA Graphs, overlap scheduling and shared expert fusion. The unquantized
+speculative draft defaults to `--speculative-moe-a2a-backend none`; the
+target model still uses RDMA during verification. Overlap, dynamic expert
+placement, redundant experts, EPLB, elastic EP and paged experts are not
+supported by this backend.
+
+Both dispatch and combine use NVFP4, which is lossy. Validate model quality
+for your workload before deployment. NVFP4 dispatch with BF16 combine is not
+exposed by this backend.
+
 ### Examples
 
 Launch with DeepEP and DeepGEMM for DeepSeek-V3:

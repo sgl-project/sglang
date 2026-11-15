@@ -35,7 +35,11 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    RoutingMethodType,
+)
 from sglang.test.test_utils import CustomTestCase
 
 NUM_EXPERTS = 8
@@ -133,6 +137,21 @@ def _method_set_up_for(backend: MoeRunnerBackend) -> ModelOptNvFp4FusedMoEMethod
 
 
 class TestNvFp4MoeDispatch(CustomTestCase):
+    def test_rdma_requires_static_fp4_dispatch_without_nvlink_configuration(self):
+        backend = MoeA2ABackend("flashinfer_rdma")
+        self.assertFalse(backend.is_flashinfer())
+        with (
+            mock.patch.object(
+                modelopt_quant, "get_moe_a2a_backend", return_value=backend
+            ),
+            mock.patch.object(modelopt_quant, "MOE_NVFP4_DISPATCH", False),
+            mock.patch.object(
+                modelopt_quant, "get_flashinfer_a2a_dispatch_type"
+            ) as nvlink,
+        ):
+            self.assertTrue(modelopt_quant._use_nvfp4_dispatch())
+            nvlink.assert_not_called()
+
     def test_routed_trtllm_takes_the_trtllm_path(self):
         for backend in (
             MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,

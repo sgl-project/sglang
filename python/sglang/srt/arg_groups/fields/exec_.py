@@ -910,6 +910,7 @@ class ExecMoe(msgspec.Struct):
             "mori",
             "ascend_fuseep",
             "flashinfer_nvlink_one_sided",
+            "flashinfer_rdma",
             "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
             "megamoe",
             "deepep_v2",
@@ -920,7 +921,7 @@ class ExecMoe(msgspec.Struct):
         Arg(
             help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
             "FlashInfer's NVLink one-sided all-to-all; 'flashinfer' is a deprecated "
-            "alias for it.",
+            "alias for it. 'flashinfer_rdma' uses pure RDMA NVFP4 dispatch/combine on SM120.",
             choices=[
                 "none",
                 "deepep",
@@ -929,6 +930,7 @@ class ExecMoe(msgspec.Struct):
                 "mori",
                 "ascend_fuseep",
                 "flashinfer_nvlink_one_sided",
+                "flashinfer_rdma",
                 "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
@@ -939,6 +941,12 @@ class ExecMoe(msgspec.Struct):
             resolvable=True,
         ),
     ] = "none"
+    flashinfer_rdma_max_tokens_per_rank: A[
+        int,
+        "Physical decode/verify token capacity per rank for flashinfer_rdma. "
+        "Includes speculative draft tokens per request; prefill uses a separate "
+        "collective path. Increase this value for larger decode batches.",
+    ] = 256
     enable_w4a4_mxfp4_megamoe: A[
         bool,
         "Enable the W4A4 MXFP4 MegaMoE path with DeepGEMM's "

@@ -21,7 +21,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def a2a(name=None):
-    names = ("flashinfer", "pplx", "flashinfer_megamoe")
+    names = ("flashinfer", "flashinfer_rdma", "pplx", "flashinfer_megamoe")
     return types.SimpleNamespace(
         **{f"is_{n}": (lambda n=n: n == name) for n in names},
         is_none=lambda: name is None,
@@ -91,6 +91,7 @@ class TestReduceMoeOutput(CustomTestCase):
     def test_output_is_already_complete(self):
         for config in (
             {"backend": "flashinfer"},
+            {"backend": "flashinfer_rdma"},
             {"backend": "pplx"},
             {"backend": "flashinfer_megamoe"},
             {"dwdp_size": 2},

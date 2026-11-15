@@ -6,7 +6,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import FusedOpPool, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
     FlashInferCutlassMoeQuantInfo,
     FlashInferCutlassMxfp4MoeQuantInfo,
@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
     _run_flashinfer_cutlass,
     materialize_swiglu_params_for_cutlass,
 )
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -42,6 +43,31 @@ class _SingleRankMoeLayer(torch.nn.Module):
 
 
 class TestMaterializeSwigluParamsForCutlass(CustomTestCase):
+    def test_rdma_and_nvlink_keep_the_global_expert_id_kernel_layout(self):
+        standard = _dispatch_output(2)
+        output = torch.empty(2, HIDDEN, dtype=torch.bfloat16)
+        dispatch = FlashinferDispatchOutput(
+            standard.hidden_states, None, standard.topk_output, output
+        )
+        quant_info = FlashInferCutlassMoeQuantInfo(
+            quant_type="fp4", w13_weight=torch.empty(0), w2_weight=torch.empty(0)
+        )
+        for backend in ("flashinfer_rdma", "flashinfer_nvlink_one_sided"):
+            with (
+                self.subTest(backend=backend),
+                mock.patch(
+                    "sglang.srt.layers.moe.moe_runner.flashinfer_cutlass._run_flashinfer_cutlass",
+                    return_value=output,
+                ) as run,
+            ):
+                result = FusedOpPool.get_fused_func(backend, "flashinfer_cutlass")(
+                    dispatch, quant_info, MoeRunnerConfig()
+                )
+                self.assertIs(result.hidden_states, output)
+                self.assertIs(run.call_args.kwargs["dispatch_output"], dispatch)
+                self.assertIs(run.call_args.kwargs["output"], output)
+                self.assertTrue(run.call_args.kwargs["enable_alltoall"])
+
     def _materialize(self, activation="silu", **config_kwargs):
         config = MoeRunnerConfig(activation=activation, is_gated=True, **config_kwargs)
         return materialize_swiglu_params_for_cutlass(

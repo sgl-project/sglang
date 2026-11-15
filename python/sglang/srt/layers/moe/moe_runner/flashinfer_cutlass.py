@@ -418,6 +418,7 @@ def fused_experts_none_to_flashinfer_cutlass(
 
 
 @register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_cutlass")
+@register_fused_func("flashinfer_rdma", "flashinfer_cutlass")
 def fused_experts_flashinfer_to_flashinfer_cutlass(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
@@ -439,6 +440,9 @@ def fused_experts_flashinfer_to_flashinfer_cutlass(
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
     )
 
+    # Both transports provide global expert IDs and an EP-partial output
+    # buffer. enable_alltoall selects that CUTLASS layout; the dispatcher owns
+    # the actual NVLink or RDMA communication.
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
         quant_info=quant_info,
