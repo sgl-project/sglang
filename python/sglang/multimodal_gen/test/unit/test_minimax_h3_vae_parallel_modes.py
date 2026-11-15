@@ -433,6 +433,7 @@ def test_fused_residual_adds_match_the_eager_fp32_add(dtype):
     """Both fused kernels store the residual as eager computes it: a rounded
     FP32 multiply, then the add (no FMA; on ROCm the launch disables fusion)."""
     from sglang.kernels.ops.diffusion import (
+        h3_vae_rmsnorm,
         h3_vae_scale_add_rmsnorm,
         try_fused_scaled_residual_add_exact,
     )
@@ -453,6 +454,17 @@ def test_fused_residual_adds_match_the_eager_fp32_add(dtype):
     assert torch.equal(added, expected)
     reference = nn.functional.rms_norm(expected, (2048,), weight, 1e-5)
     torch.testing.assert_close(normed, reference, rtol=1e-5, atol=1e-5)
+
+    # stored in the autocast dtype, the rows round exactly as the linear's input cast
+    with torch.no_grad():
+        _, normed_half = h3_vae_scale_add_rmsnorm(
+            residual.clone(), update, scale, weight, 1e-5, out_dtype=dtype
+        )
+        first = h3_vae_rmsnorm(residual, weight, 1e-5)
+        first_half = h3_vae_rmsnorm(residual, weight, 1e-5, out_dtype=dtype)
+    assert torch.equal(normed_half, normed.to(dtype))
+    assert first.dtype == torch.float32
+    assert torch.equal(first_half, first.to(dtype))
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm aten replica")

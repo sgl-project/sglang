@@ -60,6 +60,7 @@ def _scale_add_rmsnorm_kernel(
     D: tl.constexpr,
     BLOCK: tl.constexpr,
     OPAQUE_MUL: tl.constexpr,
+    OUT_KIND: tl.constexpr,
 ):
     row = tl.program_id(0)
     if row >= rows:
@@ -78,7 +79,12 @@ def _scale_add_rmsnorm_kernel(
     tl.store(res_out_ptr + row * D + cols, acc, mask=mask)
     rstd = tl.rsqrt(tl.sum(acc * acc, axis=0) / D + eps)
     weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + row * D + cols, acc * rstd * weight, mask=mask)
+    y = acc * rstd * weight
+    if OUT_KIND == 1:
+        y = y.to(tl.float16)
+    elif OUT_KIND == 2:
+        y = y.to(tl.bfloat16)
+    tl.store(out_ptr + row * D + cols, y, mask=mask)
 
 
 def _out_kind(dtype: torch.dtype) -> int:
@@ -109,13 +115,17 @@ def _rows_of(tensor: torch.Tensor) -> tuple[torch.Tensor, int, int]:
 
 
 def h3_vae_rmsnorm(
-    hidden: torch.Tensor, weight: torch.Tensor, eps: float
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """FP32 RMSNorm. The stored dtype matches ``hidden`` so it lines up with ``.to(dtype)``."""
+    """FP32 RMSNorm, stored as ``out_dtype`` (default ``hidden``'s, so it lines up with ``.to(dtype)``)."""
     flat, rows, dim = _rows_of(hidden)
     if weight.shape != (dim,) or weight.device != hidden.device:
         raise ValueError("H3 VAE RMSNorm weight must match the last dimension")
-    out = torch.empty(flat.shape, device=hidden.device, dtype=hidden.dtype)
+    out_dtype = hidden.dtype if out_dtype is None else out_dtype
+    out = torch.empty(flat.shape, device=hidden.device, dtype=out_dtype)
     block, num_warps = _launch_config(dim)
     _rmsnorm_kernel[(rows,)](
         out,
@@ -125,7 +135,7 @@ def h3_vae_rmsnorm(
         float(eps),
         D=dim,
         BLOCK=block,
-        OUT_KIND=_out_kind(hidden.dtype),
+        OUT_KIND=_out_kind(out_dtype),
         num_warps=num_warps,
     )
     return out.view(hidden.shape)
@@ -137,8 +147,9 @@ def h3_vae_scale_add_rmsnorm(
     scale: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    out_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``residual + update * scale`` in FP32, then RMSNorm of that sum.
+    """``residual + update * scale`` in FP32, then RMSNorm of that sum, stored as ``out_dtype``.
 
     The residual is updated in place when it is already a contiguous FP32
     tensor. Otherwise a new FP32 residual is returned, matching the dtype the
@@ -168,7 +179,7 @@ def h3_vae_scale_add_rmsnorm(
         if inplace
         else torch.empty(flat.shape, device=residual.device, dtype=torch.float32)
     )
-    normed = torch.empty(flat.shape, device=residual.device, dtype=torch.float32)
+    normed = torch.empty(flat.shape, device=residual.device, dtype=out_dtype)
     block, num_warps = _launch_config(dim)
     _scale_add_rmsnorm_kernel[(rows,)](
         flat,
@@ -182,6 +193,7 @@ def h3_vae_scale_add_rmsnorm(
         D=dim,
         BLOCK=block,
         OPAQUE_MUL=torch.version.hip is None,
+        OUT_KIND=_out_kind(out_dtype),
         num_warps=num_warps,
         **({"enable_fp_fusion": False} if torch.version.hip else {}),
     )
