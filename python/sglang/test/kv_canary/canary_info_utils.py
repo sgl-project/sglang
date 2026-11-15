@@ -19,10 +19,11 @@ from sglang.srt.kv_canary.canary_info.digest import sampling_digest
 from sglang.srt.kv_canary.canary_info.tokenizer_manager_hook import _check_canary_infos
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+# No min_p: the e2e servers run EAGLE, and speculative decoding aborts min_p requests.
 CANARY_INFO_SAMPLING_PARAMS: tuple[dict[str, Any], ...] = (
     {"temperature": 0.0},
     {"temperature": 0.7, "top_p": 0.9},
-    {"temperature": 1.0, "top_k": 20, "min_p": 0.05},
+    {"temperature": 1.0, "top_k": 20},
     {"temperature": 0.8, "sampling_seed": 1234},
 )
 

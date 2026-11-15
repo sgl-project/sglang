@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import _gdn_gating_values
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
@@ -643,6 +644,19 @@ def fused_qkv_split_gdn_prefill_kernel(
     k,
     v,
     mixed_qkv,
+    g,
+    beta_output,
+    A_log,
+    a,
+    b,
+    dt_bias,
+    token_indices,
+    STRIDE_A_T: tl.constexpr,
+    STRIDE_A_H: tl.constexpr,
+    STRIDE_B_T: tl.constexpr,
+    STRIDE_B_H: tl.constexpr,
+    STRIDE_A_LOG: tl.constexpr,
+    STRIDE_DT_BIAS: tl.constexpr,
     MIXED_QKV_STRIDE_T: tl.constexpr,
     MIXED_QKV_STRIDE_D: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
@@ -652,9 +666,17 @@ def fused_qkv_split_gdn_prefill_kernel(
     HEAD_K: tl.constexpr,
     HEAD_V: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    NORMALIZE_QK: tl.constexpr,
+    BLOCK_Q_HEADS: tl.constexpr,
+    BLOCK_K_HEADS: tl.constexpr,
+    BLOCK_HEAD_Q: tl.constexpr,
+    BLOCK_HEAD_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    FUSE_GATING: tl.constexpr,
+    BLOCK_GATE_HEADS: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
+    i_t = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     q_dim: tl.constexpr = NUM_Q_HEADS * HEAD_Q
     k_dim: tl.constexpr = NUM_K_HEADS * HEAD_K
@@ -662,22 +684,101 @@ def fused_qkv_split_gdn_prefill_kernel(
     qk_dim: tl.constexpr = q_dim + k_dim
     qkv_dim: tl.constexpr = qk_dim + v_dim
 
-    mask = offsets < qkv_dim
-    values = tl.load(
-        mixed_qkv + i_t * MIXED_QKV_STRIDE_T + offsets * MIXED_QKV_STRIDE_D,
-        mask=mask,
-    )
+    if NORMALIZE_QK:
+        q_heads = tl.arange(0, BLOCK_Q_HEADS)[:, None]
+        q_cols = tl.arange(0, BLOCK_HEAD_Q)[None, :]
+        q_offsets = (q_heads * HEAD_Q + q_cols).to(tl.int64)
+        q_mask = (q_heads < NUM_Q_HEADS) & (q_cols < HEAD_Q)
+        q_values = tl.load(
+            mixed_qkv + i_t * MIXED_QKV_STRIDE_T + q_offsets * MIXED_QKV_STRIDE_D,
+            mask=q_mask,
+            other=0,
+        ).to(tl.float32)
+        q_norm = tl.sqrt(tl.sum(q_values * q_values, 1) + 1e-6)[:, None]
+        # Match both arithmetic paths in FLA's l2norm_fwd.
+        if HEAD_Q <= 512:
+            q_values = q_values / q_norm
+        else:
+            q_values = q_values * (1 / q_norm)
+        tl.store(
+            q + i_t * q_dim + q_offsets, q_values.to(q.dtype.element_ty), mask=q_mask
+        )
 
-    q_mask = offsets < q_dim
-    tl.store(q + i_t * q_dim + offsets, values, mask=q_mask)
+        k_heads = tl.arange(0, BLOCK_K_HEADS)[:, None]
+        k_cols = tl.arange(0, BLOCK_HEAD_K)[None, :]
+        k_offsets = (k_heads * HEAD_K + k_cols).to(tl.int64)
+        k_mask = (k_heads < NUM_K_HEADS) & (k_cols < HEAD_K)
+        k_values = tl.load(
+            mixed_qkv
+            + i_t * MIXED_QKV_STRIDE_T
+            + (q_dim + k_offsets) * MIXED_QKV_STRIDE_D,
+            mask=k_mask,
+            other=0,
+        ).to(tl.float32)
+        k_norm = tl.sqrt(tl.sum(k_values * k_values, 1) + 1e-6)[:, None]
+        if HEAD_K <= 512:
+            k_values = k_values / k_norm
+        else:
+            k_values = k_values * (1 / k_norm)
+        tl.store(
+            k + i_t * k_dim + k_offsets, k_values.to(k.dtype.element_ty), mask=k_mask
+        )
+        v_offsets = tl.arange(0, BLOCK_V).to(tl.int64)
+        v_mask = v_offsets < v_dim
+        v_values = tl.load(
+            mixed_qkv
+            + i_t * MIXED_QKV_STRIDE_T
+            + (qk_dim + v_offsets) * MIXED_QKV_STRIDE_D,
+            mask=v_mask,
+            other=0,
+        )
+        tl.store(v + i_t * v_dim + v_offsets, v_values, mask=v_mask)
+    else:
+        mask = offsets < qkv_dim
+        values = tl.load(
+            mixed_qkv + i_t * MIXED_QKV_STRIDE_T + offsets * MIXED_QKV_STRIDE_D,
+            mask=mask,
+        )
 
-    k_offsets = offsets - q_dim
-    k_mask = (offsets >= q_dim) & (offsets < qk_dim)
-    tl.store(k + i_t * k_dim + k_offsets, values, mask=k_mask)
+        q_mask = offsets < q_dim
+        tl.store(q + i_t * q_dim + offsets, values, mask=q_mask)
 
-    v_offsets = offsets - qk_dim
-    v_mask = (offsets >= qk_dim) & (offsets < qkv_dim)
-    tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
+        k_offsets = offsets - q_dim
+        k_mask = (offsets >= q_dim) & (offsets < qk_dim)
+        tl.store(k + i_t * k_dim + k_offsets, values, mask=k_mask)
+
+        v_offsets = offsets - qk_dim
+        v_mask = (offsets >= qk_dim) & (offsets < qkv_dim)
+        tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
+
+    if FUSE_GATING:
+        source_token = tl.load(token_indices + i_t).to(tl.int64)
+        gate_heads = tl.arange(0, BLOCK_GATE_HEADS).to(tl.int64)
+        gate_mask = gate_heads < NUM_V_HEADS
+        gate_a = tl.load(
+            a + source_token * STRIDE_A_T + gate_heads * STRIDE_A_H,
+            mask=gate_mask,
+            other=0,
+        )
+        gate_b = tl.load(
+            b + source_token * STRIDE_B_T + gate_heads * STRIDE_B_H,
+            mask=gate_mask,
+            other=0,
+        )
+        gate_A_log = tl.load(A_log + gate_heads * STRIDE_A_LOG, mask=gate_mask, other=0)
+        gate_bias = tl.load(
+            dt_bias + gate_heads * STRIDE_DT_BIAS, mask=gate_mask, other=0
+        )
+        gate_g, gate_beta = _gdn_gating_values(
+            gate_A_log, gate_a, gate_b, gate_bias, 1.0, 20.0
+        )
+        tl.store(g + i_t * NUM_V_HEADS + gate_heads, gate_g, mask=gate_mask)
+        # Standalone gating rounds sigmoid to b's dtype before the FP32 store.
+        tl.store(
+            beta_output + i_t * NUM_V_HEADS + gate_heads,
+            gate_beta.to(b.dtype.element_ty),
+            mask=gate_mask,
+        )
 
 
 def fused_qkv_split_gdn_prefill(
@@ -688,6 +789,8 @@ def fused_qkv_split_gdn_prefill(
     head_q: int,
     head_k: int,
     head_v: int,
+    *,
+    normalize_qk: bool = False,
 ):
     """Split packed post-conv GDN QKV into contiguous FLA prefill tensors.
 
@@ -695,7 +798,98 @@ def fused_qkv_split_gdn_prefill(
     chunk kernels consume separate contiguous `[1, T, H, D]` tensors, so this
     fused split replaces three independent `aten::copy_` kernels from the
     generic FLA input guard. `mixed_qkv` may be a strided `[T, qkv_dim]` view.
+    Optional Q/K normalization uses FLA's epsilon and output-dtype cast. Its
+    FP32 reduction order can differ from standalone FLA normalization, so
+    bitwise parity is not guaranteed.
     """
+    q, k, v, _, _ = _prepare_gdn_prefill(
+        mixed_qkv,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_q,
+        head_k,
+        head_v,
+        normalize_qk=normalize_qk,
+    )
+    return q, k, v
+
+
+def fused_qkv_gating_gdn_prefill(
+    mixed_qkv: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_q: int,
+    head_k: int,
+    head_v: int,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    token_indices: torch.Tensor,
+):
+    """Split/normalize post-conv QKV and compute mapped gates in one Triton launch.
+
+    QKV has compact [T, Q + K + V] rows; gates have [source_T, Hv] rows.
+    Device int32/int64 indices map each compact row to an in-range source
+    gate row. CUDA/HIP callers retain the split's <=8192 channel gate.
+    Strided inputs are supported. Outputs are contiguous Q/K/V plus FP32 g/beta,
+    with sigmoid rounded through b's dtype as in standalone gating.
+    """
+    if (
+        mixed_qkv.ndim != 2
+        or mixed_qkv.shape[1]
+        != num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
+        or min(num_q_heads, num_k_heads, num_v_heads, head_q, head_k, head_v) <= 0
+    ):
+        raise ValueError("GDN preparation requires packed [T, Q + K + V] input")
+    if a.ndim != 2 or b.shape != a.shape or a.shape[1] != num_v_heads:
+        raise ValueError("GDN preparation requires equal [source_T, Hv] gate shapes")
+    if A_log.shape != (num_v_heads,) or dt_bias.shape != (num_v_heads,):
+        raise ValueError("GDN preparation requires [Hv] A_log and dt_bias")
+    for tensor in (mixed_qkv, A_log, a, b, dt_bias):
+        if tensor.device != mixed_qkv.device or tensor.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError("GDN preparation requires same-device floating inputs")
+    if (
+        token_indices.shape != (mixed_qkv.shape[0],)
+        or token_indices.device != mixed_qkv.device
+        or token_indices.dtype not in (torch.int32, torch.int64)
+        or not token_indices.is_contiguous()
+    ):
+        raise ValueError("GDN preparation requires contiguous device token indices")
+    return _prepare_gdn_prefill(
+        mixed_qkv,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_q,
+        head_k,
+        head_v,
+        normalize_qk=True,
+        gating=(A_log, a, b, dt_bias),
+        token_indices=token_indices,
+    )
+
+
+def _prepare_gdn_prefill(
+    mixed_qkv: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_q: int,
+    head_k: int,
+    head_v: int,
+    *,
+    normalize_qk: bool,
+    gating: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    token_indices: torch.Tensor | None = None,
+):
     seq_len = mixed_qkv.shape[0]
     q = torch.empty(
         (1, seq_len, num_q_heads, head_q),
@@ -714,13 +908,33 @@ def fused_qkv_split_gdn_prefill(
     )
 
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
-    if _is_hip and seq_len == 0:
-        return q, k, v
+    A_log, a, b, dt_bias = (None, None, None, None) if gating is None else gating
+    g = beta_output = None
+    if gating is not None:
+        g = torch.empty(
+            (1, seq_len, num_v_heads), dtype=torch.float32, device=mixed_qkv.device
+        )
+        beta_output = torch.empty_like(g)
+    if seq_len == 0:
+        return q, k, v, g, beta_output
     fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
         q,
         k,
         v,
         mixed_qkv,
+        g,
+        beta_output,
+        A_log,
+        a,
+        b,
+        dt_bias,
+        token_indices,
+        a.stride(0) if a is not None else 0,
+        a.stride(1) if a is not None else 0,
+        b.stride(0) if b is not None else 0,
+        b.stride(1) if b is not None else 0,
+        A_log.stride(0) if A_log is not None else 0,
+        dt_bias.stride(0) if dt_bias is not None else 0,
         mixed_qkv.stride(0),
         mixed_qkv.stride(1),
         num_q_heads,
@@ -730,7 +944,15 @@ def fused_qkv_split_gdn_prefill(
         head_k,
         head_v,
         BLOCK_SIZE=triton.next_power_of_2(qkv_dim),
+        NORMALIZE_QK=normalize_qk,
+        BLOCK_Q_HEADS=triton.next_power_of_2(num_q_heads),
+        BLOCK_K_HEADS=triton.next_power_of_2(num_k_heads),
+        BLOCK_HEAD_Q=triton.next_power_of_2(head_q),
+        BLOCK_HEAD_K=triton.next_power_of_2(head_k),
+        BLOCK_V=triton.next_power_of_2(num_v_heads * head_v),
+        FUSE_GATING=gating is not None,
+        BLOCK_GATE_HEADS=triton.next_power_of_2(num_v_heads),
         num_warps=8,
         num_stages=3,
     )
-    return q, k, v
+    return q, k, v, g, beta_output

@@ -43,8 +43,6 @@ _DIT_BLOCK_PREFIX = re.compile(r"^blocks\.(\d+)\.")
 
 
 class HybridWindowAttentionH3Backend(AttentionBackend):
-    accept_output_buffer: bool = False
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128]

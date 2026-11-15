@@ -18,6 +18,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -41,9 +42,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 
 class HYV3FeedForward(nn.Module):
@@ -230,9 +231,11 @@ class HYV3Attention(nn.Module):
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.alt_stream = alt_stream
         tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -355,10 +358,14 @@ class HYV3Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.use_qk_norm:
-            q = self.q_norm(q.reshape(-1, self.head_dim))
-            q = q.view(-1, self.q_size)
-            k = self.k_norm(k.reshape(-1, self.head_dim))
-            k = k.view(-1, self.kv_size)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
@@ -390,6 +397,7 @@ class HYV3DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            alt_stream=alt_stream,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)

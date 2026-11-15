@@ -330,6 +330,7 @@ class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
         mgr.request_status = {room: KVPoll.WaitingForInput}
         mgr.transfer_infos = {
             room: {
@@ -366,6 +367,8 @@ class TestNixlTransferWorker(CustomTestCase):
         }
         mgr.req_to_decode_prefix_len = {room: 4}
         mgr.enable_staging = False
+        mgr.enable_kv_packing = False
+        mgr._kv_packers = []
         mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)
@@ -432,6 +435,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self.addCleanup(context.restore)
         mgr = self._make_manager(21)
         mgr.customized_info_enabled = True
+        mgr.exchange_aux_item_lens = True
         healthy = self._make_manager(22)
         mgr.kv_args.aux_data_ptrs = [0] * 8
         mgr.kv_args.aux_item_lens = [64] * 6 + [4096, 64]
@@ -543,6 +547,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 dst_dcp_rank=dcp_rank,
                 dcp_dst_region_indices=[0],
                 dcp_token_item_lens=[4],
+                dst_draft_rows_dcp_collapsed=False,
             )
             for i, (agent, dcp_rank) in enumerate(zip(agents, dcp_ranks))
         }
@@ -628,6 +633,39 @@ class TestNixlTransferWorker(CustomTestCase):
             [("127.0.0.1", 5555)],
         )
         self.assertNotIn(room, mgr.transfer_infos)
+
+    def test_packed_kv_from_this_worker_settles_before_success(self):
+        """Prefill TP < decode TP with packing on: the worker posts through its own packer, then settles."""
+        room = 26
+        mgr = self._make_manager(room)
+        mgr.decode_kv_args_table["agent"].decode_tp_size = 2
+        mgr.enable_kv_packing = True
+        mgr._kv_packers = ["packer0", "packer1"]
+        events = []
+
+        def send_packed(*, packer, peer_name, src_pages, dst_pages, handles):
+            events.append(packer)
+            handles.append("packed")
+
+        mgr._send_packed_kvcache = MagicMock(side_effect=send_packed)
+        mgr.send_kvcache_slice = MagicMock(side_effect=AssertionError("slice path"))
+        mgr.send_aux = MagicMock(return_value="aux")
+        mgr.agent.check_xfer_state = lambda handle: events.append(handle) or "DONE"
+        mgr.send_kv_status_message.side_effect = lambda **kwargs: events.append(
+            kwargs["status"]
+        )
+        queue = SimpleNamespace(
+            get=MagicMock(
+                side_effect=[
+                    self._make_chunk(room, [1], is_last_chunk=True),
+                    SystemExit(),
+                ]
+            )
+        )
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue, worker_index=1)
+
+        self.assertEqual(events, ["packer1", "packed", "aux", KVPoll.Success])
 
     def test_failed_handle_never_emits_success(self):
         room = 25
@@ -799,6 +837,8 @@ class TestNixlDecodeListener(CustomTestCase):
         mgr._deferred_ack_poisoned_rooms = set()
         mgr._staging_outstanding = {}
         mgr.enable_staging = False
+        mgr.enable_kv_packing = False
+        mgr._kv_packers = []
         mgr._staging_handler = MagicMock()
         receiver = NixlKVReceiver(mgr, "prefill:8998", 11)
         mgr.update_status(11, KVPoll.WaitingForInput)
@@ -832,6 +872,8 @@ class TestNixlEarlySendWaitEvent(CustomTestCase):
         mgr = object.__new__(NixlKVManager)
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.enable_staging = False
+        mgr.enable_kv_packing = False
+        mgr._kv_packers = []
         mgr.transfer_infos = {room: {"agent": SimpleNamespace(dst_port=5555)}}
         queue = SimpleNamespace(put=MagicMock())
         mgr.transfer_queues = [queue]
@@ -955,6 +997,7 @@ class TestNixlStaging(CustomTestCase):
     def _make_manager(self, agent=None):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
         mgr.agent = agent or StagingFakeAgent()
         mgr.attn_tp_size = 2
         mgr.is_mla_backend = False
@@ -979,6 +1022,7 @@ class TestNixlStaging(CustomTestCase):
                 agent = StagingFakeAgent()
                 mgr = self._make_manager(agent)
                 mgr.customized_info_enabled = enabled
+                mgr.exchange_aux_item_lens = enabled
                 src_ptrs = [0x1000 + i * 0x10000 for i in range(8)]
                 dst_ptrs = [0x2000 + i * 0x10000 for i in range(8)]
                 mgr.kv_args.aux_data_ptrs = src_ptrs
@@ -1010,6 +1054,7 @@ class TestNixlStaging(CustomTestCase):
         agent = StagingFakeAgent()
         mgr = self._make_manager(agent)
         mgr.customized_info_enabled = True
+        mgr.exchange_aux_item_lens = True
         mgr.kv_args.aux_data_ptrs = [0x1000] * 8
         mgr.kv_args.aux_item_lens = [64] * 8
 
@@ -1252,6 +1297,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
     def _make_manager(self, peers):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
         mgr.agent = ReloadFakeAgent()
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.is_mla_backend = False
@@ -1329,6 +1375,8 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
                 for i, name in enumerate(peers)
             }
         mgr.enable_staging = False
+        mgr.enable_kv_packing = False
+        mgr._kv_packers = []
         mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)

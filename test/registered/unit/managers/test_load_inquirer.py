@@ -13,8 +13,8 @@ from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.observability.metrics_collector import SchedulerStats
@@ -139,7 +139,7 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
                 ListKind.WAITING: [],
                 ListKind.PD_PREALLOC: prealloc,
                 ListKind.PD_RECEIVING: decode_queue(ListKind.PD_RECEIVING),
-                ListKind.PD_RETRACTED: _RequestList(ListKind.PD_RETRACTED),
+                ListKind.PD_RETRACTED: IndexedReqList(ListKind.PD_RETRACTED),
             },
             get_total_prefill_uncached_tokens=lambda: 0,
             get_total_prefill_busy_us=lambda: 0,

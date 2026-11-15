@@ -5,6 +5,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -23,8 +24,6 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
     is_cuda,
     is_hip,
     is_sm90_supported,
@@ -39,16 +38,7 @@ except:
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
-
-if _is_cuda:
-    pass
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    pass
 
 padding_size = get_moe_padding_size(_use_aiter)
 
@@ -256,7 +246,7 @@ def fused_moe_kernel_gptq_awq(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs)
+        b = tl.load(b_ptrs, mask=k_mask, other=k_other)
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
@@ -913,10 +903,16 @@ def invoke_fused_moe_kernel(
                 # the matching scales (row- or column-major, strides are
                 # passed to the kernel below).
                 assert A_scale is not None
-            elif _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:
-                A, A_scale = per_token_group_quant_fp8(A, block_k)
+                # A TP shard can end K in a partial scale group (e.g. 160 with group 128);
+                # quantize a zero-padded copy, the GEMM masks to B.shape[2] as the logical K.
+                pad_k = (-A.shape[-1]) % block_k
+                if pad_k:
+                    A = F.pad(A, (0, pad_k))
+                if _is_cuda:
+                    A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                else:
+                    A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
@@ -994,6 +990,18 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
+        group_size = block_shape[1]
+        num_groups = triton.cdiv(A.shape[1], group_size)
+        if B_scale.shape[2] != num_groups:
+            raise ValueError(
+                f"Expected {num_groups} scale groups for K={A.shape[1]} "
+                f"and group_size={group_size}, got {B_scale.shape[2]}"
+            )
+        if B_zp is not None and B_zp.shape[2] != num_groups:
+            raise ValueError(
+                f"Expected {num_groups} zero-point groups for K={A.shape[1]} "
+                f"and group_size={group_size}, got {B_zp.shape[2]}"
+            )
         fused_moe_kernel_gptq_awq[grid](
             A,
             B,
@@ -1021,14 +1029,15 @@ def invoke_fused_moe_kernel(
             B_zp.stride(0) if B_zp is not None else 0,
             B_zp.stride(2) if B_zp is not None else 0,
             B_zp.stride(1) if B_zp is not None else 0,
-            group_size=block_shape[1],
+            group_size=group_size,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
-            even_Ks=even_Ks,
+            # This kernel iterates over logical K, not the int4 packed width.
+            even_Ks=A.shape[1] % config["BLOCK_SIZE_K"] == 0,
             **config,
         )
 

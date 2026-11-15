@@ -234,7 +234,14 @@ def _blake3_device(tensor: torch.Tensor) -> torch.Tensor:
     if not tensor.is_cuda or tensor.layout != torch.strided:
         raise ValueError("BLAKE3 requires a dense CUDA tensor")
     with torch.cuda.device(tensor.device):
-        data = tensor.detach().contiguous().reshape(-1).view(torch.uint8)
+        data = (
+            tensor.detach()
+            .resolve_conj()
+            .resolve_neg()
+            .contiguous()
+            .reshape(-1)
+            .view(torch.uint8)
+        )
         n_chunks = max(triton.cdiv(data.numel(), 1024), 1)
         group = min(triton.next_power_of_2(n_chunks), 128)
         n_nodes = triton.cdiv(n_chunks, group)
@@ -277,3 +284,20 @@ def gpu_tensor_blake3(tensor: torch.Tensor) -> bytes:
     Returning bytes synchronizes a 32-byte device-to-host copy.
     """
     return _blake3_device(tensor).cpu().numpy().tobytes()
+
+
+def gpu_tensors_blake3(tensors: list[torch.Tensor]) -> list[bytes]:
+    """Hash a same-device batch with one digest-only host synchronization.
+
+    Inputs remain independent: concatenating their bytes would lose boundaries
+    and allocate another feature-sized buffer. Work runs on the caller's current
+    stream; callers must establish producer readiness before hashing.
+    """
+    if not tensors:
+        return []
+    device = tensors[0].device
+    if any(t.device != device for t in tensors):
+        raise ValueError("BLAKE3 batch requires tensors on the same CUDA device")
+    digests = torch.stack([_blake3_device(t) for t in tensors])
+    host = digests.cpu().numpy()
+    return [row.tobytes() for row in host]

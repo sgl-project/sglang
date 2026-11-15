@@ -52,7 +52,6 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     delight_enable: bool = True
     delight_prompt: str = ""
     delight_negative_prompt: str = ""
-    delight_strength: float = 1.0
     delight_num_inference_steps: int = 50
     delight_guidance_scale: float = 1.0
     delight_cfg_image: float = 1.5

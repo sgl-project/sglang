@@ -15,7 +15,6 @@ import torch
 import triton
 from packaging import version
 
-import sglang.kernels.ops.attention.triton_block_ptr_compat  # noqa: F401
 from sglang.srt.utils.common import torch_release
 
 logger = logging.getLogger(__name__)
@@ -143,18 +142,36 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     return wrapper
 
 
-def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+def input_guard(
+    fn: Optional[Callable[..., torch.Tensor]] = None,
+    *,
+    keep_strides: Tuple[str, ...] = (),
+) -> Callable[..., torch.Tensor]:
     """
     A decorator to make sure all input tensors are contiguous and set the device based on input tensors.
+    Tensors bound to the parameters named in `keep_strides` are passed with their own strides.
     """
+    if fn is None:
+        return functools.partial(input_guard, keep_strides=keep_strides)
+    param_names = list(inspect.signature(fn).parameters)
+    kept_positions = {param_names.index(name) for name in keep_strides}
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         contiguous_args = (
-            i if not isinstance(i, torch.Tensor) else i.contiguous() for i in args
+            (
+                i
+                if not isinstance(i, torch.Tensor) or pos in kept_positions
+                else i.contiguous()
+            )
+            for pos, i in enumerate(args)
         )
         contiguous_kwargs = {
-            k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
+            k: (
+                v
+                if not isinstance(v, torch.Tensor) or k in keep_strides
+                else v.contiguous()
+            )
             for k, v in kwargs.items()
         }
 

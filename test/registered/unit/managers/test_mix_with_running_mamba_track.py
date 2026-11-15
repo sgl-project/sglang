@@ -52,6 +52,7 @@ class _Pool:
     @staticmethod
     def set_mamba_ping_pong_slot(req, idx, value):
         req.kv.mamba_ping_pong_track_buffer[idx] = value
+        req.kv.mamba_ping_pong_empty[idx] = value == -1
 
     @staticmethod
     def get_mamba_ping_pong_other_idx(idx):
@@ -70,10 +71,10 @@ class _Req:
         self.decode_batch_idx = 3
         self.kv = SimpleNamespace(
             mamba_ping_pong_track_buffer=torch.tensor(buf, dtype=torch.int64),
+            mamba_ping_pong_empty=[slot == -1 for slot in buf],
             mamba_next_track_idx=next_idx,
             mamba_last_track_idx=last_idx,
             mamba_last_track_seqlen=None,
-            mamba_untracked_decode_batch_idx=None,
         )
 
     def refresh_fill_ids(self):
@@ -203,7 +204,7 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
                 )
                 self.assertEqual(batch.mamba_track_seqlens.tolist(), [428, -1, -1, -1])
                 self.assertEqual(batch.mamba_track_indices.tolist()[:2], [7, 9])
-                self.assertEqual(batch.mamba_track_indices.tolist()[2:], [-1, -1])
+                self.assertEqual(batch.mamba_track_indices.tolist()[2:], [0, 0])
 
                 # The slot checkpoint_kv_cache donates (donate_mamba_ping_pong_slot)
                 # for the tracked prefill row ...
@@ -239,20 +240,8 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
         self.assertEqual(d0.kv.mamba_ping_pong_track_buffer.tolist(), [5, -1])
         self.assertEqual(d0.kv.mamba_next_track_idx, 0)
         self.assertEqual(d0.kv.mamba_last_track_idx, 0)
-        self.assertEqual(d0.kv.mamba_untracked_decode_batch_idx, d0.decode_batch_idx)
         self.assertEqual(d1.kv.mamba_ping_pong_track_buffer.tolist(), [6, -1])
         self.assertEqual(d1.kv.mamba_next_track_idx, 0)
-        self.assertIsNone(d1.kv.mamba_untracked_decode_batch_idx)
-
-    def test_lazy_undo_keeps_the_slot_when_the_prealloc_failed(self):
-        pool = _Pool()
-        req = _Req("d0", 600, 40, [5, -1], next_idx=0, last_idx=0)
-        running = _batch([req], pool, mamba_track_mask_cpu=[True])
-        running.mamba_lazy_undo_prealloc_at_boundary()
-        self.assertEqual(pool.freed, [])
-        self.assertEqual(req.kv.mamba_ping_pong_track_buffer.tolist(), [5, -1])
-        self.assertEqual(req.kv.mamba_next_track_idx, 0)
-        self.assertEqual(req.kv.mamba_untracked_decode_batch_idx, req.decode_batch_idx)
 
     def test_non_lazy_decode_tails_keep_their_slots(self):
         batch, pool = self._mix(lazy=False)
@@ -260,16 +249,17 @@ class TestMixWithRunningMambaTrack(unittest.TestCase):
         self.assertEqual(batch.reqs[2].kv.mamba_next_track_idx, 1)
 
 
-class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
-    """A request finishes at grid - 1 in step N while overlapped step N + 1, its
-    boundary step, is mixed. The keep slot is untouched, so the radix insert must
-    still happen; only an in-place boundary write may skip it."""
+class TestLazyFinishBeforeBoundary(unittest.TestCase):
+    """A request finishes at grid - 1 in step N while overlapped step N + 1 is its
+    boundary step. A boundary step never writes the keep slot (without a second
+    slot it skips the snapshot), so the radix insert must still happen."""
 
-    def _finish(self, untracked):
+    def _finish(self):
         from sglang.srt.managers.scheduler_components import (
             batch_result_processor as brp,
         )
 
+        released = []
         req = SimpleNamespace(
             rid="r",
             decode_batch_idx=5,
@@ -280,7 +270,6 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
             kv=SimpleNamespace(
                 mamba_next_track_idx=0,
                 mamba_last_track_idx=0,
-                mamba_untracked_decode_batch_idx=5 if untracked else None,
             ),
         )
         batch = SimpleNamespace(
@@ -297,8 +286,10 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
             _maybe_collect_routed_experts=lambda req: None,
             _maybe_collect_indexer_topk=lambda req: None,
             _maybe_collect_customized_info=lambda i, req, out, n: None,
+            request_retirer=SimpleNamespace(
+                release=lambda req, checkpoint: released.append(checkpoint)
+            ),
         )
-        released = []
         with (
             patch.object(brp, "get_exec", return_value=_settings(lazy=True)),
             patch.object(
@@ -308,25 +299,14 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
                     disaggregation_decode_enable_offload_kvcache=False
                 ),
             ),
-            patch.object(
-                brp, "get_memory", return_value=SimpleNamespace(enable_hisparse=False)
-            ),
-            patch.object(
-                brp,
-                "release_kv_cache",
-                lambda req, cache, checkpoint: released.append(checkpoint),
-            ),
         ):
             brp.SchedulerBatchResultProcessor._handle_finish_state_updated_req(
                 processor, req, batch, None, 0, None
             )
         return released
 
-    def test_mixed_boundary_step_keeps_the_radix_insert(self):
-        self.assertEqual(self._finish(untracked=True), [True])
-
-    def test_in_place_boundary_write_skips_the_radix_insert(self):
-        self.assertEqual(self._finish(untracked=False), [False])
+    def test_boundary_step_without_a_second_slot_keeps_the_radix_insert(self):
+        self.assertEqual(self._finish(), [True])
 
 
 if __name__ == "__main__":

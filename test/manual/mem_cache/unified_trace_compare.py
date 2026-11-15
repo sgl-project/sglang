@@ -10,8 +10,9 @@ script whose result a PR reports, not a unit test:
     # two implementations in one checkout
     python test/manual/mem_cache/unified_trace_compare.py pair --a builder --b <name>
 
-Each run is one configuration (chain, page size, lazy compaction) driven by a
-seed or by a scenario file from unified_trace_scenarios/. `compare` and `pair`
+Each run is one configuration (chain, page size; a unified chain always
+compacts lazily) driven by a seed or by a scenario file from
+unified_trace_scenarios/. `compare` and `pair`
 print the first divergence per run with the operations before it, and exit
 non-zero on any divergence.
 """
@@ -42,8 +43,7 @@ def _configs(args):
     for chain in args.chains.split(","):
         assert chain in CHAINS, f"unknown chain {chain!r}; choose from {CHAINS}"
         for ps in (int(x) for x in args.page_sizes.split(",")):
-            for lazy in (bool(int(x)) for x in args.lazy.split(",")):
-                yield TraceConfig(chain=chain, page_size=ps, lazy=lazy)
+            yield TraceConfig(chain=chain, page_size=ps)
 
 
 def _scenarios(directory: str):
@@ -52,9 +52,7 @@ def _scenarios(directory: str):
     out = []
     for path in sorted(Path(directory).glob("*.json")):
         sc = json.loads(path.read_text())
-        config = TraceConfig(
-            chain=sc["chain"], page_size=sc["page_size"], lazy=sc["lazy"]
-        )
+        config = TraceConfig(chain=sc["chain"], page_size=sc["page_size"])
         out.append((sc["name"], config, sc["ops"]))
     return out
 
@@ -104,7 +102,6 @@ def cmd_record(args) -> int:
                 "config": {
                     "chain": config.chain,
                     "page_size": config.page_size,
-                    "lazy": config.lazy,
                 },
                 "records": records,
             }
@@ -122,7 +119,12 @@ def cmd_compare(args) -> int:
     runs = diverged = ops = 0
     for line in lines[1:]:
         run = json.loads(line)
-        config = TraceConfig(**run["config"])
+        if not run["config"].get("lazy", True):
+            # An eager-compaction run: a unified chain compacts lazily only.
+            continue
+        config = TraceConfig(
+            chain=run["config"]["chain"], page_size=run["config"]["page_size"]
+        )
         divergence = replay_run(
             config,
             run["records"],
@@ -171,7 +173,6 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("--chains", default=",".join(CHAINS))
         p.add_argument("--page-sizes", default="1,16")
-        p.add_argument("--lazy", default="0,1")
         p.add_argument("--seeds", default="0-15")
         p.add_argument("--steps", type=int, default=200)
         p.add_argument("--scenarios", default=str(_SCENARIOS))

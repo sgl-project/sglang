@@ -507,9 +507,16 @@ def test_condition_slots_expand_to_actual_latent_grid():
 
 
 class _RecordingAttention(torch.nn.Module):
-    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+    def forward(
+        self, x, ropes, prefixes, layouts, caches, prefix_pad, project_out=True
+    ):
         self.seen = caches
         return torch.zeros_like(x), [None] * len(caches)
+
+
+class _IdentityFeedForward(torch.nn.Module):
+    def forward(self, x, use_packed_bf16=False):
+        return x
 
 
 def _block_recording_caches(layer_id, dim=4):
@@ -520,7 +527,7 @@ def _block_recording_caches(layer_id, dim=4):
     block.img_norm1 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.img_norm2 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.attn = _RecordingAttention()
-    block.img_mlp = torch.nn.Identity()
+    block.img_mlp = _IdentityFeedForward()
     return block
 
 

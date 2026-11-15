@@ -153,6 +153,81 @@ class TestTRTLLMHAFullAttnKVSplit(CustomTestCase):
 
     SMS, KV_HEADS, SPLITS = 148, 4, 8
 
+    def test_constructor_keeps_main_kv_split_configuration(self):
+        access = SimpleNamespace(
+            kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
+        )
+
+        def parent_init(backend, *args, **kwargs):
+            backend.kv_cache_quant_method = SimpleNamespace(
+                resolve_attention_access=lambda *args: access
+            )
+            backend.runner_ids = SimpleNamespace(is_translating=False)
+
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(
+                context_len=64,
+                hidden_size=32,
+                num_attention_heads=4,
+                head_dim=8,
+                v_head_dim=8,
+            ),
+            prefill_attention_backend_str="trtllm_mha",
+            decode_attention_backend_str="trtllm_mha",
+            kv_cache_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            page_size=16,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((2, 64))),
+            device="cpu",
+            is_draft_worker=False,
+            max_running_requests=4,
+            model=torch.nn.Identity(),
+        )
+        for configured, xqa, expected in ((0, False, 0), (8, False, 8), (8, True, 0)):
+            with (
+                self.subTest(configured=configured, xqa=xqa),
+                trtllm_mha_backend.envs.SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS.override(
+                    configured
+                ),
+                patch.object(
+                    trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
+                ),
+                patch.object(
+                    trtllm_mha_backend,
+                    "get_platform",
+                    return_value=SimpleNamespace(is_sm90=xqa, is_sm120=False),
+                ),
+                patch.object(
+                    trtllm_mha_backend,
+                    "get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_eagle_topk=1, speculative_num_draft_tokens=None
+                    ),
+                ),
+                patch.object(
+                    trtllm_mha_backend,
+                    "get_buffer",
+                    side_effect=lambda *args: torch.ones(1),
+                ),
+                patch.object(
+                    trtllm_mha_backend, "resolve_window_kv_pool", return_value=None
+                ),
+                patch.object(
+                    trtllm_mha_backend,
+                    "make_persistent_multi_ctas_kv_counter_buffer",
+                    return_value=None,
+                ),
+                patch.object(
+                    TRTLLMHAAttnBackend, "_init_full_attn_kv_splits"
+                ) as initialize,
+            ):
+                backend = TRTLLMHAAttnBackend(runner)
+                self.assertEqual(backend._full_attn_kv_splits, expected)
+                if expected > 1:
+                    initialize.assert_called_once_with(v_head_dim=8)
+                else:
+                    initialize.assert_not_called()
+
     def _backend(self, *, min_bs=12, max_split_ctas=1 << 20):
         backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
         backend._full_attn_kv_splits = self.SPLITS
