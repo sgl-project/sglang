@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """fp8_fa_sm120 attention backend against cuDNN SDPA on MiniMax-H3 style inputs.
 
-Needs an SM120 GPU; skipped elsewhere. Shapes are kept small (8 heads) so the
+Needs an SM89 or SM120 GPU; skipped elsewhere. Shapes are kept small (8 heads) so the
 CuTe-DSL compile and the runs stay in seconds.
 """
 
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.platforms.cuda import FP8_FA_SM120_CAPABILITIES
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
-    reason="fp8_fa_sm120 attention needs an SM120 GPU",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in FP8_FA_SM120_CAPABILITIES,
+    reason="fp8_fa_sm120 attention needs an SM89 or SM120 GPU",
 )
 
 HEADS = 8
@@ -194,7 +197,14 @@ def test_prep_defines_every_padded_byte():
 
 def test_block_scaled_mma_is_bit_equal():
     """Unit UE8M0 scales must not move one output bit; S=1052 also covers the key mask."""
+    from sglang.kernels.ops.attention.fp8_fa_sm120.kernel import (
+        _block_scaled_mma_supported,
+    )
     from sglang.kernels.ops.attention.fp8_fa_sm120.plan import _fp8_attention
+
+    if not _block_scaled_mma_supported():
+        # Without the block-scaled encoding (SM89) both calls run the plain MMA.
+        pytest.skip("block-scaled FP8 MMA needs sm_120a/f or sm_121a/f")
 
     for sequence in (1052, 4096):
         q, k, v = _fused_qkv_views(sequence)
@@ -204,6 +214,18 @@ def test_block_scaled_mma_is_bit_equal():
         )
         assert torch.equal(output.view(torch.int16), scaled_output.view(torch.int16))
         assert torch.equal(lse.view(torch.int32), scaled_lse.view(torch.int32))
+
+
+def test_kernel_package_imports_under_meta_device():
+    """The backend must import while a DiT is constructed under torch.device("meta")."""
+    import importlib
+
+    from sglang.kernels.ops.attention.fp8_fa_sm120 import fused_prep
+
+    expected = fused_prep.INVERSE_FP8_MAX
+    with torch.device("meta"):
+        importlib.reload(fused_prep)
+    assert fused_prep.INVERSE_FP8_MAX == expected
 
 
 def test_causal_falls_back_to_cudnn():

@@ -88,7 +88,8 @@ def _head_amax_qkv(
 
 # Torch evaluates `tensor / 448.0` as `tensor * (1/448)` with the reciprocal in
 # FP32 (CPU-scalar divisor fast path). The same product keeps the scales bit-equal.
-INVERSE_FP8_MAX = (torch.ones((), dtype=torch.float32) / 448.0).item()
+# Explicit CPU: the backend is first imported while a DiT is built under torch.device("meta").
+INVERSE_FP8_MAX = (torch.ones((), dtype=torch.float32, device="cpu") / 448.0).item()
 
 
 # scales[operand, head] = amax * (1/448), or 1 for an all-zero head.
