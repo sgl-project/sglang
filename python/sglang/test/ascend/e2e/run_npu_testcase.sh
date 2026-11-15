@@ -31,23 +31,6 @@ echo "===== Install kubernetes - End ====="
 
 PYTHON_FOR_SGLANG="python"
 PIP_FOR_SGLANG="pip"
-
-# The pods run the checked-out sglang (see PYTHONPATH below) on top of the
-# image's site-packages, so an image built before a dependency was added to
-# python/pyproject_npu.toml dies at import time on that dependency. blake3
-# (#47120) is imported by srt/multimodal/cache/digest.py via
-# managers/schedule_batch.py, i.e. on every server start, so a stale image such
-# as cann9.1.0-a3-B106 fails every e2e case with
-# "ModuleNotFoundError: No module named 'blake3'" before any test runs.
-echo "===== Install checkout runtime dependencies - Begin ====="
-if ${PYTHON_FOR_SGLANG} -c "import blake3" >/dev/null 2>&1; then
-  echo "blake3 is already available in the image."
-else
-  echo "blake3 is missing from the image, install it online."
-  ${PIP_FOR_SGLANG} install blake3 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-fi
-echo "===== Install checkout runtime dependencies - End ====="
-
 if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
   echo "===== Install transformers for sglang - Begin ====="
   TRANSFORMERS_PKG_PATH_SOURCE=/root/.cache/.cache/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
@@ -126,8 +109,17 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# Run the checkout's sglang; the image only supplies the environment.
-export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+# Use the sglang installed in the image; only the checkout's test helpers are
+# overlaid onto it. The pod's site-packages come from the image, so running the
+# checkout's library code requires the image to already satisfy every
+# dependency in python/pyproject_npu.toml (blake3 from #47120 is missing from
+# cann9.1.0-a3-B106), which kills every server start before any test runs.
+echo "Use sglang from docker image"
+sglang_pkg_path=/sgl-workspace/sglang/python
+ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
+mkdir -p "${ascend_test_util_path}"
+mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak"
+cp -r "${sglang_source_path}/python/sglang/test/ascend" "${ascend_test_util_path}"
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh

@@ -347,8 +347,16 @@ jobs:
           echo "SGLANG_SET_CPU_AFFINITY: $SGLANG_SET_CPU_AFFINITY"
 
 
-          # Run the checkout's sglang; the image only supplies the environment.
-          export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+          # Use the sglang installed in the image; only the checkout's test
+          # helpers are overlaid onto it. Running the checkout's library code
+          # would require the image to already satisfy every dependency in
+          # python/pyproject_npu.toml (blake3 from #47120 is missing from the
+          # nightly images), which fails at server startup.
+          sglang_pkg_path=/sgl-workspace/sglang/python
+          ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
+          mkdir -p ${ascend_test_util_path}
+          mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
+          cp -r ${sglang_source_path}/python/sglang/test/ascend ${ascend_test_util_path}
 
           # External env scripts may reference unset shell vars (e.g. ZSH_VERSION),
           # which abort the whole script under `set -u`. Temporarily disable -u.
