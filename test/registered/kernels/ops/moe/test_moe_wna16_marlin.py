@@ -1340,6 +1340,24 @@ def test_muse_marlin_inactive_routes(
             rows * topk * max(2 * intermediate, hidden) * x.element_size()
         )
     torch.testing.assert_close(mapped, local_ids, rtol=0, atol=0)
+    if rows == 16 and use_expert_map:
+        # Compare the old local-density tile (32) with the new tile (16) on
+        # identical inputs, before comparing either path with a dense reference.
+        with patch(
+            "sglang.srt.layers.muse_spark.muse_spark_fp4_moe."
+            "_MARLIN_BLOCK_SIZE_M_CANDIDATES",
+            [32],
+        ):
+            previous_tile_output, _ = layer._marlin_expert_outputs(x, weights, ids)
+        torch.testing.assert_close(
+            expert_output[local_ids >= 0],
+            previous_tile_output[local_ids >= 0],
+            rtol=0.05,
+            atol=0.25,
+            msg=lambda msg: (
+                f"The global- and local-density tile outputs differ:\n{msg}"
+            ),
+        )
     expected_experts = torch.zeros((rows, topk, hidden), device="cuda", dtype=dtype)
     w13_ref, w2_ref = references
     for row in range(rows):
@@ -1349,7 +1367,8 @@ def test_muse_marlin_inactive_routes(
                 continue
             gate_up = x[row] @ w13_ref[expert].T
             gate, up = gate_up.chunk(2)
-            activated = torch.nn.functional.silu(gate) * up
+            # The filtered CUDA activation multiplies in FP32, then rounds once.
+            activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(dtype)
             expected_experts[row, route] = activated @ w2_ref[expert].T
     torch.testing.assert_close(
         expert_output[local_ids >= 0],
