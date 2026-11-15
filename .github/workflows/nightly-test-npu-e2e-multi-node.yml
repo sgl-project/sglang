@@ -45,11 +45,6 @@ on:
         type: string
         description: image for pods
         default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3"
-      install_sglang_from_source:
-        required: false
-        type: boolean
-        default: true
-        description: use sglang from source code or from docker image
       prefill_decode_deployment:
         required: true
         type: string
@@ -234,15 +229,7 @@ jobs:
             CMD="${CMD} --sglang-is-in-ci"
           fi
 
-          install_sglang_from_source="${{ inputs.install_sglang_from_source }}"
-          if [ "$install_sglang_from_source" = "true" ] || [ "$install_sglang_from_source" = "True" ];then
-            echo "Install sglang from source."
-            CMD="${CMD} --install-sglang-from-source"
-            commit_id=${{ github.sha }}
-            echo "commit id: ${commit_id}" > "$(dirname "${sglang_test_results_output_path}")/commit_id"
-          else
-            echo "Use sglang from image: ${{ inputs.image }}"
-          fi
+          echo "commit id: ${{ github.sha }}" > "$(dirname "${sglang_test_results_output_path}")/commit_id"
 
           if [ "$transformers_version" != "" ];then
             CMD="${CMD} --transformers-version ${transformers_version}"
