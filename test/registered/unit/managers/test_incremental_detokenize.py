@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import get_context
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 SPECIAL = 100
+BYTE_SPECIAL = 300
 
 
 class _Tokenizer:
@@ -47,13 +48,14 @@ class _Tokenizer:
 
 class _ByteTokenizer:
     is_fast = True
+    all_special_ids = [BYTE_SPECIAL]
 
     def __init__(self):
         self.longest = 0
 
     def decode(self, ids, skip_special_tokens, spaces_between_special_tokens):
         self.longest = max(self.longest, len(ids))
-        kept = [t for t in ids if not (skip_special_tokens and t >= 256)]
+        kept = [t for t in ids if not (skip_special_tokens and t == BYTE_SPECIAL)]
         return bytes(kept).decode("utf-8", errors="replace")
 
     def batch_decode(self, ids_list, **kwargs):
@@ -340,7 +342,13 @@ class TestDetokenizeState(CustomTestCase):
         detok = _detokenizer()
         detok.tokenizer = _ByteTokenizer()
         sent = {}
-        rows = [[0x61] * 2 * MAX_UNCOMMITTED_IDS + [0xE4], [0xB8], [0xAD], [0x21]]
+        rows = [
+            [0x61] * 2 * MAX_UNCOMMITTED_IDS + [0xE4],
+            [BYTE_SPECIAL] * 4,
+            [0xB8],
+            [0xAD],
+            [0x21],
+        ]
 
         texts = [
             detok.handle_batch_token_id_out(
@@ -358,10 +366,15 @@ class TestDetokenizeState(CustomTestCase):
         data += "\u4e2d!".encode()
         rng = random.Random(0)
         for _ in range(50):
+            ids = []
+            for b in data:
+                if rng.random() < 0.08:
+                    ids += [BYTE_SPECIAL] * rng.randint(1, 5)
+                ids.append(b)
             detok = _detokenizer()
             detok.tokenizer = _ByteTokenizer()
             sent, texts, i = {}, [], 0
-            while i < len(data):
+            while i < len(ids):
                 n = rng.randint(1, 40)
                 out = detok.handle_batch_token_id_out(
                     _output(
@@ -369,9 +382,9 @@ class TestDetokenizeState(CustomTestCase):
                         [
                             (
                                 "r",
-                                list(data[i : i + n]),
+                                ids[i : i + n],
                                 _header([0x20]) if i == 0 else None,
-                                i + n >= len(data),
+                                i + n >= len(ids),
                             )
                         ],
                     )
@@ -382,7 +395,10 @@ class TestDetokenizeState(CustomTestCase):
             self.assertEqual("".join(texts), data.decode("utf-8", errors="replace"))
 
     def test_a_tail_that_never_completes_keeps_the_decode_window_bounded(self):
-        for tail_id, skip, expected in [(0xE4, False, "\ufffd"), (300, True, "")]:
+        for tail_id, skip, expected in [
+            (0xE4, False, "\ufffd"),
+            (BYTE_SPECIAL, True, ""),
+        ]:
             with self.subTest(tail_id=tail_id):
                 detok = _detokenizer()
                 detok.tokenizer = _ByteTokenizer()

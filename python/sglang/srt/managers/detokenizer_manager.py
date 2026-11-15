@@ -341,7 +341,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 for read, skip, space in zip(read_ids, skip_list, space_list)
             ]
 
-        stalled_commit_texts = self._decode_stalled_commits(
+        stalled_commits = self._decode_stalled_commits(
             recv_obj, states, skip_list, space_list
         )
 
@@ -361,7 +361,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_text=surr_texts[i],
                     finished_reason=finished_reason,
                     trim_matched_stop=self.trim_matched_stop,
-                    stalled_commit_text=stalled_commit_texts[i],
+                    stalled_commit=stalled_commits[i],
                 )
             )
 
@@ -373,18 +373,27 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         states: List[Optional[DetokenizeState]],
         skip_list: List[bool],
         space_list: List[bool],
-    ) -> List[Optional[str]]:
+    ) -> List[Optional[Tuple[int, str]]]:
         """Decode the commit prefix of each streaming row whose tail has stalled."""
-        texts: List[Optional[str]] = [None] * len(states)
-        rows, ids_list = [], []
-        for i, s in enumerate(states):
-            if s is None or recv_obj.finished_reasons[i] is not None:
-                continue
-            if (ids := s.stalled_commit_ids()) is not None:
+        commits: List[Optional[Tuple[int, str]]] = [None] * len(states)
+        candidates = [
+            i
+            for i, s in enumerate(states)
+            if s is not None and s.stalled and recv_obj.finished_reasons[i] is None
+        ]
+        if not candidates:
+            return commits
+        special_ids = frozenset(getattr(self.tokenizer, "all_special_ids", ()))
+        rows, cuts, ids_list = [], [], []
+        for i in candidates:
+            s = states[i]
+            skipped = special_ids if s.header.skip_special_tokens else frozenset()
+            if (cut := s.stalled_commit_cut(skipped)) is not None:
                 rows.append(i)
-                ids_list.append(ids)
+                cuts.append(cut)
+                ids_list.append(s.decode_ids[s.surr_offset : cut])
         if not rows:
-            return texts
+            return commits
         skips = [skip_list[i] for i in rows]
         spaces = [space_list[i] for i in rows]
         if not self.disable_tokenizer_batch_decode:
@@ -396,9 +405,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
                 for ids, skip, space in zip(ids_list, skips, spaces)
             ]
-        for i, text in zip(rows, decoded):
-            texts[i] = text
-        return texts
+        for i, cut, text in zip(rows, cuts, decoded):
+            commits[i] = (cut, text)
+        return commits
 
     @staticmethod
     def _b64_encode_per_request(

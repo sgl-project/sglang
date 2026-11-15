@@ -7,7 +7,15 @@ from __future__ import annotations
 import logging
 from array import array
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    AbstractSet,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 
 import msgspec
 
@@ -212,15 +220,23 @@ class DetokenizeState(msgspec.Struct):
         surr_ids = self.decode_ids[self.surr_offset : self.read_offset]
         return read_ids, surr_ids
 
-    def stalled_commit_ids(self) -> Optional[List[int]]:
-        """The ids to decode for committing a long stalled tail, or None.
+    def stalled_commit_cut(self, skipped_ids: AbstractSet[int]) -> Optional[int]:
+        """Where to commit a long stalled tail, or None.
 
-        They stop MAX_CHAR_CONTINUATION_IDS short of the end, so a character
-        still being completed is left out of the commit."""
-        cut = len(self.decode_ids) - MAX_CHAR_CONTINUATION_IDS
-        if not self.stalled or cut - self.read_offset <= MAX_UNCOMMITTED_IDS:
+        The cut sits before the last MAX_CHAR_CONTINUATION_IDS ids that decode to
+        bytes (skipped special tokens do not count), so a character still being
+        completed is left out of the commit."""
+        if not self.stalled:
             return None
-        return self.decode_ids[self.surr_offset : cut]
+        cut, kept = len(self.decode_ids), 0
+        for i in range(len(self.decode_ids) - 1, self.read_offset - 1, -1):
+            if self.decode_ids[i] not in skipped_ids:
+                cut, kept = i, kept + 1
+                if kept == MAX_CHAR_CONTINUATION_IDS:
+                    break
+        if cut - self.read_offset <= MAX_UNCOMMITTED_IDS:
+            return None
+        return cut
 
     def step(
         self,
@@ -229,7 +245,7 @@ class DetokenizeState(msgspec.Struct):
         surr_text: str,
         finished_reason: Optional[Dict],
         trim_matched_stop: Callable,
-        stalled_commit_text: Optional[str] = None,
+        stalled_commit: Optional[Tuple[int, str]] = None,
     ) -> str:
         """Advance by one row's decoded texts; return the text to send."""
         new_text = read_text[len(surr_text) :]
@@ -248,15 +264,14 @@ class DetokenizeState(msgspec.Struct):
                 self.stalled = False
                 return new_text[pending:] if pending else new_text
             self.stalled = True
-            if stalled_commit_text is not None and read_text.startswith(
-                stalled_commit_text
-            ):
+            if stalled_commit is not None and read_text.startswith(stalled_commit[1]):
                 # The later ids do not change this prefix's text: commit it so
                 # the window stops growing while the tail stays incomplete.
-                committed = stalled_commit_text[len(surr_text) :]
+                cut, cut_text = stalled_commit
+                committed = cut_text[len(surr_text) :]
                 self.append_decoded_text(committed)
                 self.surr_offset = self.read_offset
-                self.read_offset = len(self.decode_ids) - MAX_CHAR_CONTINUATION_IDS
+                self.read_offset = cut
                 self.sent_offset = max(self.sent_offset, self.decoded_text_len)
                 return committed[pending:]
             # Incomplete UTF-8: emit the printable prefix only; do not
