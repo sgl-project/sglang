@@ -26,12 +26,9 @@ Two filters can narrow the discovered set:
   built.
 """
 
-import json
 import os
-import re
 import runpy
 import shutil
-import subprocess
 from pathlib import Path
 
 from setuptools import setup
@@ -46,174 +43,37 @@ except ModuleNotFoundError as exc:
     # install setuptools-rust.
     build_rust = None
 
-_BUILD_RUST_EXTS_ENV = "SGLANG_BUILD_RUST_EXTS"
 _PYTHON_DIR = Path(__file__).resolve().parent
-_RUST_WORKSPACE_DIR = _PYTHON_DIR.parent / "rust"
-_RUST_BUILD_HELPERS = runpy.run_path(
-    os.fspath(_PYTHON_DIR / "sglang" / "srt" / "rust_extensions" / "torch_build.py")
-)
+_RUST_EXTENSIONS_DIR = _PYTHON_DIR / "sglang" / "srt" / "rust_extensions"
+_RUST_BUILD_HELPERS = runpy.run_path(os.fspath(_RUST_EXTENSIONS_DIR / "torch_build.py"))
 _torch_build_configuration = _RUST_BUILD_HELPERS["torch_build_configuration"]
+_RUST_DISCOVERY = runpy.run_path(os.fspath(_RUST_EXTENSIONS_DIR / "discovery.py"))
+_selected_rust_extensions = _RUST_DISCOVERY["selected_rust_extensions"]
 
 
-def _cargo_metadata(manifest_path):
-    """One Cargo workspace/package manifest as Cargo's own JSON metadata."""
-    if not manifest_path.is_file():
-        raise RuntimeError(
-            f"no Cargo manifest at {manifest_path} (building outside a repo "
-            f"checkout?); set {_BUILD_RUST_EXTS_ENV}=none to build without "
-            "Rust extensions"
-        )
-    try:
-        out = subprocess.run(
-            [
-                "cargo",
-                "metadata",
-                "--format-version",
-                "1",
-                "--no-deps",
-                "--manifest-path",
-                str(manifest_path),
-            ],
-            capture_output=True,
-            check=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "cargo is required to discover the Rust extension modules in "
-            f"{_RUST_WORKSPACE_DIR} (and to build them); install a Rust "
-            f"toolchain, or set {_BUILD_RUST_EXTS_ENV}=none to build without "
-            "Rust extensions"
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"cargo metadata failed:\n{exc.stderr}") from exc
-    return json.loads(out.stdout)
-
-
-def _cargo_workspace_metadata():
-    """Root workspace metadata plus explicitly declared extension workspaces."""
-    root_manifest = _RUST_WORKSPACE_DIR / "Cargo.toml"
-    document = _cargo_metadata(root_manifest)
-    external_manifests = (
-        (document.get("metadata") or {})
-        .get("sglang", {})
-        .get("extension-manifests", [])
-    )
-    packages = list(document["packages"])
-    for relative_manifest in external_manifests:
-        external = (_RUST_WORKSPACE_DIR / relative_manifest).resolve()
-        if _RUST_WORKSPACE_DIR not in external.parents:
-            raise RuntimeError(
-                f"external Rust extension manifest escapes rust/: {relative_manifest}"
-            )
-        packages.extend(_cargo_metadata(external)["packages"])
-    document["packages"] = packages
-    return document
-
-
-def _match_by_substring(declared, tokens, source):
-    """Match tokens as case-insensitive substrings of extension names."""
-    matched = set()
-    unmatched = []
-    for token in tokens:
-        hits = {ext.name for ext in declared if token in ext.name.lower()}
-        if hits:
-            matched |= hits
-        else:
-            unmatched.append(token)
-    if unmatched:
-        declared_names = sorted(ext.name for ext in declared)
-        raise ValueError(
-            f"{source} matched no discovered Rust extension for: {unmatched}; "
-            f"discovered extensions are {declared_names}"
-        )
-    return [ext for ext in declared if ext.name in matched]
-
-
-def _discovered_rust_extensions():
-    """One RustExtension per workspace crate declaring a python-module."""
+def _declared_rust_extensions():
+    """One RustExtension per declared crate the pyproject allowlist keeps."""
     extensions = []
-    for package in sorted(
-        _cargo_workspace_metadata()["packages"], key=lambda p: p["name"]
+    for declared in _RUST_DISCOVERY["declared_rust_extensions"](
+        rust_dir=_PYTHON_DIR.parent / "rust", pyproject=_PYTHON_DIR / "pyproject.toml"
     ):
-        sglang_meta = (package["metadata"] or {}).get("sglang", {})
-        if "python-module" not in sglang_meta:
-            continue
         extension = RustExtension(
-            target=sglang_meta["python-module"],
-            path=package["manifest_path"],
+            target=declared.name,
+            path=declared.manifest_path,
             binding=Binding.PyO3,
-            debug=sglang_meta.get("debug"),
+            debug=declared.metadata.get("debug"),
             # Crates that gate their PyO3 bindings behind a non-default
             # feature (so the pure-Rust core stays pyo3-free) declare it here.
-            features=sglang_meta.get("features"),
+            features=declared.metadata.get("features"),
             cargo_manifest_args=["--locked"],
         )
         # Preserve Cargo metadata until the selected extension is actually
         # built. Alternate platform pyprojects filter the Rust TreeCore extension
         # out before this point and therefore do not need torch as a build dependency.
-        extension._sglang_metadata = sglang_meta
-        extension._sglang_manifest_path = package["manifest_path"]
+        extension._sglang_metadata = declared.metadata
+        extension._sglang_manifest_path = declared.manifest_path
         extensions.append(extension)
-    if not extensions:
-        raise RuntimeError(
-            f"no crate under {_RUST_WORKSPACE_DIR} declares "
-            "[package.metadata.sglang] python-module; set "
-            f"{_BUILD_RUST_EXTS_ENV}=none to build without Rust extensions"
-        )
     return extensions
-
-
-# Deliberately not a TOML parser (keeps setup.py stdlib-only): the allowlist
-# must be written as a single line, e.g. rust-extensions = ["multimodal"].
-_ALLOWLIST_RE = re.compile(r"^rust-extensions\s*=\s*\[([^\]]*)\]", re.MULTILINE)
-
-
-def _pyproject_rust_extensions(declared):
-    """Apply the active pyproject's [tool.sglang] rust-extensions allowlist."""
-    pyproject_text = (_PYTHON_DIR / "pyproject.toml").read_text(encoding="utf-8")
-    match = _ALLOWLIST_RE.search(pyproject_text)
-    if match is None:
-        return declared
-    tokens = re.findall(r'"([^"]*)"', match.group(1))
-    return _match_by_substring(
-        declared=declared,
-        tokens=[token.lower() for token in tokens],
-        source="[tool.sglang] rust-extensions",
-    )
-
-
-def _selected_rust_extensions(declared):
-    """Apply the SGLANG_BUILD_RUST_EXTS build-time filter."""
-    declared = list(declared)
-    raw = os.environ.get(_BUILD_RUST_EXTS_ENV)
-    if raw is None:
-        return declared
-
-    spec = raw.strip().lower()
-    # An empty or whitespace-only value is treated as unset (build everything).
-    if not spec or spec == "all":
-        return declared
-    if spec == "none":
-        return []
-
-    tokens = [token.strip() for token in spec.split(",")]
-    if not all(tokens):
-        raise ValueError(
-            f"{_BUILD_RUST_EXTS_ENV}={raw!r} has an empty item; unset it or use "
-            "'all', 'none', or a comma-separated list of extension names"
-        )
-    return _match_by_substring(
-        declared=declared, tokens=tokens, source=_BUILD_RUST_EXTS_ENV
-    )
-
-
-def _declared_rust_extensions():
-    # "none" short-circuits discovery so builds without a ../rust checkout
-    # (e.g. from an sdist) still work.
-    if (os.environ.get(_BUILD_RUST_EXTS_ENV) or "").strip().lower() == "none":
-        return []
-    return _pyproject_rust_extensions(_discovered_rust_extensions())
 
 
 class Sdist(sdist):

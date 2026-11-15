@@ -80,6 +80,7 @@ jobs:
             python/setup.py
             python/pyproject.toml
             python/sglang/srt/rust_extensions/torch_build.py
+            python/sglang/srt/rust_extensions/discovery.py
             python/sglang/srt/utils/auth_levels.json
             .github
             scripts/ci/utils
@@ -87,8 +88,9 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # The setup hook and torch helper select and configure what gets built;
-      # pyproject.toml pins the libtorch ABI used by sglang-radix-tree.
+      # The setup hook, the discovery and torch helpers, and the build script
+      # select and configure what gets built; pyproject.toml pins the libtorch ABI
+      # used by sglang-radix-tree.
       - name: Restore built modules
         id: cache
         uses: actions/cache/restore@v4
@@ -96,7 +98,7 @@ jobs:
           path: |
             python/sglang/srt/rust_extensions/_*.so
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', 'python/sglang/srt/utils/auth_levels.json', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', 'python/sglang/srt/rust_extensions/discovery.py', 'python/sglang/srt/utils/auth_levels.json', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh', 'scripts/ci/utils/build_rust_ext_modules.py') }}
 
       # On a miss: different hash = rust/setup.py moved; no entries = evicted.
       - name: Report cache lookup
@@ -198,12 +200,15 @@ jobs:
           LIBTORCH="$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"
           export LIBTORCH
           export LD_LIBRARY_PATH="${LIBTORCH}/lib:${LD_LIBRARY_PATH:-}"
-          # Thin-LTO profile from rust/Cargo.toml; setuptools-rust uses it instead of --release.
+          # Thin-LTO profile from rust/Cargo.toml, used instead of --release. The libs the
+          # build script builds together skip LTO, being rlibs too (see the script).
           export SETUPTOOLS_RUST_CARGO_PROFILE=ci
           cargo clean --profile "${SETUPTOOLS_RUST_CARGO_PROFILE}" \
               --manifest-path rust/sglang-radix-tree/Cargo.toml \
               -p torch-sys -p sglang-radix-tree 2>/dev/null || true
-          (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
+          # Builds the extensions without features in one cargo invocation, so their
+          # shared dependencies compile once; the rest go through setup.py.
+          SGLANG_BUILD_RUST_EXTS=all python scripts/ci/utils/build_rust_ext_modules.py
           python - <<'PY'
           import importlib.util
           import os
@@ -310,6 +315,7 @@ jobs:
             python/setup.py
             python/pyproject.toml
             python/sglang/srt/rust_extensions/torch_build.py
+            python/sglang/srt/rust_extensions/discovery.py
             python/sglang/srt/utils/auth_levels.json
             .github
             scripts/ci/utils

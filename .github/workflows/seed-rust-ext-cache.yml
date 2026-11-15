@@ -13,10 +13,12 @@ on:
       - 'python/setup.py'
       - 'python/pyproject.toml'
       - 'python/sglang/srt/rust_extensions/torch_build.py'
+      - 'python/sglang/srt/rust_extensions/discovery.py'
       - 'python/sglang/srt/utils/auth_levels.json'
       # The key's prefix lives in this file, so a bump there also moves the key.
       - '.github/workflows/_pr-test-rust-ext-build.yml'
       - 'scripts/ci/utils/stage_rust_ext_modules.sh'
+      - 'scripts/ci/utils/build_rust_ext_modules.py'
       # Not hashed into the key, but they carry the prefix each side uses: the one
       # seeded per arch here, and the one consumers restore with there.
       - '.github/workflows/seed-rust-ext-cache.yml'
