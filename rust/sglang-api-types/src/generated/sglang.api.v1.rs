@@ -961,6 +961,14 @@ pub struct GetServerInfoResponse {
     /// Distributed deployment metadata required by out-of-process orchestrators.
     #[prost(message, optional, tag = "12")]
     pub deployment_info: ::core::option::Option<DeploymentInfo>,
+    /// Opaque owning-runtime boot identity (UUIDv4). Minted once when the
+    /// embedded Rust serving runtime (`CoreHandle`) is constructed; stable for
+    /// that runtime across transport reconnects and out-of-process sidecar
+    /// restarts. Empty means the peer does not advertise identity. Distinct from
+    /// `PortArgs.instance_id` (shared IPC/load snapshot namespace). Not a
+    /// cluster-wide epoch, health check, or request-cleanup proof.
+    #[prost(string, tag = "16")]
+    pub instance_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeploymentInfo {
