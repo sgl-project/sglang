@@ -104,7 +104,9 @@ class KVControl:
             engine_id, namespace, limits=limits, clock=clock
         )
         self._pending: dict[str, _Pending] = {}
-        self._requests: dict[tuple[str, str], set[str]] = {}
+        # Attached actions acquire cache resources in submission order. A
+        # hash-dependent order could pick different victims on TP ranks.
+        self._requests: dict[tuple[str, str], dict[str, None]] = {}
 
     def context(
         self, caller_id: str, *, binding_id: str | None = None
@@ -222,7 +224,7 @@ class KVControl:
             not isinstance(payload, Pin) or payload.mode == "acquire"
         ):
             key = ref.context.caller_id, ref.context.binding_id
-            self._requests.setdefault(key, set()).add(ref.operation_id)
+            self._requests.setdefault(key, {})[ref.operation_id] = None
             self.registry.update(
                 ref,
                 ExecutionUpdate(
@@ -505,7 +507,7 @@ class KVControl:
             key = ref.context.caller_id, ref.context.binding_id
             ids = self._requests.get(key)
             if ids is not None:
-                ids.discard(ref.operation_id)
+                ids.pop(ref.operation_id, None)
                 if not ids:
                     del self._requests[key]
         return result

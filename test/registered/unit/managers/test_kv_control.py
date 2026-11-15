@@ -317,6 +317,25 @@ class TestKVControl(CustomTestCase):
         ).replayed
         assert boundary.starts == 1
 
+    def test_attached_actions_start_in_submission_order_after_cancellation(self):
+        boundary = CompletionBoundary()
+        core = KVControl("engine", "ns", enabled=True, executor=boundary)
+        context = core.context("router", binding_id="r")
+        payload = movement() | {"target": "request_cached"}
+        action_ids = ("last-name", "cancelled", "first-name", "middle")
+        submission = submit(
+            core,
+            *(action(payload=payload, action_id=i) for i in action_ids),
+            context=context,
+        )
+        core.cancel(submission.results[1].ref)
+        core.request_event(context, "success", committed=tokens())
+        assert tuple(w.ref.action_id for w in boundary.work.values()) == (
+            "last-name",
+            "first-name",
+            "middle",
+        )
+
     def test_executor_failure_origin_survives_drain_ack_and_replay(self):
         """A quiescent cancellation receipt must not relabel a backend exception."""
         observed = completed_outcome()
