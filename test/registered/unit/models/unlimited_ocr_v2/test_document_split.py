@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionResponseChoice,
     ChatMessage,
     DocSplitOptions,
+    StreamOptions,
     UsageInfo,
 )
 from sglang.srt.models.unlimited_ocr_v2_support import chat as serving_chat_doc_split
@@ -761,6 +762,29 @@ class TestSplitDocumentAssembly(CustomTestCase):
             return found
 
         self.assertEqual(asyncio.run(mismatches()), [])
+
+    def test_a_stream_reports_usage_with_cache_report(self):
+        override = get_context().override_server_args(enable_cache_report=True)
+        override.install()
+        self.addCleanup(override.restore)
+
+        async def final_usage():
+            request = _document_request(2, stream=True)
+            request.stream_options = StreamOptions(include_usage=True)
+            usage = None
+            async for chunk in _splitter(
+                _ScriptedWindows(["p0", "p1"])
+            )._split_document_stream(
+                request, None, [(0, 1, 0), (1, 2, 1)], doc_reuse_id=None
+            ):
+                payload = chunk[len("data: ") :].strip()
+                if payload != "[DONE]":
+                    usage = json.loads(payload).get("usage") or usage
+            return usage
+
+        usage = asyncio.run(final_usage())
+        self.assertEqual(usage["prompt_tokens"], 20)
+        self.assertEqual(usage["prompt_tokens_details"]["cached_tokens"], 0)
 
     def test_context_rejection_returns_partial_text_and_usage(self):
         """A rejected window must not break accounting for windows that succeeded"""

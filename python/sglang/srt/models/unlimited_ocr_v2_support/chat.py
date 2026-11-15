@@ -679,7 +679,7 @@ def _stream_epilogue(*, request, plan, totals, sse, include_usage):
             prompt_tokens=totals.prompt,
             completion_tokens=totals.completion,
             cached_tokens=(
-                UsageProcessor._details_if_cached(totals.cached)
+                PromptTokensDetails(cached_tokens=totals.cached)
                 if get_serving().enable_cache_report
                 else None
             ),
