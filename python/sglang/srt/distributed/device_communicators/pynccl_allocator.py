@@ -352,13 +352,11 @@ class SymmetricMemoryContext:
 
         # Get comm ptr for tracking registrations
         # Use the comm pointer value as unique identifier
-        self._comm_ptr = self.group_coordinator.pynccl_comm.comm.value
+        self._comm_ptr = group_coordinator.require_pynccl_comm(
+            "Symmetric memory"
+        ).comm.value
 
     def __enter__(self):
-        assert self.group_coordinator.pynccl_comm is not None, (
-            f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
-        )
-
         if self.is_graph_capture:
             assert _graph_pool_id is not None, (
                 "graph_pool_id is not set under graph capture"

@@ -29,6 +29,7 @@ register_amd_ci(
     est_time=7200,
     suite="nightly-amd-8-gpu-mi35x-kimi-k25-mxfp4-aiter-mla",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 

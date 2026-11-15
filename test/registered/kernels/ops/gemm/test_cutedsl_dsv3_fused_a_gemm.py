@@ -5,11 +5,8 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.jit.utils import (
-    get_ci_test_range,
-    get_jit_cuda_arch,
-    is_hip_runtime,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -21,8 +18,8 @@ from sglang.kernels.ops.gemm.cutedsl_dsv3_fused_a_gemm import (  # noqa: E402
     dsv3_fused_a_gemm,
 )
 
-# hd_in must be a multiple of 256; 6144/7168 cover the real fused-A shapes.
-HD_INS = [6144, 7168]
+# hd_in must be a multiple of 256; 2560/3584 are not 1024-aligned.
+HD_INS = [2560, 3584, 6144, 7168]
 # hd_out must be a multiple of 16; 2112 and 2624 cover real fused-A variants.
 HD_OUTS = [2112, 2624]
 NUM_TOKENS = get_ci_test_range(list(range(1, 17)), [1, 8, 16])
@@ -33,7 +30,7 @@ NUM_TOKENS = get_ci_test_range(list(range(1, 17)), [1, 8, 16])
 @pytest.mark.parametrize("hd_in", HD_INS)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 def test_dsv3_fused_a_gemm(num_tokens, hd_in, hd_out):
-    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+    if not current_arch().is_sm_at_least(9):
         pytest.skip("SM90+ required")
 
     torch.manual_seed(num_tokens)

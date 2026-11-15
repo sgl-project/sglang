@@ -9,7 +9,7 @@ import triton
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
 
 from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import per_tensor_quant_fp8
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
 # Optional vLLM import
 try:
@@ -22,7 +22,7 @@ except ImportError:
     vllm_scaled_fp8_quant = None
     VLLM_AVAILABLE = False
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 # Weight Shapes are in the format
 # ([K, N], TP_SPLIT_DIM)
