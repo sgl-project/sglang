@@ -66,9 +66,7 @@ class TestPrefillMmRelease(CustomTestCase):
         mm_inputs.release_features.assert_called_once_with()
         self.assertIsNone(done.multimodal_inputs)
         self.assertIsNotNone(transferring.multimodal_inputs)
-        scheduler.request_retirer.release.assert_called_once_with(
-            done, checkpoint=True
-        )
+        scheduler.request_retirer.release.assert_called_once_with(done, checkpoint=True)
 
     def test_bootstrap_failure_releases_features_after_streaming(self):
         req = _req("bootstrap-failed")
