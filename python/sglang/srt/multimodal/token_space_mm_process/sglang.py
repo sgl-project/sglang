@@ -1,20 +1,12 @@
-import contextlib
 import functools
-import hashlib
 import os
 from typing import Optional
 
 import torch
 from transformers import BaseImageProcessor, BatchFeature
 
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
-from sglang.srt.multimodal.cache import (
-    CONTENT_HASH_PREFIX,
-    resolve_multimodal_item_hash,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.cache import build_processor_fingerprint
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
@@ -123,6 +115,8 @@ class TokenSpaceSGLangProcessor:
             or self._serving_spec.auto_mm_io_worker_num,
             allowed_media_domains=mm.allowed_media_domains,
             media_url_max_file_size_mb=mm.media_url_max_file_size_mb,
+            media_url_timeout=mm.media_url_timeout,
+            allow_local_media_files=mm.allow_local_media_files,
             keep_mm_features_on_device=self._feature_transport.keep_mm_features_on_device,
         )
         self._core = TokenSpaceProcessor.for_strategy(strategy_class)(
@@ -137,6 +131,7 @@ class TokenSpaceSGLangProcessor:
         # Request validation reads the prompt's media markers through it.
         self.mm_tokens = self._serving_spec.build_mm_tokens(_processor)
         self._image_device = self._serving_image_processor_device()
+        self._processor_fingerprint = None
 
     @property
     def cudaipc_mmfeature_pool(self):
@@ -200,8 +195,9 @@ class TokenSpaceSGLangProcessor:
 
         Runs on a processor worker thread, concurrently with other requests. Read
         only state fixed at construction, never `self._core._processor`: that is the
-        shared original, and each worker holds its own clone. The CUDA IPC pool is
-        the only shared mutable state, and it locks its own allocations.
+        shared original, and each worker holds its own clone. The shared mutable
+        state is the CUDA IPC pool, which locks its own allocations, and the processor
+        fingerprint, which every thread builds to the same value.
         """
         input_ids = output["input_ids"].flatten()
         # Offsets are where locate_media put each media, inclusive, in list order.
@@ -215,12 +211,13 @@ class TokenSpaceSGLangProcessor:
             item.offsets = offsets[item.modality]
         mm_items = self._serving_spec.split_mm_items(mm_items)
         # Hash the feature tensors themselves: transport may swap them for CUDA IPC handles.
-        self._set_item_hashes(mm_items)
+        self._bind_cache_namespaces(mm_items)
+        for item in mm_items:
+            item.set_pad_value()
         mm_items = self._feature_transport.prepare_mm_items_for_transport(mm_items)
         input_ids_list = input_ids.tolist()
         params = self._core.strategy.mm_token_expansion_params
-        # No padded_input_ids: caller mm_hashes may still replace the item hashes,
-        # so the scheduler pads with the final pad values.
+        # No padded_input_ids: the scheduler pads with the final pad values.
         return MultimodalProcessorOutput(
             input_ids=input_ids_list,
             mm_items=mm_items,
@@ -231,32 +228,24 @@ class TokenSpaceSGLangProcessor:
             **{field: output[field] for field in _OUTPUT_FIELDS if field in output},
         )
 
-    def _set_item_hashes(self, mm_items: list[MultimodalDataItem]) -> None:
-        """Hash each item's feature scoped by its other strategy fields, e.g. grids.
-
-        Features carry no layout: a solid 448x896 and 896x448 image give equal
-        patches and differ only in image_grid_thw, so a feature-only hash would let
-        one reuse the other's embedding and KV cache.
-        """
-        strategy = self._core.strategy
-        layout_fields = sorted(
-            set(strategy.mm_item_fields) - strategy.mm_feature_fields
-        )
-        for item in mm_items:
-            feature = item.feature
-            # tensor_hash copies a CUDA feature to the current device, cuda:0 on this thread.
-            on_feature_device = (
-                torch.cuda.device(feature.device)
-                if isinstance(feature, torch.Tensor) and feature.is_cuda
-                else contextlib.nullcontext()
+    def _bind_cache_namespaces(self, mm_items: list[MultimodalDataItem]) -> bool:
+        if self._processor_fingerprint is None:
+            self._processor_fingerprint = build_processor_fingerprint(
+                self, self._core.hf_config
             )
-            with on_feature_device:
-                item.set_hash(
-                    resolve_multimodal_item_hash(
-                        feature=feature,
-                        namespace=_layout_digest(item, layout_fields),
-                    )
-                )
+        changed = False
+        for item in mm_items:
+            changed |= item.bind_processor_fingerprint(self._processor_fingerprint)
+        return changed
+
+    def finalize_cache_identities(self, output: MultimodalProcessorOutput) -> None:
+        if (
+            self._bind_cache_namespaces(output.mm_items)
+            and output.padded_input_ids is not None
+        ):
+            output.padded_input_ids = output.build_padded_input_ids(
+                output.input_ids, output.mm_items
+            )
 
     # Adapted from sglang.srt.multimodal.processors.base_processor.BaseMultimodalProcessor.collect_mm_items_from_processor_output.
     def _collect_mm_items(self, output: BatchFeature) -> list[MultimodalDataItem]:
@@ -309,21 +298,3 @@ class TokenSpaceSGLangProcessor:
     def shutdown(self) -> None:
         self.hash_executor.shutdown()
         self._core.shutdown()
-
-
-def _layout_digest(item: MultimodalDataItem, field_names: list[str]) -> str:
-    """SHA-256 identity of the named fields an item holds, in the given order."""
-    hasher = hashlib.sha256()
-    for name in field_names:
-        if name not in item.model_specific_data:
-            continue
-        value = torch.as_tensor(item.model_specific_data[name]).detach().cpu()
-        for part in (
-            name.encode(),
-            str(value.dtype).encode(),
-            str(tuple(value.shape)).encode(),
-            value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes(),
-        ):
-            hasher.update(len(part).to_bytes(8, "big"))
-            hasher.update(part)
-    return CONTENT_HASH_PREFIX + hasher.hexdigest()
