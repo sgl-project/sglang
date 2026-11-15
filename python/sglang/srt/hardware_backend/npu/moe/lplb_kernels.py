@@ -8,6 +8,7 @@ _COUNT_BLOCK_SIZE = 1024
 _DISPATCH_BLOCK_SIZE = 32
 _SMALL_DISPATCH_BLOCK_SIZE = 16
 _SMALL_DISPATCH_MAX_ROUTES = 8192
+_LP_PREPARE_BLOCK_ROWS = 32
 
 
 @triton.jit
@@ -76,7 +77,10 @@ def _prepare_lp(
     count = tl.load(Counts + e, e < E, 0).to(tl.float32)
     count /= tl.maximum(tl.sum(count, 0), 1.0)
     single_rank = tl.load(SingleRank + e, e < E, -1)
+    # Bound the two row-by-expert reductions and matrix tile to fit local UB.
     r = tl.arange(0, BC)
+    if NC > BC:
+        r += tl.program_id(0) * BC
     v = tl.arange(0, BV)
     replicated = tl.load(Replicated + r, r < H, -1)
     demand = tl.sum(tl.where(replicated[:, None] == e[None, :], count[None, :], 0.0), 1)
@@ -235,8 +239,9 @@ def _solve_ipm_schur(
 
 def solve_ipm(base, replicated, single_rank, counts, a, b, x, diagnostics, iterations):
     nc, nv = a.shape
-    bc, bv = max(16, triton.next_power_of_2(nc)), max(16, triton.next_power_of_2(nv))
-    _prepare_lp[(1,)](
+    bc = min(_LP_PREPARE_BLOCK_ROWS, max(16, triton.next_power_of_2(nc)))
+    bv = max(16, triton.next_power_of_2(nv))
+    _prepare_lp[(triton.cdiv(nc, bc),)](
         counts,
         base,
         replicated,
