@@ -14,6 +14,10 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    SGL_ROUTER_REQUEST_TIMEOUT_SECS,
+    find_sgl_router_binary,
+)
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 
 logging.basicConfig(
@@ -390,6 +394,13 @@ def _get_nnodes_from_args(args_list):
     return None
 
 
+def _get_served_model_name(model_config):
+    args = model_config["prefill_args"]
+    if "--served-model-name" in args:
+        return str(args[args.index("--served-model-name") + 1])
+    return model_config["model_path"]
+
+
 def _get_pod_ip_by_keyword(configmap_data, keyword):
     for pod_name, pod_ip in configmap_data.items():
         if keyword in pod_name:
@@ -688,14 +699,13 @@ def launch_pd_separation_node(model_config):
 
 
 # Launch router node
-def launch_router(model_config):
+def launch_router(model_config, router_binary):
     logger.info(f"launch_router start ......")
     discover_worker_nodes()
 
     # Monitor to generate prefill/decode URL
     prefill_url = []
     decode_url = []
-    bootstrap_ports = []
     node_ip_list = []
     is_multi_node_prefill_instance = "--node-rank" not in model_config["prefill_args"]
     is_multi_node_decode_instance = "--node-rank" not in model_config["decode_args"]
@@ -712,7 +722,6 @@ def launch_router(model_config):
     )
 
     is_ready = False
-    bootstrap_init_port = BOOTSTRAP_INIT_PORT
     start_time = time.time()
     while not is_ready and time.time() - start_time < ROUTER_CONFIGMAP_TIMEOUT:
         configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
@@ -724,7 +733,6 @@ def launch_router(model_config):
 
         prefill_url.clear()
         decode_url.clear()
-        bootstrap_ports.clear()
         node_ip_list.clear()
 
         for pod_name, pod_ip in configmap.data.items():
@@ -742,22 +750,16 @@ def launch_router(model_config):
                     if prefill_nnodes is not None and prefill_nnodes > 1:
                         if pod_index % prefill_nnodes == 0:
                             prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            bootstrap_ports.append(
-                                str(bootstrap_init_port + pod_index // prefill_nnodes)
-                            )
                             node_ip_list.append(pod_ip)
                     elif prefill_nnodes is not None and prefill_nnodes == 1:
                         prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                        bootstrap_ports.append(str(bootstrap_init_port + pod_index))
                         node_ip_list.append(pod_ip)
                     else:
                         if pod_index == 0:
                             prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            bootstrap_ports.append(str(bootstrap_init_port))
                             node_ip_list.append(pod_ip)
                 else:
                     prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                    bootstrap_ports.append(str(bootstrap_init_port + pod_index))
                     node_ip_list.append(pod_ip)
 
             if "decode" in pod_name:
@@ -789,7 +791,7 @@ def launch_router(model_config):
         )
     logger.info(
         f"ConfigMap monitoring complete: prefill_url={prefill_url}, decode_url={decode_url}, "
-        f"bootstrap_ports={bootstrap_ports}, node_ip_list={node_ip_list}"
+        f"node_ip_list={node_ip_list}"
     )
 
     # Check all node port ready
@@ -801,30 +803,30 @@ def launch_router(model_config):
     # Set environment variables
     set_environment_variables(model_config.get("router_envs"))
 
-    router_args = model_config["router_args"]
-    # Router server params
+    router_args = [str(x) for x in model_config["router_args"]]
+    if "--request-timeout-secs" not in router_args:
+        router_args += ["--request-timeout-secs", str(SGL_ROUTER_REQUEST_TIMEOUT_SECS)]
+    request_timeout_secs = router_args[router_args.index("--request-timeout-secs") + 1]
+    # The router reads each worker's PD role and bootstrap port from its
+    # /server_info, so prefill and decode URLs go in one list.
     router_command = [
-        "python3",
-        "-u",
-        "-m",
-        "sglang_router.launch_router",
+        router_binary,
+        "--model-id",
+        _get_served_model_name(model_config),
+        "--worker-urls",
+        *[f"http://{url}" for url in prefill_url + decode_url],
         "--host",
         "0.0.0.0",
         "--port",
         str(SERVICE_PORT),
-        "--pd-disaggregation",
-        "--policy",
-        "cache_aware",
-        *[str(x) for x in router_args],
+        # Workers tokenize and render chat themselves.
+        "--no-tokenizer",
+        # The stale-request reaper (600s by default) would cut a request the
+        # request timeout still allows.
+        "--stale-request-timeout-secs",
+        request_timeout_secs,
+        *router_args,
     ]
-
-    for index, url in enumerate(prefill_url):
-        router_command.extend(
-            ["--prefill", f"http://{url}", f"{bootstrap_ports[index]}"]
-        )
-
-    for url in decode_url:
-        router_command.extend(["--decode", f"http://{url}"])
 
     logger.info(f"Starting router with command: {' '.join(router_command)}")
     try:
@@ -1009,12 +1011,15 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
     def start_router_server(cls):
         logger.info(f"Starting router in thread...")
         cls.sglang_thread = threading.Thread(
-            target=launch_router, args=(cls.model_config,)
+            target=launch_router,
+            args=(cls.model_config, find_sgl_router_binary()),
         )
         cls.sglang_thread.daemon = True
         cls.sglang_thread.start()
 
-        health_check_url = f"{cls.base_url}/health"
+        # /health answers once the router listens; /readiness waits for the
+        # prefill and decode workers to be registered.
+        health_check_url = f"{cls.base_url}/readiness"
         logger.info(f"Waiting for router to be ready at {health_check_url}")
         wait_server_ready(health_check_url)
 

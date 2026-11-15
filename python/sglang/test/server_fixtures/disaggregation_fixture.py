@@ -288,6 +288,18 @@ class PDDisaggregationServerBase(CustomTestCase):
         time.sleep(5)
 
 
+def find_sgl_router_binary() -> str:
+    name = envs.SGLANG_TEST_PD_ROUTER_BINARY.get()
+    binary = shutil.which(name)
+    if binary is None:
+        raise FileNotFoundError(
+            f"sgl-router binary {name!r} not found: build it with "
+            "`cargo build --release --bin sgl-router` in sgl-router/, then put it "
+            "on PATH or set SGLANG_TEST_PD_ROUTER_BINARY to its path."
+        )
+    return binary
+
+
 def popen_launch_sgl_router(
     model: str,
     worker_urls: list[str],
@@ -301,16 +313,8 @@ def popen_launch_sgl_router(
     The router reads each worker's PD role from its `/server_info`, so prefill
     and decode URLs go in one list.
     """
-    name = envs.SGLANG_TEST_PD_ROUTER_BINARY.get()
-    binary = shutil.which(name)
-    if binary is None:
-        raise FileNotFoundError(
-            f"sgl-router binary {name!r} not found: build it with "
-            "`cargo build --release --bin sgl-router` in sgl-router/, then put it "
-            "on PATH or set SGLANG_TEST_PD_ROUTER_BINARY to its path."
-        )
     command = [
-        binary,
+        find_sgl_router_binary(),
         "--model-id",
         model,
         "--worker-urls",

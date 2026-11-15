@@ -35,6 +35,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     wait_for_prefill_decode_exit,
     wait_server_ready,
 )
+from sglang.test.server_fixtures.disaggregation_fixture import find_sgl_router_binary
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -1598,11 +1599,16 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     def start_router_server(cls):
         wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
         logger.info(f"Starting router in thread...")
-        sglang_thread = threading.Thread(target=launch_router, args=(cls.model_config,))
+        sglang_thread = threading.Thread(
+            target=launch_router,
+            args=(cls.model_config, find_sgl_router_binary()),
+        )
         sglang_thread.daemon = True
         sglang_thread.start()
 
-        health_check_url = f"{cls.base_url}/health"
+        # /health answers once the router listens; /readiness waits for the
+        # prefill and decode workers to be registered.
+        health_check_url = f"{cls.base_url}/readiness"
         logger.info(f"Waiting for router to be ready at {health_check_url}")
         wait_server_ready(health_check_url)
 
