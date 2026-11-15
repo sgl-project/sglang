@@ -113,12 +113,7 @@ For more usage examples (e.g. OpenAI compatible API, server mode), check the [CL
 
 ## SGLang-Diffusion Adoption & Integrations
 
-<p align="center">
-  <img src="../../../assets/sglang-diffusion-adoption.png" alt="Organizations adopting SGLang-Diffusion" width="680" align="middle">
-  <a href="https://blog.fal.ai/h3-max-built-with-fal-inference-and-training/">
-    <img src="../../../assets/fal.png" alt="fal (Falcon)" width="80" align="middle">
-  </a>
-</p>
+<img src="../../../assets/sglang-diffusion/adoption.png" alt="SGLang-Diffusion adopters and integrations: Modal, Black Forest Labs, Krea, Baseten, Ant Group, Skywork, Google, TikTok, Tencent Hunyuan, Infinigence, fal, MOSS-Image, and Sol-Engine" width="800">
 
 [fal](https://blog.fal.ai/h3-max-built-with-fal-inference-and-training/) ported SGLang-Diffusion's H3 implementation to its Falcon inference engine.
 
