@@ -30,33 +30,6 @@ SGL_DEVICE float ex2_approx(float x) {
   return y;
 }
 
-SGL_DEVICE uint32_t cluster_ctarank() {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  uint32_t rank;
-  asm("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
-  return rank;
-#else
-  return 0;
-#endif
-}
-
-SGL_DEVICE uint32_t cluster_nctarank() {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  uint32_t num;
-  asm("mov.u32 %0, %%cluster_nctarank;" : "=r"(num));
-  return num;
-#else
-  return 1;
-#endif
-}
-
-/// \brief Address of the same shared variable in CTA `rank` of this cluster.
-SGL_DEVICE uint32_t mapa_shared(uint32_t addr, uint32_t rank) {
-  uint32_t result;
-  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(result) : "r"(addr), "r"(rank));
-  return result;
-}
-
 /// \brief Makes this thread's `mbarrier.init` visible to the cluster without a `MEMBAR.GPU`.
 SGL_DEVICE void fence_mbarrier_init_cluster() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
