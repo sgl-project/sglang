@@ -12,6 +12,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     TypeVar,
     Union,
@@ -1062,6 +1063,14 @@ def _tail_rows(
         # Same rows as t[token_indices]; t may carry MLP-sync padding past the extend.
         return t[contiguous_start : contiguous_start + token_indices.shape[0]]
     return t[token_indices]
+
+
+def _restore_non_padded(forward_batch: ForwardBatch, saved: Sequence) -> None:
+    (
+        forward_batch.global_num_token_non_padded_cpu,
+        forward_batch.global_num_token_non_padded,
+        forward_batch.num_token_non_padded,
+    ) = saved
 
 
 def _late_layer_whole_extend(
@@ -2242,7 +2251,25 @@ class DeepseekV4AttnBackend(
             get_local_dp_buffer_len(),
         )
         tail = tail_metadata.late_layer_tail
-        saved = saved + (
+        saved = saved + self._bound_non_padded_to_tail(forward_batch, tail)
+        tail_core = tail_metadata.core_attn_metadata
+        self.forward_metadata = tail_metadata
+        if self.token_to_kv_pool.request_window is not None:
+            self.token_to_kv_pool.request_window.activate(
+                tail_core.request_window_layout
+            )
+        if tail.cp_metadata is not None:
+            forward_batch.attn_cp_metadata = tail.cp_metadata
+            set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
+        return saved
+
+    def _bound_non_padded_to_tail(
+        self, forward_batch: ForwardBatch, tail: LateLayerTail
+    ) -> tuple:
+        """Bound the non-padded row counts to the real rows of a prefill-graph tail
+        block. The eager breaks then skip its padding rows. Pass the return value
+        to _restore_non_padded."""
+        saved = (
             forward_batch.global_num_token_non_padded_cpu,
             forward_batch.global_num_token_non_padded,
             forward_batch.num_token_non_padded,
@@ -2260,15 +2287,6 @@ class DeepseekV4AttnBackend(
                 )
                 forward_batch.global_num_token_non_padded = bound
                 forward_batch.num_token_non_padded = bound
-        tail_core = tail_metadata.core_attn_metadata
-        self.forward_metadata = tail_metadata
-        if self.token_to_kv_pool.request_window is not None:
-            self.token_to_kv_pool.request_window.activate(
-                tail_core.request_window_layout
-            )
-        if tail.cp_metadata is not None:
-            forward_batch.attn_cp_metadata = tail.cp_metadata
-            set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
@@ -2276,14 +2294,10 @@ class DeepseekV4AttnBackend(
             self.forward_metadata,
             forward_batch.attn_cp_metadata,
             local_dp_buffer_len,
-            non_padded,
-            non_padded_gpu,
-            local_non_padded,
+            *non_padded,
         ) = saved
         set_local_dp_buffer_len(local_dp_buffer_len)
-        forward_batch.global_num_token_non_padded_cpu = non_padded
-        forward_batch.global_num_token_non_padded = non_padded_gpu
-        forward_batch.num_token_non_padded = local_non_padded
+        _restore_non_padded(forward_batch, non_padded)
         self.tail_source_kv_layer_id = None
 
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
