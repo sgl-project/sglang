@@ -3,7 +3,6 @@
 use crate::message::request::{RenderedChat, RequestKind, TokenizeInput};
 use crate::message::response::ResponseItem;
 use crate::message::types::TokenIds;
-use crate::utils::error::Error;
 
 use super::handle::{CoreHandle, translate_runtime_error};
 use crate::api_server::core::CoreError;
@@ -23,9 +22,6 @@ impl CoreHandle {
             .await?;
         let bytes = match call.recv().await {
             Some(ResponseItem::Data(bytes)) => bytes,
-            Some(ResponseItem::Error(Error::Validation(message))) => {
-                return Err(CoreError::InvalidArgument(message));
-            }
             Some(ResponseItem::Error(error)) => return Err(translate_runtime_error(error)),
             Some(_) => {
                 return Err(CoreError::InvalidResponse(
@@ -63,9 +59,6 @@ impl CoreHandle {
         let mut call = self.submit(RequestKind::Tokenize(input)).await?;
         match call.recv().await {
             Some(ResponseItem::TokenIds(ids)) => Ok(ids),
-            Some(ResponseItem::Error(Error::Validation(message))) => {
-                Err(CoreError::InvalidArgument(message))
-            }
             Some(ResponseItem::Error(error)) => Err(translate_runtime_error(error)),
             Some(_) => Err(CoreError::InvalidResponse(
                 "unexpected output for tokenize request".into(),
