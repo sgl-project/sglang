@@ -309,7 +309,8 @@ class SchedulePolicy:
             or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
-            or get_memory().radix_eviction_policy.lower() not in ("lru", "joint_lru")
+            or get_memory().radix_eviction_policy.lower()
+            not in ("lru", "joint_lru", "state_cost")
             or self.tree_cache.supports_fast_match_prefix()
             or not self.tree_cache.supports_prefix_sharing()
         ):
@@ -986,11 +987,7 @@ class PrefillAdder:
 
     @capacity_decision
     def budget_state(self):
-        no_token = (
-            self.chunked_req_waits
-            or not self.memory_budget.has_capacity()
-            or self.memory_budget.state_slots_exhausted()
-        )
+        no_token = self.chunked_req_waits or not self.memory_budget.admits_more()
         if no_token:
             return AddReqResult.NO_TOKEN
 
