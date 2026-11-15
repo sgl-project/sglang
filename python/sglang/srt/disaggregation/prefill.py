@@ -1532,7 +1532,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.release_prefill_sender(req, abort_sender=False)
         self.request_retirer.release(req, checkpoint=False)
         self.output_streamer.stream_output([req], req.return_logprob)
-        self._release_mm_inputs(req)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
 
