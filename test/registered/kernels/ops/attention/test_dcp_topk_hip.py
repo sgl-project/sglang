@@ -47,9 +47,7 @@ def _row_lengths(world: int) -> list[int]:
         world * _REGISTER_SCORES + 1,
         world * 17500,
         world * 40000,  # several chunks on the chunked path
-        world * 8 * _REGISTER_SCORES,  # chunked: every chunk full
-        world * 8 * _REGISTER_SCORES
-        + world * 3,  # chunked: the last chunk re-reads its excess
+        world * 9 * _REGISTER_SCORES,  # past 8 chunks: the last re-reads the rest
     ]
 
 
