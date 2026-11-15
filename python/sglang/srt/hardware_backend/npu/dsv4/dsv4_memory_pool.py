@@ -21,7 +21,10 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
-from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog
+from sgl_kernel_npu.operators.mem_cache import (
+    get_npu_kv_quant_path,
+    kv_compress_epilog,
+)
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import NPUDSV4KVLayout
@@ -75,13 +78,24 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
             self.kv_buffer, page_slots=self.kernel_page_size, layout="pa_nd"
         )
 
+    @property
+    def arch35_packed_kv_dim(self) -> int:
+        # V4 on arch35 (upstream ABI): the row width is the runtime quant
+        # path's own packed_dim (the 608B encoding), not a layout-enum formula.
+        return get_npu_kv_quant_path().packed_dim(
+            self.qk_nope_head_dim, self.qk_rope_head_dim
+        )
+
     def create_buffer(self, *, num_pages: int):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
         if self.store_dtype != torch.bfloat16:
             return super().create_buffer(num_pages=num_pages)
-        kv_dim, kv_dtype = self.layout.kv_info(
-            self.qk_nope_head_dim, self.qk_rope_head_dim
-        )
+        if self.layout is NPUDSV4KVLayout.V4_FP8:
+            kv_dim, kv_dtype = self.arch35_packed_kv_dim, torch.float8_e4m3fn
+        else:
+            kv_dim, kv_dtype = self.layout.kv_info(
+                self.qk_nope_head_dim, self.qk_rope_head_dim
+            )
         self.kv_cache_total_dim = kv_dim
         # The HiCache assembler uses bytes_per_page_padded as host item_bytes.
         # For example: kernel_page_size * kv_dim * sizeof(bf16).
@@ -868,10 +882,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             buf,
             cache_2d,
             slot_mapping,
-            quant_group_size=NPUDSV4KVLayout.V4_FP8.quant_group,
-            quant_mode=NPUDSV4KVLayout.V4_FP8.quant_mode,
-            round_scale_flag=True,
-            layout=1,
         )
 
     def _write_dsv41_packed_kv(
