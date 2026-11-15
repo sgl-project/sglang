@@ -251,6 +251,20 @@ struct TCGen05Common {
   };
   static_assert(sizeof(InstrDesc) == 4);
 
+  /// bf16 x bf16 (kind::f16, formats 1 = BF16), f32 accumulate, both K-major.
+  template <uint32_t M, uint32_t N>
+  SGL_DEVICE static InstrDesc make_instr_desc_bf16() {
+    static_assert(M == 64 || M == 128 || M == 256);
+    static_assert(N >= 8 && N <= 256 && N % (M == 64 ? 8 : 16) == 0);
+    InstrDesc desc{};
+    desc.c_format = 1;
+    desc.a_format = 1;
+    desc.b_format = 1;
+    desc.n_dim = N >> 3;
+    desc.m_dim = M >> 4;
+    return desc;
+  }
+
   /// e4m3 x e4m3, f32 accumulate, both K-major, no scales.
   template <uint32_t M, uint32_t N>
   SGL_DEVICE static InstrDesc make_instr_desc_f8() {
@@ -381,6 +395,22 @@ struct TCGen05 : TCGen05Common {
     asm volatile(
         "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
         "tcgen05.mma.cta_group::%5.kind::f8f6f4 [%0], %1, %2, %3, p;\n\t}" ::"r"(taddr_d),
+        "l"(adesc),
+        "l"(bdesc),
+        "r"(idesc),
+        "r"(accumulate),
+        "n"(kCtaGroup)
+        : "memory");
+  }
+
+  // ---- 16-bit MMA (kind::f16: f16 / bf16 inputs) ----------------------------
+
+  /// D [+]= A x B with A and B from smem; `idesc` from make_instr_desc_bf16.
+  SGL_DEVICE static void
+  mma_f16_ss(uint32_t taddr_d, uint64_t adesc, uint64_t bdesc, uint32_t idesc, uint32_t accumulate) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::%5.kind::f16 [%0], %1, %2, %3, p;\n\t}" ::"r"(taddr_d),
         "l"(adesc),
         "l"(bdesc),
         "r"(idesc),
