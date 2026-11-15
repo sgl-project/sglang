@@ -93,9 +93,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 "--speculative-eagle-topk 1."
             )
         # lightning attn does not need conv cache, but to keep the interface for mamba cache
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -151,6 +149,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
         self.forward_metadata = BailingLinearMetadata.prepare_decode(
             metadata.query_start_loc,
@@ -407,7 +406,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             q = q.to(self.kv_cache_dtype)
 
         cache_indices = self.forward_metadata.mamba_cache_indices
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        mamba_cache_params = self.state_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":
             o = self._prefill_and_mix_infer(
@@ -499,7 +498,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
         # Do linear attention
         cache_indices = self.forward_metadata.mamba_cache_indices
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        mamba_cache_params = self.state_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":
             o = self._decode_infer(q, k, v, ssm_states, cache_indices, metadata, layer)

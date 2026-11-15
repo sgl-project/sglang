@@ -79,11 +79,17 @@ fn bad_request(message: impl Into<String>) -> Response {
     error_body(StatusCode::BAD_REQUEST, "BadRequestError", message)
 }
 
-/// A failed core operation: a rejected input is the client's 400; anything
-/// else is the 500 Python's catch-all returns.
+/// A failed core operation: a rejected input is the client's 400, and a full
+/// queue the 503 every other overloaded route answers (typed by its status,
+/// as Python types an `HTTPException`); anything else is the 500 Python's
+/// catch-all returns.
 fn core_error(error: CoreError, operation: &str) -> Response {
     match error {
         CoreError::InvalidArgument(message) => bad_request(message),
+        error @ CoreError::Overloaded(_) => {
+            let status = error.http_status();
+            error_body(status, status.as_str(), error.to_string())
+        }
         other => error_body(
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalServerError",
@@ -244,7 +250,7 @@ mod tests {
 
     use super::super::test_utils::{body_json, post_json};
     use super::*;
-    use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::ServerArgs;
     use crate::message::request::{RequestKind, TokenizeInput};
     use crate::message::response::ResponseItem;
@@ -259,6 +265,10 @@ mod tests {
             while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
                 assert!(admission.try_accept());
                 let item = match &request.kind {
+                    // What intake answers when the tokenizer pool is full.
+                    RequestKind::Tokenize(TokenizeInput::Text { text, .. }) if text == "full" => {
+                        ResponseItem::Error(crate::utils::error::Error::QueueFull)
+                    }
                     RequestKind::Tokenize(TokenizeInput::Text {
                         text,
                         add_special_tokens,
@@ -296,8 +306,13 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(server_args.as_ref()),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(
@@ -396,5 +411,26 @@ mod tests {
         let (status, error) = call("/v1/tokenize", json!({"messages": []})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error["type"], "BadRequestError");
+    }
+
+    /// A full tokenizer pool is overload, not an internal error: the 503 the
+    /// generate routes answer, in this endpoint's flat error body.
+    #[tokio::test]
+    async fn full_tokenizer_pool_is_a_503() {
+        for prompt in [json!("full"), json!(["a", "full"])] {
+            let (status, error) = call("/v1/tokenize", json!({"prompt": prompt})).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{prompt}");
+            assert_eq!(
+                error,
+                json!({
+                    "object": "error",
+                    "message": "to_scheduler channel full",
+                    "type": "503",
+                    "param": null,
+                    "code": 503,
+                }),
+                "{prompt}"
+            );
+        }
     }
 }

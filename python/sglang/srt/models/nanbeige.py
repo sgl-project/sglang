@@ -5,7 +5,7 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.configs import NanbeigeConfig
+from sglang.srt.configs.nanbeige import NanbeigeConfig
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -27,6 +27,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -34,7 +36,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -487,17 +488,6 @@ class NanbeigeForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        assert False, "NanbeigeModel does not support split_prefill."
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

@@ -104,13 +104,19 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
         return ExitFacts()
     output = path.output
     scattered = variant is BatchVariant.INPUT_SCATTERED
+    cp_active = variant is not BatchVariant.ORDINARY
     tp = get_parallel().tp_size > 1
     if kind is StageKind.ATTENTION:
         return ExitFacts(
             defers_mixer_sum=output.may_defer_to_next
             and tp
             and not is_dp_attention_enabled()
-            and _sum_deferral_allowed(plan, output, scattered=scattered)
+            and _sum_deferral_allowed(
+                plan,
+                output,
+                scattered=scattered,
+                cp_active=cp_active,
+            )
         )
     sum_in_reduce_scatter = output.may_reduce_scatter and (
         path.output_move_completes_sum or (scattered and not plan.terminal)
@@ -118,7 +124,12 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
     may_defer_sum = (
         tp
         and (not plan.terminal or output.may_defer_to_next)
-        and _sum_deferral_allowed(plan, output, scattered=scattered)
+        and _sum_deferral_allowed(
+            plan,
+            output,
+            scattered=scattered,
+            cp_active=cp_active,
+        )
         # Under attention DP the next layer must also run postprocess's
         # scatter back to this rank's tokens, and nothing more.
         and (
@@ -147,10 +158,14 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
     )
 
 
-def _sum_deferral_allowed(plan, output, *, scattered: bool) -> bool:
+def _sum_deferral_allowed(
+    plan, output, *, scattered: bool, cp_active: bool = True
+) -> bool:
     # Under the MoE-CP all-gather the fusion path would skip complete_now
     # and its MoE-CP scatter, leaving hidden_states longer than the residual.
-    if is_enable_moe_cp_allgather() or output.group is None:
+    # Ordinary decode/verify batches hold the same rows on every CP rank.
+    # A launch configured for prefill CP must not disable their fused consumer.
+    if (cp_active and is_enable_moe_cp_allgather()) or output.group is None:
         return False
 
     # The fused residual+LN reduces over a single group. Hybrid EP+TP spans

@@ -7,9 +7,11 @@ from unittest.mock import patch
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
+    _resolve_dspark_lm_head_dtype,
     _target_checkpoint_bundles_dspark_draft,
     _target_checkpoint_dspark_subfolder,
 )
+from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -61,6 +63,30 @@ class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
             model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
         )
         self.assertFalse(_target_checkpoint_bundles_dspark_draft(server_args))
+
+
+class TestDsparkLmHeadDtype(CustomTestCase):
+    def _resolve(self, dtype, *, is_gfx95=False, is_blackwell=False):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.speculative_dspark_lm_head_dtype = dtype
+        facts = SimpleNamespace(is_gfx95=is_gfx95, is_blackwell=is_blackwell)
+        with patch(f"{_HOOK}.get_platform", return_value=facts):
+            _resolve_dspark_lm_head_dtype(server_args)
+        return resolution_result(server_args, "speculative_dspark_lm_head_dtype")
+
+    def test_unsupported_platform_raises(self):
+        for dtype in ("fp8", "mxfp8"):
+            with self.assertRaises(ValueError):
+                self._resolve(dtype)
+
+    def test_supported_platform_keeps_dtype(self):
+        self.assertEqual(self._resolve("mxfp8", is_blackwell=True), "mxfp8")
+        self.assertEqual(self._resolve("fp8", is_gfx95=True), "fp8")
+
+    def test_unset_is_a_no_op(self):
+        self.assertIsNone(self._resolve(None))
 
 
 class TestDsparkDraftPathDefaulting(CustomTestCase):
@@ -166,9 +192,13 @@ class TestTargetCheckpointDsparkSubfolderOnHub(CustomTestCase):
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""
 
-    def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
+    def _dp_server_args(
+        self, *, moe_a2a_backend: str, arch: str = "DeepseekV4ForCausalLM"
+    ) -> ServerArgs:
+        hf_config = _bundled_hf_config()
+        hf_config.architectures = [arch]
         server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+            model_path=_BUNDLED_MODEL_PATH, hf_config=hf_config
         )
         server_args.enable_dp_lm_head = True
         server_args.attn_dp_size = 2
@@ -183,6 +213,18 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
             for backend in ("deepep", "pplx"):
                 with self.assertRaisesRegex(ValueError, backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_ernie55_admits_deepep_and_rejects_megamoe(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(
+                self._dp_server_args(moe_a2a_backend="deepep", arch=ERNIE5_5_MOE_ARCH)
+            )
+            with self.assertRaisesRegex(ValueError, "megamoe"):
+                _handle_dspark(
+                    self._dp_server_args(
+                        moe_a2a_backend="megamoe", arch=ERNIE5_5_MOE_ARCH
+                    )
+                )
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
         server_args = self._dp_server_args(moe_a2a_backend="megamoe")

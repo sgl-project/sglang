@@ -4,7 +4,7 @@ from typing import List
 
 import torch
 
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -67,6 +67,12 @@ class MultimodalFeatureTransport:
         """Wrap final GPU features, rolling back every lease if one wrap fails."""
         if not self.use_cuda_ipc:
             return mm_items
+
+        for item in mm_items:
+            # Never reconstruct/consume an IPC lease merely to hash its contents.
+            # Leave namespace binding to finalization: fast paths may have
+            # already built padding, which must change together with identity.
+            item.set_pad_value()
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
         # and releases each successful pool slice.

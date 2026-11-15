@@ -37,6 +37,7 @@ import msgspec
 
 from sglang.srt.arg_groups.kv_cache_hook import (
     ASYMMETRIC_KV_BACKENDS,
+    draft_rows_refusal,
     handle_page_major_kv_layout,
 )
 from sglang.srt.configs.model_config import AttentionArch
@@ -54,6 +55,9 @@ def _accepts(
     linear_decode: str | None = None,
     linear_prefill: str | None = None,
     has_asymmetric_kv: bool = False,
+    draft_backend: str | None = None,
+    hf_config=None,
+    **overrides,
 ) -> bool:
     """Run just `handle_page_major_kv_layout` against a minimal stand-in, since
     ServerArgs' real constructor pulls in a model config."""
@@ -70,6 +74,8 @@ def _accepts(
         "linear_attn_decode_backend": linear_decode,
         "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
+        "speculative_draft_attention_backend": draft_backend,
+        **overrides,
     }.items():
         msgspec.Struct.__setattr__(sa, name, value)
     setattr(
@@ -82,6 +88,8 @@ def _accepts(
             v_head_dim=128,
             swa_head_dim=128,
             swa_v_head_dim=128,
+            hf_config=hf_config
+            or SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
         ),
     )
     try:
@@ -163,6 +171,46 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 "and must stay rejected for an asymmetric-K/V model",
             )
 
+    def test_the_gate_judges_the_target_backends_only(self):
+        """An external draft has its own K/V geometry, so the gate does not
+        judge a draft backend by the target's: an asymmetric target on fa3
+        with a symmetric DFLASH draft on flashinfer passes it."""
+        self.assertTrue(
+            _accepts(
+                "fa3",
+                use_mla=False,
+                has_asymmetric_kv=True,
+                draft_backend="flashinfer",
+            )
+        )
+
+    def test_draft_rows_are_judged_by_the_draft_geometry(self):
+        """The draft runner's check reads the draft model's rows: asymmetric
+        rows need backends that carry v_head_dim, whether set for the draft or
+        inherited from the target; symmetric rows and MLA rows need none."""
+        cases = [
+            # (draft rows asymmetric, draft uses MLA, draft backends, refused)
+            (
+                False,
+                False,
+                ("flashinfer",),
+                False,
+            ),  # asymmetric target, symmetric draft
+            (True, False, ("flashinfer",), True),  # symmetric target, asymmetric draft
+            (True, False, ("trtllm_mha",), True),
+            (True, False, ("fa3",), False),
+            (True, False, ("triton", "fa3"), False),  # inherited from the target
+            (True, False, ("triton", "flashinfer"), True),
+            (True, False, (None, "fa4"), False),
+            (True, True, ("flashinfer",), False),
+        ]
+        for asymmetric, mla, backends, refused in cases:
+            with self.subTest(asymmetric=asymmetric, mla=mla, backends=backends):
+                reason = draft_rows_refusal(
+                    has_asymmetric_kv=asymmetric, uses_mla=mla, backends=backends
+                )
+                self.assertEqual(reason is not None, refused, reason)
+
     def test_asymmetric_dims_do_not_screen_out_mla(self):
         """Screening on `has_asymmetric_kv` alone would lock every real MLA
         config out of the unified pool."""
@@ -172,6 +220,34 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} must stay allowed for an MLA model with asymmetric "
                 "K/V head dims",
             )
+
+    def test_sparse_attention_serves_flashmla_kv_only(self):
+        """A DSA model (Kimi-K3.1) reads its unified pages with the dsa backend
+        and the flashmla_kv kernels; the trtllm kernels read flat rows, and
+        modes the unified pool does not serve for it yet are refused."""
+        k31 = SimpleNamespace(
+            architectures=["KimiK31ForConditionalGeneration"], index_topk=2048
+        )
+        dsa = dict(
+            use_mla=True,
+            hf_config=k31,
+            dsa_prefill_backend="flashmla_kv",
+            dsa_decode_backend="flashmla_kv",
+        )
+        self.assertTrue(_accepts("dsa", **dsa))
+        self.assertFalse(_accepts("dsa", use_mla=True))
+        for overrides in (
+            dict(dsa_decode_backend="trtllm"),
+            dict(dsa_prefill_backend="trtllm"),
+            dict(speculative_algorithm="DFLASH"),
+            dict(dcp_size=8),
+            dict(disaggregation_mode="decode"),
+            dict(enable_hierarchical_cache=True),
+            dict(enable_return_indexer_topk=True),
+        ):
+            with self.subTest(**overrides):
+                with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+                    _accepts("dsa", **{**dsa, **overrides})
 
     def test_page_major_rejected_without_unified_memory(self):
         """There is no static page-major arm today, so the flag alone is

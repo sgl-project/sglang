@@ -5,11 +5,11 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       run_all_tests:
-        description: "Build and run both sanity files even without PPU path changes"
+        description: "Build and run the PPU model sanity suite even without PPU path changes"
         required: false
         type: boolean
         default: true
@@ -27,16 +27,7 @@ on:
         default: false
 
 concurrency:
-  # Unrelated label events must not cancel or replace the active PPU checks.
-  group: >-
-    pr-test-ppu-${{
-      (github.event_name == 'pull_request' &&
-       github.event.action == 'labeled' &&
-       github.event.label.name != 'run-ci' &&
-       github.event.label.name != 'run-ci-ppu') &&
-      format('ignored-label-{0}', github.run_id) ||
-      inputs.ref || github.ref
-    }}
+  group: pr-test-ppu-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -48,15 +39,7 @@ env:
 
 jobs:
   check-changes:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-check-changes' || 'check-changes' }}
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-ppu'
+    name: check-changes
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -95,19 +78,27 @@ jobs:
             ppu:
               - ".github/workflows/pr-test-ppu.yml"
               - "scripts/ci/ppu/**"
+              - "python/pyproject_other.toml"
               - "python/sglang/srt/platforms/sail.py"
+              - "python/sglang/srt/hardware_backend/sail/**"
+              - "python/sglang/srt/layers/attention/flashmla_backend.py"
+              - "python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py"
+              - "python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py"
+              - "python/sglang/srt/models/deepseek_common/utils.py"
+              - "python/sglang/kernels/aot/python/sgl_kernel/flash_attn.py"
+              - "python/sglang/kernels/aot/python/sgl_kernel/utils.py"
               - "python/sglang/kernels/aot/setup_sail.py"
               - "python/sglang/kernels/aot/pyproject_sail.toml"
               - "python/sglang/kernels/aot/csrc/common_extension_sail.cc"
               - "python/sglang/kernels/jit/utils/compile/sailify.py"
               - "test/registered/core/test_basic_sanity_eagle3.py"
               - "test/registered/core/test_basic_sanity_dflash.py"
+              - "test/registered/core/test_basic_sanity.py"
+              - "test/registered/radix_cache/test_radix_attention.py"
+              - "test/registered/ppu/**"
 
   pr-gate:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-pr-gate' || 'pr-gate' }}
+    name: pr-gate
     needs: check-changes
     if: needs.check-changes.outputs.ppu == 'true'
     uses: ./.github/workflows/pr-gate.yml
@@ -117,10 +108,7 @@ jobs:
     secrets: inherit
 
   ppu-build:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-ppu-build' || 'ppu-build' }}
+    name: ppu-build
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.ppu == 'true'
     runs-on: ubuntu-24.04
@@ -178,11 +166,7 @@ jobs:
           if-no-files-found: warn
 
   ppu-sanity:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          format('ignored-label-ppu-sanity ({0})', matrix.runner) ||
-          format('ppu-sanity ({0})', matrix.runner) }}
+    name: ppu-sanity (${{ matrix.runner }})
     needs: [check-changes, pr-gate, ppu-build]
     if: needs.check-changes.outputs.ppu == 'true'
     # Both PPU generations reuse the same wheels; each host supplies its own
@@ -227,15 +211,17 @@ jobs:
           merge-multiple: true
           path: ${{ env.PPU_CI_WHEEL_DIR }}
 
-      - name: Run both speculative sanity files in isolated Docker
+      - name: Run the PPU model sanity suite in isolated Docker
         env:
           CONFIG_PPU_CI_DEVICE: ${{ vars.PPU_CI_DEVICE }}
           CONFIG_PPU_CI_TARGET_MODEL_PATH: ${{ vars.PPU_CI_TARGET_MODEL_PATH }}
           CONFIG_PPU_CI_EAGLE3_MODEL_PATH: ${{ vars.PPU_CI_EAGLE3_MODEL_PATH }}
           CONFIG_PPU_CI_DFLASH_MODEL_PATH: ${{ vars.PPU_CI_DFLASH_MODEL_PATH }}
+          CONFIG_PPU_CI_MLA_MODEL_PATH: ${{ vars.PPU_CI_MLA_MODEL_PATH }}
+          CONFIG_PPU_CI_SMALL_MODEL_PATH: ${{ vars.PPU_CI_SMALL_MODEL_PATH }}
           CONFIG_PPU_CI_EVAL_CACHE: ${{ vars.PPU_CI_EVAL_CACHE }}
         run: |
-          for key in PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_EVAL_CACHE; do
+          for key in PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_MLA_MODEL_PATH PPU_CI_SMALL_MODEL_PATH PPU_CI_EVAL_CACHE; do
             override="CONFIG_$key"
             if [[ -n "${!override}" ]]; then
               export "$key=${!override}"
@@ -252,10 +238,7 @@ jobs:
           if-no-files-found: warn
 
   pr-test-ppu-finish:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
+    name: pr-test-ppu-finish
     needs: [pr-gate, check-changes, ppu-build, ppu-sanity]
     if: always() && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest

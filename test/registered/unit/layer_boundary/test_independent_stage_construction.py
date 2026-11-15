@@ -25,7 +25,7 @@ from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.facts import facts_of
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.boundary_fixtures import build_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

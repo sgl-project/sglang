@@ -23,7 +23,7 @@ from sglang.multimodal_gen.configs.models.vaes.wanvae import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import HunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import _try_save_cuda_video_direct
 from sglang.multimodal_gen.runtime.models.vaes.hunyuanvae import (
     AutoencoderKLHunyuanVideo,
@@ -33,7 +33,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.test.test_utils import CustomTestCase
 
 FPS = 16
@@ -184,9 +183,7 @@ class TestStreamedEncode(CustomTestCase):
                 )
                 self.assertEqual(one_shot.read_bytes(), streamed.read_bytes())
 
-    @unittest.skipUnless(
-        current_platform.is_cuda(), "streaming is gated on the CUDA platform, not ROCm"
-    )
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA or ROCm device")
     def test_only_file_path_video_requests_stream(self):
         server_args = _server_args()
         stage = _stage(_vae(_vae_config(wan22=False)), server_args)

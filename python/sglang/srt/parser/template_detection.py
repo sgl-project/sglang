@@ -29,8 +29,9 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.muse_spark_hook import muse_spark_chat_template_default
-from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -616,6 +617,11 @@ TOOL_CALL_PARSER_RULES = (
         name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
     ),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
+    DetectionRule(
+        name="granite_toolcall_parser",
+        value="granite_toolcall_parser",
+        predicate=lambda ctx: _is_granite_thinking_parser(ctx) and _is_qwen3_coder(ctx),
+    ),
     DetectionRule(name="qwen3_coder", value="qwen3_coder", predicate=_is_qwen3_coder),
     DetectionRule(name="qwen", value="qwen", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v3", value="deepseekv3", predicate=_is_deepseek_v3),
@@ -826,7 +832,7 @@ def _checkpoint_python_chat_template(server_args, template):
 
     cfg = resolving_view(server_args)
     try:
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from sglang.srt.hf_transformers import get_config
 
         config = get_config(
             cfg.model_path,
@@ -845,7 +851,7 @@ def _checkpoint_python_chat_template(server_args, template):
 def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
     """The parsers the model architecture implies, for the fields still on auto."""
     from sglang.srt.entrypoints.openai.chat_encoding import is_deepseek_v41_arch
-    from sglang.srt.utils.hf_transformers_utils import get_config
+    from sglang.srt.hf_transformers import get_config
 
     cfg = resolving_view(server_args)
     config = get_config(
@@ -974,7 +980,7 @@ def resolve_auto_parsers(server_args) -> None:
             _declare_python_template_parsers(server_args, python_template, needs)
             return
 
-    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+    from sglang.srt.hf_transformers import get_tokenizer
 
     try:
         explicit_jinja_template = _load_explicit_jinja_template(chat_template_arg)
