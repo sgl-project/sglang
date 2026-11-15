@@ -10,6 +10,7 @@ from sglang.srt.configs.model_config import (
     is_score_and_pool_model,
 )
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
+from sglang.srt.layers.attention.mis_swa_guard import validate_swa_mis_query_items
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.multimodal.media_io import ImageData
@@ -98,6 +99,11 @@ class TokenizerManagerScoreMixin:
         Build a single token sequence for multi-item scoring.
         Format: query<delimiter>item1<delimiter>item2<delimiter>item3<delimiter>
         """
+        validate_swa_mis_query_items(
+            query_len=len(query),
+            item_lens=[len(item) for item in items],
+            window_left=getattr(self, "min_positive_swa_window", None),
+        )
         combined_sequence = query[:]  # Start with query
         delimiter_indices = []
 

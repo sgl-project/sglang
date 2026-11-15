@@ -36,6 +36,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
     resolve_window_id_space,
     resolve_window_kv_pool,
 )
+from sglang.srt.layers.attention.mis_swa_guard import (
+    aggregate_min_positive_swa_window,
+    validate_swa_mis_batch,
+)
 from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
@@ -45,7 +49,7 @@ from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
-from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.kv.alloc.id_space import (
     IdSpace,
     IdSpaceKind,
@@ -75,11 +79,30 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_runner_min_positive_swa_window(
+    *, model_runner: ModelRunner
+) -> Optional[int]:
+    """Resolve the minimum non-negative SWA window across RadixAttention layers."""
+    layer_windows: list[int] = []
+    has_radix_attn = False
+    model = getattr(model_runner, "model", None)
+    if model is not None and hasattr(model, "modules"):
+        for module in model.modules():
+            if isinstance(module, RadixAttention):
+                has_radix_attn = True
+                layer_windows.append(getattr(module, "sliding_window_size", None))
+    if has_radix_attn:
+        return aggregate_min_positive_swa_window(windows=layer_windows)
+    return aggregate_min_positive_swa_window(
+        windows=[getattr(model_runner, "sliding_window_size", None)]
+    )
+
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -448,6 +471,9 @@ class FlashInferAttnBackend(AttentionBackend):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
+        self.min_positive_swa_window = _resolve_runner_min_positive_swa_window(
+            model_runner=model_runner
+        )
         if model_runner.sliding_window_size is not None:
             self.num_wrappers = 2
             self.dispatch_reason = WrapperDispatch.SLIDING_WINDOW
@@ -790,7 +816,8 @@ class FlashInferAttnBackend(AttentionBackend):
             return MultiItemScoringParams()
 
         prefix_cache_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-        extend_seq_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        raw_extend_seq_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        extend_seq_lens = raw_extend_seq_lens
         prefix_len_ptr, token_pos_in_items_ptr = [], []
         token_pos_in_items_len = 0
         device = forward_batch.input_ids.device
@@ -798,6 +825,14 @@ class FlashInferAttnBackend(AttentionBackend):
         # If no extend_seq_lens, treat whole batch as one sequence
         if extend_seq_lens is None or len(extend_seq_lens) <= 1:
             extend_seq_lens = [forward_batch.input_ids.size(0)]
+
+        validate_swa_mis_batch(
+            precomputed_indices=precomputed_indices,
+            extend_seq_lens=extend_seq_lens,
+            raw_extend_seq_lens=raw_extend_seq_lens,
+            prefix_cache_lens=prefix_cache_lens,
+            window_left=self.min_positive_swa_window,
+        )
 
         # The metadata tensors below are tiny (a few thousand elements at most)
         # but get rebuilt every forward. MIS disables CUDA graphs, so doing this
