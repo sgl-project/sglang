@@ -497,7 +497,10 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="f39fa765e897c95995957d0518908cc982a88fc2"
+# Must stay at or after ROCm/mori#872 (merged af56d9b5, 2026-11-09), which adds
+# GemmAllReduceOp(quant="bf16"); earlier pins have no bf16 entry at all and
+# window_bytes_for() there takes no k=.
+ARG MORI_COMMIT="5a4570e96128840ee1845044110505538ae86269"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
