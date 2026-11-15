@@ -78,15 +78,16 @@ class TestBeamAllReduce(CustomTestCase):
             )
         register_comm_cleanup(cls.comm)
         # Exercise the shared phase word, regardless of platform tuning.
-        cls.comm.override_algo = AllReduceAlgo.ONE_SHOT_PUSH
+        cls.comm.forced_algo = AllReduceAlgo.ONE_SHOT_PUSH
         # The same workspaces and phase word without a multicast address take the
         # per-peer store path; the multicast plane is the control where it exists.
+        lease = cls.comm._lease
         unicast = Communicator(
             push=PushPlane(
-                cls.comm.rank,
-                cls.comm.world_size,
-                workspaces=cls.comm._push_workspaces,
-                counter=cls.comm._push_counter,
+                lease.rank,
+                lease.world_size,
+                workspaces=lease.data.push_slots,
+                counter=lease.control.epoch,
                 default_blocks=cls.comm.config.num_push_blocks,
             ),
             pull=cls.comm.obj.pull,

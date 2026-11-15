@@ -326,6 +326,7 @@ class MockGDNModelRunner(ModelRunner):
             get_kvcache=lambda: self.token_to_kv_pool,
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
         self.is_draft_worker = False
         self.init_runner_ids()
