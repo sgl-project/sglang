@@ -407,7 +407,6 @@ def flash_decode_with_gqa_share_sparse(
     block_size: int,
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
-    use_tma: bool = True,
     page_size: int = 0,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,

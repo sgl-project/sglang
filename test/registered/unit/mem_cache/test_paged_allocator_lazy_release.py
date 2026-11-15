@@ -1,7 +1,7 @@
 """need_sort allocators stage released pages and merge only under allocation pressure."""
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -64,6 +64,22 @@ class TestPagedAllocatorLazyRelease(CustomTestCase):
         allocator.clear()
         self.assertEqual(allocator.available_size(), allocator.size)
         self.assertEqual(allocator.staged_pages, [])
+
+    def test_reuse_guard_waits_only_when_staged_pages_are_needed(self):
+        allocator = _make_allocator(need_sort=True)
+        allocated = allocator.alloc(24)
+        event = Mock()
+        allocator.set_reuse_guard_event(event)
+        allocator.free(allocated[:2])
+        # Fresh pages are safe to hand to an asynchronous PD transfer.
+        allocator.alloc(8)
+        event.synchronize.assert_not_called()
+
+        reused = allocator.alloc(2)
+        self.assertTrue(torch.equal(_page_ids(reused), torch.tensor([1])))
+        event.synchronize.assert_called_once_with()
+        allocator.merge_and_sort_free()
+        event.synchronize.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -281,6 +281,12 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
+    "QiuMike": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "Ratish1": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -408,6 +414,12 @@
         "reason": "custom override"
     },
     "ZhengdQin": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "aaronlinear": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,

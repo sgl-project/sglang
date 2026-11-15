@@ -7,7 +7,7 @@ python token_in_token_out_llm_server.py
 
 import requests
 
-from sglang.srt.utils.hf_transformers import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.test.test_utils import is_in_ci
 from sglang.utils import terminate_process, wait_for_server
 
