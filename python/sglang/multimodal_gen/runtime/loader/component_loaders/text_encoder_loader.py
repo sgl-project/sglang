@@ -109,7 +109,7 @@ from sglang.srt.model_loader.checkpoint_quantization import (
 
 logger = init_logger(__name__)
 
-_ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "convrot_int8", "mxfp4"})
+_ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "mxfp8", "convrot_int8", "mxfp4"})
 
 _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
     "T5EncoderModel": transformers.T5EncoderModel,
@@ -750,10 +750,11 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     key_filter=model.should_materialize_checkpoint_weight,
                 )
             else:
+                # copy into the allocated parameters without a second GPU weight tensor
                 checkpoint_weights = self._get_all_weights(
                     model,
                     model_path,
-                    to_cpu=component_starts_on_cpu,
+                    to_cpu=True,
                 )
             if isinstance(quant_config, QuantoInt8Config):
                 checkpoint_weights = normalize_quanto_int8_weights(checkpoint_weights)
@@ -761,6 +762,16 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             self.validate_checkpoint_keys(
                 weights_to_load - loaded_weights, [], component_name
             )
+
+            # process_weights_after_loading for unquantized linear
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is None or not isinstance(
+                    quant_method, UnquantizedLinearMethod
+                ):
+                    continue
+                if hasattr(quant_method, "process_weights_after_loading"):
+                    quant_method.process_weights_after_loading(module)
 
             if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device

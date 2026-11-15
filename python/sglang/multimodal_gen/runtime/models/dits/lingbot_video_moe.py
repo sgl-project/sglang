@@ -50,7 +50,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 LINGBOT_VIDEO_FP32_MODULES = (
     "time_embedder",
@@ -148,20 +148,6 @@ def _lingbot_norm_modulate(
         except Exception:
             pass
     return (norm(x) * (1.0 + scale) + shift).to(out_dtype)
-
-
-def make_joint_position_ids(
-    text_len: int, grid_t: int, grid_h: int, grid_w: int, device: torch.device
-) -> torch.Tensor:
-    tt = torch.arange(grid_t, device=device, dtype=torch.int32) + (text_len + 1)
-    hh = torch.arange(grid_h, device=device, dtype=torch.int32)
-    ww = torch.arange(grid_w, device=device, dtype=torch.int32)
-    grid = torch.stack(torch.meshgrid(tt, hh, ww, indexing="ij"), dim=-1).flatten(0, 2)
-    text_t = torch.arange(text_len, device=device, dtype=torch.int32) + 1
-    text_pos = torch.stack(
-        [text_t, torch.zeros_like(text_t), torch.zeros_like(text_t)], dim=-1
-    )
-    return torch.cat([grid, text_pos], dim=0)  # (Nx + L, 3)
 
 
 def _joint_position_ids(

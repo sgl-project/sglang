@@ -16,7 +16,7 @@ All of this is pure CPU logic (no server / engine launch).
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import os
 import tempfile
@@ -25,7 +25,7 @@ import unittest
 import safetensors.torch
 import torch
 
-from sglang.srt.configs import Cosmos3Config
+from sglang.srt.configs.cosmos3 import Cosmos3Config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
@@ -193,7 +193,7 @@ class TestCosmos3Config(CustomTestCase):
         # not one implementation class.
         from transformers import AutoConfig
 
-        import sglang.srt.utils.hf_transformers.common  # noqa: F401
+        import sglang.srt.hf_transformers.common  # noqa: F401
 
         cfg = AutoConfig.for_model(
             "cosmos3_omni",

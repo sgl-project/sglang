@@ -23,9 +23,10 @@ from typing import Any, Optional, Sequence, Union
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    FlowRolloutController,
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
@@ -96,7 +97,6 @@ class Req:
     preprocessed_image: torch.Tensor | None = None
     preprocessed_video: torch.Tensor | None = None
 
-    output_file_ext: str | None = None
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None
@@ -142,7 +142,6 @@ class Req:
 
     # Audio Latents
     audio_latents: torch.Tensor | None = None
-    audio_noise: torch.Tensor | None = None
     raw_audio_latent_shape: tuple[int, ...] | None = None
     did_sp_shard_audio_latents: bool = False
     sp_audio_start_frame: int = 0
@@ -165,10 +164,6 @@ class Req:
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
     vae_image_sizes: list[tuple[int, int]] | None = None
     c2ws_plucker_emb: torch.Tensor | None = None
-
-    # Latent dimensions
-    height_latents: list[int] | int | None = None
-    width_latents: list[int] | int | None = None
 
     # Timesteps
     timesteps: torch.Tensor | None = None
@@ -198,6 +193,8 @@ class Req:
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
+    # Rollout controllers of this request, keyed by latent stream.
+    rollout_controllers: dict[str, FlowRolloutController] = field(default_factory=dict)
     trajectory_audio_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
@@ -206,6 +203,12 @@ class Req:
     condition_inputs: dict[str, Any] = field(default_factory=dict)
 
     is_warmup: bool = False
+    report_progress: bool = False
+    # the client can cancel it by request id, see managers/request_cancel.py
+    cancellable: bool = False
+
+    # request ids merged into this dynamic batch
+    merged_request_ids: list[str] | None = None
 
     # STA parameters
     STA_param: list | None = None
@@ -343,6 +346,11 @@ class Req:
             return None
         return f"{int(width)}x{int(height)}"
 
+    def client_request_ids(self) -> list[str]:
+        if self.merged_request_ids:
+            return self.merged_request_ids
+        return [self.request_id] if self.request_id else []
+
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
         self.save_output = False
@@ -436,7 +444,7 @@ class Req:
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}
                   flow_shift: {effective_flow_shift}
-                  image_path: {self.image_path}
+                  image_path: {_sanitize_for_logging(self.image_path)}
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
@@ -478,7 +486,11 @@ class OutputBatch:
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    # the client cancelled the request; error tells which one
+    cancelled: bool = False
     output_file_paths: list[str] | None = None
+    # encoded image per output when the request sets return_image_bytes
+    output_image_bytes: list[bytes | None] | None = None
     # Decoded LiDAR of a joint camera/LiDAR request: file paths and metadata,
     # plus range_m/intensity/validity arrays when the client asked for frames.
     lidar: dict[str, Any] | None = None
@@ -500,6 +512,7 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.output_image_bytes = None
         self.lidar = None
         self.raw_frame_batches = None
         self.noise_pred = None

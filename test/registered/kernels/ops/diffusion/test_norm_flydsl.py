@@ -238,12 +238,38 @@ def test_flydsl_multi_iteration_dim():
     torch.testing.assert_close(y, y_ref, atol=1.0, rtol=5e-2)
 
 
+@pytest.mark.parametrize("norm_type", ["rms", "layer"])
+def test_flydsl_norm_honors_eps(norm_type):
+    """A caller's eps must reach the kernel instead of a hard-coded 1e-6.
+
+    Inputs with variance ~1e-6 make eps=1e-5 dominate the normalizer, so a
+    kernel that drops eps is off by about 2x.
+    """
+    fused_op, nss_op = _flydsl_ops()
+
+    eps = 1e-5
+    B, L = 1, 16
+    residual = _mk((B, L, FLYDSL_D)) * 1e-3
+    x = _mk((B, L, FLYDSL_D)) * 1e-3
+    zeros = torch.zeros(B, 1, FLYDSL_D, device=DEVICE, dtype=torch.bfloat16)
+
+    y = nss_op(x, None, None, zeros, zeros, norm_type, eps)
+    y_ref = _ref_norm_ss(x, None, None, zeros, zeros, norm_type, eps)
+    torch.testing.assert_close(y, y_ref, atol=2e-2, rtol=2e-2)
+
+    y, _ = fused_op(residual, x, None, None, None, zeros, zeros, norm_type, eps)
+    y_ref, _ = _ref_fused_residual_norm_ss(
+        residual, x, None, None, None, zeros, zeros, norm_type, eps
+    )
+    torch.testing.assert_close(y, y_ref, atol=2e-2, rtol=2e-2)
+
+
 def test_flydsl_compile_cache_reuse_across_row_counts_and_layouts():
     """Guard for the compile-cache/shape-specialization hazard.
 
-    The cache key is (D, is_rms, has_gate, has_weight) and deliberately excludes
-    the row count and whether scale/shift are broadcast. One compiled kernel must
-    therefore stay correct when both of those change between calls.
+    The cache key is (D, is_rms, has_gate, has_weight, eps) and deliberately
+    excludes the row count and whether scale/shift are broadcast. One compiled
+    kernel must therefore stay correct when both of those change between calls.
     """
     _, nss_op = _flydsl_ops()
 

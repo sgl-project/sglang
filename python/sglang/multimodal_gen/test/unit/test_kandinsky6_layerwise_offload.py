@@ -36,7 +36,10 @@ from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_audio import (
     Kandinsky6AudioVAE,
 )
 from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_sr_vae import Kandinsky6SRVAE
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils import precision
 from sglang.multimodal_gen.test.unit.kandinsky6_sr_tiny_components import (
@@ -219,6 +222,11 @@ def test_layerwise_groups_preserve_repeated_forwards(component, resident_layers)
     assert set(groups) <= set(model.layer_names)
     assert model.layerwise_offload_dit_group_enabled == component.endswith("dit")
     state = {name: value.cpu().clone() for name, value in model.state_dict().items()}
+    tolerance = dict(rtol=0, atol=0)
+    if component == "audio-vae" and current_platform.is_rocm():
+        # On MI300 the offloaded fp32 audio VAE differs from the resident run by
+        # ~1e-6 (CUDA is bit-exact); the weights are still compared exactly below.
+        tolerance = dict(rtol=1e-4, atol=1e-5)
     with (
         torch.inference_mode(),
         set_forward_context(current_timestep=0, attn_metadata=None),
@@ -241,12 +249,12 @@ def test_layerwise_groups_preserve_repeated_forwards(component, resident_layers)
         } == set(groups)
         for _ in range(2):
             model.prepare_for_next_req()
-            torch.testing.assert_close(forward(), expected, rtol=0, atol=0)
+            torch.testing.assert_close(forward(), expected, **tolerance)
             for manager in model.layerwise_offload_managers:
                 assert manager._last_forwarded_layer == manager.num_layers - 1
                 manager.release_all()
         model.disable_offload()
-        torch.testing.assert_close(forward(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(forward(), expected, **tolerance)
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value.cpu(), state[name], rtol=0, atol=0)
 
