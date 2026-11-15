@@ -32,6 +32,7 @@ use sglang_processor::{
     tool_call_stream,
 };
 
+use super::super::auth::DeclaredRoute;
 use super::super::dp_relay::HintRoute;
 use super::completions::completion_usage;
 use super::lowered;
@@ -56,7 +57,7 @@ use crate::message::types::OneOrMany;
 use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/chat/completions", post(chat_completions))
+    Router::new().declared_route("/v1/chat/completions", post(chat_completions))
 }
 
 #[derive(Deserialize)]

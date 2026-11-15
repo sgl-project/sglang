@@ -1128,7 +1128,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--admin-api-key`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set <strong>admin API key</strong> for administrative/control endpoints (e.g., weights update, cache flush, <code>/server_info</code>). Endpoints marked as admin-only require <code>Authorization: Bearer &lt;admin_api_key&gt;</code> when this is set.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set <strong>admin API key</strong> (sent as <code>Authorization: Bearer &lt;admin_api_key&gt;</code>). Sensitive control endpoints (e.g., weights update, LoRA load/unload, profiling, <code>/pause_generation</code>, <code>/hicache/storage-backend</code>) always require it and return HTTP 403 when it is unset, lighter ones (e.g., <code>/flush_cache</code>, <code>/abort_request</code>) require it only once it is set (else <code>--api-key</code> if set), and all other endpoints (inference, <code>/server_info</code>) only check <code>--api-key</code>. Defaults to <code>SGLANG_ADMIN_API_KEY</code> when the flag is not given.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
