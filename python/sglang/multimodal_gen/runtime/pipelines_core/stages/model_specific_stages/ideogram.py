@@ -374,11 +374,13 @@ class Ideogram4DenoisingStage(DenoisingStage):
         if (
             lora_scale == 0.0
             and getattr(server_args, "lora_path", None) is not None
-            and getattr(server_args, "lora_merge_mode", "auto") != "dynamic"
+            and getattr(server_args, "lora_merge_mode", "auto")
+            not in ("dynamic", "disabled")
         ):
             raise ValueError(
                 f"Ideogram 4 preset {preset} disables LoRA, but request-local LoRA "
-                "switching requires --lora-merge-mode dynamic when --lora-path is set."
+                "switching requires --lora-merge-mode dynamic or disabled "
+                "when --lora-path is set."
             )
 
         pipeline = self.pipeline() if self.pipeline else None

@@ -2,8 +2,10 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
+    LTX2TwoStageHQPipeline,
     LTX2TwoStageResidencyController,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 def _controller(
@@ -11,13 +13,34 @@ def _controller(
 ) -> LTX2TwoStageResidencyController:
     controller = object.__new__(LTX2TwoStageResidencyController)
     controller.mode = mode
+    controller.server_args = SimpleNamespace(lora_merge_mode="auto")
     controller.pipeline = SimpleNamespace(
         _distilled_lora_path=distilled_lora, _stage1_lora_path=stage1_lora
     )
     return controller
 
 
-class TestLTX2PremergedStage2(unittest.TestCase):
+class TestLTX2PremergedStage2(CustomTestCase):
+    def test_disabled_merge_skips_both_premerge_optimizations(self):
+        controller = _controller("resident", distilled_lora="lora")
+        controller.server_args.lora_merge_mode = "disabled"
+        self.assertFalse(controller.should_use_premerged)
+
+        pipeline = object.__new__(LTX2TwoStageHQPipeline)
+        pipeline._ltx2_residency = SimpleNamespace(mode="original")
+        pipeline._stage1_lora_path = None
+        args = SimpleNamespace(
+            lora_merge_mode="auto",
+            pipeline_config=SimpleNamespace(
+                vae_config=SimpleNamespace(
+                    arch_config=SimpleNamespace(ltx_variant="ltx_2_3")
+                )
+            ),
+        )
+        self.assertTrue(pipeline._can_merge_stage1_distilled_into_base(args))
+        args.lora_merge_mode = "disabled"
+        self.assertFalse(pipeline._can_merge_stage1_distilled_into_base(args))
+
     def test_resident_mode_premerges_the_distilled_lora(self):
         self.assertTrue(
             _controller("resident", distilled_lora="lora").should_use_premerged
