@@ -351,6 +351,12 @@ def _kf_bm(rows: int) -> int:
     return min(KF_BM, max(1, triton.next_power_of_2(rows) // 8))
 
 
+def _kf_bl(rows: int) -> int:
+    # Half-width column blocks (twice the reduce programs) for one 64-row tile: 0.5-0.7 us faster per seam at
+    # 33-64 rows, slower or level at the other row counts (gfx950).
+    return KF_BL // 2 if _ROW_TILE // 2 < rows <= _ROW_TILE else KF_BL
+
+
 def hc_seam_supported(rows: int, x: torch.Tensor) -> bool:
     return (
         0 < rows <= MAX_ROWS
@@ -430,7 +436,8 @@ def hc_seam(
         HAS_COMBINE=has_combine,
         num_warps=KA_WARPS,
     )
-    nlt = triton.cdiv(LOWRANK, KF_BL)
+    kf_bl = _kf_bl(rows)
+    nlt = triton.cdiv(LOWRANK, kf_bl)
     kf_bm = _kf_bm(rows)
     _hc_seam_reduce_kernel[
         (triton.cdiv(rows, kf_bm), nlt + (kf_bm * HC if has_gate else 0))
@@ -450,7 +457,7 @@ def hc_seam(
         L=LOWRANK,
         KB=KA_KB,
         BM=kf_bm,
-        BL=KF_BL,
+        BL=kf_bl,
         BKG=KF_BKG,
         NKP=triton.next_power_of_2(HS // KA_KB),
         NQP=triton.next_power_of_2(HS // KF_BKG),
