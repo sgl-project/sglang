@@ -1268,9 +1268,9 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--load-balance-method`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The load balancing strategy for data parallelism. The `total_tokens` algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The load balancing strategy for data parallelism. The `total_tokens` algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers. The `prefix_aware` algorithm sends each request to the DP rank that already caches the longest prefix of its prompt (tracked approximately from the prompts routed so far), so multi-turn sessions keep their radix-cache hits; short matches and overloaded ranks fall back to the least-loaded rank. Tuned with the `SGLANG_DP_PREFIX_ROUTING_*` environment variables.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>round_robin</code>, <code>follow_bootstrap_room</code>, <code>total_requests</code>, <code>total_tokens</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>round_robin</code>, <code>follow_bootstrap_room</code>, <code>total_requests</code>, <code>total_tokens</code>, <code>prefix_aware</code></td>
     </tr>
   </tbody>
 </table>
