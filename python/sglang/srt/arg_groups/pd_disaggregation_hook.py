@@ -61,6 +61,8 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "overhead without improving prefill performance."
         )
 
+    if cfg.disaggregation_decode_lane_balance_margin < 0:
+        raise ValueError("--disaggregation-decode-lane-balance-margin must be >= 0")
     if not 0 <= cfg.disaggregation_decode_host_receive_threshold <= 1:
         raise ValueError(
             "--disaggregation-decode-host-receive-threshold must be between 0 and 1"

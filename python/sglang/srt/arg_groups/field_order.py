@@ -573,5 +573,6 @@ POSITIONAL_FIELD_ORDER = (
     "hybrid_cache_checkpoints_level",
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
+    "disaggregation_decode_lane_balance_margin",
 )
 # fmt: on

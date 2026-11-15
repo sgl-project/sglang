@@ -574,6 +574,17 @@ class DPDrainColumn:
         self.rows: Optional[list[int]] = None
 
 
+class DPRankRows:
+    """Each attention-DP group's row count from the last gather that produced
+    metadata (decode: its running requests, 0 when idle). Every rank holds the
+    same list."""
+
+    __slots__ = ("rows",)
+
+    def __init__(self) -> None:
+        self.rows: Optional[list[int]] = None
+
+
 class DPShutdownVoteSent:
     """Whether a gather has carried this rank's own shutdown vote (the adapter is frozen)."""
 
@@ -596,6 +607,7 @@ def prepare_mlp_sync_batch_raw(
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
     drain_column: Optional[DPDrainColumn] = None,
+    rank_rows: Optional[DPRankRows] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -729,6 +741,8 @@ def prepare_mlp_sync_batch_raw(
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:
         drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
+    if rank_rows is not None and metadata_ready:
+        rank_rows.rows = mlp_sync_info.global_num_tokens
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -818,6 +832,7 @@ class SchedulerDPAttnAdapter:
     shutdown_vote_sent: DPShutdownVoteSent = field(
         default_factory=DPShutdownVoteSent, init=False
     )
+    rank_rows: DPRankRows = field(default_factory=DPRankRows, init=False)
 
     def shutdown_vote_pending(self) -> bool:
         """This rank honored a ShutdownReq that no MLP-sync gather has carried yet.
@@ -863,6 +878,7 @@ class SchedulerDPAttnAdapter:
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
             drain_column=drain_column,
+            rank_rows=self.rank_rows,
         )
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)
