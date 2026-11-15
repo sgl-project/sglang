@@ -418,6 +418,23 @@ class LRUFileEvictor:
             return None
         return st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
 
+    def _pending_reserved_bytes_locked(self) -> int:
+        """Bytes reserved by in-flight writes that may not be on disk yet.
+
+        ``reserve`` admits a write and charges it to the LRU accounting, but
+        the bytes only reach the filesystem when the write is committed. A
+        ``statvfs`` probe can therefore still report them as free space and a
+        later writer could reuse their budget. Charge every pending
+        reservation against the free-space floor; the charge is pessimistic
+        when part of a write already landed on disk.
+        """
+        total = 0
+        for stem in self._pending_writes:
+            size = self._lru.get(stem)
+            if size is not None:
+                total += size
+        return total
+
     def _enforce_free_space_locked(self, value_bytes: int) -> bool:
         """Evict until writing ``value_bytes`` still leaves ``min_free_bytes``.
 
@@ -434,18 +451,23 @@ class LRUFileEvictor:
                 self.file_path,
             )
             return False
+        # Pending writes are admitted but may not have reached the filesystem
+        # yet, so their bytes are not visible in statvfs. Charge them here or
+        # a later writer would reuse their budget.
+        pending = self._pending_reserved_bytes_locked()
         # Credit reclaimed bytes instead of re-probing statvfs per victim;
         # the final probe below catches filesystems that free space lazily.
         free = fs[1]
         before_entries = len(self._lru)
         self._evict_while(
-            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
+            lambda reclaimed: (free + reclaimed) - pending - value_bytes
+            < self.min_free_bytes
         )
         self._foreground_evicted_entries += before_entries - len(self._lru)
         fs = self._fs_stats()
         if fs is None:
             return False
-        return fs[1] - value_bytes >= self.min_free_bytes
+        return fs[1] - pending - value_bytes >= self.min_free_bytes
 
     def _scan_existing_files(self, *, track_entries: bool) -> None:
         """Remove stale temp files and optionally seed the LRU (oldest first)."""
