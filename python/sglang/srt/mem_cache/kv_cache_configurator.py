@@ -3589,9 +3589,16 @@ class KVCacheConfigurator:
         )
         if replayssm_active:
             record_len = get_exec().mamba.linear_replayssm_cache_len
+            # A GDN tree keeps one raw-input record per draft token instead.
+            gdn_tree = (
+                self.hybrid_gdn_config is not None
+                and (get_spec().speculative_eagle_topk or 0) > 1
+            )
+            if gdn_tree:
+                record_len = max_speculative_num_draft_tokens() or record_len
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
-                    record_len=record_len
+                    record_len=record_len, gdn_tree=gdn_tree
                 )
             )
         else:

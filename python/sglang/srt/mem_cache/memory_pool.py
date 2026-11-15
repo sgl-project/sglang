@@ -544,8 +544,9 @@ class MambaPool:
         #   replayssm_d: [num_layers, num_slots, HV, L, V]
         #   replayssm_k: [num_layers, num_slots, H,  L, K]
         #   replayssm_g: [num_layers, num_slots, HV, L]  (fp32)
-        # Under GDN spec verify, rawv/rawk hold compact D/K low parts and beta is
-        # None. KDA uses the same fields for its raw-input fold window.
+        # Under GDN chain spec verify, rawv/rawk hold compact D/K low parts and
+        # beta is None. KDA and the GDN tree verify use the same fields for their
+        # raw-input fold window.
         replayssm_d: Optional[torch.Tensor] = None
         replayssm_k: Optional[torch.Tensor] = None
         replayssm_g: Optional[torch.Tensor] = None
@@ -686,12 +687,18 @@ class MambaPool:
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
         # chunked (d, k) records + write_pos; the spec-verify flag
-        # (--enable-linear-replayssm-spec) uses compact replay for GDN and raw
-        # fold-every-commit for KDA. The shared g allocation gates on
-        # `_replayssm_on`.
+        # (--enable-linear-replayssm-spec) uses compact replay for GDN chains and
+        # raw fold-every-commit for KDA and GDN trees. The shared g allocation
+        # gates on `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        tree_verify = (speculative_eagle_topk or 0) > 1
+        if enable_linear_replayssm_spec and cache_params.is_kda and tree_verify:
+            raise ValueError(
+                "--enable-linear-replayssm-spec supports tree verify "
+                "(--speculative-eagle-topk > 1) for GDN layers only, not KDA."
+            )
         self.replayssm_spec_fold = bool(
-            enable_linear_replayssm_spec and cache_params.is_kda
+            enable_linear_replayssm_spec and (cache_params.is_kda or tree_verify)
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
         self.replayssm_request_ring = False
@@ -782,7 +789,7 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
-                if enable_linear_replayssm_spec and not cache_params.is_kda:
+                if enable_linear_replayssm_spec and not self.replayssm_spec_fold:
                     # The GDN verify writes its window at ring positions
                     # [write_pos, write_pos + T) and drops stores past L; the
                     # commit folds early enough to keep the window inside the
@@ -854,10 +861,11 @@ class MambaPool:
                     dtype=torch.float32,
                     device=device,
                 )
-                # KDA still uses raw-input fold-every-commit. GDN materializes
-                # its compact d/k/g history directly and needs no duplicate ring.
-                if enable_linear_replayssm_spec and cache_params.is_kda:
-                    if cache_params.is_kda or not self.replayssm_spec_fold:
+                # KDA and the GDN tree verify use raw-input fold-every-commit.
+                # The GDN chain materializes its compact d/k/g history directly
+                # and needs no duplicate ring.
+                if self.replayssm_spec_fold:
+                    if cache_params.is_kda:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:
@@ -912,8 +920,8 @@ class MambaPool:
                 # the conv state -- is dead weight there and is skipped. The conv
                 # intermediate windows below STAY (conv rollback consumes them).
                 # The recurrent-verify fallback cannot be reached under the flag
-                # (GDN + linear chain + triton enforced in server_args; the
-                # backend asserts loudly if it ever is).
+                # (GDN + triton enforced in server_args; the backend asserts
+                # loudly if it ever is).
                 # ReplaySSM skips this dominant scratch (~9GB @ K3 dspark γ=7): the
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit

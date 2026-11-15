@@ -124,11 +124,14 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
-    def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
+    def replayssm_ring_bytes_per_req(
+        self, record_len: int, gdn_tree: bool = False
+    ) -> int:
         """ReplaySSM spec-verify scratch bytes across all layers.
 
-        GDN keeps compact d/k/g plus low parts for the activation-dtype d/k
-        rings. KDA keeps its raw-input fold window and d/k rings.
+        A GDN chain keeps compact d/k/g plus low parts for the activation-dtype
+        d/k rings. A GDN tree keeps a raw-input fold window. KDA keeps its
+        raw-input fold window and d/k rings.
         """
         hv, v_dim, k_dim = self.shape.temporal
         h_k = self.shape.num_k_heads_per_tp
@@ -142,6 +145,12 @@ class BaseLinearStateParams(ABC):
                 + hv * record_len * k_dim * fp32_b  # vector g
                 + hv * record_len * v_dim * conv_b  # d
                 + h_k * record_len * k_dim * conv_b  # k
+            )
+        elif gdn_tree:
+            per_layer = (
+                hv * record_len * v_dim * conv_b  # rawv
+                + h_k * record_len * k_dim * conv_b  # rawk
+                + 2 * hv * record_len * fp32_b  # scalar g, beta
             )
         else:
             per_layer = (
