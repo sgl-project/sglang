@@ -1,15 +1,19 @@
-"""The AMD PR suites, read from the AMD PR workflows that run them.
+"""The AMD suites /rerun-test runs, read from the PR jobs that run them.
 
-pr-test-amd.yml and pr-test-amd-extra.yml hard-code one job per suite. A job
-that runs `run_suite.py --hw amd --suite <suite>` through amd_ci_exec.sh and
-sets up with the setup-amd-ci action names the suite's runner, ROCm image,
-sgl-router fetch, and container env; /rerun-test runs the suite's files the
-same way. Every value is the one a pull_request run takes.
+pr-test-amd.yml and pr-test-amd-extra.yml run each suite in a job that sets up
+with the setup-amd-ci action and runs `run_suite.py --hw amd --suite <suite>`
+through amd_ci_exec.sh; /rerun-test runs the suite's files the same way, with
+the values a pull_request run takes. Jobs that set up their own container
+(disaggregation) are left out.
+
+Run as a script, it prints the setup inputs and container env of suite argv[1]
+as GITHUB_OUTPUT lines for rerun-test.yml.
 """
 
 import functools
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,83 +75,60 @@ def _pr_expr(expr, job, jobs):
     raise ValueError(f"cannot evaluate `${{{{ {expr} }}}}`")
 
 
-def _suite_steps(job):
-    """(suite, exec_env) of each step running run_suite.py through amd_ci_exec.sh."""
-    out = []
-    for step in job.get("steps") or []:
-        run = str(step.get("run", "")).replace("\\\n", " ")
-        m = _RUN_SUITE.search(run)
-        if m is None or not re.search(r"--hw\s+amd\b", m.group("args")):
-            continue
-        suite = re.search(r"--suite\s+(\S+)", m.group("args"))
-        exec_env = tuple(re.findall(r"(?<!\S)-e\s+(\S+)", m.group("exec_args")))
-        out.append((suite.group(1) if suite else "", exec_env))
-    return out
-
-
 @functools.cache
-def _jobs(workflows_dir=WORKFLOWS_DIR):
-    """(source, suite, exec_env, job, jobs) for every job in WORKFLOWS that runs
-    one AMD suite."""
-    out = []
+def load_suites():
+    """Suite -> AmdSuite for every job in WORKFLOWS that sets up with
+    SETUP_ACTION; ValueError when a value is not literal for a pull_request run
+    or one suite runs with two settings."""
+    suites = {}
     for name in WORKFLOWS:
-        with open(workflows_dir / name, encoding="utf-8") as f:
+        with open(WORKFLOWS_DIR / name, encoding="utf-8") as f:
             jobs = yaml.safe_load(f)["jobs"]
         for job_name, job in jobs.items():
-            runs = set(_suite_steps(job))
-            if not runs:
+            steps = job.get("steps") or []
+            setups = [s for s in steps if s.get("uses") == SETUP_ACTION]
+            if not setups:
                 continue
             source = f"{name} job `{job_name}`"
-            suite, exec_env = _one(sorted(runs), f"{source}'s run_suite.py steps")
-            if not suite or "${{" in suite:
-                raise ValueError(f"{source}: cannot read a literal --suite")
-            out.append((source, suite, exec_env, job, jobs))
-    return out
-
-
-@functools.cache
-def load_suites(workflows_dir=WORKFLOWS_DIR):
-    """Suite -> AmdSuite for every job in WORKFLOWS that sets up with SETUP_ACTION.
-
-    Raises ValueError when a job's values cannot be read, or when two jobs run
-    one suite with different settings.
-    """
-    suites, sources = {}, {}
-    for source, suite_name, exec_env, job, jobs in _jobs(workflows_dir):
-        setups = [s for s in job["steps"] if s.get("uses") == SETUP_ACTION]
-        if not setups:
-            continue
-        setup = _one(setups, f"{source}'s {SETUP_ACTION} steps").get("with") or {}
-        sgl_router = setup.get("sgl_router", False)
-        if not isinstance(sgl_router, bool) or any("${{" in e for e in exec_env):
-            raise ValueError(
-                f"{source}: cannot read a literal sgl_router and container env "
-                f"from {setup} and {list(exec_env)}"
-            )
-        try:
-            suite = AmdSuite(
-                runs_on=_pr_value(job["runs-on"], job, jobs),
-                rocm_version=_pr_value(setup.get("rocm_version", ""), job, jobs),
-                sgl_router=sgl_router,
-                exec_env=exec_env,
-            )
-        except (KeyError, ValueError) as e:
-            raise ValueError(f"{source}: {e!r}") from e
-        if suites.setdefault(suite_name, suite) != suite:
-            raise ValueError(
-                f"AMD suite `{suite_name}` runs with {suites[suite_name]} in "
-                f"{sources[suite_name]} but with {suite} in {source}"
-            )
-        sources.setdefault(suite_name, source)
+            setup = _one(setups, f"{source}'s {SETUP_ACTION} steps").get("with") or {}
+            for step in steps:
+                run = str(step.get("run", "")).replace("\\\n", " ")
+                m = _RUN_SUITE.search(run)
+                if m is None or not re.search(r"--hw\s+amd\b", m.group("args")):
+                    continue
+                suite = re.search(r"--suite\s+(\S+)", m.group("args"))
+                exec_env = tuple(re.findall(r"(?<!\S)-e\s+(\S+)", m.group("exec_args")))
+                sgl_router = setup.get("sgl_router", False)
+                if (
+                    suite is None
+                    or not isinstance(sgl_router, bool)
+                    or "${{" in suite.group(1) + " ".join(exec_env)
+                ):
+                    raise ValueError(
+                        f"{source}: non-literal suite, sgl_router, or container env"
+                    )
+                try:
+                    entry = AmdSuite(
+                        _pr_value(job["runs-on"], job, jobs),
+                        _pr_value(setup.get("rocm_version", ""), job, jobs),
+                        sgl_router,
+                        exec_env,
+                    )
+                except KeyError as e:
+                    raise ValueError(f"{source}: cannot evaluate {e!r}") from e
+                if suites.setdefault(suite.group(1), entry) != entry:
+                    raise ValueError(
+                        f"AMD suite `{suite.group(1)}` runs as "
+                        f"{suites[suite.group(1)]} in one job but as {entry} in "
+                        f"{source}"
+                    )
     return suites
 
 
-@functools.cache
-def own_setup_jobs():
-    """Suite -> source for the jobs in WORKFLOWS that set up their own container
-    (no SETUP_ACTION step), which /rerun-test cannot reproduce."""
-    return {
-        suite: source
-        for source, suite, _, job, _ in _jobs()
-        if not any(s.get("uses") == SETUP_ACTION for s in job["steps"])
-    }
+if __name__ == "__main__":
+    suite = load_suites().get(sys.argv[1])
+    if suite is None:
+        sys.exit(f"No {SETUP_ACTION} job in {', '.join(WORKFLOWS)} runs {sys.argv[1]}")
+    print(f"rocm_version={suite.rocm_version}")
+    print(f"sgl_router={str(suite.sgl_router).lower()}")
+    print(f"exec_env={' '.join(suite.exec_env)}")

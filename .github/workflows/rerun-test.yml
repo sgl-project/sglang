@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Dispatch mode: cuda | multimodal_gen | cpu | npu | npu_single_node | amd"
+        description: "Dispatch mode: cuda | multimodal_gen | cpu | npu | amd"
         required: true
         type: choice
         options:
@@ -13,7 +13,6 @@ on:
           - multimodal_gen
           - cpu
           - npu
-          - npu_single_node
           - amd
       test_command:
         description: "Test command(s) to run, one per line (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
@@ -39,38 +38,8 @@ on:
         required: false
         type: string
         default: ""
-      npu_suite:
-        description: "Registered NPU suite the files belong to (npu modes only)"
-        required: false
-        type: string
-        default: ""
-      npu_image:
-        description: "Container image the NPU stage installs the PR into (npu modes only)"
-        required: false
-        type: string
-        default: ""
-      npu_sgl_router:
-        description: "Build sgl-router for PD tests (npu mode only)"
-        required: false
-        type: boolean
-        default: false
-      npu_collect_nightly_tests:
-        description: "The files are registered with nightly=True (npu modes only)"
-        required: false
-        type: boolean
-        default: false
-      amd_rocm_version:
-        description: "ROCm image variant of the AMD CI container, e.g. rocm10 (amd only)"
-        required: false
-        type: string
-        default: ""
-      amd_sgl_router:
-        description: "Fetch sgl-router for PD tests (amd only)"
-        required: false
-        type: boolean
-        default: false
-      amd_exec_env:
-        description: "Space-separated KEY=VALUE env for amd_ci_exec.sh (amd only)"
+      suite:
+        description: "Registered suite the files belong to (npu and amd only)"
         required: false
         type: string
         default: ""
@@ -131,9 +100,16 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.partition.outputs.matrix }}
-      # npu modes only: the NPU stages split one file list with run_suite.py.
+      # npu only: the inputs of the suite's _npu-pr-test-stage.yml job.
       partitions: ${{ steps.partition.outputs.partitions }}
       only_tests: ${{ steps.partition.outputs.only_tests }}
+      image: ${{ steps.partition.outputs.image }}
+      sgl_router: ${{ steps.partition.outputs.sgl_router }}
+      collect_nightly_tests: ${{ steps.partition.outputs.collect_nightly_tests }}
+      # amd only (and sgl_router above): the setup-amd-ci inputs and container
+      # env of the suite's job in pr-test-amd.yml or pr-test-amd-extra.yml.
+      rocm_version: ${{ steps.partition.outputs.rocm_version }}
+      exec_env: ${{ steps.partition.outputs.exec_env }}
     steps:
       - name: Checkout partition script
         uses: actions/checkout@v4
@@ -155,7 +131,17 @@ jobs:
           TEST_ROOT: partition-source
           MODE: ${{ inputs.mode }}
           RUNS_ON: ${{ inputs.runs_on }}
-        run: python3 scripts/ci/partition_rerun_tests.py
+          SUITE: ${{ inputs.suite }}
+        run: |
+          python3 scripts/ci/partition_rerun_tests.py
+          # Fails for a suite no stage or setup-amd-ci job runs, so only those
+          # names reach the later shell steps. This checkout is github.sha, so
+          # the derived values come from the base branch's workflows.
+          if [[ "$MODE" == "npu" || "$MODE" == "amd" ]]; then
+            python3 -c 'import yaml' 2>/dev/null ||
+              python3 -m pip install --disable-pip-version-check pyyaml
+            python3 "scripts/ci/${MODE}_suites.py" "$SUITE" >> "$GITHUB_OUTPUT"
+          fi
 
   rerun-test-cuda:
     name: rerun-test-cuda (partition ${{ matrix.partition }})
@@ -505,8 +491,8 @@ jobs:
           fi
           echo "All $total test(s) passed in ${total_elapsed}s"
 
-  # The NPU stages run the files through run_suite.py with the suite's own
-  # install; their reply line has no "running" mark, only the result.
+  # The NPU stage runs the files through run_suite.py with the suite's own
+  # install; its reply line has no "running" mark, only the result.
   rerun-test-npu:
     needs: prepare-partitions
     if: inputs.mode == 'npu'
@@ -514,43 +500,20 @@ jobs:
       contents: read
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: ${{ inputs.npu_suite }}
+      self_name: ${{ inputs.suite }}
       runner_config: ${{ inputs.runs_on }}
-      image: ${{ inputs.npu_image }}
-      npu_device_type: a3
+      image: ${{ needs.prepare-partitions.outputs.image }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
       partitions: ${{ needs.prepare-partitions.outputs.partitions }}
       ref: ${{ inputs.pr_head_sha || github.sha }}
       skip_pr_test_health_check: 'true'
       only_tests: ${{ fromJson(needs.prepare-partitions.outputs.only_tests) }}
-      collect_nightly_tests: ${{ inputs.npu_collect_nightly_tests }}
-      sgl_router: ${{ inputs.npu_sgl_router }}
-
-  rerun-test-npu-single-node:
-    needs: prepare-partitions
-    if: inputs.mode == 'npu_single_node'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: ${{ inputs.runs_on }}
-      # Only nightly runs read it, to name their output directories.
-      test_type: ${{ contains(inputs.npu_suite, '-perf-') && 'perf' || 'accuracy' }}
-      test_suite: ${{ inputs.npu_suite }}
-      image: ${{ inputs.npu_image }}
-      install_sglang_deps: true
-      device_type_for_deps: a3
-      skip_pr_test_health_check: 'true'
-      partitions: ${{ needs.prepare-partitions.outputs.partitions }}
-      ref: ${{ inputs.pr_head_sha || github.sha }}
-      test_timeout_minutes: '60'
-      only_tests: ${{ fromJson(needs.prepare-partitions.outputs.only_tests) }}
-      collect_nightly_tests: ${{ inputs.npu_collect_nightly_tests }}
+      collect_nightly_tests: ${{ needs.prepare-partitions.outputs.collect_nightly_tests == 'true' }}
+      sgl_router: ${{ needs.prepare-partitions.outputs.sgl_router == 'true' }}
 
   # Runs each file directly, as rerun-test-cuda does, in the AMD CI container
-  # set up as the suite's job in pr-test-amd.yml or pr-test-amd-extra.yml
-  # sets it up (scripts/ci/amd_suites.py).
+  # set up as the suite's job sets it up (scripts/ci/amd_suites.py).
   rerun-test-amd:
     name: rerun-test-amd (partition ${{ matrix.partition }})
     needs: prepare-partitions
@@ -593,17 +556,18 @@ jobs:
 
       - uses: ./.github/actions/setup-amd-ci
         with:
-          rocm_version: ${{ inputs.amd_rocm_version }}
-          sgl_router: ${{ inputs.amd_sgl_router }}
+          rocm_version: ${{ needs.prepare-partitions.outputs.rocm_version }}
+          sgl_router: ${{ needs.prepare-partitions.outputs.sgl_router }}
 
       - name: Run test
         timeout-minutes: 60
         env:
           TEST_COMMAND: ${{ matrix.test_command }}
-          AMD_EXEC_ENV: ${{ inputs.amd_exec_env }}
+          EXEC_ENV: ${{ needs.prepare-partitions.outputs.exec_env }}
         run: |
+          read -ra kvs <<< "$EXEC_ENV"
           exec_env=()
-          for kv in $AMD_EXEC_ENV; do
+          for kv in "${kvs[@]}"; do
             exec_env+=(-e "$kv")
           done
           cmds=()
@@ -644,14 +608,7 @@ jobs:
           echo "All $total test(s) passed in ${total_elapsed}s"
 
   write-back-result:
-    needs:
-      - prepare-partitions
-      - rerun-test-cuda
-      - rerun-test-multimodal-gen
-      - rerun-test-cpu
-      - rerun-test-npu
-      - rerun-test-npu-single-node
-      - rerun-test-amd
+    needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu, rerun-test-npu, rerun-test-amd]
     if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
     runs-on: ubuntu-latest
     permissions:
@@ -677,7 +634,6 @@ jobs:
              || "${{ needs.rerun-test-multimodal-gen.result }}" == "success" \
              || "${{ needs.rerun-test-cpu.result }}" == "success" \
              || "${{ needs.rerun-test-npu.result }}" == "success" \
-             || "${{ needs.rerun-test-npu-single-node.result }}" == "success" \
              || "${{ needs.rerun-test-amd.result }}" == "success" ]]; then
             STATUS=success
           else
