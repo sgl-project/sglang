@@ -220,7 +220,9 @@ class TestStageLifecycle(unittest.TestCase):
                 with patch.object(
                     deepseek_v4,
                     "get_platform",
-                    return_value=SimpleNamespace(is_sm100=False, is_sm90=False),
+                    return_value=SimpleNamespace(
+                        is_sm100=False, is_sm90=False, is_sm120=False
+                    ),
                 ):
                     layer.refresh_mhc_norm_weight_cache()
                 self.assertNotIn("_can_fuse_attn_mhc", layer.__dict__)

@@ -664,22 +664,30 @@ python3 -m sglang.launch_server \
 
 3. Launch Router
 
-The router command requires the `sglang-router` package. It is pre-installed in the Docker image; if you installed
-SGLang from source and do not have it yet, run `pip install sglang-router` first.
+The router is the `sgl-router` binary. It is pre-installed in the Docker image at `/usr/local/bin/sgl-router`; if you
+installed SGLang from source, build it from the `sgl-router` directory of the SGLang repository (this needs a Rust
+toolchain, e.g., from [rustup](https://rustup.rs)) and put it on your `PATH`:
 
 ```bash Command
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://127.0.0.1:30001 8995 \
-    --decode http://127.0.0.1:30002 \
+cd sgl-router
+cargo build --release --bin sgl-router
+cp target/release/sgl-router /usr/local/bin/
+```
+
+```bash Command
+sgl-router \
+    --model-id meta-llama/Llama-3.1-8B-Instruct \
+    --no-tokenizer \
+    --worker-urls http://127.0.0.1:30001 http://127.0.0.1:30002 \
     --host 127.0.0.1 \
     --port 30000
 ```
 
 <Note>
-The `8995` in command script is the disaggregation bootstrap port. It must match the
-`--disaggregation-bootstrap-port` value set on the prefill server in step 1.
+`--worker-urls` lists the prefill and decode servers together: the router reads each server's role and the prefill
+bootstrap port from the server itself. `--model-id` must match the servers' model name, which is their
+`--served-model-name`, or their `--model-path` when that flag is not set. `--no-tokenizer` leaves tokenization to the
+servers. Wait for `curl http://127.0.0.1:30000/readiness` to return HTTP 200, which means both servers are registered.
 </Note>
 
 ### Running Service For Multimodal Language Models
@@ -757,7 +765,8 @@ SGLang defaults to port `30000` when `--port` is not specified. The examples in 
 curl http://127.0.0.1:30000/health
 ```
 
-A successful response returns HTTP 200 with an empty body.
+A successful response returns HTTP 200 with an empty body. On the PD router, `/health` only shows that the router is
+up; use `/readiness` to check that the prefill and decode servers are registered.
 
 ### Generate (Native Endpoint)
 

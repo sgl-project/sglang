@@ -1378,6 +1378,32 @@ class RowParallelLinear(LinearBase):
 
         return output, output_bias
 
+    def supports_partial_into(self, input_: torch.Tensor) -> bool:
+        """Whether ``partial_into`` runs the GEMM ``forward`` runs on this input."""
+        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        return (
+            type(self.quant_method) is UnquantizedLinearMethod
+            and current_platform.is_cuda()
+            # an out= GEMM is not differentiable
+            and not torch.is_grad_enabled()
+            and self.input_is_parallel
+            and input_.dim() >= 2
+            and input_.dtype == self.weight.dtype
+            and (
+                bias is None or (bias.dtype == input_.dtype and input_.is_contiguous())
+            )
+        )
+
+    def partial_into(self, input_: torch.Tensor, out: torch.Tensor) -> None:
+        """This rank's partial sum of ``forward``, before the all-reduce, written
+        into the 2D ``out``: the mm / addmm that ``F.linear`` lowers to."""
+        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        rows = input_.reshape(-1, input_.shape[-1])
+        if bias is None:
+            torch.mm(rows, self.weight.t(), out=out)
+        else:
+            torch.addmm(bias, rows, self.weight.t(), out=out)
+
     def extra_repr(self) -> str:
         s = f"input_features={self.input_size_per_partition}"
         s += f", output_features={self.output_size}"

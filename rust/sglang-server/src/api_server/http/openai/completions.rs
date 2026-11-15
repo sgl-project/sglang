@@ -18,6 +18,7 @@ use sglang_processor::dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, PromptTokensDetails, Stop,
 };
 
+use super::super::auth::DeclaredRoute;
 use super::super::dp_relay::HintRoute;
 use super::pd_routing::PDRoutingFields;
 use super::{
@@ -35,7 +36,7 @@ use crate::message::types::{OneOrMany, TokenIds};
 use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/completions", post(completions))
+    Router::new().declared_route("/v1/completions", post(completions))
 }
 
 #[derive(Deserialize)]

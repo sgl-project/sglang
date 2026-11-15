@@ -15,16 +15,18 @@
 
 from __future__ import annotations
 
+import errno
 import ipaddress
 import logging
 import math
 import os
+import stat
 import threading
 import time
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
-from typing import Dict, Optional, Sequence, Union
+from typing import BinaryIO, Dict, Optional, Sequence, Union
 from urllib.parse import unquote, urljoin, urlparse
 
 import numpy as np
@@ -38,6 +40,13 @@ from sglang.srt.utils.device import is_cuda
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
+
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
 
 
 _mm_http_session = threading.local()
@@ -56,6 +65,12 @@ _allowed_media_domains: frozenset[str] = frozenset()
 
 
 _media_url_max_file_size_bytes = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB * 1024 * 1024
+
+
+_media_url_timeout: Optional[float] = None
+
+
+_allow_local_media_files = True
 
 
 def _normalize_media_domain(domain: str) -> str:
@@ -93,6 +108,8 @@ def _normalize_media_domain(domain: str) -> str:
 def configure_media_url_security(
     allowed_media_domains: Optional[Sequence[str]] = None,
     max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
+    timeout: Optional[float] = None,
+    allow_local_files: bool = True,
 ) -> list[str]:
     """Configure process-wide safeguards for client-supplied media URLs.
 
@@ -103,14 +120,29 @@ def configure_media_url_security(
 
     if max_file_size_mb < 0:
         raise ValueError("media_url_max_file_size_mb must be non-negative")
+    if timeout is not None and timeout <= 0:
+        raise ValueError("media_url_timeout must be positive")
 
     normalized_domains = sorted(
         {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
     )
     global _allowed_media_domains, _media_url_max_file_size_bytes
+    global _media_url_timeout, _allow_local_media_files
     _allowed_media_domains = frozenset(normalized_domains)
     _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
+    _media_url_timeout = timeout
+    _allow_local_media_files = allow_local_files
     return normalized_domains
+
+
+def media_url_security_config() -> tuple:
+    """The configured policy, as ``configure_media_url_security`` arguments."""
+    return (
+        sorted(_allowed_media_domains),
+        _media_url_max_file_size_bytes // (1024 * 1024),
+        _media_url_timeout,
+        _allow_local_media_files,
+    )
 
 
 def _assert_media_url_allowed(url: str) -> None:
@@ -125,6 +157,12 @@ def _assert_media_url_allowed(url: str) -> None:
             f"Allowed domains: {sorted(_allowed_media_domains)}; "
             f"input domain: {hostname}"
         )
+
+
+def media_url_timeout(default: float) -> float:
+    if _media_url_timeout is not None:
+        return _media_url_timeout
+    return float(os.getenv("REQUEST_TIMEOUT", default))
 
 
 def download_remote_media(url: str, timeout: float) -> bytes:
@@ -229,6 +267,93 @@ CLIENT_MEDIA_EXCEPTIONS = (
 )
 
 
+# The client named a path that cannot exist as a file. Anything else (EMFILE,
+# ENOSPC, EACCES, ...) is a server-side fault and propagates.
+_CLIENT_PATH_ERRNOS = frozenset(
+    {
+        errno.ENOENT,
+        errno.ENOTDIR,
+        errno.EISDIR,
+        errno.ENAMETOOLONG,
+        errno.ELOOP,
+        errno.ENXIO,
+    }
+)
+
+
+def shorten_media_source(value: str) -> str:
+    return value if len(value) <= 100 else value[:100] + "..."
+
+
+def _open_local_media_file(path: str) -> BinaryIO:
+    if not _allow_local_media_files:
+        raise ValueError("Local media files are not allowed")
+    try:
+        # A FIFO opens at once instead of waiting for a writer; fstat rejects it.
+        f = open(path, "rb", opener=lambda p, flags: os.open(p, flags | os.O_NONBLOCK))
+    except OSError as e:
+        if e.errno not in _CLIENT_PATH_ERRNOS:
+            raise
+        # str(e) repeats the full path; e.strerror does not.
+        raise ValueError(
+            f"Could not read media from path {shorten_media_source(path)}: {e.strerror}"
+        ) from e
+    st = os.fstat(f.fileno())
+    max_bytes = _media_url_max_file_size_bytes
+    if not stat.S_ISREG(st.st_mode):
+        f.close()
+        raise ValueError(
+            f"Media path is not a regular file: {shorten_media_source(path)}"
+        )
+    if max_bytes and st.st_size > max_bytes:
+        f.close()
+        raise ValueError(
+            f"Media file exceeds the {max_bytes} byte limit: {shorten_media_source(path)}"
+        )
+    return f
+
+
+def check_local_media_file(path: str) -> str:
+    """Raise ValueError unless ``path`` is an allowed, in-cap regular file."""
+    _open_local_media_file(path).close()
+    return path
+
+
+def read_local_media_file(path: str) -> bytes:
+    max_bytes = _media_url_max_file_size_bytes
+    with _open_local_media_file(path) as f:
+        # Bounded even when st_size understates the content (e.g. /proc files).
+        data = f.read(max_bytes + 1) if max_bytes else f.read()
+    if max_bytes and len(data) > max_bytes:
+        raise ValueError(
+            f"Media file exceeds the {max_bytes} byte limit: {shorten_media_source(path)}"
+        )
+    return data
+
+
+def is_local_media_path(value: str) -> bool:
+    """Probes the filesystem only when local files are allowed, so a disallowed
+    path never reveals whether it exists."""
+    return _allow_local_media_files and os.path.exists(value)
+
+
+def _decode_bare_base64(value: str) -> bytes:
+    try:
+        return pybase64.b64decode(value, validate=True)
+    except ValueError as e:
+        if not value.startswith("/"):
+            raise
+        # Neither base64 nor an existing local file: say both.
+        hint = (
+            "no such file exists"
+            if _allow_local_media_files
+            else "local media files are not allowed"
+        )
+        raise ValueError(
+            f"Media is not valid base64 ({e}) and {hint}: {shorten_media_source(value)}"
+        ) from e
+
+
 def load_audio(
     audio_file: Union[str, bytes], sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
@@ -243,12 +368,12 @@ def load_audio(
     elif isinstance(audio_file, str) and (
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        timeout = media_url_timeout(5)
         source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
-        source = unquote(urlparse(audio_file).path)
+        source = check_local_media_file(unquote(urlparse(audio_file).path))
     elif isinstance(audio_file, str):
-        source = audio_file
+        source = check_local_media_file(audio_file)
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
@@ -348,7 +473,18 @@ class VideoData:
     max_long_side_pixel: Optional[int] = None
 
 
-image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+image_extension_names = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".heic",
+    ".heif",
+)
 
 
 GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
@@ -514,16 +650,19 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        timeout = media_url_timeout(3)
         return download_remote_media(image_file, timeout=timeout)
-    if image_file.startswith(("file://", "/")):
-        with open(image_file, "rb") as f:
-            return f.read()
+    if image_file.startswith("file://"):
+        return read_local_media_file(unquote(urlparse(image_file).path))
+    # Raw base64 JPEG also starts with "/" ("/9j/..."), so only existing paths
+    # take the path branch.
+    if image_file.startswith("/") and is_local_media_path(image_file):
+        return read_local_media_file(image_file)
     if isinstance(image_file, str) and image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
     if isinstance(image_file, str):
-        return pybase64.b64decode(image_file, validate=True)
+        return _decode_bare_base64(image_file)
     raise NotImplementedError(f"Invalid image: {image_file}")
 
 
@@ -540,17 +679,17 @@ def _normalize_video_input(
         return video_file
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = media_url_timeout(10)
             return download_remote_media(video_file, timeout=timeout)
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
-            return unquote(urlparse(video_file).path)
-        elif os.path.isfile(unquote(urlparse(video_file).path)):
-            return video_file
+            return check_local_media_file(unquote(urlparse(video_file).path))
+        elif is_local_media_path(video_file):
+            return check_local_media_file(video_file)
         else:
-            return pybase64.b64decode(video_file, validate=True)
+            return _decode_bare_base64(video_file)
     else:
         return None
 
@@ -564,8 +703,7 @@ def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
     if isinstance(source, bytes):
         return source
     if isinstance(source, str):
-        with open(source, "rb") as f:
-            return f.read()
+        return read_local_media_file(source)
     raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
 

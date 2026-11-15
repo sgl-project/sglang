@@ -421,6 +421,9 @@ _DIT_SUBFOLDER = "transformer"
 _DIT_SINGLE_FILE = "diffusion_pytorch_model.safetensors"
 _FLOAT_DTYPE_BYTES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2}
 _FLOAT_DTYPES = frozenset(_FLOAT_DTYPE_BYTES)
+# BatchNorm's int64 step counter (the FLUX.2 VAE has one) is not a weight;
+# counting its dtype would make the checkpoint look quantized and unsized.
+_NON_WEIGHT_BUFFER_SUFFIXES = (".num_batches_tracked",)
 _UNSIZED_WEIGHT_SUFFIXES = (".bin", ".pt", ".pth", ".ckpt", ".gguf")
 
 
@@ -442,7 +445,10 @@ def _local_dit_parameter_counts(folder: str) -> Counter[str] | None:
         return None
     counts: Counter[str] = Counter()
     for shard in shards:
-        counts.update(parse_local_safetensors_file_metadata(shard).parameter_count)
+        tensors = parse_local_safetensors_file_metadata(shard).tensors
+        for name, info in tensors.items():
+            if not name.endswith(_NON_WEIGHT_BUFFER_SUFFIXES):
+                counts[info.dtype] += info.parameter_count
     return counts
 
 

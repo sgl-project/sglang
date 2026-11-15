@@ -16,65 +16,41 @@
     },
     "runner_overrides": {
         "b200-cirrascale1-0123": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1574.32
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17742.04
             }
         },
         "b200-cirrascale1-4567": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1574.32
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17742.04
             }
         },
         "b200-cirrascale2": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1471.19
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17346.65
             }
         },
         "b200-cirrascale3-0123": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1470.24
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17894.49
             }
         },
         "b200-cirrascale3-4567": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1471.19
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17346.65
             }
         },
         "b200-cirrascale4-0123": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1470.24
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17894.49
             }
         },
         "b200-cirrascale4-4567": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1471.19
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 17346.65
             }
         },
         "b200-di": {
-            "flux1_modelopt_nvfp4_t2i": {
-                "expected_e2e_ms": 1334.16
-            },
             "qwen_image_2512_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 16126.87
             }
@@ -114,39 +90,6 @@
         ]
     },
     "scenarios": {
-        "flux1_modelopt_nvfp4_t2i": {
-            "expected_load_ms": 38841.5,
-            "stages_ms": {
-                "InputValidationStage": 0.06,
-                "TextEncodingStage": 25.48,
-                "LatentPreparationStage": 0.23,
-                "TimestepPreparationStage": 2.09,
-                "DenoisingStage": 1097.5,
-                "DecodingStage": 15.42
-            },
-            "denoise_step_ms": {
-                "0": 100.7,
-                "1": 51.43,
-                "2": 92.65,
-                "3": 50.75,
-                "4": 91.21,
-                "5": 51.0,
-                "6": 51.14,
-                "7": 91.25,
-                "8": 50.41,
-                "9": 90.48,
-                "10": 50.42,
-                "11": 90.57
-            },
-            "expected_e2e_ms": 836.71,
-            "expected_avg_denoise_ms": 91.2,
-            "expected_median_denoise_ms": 90.58,
-            "estimated_full_test_time_s": 71.2,
-            "load_peak_vram_mb": 18297.16,
-            "runtime_peak_vram_mb": 23335.04,
-            "load_peak_allocated_mb": 18112.88,
-            "runtime_peak_allocated_mb": 19195.3
-        },
         "flux2_modelopt_nvfp4_t2i": {
             "expected_load_ms": 71333.99,
             "stages_ms": {
@@ -352,6 +295,62 @@
             "runtime_peak_vram_mb": 34903.58,
             "load_peak_allocated_mb": 13661.57,
             "runtime_peak_allocated_mb": 31120.37
+        },
+        "minimax_h3_image_t2i": {
+            "stages_ms": {
+                "MiniMaxH3PartitionAdmissionStage": 0.01,
+                "MiniMaxH3TextEncodingStage": 0.54,
+                "MiniMaxH3VisualEncodingStage": 0.01,
+                "MiniMaxH3LatentPreparationStage": 1.84,
+                "MiniMaxH3TimestepPreparationStage": 0.09,
+                "MiniMaxH3DenoisingStage": 903.57,
+                "MiniMaxH3DecodingStage": 874.98
+            },
+            "denoise_step_ms": {
+                "0": 19.61,
+                "1": 75.53,
+                "2": 148.58,
+                "3": 147.61,
+                "4": 153.34,
+                "5": 152.23
+            },
+            "expected_e2e_ms": 1788.26,
+            "expected_load_ms": 235750.66,
+            "expected_avg_denoise_ms": 116.15,
+            "expected_median_denoise_ms": 148.09,
+            "load_peak_vram_mb": 115964.0,
+            "runtime_peak_vram_mb": 116498.0,
+            "load_peak_allocated_mb": 115514.33,
+            "runtime_peak_allocated_mb": 114358.96,
+            "estimated_full_test_time_s": 281.1
+        },
+        "minimax_h3_image_edit": {
+            "stages_ms": {
+                "MiniMaxH3PartitionAdmissionStage": 0.01,
+                "MiniMaxH3TextEncodingStage": 16.25,
+                "MiniMaxH3VisualEncodingStage": 43.95,
+                "MiniMaxH3LatentPreparationStage": 0.04,
+                "MiniMaxH3TimestepPreparationStage": 0.08,
+                "MiniMaxH3DenoisingStage": 1658.58,
+                "MiniMaxH3DecodingStage": 907.8
+            },
+            "denoise_step_ms": {
+                "0": 18.99,
+                "1": 135.22,
+                "2": 272.4,
+                "3": 281.78,
+                "4": 275.84,
+                "5": 276.59
+            },
+            "expected_e2e_ms": 2635.42,
+            "expected_load_ms": 48000.89,
+            "expected_avg_denoise_ms": 210.13,
+            "expected_median_denoise_ms": 274.12,
+            "load_peak_vram_mb": 115964.0,
+            "runtime_peak_vram_mb": 116962.0,
+            "load_peak_allocated_mb": 115514.33,
+            "runtime_peak_allocated_mb": 114641.36,
+            "estimated_full_test_time_s": 66.8
         }
     }
 }

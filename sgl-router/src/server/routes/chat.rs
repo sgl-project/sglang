@@ -11,6 +11,7 @@ pub(super) use preparation::enforce_minimax_m31_thinking;
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
+use crate::off_worker;
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
@@ -38,9 +39,80 @@ use std::time::Instant;
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
-/// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
-/// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
+/// Default cap on a buffered inference request body, including base64
+/// multimodal inputs (32 MiB). [`SGLANG_ROUTER_MAX_BODY_BYTES`] overrides it;
+/// [`max_chat_body_bytes`] is the value actually enforced.
 pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
+
+/// Env var that overrides [`MAX_CHAT_BODY_BYTES`]: a positive decimal byte
+/// count. A deployment that accepts larger multimodal requests (several base64
+/// images or audio clips) raises it without rebuilding the router.
+pub const SGLANG_ROUTER_MAX_BODY_BYTES: &str = "SGLANG_ROUTER_MAX_BODY_BYTES";
+
+/// The request-body cap every inference route enforces, through the
+/// `DefaultBodyLimit` layer in app.rs (413 past it). Read from
+/// [`SGLANG_ROUTER_MAX_BODY_BYTES`] once, on first use (`build_router` at
+/// startup), and logged then; an unset or empty variable gives
+/// [`MAX_CHAT_BODY_BYTES`], and an unparsable or zero value gives the same
+/// default with a WARN rather than failing startup. The value is bytes: `256`
+/// is a 256-byte cap, not 256 MiB.
+pub fn max_chat_body_bytes() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var_os(SGLANG_ROUTER_MAX_BODY_BYTES);
+        let (bytes, source) = resolve_max_body_bytes(raw.as_deref());
+        match source {
+            BodyCapSource::Default | BodyCapSource::Env => tracing::info!(
+                max_body_bytes = bytes,
+                source = if source == BodyCapSource::Env {
+                    SGLANG_ROUTER_MAX_BODY_BYTES
+                } else {
+                    "default"
+                },
+                "request body cap"
+            ),
+            BodyCapSource::Invalid(reason) => tracing::warn!(
+                value = ?raw,
+                reason,
+                max_body_bytes = bytes,
+                "ignoring {SGLANG_ROUTER_MAX_BODY_BYTES}; using the default request body cap"
+            ),
+        }
+        bytes
+    })
+}
+
+/// Where the resolved request-body cap came from.
+#[derive(Debug, PartialEq)]
+enum BodyCapSource {
+    Default,
+    Env,
+    /// The variable was set but unusable; the default applies.
+    Invalid(String),
+}
+
+/// Resolve a raw [`SGLANG_ROUTER_MAX_BODY_BYTES`] value to the cap. Unset,
+/// empty or whitespace-only gives the default. A positive decimal integer
+/// (surrounding whitespace allowed, no unit suffix) is the cap. Anything else,
+/// zero, overflow and non-UTF-8 included, gives the default and the reason.
+fn resolve_max_body_bytes(raw: Option<&std::ffi::OsStr>) -> (usize, BodyCapSource) {
+    let Some(raw) = raw else {
+        return (MAX_CHAT_BODY_BYTES, BodyCapSource::Default);
+    };
+    let invalid = |reason: String| (MAX_CHAT_BODY_BYTES, BodyCapSource::Invalid(reason));
+    let Some(raw) = raw.to_str() else {
+        return invalid("not valid UTF-8".to_string());
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return (MAX_CHAT_BODY_BYTES, BodyCapSource::Default);
+    }
+    match raw.parse::<usize>() {
+        Ok(0) => invalid("must be greater than zero".to_string()),
+        Ok(bytes) => (bytes, BodyCapSource::Env),
+        Err(e) => invalid(format!("not a byte count: {e}")),
+    }
+}
 
 /// An inference route. HTTP and gRPC calls prepare and select for it alike.
 #[derive(Clone, Copy)]
@@ -191,6 +263,9 @@ impl Endpoint {
 }
 
 /// Validate the body and resolve its routing policy, as `endpoint` does over HTTP.
+/// Render and tokenize leave the async worker on their own. Parsing and
+/// rebuilding a large body is CPU work too, so for a large body the whole step
+/// runs through [`off_worker::run_for_body`].
 async fn prepare<'a>(
     ctx: &'a AppContext,
     endpoint: Endpoint,
@@ -198,50 +273,55 @@ async fn prepare<'a>(
     body: Bytes,
     grpc: bool,
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
-    let served_model = || ModelId(ctx.config.model.id.clone());
-    let (routing, request) = match endpoint {
+    off_worker::run_for_body(body.len(), || {
+        prepare_now(ctx, endpoint, headers, body, grpc)
+    })
+}
+
+fn prepare_now<'a>(
+    ctx: &'a AppContext,
+    endpoint: Endpoint,
+    headers: &HeaderMap,
+    body: Bytes,
+    grpc: bool,
+) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
+    // One model is served, so any `model` name routes to it; the engine still
+    // reads the name the body carries, with any `:adapter` suffix.
+    let model = ModelId(ctx.config.model.id.clone());
+    let routing = ModelRouting::lookup(ctx, &model)?;
+    let request = match endpoint {
         Endpoint::Chat | Endpoint::Completions => {
             let mut fields = parse_routing_fields(&body)?;
-            let model = fields.model.take();
-            let model =
-                ModelId(model.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
-            let (model, body) = canonicalize_model_alias(ctx, model, body)?;
-            let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
+            let sent = fields.model.take();
+            let sent =
+                ModelId(sent.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
+            let (_, body) = canonicalize_model_alias(ctx, sent, body)?;
             let needs_tokens = routing.needs_request_tokens(ctx);
             let path = if matches!(endpoint, Endpoint::Chat) {
                 CHAT_PATH
             } else {
                 COMPLETIONS_PATH
             };
-            let request = if grpc && matches!(endpoint, Endpoint::Completions) {
+            if grpc && matches!(endpoint, Endpoint::Completions) {
                 PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
             } else if grpc {
                 PreparedRequest::openai_grpc(ctx, path, model, fields, headers, body, needs_tokens)?
             } else {
                 PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
-            };
-            (routing, request)
+            }
         }
-        Endpoint::Generate => {
-            let model = served_model();
-            let routing = ModelRouting::lookup(ctx, &model)?;
-            (routing, PreparedRequest::generate(ctx, model, body)?)
-        }
+        Endpoint::Generate => PreparedRequest::generate(ctx, model, body)?,
         Endpoint::Embeddings | Endpoint::Classify => {
             let path = endpoint.path();
-            let (model, mut value) = parse_embedding_request(&body)?;
-            let (model, body) = canonicalize_model_alias(ctx, model, body)?;
-            value["model"] = model.0.clone().into();
-            let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
+            let (sent, mut value) = parse_embedding_request(&body)?;
+            let (sent, body) = canonicalize_model_alias(ctx, sent, body)?;
+            value["model"] = sent.0.into();
             require_plain_workers(ctx, &model, path)?;
-            let request = PreparedRequest::embeddings(ctx, path, model, body, value)?;
-            (routing, request)
+            PreparedRequest::embeddings(ctx, path, model, body, value)?
         }
         Endpoint::Rerank => {
-            let model = served_model();
-            let routing = ModelRouting::lookup(ctx, &model)?;
             require_plain_workers(ctx, &model, RERANK_PATH)?;
-            (routing, PreparedRequest::rerank(model, body)?)
+            PreparedRequest::rerank(model, body)?
         }
     };
     Ok((request, routing))
@@ -294,26 +374,6 @@ impl<'a> ModelRouting<'a> {
             ChatRouting::Reorg(resolvers) => resolvers.get(model).map(Self::Reorg),
         };
         routing.ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))
-    }
-
-    /// Like `lookup`, but `base:adapter` (SGLang's LoRA syntax) resolves to
-    /// `base`; the body still names the adapter for the engine. Aliases have
-    /// already been canonicalized in both the routing model and the body.
-    fn lookup_openai(ctx: &'a AppContext, model: ModelId) -> Result<(ModelId, Self), ApiError> {
-        let split = model
-            .0
-            .strip_prefix(&ctx.config.model.id)
-            .and_then(|suffix| suffix.strip_prefix(':'))
-            .map(|adapter| (ctx.config.model.id.as_str(), adapter))
-            .or_else(|| model.0.split_once(':'));
-        match (Self::lookup(ctx, &model), split) {
-            (Err(error), Some((base, _))) => {
-                let base = ModelId(base.trim().to_owned());
-                let routing = Self::lookup(ctx, &base).map_err(|_| error)?;
-                Ok((base, routing))
-            }
-            (routing, _) => Ok((model, routing?)),
-        }
     }
 
     fn needs_request_tokens(&self, ctx: &AppContext) -> bool {
@@ -410,7 +470,7 @@ impl<'a> ModelRouting<'a> {
     }
 }
 
-fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
+pub(crate) fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
     let model = model.0.clone();
     match error {
         PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers { model },
@@ -761,6 +821,49 @@ fn parse_optional_positive_f64_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::off_worker::test_support::{slow_chat_body, slow_template_dir, time_beside_a_timer};
+    use crate::tokenizer::TokenizerRegistry;
+    use std::time::Duration;
+
+    #[test]
+    fn max_body_bytes_resolves_from_the_env_value() {
+        use std::ffi::OsStr;
+        let resolve = |v: Option<&str>| resolve_max_body_bytes(v.map(OsStr::new));
+        // Unset or empty: the default, no warning.
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                resolve(unset),
+                (MAX_CHAT_BODY_BYTES, BodyCapSource::Default),
+                "{unset:?}"
+            );
+        }
+        // A positive byte count, larger or smaller than the default.
+        assert_eq!(resolve(Some("268435456")), (256 << 20, BodyCapSource::Env));
+        assert_eq!(resolve(Some(" 1024\n")), (1024, BodyCapSource::Env));
+        // Zero and unparsable values keep the default and say why.
+        for bad in [
+            "0",
+            "-1",
+            "256MiB",
+            "1.5",
+            "0x100",
+            "99999999999999999999999",
+        ] {
+            let (bytes, source) = resolve(Some(bad));
+            assert_eq!(bytes, MAX_CHAT_BODY_BYTES, "{bad:?}");
+            assert!(
+                matches!(source, BodyCapSource::Invalid(_)),
+                "{bad:?}: {source:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let (bytes, source) = resolve_max_body_bytes(Some(OsStr::from_bytes(b"\xff")));
+            assert_eq!(bytes, MAX_CHAT_BODY_BYTES);
+            assert!(matches!(source, BodyCapSource::Invalid(_)));
+        }
+    }
 
     #[test]
     fn aliases_match_whole_names_and_the_longest_lora_prefix() {
@@ -791,12 +894,6 @@ mod tests {
                 "{input}"
             );
         }
-        ctx.policies =
-            Arc::new(crate::policies::factory::build_registry_with_defaults(&ctx.config).unwrap());
-        let (base, _) =
-            ModelRouting::lookup_openai(&ctx, ModelId("s3://bucket/served:adapter".into()))
-                .unwrap_or_else(|_| panic!("the full served URI must resolve before its adapter"));
-        assert_eq!(base.0, ctx.config.model.id);
     }
 
     #[test]
@@ -850,5 +947,51 @@ mod tests {
             ),
             Err(ApiError::PolicySelectionFailed { .. })
         ));
+    }
+
+    /// A routable context over [`slow_template_dir`] that tokenizes chat
+    /// requests in `prepare`. The directory must outlive the registry load.
+    fn slow_render_ctx(dir: &std::path::Path) -> AppContext {
+        let mut ctx = AppContext::stub();
+        ctx.config.model.tokenizer_path = Some(dir.join("tokenizer.json").to_str().unwrap().into());
+        // A token-aware route, so `prepare` renders and tokenizes the chat.
+        ctx.config.model.dp_aware = true;
+        ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+        ctx.policies.insert(
+            ModelId("stub-model".into()),
+            Arc::new(crate::policies::round_robin::RoundRobinPolicy::new()),
+        );
+        ctx
+    }
+
+    /// With ONE worker, a slow chat render in `prepare` must not keep another
+    /// task's timer from firing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_chat_render_leaves_the_runtime_serving() {
+        let dir = slow_template_dir();
+        let ctx = Arc::new(slow_render_ctx(dir.path()));
+        let body = slow_chat_body(
+            |b| assert!(ctx.tokenizers.encode_chat("stub-model", b).is_some()),
+            Duration::from_millis(400),
+        );
+        let body = Bytes::from(body.to_string());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (took, ticked_after) = time_beside_a_timer(move || async move {
+            let tokens = prepare(&ctx, Endpoint::Chat, &HeaderMap::new(), body, false)
+                .await
+                .map(|(request, _)| request.tokens.is_some())
+                .map_err(|e| format!("{e:?}"));
+            tx.send(tokens).unwrap();
+        })
+        .await;
+        assert_eq!(
+            rx.await.unwrap(),
+            Ok(true),
+            "prepare must have rendered and tokenized the chat"
+        );
+        assert!(
+            ticked_after < took / 2,
+            "timer task waited {ticked_after:?} while prepare took {took:?}"
+        );
     }
 }

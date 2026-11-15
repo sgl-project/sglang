@@ -98,8 +98,6 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
             decode_attention_backend_str="mamba2",
         )
 
-    server_args = model_runner.server_args
-
     # Already resolved and stamped on the runner before this call.
     resolved = ResolvedAttentionBackendStr(
         prefill=model_runner.prefill_attention_backend_str,

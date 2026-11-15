@@ -104,9 +104,19 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        modelslim_cache_layout=None,
+        is_draft_worker: bool = False,
         **kwargs,
     ):
+        self.is_modelslim_mxfp8 = (
+            modelslim_cache_layout is not None
+            and modelslim_cache_layout.layout == "gqa_mxfp8"
+        )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        if self.is_modelslim_mxfp8:
+            head_num = modelslim_cache_layout.local_kv_heads
+            head_dim = modelslim_cache_layout.key_head_dim
+            v_head_dim = modelslim_cache_layout.value_head_dim
         self.use_scatter_pa_kv_cache = envs.SGLANG_NPU_USE_SCATTER_PA_KV_CACHE.get()
         self.use_triton_prefix_kv_cache_store = (
             envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
@@ -188,6 +198,37 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     for i in range(self.layer_num)
                 ]
 
+            if self.is_modelslim_mxfp8:
+                self._mxfp8_scales_initialized = False
+                if not self.use_fia:
+                    self.k_buffer = list(self.k_buffer.unbind(0))
+                    self.v_buffer = list(self.v_buffer.unbind(0))
+                pages = self.size // self.page_size + 1
+                shape = (self.layer_num, pages, self.page_size, self.head_num)
+                # QFA uses PA_BBND, with pairs of per-32 UE8M0 scales.
+                self.k_scale_buffer = list(
+                    torch.full(
+                        (*shape, self.head_dim // 64, 2),
+                        127,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    ).unbind(0)
+                )
+                self.v_scale_buffer = list(
+                    torch.empty(
+                        (
+                            self.layer_num,
+                            pages,
+                            self.page_size // 64,
+                            self.head_num,
+                            self.v_head_dim,
+                            2,
+                        ),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    ).unbind(0)
+                )
+
     def get_hicache_transfer_buffers(self):
         """Return contiguous all-layer KV tensors for NPU HiCache IO."""
         return self._hicache_k_buffer, self._hicache_v_buffer
@@ -223,6 +264,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         # implementation relies on self.data_strides / self.data_ptrs, which the
         # NPU paged buffer layout never builds.
         self._kv_copy_config = None
+
+    def get_kv_scale_buffer(self, layer_id: int):
+        local_layer = layer_id - self.start_layer
+        return self.k_scale_buffer[local_layer], self.v_scale_buffer[local_layer]
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -260,6 +305,15 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def get_kv_scale_buf_infos(self):
+        """Expose dynamic K scales for PD; V scales are initialized from weights."""
+        buffers = self.k_scale_buffer
+        return (
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [buffer[0].nbytes for buffer in buffers],
+        )
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
@@ -276,7 +330,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
+        if self.is_modelslim_mxfp8:
+            cache_k, cache_v, k_scale = layer.scheme.quantize_cache(cache_k, cache_v)
+        elif cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
@@ -296,7 +352,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             and hasattr(torch_npu, "npu_scatter_pa_kv_cache")
             and self.store_dtype in (torch.float16, torch.bfloat16, torch.int8)
         )
-        if self.use_fia or use_scatter_pa:
+        if self.use_fia or use_scatter_pa or self.is_modelslim_mxfp8:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
             num_rows = loc.numel()
@@ -344,6 +400,16 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     loc_indices,
                     cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
                 )
+                if self.is_modelslim_mxfp8:
+                    torch_npu.npu_scatter_nd_update_(
+                        self.k_scale_buffer[layer_id - self.start_layer].view(
+                            -1, self.head_num, self.head_dim // 32
+                        ),
+                        loc_indices,
+                        k_scale.contiguous().view(
+                            num_rows, self.head_num, self.head_dim // 32
+                        ),
+                    )
         else:
             loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(

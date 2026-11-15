@@ -107,7 +107,48 @@ class TestMpsRuntime(CustomTestCase):
             )
         with self.assertRaisesRegex(ValueError, "multimodal serving"):
             validate_mps_model_config(
-                types.SimpleNamespace(quantization=None, is_multimodal=True)
+                types.SimpleNamespace(
+                    quantization=None,
+                    is_multimodal=True,
+                    hf_config=types.SimpleNamespace(
+                        architectures=["Qwen2VLForCausalLM"]
+                    ),
+                )
+            )
+
+    def test_unlimited_ocr_v2_has_an_mps_contract(self):
+        def config(arch, quantization=None):
+            return types.SimpleNamespace(
+                quantization=quantization,
+                is_multimodal=True,
+                hf_config=types.SimpleNamespace(architectures=[arch]),
+            )
+
+        uocr = config("UnlimitedOCRV2ForCausalLM")
+        self.assertIsNone(
+            validate_mps_model_config(uocr, attention_backend="unlimited_ocr_v2")
+        )
+        for field in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "serves only UnlimitedOCRV2"):
+                    validate_mps_model_config(
+                        types.SimpleNamespace(
+                            quantization=None,
+                            is_multimodal=False,
+                            hf_config=types.SimpleNamespace(
+                                architectures=["Qwen3ForCausalLM"]
+                            ),
+                        ),
+                        **{field: "unlimited_ocr_v2"},
+                    )
+        with self.assertRaisesRegex(ValueError, "quantization='fp8'"):
+            validate_mps_model_config(
+                config("UnlimitedOCRV2ForCausalLM", quantization="fp8"),
+                attention_backend="unlimited_ocr_v2",
             )
 
     def test_standard_path_rejects_unsupported_execution_modes(self):
@@ -130,6 +171,12 @@ class TestMpsRuntime(CustomTestCase):
             return types.SimpleNamespace(**base)
 
         self.assertIsNone(validate_standard_mps_server_args(make()))
+        # Checked against the architecture in validate_mps_model_config.
+        self.assertIsNone(
+            validate_standard_mps_server_args(
+                make(attention_backend="unlimited_ocr_v2")
+            )
+        )
 
         for overrides, expected in (
             ({"attention_backend": "fa3"}, "torch_native attention backend"),

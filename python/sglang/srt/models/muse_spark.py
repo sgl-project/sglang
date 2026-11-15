@@ -50,6 +50,7 @@ from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.layers.communication.muse_spark_gemm_ag import (
     gemm_ag,
     gemm_local,
+    muse_workspace,
     reserve_projection_workspace,
 )
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -95,7 +96,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
-from sglang.srt.utils import is_cpu, use_intel_amx_backend
+from sglang.srt.utils import is_cpu, is_hip, use_intel_amx_backend
 from sglang.srt.utils.device import get_device_capability, is_cuda
 
 _is_cpu = is_cpu()
@@ -554,10 +555,7 @@ class MuseSpark1xMoE(nn.Module):
                 or (self.tp_size == 8 and torch.cuda.get_device_capability() == (10, 0))
             )
         ):
-            ca_comm = get_parallel().tp_group.ca_comm
-            reserve_projection_workspace(
-                ca_comm, max(self.expert_hidden_size, self.hidden_size)
-            )
+            reserve_projection_workspace(max(self.expert_hidden_size, self.hidden_size))
         self.pre_expert_norm = MuseSpark1xRMSNorm(
             self.expert_hidden_size,
             eps=config.rms_norm_eps,
@@ -732,7 +730,7 @@ class MuseSpark1xMoE(nn.Module):
             if _is_cpu:
                 output, _ = self.post_expert_proj(output)
                 return output
-            comm = get_parallel().tp_group.ca_comm if self.tp_size > 1 else None
+            comm = muse_workspace()
             if not getattr(get_forward(), "sp_active", False) and gemm_ag_supported(
                 comm, output, self.post_expert_proj.weight
             ):
@@ -812,7 +810,7 @@ class MuseSpark1xMoE(nn.Module):
         elif _is_cpu:
             expert_input, _ = self.pre_expert_proj(hidden_states)
         else:
-            comm = get_parallel().tp_group.ca_comm if self.tp_size > 1 else None
+            comm = muse_workspace()
             if (
                 self.tp_size in (4, 8)
                 and not sp_active
@@ -1043,7 +1041,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         # A TP-sliced branch means the unpooler gather was deferred to the FFN boundary.
         if ffn_output.shape[-1] != stream.shape[-1]:
             next_attn_input, stream = all_gather_norm_residual(
-                get_parallel().tp_group.ca_comm,
+                muse_workspace(),
                 ffn_output,
                 stream,
                 **self._fused_ffn_boundary.jit_kernel_kwargs(),
@@ -1119,6 +1117,8 @@ class MuseSpark1xModel(nn.Module):
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
         if is_cuda():
+            # declare the collectives' slot while the TP workspace is still open
+            muse_workspace()
             from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
                 CustomAllReduceV2,
             )
@@ -1150,23 +1150,24 @@ class MuseSpark1xModel(nn.Module):
                 elif (
                     moe_layers[0].expert_hidden_size <= 0
                     or moe_layers[0].expert_hidden_size % 256
-                    or comm.max_push_size < moe_layers[0].expert_hidden_size * 2
-                    or not 0
-                    < comm._push_counter.numel()
-                    <= torch.cuda.get_device_properties(
-                        comm.device
-                    ).multi_processor_count
                 ):
                     logger.warning(
-                        "Finalize AR fusion unavailable: unsupported hidden size "
-                        "or push workspace capacity. Using separate finalize and AR."
+                        "Finalize AR fusion unavailable: unsupported hidden size. "
+                        "Using separate finalize and AR."
                     )
                 else:
-                    self._finalize_ar_workspace = FinalizePushWorkspace(
-                        comm,
-                        tp_group.device_group,
-                        hidden_dim=moe_layers[0].expert_hidden_size,
-                        multicast=comm.world_size > 4 and comm.has_multicast,
+                    hidden_dim = moe_layers[0].expert_hidden_size
+                    lease = muse_workspace()
+                    self._finalize_ar_workspace = (
+                        FinalizePushWorkspace(
+                            lease,
+                            comm,
+                            hidden_dim=hidden_dim,
+                            device_group=tp_group.device_group,
+                            multicast=comm.world_size > 4,
+                        )
+                        if lease is not None
+                        else None
                     )
                 for moe_layer in moe_layers:
                     moe_layer.set_finalize_ar_workspace(self._finalize_ar_workspace)
@@ -1222,7 +1223,11 @@ class MuseSpark1xModel(nn.Module):
         )
         if input_embeds is None and self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
-        sp_active = layernorm_sp.runs_sp(forward_batch.forward_mode)
+        # the pass's own rows (the bucket at capture), so --layernorm-sp-min-tokens
+        # decides the entry as maybe_exit_gather decides the exit
+        sp_active = layernorm_sp.runs_sp(
+            forward_batch.forward_mode, hidden_states.shape[0]
+        )
         get_forward().set("sp_active", sp_active)
         if sp_active:
             hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
@@ -1312,15 +1317,15 @@ class MuseSparkTextForCausalLM(nn.Module):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+        num_tokens = (
+            input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
+        )
         if aux_hidden_states is not None and layernorm_sp.runs_sp(
-            forward_batch.forward_mode
+            forward_batch.forward_mode, num_tokens
         ):
             # DFLASH consumes every prompt token in replicated token order.
             # Gather the taps before logits pruning applies full-token indices;
             # FULL capture also needs the entry-scatter padding removed.
-            num_tokens = (
-                input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-            )
             # Pack while sequence-sharded so the logits processor does not
             # duplicate the full replicated draft context with torch.cat.
             # Release the tap list before allocating the gathered output.
@@ -1335,7 +1340,7 @@ class MuseSparkTextForCausalLM(nn.Module):
         if (
             input_ids is None
             and input_embeds is not None
-            and layernorm_sp.runs_sp(forward_batch.forward_mode)
+            and layernorm_sp.runs_sp(forward_batch.forward_mode, input_embeds.shape[0])
         ):
             hidden_states = layernorm_sp.sp_exit_gather(
                 hidden_states, num_tokens=input_embeds.shape[0]
@@ -1647,6 +1652,13 @@ class MuseSparkTextForCausalLM(nn.Module):
                 and not self.int4_checkpoint
             ):
                 module.experts.prepare_trtllm_weights(module.experts.post_expert_norm)
+
+
+# Preserve the CUDA implementation and its FlashInfer/JIT optimizations.
+# The independently validated MI355 implementation keeps the fused boundaries,
+# Quark loader, and kernel rounding points that were measured together.
+if is_hip():
+    from sglang.srt.rocm_muse_spark.model import MuseSparkTextForCausalLM
 
 
 __all__ = [

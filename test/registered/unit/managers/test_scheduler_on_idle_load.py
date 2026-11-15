@@ -49,6 +49,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
+            request_retirer=None,
             send_abort=None,
         )
         s.scheduler_stage_metrics = None
@@ -107,6 +108,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
+            request_retirer=None,
             send_abort=None,
         )
         scheduler.scheduler_stage_metrics = SchedulerStageMetricsRecorder(enabled=False)
@@ -118,7 +120,6 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.running_batch.is_empty.return_value = True
         scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
         scheduler.enable_overlap = False
         scheduler._pp_microbatches_drained = MagicMock(return_value=True)
@@ -134,6 +135,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
         scheduler.hisparse_coordinator = None
+        scheduler.decode_offload_manager = None
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_hicache_storage = False
         scheduler.enable_unified_cache_external_linker = False

@@ -3139,3 +3139,63 @@ def test_finish_offload_writeback_is_noop_when_idle():
     )
 
     finish_offload_writeback()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+@torch.no_grad()
+def test_layerwise_breakable_graph_preserves_copies_and_event_lifetimes():
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        BaseBreakableCudaGraphRunner,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        eager_on_graph,
+    )
+
+    @eager_on_graph(output_factory=torch.empty_like, pass_output=True)
+    def boundary(x, out=None):
+        if out is None:
+            return x
+        out.copy_(x)
+        return out
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList(
+                [torch.nn.Linear(256, 256) for _ in range(4)]
+            )
+            self.offset = torch.nn.Parameter(torch.randn(256))
+
+        def forward(self, x):
+            for block in self.blocks:
+                x = boundary(block(x).relu())
+            return x + self.offset
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    model = Model().to(device)
+    inputs = [torch.randn(n, 256, device=device) for n in (8, 16)]
+    expected = [model(x).clone() for x in inputs]
+    manager = LayerwiseOffloadManager(
+        model, layers_attr_str="blocks", num_layers=4, enabled=True
+    )
+    model.layerwise_offload_managers = [manager]
+    copy_stream = manager.copy_stream
+    runner = BaseBreakableCudaGraphRunner(model, device)
+    try:
+        for x in inputs:
+            assert runner.capture(x=x)
+        assert len(runner.entries) == 2
+        # Rebinding component weights must not invalidate captured storage.
+        model.offset.data = model.offset.data.clone()
+        for x, reference in zip(inputs * 2, expected * 2):
+            torch.testing.assert_close(runner(x=x), reference, rtol=0, atol=0)
+        assert manager.copy_stream is copy_stream
+        assert manager._graph_capture_keepalive is None
+        assert not manager._gpu_layers
+        runner.reset()
+        torch.testing.assert_close(model(inputs[0]), expected[0], rtol=0, atol=0)
+    finally:
+        runner.reset()
+        manager.release_all()
+        manager.remove_forward_hooks()

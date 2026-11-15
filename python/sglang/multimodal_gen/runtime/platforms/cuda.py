@@ -519,16 +519,25 @@ class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
 
 
+class _FlashInferFA2BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.FLASHINFER_FA2
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from flashinfer import single_prefill_with_kv_cache  # noqa: F401
+        except ImportError as error:
+            raise ValueError("FlashInfer FA2 requires flashinfer-python.") from error
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flashinfer_fa2.FlashInferFA2Backend"
+
+
 class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA
 
     @classmethod
     def resolve(cls, platform) -> AttentionBackendEnum:
-        if platform.is_sm120():
-            logger.info(
-                "FlashAttention is not supported on SM12.x in this build; falling back to Torch SDPA."
-            )
-            return AttentionBackendEnum.TORCH_SDPA
+        # Explicit FA requests use the native FA4 preparation on Blackwell.
+        # The SM12.x default remains SDPA in _resolve_default_attn_backend.
         return AttentionBackendEnum.FA
 
 
@@ -584,6 +593,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
+        _FlashInferFA2BackendResolver,
         _FlashAttentionBackendResolver,
         _FP8FlashAttentionSM120BackendResolver,
     )
@@ -595,7 +605,6 @@ class CudaPlatformBase(Platform):
     device_name: str = "cuda"
     device_type: str = "cuda"
     dispatch_key: str = "CUDA"
-    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
@@ -813,6 +822,11 @@ class CudaPlatformBase(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
+        if selected_backend == AttentionBackendEnum.FLASHINFER_FA2 and dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise ValueError("FlashInfer FA2 requires float16 or bfloat16 inputs.")
         if selected_backend is None:
             target_backend = cls._resolve_default_attn_backend()
             if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():

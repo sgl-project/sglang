@@ -213,7 +213,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             draft_probs = (
                 torch.zeros(
-                    (self.max_bs, self.model_runner.model_config.vocab_size),
+                    # Replay copies draft probabilities into this buffer, so its
+                    # width must match the worker's pre-verification q.
+                    (
+                        self.max_bs,
+                        getattr(
+                            self.eagle_worker,
+                            "draft_probs_vocab_size",
+                            self.model_runner.model_config.vocab_size,
+                        ),
+                    ),
                     dtype=torch.float32,
                 )
                 if get_spec().speculative_use_rejection_sampling

@@ -127,8 +127,12 @@ message OptionalInt64List {
 
 // The native error body: `{"error": {"message", "code"}}` (Python
 // `http_server.generate_request` parity). Transports frame it themselves
-// (unary status + body, SSE error frame, gRPC status detail).
+// (unary status + body, SSE error frame, gRPC status detail). A streamed
+// error also carries `type` and `retryable`, as Python's `stream_results()`
+// frame does; a unary body leaves them unset.
 message ErrorBody {
   string message = 1;
   uint32 code = 2;
+  optional string type = 3;
+  optional bool retryable = 4;
 }

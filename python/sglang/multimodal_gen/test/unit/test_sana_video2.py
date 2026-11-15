@@ -151,6 +151,43 @@ class TestSanaVideo2(unittest.TestCase):
             rebuilt = model(x, t * 2, y, mask)
         torch.testing.assert_close(steps, [first, rebuilt], rtol=0, atol=0)
 
+    def test_softmax_attention_site_starts_on_reference_path(self):
+        from sglang.kernels.ops.diffusion import SANA_VIDEO2_SOFTMAX_ATTENTION
+        from sglang.multimodal_gen.runtime.models.dits.sana_video2 import (
+            GatedSoftmaxAttention,
+        )
+
+        model = self.small_model()
+        sites = list(SANA_VIDEO2_SOFTMAX_ATTENTION.iter_sites(model))
+        self.assertEqual(sites, [model.blocks[3].attn])
+        self.assertIsInstance(sites[0], GatedSoftmaxAttention)
+        self.assertFalse(SANA_VIDEO2_SOFTMAX_ATTENTION.is_enabled(sites[0]))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_softmax_attention_quality_path_matches_reference(self):
+        from sglang.kernels.ops.diffusion import SANA_VIDEO2_SOFTMAX_ATTENTION
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+            toggle_quality_fusions,
+        )
+
+        torch.manual_seed(19)
+        model = self.small_model().to(device="cuda", dtype=torch.bfloat16)
+        site = model.blocks[3].attn
+        x = torch.randn(1, 4, 2, 2, 2, device="cuda")
+        y = torch.randn(1, 5, 8, device="cuda")
+        t = torch.tensor([20.0], device="cuda")
+        mask = torch.tensor([[1, 1, 1, 0, 0]], device="cuda")
+        with torch.no_grad():
+            reference = model(x, t, y, mask)
+            toggle_quality_fusions([model], "high")
+            self.assertTrue(SANA_VIDEO2_SOFTMAX_ATTENTION.is_enabled(site))
+            fast = model(x, t, y, mask)
+            toggle_quality_fusions([model], "exact")
+            self.assertFalse(SANA_VIDEO2_SOFTMAX_ATTENTION.is_enabled(site))
+            restored = model(x, t, y, mask)
+        torch.testing.assert_close(fast, reference, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(restored, reference, rtol=0, atol=0)
+
     def test_official_checkpoint_names_and_output_sign(self):
         torch.manual_seed(17)
         model = self.small_model()

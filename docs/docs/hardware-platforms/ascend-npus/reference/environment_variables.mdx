@@ -24,7 +24,7 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>SGLANG_USE_FIA_NZ</code></td>
-      <td>Reshapes KV Cache for FIA NZ format.<br/> <code>SGLANG_USE_FIA_NZ</code> must be enabled with <code>SGLANG_NPU_USE_MLAPO</code></td>
+      <td>Reshapes KV Cache for FIA NZ format.</td>
       <td><code>false</code></td>
     </tr>
     <tr>
@@ -52,6 +52,26 @@ This document provides a list of commonly used environment variables and aims to
       <td>The maximum number of dispatched tokens on each rank.</td>
       <td><code>128</code></td>
     </tr>
+    <tr>
+      <td><code>SGLANG_SCHEDULER_SKIP_ALL_GATHER</code></td>
+      <td>Skips the scheduler's cross-DP-rank metadata all-gather on every step. <br/> Safe only when every DP rank sees the same forward mode and token <br/> counts (balanced DP load); there is no startup guard for uneven load.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_ENABLE_OVERLAP_PLAN_STREAM</code></td>
+      <td>Runs speculative batch-preparation kernels (draft-extend metadata, <br/> KV-location planning) on a dedicated stream, overlapped with other work. <br/> Incompatible with LoRA under EAGLE/NEXTN/EAGLE3 speculative decoding.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_USE_AG_AFTER_QLORA</code></td>
+      <td>Delays the attention all-gather until after the low-rank Q projection, <br/> so fewer bytes are gathered. Requires a model with <code>q_lora_rank</code> and <br/> <code>--enable-attn-tp-input-scattered</code>. The scattered-input layout is <br/> disabled under attention DP, a MoE all-to-all backend, or prefill context <br/> parallelism, and only prefill (extend) batches use it; outside those <br/> conditions the variable has no effect.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_SET_CPU_AFFINITY</code></td>
+      <td>Binds each TP rank's scheduler process to dedicated CPU cores, <br/> avoiding cross-core migration overhead.</td>
+      <td><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
@@ -73,6 +93,38 @@ attention-parameter updates in these speculative paths, enable both kernels and 
 `SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0`. Its default is `1`; the two kernel switches
 alone do not disable CPU mirrors. Setting either kernel switch to `0` keeps the existing
 attention path for that worker.
+
+## Profiling
+
+Used by the built-in PyTorch Profiler — see
+[Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling).
+
+<table>
+  <thead>
+    <tr>
+      <th>Environment Variable</th>
+      <th>Description</th>
+      <th>Default Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>SGLANG_TORCH_PROFILER_DIR</code></td>
+      <td>Output directory for profiler trace files.</td>
+      <td><code>/tmp</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_PROFILE_WITH_STACK</code></td>
+      <td>Record Python call stacks in profiler traces. An explicit <code>false</code> here or in the API parameter disables it.</td>
+      <td><code>true</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_PROFILE_RECORD_SHAPES</code></td>
+      <td>Record operator input shapes in profiler traces. An explicit <code>false</code> here or in the API parameter disables it.</td>
+      <td><code>true</code></td>
+    </tr>
+  </tbody>
+</table>
 
 ## Used in DeepEP Ascend
 

@@ -17,7 +17,12 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=980, suite="nightly-amd-8-gpu", nightly=True)
+register_amd_ci(
+    est_time=980,
+    suite="nightly-amd-8-gpu",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
+)
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 

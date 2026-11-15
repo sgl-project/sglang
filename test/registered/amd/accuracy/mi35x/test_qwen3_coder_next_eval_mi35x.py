@@ -28,7 +28,12 @@ from sglang.test.test_utils import (
 from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - MI35x Qwen3-Coder-Next accuracy test
-register_amd_ci(est_time=3600, suite="nightly-amd-8-gpu-mi35x", nightly=True)
+register_amd_ci(
+    est_time=3600,
+    suite="nightly-amd-8-gpu-mi35x",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
+)
 
 INVALID = -9999999
 
