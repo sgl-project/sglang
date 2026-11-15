@@ -70,7 +70,10 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import (
+    async_h2d_stack,
+    is_pin_memory_available,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -684,6 +687,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Each DP rank's rows from a late-layer row switch on; None on steps that skip
     # the exchange.
     global_late_layer_num_tokens_cpu: Optional[List[int]] = None
+    global_late_layer_tail_graph_compatible: bool = False
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -1517,7 +1521,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 for i in range(batch_size)
             ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            mrope_delta_tensor = async_h2d_stack(mrope_deltas, device=device)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
@@ -1944,13 +1948,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             local_late_rows = model_runner.attn_backend.late_layer_num_tokens(self)
             if local_late_rows is not None:
-                late_rows = torch.empty(sync_group_size, dtype=torch.int64)
+                tail_graph_compatible = (
+                    self.forward_mode.is_idle()
+                    or self.forward_mode.is_extend_without_speculative()
+                )
+                late_layout = torch.empty(2 * sync_group_size, dtype=torch.int64)
                 all_gather_single(
-                    late_rows,
-                    torch.tensor([local_late_rows], dtype=torch.int64),
+                    late_layout,
+                    torch.tensor(
+                        [local_late_rows, tail_graph_compatible], dtype=torch.int64
+                    ),
                     group=get_parallel().tp_group.cpu_group,
                 )
-                self.global_late_layer_num_tokens_cpu = late_rows.tolist()
+                late_rows, tail_graph_votes = late_layout.view(-1, 2).T.tolist()
+                self.global_late_layer_num_tokens_cpu = late_rows
+                self.global_late_layer_tail_graph_compatible = all(tail_graph_votes)
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker

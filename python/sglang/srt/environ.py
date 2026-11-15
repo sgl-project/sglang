@@ -335,6 +335,8 @@ class Envs:
     # ===================================================================
     # HTTP server and health
     # ===================================================================
+    # --admin-api-key when the flag is not given; the bundled clients send it as well.
+    SGLANG_ADMIN_API_KEY = EnvStr(None, secret=True)
     # Decompress request bodies tagged with `x-body-compressed`.
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
@@ -452,6 +454,8 @@ class Envs:
     # ===================================================================
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
+    # sgl-router binary the PD fixture launches: a path, or a name looked up on PATH
+    SGLANG_TEST_PD_ROUTER_BINARY = EnvStr("sgl-router")
     SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
     SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
     SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)

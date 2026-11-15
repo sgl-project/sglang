@@ -14,6 +14,8 @@ from sglang.srt.constants import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_HEADERS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -59,6 +61,8 @@ class UpdateWeightsFromDiskBase:
             *backend_test_suite.get("other_args", ()),
             "--enable-memory-saver",
             "--cuda-graph-backend-prefill=disabled",
+            "--admin-api-key",
+            ADMIN_API_KEY_FOR_TEST,
         )
         return popen_launch_server(
             self.model,
@@ -80,6 +84,7 @@ class UpdateWeightsFromDiskBase:
         response = requests.post(
             f"{self.base_url}{endpoint}",
             json=payload,
+            headers=ADMIN_HEADERS_FOR_TEST,
             timeout=timeout or self.request_timeout,
         )
         response.raise_for_status()
