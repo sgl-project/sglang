@@ -2252,13 +2252,16 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
                 validate_hisparse(server_args)
 
-    def _validate_hisparse_with_spec(self, algorithm):
+    def _validate_hisparse_with_spec(
+        self, algorithm, *, disaggregation_mode="null", minimax_sparse=False
+    ):
         server_args = ServerArgs(
             model_path="dummy",
             enable_hisparse=True,
             disable_radix_cache=True,
             speculative_algorithm=algorithm,
             speculative_eagle_topk=1,
+            disaggregation_mode=disaggregation_mode,
         )
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
@@ -2271,13 +2274,32 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             ),
             patch(
                 "sglang.srt.configs.model_config.is_deepseek_dsa",
-                return_value=True,
+                return_value=not minimax_sparse,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_minimax_sparse",
+                return_value=minimax_sparse,
             ),
         ):
             validate_hisparse(server_args)
 
-    def test_hisparse_accepts_dflash_speculation(self):
-        self._validate_hisparse_with_spec("DFLASH")
+    def test_hisparse_accepts_dflash_speculation_on_pd_decode(self):
+        self._validate_hisparse_with_spec("DFLASH", disaggregation_mode="decode")
+
+    def test_hisparse_accepts_eagle_speculation_without_pd(self):
+        self._validate_hisparse_with_spec("EAGLE")
+
+    def test_hisparse_rejects_dflash_and_uno_speculation_without_pd(self):
+        for algorithm in ("DFLASH", "UNO"):
+            with self.subTest(algorithm=algorithm):
+                with self.assertRaisesRegex(ValueError, "only on a PD decode server"):
+                    self._validate_hisparse_with_spec(algorithm)
+
+    def test_hisparse_rejects_speculation_on_minimax_sparse(self):
+        with self.assertRaisesRegex(ValueError, "DSA caches only"):
+            self._validate_hisparse_with_spec(
+                "DFLASH", disaggregation_mode="decode", minimax_sparse=True
+            )
 
     def test_hisparse_rejects_unvalidated_speculation(self):
         with self.assertRaisesRegex(ValueError, "has not validated"):

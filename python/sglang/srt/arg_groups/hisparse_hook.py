@@ -24,6 +24,8 @@ HISPARSE_XPU_DSA_BACKENDS_BY_DTYPE = {"bfloat16": {"intel_xpu"}}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
 HISPARSE_VALIDATED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "UNO", "DFLASH")
+# A request leaving HiSparse staging is relayed as an EAGLE draft input.
+HISPARSE_STAGED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3")
 
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
@@ -149,6 +151,22 @@ def validate_hisparse(server_args: ServerArgs) -> None:
                 "combinations are accepted: "
                 f"{', '.join(HISPARSE_VALIDATED_SPEC_ALGORITHMS)} (linear "
                 "speculation only, --speculative-eagle-topk 1)."
+            )
+        if is_v4_hisparse or is_m3_hisparse:
+            raise ValueError(
+                "HiSparse speculative decoding supports DSA caches only; drop "
+                "--speculative-algorithm or --enable-hisparse."
+            )
+        # A PD decode admits requests directly and never stages them.
+        if (
+            cfg.disaggregation_mode == "null"
+            and algorithm.upper() not in HISPARSE_STAGED_SPEC_ALGORITHMS
+        ):
+            raise ValueError(
+                f"--enable-hisparse supports speculative algorithm {algorithm!r} "
+                "only on a PD decode server (--disaggregation-mode decode); "
+                "without PD only "
+                f"{', '.join(HISPARSE_STAGED_SPEC_ALGORITHMS)} are supported."
             )
         if (cfg.speculative_eagle_topk or 1) != 1:
             raise ValueError(
