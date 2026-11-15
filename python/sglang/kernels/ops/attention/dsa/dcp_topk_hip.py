@@ -23,6 +23,9 @@ TOPK = 2048
 # Scores per thread held in registers (1024 threads); longer rows re-read the excess
 # per pass. 16 covers a DCP8 rank's share of a 131K context; 32 spills on gfx950.
 _LOCAL_PER_THREAD = 16
+# A row needing fewer chunks stays in one block: below 3 chunks the merge costs more than
+# the shorter re-reads save on MI355X.
+_LOCAL_MIN_CHUNKS = 3
 
 
 @cache_once
@@ -84,6 +87,7 @@ def dcp_local_candidates_hip(
             positions,
             chunk_scores,
             chunk_positions,
+            _LOCAL_MIN_CHUNKS,
             world,
             rank,
         )
@@ -96,10 +100,10 @@ def dcp_local_candidates_hip(
 
 # 1 selects the single-block kernel; the merge holds at most one block's registers of candidates.
 def _local_max_chunks(width: int) -> int:
-    if not envs.SGLANG_DSA_DCP_TOPK_CHUNKED.get():
+    chunks = triton.cdiv(width, _LOCAL_PER_THREAD * 1024)
+    if not envs.SGLANG_DSA_DCP_TOPK_CHUNKED.get() or chunks < _LOCAL_MIN_CHUNKS:
         return 1
-    chunk = _LOCAL_PER_THREAD * 1024
-    return min(triton.cdiv(width, chunk), chunk // TOPK)
+    return min(chunks, _LOCAL_PER_THREAD * 1024 // TOPK)
 
 
 def dcp_global_slots_hip(

@@ -347,6 +347,15 @@ __global__ __launch_bounds__(kThreads) void dcp_local_candidates_kernel(
       });
 }
 
+// Chunks a row of len scores is split into; a row needing fewer than min_chunks stays in one block
+// and re-reads its excess, as dcp_local_candidates_kernel does.
+template <int kPer>
+SGL_DEVICE int local_chunk_count(int len, int min_chunks, int max_chunks) {
+  constexpr int kChunk = kPer * kThreads;
+  const int n = (len + kChunk - 1) / kChunk;
+  return n < min_chunks ? 1 : min(n, max_chunks);
+}
+
 // Chunked local step for rows longer than one block holds in registers: block (row, c) takes the
 // top-2048 of chunk c (kPer * kThreads scores; the last chunk takes the rest of the row). A row of
 // one chunk writes its result directly; longer rows write per-chunk candidates for the merge kernel.
@@ -360,6 +369,7 @@ __global__ __launch_bounds__(kThreads) void dcp_local_chunk_kernel(
     int32_t* __restrict__ positions,
     float* __restrict__ chunk_scores,
     int32_t* __restrict__ chunk_positions,
+    int min_chunks,
     int max_chunks,
     int world,
     int rank) {
@@ -368,7 +378,7 @@ __global__ __launch_bounds__(kThreads) void dcp_local_chunk_kernel(
   const int64_t row = blockIdx.x;
   const int c = static_cast<int>(blockIdx.y);
   const int len = lengths[row];
-  const int nch = min(max((len + kChunk - 1) / kChunk, 1), max_chunks);
+  const int nch = local_chunk_count<kPer>(len, min_chunks, max_chunks);
   if (c >= nch) return;
   const int begin = c * kChunk;
   const int end = c == nch - 1 ? len : begin + kChunk;
@@ -419,12 +429,12 @@ __global__ __launch_bounds__(kThreads) void dcp_local_merge_kernel(
     const int32_t* __restrict__ chunk_positions,
     float* __restrict__ scores,
     int32_t* __restrict__ positions,
+    int min_chunks,
     int max_chunks) {
-  constexpr int kChunk = kPer * kThreads;
   __shared__ Smem sm;
   const int64_t row = blockIdx.x;
   const int len = lengths[row];
-  const int nch = min(max((len + kChunk - 1) / kChunk, 1), max_chunks);
+  const int nch = local_chunk_count<kPer>(len, min_chunks, max_chunks);
   if (nch == 1) return;
   const int64_t base = row * max_chunks * kTopK;
   float* os = scores + row * kTopK;
@@ -547,6 +557,7 @@ struct DcpLocalCandidatesChunkedHip {
       const tvm::ffi::TensorView positions,
       const tvm::ffi::TensorView chunk_scores,
       const tvm::ffi::TensorView chunk_positions,
+      const int64_t min_chunks,
       const int64_t world,
       const int64_t rank) {
     using namespace host;
@@ -570,6 +581,7 @@ struct DcpLocalCandidatesChunkedHip {
         "chunk_positions must be a dense [rows, max_chunks, 2048]");
     // the merge holds every candidate of a row in registers
     RuntimeCheck(max_chunks >= 1 && max_chunks * kTopK <= kPer * kThreads, "max_chunks out of range");
+    RuntimeCheck(min_chunks >= 1, "min_chunks must be positive");
     if (rows == 0) return;
     LaunchKernel(dim3(static_cast<uint32_t>(rows), static_cast<uint32_t>(max_chunks)), kThreads, logits.device())(
         dcp_local_chunk_kernel<kPer>,
@@ -580,6 +592,7 @@ struct DcpLocalCandidatesChunkedHip {
         static_cast<int32_t*>(positions.data_ptr()),
         static_cast<float*>(chunk_scores.data_ptr()),
         static_cast<int32_t*>(chunk_positions.data_ptr()),
+        static_cast<int>(min_chunks),
         static_cast<int>(max_chunks),
         static_cast<int>(world),
         static_cast<int>(rank));
@@ -591,6 +604,7 @@ struct DcpLocalCandidatesChunkedHip {
         static_cast<const int32_t*>(chunk_positions.data_ptr()),
         static_cast<float*>(scores.data_ptr()),
         static_cast<int32_t*>(positions.data_ptr()),
+        static_cast<int>(min_chunks),
         static_cast<int>(max_chunks));
   }
 };
