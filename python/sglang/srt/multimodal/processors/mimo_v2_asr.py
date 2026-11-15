@@ -5,6 +5,7 @@ processor only handles the special-token contract and content interleaving.
 """
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from typing import List, Literal, Union
@@ -23,7 +24,8 @@ from sglang.srt.multimodal.processors.mimo_audio import (
     AudioInput,
     MiMoAudioPipeline,
 )
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 TextInput = str | list[int]
 

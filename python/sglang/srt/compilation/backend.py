@@ -27,7 +27,7 @@ from sglang.srt.compilation.xpu_piecewise_backend import XPUPiecewiseBackend
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import require_out_of_tree_impl
-from sglang.srt.utils.common import is_npu, is_xpu
+from sglang.srt.utils.device import is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 

@@ -32,14 +32,17 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.kv.storage import _page_pairs
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverEvictedSWA,
     RecoverSWAWithLockedFull,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    ComponentType,
+    tree_slot_ids,
+)
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import (
@@ -52,6 +55,12 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _SWA = ComponentType.SWA
+
+
+def _window_slot(storage) -> ComponentType:
+    """The tree's id for unified ``storage``'s window slot."""
+    (slot,) = (s for s in storage.tree_slots() if s.family == TREE_WINDOW)
+    return tree_slot_ids(storage.tree_slots())[slot.component]
 
 
 class _StubTreeCore:
@@ -83,6 +92,9 @@ class _Probe(SWAComponent):
     def __init__(self, allocator):
         self.cache = _Cache(allocator, allocator.storage)
         self.tree_core = _StubTreeCore()
+        # The id the tree gives the storage's window slot, as a built
+        # component takes it from its slot.
+        self.component_type = _window_slot(allocator.storage)
 
 
 class _StaticAllocRecorder:
@@ -180,7 +192,7 @@ class TestOwnershipTransfer(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         donated = swa.ids.virtual_to_physical[incoming.to(torch.int64)].clone()
 
-        allocator.storage.rehome_window("swa", kept, incoming)
+        allocator.storage.rehome_window("window_32", kept, incoming)
 
         self.assertEqual(
             swa.ids.virtual_to_physical[kept.to(torch.int64)].tolist(),
@@ -203,7 +215,7 @@ class TestOwnershipTransfer(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(incoming)  # donor no longer owns anything
         with self.assertRaises(AssertionError):
-            allocator.storage.rehome_window("swa", kept, incoming)
+            allocator.storage.rehome_window("window_32", kept, incoming)
 
 
 class TestRecoverActionHandler(_RecoverTestBase):
@@ -216,9 +228,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(kept)  # what eviction does when it tombstones
         self.assertTrue(
-            bool(
-                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) == 0).all()
-            ),
+            bool((allocator.id_spaces()[allocator.roles.window].ids(kept) == 0).all()),
             "precondition: a tombstoned range translates to the sink",
         )
         # Snapshot AFTER the setup traffic: the invariant under test is that
@@ -226,12 +236,15 @@ class TestRecoverActionHandler(_RecoverTestBase):
         swa_live = swa.allocated_count()
         full_avail = allocator.full_attn_allocator.available_size()
 
+        window = _window_slot(allocator.storage)
         probe.apply_component_action(
-            RecoverSWAWithLockedFull(node_id=7, kept_full=kept, incoming_full=incoming)
+            RecoverSWAWithLockedFull(
+                node_id=7, kept_full=kept, incoming_full=incoming, component_type=window
+            )
         )
 
         ((node_id, ct, value),) = probe.tree_core.set_calls
-        self.assertEqual((node_id, ct), (7, _SWA))
+        self.assertEqual((node_id, ct), (7, window))
         self.assertEqual(len(value), len(kept))
         self.assertTrue(
             bool((value > 0).all()),
@@ -248,9 +261,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
             "the incoming ids' FULL side must come back",
         )
         self.assertTrue(
-            bool(
-                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) > 0).all()
-            ),
+            bool((allocator.id_spaces()[allocator.roles.window].ids(kept) > 0).all()),
             "after recovery the node's ids must address live swa pages",
         )
 
@@ -304,14 +315,14 @@ class TestRecoverEvictedSWAHandler(_RecoverTestBase):
 
         probe.apply_component_action(
             RecoverEvictedSWA(
-                component_type=_SWA, kept_full=kept, incoming_full=incoming
+                component_type=_window_slot(allocator.storage),
+                kept_full=kept,
+                incoming_full=incoming,
             )
         )
 
         self.assertTrue(
-            bool(
-                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) > 0).all()
-            ),
+            bool((allocator.id_spaces()[allocator.roles.window].ids(kept) > 0).all()),
             "the node's ids must address live swa pages after recovery",
         )
         self.assertTrue(

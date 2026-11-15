@@ -108,6 +108,11 @@ def test_fp8_dsa_prefix_read_uses_the_hybrid_full_attn_child():
         mock.patch.object(forward_mha, "get_kv_layers", return_value=fake_layers),
         mock.patch.object(
             forward_mha,
+            "get_token_to_kv_pool",
+            return_value=SimpleNamespace(dsa_kv_cache_store_fp8=False),
+        ),
+        mock.patch.object(
+            forward_mha,
             "filter_dcp_local_kv_indices",
             side_effect=lambda kv_indices: kv_indices,
         ),

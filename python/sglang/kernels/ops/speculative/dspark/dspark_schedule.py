@@ -9,6 +9,9 @@ import triton.language as tl
 from sglang.kernels.ops.speculative.dspark.dispatch import (
     inputs_on_cuda,
 )
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.dspark_components.dspark_planner import (
@@ -19,6 +22,11 @@ if TYPE_CHECKING:
 class ScheduleVerifyLensTopk:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
+        # All NPU archs route to the bit-exact torch reference: the triton
+        # kernel body (2D broadcast compare + axis-1 reduce, loop-carried
+        # rank) is not legalizable by the triton-ascend TTIR->Linalg pass
+        # (ascend has no global sort; the O(n^2)-rank scheme relies on
+        # patterns the backend cannot lower). CUDA keeps the fused kernel.
         if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
@@ -41,6 +49,14 @@ class ScheduleVerifyLensTopk:
         budget: int,
         cfg: DSparkScheduleConfig,
     ) -> torch.Tensor:
+        if _is_npu:
+            from sgl_kernel_npu.operators.sample import (
+                schedule_verify_lens_topk_triton as npu_schedule_verify_lens_topk,
+            )
+
+            return npu_schedule_verify_lens_topk(
+                confidence=confidence, budget=budget, cfg=cfg
+            )
         return schedule_verify_lens_topk_triton(
             confidence=confidence, budget=budget, cfg=cfg
         )
@@ -232,8 +248,12 @@ def schedule_verify_lens_topk_triton(
         G_P2=triton.next_power_of_2(max(gamma, 1)),
     )
     if budget > 0 and n > 0:
-        BLOCK_C = 64
-        BLOCK_CP = 256
+        if confidence.device.type == "npu":
+            BLOCK_C = 32
+            BLOCK_CP = 128
+        else:
+            BLOCK_C = 64
+            BLOCK_CP = 256
         grid = (triton.cdiv(n, BLOCK_C),)
         _schedule_topk_selected_extra_kernel[grid](
             survival,

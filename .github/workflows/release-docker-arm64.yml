@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
+
+name: Release Docker Arm64 CPU Images
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (without v prefix, e.g., 0.5.7)'
+        required: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-24.04-arm
+    environment: 'prod'
+    strategy:
+      matrix:
+        build_type: ['all']
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          # Validate version format
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push
+        run: |
+          version=${{ steps.version.outputs.version }}
+          tag=v${version}-arm64-cpu
+
+          docker build . -f docker/arm64.Dockerfile \
+            --build-arg VER_SGLANG=v${version} \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache
+          docker run --rm \
+            --entrypoint /opt/.venv/bin/python \
+            lmsysorg/sglang:${tag} \
+            -c 'import platform, torch, sgl_kernel; assert platform.machine() == "aarch64"; assert hasattr(torch.ops.sgl_kernel, "decode_attention_cpu"); print("Arm CPU kernel is available")'
+
+          docker push lmsysorg/sglang:${tag}

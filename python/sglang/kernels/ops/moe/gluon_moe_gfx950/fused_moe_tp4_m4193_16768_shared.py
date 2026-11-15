@@ -9,10 +9,8 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from .common import _add
 
-@gluon.jit
-def _add(a, b):
-    return a + b
 
 @gluon.jit
 def _maximum(a, b):

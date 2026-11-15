@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-_DSV4 = SimpleNamespace(is_deepseek_v4_arch=True, is_hybrid_swa_compress=False)
+_DSV4 = SimpleNamespace(is_compressed_kv_arch=True, is_hybrid_swa_compress=False)
 
 
 def _validate(token_to_kv_pool):

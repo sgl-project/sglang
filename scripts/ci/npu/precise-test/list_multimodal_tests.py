@@ -12,8 +12,8 @@ Output: one pytest target per line, with absolute paths, e.g.
     <workspace>/python/sglang/multimodal_gen/test/server/ascend/test_glm_image_distributed.py
 
 Absolute paths matter: run_tests_with_coverage.sh encodes them into the
-coverage directory name and test_selector.py recovers the repo-relative test
-path from the ``__sglang__sglang__`` workspace marker.
+coverage directory name and the precision selector recovers the
+repo-relative test path from the ``__sglang__sglang__`` workspace marker.
 
 Usage:
     python3 list_multimodal_tests.py --suite 1-npu \

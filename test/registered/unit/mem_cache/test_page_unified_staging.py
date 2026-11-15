@@ -121,7 +121,12 @@ def _cpu_staging_environment(*, dcp_size=1, **memory_overrides):
             )
         )
         stack.enter_context(
-            mock.patch.object(base, "host_memory_budget_bytes", return_value=1 << 40)
+            mock.patch.object(
+                base, "can_use_page_unified_load_back_jit_kernel", return_value=True
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(base, "host_memory_preflight", return_value=(0, 1 << 40))
         )
         stack.enter_context(
             mock.patch.dict(common.ALLOC_MEMORY_FUNCS, {"cpu": allocate_host})

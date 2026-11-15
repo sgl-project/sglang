@@ -108,9 +108,7 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
         )
         memory = SimpleNamespace(disable_radix_cache=False)
         modules = {
-            "sgl_kernel.flash_attn": _fake_attention_module(
-                "sgl_kernel.flash_attn", with_scheduler_metadata=True
-            ),
+            "sgl_fa3": _fake_attention_module("sgl_fa3", with_scheduler_metadata=True),
             "sglang.kernels.ops.attention.flash_attention_v4": _fake_attention_module(
                 "sglang.kernels.ops.attention.flash_attention_v4"
             ),
@@ -367,6 +365,7 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
         swa = torch.arange(24, device=device, dtype=torch.int32)
         swa[7] = -1
         runner_ids = RunnerIds.__new__(RunnerIds)
+        runner_ids._role_sub_pools = {}
         runner_ids._spaces = {
             IdSpaceKind.FULL: IdSpace(key="full", read_v2p=full),
         }

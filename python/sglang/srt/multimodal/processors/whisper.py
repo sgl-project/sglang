@@ -6,9 +6,9 @@ from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.whisper import WhisperForConditionalGeneration
+from sglang.srt.multimodal.media_io import load_audio
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import load_audio
 
 logger = logging.getLogger(__name__)
 

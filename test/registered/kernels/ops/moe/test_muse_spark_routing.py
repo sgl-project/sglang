@@ -10,7 +10,7 @@ from sglang.kernels.ops.moe.muse_spark_routing import FusedMuseSparkRouting
 from sglang.kernels.spec import KernelBackend
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _routing_op(num_experts, eps, multiplier, ep_map, num_valid):

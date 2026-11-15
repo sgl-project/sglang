@@ -41,7 +41,7 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     select_output_rollout_trajectory,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
-from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.server_warmup import (
     run_sync_client_warmup,
     should_run_explicit_client_warmup,
@@ -118,7 +118,6 @@ class DiffGenerator:
             server_args: The inference arguments
         """
         self.server_args = server_args
-        self.port_args = PortArgs.from_server_args(server_args)
 
         # The executor is now a client to the Scheduler service
         self.local_scheduler_process: list[mp.Process] | None = None

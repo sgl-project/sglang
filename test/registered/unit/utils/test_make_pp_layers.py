@@ -3,8 +3,8 @@ import unittest
 from torch import nn
 
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import make_pp_layers
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 

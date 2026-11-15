@@ -12,10 +12,22 @@ from pathlib import Path
 import requests
 from github import Auth, Github
 
-# Import scripts/ci/ modules (sibling-up dir): runner_configs and the rerun partitioner.
+# Import scripts/ci/ modules (sibling-up dir): runner_configs, npu_suites,
+# amd_suites, and the rerun partitioner.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import amd_suites as _amd_suites  # noqa: E402
+import npu_suites as _npu_suites  # noqa: E402
 import partition_rerun_tests as _partition  # noqa: E402
 import runner_configs as _runner_configs  # noqa: E402
+
+# ci_register.py imports nothing from sglang, so it loads without the package.
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "../../../python/sglang/test/ci"
+    ),
+)
+import ci_register as _ci_register  # noqa: E402
 
 # install_script values from runner_configs.yml are passed verbatim into a
 # `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
@@ -31,6 +43,7 @@ PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regress
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 CHANGED_TESTS_FLAG = "--changed"
 CHANGED_TESTS_SHORT_FLAG = "-c"
+HW_FLAG = "--hw"
 # CI selections: name -> workflow files and an optional opt-in label.
 # A null label selects existing workflows without a new hardware gate.
 # Resolved next to this script so it loads from any cwd;
@@ -989,13 +1002,13 @@ def _extract_runner_configs(content):
     return out
 
 
-def _extract_suites(content, register_fn):
-    """Pull every single-string `suite=` from `<register_fn>(...)` calls."""
+def _extract_suites(content, register_fn, kwarg="suite"):
+    """Pull every single-string `<kwarg>=` from `<register_fn>(...)` calls."""
     out = []
     for args in re.finditer(
         rf"^[^#\n]*{register_fn}\s*\(([^)]*)\)", content, re.MULTILINE
     ):
-        m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        m = re.search(rf'{kwarg}\s*=\s*["\']([^"\']+)["\']', args.group(1))
         if m:
             out.append(m.group(1))
     return out
@@ -1007,17 +1020,17 @@ def _extract_legacy_suites(content):
     return _extract_suites(content, "register_cuda_ci")
 
 
-# Backends with no job in rerun-test.yml (cuda / multimodal_gen / cpu only) and
-# no runner_config in runner_configs.yml, so no dispatch can be built for them.
+# Backends with no job in rerun-test.yml (cuda / multimodal_gen / cpu / npu /
+# amd only) and no runner_config in runner_configs.yml, so no dispatch can be
+# built for them.
 # Mirrors `REGISTER_MAPPING` in python/sglang/test/ci/ci_register.py.
 _OTHER_BACKEND_REGISTERS = {
-    "register_amd_ci": "AMD",
-    "register_npu_ci": "NPU",
     "register_xpu_ci": "XPU",
     "register_musa_ci": "MUSA",
     "register_mlx_ci": "MLX",
     "register_mps_ci": "MPS",
     "register_ppu_ci": "PPU",
+    "register_mlu_ci": "MLU",
 }
 
 
@@ -1046,7 +1059,7 @@ def _dispatch_err(suite, msg):
         "install_script": "",
         "install_timeout": "",
         "rdma_devices": "",
-        "is_cpu": False,
+        "mode": None,
         "error": msg,
     }
 
@@ -1081,15 +1094,19 @@ def _resolve_runner_config(rc, full_path, suite):
         "install_script": install_script,
         "install_timeout": str(cfg["install_timeout"]),
         "rdma_devices": cfg.get("rdma_devices", ""),
-        "is_cpu": False,
+        "mode": "cuda",
         "error": None,
     }
 
 
-def detect_suite(file_path_from_test):
+def detect_suite(file_path_from_test, hw=None):
     """
-    Read a test file and extract dispatch info from register_cuda_ci or
-    register_cpu_ci.
+    Read a test file and extract dispatch info from register_cuda_ci,
+    register_cpu_ci, register_npu_ci, or register_amd_ci.
+
+    `hw` is a key of RERUN_HW: the file's registrations for that backend, or
+    [] when it has none. Without `hw`, the first backend in RERUN_HW that the
+    file registers.
 
     A CUDA file can carry multiple `register_cuda_ci(...)` calls — one per
     pool it should run on — so this returns a *list* of dispatch dicts, one
@@ -1100,24 +1117,38 @@ def detect_suite(file_path_from_test):
     one path; the legacy single-string `suite=` carries no runner_config and is
     reported as non-dispatchable.
 
-    CPU files yield a single-element list. A file with no recognised (or no
+    CPU files yield a single-element list, NPU and AMD files one dict per
+    `register_npu_ci(...)` or `register_amd_ci(...)` call. A file with no recognised (or no
     dispatchable) registration yields a one-element list whose dict has an
     `error` set.
 
     Each dict has keys: suite, runner_label, install_script,
-    install_timeout, rdma_devices, is_cpu, error.
+    install_timeout, rdma_devices, mode, error; a dispatchable one also
+    has stage (the registered CI stage, e.g. `base-b`, the NPU or AMD suite, or
+    None).
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
         content = f.read()
 
+    for item in [hw] if hw else RERUN_HW:
+        infos = RERUN_HW[item][1](full_path, content)
+        if infos or hw:
+            return infos
+    return _no_rerun_backend_error(full_path, content)
+
+
+def _detect_cuda_or_cpu(full_path, content):
     cuda_calls = _extract_runner_configs(content)
     if cuda_calls:
         results = []
         for rc, args_str in cuda_calls:
             stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
             suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
-            results.append(_resolve_runner_config(rc, full_path, suite))
+            stage = stage_m.group(1) if stage_m else None
+            results.append(
+                {**_resolve_runner_config(rc, full_path, suite), "stage": stage}
+            )
         return results
 
     legacy_suites = _extract_legacy_suites(content)
@@ -1139,14 +1170,23 @@ def detect_suite(file_path_from_test):
                     f"{workflow} workflow manually.",
                 )
             ]
+        stages = _extract_suites(content, "register_cpu_ci", kwarg="stage")
+        ubuntu_suites = sorted(set(cpu_suites) & _partition.UBUNTU_CPU_SUITES)
+        if stages:
+            stage = stages[0]
+        elif ubuntu_suites:
+            stage = ubuntu_suites[0].split("-test-", 1)[0]
+        else:
+            stage = None
         return [
             {
                 "suite": "cpu",
+                "stage": stage,
                 "runner_label": "ubuntu-latest",
                 "install_script": "",
                 "install_timeout": "",
                 "rdma_devices": "",
-                "is_cpu": True,
+                "mode": "cpu",
                 "error": None,
             }
         ]
@@ -1164,6 +1204,10 @@ def detect_suite(file_path_from_test):
             )
         ]
 
+    return []
+
+
+def _no_rerun_backend_error(full_path, content):
     labels, suites = _extract_other_backends(content)
     if labels:
         backends = ", ".join(labels)
@@ -1172,8 +1216,8 @@ def detect_suite(file_path_from_test):
             _dispatch_err(
                 suites[0] if suites else None,
                 f"`{full_path}` is registered for {backends}{where}, not for "
-                f"CUDA or CPU; rerun-test.yml has no {backends} job. Rerun it "
-                f"with /rerun-failed-ci, or dispatch the {backends} workflow "
+                f"CUDA, CPU, NPU, or AMD; rerun-test.yml has no {backends} job. Rerun "
+                f"it with /rerun-failed-ci, or dispatch the {backends} workflow "
                 f"manually.",
             )
         ]
@@ -1181,20 +1225,119 @@ def detect_suite(file_path_from_test):
     return [
         _dispatch_err(
             None,
-            f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
-            f"found in `{full_path}`. This file may not be a registered CI test.",
+            f"No `register_cuda_ci(runner_config=...)`, `register_cpu_ci()`, "
+            f"`register_npu_ci()`, or `register_amd_ci()` found in `{full_path}`. "
+            f"This file may not be a registered CI test.",
         )
     ]
 
 
-def _resolve_test_spec(test_spec):
+def _detect_npu(full_path, content):
+    if not re.search(r"^[^#\n]*register_npu_ci\s*\(", content, re.MULTILINE):
+        return []
+    try:
+        # run_suite.py selects tests by this parse, `disabled` included.
+        registries, _ = _ci_register.ut_parse_one_file(full_path)
+        suites = _npu_suites.load_suites()
+    except (SyntaxError, ValueError) as e:
+        return [_dispatch_err(None, f"Cannot resolve NPU registrations: {e}")]
+    out = []
+    for r in registries:
+        if r.backend != _ci_register.HWBackend.NPU:
+            continue
+        suite = r.effective_suite
+        if suite not in suites:
+            out.append(
+                _dispatch_err(
+                    suite,
+                    f"NPU suite `{suite or '(multi-node)'}` of `{full_path}` has no a3 job calling "
+                    f"`_npu-pr-test-stage.yml`, the only NPU stage /rerun-test "
+                    f"runs (the perf/accuracy single-node stage, multi-node, "
+                    f"base-a, and a2/a5 suites are not supported).",
+                )
+            )
+        elif r.disabled is not None:
+            out.append(
+                _dispatch_err(
+                    suite,
+                    f"`{full_path}` is disabled in NPU suite `{suite}` "
+                    f"({r.disabled}), so run_suite.py would skip it.",
+                )
+            )
+        else:
+            out.append(
+                {
+                    "suite": suite,
+                    "stage": suite,
+                    "runner_label": suites[suite].runs_on,
+                    "install_script": "",
+                    "install_timeout": "",
+                    "rdma_devices": "",
+                    "mode": "npu",
+                    "error": None,
+                }
+            )
+    return out
+
+
+def _detect_amd(full_path, content):
+    if not re.search(r"^[^#\n]*register_amd_ci\s*\(", content, re.MULTILINE):
+        return []
+    try:
+        registries, _ = _ci_register.ut_parse_one_file(full_path)
+        suites = _amd_suites.load_suites()
+    except (SyntaxError, ValueError) as e:
+        return [_dispatch_err(None, f"Cannot resolve AMD registrations: {e}")]
+    out = []
+    for r in registries:
+        if r.backend != _ci_register.HWBackend.AMD:
+            continue
+        suite = r.effective_suite
+        if r.nightly or suite not in suites:
+            out.append(
+                _dispatch_err(
+                    suite,
+                    f"AMD suite `{suite}` of `{full_path}` has no job in "
+                    f"{' or '.join(_amd_suites.WORKFLOWS)} that sets up with "
+                    f"`setup-amd-ci`, the only AMD jobs /rerun-test reproduces "
+                    f"(nightly and disaggregation suites are not supported).",
+                )
+            )
+        else:
+            out.append(
+                {
+                    "suite": suite,
+                    "stage": suite,
+                    "runner_label": suites[suite].runs_on,
+                    "install_script": "",
+                    "install_timeout": "",
+                    "rdma_devices": "",
+                    "mode": "amd",
+                    "error": None,
+                }
+            )
+    return out
+
+
+# /rerun-test backends -> (label, detector). Without `--hw`, a file runs on the
+# first one it registers.
+RERUN_HW = {
+    "cuda": ("CUDA/CPU", _detect_cuda_or_cpu),
+    "npu": ("NPU", _detect_npu),
+    "amd": ("AMD", _detect_amd),
+}
+
+
+def _resolve_test_spec(test_spec, hw=None):
     """
     Resolve a single test spec into one or more dispatch entries.
 
-    A file registered on N pools (multiple `register_cuda_ci(...)` calls)
-    yields N entries — handle_rerun_test's grouping then sends one workflow
-    per pool. Multimodal and CPU files yield a single entry. Resolution
-    errors yield a one-element list with {"spec","error"}.
+    A file registered on N pools (multiple `register_cuda_ci(...)` or
+    `register_npu_ci(...)` calls) yields N entries — handle_rerun_test's
+    grouping then sends one workflow per pool. Multimodal and CPU files yield
+    a single entry. Resolution errors yield a one-element list with
+    {"spec","error"}. With `hw`, a file not registered for it yields [] (see
+    detect_suite); multimodal_gen files run only on cuda.
     """
     if "::" in test_spec:
         file_part, test_selector = test_spec.split("::", 1)
@@ -1209,6 +1352,9 @@ def _resolve_test_spec(test_spec):
     resolved_path, is_multimodal, err = resolve_test_file(file_part)
     if err:
         return [{"spec": test_spec, "error": err}]
+
+    if is_multimodal and hw not in (None, "cuda"):
+        return []
 
     if is_multimodal:
         runner_label, err = detect_multimodal_suite(resolved_path)
@@ -1229,7 +1375,9 @@ def _resolve_test_spec(test_spec):
             "spec": test_spec,
             "test_command": test_command,
             "mode": "multimodal_gen",
+            "stage": None,
             "runs_on": runner_label,
+            "suite": "",
             "install_script": "",
             "install_timeout": "",
             "rdma_devices": "",
@@ -1243,11 +1391,20 @@ def _resolve_test_spec(test_spec):
         test_command = f"{resolved_path} {test_selector}"
 
     out = []
-    for info in detect_suite(resolved_path):
+    for info in detect_suite(resolved_path, hw):
         if info["error"]:
             out.append({"spec": test_spec, "error": info["error"]})
             continue
-        mode = "cpu" if info["is_cpu"] else "cuda"
+        mode = info["mode"]
+        if mode == "npu" and test_selector:
+            out.append(
+                {
+                    "spec": test_spec,
+                    "error": "NPU tests run as whole files through run_suite.py; "
+                    f"drop the `::{test_selector}` selector.",
+                }
+            )
+            continue
         print(
             f"Resolved: file={resolved_path}, selector={test_selector}, "
             f"suite={info['suite']}, mode={mode}, runs_on={info['runner_label']}, "
@@ -1259,7 +1416,11 @@ def _resolve_test_spec(test_spec):
             "spec": test_spec,
             "test_command": test_command,
             "mode": mode,
+            "stage": info["stage"],
             "runs_on": info["runner_label"],
+            # The suite the npu stage workflow runs, or whose container setup the
+            # amd job reproduces; cuda/cpu jobs need none.
+            "suite": info["suite"] if mode in ("npu", "amd") else "",
             "install_script": info["install_script"],
             "install_timeout": info["install_timeout"],
             "rdma_devices": info["rdma_devices"],
@@ -1272,7 +1433,11 @@ def _resolve_test_spec(test_spec):
 
 def _too_long_for_rerun(entry, path):
     est = _partition.estimate_seconds(
-        entry["test_command"], Path("."), entry["mode"], entry["runs_on"]
+        entry["test_command"],
+        Path("."),
+        entry["mode"],
+        entry["runs_on"],
+        entry["suite"],
     )
     if est is None or est <= _partition.STEP_TIMEOUT_SECONDS:
         return None
@@ -1295,7 +1460,7 @@ def _dispatch_batch(
 ):
     """
     Dispatch a single workflow run for a batch of resolved test specs that
-    share the same dispatch shape (mode + runs_on + install_script +
+    share the same dispatch shape (mode + runs_on + suite + install_script +
     install_timeout + rdma_devices).
 
     Returns a dict with keys: specs, success, test_commands, runner_label, run_url, error.
@@ -1342,6 +1507,10 @@ def _dispatch_batch(
             "reply_marker": reply_marker,
             "refresh_precision_baseline": str(refresh_precision_baseline).lower(),
         }
+        # Only npu and amd dispatches send `suite`, so cuda/cpu ones still match
+        # the inputs of a PR branch's older rerun-test.yml.
+        if batch[0]["suite"]:
+            inputs["suite"] = batch[0]["suite"]
         if is_fork:
             ref = "main"
             pr_head_sha = pr.head.sha
@@ -1386,6 +1555,8 @@ def _dispatch_batch(
             "specs": [r["spec"] for r in batch],
             "success": True,
             "test_commands": test_commands,
+            "stages": [r["stage"] for r in batch],
+            "skip_notes": [r["skip_note"] for r in batch],
             "mode": mode,
             "runs_on": runs_on,
             "run_url": run_url,
@@ -1458,11 +1629,16 @@ def handle_rerun_test(
     command_label=None,
     refresh_precision_baseline=False,
     include_changed_tests=False,
+    hw=None,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
-    dispatch shape (mode + runs_on + install_script + install_timeout +
+    dispatch shape (mode + runs_on + suite + install_script + install_timeout +
     rdma_devices), and dispatches one workflow per group.
+
+    `hw` is the raw `--hw` value: `all` runs every backend in RERUN_HW that a
+    file registers; a comma-separated list runs each listed backend, and notes
+    the listed ones a dispatched file does not register as skipped.
     """
     if not skip_permission_check and not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "rerun-test"
@@ -1473,6 +1649,20 @@ def handle_rerun_test(
         gh_repo, pr, comment
     ):
         return False
+
+    if hw is None:
+        hw_items = [None]
+    elif hw == "all":
+        hw_items = list(RERUN_HW)
+    else:
+        hw_items = hw.split(",")
+        if not set(hw_items) <= set(RERUN_HW) or len(set(hw_items)) < len(hw_items):
+            comment.create_reaction("confused")
+            choices = ", ".join(f"`{c}`" for c in RERUN_HW)
+            pr.create_issue_comment(
+                f"⛔ `{HW_FLAG}` takes `all` or a comma-separated list of {choices}."
+            )
+            return False
 
     if not test_specs and not include_changed_tests:
         comment.create_reaction("confused")
@@ -1486,7 +1676,10 @@ def handle_rerun_test(
             "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching "
             "file; wrap the pattern in backticks so GitHub keeps the `*` literal)\n"
             f"- `/rerun-test {CHANGED_TESTS_FLAG}` (or `{CHANGED_TESTS_SHORT_FLAG}`; "
-            "every test file this PR adds or modifies)"
+            "every test file this PR adds or modifies)\n"
+            f"- `/rerun-test {HW_FLAG} npu test_foo.py` (backends to run on: "
+            f"`cuda`, `npu`, `amd`, a list such as `cuda,amd`, or `all`; without "
+            "it a file runs on the first of CUDA/CPU, NPU, and AMD it registers)"
         )
         return False
 
@@ -1557,15 +1750,30 @@ def handle_rerun_test(
     resolved = []
     seen_commands = set()
     for spec in expanded_specs:
-        for r in _resolve_test_spec(spec):
+        by_hw = {item: _resolve_test_spec(spec, item) for item in hw_items}
+        skipped = [item for item, entries in by_hw.items() if not entries]
+        if len(skipped) == len(hw_items):
+            if hw != "all":
+                labels = " or ".join(RERUN_HW[item][0] for item in skipped)
+                _record_failure(
+                    spec,
+                    f"No {labels} registration, so `{HW_FLAG} {hw}` has nothing to run.",
+                )
+                continue
+            by_hw = {None: _resolve_test_spec(spec)}
+        skip_note = ""
+        if skipped and hw != "all":
+            verb = "is" if len(skipped) == 1 else "are"
+            skip_note = f"({', '.join(skipped)} {verb} skipped)"
+        for r in [r for entries in by_hw.values() for r in entries]:
             if r.get("error"):
                 _record_failure(r["spec"], r["error"])
                 continue
-            key = (r["mode"], r["runs_on"], r["test_command"])
+            key = (r["mode"], r["runs_on"], r["suite"], r["test_command"])
             if key in seen_commands:
                 continue
             seen_commands.add(key)
-            resolved.append(r)
+            resolved.append({**r, "skip_note": skip_note})
 
     if refresh_precision_baseline:
         is_exact_precision_test = (
@@ -1587,6 +1795,7 @@ def handle_rerun_test(
         key = (
             r["mode"],
             r["runs_on"],
+            r["suite"],
             r["install_script"],
             r["install_timeout"],
             r["rdma_devices"],
@@ -1623,13 +1832,16 @@ def handle_rerun_test(
     for dr in dispatch_results:
         if dr["success"]:
             if dr["mode"] == "multimodal_gen":
-                cmds = "\n".join(
-                    f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]
-                )
+                cmds = [f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]]
             else:
-                cmds = "\n".join(
-                    f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
-                )
+                cmds = [f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]]
+            notes = [
+                " ".join(filter(None, pair))
+                for pair in zip(dr["stages"], dr["skip_notes"])
+            ]
+            cmds = "\n".join(
+                f"{cmd}  # {note}" if note else cmd for cmd, note in zip(cmds, notes)
+            )
             marker = dr.get("reply_marker", "")
             label = dr["runs_on"] or dr["mode"]
             if dr.get("run_url"):
@@ -1662,6 +1874,18 @@ def handle_rerun_test(
 
     reply_comment.edit(body)
     return len(successes) > 0
+
+
+def _pop_hw_flag(args):
+    """Split `--hw <value>` off /rerun-test arguments: (value or None, rest).
+
+    A trailing `--hw` with no value yields "", which handle_rerun_test rejects.
+    """
+    if HW_FLAG not in args:
+        return None, args
+    i = args.index(HW_FLAG)
+    hw = args[i + 1] if i + 1 < len(args) else ""
+    return hw, args[:i] + args[i + 2 :]
 
 
 def handle_rerun_group(
@@ -2067,7 +2291,7 @@ def main():
         )
 
     elif first_line.startswith("/rerun-test"):
-        rerun_args = first_line.split()[1:]
+        hw, rerun_args = _pop_hw_flag(first_line.split()[1:])
         refresh_precision_baseline = PRECISION_BASELINE_REFRESH_FLAG in rerun_args
         changed_flags = {CHANGED_TESTS_FLAG, CHANGED_TESTS_SHORT_FLAG}
         include_changed_tests = bool(changed_flags & set(rerun_args))
@@ -2083,6 +2307,7 @@ def main():
             command_label=first_line,
             refresh_precision_baseline=refresh_precision_baseline,
             include_changed_tests=include_changed_tests,
+            hw=hw,
         )
 
     else:
