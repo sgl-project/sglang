@@ -583,6 +583,7 @@ class Req(ReqDllmMixin):
         self.finished_reason: Optional[BaseFinishReason] = None
         # finished position (in output_ids), used when checking stop conditions with speculative decoding
         self.finished_len = None
+        self.kv_cache_limited_output = False
         # Whether this request has finished output
         self.finished_output = None
         # Set by exit_ledger (CI only).
@@ -1432,7 +1433,9 @@ class Req(ReqDllmMixin):
         """
         max_new_tokens = self.sampling_params.max_new_tokens
         if self.finished_len is not None and self.finished_len > max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_reason = FINISH_LENGTH(
+                length=max_new_tokens, kv_cache_limited=self.kv_cache_limited_output
+            )
             self.finished_len = max_new_tokens
 
     def request_finish(self, reason: BaseFinishReason) -> None:
@@ -1486,7 +1489,8 @@ class Req(ReqDllmMixin):
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
+                length=self.sampling_params.max_new_tokens,
+                kv_cache_limited=self.kv_cache_limited_output,
             )
             self.finished_len = self.sampling_params.max_new_tokens
             return
