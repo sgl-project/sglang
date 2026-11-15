@@ -79,9 +79,9 @@ dependencies = [
   "setproctitle",
   "sgl-deep-ep==0.1.2.post1",
   "sgl-deep-gemm==0.2.8",
-  "sgl-fa3==0.1.0rc0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",  # Only an x86_64 wheel is published.
+  "sgl-fa3==0.1.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",  # Only an x86_64 wheel is published.
   "sgl-flash-mla==1.0.5",
-  "sglang-kernel==0.4.10",
+  "sglang-kernel==0.4.11",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",

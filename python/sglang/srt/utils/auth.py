@@ -10,6 +10,24 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 
+from sglang.srt.environ import envs
+
+# The Rust server answers with the same text (`ADMIN_KEY_MISSING`).
+ADMIN_API_KEY_MISSING_MESSAGE = (
+    "This endpoint requires admin API key, but this server was started "
+    "without one (admin-api-key). Restart with --admin-api-key to enable."
+)
+
+
+def bearer_auth_headers(key: Optional[str]) -> dict:
+    """`Authorization: Bearer <key>`, or no header when there is no key."""
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def admin_auth_headers(admin_api_key: Optional[str] = None) -> dict:
+    """Bearer headers for the admin endpoints: `admin_api_key`, else `SGLANG_ADMIN_API_KEY`."""
+    return bearer_auth_headers(admin_api_key or envs.SGLANG_ADMIN_API_KEY.get())
+
 
 @dataclass(frozen=True)
 class AuthDecision:
@@ -35,26 +53,41 @@ def auth_level(level: AuthLevel):
     return decorator
 
 
+def _iter_leaf_routes(routes, prefix: str = ""):
+    """Yield `(prefix, route)`, descending into the routers FastAPI keeps nested on include."""
+    for route in routes:
+        included = getattr(route, "original_router", None)
+        if included is None:
+            yield prefix, route
+            continue
+        context = getattr(route, "include_context", None)
+        yield from _iter_leaf_routes(
+            included.routes, prefix + (getattr(context, "prefix", "") or "")
+        )
+
+
+def _route_auth_level(route) -> AuthLevel:
+    level = getattr(getattr(route, "endpoint", None), "_auth_level", None)
+    return level if isinstance(level, AuthLevel) else AuthLevel.NORMAL
+
+
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
     """Best-effort resolve auth level by matching the request to a route."""
     # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
     # required unless you actually use the middleware / route matching).
     from starlette.routing import Match
 
-    # Prefer app.router.routes when available; fall back to app.routes.
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
-    )
-
-    for route in routes:
+    for prefix, route in _iter_leaf_routes(app.router.routes):
+        if not scope["path"].startswith(prefix):
+            continue
         try:
-            match, child_scope = route.matches(scope)
+            match, _ = route.matches(
+                {**scope, "path": scope["path"][len(prefix) :]} if prefix else scope
+            )
         except Exception:
             continue
         if match == Match.FULL:
-            endpoint = child_scope.get("endpoint") or getattr(route, "endpoint", None)
-            level = getattr(endpoint, "_auth_level", None)
-            return level if isinstance(level, AuthLevel) else AuthLevel.NORMAL
+            return _route_auth_level(route)
 
     return AuthLevel.NORMAL
 
@@ -181,7 +214,7 @@ def add_api_key_middleware(app, *, get_keys: Callable[[], tuple]):
                     "error": (
                         "Unauthorized"
                         if decision.error_status_code == 401
-                        else "Forbidden"
+                        else ADMIN_API_KEY_MISSING_MESSAGE
                     )
                 },
                 status_code=decision.error_status_code,

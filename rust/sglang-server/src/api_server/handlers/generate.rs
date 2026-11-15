@@ -1408,23 +1408,22 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn explicit_abort_cancels_duplicates_but_not_later_id_reuse() {
+    async fn assert_duplicate_abort_and_reuse(public_id: &str) {
         let harness = Harness::unbounded(8);
         let mut first = harness
             .handle
-            .generate(public_request("same"), ReceivedAs::without_headers())
+            .generate(public_request(public_id), ReceivedAs::without_headers())
             .await
             .unwrap();
         let mut second = harness
             .handle
-            .generate(public_request("same"), ReceivedAs::without_headers())
+            .generate(public_request(public_id), ReceivedAs::without_headers())
             .await
             .unwrap();
         let old_a = accept_intake(harness.intake_rx.recv().unwrap());
         let old_b = accept_intake(harness.intake_rx.recv().unwrap());
-        assert!(harness.handle.abort(Some("same"), CancelledError));
-        assert!(!harness.handle.abort(Some("same"), CancelledError));
+        assert!(harness.handle.abort(Some(public_id), CancelledError));
+        assert!(!harness.handle.abort(Some(public_id), CancelledError));
         // Backend cancellation does not depend on polling either response.
         let aborted: std::collections::HashSet<_> = (0..2)
             .map(|_| harness.abort_rx.try_recv().unwrap().rid().clone())
@@ -1433,7 +1432,7 @@ mod tests {
 
         let new = harness
             .handle
-            .generate(public_request("same"), ReceivedAs::without_headers())
+            .generate(public_request(public_id), ReceivedAs::without_headers())
             .await
             .unwrap();
         let new_request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1446,10 +1445,20 @@ mod tests {
         }
         drop((first, second));
         assert!(harness.abort_rx.try_recv().is_err());
-        assert!(harness.handle.abort(Some("same"), CancelledError));
+        assert!(harness.handle.abort(Some(public_id), CancelledError));
         assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &new_request.rid);
         drop(new);
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_abort_cancels_duplicates_but_not_later_id_reuse() {
+        assert_duplicate_abort_and_reuse("same").await;
+    }
+
+    #[tokio::test]
+    async fn long_public_id_abort_cancels_duplicates_but_not_later_reuse() {
+        assert_duplicate_abort_and_reuse(&"x".repeat(200)).await;
     }
 
     #[tokio::test]
