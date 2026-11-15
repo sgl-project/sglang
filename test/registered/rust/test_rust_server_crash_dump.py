@@ -50,6 +50,7 @@ def _server_args(ext, port: int):
         hicache_write_policy=None,
         host="127.0.0.1",
         port=port,
+        http2=None,
         grpc_port=None,
         grpc_response_timeout_secs=300,
         api_key=None,
