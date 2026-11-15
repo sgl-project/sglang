@@ -217,6 +217,30 @@ class TestMistralDetector(CustomTestCase):
         params = json.loads(full_params)
         self.assertEqual(params["city"], "Tokyo")
 
+    def test_streaming_json_array_multiple_tool_calls(self):
+        detector = MistralDetector()
+        text = (
+            '[{"name": "get_weather", "arguments": {"city": "Beijing"}}, '
+            '{"name": "search", "arguments": {"query": "restaurants"}}]'
+        )
+        normal_text, names, params = "", [], {}
+        for chunk in ["[TOOL_CALLS]", " ", *text]:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                params[call.tool_index] = params.get(call.tool_index, "") + (
+                    call.parameters or ""
+                )
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(names, ["get_weather", "search"])
+        self.assertEqual(
+            [json.loads(params[i]) for i in sorted(params)],
+            [{"city": "Beijing"}, {"query": "restaurants"}],
+        )
+
 
 if __name__ == "__main__":
     import unittest

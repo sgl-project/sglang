@@ -125,6 +125,13 @@ class MistralDetector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
+        # The rest of a JSON array after its first call: `, {...}]`.
+        if self.current_tool_id > 0:
+            if self.tool_call_separator.startswith(current_text):
+                return StreamingParseResult()
+            if current_text.startswith(self.tool_call_separator):
+                return super().parse_streaming_increment(new_text="", tools=tools)
+
         # No marker: either flush as normal text or keep buffering a partial marker.
         if self._tool_calls_marker not in current_text:
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
