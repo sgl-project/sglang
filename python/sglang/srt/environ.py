@@ -995,7 +995,7 @@ class Envs:
     SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 
     # ===================================================================
-    # MoRI transport and expert dispatch
+    # MoRI transport, expert dispatch, and fused collectives
     # ===================================================================
     SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
@@ -1046,6 +1046,21 @@ class Envs:
     )
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
+    # ROCm gfx950: fuse a BF16 attention o_proj GEMM with its attention-TP sum
+    # over mori cco SDMA -- GEMM + all-reduce, or GEMM + reduce-scatter on
+    # SP-MoE layers. Prefill only; needs MORI_ENABLE_SDMA=1 (and, with a mori
+    # EP a2a backend, SGLANG_MORI_EP_V2=1). See
+    # srt/layers/communication/mori_gemm_ar_bf16.py.
+    # Requires a mori build containing ROCm/mori#872, which added
+    # GemmAllReduceOp(quant="bf16"); older builds have no BF16 entry point and
+    # the fusion disables itself on every rank at load.
+    SGLANG_MORI_OPROJ_AR = EnvBool(False)
+    # Smallest M fused; smaller batches take the ordinary path.
+    SGLANG_MORI_OPROJ_AR_MIN_M = EnvInt(2048)
+    # Copy the fused output out of mori's window (debug aid).
+    SGLANG_MORI_OPROJ_AR_CLONE = EnvBool(False)
+    # Check every fused call against GEMM + collective and log relL2 (slow).
+    SGLANG_MORI_OPROJ_AR_DEBUG = EnvBool(False)
 
     # ===================================================================
     # AMD, ROCm, and AITER

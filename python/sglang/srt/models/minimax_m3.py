@@ -45,6 +45,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
+from sglang.srt.layers.communication import mori_gemm_ar_bf16
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -1700,6 +1701,34 @@ def _uses_push_plane_fusion() -> bool:
     )
 
 
+def _mori_oproj_sum_impl():
+    """The attention stage's ATTN_TP sum when o_proj's GEMM fuses it over mori
+    (ROCm gfx950), or None to leave the boundary's ordinary all-reduce.
+
+    Off unless SGLANG_MORI_OPROJ_AR=1; see
+    srt/layers/communication/mori_gemm_ar_bf16.py.
+    """
+    if not _is_gfx95_supported:
+        return None
+    # Declaring any sum here costs the aiter fused all-reduce + add_norm on the
+    # attention -> FFN edge: the entry completes a DeclaredSum itself and then
+    # runs the step built without fusions (layer_boundary/prepare.py). That
+    # applies to every batch, including the decode shapes this never fuses, so
+    # the two are alternatives rather than additive.
+    #
+    # Standard EP keeps the attention-TP sum on the boundary's own collective,
+    # as it already does for the aiter fused all-reduce (arg_groups/
+    # model_overrides/minimax_m3.py). That kernel's documented failure is a
+    # deferred sum meeting sparse MoE partial outputs, which an attention
+    # sum_impl does not reproduce -- it finishes directly into a DeclaredSum
+    # (layer_boundary/stage.py) and never reaches the exit's deferral. This is
+    # held back as an untested combination, not a known one; lift it with
+    # evidence from a standard-EP run.
+    if get_parallel().moe_ep_size > 1 and get_moe_a2a_backend().is_none():
+        return None
+    return mori_gemm_ar_bf16.sum_impl()
+
+
 def _input_rows(hidden_states) -> int:
     # an input norm that quantized for a projection returns (fp8, scale[, bf16])
     if isinstance(hidden_states, tuple):
@@ -1808,7 +1837,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         shared declaration function, which the layer declares with too (see
         make_layers)."""
         return (
-            declare_attn(),
+            # A fused o_proj GEMM + all-reduce leaves the sum already complete;
+            # the declared sum then passes that output through.
+            declare_attn(sum_impl=_mori_oproj_sum_impl()),
             declare_ffn(
                 sparse=cls._is_layer_sparse(config, layer_id),
                 next_layer_sparse=cls._is_next_layer_sparse(config, layer_id),
@@ -2122,6 +2153,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
             # Decode and verify batches up to 341 rows at hidden 6144.
             register_fused_all_reduce_comm(max_push_size=4 * 1024 * 1024)
+
+        # Opt-in fused o_proj GEMM + attention-TP all-reduce (ROCm, mori). Runs
+        # here rather than in post_load_weights because o_proj's weight is only
+        # final after process_weights_after_loading, and the window has to be
+        # allocated before the memory profiler sizes the KV pool.
+        mori_gemm_ar_bf16.prepare(
+            (layer.self_attn, False)
+            for layer in self.model.layers
+            if not isinstance(layer, PPMissingLayer)
+        )
 
     @torch.no_grad()
     def forward(
