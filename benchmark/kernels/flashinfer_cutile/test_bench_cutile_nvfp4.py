@@ -25,6 +25,31 @@ import torch
 
 
 class TestCuTileBenchmark(CustomTestCase):
+    def test_workspace_bucket_coverage_counts_tail_and_deduplicates(self):
+        expected, visited, per_call = benchmark.workspace_bucket_coverage(
+            [8192, 8193, 16384],
+            8192,
+            8192,
+            lambda capacity: (1, 2, 8192),
+            lambda count, capacity: min(count, capacity),
+        )
+        self.assertEqual(expected, [1, 2, 8192])
+        self.assertEqual(visited, [1, 8192])
+        self.assertEqual(per_call[8193], [8192, 1])
+        self.assertEqual(per_call[16384], [8192, 8192])
+        self.assertNotEqual(expected, visited)
+
+    def test_workspace_inventory_deduplicates_aliases_and_breaks_cycles(self):
+        tensor = torch.ones(8)
+        # The fake object needs the same module boundary as the external runner.
+        runner_type = type("FakeRunner", (), {"__module__": "flashinfer.test"})
+        runner = runner_type()
+        runner._workspace_cache = {(8192, 32): [tensor, tensor.view(2, 4)]}
+        runner.parent = runner
+        inventory = benchmark.execution_workspace_inventory({"runner": runner})
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["unique_storage_bytes"], 32)
+
     def arguments(self, *extra):
         return [
             "--synthetic",
@@ -36,6 +61,176 @@ class TestCuTileBenchmark(CustomTestCase):
             "/unused",
             *extra,
         ]
+
+    def test_peer_inputs_keep_preselected_routes_and_copy_all_fields(self):
+        config = SimpleNamespace(hidden_size=32, num_experts=16, top_k=4)
+        layer = SimpleNamespace(moe_runner_config=config)
+        one = benchmark.make_inputs(
+            layer, 65, 17, 0.5, sets=1, input_protocol="peer-compatible", device="cpu"
+        )
+        four = benchmark.make_inputs(
+            layer, 65, 999, 0.5, sets=4, input_protocol="peer-compatible", device="cpu"
+        )
+        self.assertEqual(len(one), 1)
+        self.assertEqual(len(four), 4)
+        self.assertTrue(torch.equal(one[0].hidden_states, four[0].hidden_states))
+        first, second = four[:2]
+        self.assertFalse(torch.equal(first.hidden_states, second.hidden_states))
+        for item in four:
+            routes = item.topk_output
+            self.assertTrue(all(len(set(row.tolist())) == 4 for row in routes.topk_ids))
+            self.assertFalse(
+                torch.allclose(routes.topk_weights.sum(-1), torch.ones(65))
+            )
+            torch.testing.assert_close(
+                routes.router_logits.gather(1, routes.topk_ids.long()),
+                routes.topk_weights,
+                rtol=0,
+                atol=0,
+            )
+        benchmark.copy_input(first, second)
+        self.assertEqual(
+            benchmark.input_full_hashes([first]), benchmark.input_full_hashes([second])
+        )
+        sliced = benchmark.slice_input(second, 7)
+        self.assertTrue(
+            torch.equal(
+                sliced.topk_output.router_logits, second.topk_output.router_logits[:7]
+            )
+        )
+        before = benchmark.input_full_hashes([second])
+        prefix = benchmark.input_prefix_hashes([second])
+        second.topk_output.router_logits[-1, 0] += 1
+        self.assertNotEqual(before, benchmark.input_full_hashes([second]))
+        self.assertEqual(prefix, benchmark.input_prefix_hashes([second]))
+
+    def test_historical_protocol_is_still_normalized(self):
+        layer = SimpleNamespace(
+            moe_runner_config=SimpleNamespace(hidden_size=32, num_experts=8, top_k=4)
+        )
+        values = benchmark.make_inputs(layer, 7, 17, 0.5, sets=1, device="cpu")
+        torch.testing.assert_close(
+            values[0].topk_output.topk_weights.sum(-1), torch.ones(7)
+        )
+
+    def test_tp1_comparison_rejects_single_gpu_substitution(self):
+        with self.assertRaisesRegex(ValueError, "TP2 or TP4"):
+            benchmark.actual_tp1_comparison(SimpleNamespace(), None, [], [], 0, None, 1)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                benchmark.parse_args(self.arguments("--compare-tp1"))
+
+    def test_peer_reference_does_not_replace_corrected_reference(self):
+        args = benchmark.parse_args(
+            self.arguments(
+                "--input-protocol", "peer-compatible", "--reference-protocol", "both"
+            )
+        )
+        self.assertEqual(args.max_relative_l2, 0.05)
+        self.assertEqual(args.reference_protocol, "both")
+        with self.assertRaises(benchmark.BenchmarkCheckError):
+            benchmark.repeat_metrics("marlin", torch.full((4,), 1.002), torch.ones(4))
+        with self.assertRaises(benchmark.BenchmarkCheckError):
+            benchmark.repeat_metrics("cutile", torch.full((4,), 1.00001), torch.ones(4))
+
+    def test_reference_sampling_covers_chunk_edges_and_tail(self):
+        for tokens in (1, 64, 8191, 8192, 8193, 16384, 16385):
+            with self.subTest(tokens=tokens):
+                indices = helpers._reference_token_indices(tokens, 64)
+                self.assertEqual(len(indices), min(tokens, 64))
+                self.assertEqual(indices, sorted(set(indices)))
+                self.assertIn(0, indices)
+                self.assertIn(tokens - 1, indices)
+                for edge in range(8192, tokens, 8192):
+                    self.assertIn(edge - 1, indices)
+                    self.assertIn(edge, indices)
+        with self.assertRaisesRegex(ValueError, "budget"):
+            helpers._reference_token_indices(16385, 4)
+
+    def test_boundary_reference_detects_corrupted_tail_and_gathers_routes(self):
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        rows = torch.arange(16385).float()
+        dispatch = StandardDispatchOutput(
+            hidden_states=rows[:, None].expand(-1, 2),
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(
+                topk_ids=rows.long()[:, None],
+                topk_weights=rows[:, None],
+                router_logits=rows[:, None].expand(-1, 3),
+            ),
+        )
+        indices = helpers._reference_token_indices(16385, 64)
+        selected = helpers._select_dispatch_rows(dispatch, indices)
+        for field in ("topk_ids", "topk_weights", "router_logits"):
+            torch.testing.assert_close(
+                getattr(selected.topk_output, field),
+                getattr(dispatch.topk_output, field)[indices],
+            )
+        no_logits = dispatch._replace(
+            topk_output=dispatch.topk_output._replace(router_logits=None)
+        )
+        self.assertIsNone(
+            helpers._select_dispatch_rows(no_logits, indices).topk_output.router_logits
+        )
+        expected = torch.ones(64, 2)
+        actual = torch.ones(16385, 2)
+        actual[-1] = 10
+        # The old prefix gate would not detect this finite tail corruption.
+        self.assertEqual(
+            benchmark.error_metrics(actual[:64], expected)["relative_l2"], 0
+        )
+        sampled = benchmark.select_reference_output(
+            actual, expected, {"reference_indices": indices}
+        )
+        self.assertGreater(
+            benchmark.error_metrics(sampled, expected)["relative_l2"], 0.05
+        )
+
+    def test_same_partition_oracle_remains_strict(self):
+        expected = torch.ones(8)
+        small = expected + 0.001
+        with self.assertRaises(benchmark.BenchmarkCheckError):
+            benchmark.compare_direct_outputs(
+                small, expected, same_partition=True, relative_l2_limit=0.05
+            )
+        comparison = benchmark.compare_direct_outputs(
+            small, expected, same_partition=False, relative_l2_limit=0.05
+        )
+        self.assertFalse(comparison["bit_identity"])
+        with self.assertRaises(benchmark.BenchmarkCheckError):
+            benchmark.compare_direct_outputs(
+                expected + 0.06, expected, same_partition=False, relative_l2_limit=0.05
+            )
+
+    def test_workspace_control_rejects_shared_execution_across_streams(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            benchmark.parse_args(
+                self.arguments("--mode", "workspace", "--workspace-backend", "direct")
+            )
+        args = benchmark.parse_args(
+            self.arguments(
+                "--mode", "workspace", "--workspace-backend", "direct", "--streams", "1"
+            )
+        )
+        self.assertEqual(args.workspace_backend, "direct")
+        self.assertEqual(
+            benchmark.parse_args(self.arguments()).reference_sampling, "prefix"
+        )
+        parsed = benchmark.parse_args(
+            self.arguments(
+                "--backends",
+                "cutile",
+                "direct-chunked",
+                "direct",
+                "--reference-sampling",
+                "chunk-boundaries",
+            )
+        )
+        self.assertEqual(parsed.reference_sampling, "chunk-boundaries")
 
     def test_percentiles_use_interpolation_and_endpoints(self):
         self.assertEqual(benchmark.percentile([8, 2], 0), 2)
@@ -203,6 +398,9 @@ class TestCuTileBenchmark(CustomTestCase):
             rows = []
             with (
                 patch.object(benchmark, "make_inputs", return_value=[dispatch(0)]),
+                patch.object(torch.cuda, "memory_allocated", return_value=1024),
+                patch.object(torch.cuda, "reset_peak_memory_stats"),
+                patch.object(torch.cuda, "max_memory_allocated", return_value=2048),
                 patch.object(torch.cuda, "Event", return_value=event),
                 patch.object(torch.cuda, "CUDAGraph", return_value=Mock()),
                 patch.object(

@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import math
 import threading
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
 import torch
+from packaging.version import Version
 
 from sglang.srt.layers.moe.moe_runner.base import (
     DispatchMoeRunnerCore,
@@ -20,6 +22,11 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+
+# Limit each FlashInfer call, not the scheduler's total accepted batch size.
+# A token count of 8193 otherwise rounds up to a 16384-token workspace bucket.
+_MAX_TOKENS_PER_CHUNK = 8192
 
 
 class FlashInferCuTileMoeQuantInfo(MoeQuantInfo):
@@ -51,15 +58,22 @@ class _CuTileExecution:
         capturing = _is_capturing(self.device)
         # Track successful eager calls, not just allocated workspace buckets:
         # capture must not be the first call that needs a compiled shape.
-        if capturing and num_tokens not in self.warmed_token_counts:
-            raise RuntimeError(
-                "flashinfer_cutile requires an eager warmup of this token count "
-                "on the same CUDA stream before CUDA graph capture."
-            )
+        if capturing:
+            self.require_warmed((num_tokens,))
         output = self.layer(act_pack, weight_pack)
         if not capturing:
             self.warmed_token_counts.add(num_tokens)
         return output
+
+    def require_warmed(self, token_counts: tuple[int, ...]) -> None:
+        # Called before ANY chunk is captured, so a cold tail cannot fail after
+        # earlier chunks have already emitted work into an incomplete graph.
+        missing = sorted(set(token_counts) - self.warmed_token_counts)
+        if missing:
+            raise RuntimeError(
+                "flashinfer_cutile requires an eager warmup of token counts "
+                f"{missing} on the same CUDA stream before CUDA graph capture."
+            )
 
 
 class FlashInferCuTileRunnerCore(DispatchMoeRunnerCore):
@@ -67,7 +81,8 @@ class FlashInferCuTileRunnerCore(DispatchMoeRunnerCore):
 
     FlashInfer caches workspaces for visited token buckets in each execution.
     Different streams need independent executions, so their allocations add up.
-    The token capacity bounds inputs, not the sum of resident workspace memory.
+    Each call is capped at 8192 tokens; the sum of resident buckets/streams
+    is still not a total workspace byte budget.
     Keep these allocations until the runtime resources are reset: individual
     eviction could invalidate a captured CUDA graph.
     """
@@ -94,6 +109,11 @@ class FlashInferCuTileRunnerCore(DispatchMoeRunnerCore):
                 f"flashinfer_cutile received {num_tokens} tokens, exceeding "
                 f"the configured capacity {max_num_tokens}."
             )
+        # Validate the complete input against the scheduler above; only the
+        # underlying FlashInfer execution is capped. Using this ceiling in the
+        # pool key lets different scheduler limits share the same bounded
+        # execution without weakening the per-call input-capacity check.
+        max_num_tokens = min(max_num_tokens, _MAX_TOKENS_PER_CHUNK)
         # Weights are supplied per call, so equal geometries can share an
         # execution across layers. A separate execution per thread/stream avoids
         # concurrent calls overwriting the same temporary buffers.
@@ -180,22 +200,43 @@ class FlashInferCuTileRunnerCore(DispatchMoeRunnerCore):
         if x.shape[0] == 0:
             return StandardCombineInput(hidden_states=torch.empty_like(x))
 
-        # Graph padding can contain unrouted slots (expert id -1). Replace
-        # each with an in-range id AND zero weight: changing only the id would
-        # add expert 0's output. Keep this on-device to avoid a capture-breaking
-        # host synchronization; routing normalization already happened upstream.
-        valid = ids >= 0
-        ids = torch.where(valid, ids, 0).to(dtype=torch.int32).contiguous()
-        weights = torch.where(valid, weights, 0).to(dtype=torch.float32).contiguous()
-        act_pack = MoEActivationPack(
-            hidden_states_q=x.contiguous(),
-            hidden_states_scale=None,
-            topk_ids=ids,
-            topk_weights=weights,
-            routing_input_mode=RoutingInputMode.PackedPrecomputed,
-        )
-        execution = self._get_execution(device=x.device, num_tokens=x.shape[0])
-        output = execution(act_pack, quant_info.weight_pack)
+        num_tokens = x.shape[0]
+        execution = self._get_execution(device=x.device, num_tokens=num_tokens)
+
+        def run_chunk(start: int, end: int) -> torch.Tensor:
+            chunk_ids, chunk_weights = ids[start:end], weights[start:end]
+            # Graph padding contains absent routes (-1). Sanitize both the ID
+            # and its weight on device, independently for each chunk, without
+            # changing the caller's routing or creating full-batch temporaries.
+            valid = chunk_ids >= 0
+            act_pack = MoEActivationPack(
+                hidden_states_q=x[start:end].contiguous(),
+                hidden_states_scale=None,
+                topk_ids=torch.where(valid, chunk_ids, 0)
+                .to(dtype=torch.int32)
+                .contiguous(),
+                topk_weights=torch.where(valid, chunk_weights, 0)
+                .to(dtype=torch.float32)
+                .contiguous(),
+                routing_input_mode=RoutingInputMode.PackedPrecomputed,
+            )
+            return execution(act_pack, quant_info.weight_pack)
+
+        if num_tokens <= _MAX_TOKENS_PER_CHUNK:
+            # Decode and small prefill keep the single-call path: no output copy.
+            output = run_chunk(0, num_tokens)
+        else:
+            tail = num_tokens % _MAX_TOKENS_PER_CHUNK
+            required = (_MAX_TOKENS_PER_CHUNK,) + ((tail,) if tail else ())
+            if _is_capturing(x.device):
+                execution.require_warmed(required)
+            output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            for start in range(0, num_tokens, _MAX_TOKENS_PER_CHUNK):
+                end = min(start + _MAX_TOKENS_PER_CHUNK, num_tokens)
+                # Consume each result immediately instead of retaining every
+                # chunk until a final cat. The full output stays contiguous for
+                # the caller's single TP reduction, outside this runner.
+                output[start:end].copy_(run_chunk(start, end))
         # MiniMaxM3MoE configures TopK to include model scaling in its weights.
         # Preserve those weights and apply only an additional factor carried by
         # the runner contract, at the same output-side boundary as Marlin.
@@ -262,6 +303,7 @@ def prepare_flashinfer_cutile_nvfp4_weights(
     Reorder the matching scales with the rows; w2 is the down projection and
     keeps its order. FlashInfer then owns the backend-specific preparation.
     """
+    _check_dependency_support()
     from flashinfer.fused_moe import CuTileNvfp4Config, MoEWeightPack, SwiGLU
 
     validate_flashinfer_cutile_config(config)
@@ -343,6 +385,37 @@ def _activation_parameters(config: MoeRunnerConfig) -> tuple[float, float, float
     return tuple(float(value) for value in parameters)
 
 
+def _check_dependency_support() -> None:
+    """Diagnose setup errors before preparing weights or creating a workspace.
+
+    This is a load-time check, not a forward-time version lookup. Runtime
+    compiler/kernel errors still propagate: an unavailable backend must never
+    silently select a different quantization path.
+    """
+    try:
+        installed = version("flashinfer-python")
+    except PackageNotFoundError as error:
+        raise ImportError(
+            "flashinfer_cutile requires flashinfer-python>=0.7.2; it is not installed."
+        ) from error
+    if Version(installed) < Version("0.7.2"):
+        raise ValueError(
+            f"flashinfer_cutile requires flashinfer-python>=0.7.2; found {installed}."
+        )
+    try:
+        from flashinfer.cutile import is_cuda_tile_available
+    except ImportError as error:
+        raise ImportError(
+            "flashinfer_cutile requires the FlashInfer cuTile API and cuda-tile."
+        ) from error
+    if not is_cuda_tile_available():
+        raise RuntimeError(
+            "flashinfer_cutile requires cuda-tile and a working tileiras compiler. "
+            "The pip nvidia-cuda-tileiras, nvidia-cuda-nvcc and nvidia-nvvm "
+            "packages must have matching major.minor versions."
+        )
+
+
 def _check_device_support(device: torch.device) -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise ValueError("flashinfer_cutile requires an SM120 or SM121 CUDA device.")
@@ -372,6 +445,7 @@ def _get_max_num_tokens() -> int:
 def _create_moe_layer(
     *, config: MoeRunnerConfig, device: torch.device, max_num_tokens: int
 ):
+    _check_dependency_support()
     from flashinfer.fused_moe import (
         BackendOptions,
         CuTileNvfp4Config,

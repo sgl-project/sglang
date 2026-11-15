@@ -162,9 +162,86 @@ python benchmark/kernels/flashinfer_cutile/bench_cutile_nvfp4.py \
 `workspace.json` and `workspace.csv` distinguish allocated, reserved, peak,
 and cumulative memory. Streams are visited sequentially: this tests cumulative
 residency, not concurrent throughput. No cache eviction or allocator clearing
-occurs between steps. The current backend has no automatic 8192-token chunking;
-an 8193-token workspace increase must remain visible. Never free a workspace
-while a live CUDA Graph can still reference it.
+occurs between steps. The adapter limits each FlashInfer call to 8192 tokens:
+8193 becomes 8192 + 1, and 16385 becomes 8192 + 8192 + 1. The scheduler's total
+accepted capacity is unchanged. Each chunk is copied into its original output
+rows immediately; output scaling and the caller's NCCL reduction still apply
+to the complete result. Small batches keep one call without this assembly copy.
+Capture requires eager warmup of every chunk shape on the same stream,
+including the tail.
+
+This limits individual workspace buckets, not their cumulative byte total.
+FlashInfer retains previously visited buckets; each stream has its own
+execution. Never free a workspace referenced by a live CUDA Graph. Measure
+the additional output/copy cost too: less memory does not imply lower latency.
+
+### Chunk-boundary accuracy, Graph and memory protocol
+
+Enable the manual large-batch tests for 8191/8192/8193/16384/16385 tokens,
+including strided input, padded routes and scaling. Existing empty/one-token
+checks remain separate. Real boundary cases sample 64 FP32-reference rows
+across the batch, including both sides of each 8192 boundary and the last row.
+This is not a full FP32 calculation of every row. Shape/finiteness, independent
+same-partition output, repeatability and changed-input Graph checks still
+cover the whole output.
+
+Select `--reference-sampling chunk-boundaries` for the latency harness.
+The default stays `prefix` to preserve the historical measurement protocol;
+results record selected indices. `direct-chunked` calls public FlashInfer
+independently per 8192 rows and concatenates results. It must match the adapter
+bit for bit. `direct` uses one call for the full batch. Above 8192 this changes
+GEMM shapes, so its cross-shape delta is reported against the existing 0.05 L2
+bound. It does not replace the strict same-partition check.
+
+```bash
+python benchmark/kernels/flashinfer_cutile/bench_cutile_nvfp4.py \
+  --checkpoint-dir /models/MiniMax-M3.1-Flash \
+  --checkpoint-revision CHECKPOINT_SHA --experts 32 \
+  --tokens 8191 8192 8193 16384 16385 --capacity 32768 \
+  --backends cutile direct-chunked direct --execution eager graph \
+  --reference-sampling chunk-boundaries --reference-tokens 64 \
+  --implementation-label pr49795-chunked --flashinfer-variant stock-0.7.4 \
+  --output-dir /results/pr49795-chunked-boundaries-tp1-e32
+```
+
+Repeat with 128 experts and torchrun TP2/TP4. The entire chunked MoE, output
+assembly and one NCCL SUM are inside each timed call/Graph. All ranks must agree
+after reduction. Changed input/routing replays exercise the tail too. The
+manual real TP2 partition sum versus TP1 is a separate single-GPU numerical
+experiment (the existing synthetic slice test's 2% bound), not NCCL validation.
+The real-weight std=4 clamp test requires measurable clipping and retains both
+W4A4 and BF16 references.
+
+Collect three separate memory experiments for each expert count:
+
+1. **Cold boundary control:** new process per token count (8192, 8193, 16384,
+   16385), `--mode workspace --streams 1`. Compare
+   `--workspace-backend cutile` to `--workspace-backend direct` in separate
+   directories with the same capacity and inputs. Direct is an unchunked
+   public-API control with one execution; multi-stream direct control is
+   rejected to avoid sharing scratch buffers.
+2. **Matched cumulative sequence:** keep the historical token sequence,
+   capacity and two-stream order unchanged across before/after adapter
+   checkouts. Fresh process per checkout; no context reset or cache clearing
+   between visits. Report live allocation, reserved memory and peaks separately.
+3. **All buckets up to 8192:** run the 21-bucket sequence below with two streams
+   on both before/after checkouts. Confirm boundaries for the pinned FlashInfer
+   version before using this protocol with another version.
+
+```bash
+python benchmark/kernels/flashinfer_cutile/bench_cutile_nvfp4.py \
+  --mode workspace --checkpoint-dir /models/MiniMax-M3.1-Flash \
+  --checkpoint-revision CHECKPOINT_SHA --experts 128 \
+  --tokens 1 2 4 8 16 32 64 128 256 512 768 1024 1280 1536 1792 2048 2560 3072 3584 4096 8192 \
+  --capacity 16384 --streams 2 \
+  --implementation-label pr49795-chunked --flashinfer-variant stock-0.7.4 \
+  --output-dir /results/pr49795-chunked-all-buckets-e128
+```
+
+Do not compare an old short sweep with a new 21-bucket sweep and attribute the
+difference only to chunking. Capture is tested separately from eager memory
+measurements. Preserve all historical Marlin failures and their original gates.
+New GPU checks are unvalidated until executed.
 
 ## 4. Full-model serving and memory saver
 
@@ -227,12 +304,13 @@ settings for both implementations, preserving per-example outputs and truncation
 counts. Report the sample size and uncertainty; do not equate one successful
 generation with an accuracy evaluation.
 
-## Fair comparison and review evidence
+## Benchmark protocol and review evidence
 
-For #49795 versus #49791, use the same harness files and immutable input protocol
-in separately provisioned checkouts. Select `--cutile-api runner-core` for the
-former and `--cutile-api fused` for the latter. The shim calls each implementation's
-real entry point; it does not substitute the direct FlashInfer kernel.
+Use the same harness files and immutable input protocol when comparing
+implementation revisions in separately provisioned checkouts. Select
+`--cutile-api runner-core` for this adapter or `--cutile-api fused` for a
+compatible fused entry point. The shim calls the selected implementation;
+it does not substitute the direct FlashInfer kernel.
 Copying the harness into another checkout must preserve its file hashes and
 must not overwrite that checkout's production implementation. Provisioning and
 checking out those revisions are separate preparation steps.
@@ -254,3 +332,81 @@ A review report should include:
 - Known unsupported operations, failed cases, and untested hardware.
 
 Do not label this evidence complete until the actual GPU and server runs finish.
+
+## Extended validation protocol
+
+The 8192-token adapter limit bounds **each FlashInfer call**, not the sum of
+resident workspaces. Different visited buckets and streams still accumulate.
+Keep graph-referenced workspaces alive until their captures are destroyed.
+
+The independent coverage-v1 bundle contains run_cutile_coverage_v1.py,
+collect_cutile_marlin_performance_v2.py, profile_cutile_kernels_v1.py, and
+test_cutile_coverage_v1.py. These remain outside the production repository.
+Their source hashes, the six-file candidate diff, environment versions, full
+commands, and raw results must travel with the report.
+
+The independent coverage index groups the validation assertions:
+A01–A14 (correctness), S01–S08 (timing), P01–P04 (profiling),
+M01–M07 (memory), T01–T04 (tensor parallelism), C01–C04 (integration).
+The bundle's fixed coverage-plan.json and audit crosswalk provide the assertion
+mapping. An experiment count does not prove that an assertion passed.
+
+### Comparable inputs and references
+
+The historical input protocol preserves the CUDA BF16 generator and normalized
+routing weights. The `--input-protocol peer-compatible` option uses
+CPU float32 generation, BF16 conversion, distinct randperm expert IDs, and
+unnormalized random weights. Dense router scores satisfy the Marlin API; this
+does not benchmark a learned router. Four inputs have full-tensor SHA256 hashes,
+including router scores. Every TP rank must agree on all hashes.
+
+The --reference-protocol both option retains the corrected NVFP4 reference as
+the 5% gate and adds a separately labeled FP32-intermediate diagnostic. Marlin remains
+W4A16 and is checked against the BF16-activation reference; its repeat/replay
+relative L2 limit remains 0.001. cuTile must remain bit-identical across repeats
+and eager/Graph execution.
+
+The v2 collector may finish timing only for the already recorded Marlin repeat
+failures at 1/4096/8192/8193/16384 tokens. Those rows still fail their original
+gate. Any cuTile failure, new token failure, malformed/nonfinite output, reference
+failure, or execution error stops the stage.
+
+### Software and measurement scope
+
+Keep the current stack (PyTorch cu132 / FlashInfer 0.7.4) separate from the
+cu130 / FlashInfer 0.7.3 stack. Both stock and the fixed
+[FlashInfer #9129](https://github.com/flashinfer-ai/flashinfer/pull/9129) patch are
+measured; the latter is upstream work, not an optimization attributed to this
+adapter. Compiler variants 13.3/13.4/13.5 use isolated environments.
+Unsupported toolchains or profiling permissions remain explicit gaps.
+
+The standard protocol uses four inputs, ten warmups/input, 100 raw samples,
+twenty repeat checks, and seven Graph mutation/restore checks. The separate
+compatibility bridge uses a one-warmup/input timing protocol and the direct
+Marlin API. Extra correctness checks run in a separate validation
+pass. Do not combine these timing rows into an unlabeled average.
+
+Profiling uses one warmed MoE call inside CUDA profiler start/stop.
+Record GEMM1/GEMM2, registers, launch dimensions, and static/dynamic shared memory.
+Profiled duration is not used as the ordinary benchmark latency. Preserve CUBIN
+bytes and hashes with their compiler and software-stack provenance.
+
+### Memory and actual distributed checks
+
+The --workspace-warm-repeats option checks live allocation after dropping each
+output. --require-all-buckets validates the sequence against the installed
+FlashInfer mapping. Record cold/warm peak, output-live allocation, reserved
+memory, actual cache keys, owner identity, and unique storage bytes separately.
+The benchmark fixture retains source weights; only the production preparation
+test supports conclusions about released source copies.
+
+The --compare-tp1 option requires real checkpoints and TP2/TP4 launched with
+torch.distributed.run. It compares actual BF16 NCCL-reduced outputs to a separate
+full-weight TP1 call outside timing/capture, using the existing 2% TP bound.
+Output hashes and both reference errors are recorded. A single-GPU sum of TP
+slices is a distinct test and cannot replace this experiment.
+
+Historical results describe their original source hashes and do not establish
+quality for later source snapshots. Service regression covers eager/decode Graph,
+8192/16384 prefill chunks, and observed MoE call/chunk sizes; prior full GSM8K and
+high-concurrency evidence retain their original source labels.

@@ -158,6 +158,131 @@ def _synthetic_layer(
     )
 
 
+def _packed_synthetic_layer(seed=0):
+    """Large raw-NVFP4 fixture matching the public comparison's stress geometry.
+
+    Generate packed codes, E4M3 scales and unequal branch globals directly;
+    this complements the existing quantized-Gaussian fixture rather than
+    replacing it. The generator is local so tests do not depend on run order.
+    """
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    experts, hidden, intermediate = 16, 6144, 3072
+
+    def packed(rows, columns):
+        return torch.randint(
+            0,
+            256,
+            (experts, rows, columns // 2),
+            dtype=torch.uint8,
+            device="cuda",
+            generator=generator,
+        )
+
+    def scales(rows, columns):
+        return (
+            torch.rand(experts, rows, columns // 16, device="cuda", generator=generator)
+            + 0.5
+        ).to(torch.float8_e4m3fn)
+
+    def globals_(shape):
+        return torch.rand(shape, device="cuda", generator=generator) * 200 + 300
+
+    return _layer(
+        dict(
+            w13_weight_packed=packed(2 * intermediate, hidden),
+            w13_weight_scale=scales(2 * intermediate, hidden),
+            w13_weight_global_scale=globals_((experts, 2)),
+            w13_input_global_scale=torch.ones(experts, 2, device="cuda"),
+            w2_weight_packed=packed(hidden, intermediate),
+            w2_weight_scale=scales(hidden, intermediate),
+            w2_weight_global_scale=globals_((experts,)),
+            w2_input_global_scale=torch.ones(experts, device="cuda"),
+        ),
+        top_k=4,
+    )
+
+
+def _peer_dispatch(layer, tokens, *, seed, input_std=0.5, skewed=False):
+    """CPU RNG and unnormalized weights; no simulated router is being timed."""
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    cfg = layer.moe_runner_config
+    generator = torch.Generator().manual_seed(seed)
+    x = (
+        torch.randn(tokens, cfg.hidden_size, generator=generator) * input_std
+    ).bfloat16()
+    ids = torch.stack(
+        [
+            torch.randperm(cfg.num_experts, generator=generator)[: cfg.top_k]
+            for _ in range(tokens)
+        ]
+    ).int()
+    if skewed:
+        ids[:] = torch.arange(cfg.top_k, dtype=torch.int32)
+    weights = torch.rand(tokens, cfg.top_k, generator=generator)
+    # The layer API carries full routing scores even when top-k is precomputed.
+    # Build a consistent dense representation without drawing extra RNG values.
+    logits = torch.zeros(tokens, cfg.num_experts).scatter_(1, ids.long(), weights)
+    device = layer.w13_weight_packed.device
+    return StandardDispatchOutput(
+        hidden_states=x.to(device),
+        hidden_states_scale=None,
+        topk_output=StandardTopKOutput(
+            topk_ids=ids.to(device),
+            topk_weights=weights.to(device),
+            router_logits=logits.to(device),
+        ),
+    )
+
+
+def _relative_l2(actual, expected):
+    return (
+        (actual.float() - expected.float()).norm()
+        / expected.float().norm().clamp_min(1e-8)
+    ).item()
+
+
+def _weight_storage_inventory(value):
+    """Count unique live tensor storage, not tensor aliases or allocator reserves."""
+    seen, tensors, storages = set(), [], {}
+
+    def visit(obj, path):
+        if isinstance(obj, torch.Tensor):
+            storage = obj.untyped_storage()
+            key = (str(obj.device), storage.data_ptr(), storage.nbytes())
+            storages[key] = storage.nbytes()
+            tensors.append(
+                dict(
+                    path=path,
+                    shape=list(obj.shape),
+                    dtype=str(obj.dtype),
+                    device=str(obj.device),
+                    storage_ptr=storage.data_ptr(),
+                    storage_bytes=storage.nbytes(),
+                )
+            )
+            return
+        if id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if isinstance(obj, dict):
+            for key, child in obj.items():
+                visit(child, path + "." + str(key))
+        elif isinstance(obj, (list, tuple)):
+            for index, child in enumerate(obj):
+                visit(child, path + "." + str(index))
+        elif hasattr(obj, "__dict__"):
+            visit(vars(obj), path)
+
+    visit(value, "weight_pack")
+    return dict(
+        tensors=tensors,
+        unique_storage_count=len(storages),
+        unique_storage_bytes=sum(storages.values()),
+    )
+
+
 def _direct_flashinfer(layer, *, capacity):
     """Build a public-API reference without the SGLang adapter helpers."""
     from flashinfer.fused_moe import (
@@ -206,7 +331,16 @@ def _direct_flashinfer(layer, *, capacity):
 
 
 def _reference(
-    layer, x, ids, weights, *, quantize_activations=True, return_stats=False
+    layer,
+    x,
+    ids,
+    weights,
+    *,
+    quantize_activations=True,
+    return_stats=False,
+    reference_mode="corrected",
+    swap_gate_up=False,
+    apply_clamp=True,
 ):
     """FP32 GEMMs with unpacked weights and either NVFP4 or BF16 activations.
 
@@ -214,6 +348,11 @@ def _reference(
     The BF16 path makes that loss visible, but is not bitwise Marlin output.
     Negative IDs represent absent routes and therefore contribute nothing.
     """
+    if reference_mode not in ("corrected", "peer-diagnostic"):
+        raise ValueError("unknown reference mode")
+    # The peer diagnostic omits GEMM BF16 boundaries and moves encode globals
+    # into dequantization. It explains report differences; it is NOT a new gate.
+    rounded_gemms = quantize_activations and reference_mode == "corrected"
     xq = _activation_reference(x) if quantize_activations else x.bfloat16().float()
     output = torch.zeros_like(x, dtype=torch.float32)
     clamped = torch.zeros((), device=x.device, dtype=torch.int64)
@@ -225,7 +364,9 @@ def _reference(
         qg, qu = layer.w13_weight_packed[expert].chunk(2, dim=0)
         sg, su = layer.w13_weight_scale[expert].chunk(2, dim=0)
         gg, gu = layer.w13_weight_global_scale[expert]
-        if quantize_activations:
+        if swap_gate_up:
+            qg, qu, sg, su, gg, gu = qu, qg, su, sg, gu, gg
+        if rounded_gemms:
             # cuTile accumulates block-scaled FP4 products in FP32, applies
             # the expert global scale, then stores BF16 before SwiGLU.
             # Moving the global scale into the GEMM or omitting this rounding
@@ -239,8 +380,9 @@ def _reference(
         if return_stats:
             clamped += (gate > LIMIT).sum() + (up.abs() > LIMIT).sum()
             total += gate.numel() + up.numel()
-        gate = gate.clamp(max=LIMIT)
-        up = up.clamp(-LIMIT, LIMIT)
+        if apply_clamp:
+            gate = gate.clamp(max=LIMIT)
+            up = up.clamp(-LIMIT, LIMIT)
         hidden = gate * torch.sigmoid(ALPHA * gate) * (up + BETA)
         hidden = (
             _activation_reference(hidden)
@@ -251,10 +393,10 @@ def _reference(
         down = _dequantize(
             layer.w2_weight_packed[expert],
             layer.w2_weight_scale[expert],
-            1.0 if quantize_activations else global_scale,
+            1.0 if rounded_gemms else global_scale,
         )
         expert_output = hidden @ down.T
-        if quantize_activations:
+        if rounded_gemms:
             # GEMM2 also stores BF16 before the FP32 routing-weight reduction.
             expert_output = (expert_output / global_scale).bfloat16().float()
         output.index_add_(0, token, expert_output * weights[token, choice, None])
@@ -444,6 +586,80 @@ def _dispatch(layer, tokens, *, input_std=1.0):
     )
 
 
+def _reference_token_indices(tokens, limit):
+    """Sample both sides of every 8192 boundary and the final row.
+
+    Fill the remaining budget across the batch, rather than checking only a
+    prefix that cannot detect a misplaced tail. Reject an insufficient budget.
+    """
+    if tokens < 1 or limit < 1:
+        raise ValueError("tokens and reference limit must be positive")
+    count = min(tokens, limit)
+    required = {0, tokens - 1}
+    for boundary in range(8192, tokens, 8192):
+        required.update((boundary - 1, boundary))
+    if len(required) > count:
+        raise ValueError("reference budget cannot cover all chunk boundaries")
+    # Include evenly spaced rows first, then fill any deduplicated positions.
+    if count > 1:
+        candidates = [i * (tokens - 1) // (count - 1) for i in range(count)]
+    else:
+        candidates = [0]
+    for index in candidates:
+        if len(required) == count:
+            break
+        required.add(index)
+    for index in range(tokens):
+        if len(required) == count:
+            break
+        required.add(index)
+    return sorted(required)
+
+
+def _select_dispatch_rows(dispatch, indices):
+    """Gather activation and routing rows together, preserving optional logits."""
+    indices = torch.tensor(indices, device=dispatch.hidden_states.device)
+    topk = dispatch.topk_output
+    logits = topk.router_logits
+    return dispatch._replace(
+        hidden_states=dispatch.hidden_states.index_select(0, indices),
+        topk_output=topk._replace(
+            topk_ids=topk.topk_ids.index_select(0, indices),
+            topk_weights=topk.topk_weights.index_select(0, indices),
+            router_logits=None if logits is None else logits.index_select(0, indices),
+        ),
+    )
+
+
+def _direct_dispatch(runner, prepared, dispatch, *, chunk_size=None):
+    """Independent public-API oracle: concatenate results without adapter code."""
+    from flashinfer.fused_moe import MoEActivationPack
+    from flashinfer.fused_moe.core import RoutingInputMode
+
+    tokens = dispatch.hidden_states.shape[0]
+    if tokens < 1:
+        raise ValueError("direct oracle requires a nonempty batch")
+    step = tokens if chunk_size is None else chunk_size
+    outputs = []
+    for start in range(0, tokens, step):
+        end = min(start + step, tokens)
+        ids = dispatch.topk_output.topk_ids[start:end]
+        weights = dispatch.topk_output.topk_weights[start:end]
+        outputs.append(
+            runner(
+                MoEActivationPack(
+                    hidden_states_q=dispatch.hidden_states[start:end].contiguous(),
+                    hidden_states_scale=None,
+                    topk_ids=ids.clamp_min(0).int().contiguous(),
+                    topk_weights=weights.masked_fill(ids < 0, 0).float().contiguous(),
+                    routing_input_mode=RoutingInputMode.PackedPrecomputed,
+                ),
+                prepared,
+            )
+        )
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
+
 class TestFlashInferCuTileNvfp4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -475,11 +691,16 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         )
 
     def _run_case(
-        self, layer, tokens, *, dispatch=None, capacity=None, expect_clamp=False
+        self,
+        layer,
+        tokens,
+        *,
+        dispatch=None,
+        capacity=None,
+        expect_clamp=False,
+        reference_tokens=None,
+        compare_unchunked=False,
     ):
-        from flashinfer.fused_moe import MoEActivationPack
-        from flashinfer.fused_moe.core import RoutingInputMode
-
         capacity = max(512, tokens) if capacity is None else capacity
         self.enterContext(get_schedule().override(max_prefill_tokens=capacity))
         dispatch = _dispatch(layer, tokens) if dispatch is None else dispatch
@@ -488,14 +709,36 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         weights = dispatch.topk_output.topk_weights
         factor = layer.moe_runner_config.routed_scaling_factor
         factor = 1.0 if factor is None else factor
-        reference, stats = _reference(layer, x, ids, weights, return_stats=True)
+        reference_indices = _reference_token_indices(
+            tokens, tokens if reference_tokens is None else reference_tokens
+        )
+        selected = _select_dispatch_rows(dispatch, reference_indices)
+        reference, stats = _reference(
+            layer,
+            selected.hidden_states,
+            selected.topk_output.topk_ids,
+            selected.topk_output.topk_weights,
+            return_stats=True,
+        )
         reference = reference * factor
         bf16_reference = (
-            _reference(layer, x, ids, weights, quantize_activations=False) * factor
+            _reference(
+                layer,
+                selected.hidden_states,
+                selected.topk_output.topk_ids,
+                selected.topk_output.topk_weights,
+                quantize_activations=False,
+            )
+            * factor
         )
         if expect_clamp:
             self.assertGreater(stats["clamped_fraction"], 0.01)
-        direct, direct_weights = _direct_flashinfer(layer, capacity=capacity)
+        # Use identical per-call shapes for the bit-exact integration oracle.
+        # The unchunked oracle below is a separate, cross-shape comparison.
+        direct, direct_weights = _direct_flashinfer(layer, capacity=min(capacity, 8192))
+        unsplit = (
+            _direct_flashinfer(layer, capacity=capacity) if compare_unchunked else None
+        )
         prepared = self.adapter.prepare_flashinfer_cutile_nvfp4_weights(
             layer, layer.moe_runner_config
         )
@@ -507,19 +750,7 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
             ).hidden_states
 
         def direct_run():
-            # Independently sanitize the public FI input. The reference loop
-            # ignores -1; retaining a nonzero weight here would expose padding.
-            valid_weights = weights.masked_fill(ids < 0, 0).float().contiguous()
-            result = direct(
-                MoEActivationPack(
-                    hidden_states_q=x,
-                    hidden_states_scale=None,
-                    topk_ids=ids.clamp_min(0).int().contiguous(),
-                    topk_weights=valid_weights,
-                    routing_input_mode=RoutingInputMode.PackedPrecomputed,
-                ),
-                direct_weights,
-            )
+            result = _direct_dispatch(direct, direct_weights, dispatch, chunk_size=8192)
             return result if factor == 1.0 else result * factor
 
         stream = torch.cuda.Stream()
@@ -529,13 +760,24 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
             actual = run().clone()
             self.assertTrue(torch.isfinite(actual).all().item())
             # Same kernel through two entry points must be bit-identical.
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            relative = (actual.float() - reference).norm() / reference.norm().clamp_min(
+            self.assertTrue(
+                torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+            )
+            sampled_actual = actual[reference_indices].float()
+            relative = (sampled_actual - reference).norm() / reference.norm().clamp_min(
                 1e-8
             )
             bf16_relative = (
-                actual.float() - bf16_reference
+                sampled_actual - bf16_reference
             ).norm() / bf16_reference.norm().clamp_min(1e-8)
+            unchunked_relative = None
+            if unsplit is not None:
+                unchunked = _direct_dispatch(*unsplit, dispatch) * factor
+                unchunked_relative = (
+                    (actual.float() - unchunked.float()).norm()
+                    / unchunked.float().norm().clamp_min(1e-8)
+                ).item()
+                self.assertLess(unchunked_relative, 0.05)
             # Predeclared integration bound, separate from W4A4-vs-W4A16 loss.
             # Do not loosen it to accommodate a failing GPU run without first
             # investigating the numerical reference and reporting both errors.
@@ -568,7 +810,11 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
                 direct_changed = direct_run().clone()
                 graph.replay()
                 torch.testing.assert_close(captured, eager_changed, rtol=0, atol=0)
-                torch.testing.assert_close(captured, direct_changed, rtol=0, atol=0)
+                self.assertTrue(
+                    torch.equal(
+                        captured.view(torch.int16), direct_changed.view(torch.int16)
+                    )
+                )
             stream.synchronize()
             # Captured workspaces stay alive until graph destruction; no
             # reset_context or cache eviction is performed while this is live.
@@ -584,11 +830,275 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
                     "clamped_fraction": stats["clamped_fraction"],
                     "repeatability_calls": 20,
                     "changed_input_graph_replays": 4,
+                    "reference_indices": reference_indices,
+                    "direct_chunked_bit_identity": True,
+                    "relative_l2_unchunked": unchunked_relative,
+                    "chunk_size": 8192,
                 },
                 sort_keys=True,
             )
         )
         return actual
+
+    def test_large_geometry_skewed_routes_and_swap_negative_control(self):
+        for seed in (0, 1):
+            layer = _packed_synthetic_layer(seed)
+            for skewed in (False, True):
+                with self.subTest(seed=seed, skewed=skewed):
+                    dispatch = _peer_dispatch(layer, 412, seed=seed, skewed=skewed)
+                    x, routes = dispatch.hidden_states, dispatch.topk_output
+                    normal = _reference(layer, x, routes.topk_ids, routes.topk_weights)
+                    wrong = _reference(
+                        layer,
+                        x,
+                        routes.topk_ids,
+                        routes.topk_weights,
+                        swap_gate_up=True,
+                    )
+                    diagnostic = _reference(
+                        layer,
+                        x,
+                        routes.topk_ids,
+                        routes.topk_weights,
+                        reference_mode="peer-diagnostic",
+                    )
+                    if skewed:
+                        self.assertEqual(torch.unique(routes.topk_ids).numel(), 4)
+                    actual = self._run_case(layer, 412, dispatch=dispatch)
+                    good_error = _relative_l2(actual, normal)
+                    bad_error = _relative_l2(actual, wrong)
+                    self.assertLess(good_error, 0.05)
+                    self.assertGreater(bad_error, 5 * good_error)
+                    print(
+                        json.dumps(
+                            dict(
+                                test="skew_and_swap",
+                                seed=seed,
+                                skewed=skewed,
+                                experts=16,
+                                empty_experts=12 if skewed else 0,
+                                reference_l2=good_error,
+                                swapped_l2=bad_error,
+                                peer_diagnostic_l2=_relative_l2(actual, diagnostic),
+                                swap_ratio_limit=5,
+                            ),
+                            sort_keys=True,
+                        )
+                    )
+
+    def test_large_geometry_unclamped_negative_control(self):
+        layer = _packed_synthetic_layer(0)
+        dispatch = _peer_dispatch(layer, 412, seed=0, input_std=32)
+        x, routes = dispatch.hidden_states, dispatch.topk_output
+        reference, stats = _reference(
+            layer, x, routes.topk_ids, routes.topk_weights, return_stats=True
+        )
+        wrong = _reference(
+            layer, x, routes.topk_ids, routes.topk_weights, apply_clamp=False
+        )
+        self.assertGreater(stats["clamped_fraction"], 0.01)
+        self.assertGreater(_relative_l2(wrong, reference), 0.2)
+        actual = self._run_case(layer, 412, dispatch=dispatch, expect_clamp=True)
+        self.assertLess(_relative_l2(actual, reference), 0.05)
+        self.assertGreater(_relative_l2(actual, wrong), 0.2)
+        print(
+            json.dumps(
+                dict(
+                    test="unclamped_negative_control",
+                    input_std=32,
+                    **stats,
+                    reference_l2=_relative_l2(actual, reference),
+                    unclamped_l2=_relative_l2(actual, wrong),
+                    unclamped_reference_l2=_relative_l2(wrong, reference),
+                ),
+                sort_keys=True,
+            )
+        )
+
+    def test_padding_preserves_real_rows_across_batch_shapes(self):
+        layer = _packed_synthetic_layer(0)
+        cfg = layer.moe_runner_config
+        prepared = self.adapter.prepare_flashinfer_cutile_nvfp4_weights(layer, cfg)
+        runner = self.adapter.FlashInferCuTileRunnerCore(cfg)
+        dispatch = _peer_dispatch(layer, 64, seed=0)
+        small = _select_dispatch_rows(dispatch, list(range(48)))
+        expected = runner.run_from_dispatch(small, prepared, cfg).hidden_states.clone()
+        dispatch.topk_output.topk_ids[48:] = -1
+        actual = runner.run_from_dispatch(dispatch, prepared, cfg).hidden_states.clone()
+        self.assertLess(_relative_l2(actual[:48], expected), 0.01)
+        self.assertEqual(torch.count_nonzero(actual[48:]).item(), 0)
+        dispatch.topk_output.topk_ids[0, -1] = -1
+        partial = runner.run_from_dispatch(
+            dispatch, prepared, cfg
+        ).hidden_states.clone()
+        dispatch.topk_output.topk_ids[0, -1] = 0
+        dispatch.topk_output.topk_weights[0, -1] = 0
+        neutral = runner.run_from_dispatch(dispatch, prepared, cfg).hidden_states
+        self.assertTrue(
+            torch.equal(partial.view(torch.int16), neutral.view(torch.int16))
+        )
+        print(
+            json.dumps(
+                dict(
+                    test="padding_cross_batch",
+                    real_rows=48,
+                    padded_rows=16,
+                    relative_l2=_relative_l2(actual[:48], expected),
+                )
+            )
+        )
+
+    @unittest.skipUnless(
+        envs.SGLANG_TEST_CUTILE_LARGE_BATCH.get(),
+        "enable large-batch tests for workspace invariants",
+    )
+    def test_warm_workspace_is_stable_and_bounded(self):
+        layer = _packed_synthetic_layer(0)
+        cfg = layer.moe_runner_config
+        self.enterContext(get_schedule().override(max_prefill_tokens=16384))
+        prepared = self.adapter.prepare_flashinfer_cutile_nvfp4_weights(layer, cfg)
+        runner = self.adapter.FlashInferCuTileRunnerCore(cfg)
+        large = _peer_dispatch(layer, 8193, seed=0)
+        dispatches = {
+            n: _select_dispatch_rows(large, list(range(n))) for n in (8192, 8193)
+        }
+        # Warm both sizes first. All inputs/weights live before the baseline.
+        for dispatch in dispatches.values():
+            result = runner.run_from_dispatch(dispatch, prepared, cfg).hidden_states
+            del result
+        torch.cuda.synchronize()
+        gc.collect()
+        held = torch.cuda.memory_allocated()
+        peaks = {}
+        for tokens, dispatch in dispatches.items():
+            peaks[tokens] = []
+            for repeat in range(3):
+                torch.cuda.reset_peak_memory_stats()
+                result = runner.run_from_dispatch(dispatch, prepared, cfg).hidden_states
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated()
+                live = torch.cuda.memory_allocated()
+                del result
+                torch.cuda.synchronize()
+                self.assertEqual(torch.cuda.memory_allocated(), held)
+                peaks[tokens].append(peak)
+                print(
+                    json.dumps(
+                        dict(
+                            test="warm_workspace",
+                            tokens=tokens,
+                            repeat=repeat,
+                            held_bytes=held,
+                            output_live_allocated_bytes=live,
+                            output_released_allocated_bytes=torch.cuda.memory_allocated(),
+                            peak_bytes=peak,
+                            reserved_bytes=torch.cuda.memory_reserved(),
+                        ),
+                        sort_keys=True,
+                    )
+                )
+        self.assertLess(
+            max(peaks[8193]), max(peaks[8192]) + 3 * 8193 * cfg.hidden_size * 2
+        )
+
+    def test_same_geometry_layers_share_one_execution(self):
+        one, two = _synthetic_layer(), _synthetic_layer()
+        first = self.adapter.FlashInferCuTileRunnerCore(one.moe_runner_config)
+        second = self.adapter.FlashInferCuTileRunnerCore(two.moe_runner_config)
+        weights = [
+            self.adapter.prepare_flashinfer_cutile_nvfp4_weights(x, x.moe_runner_config)
+            for x in (one, two)
+        ]
+        inputs = _dispatch(one, 64)
+        first.run_from_dispatch(inputs, weights[0], one.moe_runner_config)
+        first_owner = first._get_execution(inputs.hidden_states.device, 64)
+        second.run_from_dispatch(inputs, weights[1], two.moe_runner_config)
+        second_owner = second._get_execution(inputs.hidden_states.device, 64)
+        self.assertIs(first_owner, second_owner)
+        self.assertIsNot(weights[0].weight_pack, weights[1].weight_pack)
+        print(
+            json.dumps(
+                dict(
+                    test="multi_layer_owner",
+                    layers=2,
+                    execution_owner_ids=[id(first_owner), id(second_owner)],
+                )
+            )
+        )
+
+    @unittest.skipUnless(
+        envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get(),
+        "checkpoint required for production weight ownership audit",
+    )
+    def test_real_prepared_weight_storage_has_no_retained_source_copy(self):
+        from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4MoE
+
+        for experts in (32, 128):
+            if experts == 128 and not envs.SGLANG_TEST_CUTILE_LARGE_BATCH.get():
+                continue
+            layer = _load_checkpoint_layer(
+                envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get(), experts=experts
+            )
+            names = (
+                "w13_weight_packed",
+                "w2_weight_packed",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            )
+            source = {
+                name: dict(
+                    ref=weakref.ref(getattr(layer, name)),
+                    ptr=getattr(layer, name).untyped_storage().data_ptr(),
+                    bytes=getattr(layer, name).untyped_storage().nbytes(),
+                )
+                for name in names
+            }
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            scheme = MiniMaxM3Nvfp4MoE()
+            scheme.create_moe_runner(layer, layer.moe_runner_config)
+            scheme.process_weights_after_loading(layer)
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated()
+            gc.collect()
+            inventory = _weight_storage_inventory(scheme.cutile_quant_info.weight_pack)
+            self.assertTrue(inventory["tensors"])
+            owned = {t["storage_ptr"] for t in inventory["tensors"]}
+            for name, original in source.items():
+                self.assertIsNone(getattr(layer, name))
+                # A source tensor may be the very tensor used by the prepared
+                # view (not a duplicate); all other source objects must die.
+                if original["ref"]() is not None:
+                    self.assertIn(original["ptr"], owned)
+            packed = {
+                t["storage_ptr"]
+                for t in inventory["tensors"]
+                if t["dtype"] == "torch.uint8"
+            }
+            self.assertEqual(len(packed), 2)
+            print(
+                json.dumps(
+                    dict(
+                        test="production_weight_storage",
+                        experts=experts,
+                        **inventory,
+                        source_large_storage_bytes=sum(
+                            x["bytes"] for x in source.values()
+                        ),
+                        allocated_before=before,
+                        allocated_after=torch.cuda.memory_allocated(),
+                        preparation_peak_bytes=peak,
+                        reserved_bytes=torch.cuda.memory_reserved(),
+                        source_objects_alive={
+                            n: x["ref"]() is not None for n, x in source.items()
+                        },
+                    ),
+                    sort_keys=True,
+                )
+            )
+            del layer, scheme
+            gc.collect()
 
     def test_activation_reference_midpoints(self):
         # +/-6 anchors each 16-value block to the chosen E4M3 scale. Explicit
@@ -631,6 +1141,90 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         for tokens in (1, 64, 129):
             with self.subTest(tokens=tokens):
                 self._run_case(_synthetic_layer(), tokens)
+
+    @unittest.skipUnless(
+        envs.SGLANG_TEST_CUTILE_LARGE_BATCH.get(),
+        "set SGLANG_TEST_CUTILE_LARGE_BATCH=1 for chunk-boundary Graph checks",
+    )
+    def test_chunk_boundaries_eager_graph_and_padding(self):
+        for tokens in (8191, 8192, 8193, 16384, 16385):
+            with self.subTest(tokens=tokens):
+                layer = _synthetic_layer(distinct_gate_up_scales=True)
+                layer.moe_runner_config.routed_scaling_factor = 1.75
+                dispatch = _dispatch(layer, tokens)
+                ids = dispatch.topk_output.topk_ids.long()
+                for index in (0, 8191, 8192, 16383, 16384):
+                    if index < tokens:
+                        ids[index, -1] = -1
+                ids[-1] = -1
+                # Strided rows exercise per-chunk normalization, including tail.
+                dispatch = dispatch._replace(
+                    hidden_states=dispatch.hidden_states.repeat_interleave(2, dim=1)[
+                        :, ::2
+                    ],
+                    topk_output=dispatch.topk_output._replace(
+                        topk_ids=ids.repeat_interleave(2, dim=1)[:, ::2],
+                        topk_weights=dispatch.topk_output.topk_weights.bfloat16(),
+                    ),
+                )
+                actual = self._run_case(
+                    layer,
+                    tokens,
+                    dispatch=dispatch,
+                    capacity=32768,
+                    reference_tokens=64,
+                    compare_unchunked=True,
+                )
+                self.assertEqual(torch.count_nonzero(actual[-1]).item(), 0)
+
+    @unittest.skipUnless(
+        envs.SGLANG_TEST_CUTILE_LARGE_BATCH.get(),
+        "set SGLANG_TEST_CUTILE_LARGE_BATCH=1 for cold-tail capture rejection",
+    )
+    def test_chunked_capture_requires_tail_warmup(self):
+        layer = _synthetic_layer()
+        cfg = layer.moe_runner_config
+        prepared = self.adapter.prepare_flashinfer_cutile_nvfp4_weights(layer, cfg)
+        runner = self.adapter.FlashInferCuTileRunnerCore(cfg)
+        self.enterContext(get_schedule().override(max_prefill_tokens=16384))
+        full = _dispatch(layer, 8193)
+        main = full._replace(
+            hidden_states=full.hidden_states[:8192],
+            topk_output=full.topk_output._replace(
+                topk_ids=full.topk_output.topk_ids[:8192],
+                topk_weights=full.topk_output.topk_weights[:8192],
+            ),
+        )
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            runner.run_from_dispatch(main, prepared, cfg)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            try:
+                # Main block is warm, but no 1-token call has run on this stream.
+                # Rejection must precede any work from the main block.
+                with self.assertRaisesRegex(RuntimeError, "warmup"):
+                    with torch.cuda.graph(graph, stream=stream):
+                        runner.run_from_dispatch(full, prepared, cfg)
+            finally:
+                graph.reset()
+            expected = runner.run_from_dispatch(
+                full, prepared, cfg
+            ).hidden_states.clone()
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.graph(graph, stream=stream):
+                    actual = runner.run_from_dispatch(full, prepared, cfg).hidden_states
+                graph.replay()
+                self.assertTrue(
+                    torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+                )
+                stream.synchronize()
+            finally:
+                graph.reset()
+        torch.cuda.current_stream().wait_stream(stream)
 
     def test_distinct_gate_up_global_and_block_scales(self):
         layer = _synthetic_layer(distinct_gate_up_scales=True)
@@ -693,6 +1287,11 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         self.assertTrue(scheme.use_flashinfer_cutile)
         self.assertFalse(scheme.use_marlin)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_routed_scaling_factor_two_is_applied_once(self):
+        layer = _synthetic_layer()
+        layer.moe_runner_config.routed_scaling_factor = 2.0
+        self._run_case(layer, 64)
 
     def test_two_streams_keep_execution_workspaces_separate(self):
         """Interleaved warmed calls must keep each stream's scratch space separate."""
@@ -810,8 +1409,11 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
 
     def test_tp_weight_slices_match_unsharded_layer(self):
         """Check TP slice arithmetic on one GPU; distributed all-reduce is separate."""
-        full = _synthetic_layer(intermediate_size=256)
-        dispatch = _dispatch(full, 64)
+        self._check_tp_weight_slices(_synthetic_layer(intermediate_size=256), 64)
+
+    def _check_tp_weight_slices(self, full, tokens, *, input_std=1.0):
+        self.enterContext(get_schedule().override(max_prefill_tokens=max(512, tokens)))
+        dispatch = _dispatch(full, tokens, input_std=input_std)
         cfg = full.moe_runner_config
         full_runner = self.adapter.FlashInferCuTileRunnerCore(cfg)
         full_weights = self.adapter.prepare_flashinfer_cutile_nvfp4_weights(full, cfg)
@@ -834,6 +1436,19 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         combined = torch.stack(results).sum(dim=0)
         relative = (combined - expected.float()).norm() / expected.float().norm()
         self.assertLess(relative.item(), 0.02)
+        print(
+            json.dumps(
+                {
+                    "test": "tp2_partition_sum_vs_tp1",
+                    "tokens": tokens,
+                    "experts": full.num_experts,
+                    "relative_l2": relative.item(),
+                    "relative_l2_limit": 0.02,
+                    "distributed_nccl": False,
+                },
+                sort_keys=True,
+            )
+        )
 
     @unittest.skipUnless(
         envs.SGLANG_TEST_CUTILE_LARGE_BATCH.get(),
@@ -846,7 +1461,7 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         )
         cfg = layer.moe_runner_config
         prepared = self.adapter.prepare_flashinfer_cutile_nvfp4_weights(layer, cfg)
-        # Keep one configured ceiling: 8193 must be allowed to use bucket 16384.
+        # The scheduler accepts 16384; each FlashInfer call is bounded to 8192.
         self.enterContext(get_schedule().override(max_prefill_tokens=16384))
         self.assertEqual(self.adapter._get_max_num_tokens(), 16384)
         # Retain one runtime context and runner across every bucket/stream.
@@ -894,6 +1509,7 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
                                     "step": step,
                                     "tokens": tokens,
                                     "capacity": 16384,
+                                    "flashinfer_call_ceiling": 8192,
                                     "allocated_mib": allocated_after / 2**20,
                                     "reserved_mib": reserved_after / 2**20,
                                     "step_allocated_delta_mib": (
@@ -950,6 +1566,49 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
             envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get(), experts=128
         )
         self._run_case(layer, 64, dispatch=_dispatch(layer, 64, input_std=0.5))
+
+    @unittest.skipUnless(
+        envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get()
+        and envs.SGLANG_TEST_CUTILE_LARGE_BATCH.get(),
+        "set checkpoint directory and large-batch flag for real chunk checks",
+    )
+    def test_real_layer30_chunk_boundaries(self):
+        for experts in (32, 128):
+            layer = _load_checkpoint_layer(
+                envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get(), experts=experts
+            )
+            for tokens in (8191, 8192, 8193, 16384, 16385):
+                with self.subTest(experts=experts, tokens=tokens):
+                    self._run_case(
+                        layer,
+                        tokens,
+                        capacity=32768,
+                        dispatch=_dispatch(layer, tokens, input_std=0.5),
+                        reference_tokens=64,
+                        compare_unchunked=True,
+                    )
+
+    @unittest.skipUnless(
+        envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get()
+        and envs.SGLANG_TEST_CUTILE_LARGE_BATCH.get(),
+        "set checkpoint directory and large-batch flag for real TP slice comparison",
+    )
+    def test_real_layer30_tp2_partition_sum_vs_tp1(self):
+        # This isolates partition arithmetic; torchrun exercises actual NCCL.
+        layer = _load_checkpoint_layer(envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get())
+        for tokens in (64, 8193):
+            with self.subTest(tokens=tokens):
+                self._check_tp_weight_slices(layer, tokens, input_std=0.5)
+
+    @unittest.skipUnless(
+        envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get(),
+        "set checkpoint directory for real-weight clamp coverage",
+    )
+    def test_real_layer30_clamp(self):
+        layer = _load_checkpoint_layer(envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get())
+        self._run_case(
+            layer, 64, dispatch=_dispatch(layer, 64, input_std=4.0), expect_clamp=True
+        )
 
 
 if __name__ == "__main__":

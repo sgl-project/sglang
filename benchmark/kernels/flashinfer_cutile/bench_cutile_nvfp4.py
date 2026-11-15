@@ -57,7 +57,9 @@ def summarize_rank_samples(rank_samples):
     return {
         "samples_ms": samples,
         "p50_ms": percentile(samples, 50),
+        "p90_ms": percentile(samples, 90),
         "p95_ms": percentile(samples, 95),
+        "p99_ms": percentile(samples, 99),
         "mean_ms": statistics.fmean(samples),
     }
 
@@ -84,9 +86,28 @@ def parse_args(argv=None):
     parser.add_argument("--input-std", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument(
+        "--input-protocol",
+        choices=("historical", "peer-compatible"),
+        default="historical",
+    )
+    parser.add_argument(
+        "--reference-protocol",
+        choices=("corrected", "both"),
+        default="corrected",
+        help="Both adds a peer-math diagnostic; the corrected gate is unchanged",
+    )
+    parser.add_argument("--marlin-api", choices=("runner", "direct"), default="runner")
+    parser.add_argument(
+        "--compare-tp1",
+        action="store_true",
+        help="Compare real NCCL-reduced outputs with a full-weight TP1 call",
+    )
+    parser.add_argument("--workspace-warm-repeats", type=int, default=0)
+    parser.add_argument("--require-all-buckets", action="store_true")
+    parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutile", "marlin", "direct"),
+        choices=("cutile", "marlin", "direct", "direct-chunked"),
         default=["cutile", "marlin"],
     )
     parser.add_argument(
@@ -95,6 +116,18 @@ def parse_args(argv=None):
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--reference-tokens", type=int, default=64)
+    parser.add_argument(
+        "--reference-sampling",
+        choices=("prefix", "chunk-boundaries"),
+        default="prefix",
+        help="Keep historical prefix protocol or sample every chunk boundary and tail",
+    )
+    parser.add_argument(
+        "--workspace-backend",
+        choices=("cutile", "direct"),
+        default="cutile",
+        help="Direct is an unchunked public-API control and requires one stream",
+    )
     parser.add_argument("--max-relative-l2", type=float, default=0.05)
     parser.add_argument(
         "--distributed-timeout",
@@ -150,6 +183,18 @@ def parse_args(argv=None):
         args.execution
     ):
         parser.error("duplicate backends or execution modes are not allowed")
+    if (
+        args.mode == "workspace"
+        and args.workspace_backend == "direct"
+        and args.streams != 1
+    ):
+        parser.error(
+            "direct workspace control requires --streams 1; it has one execution"
+        )
+    if args.workspace_warm_repeats < 0:
+        parser.error("--workspace-warm-repeats must be nonnegative")
+    if args.compare_tp1 and (args.synthetic or args.mode != "latency"):
+        parser.error("--compare-tp1 requires real checkpoint latency mode")
     return args
 
 
@@ -359,6 +404,9 @@ def metadata(args, torch, rank, world_size):
         },
         "protocol": {
             "reference": "FP32 matmuls with dequantized weights; W4A4 and BF16 activation variants",
+            "reference_sampling": args.reference_sampling,
+            "chunked_oracle": "direct-chunked: independent public API with 8192-token calls",
+            "workspace_backend": args.workspace_backend,
             "routing": "fixed seed, random distinct top-k experts, normalized FP32 weights",
             "inputs": "four rotating BF16 input/routing addresses and four graphs; no copies in measurement",
             "collective": "NCCL all_reduce(SUM) included in layer timing when TP>1",
@@ -429,12 +477,15 @@ def clone_layer(layer, helpers):
     return result
 
 
-def build_backend(name, source, helpers, capacity, cutile_api="runner-core"):
+def build_backend(
+    name, source, helpers, capacity, cutile_api="runner-core", marlin_api="runner"
+):
     """Use independent weights because both preparation paths can replace them."""
     import torch
 
     layer = clone_layer(source, helpers)
     config = layer.moe_runner_config
+    runner = None
     if name == "cutile":
         from sglang.srt.layers.moe.moe_runner import flashinfer_cutile
 
@@ -488,22 +539,15 @@ def build_backend(name, source, helpers, capacity, cutile_api="runner-core"):
                     dispatch, prepared, config
                 ).hidden_states
 
-    elif name == "direct":
-        from flashinfer.fused_moe import MoEActivationPack
-        from flashinfer.fused_moe.core import RoutingInputMode
-
-        runner, prepared = helpers._direct_flashinfer(layer, capacity=capacity)
+    elif name in ("direct", "direct-chunked"):
+        chunk_size = 8192 if name == "direct-chunked" else None
+        runner, prepared = helpers._direct_flashinfer(
+            layer, capacity=min(capacity, 8192) if chunk_size else capacity
+        )
 
         def call(dispatch):
-            return runner(
-                MoEActivationPack(
-                    hidden_states_q=dispatch.hidden_states,
-                    hidden_states_scale=None,
-                    topk_ids=dispatch.topk_output.topk_ids,
-                    topk_weights=dispatch.topk_output.topk_weights,
-                    routing_input_mode=RoutingInputMode.PackedPrecomputed,
-                ),
-                prepared,
+            return helpers._direct_dispatch(
+                runner, prepared, dispatch, chunk_size=chunk_size
             )
 
     else:
@@ -524,23 +568,126 @@ def build_backend(name, source, helpers, capacity, cutile_api="runner-core"):
         scheme._process_marlin_weights(layer)
         prepared = scheme.get_marlin_quant_info(layer)
 
-        def call(dispatch):
-            return fused_experts_none_to_marlin(
-                dispatch, prepared, config
-            ).hidden_states
+        if marlin_api == "runner":
+
+            def call(dispatch):
+                return fused_experts_none_to_marlin(
+                    dispatch, prepared, config
+                ).hidden_states
+        elif marlin_api == "direct":
+            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+                fused_marlin_moe,
+            )
+            from sglang.srt.layers.quantization.marlin_utils import (
+                marlin_make_workspace,
+            )
+
+            def call(dispatch):
+                topk = dispatch.topk_output
+                return fused_marlin_moe(
+                    dispatch.hidden_states,
+                    prepared.w13_qweight,
+                    prepared.w2_qweight,
+                    prepared.w13_scales,
+                    prepared.w2_scales,
+                    topk.router_logits,
+                    topk.topk_weights,
+                    topk.topk_ids,
+                    global_num_experts=config.num_experts,
+                    w1_global_scale=prepared.w13_global_scale,
+                    w2_global_scale=prepared.w2_global_scale,
+                    workspace=marlin_make_workspace(
+                        dispatch.hidden_states.device, max_blocks_per_sm=4
+                    ),
+                    num_bits=4,
+                    clamp_limit=helpers.LIMIT,
+                    gemm1_alpha=helpers.ALPHA,
+                    activation="silu",
+                    is_gated=True,
+                )
+        else:
+            raise ValueError("unknown Marlin API")
+
+    def peer_reference(dispatch, indices):
+        selected = helpers._select_dispatch_rows(dispatch, indices)
+        return helpers._reference(
+            source,
+            selected.hidden_states,
+            selected.topk_output.topk_ids,
+            selected.topk_output.topk_weights,
+            reference_mode="peer-diagnostic",
+        )
+
+    call.peer_reference = peer_reference
+    call.source_layer = source
+    call.prepared = prepared
+    call.runner = runner if name in ("cutile", "direct", "direct-chunked") else None
 
     # Retain source geometry/weights until all captures using this callable die.
     call.layer = layer
+    # Record the implementation actually imported, not the experiment label.
+    # A pre-chunking checkout can use this same harness for a matched control.
+    if name == "cutile":
+        call.chunk_size = (
+            getattr(flashinfer_cutile, "_MAX_TOKENS_PER_CHUNK", None)
+            if cutile_api == "runner-core"
+            else 8192
+        )
+    else:
+        call.chunk_size = 8192 if name == "direct-chunked" else None
     return call
 
 
-def make_inputs(layer, tokens, seed, input_std, *, sets=4):
+def make_inputs(
+    layer,
+    tokens,
+    seed,
+    input_std,
+    *,
+    sets=4,
+    input_protocol="historical",
+    device="cuda",
+):
     import torch
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
-    generator = torch.Generator(device="cuda").manual_seed(seed)
+    if input_protocol not in ("historical", "peer-compatible"):
+        raise ValueError("unknown input protocol")
+    if input_protocol == "peer-compatible":
+        # Preserve the public script's draw order and seed per input set.
+        # Dense scores are derived AFTER the draws, not sampled independently.
+        cfg = layer.moe_runner_config
+        values = []
+        for copy_index in range(sets):
+            generator = torch.Generator().manual_seed(tokens * 1009 + copy_index)
+            x = (
+                torch.randn(tokens, cfg.hidden_size, generator=generator) * input_std
+            ).bfloat16()
+            ids = torch.stack(
+                [
+                    torch.randperm(cfg.num_experts, generator=generator)[: cfg.top_k]
+                    for _ in range(tokens)
+                ]
+            ).int()
+            weights = torch.rand(tokens, cfg.top_k, generator=generator)
+            scores = torch.zeros(tokens, cfg.num_experts).scatter_(
+                1, ids.long(), weights
+            )
+            values.append(
+                StandardDispatchOutput(
+                    hidden_states=x.to(device),
+                    hidden_states_scale=None,
+                    topk_output=StandardTopKOutput(
+                        topk_ids=ids.to(device),
+                        topk_weights=weights.to(device),
+                        router_logits=scores.to(device),
+                    ),
+                )
+            )
+        return values
+    generator = torch.Generator(device=device).manual_seed(seed)
     config = layer.moe_runner_config
     values = []
     for _ in range(sets):
@@ -548,7 +695,7 @@ def make_inputs(layer, tokens, seed, input_std, *, sets=4):
             torch.randn(
                 tokens,
                 config.hidden_size,
-                device="cuda",
+                device=device,
                 dtype=torch.bfloat16,
                 generator=generator,
             )
@@ -557,7 +704,7 @@ def make_inputs(layer, tokens, seed, input_std, *, sets=4):
         # Sorting random scores gives distinct expert IDs per token. Using
         # randint would accidentally test duplicate routes instead of top-k.
         scores = torch.rand(
-            tokens, config.num_experts, device="cuda", generator=generator
+            tokens, config.num_experts, device=device, generator=generator
         )
         selected, ids = scores.topk(config.top_k, dim=-1)
         weights = selected.softmax(dim=-1).float().contiguous()
@@ -686,9 +833,13 @@ def reference_cases(layer, inputs, args, helpers, dist, world_size):
     """Bound FP32 reference cost; exact adapter/direct checks cover full tensors."""
     references = []
     for dispatch in inputs:
-        small = slice_input(
-            dispatch, min(args.reference_tokens, dispatch.hidden_states.shape[0])
-        )
+        tokens = dispatch.hidden_states.shape[0]
+        if args.reference_sampling == "chunk-boundaries":
+            indices = helpers._reference_token_indices(tokens, args.reference_tokens)
+            small = helpers._select_dispatch_rows(dispatch, indices)
+        else:
+            indices = list(range(min(args.reference_tokens, tokens)))
+            small = slice_input(dispatch, len(indices))
         x, ids, weights = (
             small.hidden_states,
             small.topk_output.topk_ids,
@@ -698,8 +849,34 @@ def reference_cases(layer, inputs, args, helpers, dist, world_size):
         bf16 = helpers._reference(layer, x, ids, weights, quantize_activations=False)
         reduce_output(quantized, dist, world_size)
         reduce_output(bf16, dist, world_size)
-        references.append((quantized, bf16, stats))
+        references.append((quantized, bf16, {**stats, "reference_indices": indices}))
     return references
+
+
+def select_reference_output(actual, reference, stats):
+    """Apply the same row selection to the output and its FP32 references."""
+    indices = stats.get("reference_indices")
+    return actual[: reference.shape[0]] if indices is None else actual[indices]
+
+
+def compare_direct_outputs(integrated, direct, *, same_partition, relative_l2_limit):
+    """Do not confuse cross-shape accuracy with same-kernel bit identity."""
+    metrics = {
+        **error_metrics(integrated, direct),
+        "bit_identity": bit_equal(integrated, direct),
+        "same_partition": same_partition,
+    }
+    if same_partition:
+        if not metrics["bit_identity"]:
+            raise BenchmarkCheckError(
+                "adapter/direct same-partition outputs differ", metrics
+            )
+    elif metrics["relative_l2"] > relative_l2_limit:
+        raise BenchmarkCheckError(
+            "chunked/unchunked mismatch",
+            {**metrics, "relative_l2_limit": relative_l2_limit},
+        )
+    return metrics
 
 
 def measure_backend(
@@ -722,15 +899,25 @@ def measure_backend(
     for index, (source, (quantized, bf16, stats)) in enumerate(zip(inputs, references)):
         evidence.stage("reference-check", execution="eager", input_index=index)
         copy_input(static, source)
+        if index == 0:
+            stream.synchronize()
+            first_resident = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            first_start = time.perf_counter()
         actual = run_static().clone()
+        if index == 0:
+            stream.synchronize()
+            first_call_seconds = time.perf_counter() - first_start
+            first_peak_bytes = torch.cuda.max_memory_allocated() - first_resident
         # Stable NaN bit patterns can pass bit_equal; sample-based references
         # must never hide malformed or nonfinite values later in the batch.
         validate_output(actual, source.hidden_states.shape)
         assert_rank_agreement(actual, dist, world_size)
         expected.append(actual)
         n = quantized.shape[0]
-        q_error = error_metrics(actual[:n], quantized)
-        bf_error = error_metrics(actual[:n], bf16)
+        sampled = select_reference_output(actual, quantized, stats)
+        q_error = error_metrics(sampled, quantized)
+        bf_error = error_metrics(sampled, bf16)
         checked = bf_error if name == "marlin" else q_error
         if checked["relative_l2"] > args.max_relative_l2:
             raise BenchmarkCheckError(
@@ -741,11 +928,20 @@ def measure_backend(
                     "relative_l2_limit": args.max_relative_l2,
                 },
             )
+        peer_error = None
+        if getattr(args, "reference_protocol", "corrected") == "both":
+            peer_reference = call.peer_reference(
+                source, stats.get("reference_indices", list(range(n)))
+            )
+            reduce_output(peer_reference, dist, world_size)
+            peer_error = error_metrics(sampled, peer_reference)
         correctness.append(
             {
+                "peer_math_diagnostic": peer_error,
                 "w4a4_reference": q_error,
                 "bf16_reference": bf_error,
                 "reference_tokens": n,
+                "reference_indices": stats.get("reference_indices", list(range(n))),
                 "clamp_stats_local_rank": stats,
             }
         )
@@ -848,6 +1044,10 @@ def measure_backend(
         rows.append(
             {
                 "backend": name,
+                "first_call_seconds": first_call_seconds,
+                "first_call_peak_above_resident_bytes": first_peak_bytes,
+                "first_call_resident_bytes": first_resident,
+                "first_call_scope": "backend call plus output clone; references already computed",
                 "execution": execution,
                 "tokens": static.hidden_states.shape[0],
                 "tp_size": world_size,
@@ -935,6 +1135,157 @@ def input_prefix_hashes(inputs, count=64):
     return values
 
 
+def input_full_hashes(inputs):
+    """Hash all input rows, including routes/logits beyond the sampled reference."""
+    import torch
+
+    hashes = []
+    for dispatch in inputs:
+        values = {}
+        for name, tensor in (
+            ("hidden_states", dispatch.hidden_states),
+            ("topk_ids", dispatch.topk_output.topk_ids),
+            ("topk_weights", dispatch.topk_output.topk_weights),
+            ("router_logits", dispatch.topk_output.router_logits),
+        ):
+            if tensor is not None:
+                raw = tensor.detach().contiguous().view(dtype=torch.uint8)
+                values[name] = hashlib.sha256(raw.cpu().numpy().tobytes()).hexdigest()
+        hashes.append(values)
+    return hashes
+
+
+def tensor_sha256(tensor):
+    """Fingerprint the complete output, outside measured/captured regions."""
+    import torch
+
+    raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def execution_workspace_inventory(root):
+    """Read actual FlashInfer caches; do not infer residency from input sizes.
+
+    The public MoELayer owns backend runners below it. Keep this diagnostic
+    traversal bounded and never follow tensor payloads or Python modules.
+    """
+    import torch
+
+    seen, caches = set(), []
+
+    def visit(value, path, depth):
+        if id(value) in seen or depth > 8 or isinstance(value, torch.Tensor):
+            return
+        seen.add(id(value))
+        if isinstance(value, dict):
+            items = value.items()
+        elif isinstance(value, (tuple, list)):
+            items = enumerate(value)
+        elif hasattr(value, "__dict__"):
+            items = vars(value).items()
+        else:
+            return
+        for key, child in items:
+            child_path = f"{path}.{key}"
+            if key in ("_workspaces", "_workspace_cache") and isinstance(child, dict):
+                tensors = []
+
+                def gather(obj):
+                    if isinstance(obj, torch.Tensor):
+                        tensors.append(obj)
+                    elif isinstance(obj, dict):
+                        for item in obj.values():
+                            gather(item)
+                    elif isinstance(obj, (list, tuple)):
+                        for item in obj:
+                            gather(item)
+
+                gather(child)
+                storages = {
+                    (
+                        str(t.device),
+                        t.untyped_storage().data_ptr(),
+                    ): t.untyped_storage().nbytes()
+                    for t in tensors
+                }
+                caches.append(
+                    {
+                        "path": child_path,
+                        "keys": [repr(k) for k in child],
+                        "unique_storage_bytes": sum(storages.values()),
+                    }
+                )
+            if isinstance(child, (dict, list, tuple)) or (
+                type(child).__module__.startswith("flashinfer")
+                and hasattr(child, "__dict__")
+            ):
+                visit(child, child_path, depth + 1)
+
+    visit(root, "execution", 0)
+    return caches
+
+
+def actual_tp1_comparison(
+    args, helpers, dispatches, reduced_outputs, rank, dist, world_size
+):
+    """Compare actual distributed BF16 NCCL results with a full-weight TP1 call.
+
+    Reference error is not subtracted to approximate this quantity. All ranks
+    finish the distributed timing first; only rank zero runs the full layer.
+    """
+
+    if world_size == 1:
+        raise ValueError("--compare-tp1 requires torchrun with TP2 or TP4")
+    dist.barrier()
+    records = []
+    if rank == 0:
+        full = helpers._load_checkpoint_layer(
+            args.checkpoint_dir, experts=args.experts, layer_index=args.layer_index
+        )
+        single = build_backend("cutile", full, helpers, args.capacity, args.cutile_api)
+        for index, (dispatch, distributed) in enumerate(
+            zip(dispatches, reduced_outputs)
+        ):
+            expected = single(dispatch).clone()
+            validate_output(expected, distributed.shape)
+            metrics = error_metrics(distributed, expected)
+            if metrics["relative_l2"] >= 0.02:
+                raise BenchmarkCheckError(
+                    "Actual NCCL TP output differs from TP1 beyond the existing TP bound",
+                    {**metrics, "relative_l2_limit": 0.02},
+                )
+            indices = helpers._reference_token_indices(
+                distributed.shape[0], min(args.reference_tokens, distributed.shape[0])
+            )
+            selected = helpers._select_dispatch_rows(dispatch, indices)
+            reference = helpers._reference(
+                full,
+                selected.hidden_states,
+                selected.topk_output.topk_ids,
+                selected.topk_output.topk_weights,
+            )
+            records.append(
+                dict(
+                    input_index=index,
+                    **metrics,
+                    distributed_nccl=True,
+                    tp_size=world_size,
+                    reduction_dtype="bfloat16",
+                    relative_l2_limit=0.02,
+                    reference_indices=indices,
+                    tp1_to_reference=error_metrics(expected[indices], reference),
+                    distributed_to_reference=error_metrics(
+                        distributed[indices], reference
+                    ),
+                    tp1_output_sha256=tensor_sha256(expected),
+                    distributed_output_sha256=tensor_sha256(distributed),
+                )
+            )
+        del single, full
+    dist.barrier()
+    return records
+
+
 def telemetry():
     return command_output(
         [
@@ -951,12 +1302,21 @@ def latency_run(layer, args, helpers, dist, rank, world_size, output, evidence):
     backends = {}
     for name in args.backends:
         evidence.stage("prepare-backend", backend=name, execution=None, tokens=None)
+        torch.cuda.synchronize()
+        preparation_start = time.perf_counter()
         backends[name] = build_backend(
-            name, layer, helpers, args.capacity, args.cutile_api
+            name,
+            layer,
+            helpers,
+            args.capacity,
+            args.cutile_api,
+            marlin_api=getattr(args, "marlin_api", "runner"),
         )
+        torch.cuda.synchronize()
+        backends[name].preparation_seconds = time.perf_counter() - preparation_start
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    rows, direct_comparisons = [], []
+    rows, direct_comparisons, tp1_comparisons = [], [], []
     with torch.cuda.stream(stream):
         for case_index, tokens in enumerate(args.tokens):
             evidence.stage(
@@ -966,14 +1326,22 @@ def latency_run(layer, args, helpers, dist, rank, world_size, output, evidence):
                 backend=None,
                 execution=None,
             )
-            inputs = make_inputs(layer, tokens, args.seed + tokens, args.input_std)
+            inputs = make_inputs(
+                layer,
+                tokens,
+                args.seed + tokens,
+                args.input_std,
+                input_protocol=getattr(args, "input_protocol", "historical"),
+            )
             hashes = input_prefix_hashes(inputs)
+            complete_hashes = input_full_hashes(inputs)
             rank_hashes = [None] * world_size
             if world_size > 1:
-                dist.all_gather_object(rank_hashes, hashes)
-                if any(value != hashes for value in rank_hashes):
+                all_hashes = {"prefix": hashes, "full": complete_hashes}
+                dist.all_gather_object(rank_hashes, all_hashes)
+                if any(value != all_hashes for value in rank_hashes):
                     raise AssertionError(
-                        "TP ranks generated different input/routing prefixes"
+                        "TP ranks generated different input/routing tensors"
                     )
             evidence.stage("compute-reference")
             references = reference_cases(layer, inputs, args, helpers, dist, world_size)
@@ -988,8 +1356,14 @@ def latency_run(layer, args, helpers, dist, rank, world_size, output, evidence):
                 before_telemetry = telemetry() if rank == 0 else None
 
                 def on_result(row):
+                    row["preparation_seconds"] = backends[name].preparation_seconds
                     row["input_prefix_sha256"] = hashes
                     row["hashed_tokens"] = min(64, tokens)
+                    row["input_full_sha256"] = complete_hashes
+                    row["input_protocol"] = getattr(
+                        args, "input_protocol", "historical"
+                    )
+                    row["marlin_api"] = getattr(args, "marlin_api", "runner")
                     if rank == 0:
                         row["telemetry_before"] = before_telemetry
                         row["telemetry_after"] = telemetry()
@@ -1021,42 +1395,101 @@ def latency_run(layer, args, helpers, dist, rank, world_size, output, evidence):
                     evidence,
                     on_result,
                 )
-            if "cutile" in outputs and "direct" in outputs:
+            for oracle in ("direct-chunked", "direct"):
+                if "cutile" not in outputs or oracle not in outputs:
+                    continue
                 evidence.stage(
-                    "direct-comparison", backend="cutile/direct", execution="eager"
+                    "direct-comparison", backend=f"cutile/{oracle}", execution="eager"
                 )
-                comparisons = []
-                for integrated, direct in zip(outputs["cutile"], outputs["direct"]):
-                    metrics = error_metrics(integrated, direct)
-                    identity = bit_equal(integrated, direct)
-                    # The fused API can chunk >8192 tokens. Chunking changes
-                    # GEMM shapes, so require numerical agreement, not the
-                    # bit identity expected from the same unchunked kernel.
-                    if args.cutile_api == "fused" and tokens > 8192:
-                        if metrics["relative_l2"] > args.max_relative_l2:
-                            raise BenchmarkCheckError(
-                                "chunked/direct mismatch", metrics
-                            )
-                    elif not identity:
-                        raise BenchmarkCheckError(
-                            "adapter/direct same-kernel outputs differ", metrics
-                        )
-                    comparisons.append({**metrics, "bit_identity": identity})
+                # Both adapter APIs split >8192. Only direct-chunked has the
+                # same per-call shape above that boundary. Retain the strict
+                # bit gate there; report the unchunked numerical delta separately.
+                adapter_chunk = backends["cutile"].chunk_size or tokens
+                oracle_chunk = backends[oracle].chunk_size or tokens
+                same_partition = min(tokens, adapter_chunk) == min(tokens, oracle_chunk)
+                comparisons = [
+                    compare_direct_outputs(
+                        integrated,
+                        direct,
+                        same_partition=same_partition,
+                        relative_l2_limit=args.max_relative_l2,
+                    )
+                    for integrated, direct in zip(outputs["cutile"], outputs[oracle])
+                ]
                 direct_comparisons.append(
-                    {"tokens": tokens, "comparisons": comparisons}
+                    {"tokens": tokens, "oracle": oracle, "comparisons": comparisons}
+                )
+            if getattr(args, "compare_tp1", False):
+                if "cutile" not in outputs:
+                    raise ValueError("--compare-tp1 requires the cutile backend")
+                compared = actual_tp1_comparison(
+                    args, helpers, inputs, outputs["cutile"], rank, dist, world_size
+                )
+                tp1_comparisons.append(dict(tokens=tokens, comparisons=compared))
+                if rank == 0:
+                    write_json(
+                        output / "actual-tp1-comparison.json",
+                        {"complete": False, "cases": tp1_comparisons},
+                    )
+            if "cutile" in backends and backends["cutile"].runner is not None:
+                execution = backends["cutile"].runner._get_execution(
+                    layer.w13_weight_packed.device, tokens
+                )
+                write_json(
+                    output / f"workspace-owner-rank{rank}-t{tokens}.json",
+                    {
+                        "rank": rank,
+                        "tp_size": world_size,
+                        "tokens": tokens,
+                        "chunk_size": backends["cutile"].chunk_size,
+                        "execution_owner_id": id(execution),
+                        "flashinfer_workspace_caches": execution_workspace_inventory(
+                            execution
+                        ),
+                        "flashinfer_ceiling": min(
+                            args.capacity, backends["cutile"].chunk_size
+                        ),
+                        "warmed_token_counts": sorted(execution.warmed_token_counts),
+                        "allocated_bytes": torch.cuda.memory_allocated(),
+                        "reserved_bytes": torch.cuda.memory_reserved(),
+                    },
                 )
             del outputs, references, inputs
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     if rank == 0:
+        if getattr(args, "compare_tp1", False):
+            write_json(
+                output / "actual-tp1-comparison.json",
+                {"complete": True, "cases": tp1_comparisons},
+            )
         write_json(
             output / "latency.json",
             {
                 "complete": True,
                 "cases": rows,
                 "direct_adapter_comparison": direct_comparisons,
+                "actual_tp1_comparison": tp1_comparisons,
             },
         )
+
+
+def workspace_bucket_coverage(
+    tokens, ceiling, chunk_size, generate_buckets, map_bucket
+):
+    """Account for every chunk, including an otherwise easy-to-miss tail."""
+    expected = sorted(generate_buckets(ceiling))
+    visited = set()
+    per_call = {}
+    for count in tokens:
+        parts = (
+            [min(chunk_size, count - start) for start in range(0, count, chunk_size)]
+            if chunk_size
+            else [count]
+        )
+        per_call[count] = [map_bucket(part, ceiling) for part in parts]
+        visited.update(per_call[count])
+    return expected, sorted(visited), per_call
 
 
 def workspace_run(layer, args, helpers, dist, rank, world_size, output, evidence):
@@ -1066,9 +1499,39 @@ def workspace_run(layer, args, helpers, dist, rank, world_size, output, evidence
         raise ValueError(
             "workspace mode uses one process/device; run it separately on each GPU"
         )
-    evidence.stage("prepare-backend", backend="cutile", execution="eager")
-    call = build_backend("cutile", layer, helpers, args.capacity, args.cutile_api)
-    inputs = make_inputs(layer, args.capacity, args.seed, args.input_std, sets=1)[0]
+    evidence.stage("prepare-backend", backend=args.workspace_backend, execution="eager")
+    call = build_backend(
+        args.workspace_backend, layer, helpers, args.capacity, args.cutile_api
+    )
+    from flashinfer.fused_moe.utils import (
+        get_hybrid_num_tokens_buckets,
+        map_to_hybrid_bucket,
+    )
+
+    ceiling = min(args.capacity, call.chunk_size or args.capacity)
+    expected_buckets, visited_buckets, per_call_buckets = workspace_bucket_coverage(
+        args.tokens,
+        ceiling,
+        call.chunk_size,
+        get_hybrid_num_tokens_buckets,
+        map_to_hybrid_bucket,
+    )
+    if (
+        getattr(args, "require_all_buckets", False)
+        and visited_buckets != expected_buckets
+    ):
+        raise ValueError(
+            f"Workspace sequence does not cover all buckets: "
+            f"visited={visited_buckets}, expected={expected_buckets}"
+        )
+    inputs = make_inputs(
+        layer,
+        args.capacity,
+        args.seed,
+        args.input_std,
+        sets=1,
+        input_protocol=getattr(args, "input_protocol", "historical"),
+    )[0]
     streams = [torch.cuda.Stream() for _ in range(args.streams)]
     torch.cuda.synchronize()
     initial_allocated = torch.cuda.memory_allocated()
@@ -1090,12 +1553,20 @@ def workspace_run(layer, args, helpers, dist, rank, world_size, output, evidence
                 torch.cuda.reset_peak_memory_stats()
                 result = call(dispatch)
                 torch.cuda.synchronize()
+                output_live_allocated = torch.cuda.memory_allocated()
+                output_bytes = result.numel() * result.element_size()
                 del result
                 row = {
+                    "mapped_buckets": per_call_buckets[tokens],
+                    "flashinfer_ceiling": ceiling,
+                    "output_live_allocated_bytes": output_live_allocated,
+                    "output_bytes": output_bytes,
                     "stream": stream_index,
                     "step": step,
                     "tokens": tokens,
                     "capacity": args.capacity,
+                    "backend": args.workspace_backend,
+                    "chunk_size": call.chunk_size,
                     "allocated_bytes": torch.cuda.memory_allocated(),
                     "reserved_bytes": torch.cuda.memory_reserved(),
                     "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
@@ -1107,6 +1578,38 @@ def workspace_run(layer, args, helpers, dist, rank, world_size, output, evidence
                     "cumulative_reserved_delta_bytes": torch.cuda.memory_reserved()
                     - initial_reserved,
                 }
+                warm = []
+                held = torch.cuda.memory_allocated()
+                for repeat in range(getattr(args, "workspace_warm_repeats", 0)):
+                    torch.cuda.reset_peak_memory_stats()
+                    warmed_result = call(dispatch)
+                    torch.cuda.synchronize()
+                    warm_peak = torch.cuda.max_memory_allocated()
+                    del warmed_result
+                    torch.cuda.synchronize()
+                    after = torch.cuda.memory_allocated()
+                    if after != held:
+                        raise BenchmarkCheckError(
+                            "Warm workspace allocated bytes changed",
+                            {"before": held, "after": after, "repeat": repeat},
+                        )
+                    warm.append(
+                        dict(
+                            repeat=repeat,
+                            allocated_bytes=after,
+                            peak_allocated_bytes=warm_peak,
+                        )
+                    )
+                row["warm_repeats"] = warm
+                execution = (
+                    call.runner._get_execution(layer.w13_weight_packed.device, tokens)
+                    if args.workspace_backend == "cutile"
+                    else call.runner
+                )
+                row["execution_owner_id"] = id(execution)
+                row["flashinfer_workspace_caches"] = execution_workspace_inventory(
+                    execution
+                )
                 rows.append(row)
                 write_json(
                     output / "workspace.json", {"complete": False, "steps": rows}
@@ -1123,6 +1626,9 @@ def workspace_run(layer, args, helpers, dist, rank, world_size, output, evidence
         {
             "complete": True,
             "steps": rows,
+            "expected_buckets": expected_buckets,
+            "visited_buckets": visited_buckets,
+            "all_buckets_visited": visited_buckets == expected_buckets,
             "initial_allocated_bytes": initial_allocated,
             "initial_reserved_bytes": initial_reserved,
             "note": "Sequential stream visits expose cumulative residency, not concurrent-stream throughput. No live graph workspace is evicted. Fixtures retain checkpoint and prepared weights; total allocation is not a production model weight budget.",

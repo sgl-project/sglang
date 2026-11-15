@@ -5,6 +5,7 @@ import sys
 import unittest
 import weakref
 from contextlib import ExitStack, contextmanager
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
@@ -244,6 +245,132 @@ class TestFlashInferCuTile(CustomTestCase):
                     )
                     torch.testing.assert_close(dispatch.hidden_states, original_input)
 
+    def test_chunk_boundaries_preserve_rows_routes_and_scaling(self):
+        config = _config(routed_scaling_factor=2.5)
+        payload = flashinfer_cutile.FlashInferCuTileMoeQuantInfo(
+            weight_pack=object(), device=torch.device("cpu")
+        )
+        with get_schedule().override(max_prefill_tokens=32768):
+            runner = flashinfer_cutile.FlashInferCuTileRunnerCore(config)
+            for tokens in (1, 8191, 8192, 8193, 16384, 16385):
+                for noncontiguous in (False, True):
+                    with self.subTest(tokens=tokens, noncontiguous=noncontiguous):
+                        dispatch = _chunk_dispatch(tokens, noncontiguous=noncontiguous)
+                        x = dispatch.hidden_states
+                        ids = dispatch.topk_output.topk_ids
+                        weights = dispatch.topk_output.topk_weights
+                        originals = [t.clone() for t in (x, ids, weights)]
+                        effective = weights.float().masked_fill(ids < 0, 0)
+                        totals = (effective * (ids.clamp_min(0) + 1)).sum(
+                            -1, keepdim=True
+                        )
+                        expected = (x.float() * totals).bfloat16() * 2.5
+                        execution = runner._get_execution(x.device, tokens)
+                        execution.layer.activations.clear()
+                        actual = runner.run_from_dispatch(
+                            dispatch, payload, config
+                        ).hidden_states
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        self.assertTrue(actual.is_contiguous())
+                        for original, current in zip(originals, (x, ids, weights)):
+                            torch.testing.assert_close(
+                                current, original, rtol=0, atol=0
+                            )
+                        chunks = execution.layer.activations
+                        self.assertEqual(
+                            [a.hidden_states_q.shape[0] for a in chunks],
+                            [
+                                min(8192, tokens - start)
+                                for start in range(0, tokens, 8192)
+                            ],
+                        )
+                        for a in chunks:
+                            self.assertTrue(a.hidden_states_q.is_contiguous())
+                            self.assertEqual(a.topk_ids.dtype, torch.int32)
+                            self.assertEqual(a.topk_weights.dtype, torch.float32)
+
+    def test_chunked_execution_ceiling_does_not_weaken_total_capacity(self):
+        config = _config()
+        runner = flashinfer_cutile.FlashInferCuTileRunnerCore(config)
+        with get_schedule().override(max_prefill_tokens=16384):
+            execution = runner._get_execution(torch.device("cpu"), 16384)
+            self.assertEqual(execution.layer.config.execution.tune_max_num_tokens, 8192)
+            dispatch = _chunk_dispatch(16385)
+            payload = flashinfer_cutile.FlashInferCuTileMoeQuantInfo(
+                weight_pack=object(), device=torch.device("cpu")
+            )
+            with self.assertRaisesRegex(ValueError, "capacity"):
+                runner.run_from_dispatch(dispatch, payload, config)
+            self.assertEqual(execution.layer.activations, [])
+        with get_schedule().override(max_prefill_tokens=32768):
+            self.assertIs(runner._get_execution(torch.device("cpu"), 16385), execution)
+        with get_schedule().override(max_prefill_tokens=4096):
+            small = runner._get_execution(torch.device("cpu"), 4096)
+            self.assertIsNot(small, execution)
+            self.assertEqual(small.layer.config.execution.tune_max_num_tokens, 4096)
+
+    def test_chunk_capture_rejects_any_cold_chunk_before_first_call(self):
+        config = _config()
+        capture = [False]
+        self._stack.enter_context(
+            patch.object(flashinfer_cutile, "_is_capturing", lambda device: capture[0])
+        )
+        with get_schedule().override(max_prefill_tokens=32768):
+            runner = flashinfer_cutile.FlashInferCuTileRunnerCore(config)
+            execution = runner._get_execution(torch.device("cpu"), 8193)
+            dispatch = _chunk_dispatch(8193)
+            payload = flashinfer_cutile.FlashInferCuTileMoeQuantInfo(
+                weight_pack=object(), device=torch.device("cpu")
+            )
+            capture[0] = True
+            for warmed in ((), (8192,), (1,)):
+                with self.subTest(warmed=warmed):
+                    execution.warmed_token_counts = set(warmed)
+                    with self.assertRaisesRegex(RuntimeError, "warmup"):
+                        runner.run_from_dispatch(dispatch, payload, config)
+                    self.assertEqual(execution.layer.activations, [])
+            capture[0] = False
+            expected = runner.run_from_dispatch(dispatch, payload, config).hidden_states
+            self.assertEqual(execution.warmed_token_counts, {8192, 1})
+            capture[0] = True
+            actual = runner.run_from_dispatch(dispatch, payload, config).hidden_states
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_chunk_output_is_consumed_before_next_external_call(self):
+        # The public boundary need not promise ownership of temporary outputs.
+        # Reusing a scratch result also detects a deferred cat of aliased chunks.
+        config = _config()
+        payload = flashinfer_cutile.FlashInferCuTileMoeQuantInfo(
+            weight_pack=object(), device=torch.device("cpu")
+        )
+        with get_schedule().override(max_prefill_tokens=32768):
+            runner = flashinfer_cutile.FlashInferCuTileRunnerCore(config)
+            execution = runner._get_execution(torch.device("cpu"), 16385)
+            scratch = torch.empty(8192, 64, dtype=torch.bfloat16)
+            calls = []
+
+            def external_call(act, weights):
+                calls.append(act.hidden_states_q.shape[0])
+                result = scratch[: calls[-1]]
+                result.fill_(len(calls))
+                return result
+
+            execution.layer = external_call
+            output = runner.run_from_dispatch(
+                _chunk_dispatch(16385), payload, config
+            ).hidden_states
+            self.assertEqual(calls, [8192, 8192, 1])
+            for start, end, value in (
+                (0, 8192, 1),
+                (8192, 16384, 2),
+                (16384, 16385, 3),
+            ):
+                self.assertTrue(
+                    torch.equal(
+                        output[start:end], torch.full_like(output[start:end], value)
+                    )
+                )
+
     def test_empty_batch_does_not_create_execution(self):
         config = _config()
         runner = flashinfer_cutile.FlashInferCuTileRunnerCore(config)
@@ -260,6 +387,21 @@ class TestFlashInferCuTile(CustomTestCase):
         result = runner.run_from_dispatch(dispatch, payload, config).hidden_states
         self.assertEqual(result.shape, (0, 64))
         self.assertEqual(result.dtype, torch.bfloat16)
+
+    def test_fp16_input_is_rejected_before_execution(self):
+        config = _config()
+        runner = flashinfer_cutile.FlashInferCuTileRunnerCore(config)
+        dispatch = _dispatch()
+        dispatch = dispatch._replace(hidden_states=dispatch.hidden_states.half())
+        prepared = flashinfer_cutile.FlashInferCuTileMoeQuantInfo(
+            weight_pack=object(), device=torch.device("cpu")
+        )
+        with (
+            patch.object(runner, "_get_execution") as create,
+            self.assertRaisesRegex(TypeError, "BF16"),
+        ):
+            runner.run_from_dispatch(dispatch, prepared, config)
+        create.assert_not_called()
 
     def test_packed_only_routing_is_rejected(self):
         config = _config()
@@ -642,6 +784,122 @@ class TestFlashInferCuTile(CustomTestCase):
                         )
 
 
+class TestFlashInferCuTileDependencies(CustomTestCase):
+    def test_versions_and_toolchain_diagnostics(self):
+        cutile = ModuleType("flashinfer.cutile")
+        cutile.is_cuda_tile_available = Mock(return_value=True)
+        with patch.dict(sys.modules, {"flashinfer.cutile": cutile}):
+            for installed in ("0.7.1", "0.7.2rc6"):
+                with (
+                    self.subTest(version=installed),
+                    patch.object(flashinfer_cutile, "version", return_value=installed),
+                    self.assertRaisesRegex(ValueError, installed.replace(".", r"\.")),
+                ):
+                    flashinfer_cutile._check_dependency_support()
+            for installed in ("0.7.2", "0.7.2.post1", "0.7.4"):
+                with patch.object(flashinfer_cutile, "version", return_value=installed):
+                    flashinfer_cutile._check_dependency_support()
+            cutile.is_cuda_tile_available.return_value = False
+            with (
+                patch.object(flashinfer_cutile, "version", return_value="0.7.4"),
+                self.assertRaisesRegex(RuntimeError, "tileiras"),
+            ):
+                flashinfer_cutile._check_dependency_support()
+
+    def test_missing_flashinfer_and_cutile_api_are_diagnosed(self):
+        with (
+            patch.object(
+                flashinfer_cutile, "version", side_effect=PackageNotFoundError
+            ),
+            self.assertRaisesRegex(ImportError, "not installed"),
+        ):
+            flashinfer_cutile._check_dependency_support()
+        with (
+            patch.object(flashinfer_cutile, "version", return_value="0.7.4"),
+            patch.dict(sys.modules, {"flashinfer.cutile": None}),
+            self.assertRaisesRegex(ImportError, "cuTile API"),
+        ):
+            flashinfer_cutile._check_dependency_support()
+
+    def test_non_cuda_and_other_architectures_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "CUDA"):
+            flashinfer_cutile._check_device_support(torch.device("cpu"))
+        for capability in ((8, 0), (9, 0), (10, 0), (10, 3), (11, 0)):
+            with (
+                self.subTest(capability=capability),
+                patch.object(torch.cuda, "is_available", return_value=True),
+                patch.object(
+                    torch.cuda, "get_device_capability", return_value=capability
+                ),
+                self.assertRaisesRegex(ValueError, "SM120/SM121"),
+            ):
+                flashinfer_cutile._check_device_support(torch.device("cuda"))
+        for capability in ((12, 0), (12, 1)):
+            with (
+                patch.object(torch.cuda, "is_available", return_value=True),
+                patch.object(
+                    torch.cuda, "get_device_capability", return_value=capability
+                ),
+            ):
+                flashinfer_cutile._check_device_support(torch.device("cuda"))
+
+    def test_real_prepared_view_preserves_branch_scales(self):
+        # This CPU tensor test really calls FlashInfer's weight preparation.
+        # A missing package is an explicit skip, which the GPU-host supplement
+        # must close before the coverage report can claim this contract.
+        try:
+            version("flashinfer-python")
+        except PackageNotFoundError:
+            self.skipTest("real FlashInfer package required for prepared-view contract")
+        from flashinfer.fused_moe import CuTileNvfp4Config
+
+        layer = torch.nn.Module()
+        gate = torch.full((2, 128, 64), 17, dtype=torch.uint8)
+        up = torch.full_like(gate, 68)
+        values = dict(
+            w13_weight_packed=torch.cat((gate, up), dim=1),
+            w13_weight_scale=torch.cat(
+                (torch.full((2, 128, 8), 0.5), torch.full((2, 128, 8), 2.0)), dim=1
+            ).to(torch.float8_e4m3fn),
+            w13_weight_global_scale=torch.tensor([[2.0, 4.0], [3.0, 6.0]]),
+            w13_input_global_scale=torch.ones(2, 2),
+            w2_weight_packed=torch.full((2, 128, 64), 34, dtype=torch.uint8),
+            w2_weight_scale=torch.ones(2, 128, 8).to(torch.float8_e4m3fn),
+            w2_weight_global_scale=torch.tensor([5.0, 7.0]),
+            w2_input_global_scale=torch.ones(2),
+        )
+        for name, value in values.items():
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
+        captured = {}
+        actual_prepare = CuTileNvfp4Config.prepare_weights
+
+        def prepare(**kwargs):
+            captured["view"] = actual_prepare(**kwargs)
+            return captured["view"]
+
+        with (
+            _runtime_scope(),
+            patch.object(flashinfer_cutile, "_check_device_support"),
+            patch.object(CuTileNvfp4Config, "prepare_weights", side_effect=prepare),
+        ):
+            flashinfer_cutile.prepare_flashinfer_cutile_nvfp4_weights(
+                layer, _config(hidden_size=128, intermediate_size_per_partition=128)
+            )
+        view = captured["view"]
+        self.assertTrue(torch.equal(view["w1"], values["w13_weight_packed"]))
+        self.assertTrue((view["w1_scale"][:, :1].float() == 0.5).all().item())
+        self.assertTrue((view["w1_scale"][:, 1:].float() == 2.0).all().item())
+        torch.testing.assert_close(
+            view["w1_global_scale"], 1.0 / values["w13_weight_global_scale"]
+        )
+        torch.testing.assert_close(
+            view["w2_global_scale"], 1.0 / values["w2_weight_global_scale"]
+        )
+        self.assertTrue(torch.equal(view["w2"], values["w2_weight_packed"]))
+
+
 @contextmanager
 def _runtime_scope(max_num_tokens=512):
     """Publish real config; exercise the same accessors as model execution."""
@@ -712,6 +970,8 @@ def _stub_flashinfer_boundary(stack):
         PackedPrecomputed="packed_precomputed"
     )
     stack.enter_context(patch.dict(sys.modules, modules))
+
+    stack.enter_context(patch.object(flashinfer_cutile, "_check_dependency_support"))
 
     # The adapter uses CPU tensors here; actual hardware eligibility and driver
     # behavior remain covered by the separate manual SM120/SM121 tests.
@@ -791,6 +1051,31 @@ def _dispatch(topk_type=StandardTopKOutput, *, empty=False):
         hidden_states=torch.ones(count, 64, dtype=torch.bfloat16),
         hidden_states_scale=None,
         topk_output=topk_type(**values),
+    )
+
+
+def _chunk_dispatch(tokens, *, noncontiguous=False):
+    rows = torch.arange(tokens)
+    x = (rows.remainder(7) + 1).bfloat16()[:, None].expand(tokens, 64)
+    ids = torch.stack((rows.remainder(2), 1 - rows.remainder(2)), dim=1)
+    weights = torch.tensor([0.25, 0.75], dtype=torch.float64).repeat(tokens, 1)
+    for row in (0, 8191, 8192, 16383, 16384):
+        if row < tokens:
+            ids[row, -1] = -1
+    if tokens > 16384:
+        ids[-1] = -1
+    if noncontiguous:
+        x = x.repeat(1, 2)[:, ::2]
+        ids = ids.repeat_interleave(2, dim=1)[:, ::2]
+        weights = weights.repeat_interleave(2, dim=1)[:, ::2]
+    else:
+        x = x.contiguous()
+    return StandardDispatchOutput(
+        hidden_states=x,
+        hidden_states_scale=None,
+        topk_output=StandardTopKOutput(
+            topk_ids=ids, topk_weights=weights, router_logits=torch.zeros(tokens, 2)
+        ),
     )
 
 
