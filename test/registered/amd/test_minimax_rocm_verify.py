@@ -109,6 +109,30 @@ class TestMiniMaxROCmVerify(unittest.TestCase):
         )
         self.assertEqual(self.batch.seq_lens.tolist(), [4095, 255])
 
+    def test_eager_step_without_host_lengths_takes_the_capture_bound(self):
+        # ROCm linear verify opts out of host seq_lens: an eager decode or verify
+        # step can arrive with seq_lens_cpu None
+        self.backend.index_cache_enabled = False
+        self.backend.is_npu = False
+        self.backend._msa_owns_decode = False
+        self.backend.max_context_len = 1 << 20
+        self.batch.seq_lens_cpu = None
+        self.backend.init_forward_metadata_out_graph(self.batch)
+        self.assertEqual(self.backend._max_seqlen_k, 1 << 20)
+
+    def test_hybrid_asks_for_host_lengths_only_through_its_backends(self):
+        from sglang.srt.layers.attention.minimax_sparse_backend import (
+            MiniMaxHybridAttnBackend,
+        )
+
+        dense = SimpleNamespace(runner_ids=(0,), needs_cpu_seq_lens=False)
+        sparse = SimpleNamespace(needs_cpu_seq_lens=False, dense_layer_ids=[])
+        hybrid = MiniMaxHybridAttnBackend(dense, sparse, sparse_layer_ids=[0])
+        self.assertFalse(hybrid.needs_cpu_seq_lens)
+        sparse.needs_cpu_seq_lens = True
+        hybrid = MiniMaxHybridAttnBackend(dense, sparse, sparse_layer_ids=[0])
+        self.assertTrue(hybrid.needs_cpu_seq_lens)
+
     def test_missing_metadata_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "Missing MiniMax-M3 linear verify"):
             self.backend.forward_extend(
