@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.kv.alloc.chain import (
     take_new_pages,
 )
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
-from sglang.srt.mem_cache.kv.alloc.pricing import FLUSH_ENDS, plan
+from sglang.srt.mem_cache.kv.alloc.pricing import FLUSH_ENDS, RELAYOUT, plan
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -1433,6 +1433,10 @@ class TestTriPoolHardening(_PoolTestCase):
         self.assertEqual(int(v1.numel()), need)
         moved = sum(int(s.numel()) for s, _, _ in sa._inverse_history[moves_before:])
         self.assertGreater(moved, 0, "the rebalance path must have fired")
+        # The slide is reported as a relocation of exactly the pages it copied.
+        self.assertEqual(sa.counters.float_relocations, 1)
+        self.assertEqual(sa.counters.float_relocated_pages, moved)
+        self.assertEqual(allocator.counters.plans.get(RELAYOUT), 1)
         # Cost bound min(L_live, G): never more than the live pages present
         # when the slide ran (the leapfrog cap).
         self.assertLessEqual(moved, live_before)

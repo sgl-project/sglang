@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 import msgspec
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.mem_cache.kv.alloc.stats import PLAN_OUTCOMES
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
     FORWARD_OVERLAP_CATEGORIES,
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from prometheus_client import Gauge
 
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.alloc.stats import ChainStats
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +129,10 @@ class SchedulerStats:
     mamba_available_tokens: int = 0
     mamba_evictable_tokens: int = 0
     mamba_used_tokens: int = 0
+
+    # Unified memory: each band's layout, the gaps between bands, and the
+    # allocator's cumulative work; None for static pools.
+    unified_memory: Optional[ChainStats] = None
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -526,6 +532,84 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+
+        # =================================================================
+        # Unified memory layout and allocator work
+        # =================================================================
+        sub_pool_labelnames = [*labels.keys(), "sub_pool"]
+        self.unified_memory_live_pages = Gauge(
+            name="sglang:unified_memory_live_pages",
+            documentation="Pages a unified-memory sub-pool keeps, by sub-pool.",
+            labelnames=sub_pool_labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.unified_memory_hole_pages = Gauge(
+            name="sglang:unified_memory_hole_pages",
+            documentation="Free pages inside a unified-memory sub-pool's span, by sub-pool.",
+            labelnames=sub_pool_labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.unified_memory_pending_pages = Gauge(
+            name="sglang:unified_memory_pending_pages",
+            documentation="Freed pages of a unified-memory sub-pool still waiting for their step to be processed, by sub-pool.",
+            labelnames=sub_pool_labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.unified_memory_gap_bytes = Gauge(
+            name="sglang:unified_memory_gap_bytes",
+            documentation="Free bytes between neighbouring unified-memory sub-pools.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.unified_memory_largest_gap_bytes = Gauge(
+            name="sglang:unified_memory_largest_gap_bytes",
+            documentation="The largest free byte gap between two neighbouring unified-memory sub-pools.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.unified_memory_compactions_total = Counter(
+            name="sglang:unified_memory_compactions_total",
+            documentation="Compaction passes that moved pages, by sub-pool and mode (urgent or opportunistic).",
+            labelnames=[*sub_pool_labelnames, "mode"],
+        )
+        self.unified_memory_compaction_moved_pages_total = Counter(
+            name="sglang:unified_memory_compaction_moved_pages_total",
+            documentation="Pages compaction moved, by sub-pool and mode (urgent or opportunistic).",
+            labelnames=[*sub_pool_labelnames, "mode"],
+        )
+        self.unified_memory_float_relocations_total = Counter(
+            name="sglang:unified_memory_float_relocations_total",
+            documentation="Relocations of a floating sub-pool into a planned block, by sub-pool.",
+            labelnames=sub_pool_labelnames,
+        )
+        self.unified_memory_float_relocated_pages_total = Counter(
+            name="sglang:unified_memory_float_relocated_pages_total",
+            documentation="Pages float relocations copied, by sub-pool.",
+            labelnames=sub_pool_labelnames,
+        )
+        self.unified_memory_plans_total = Counter(
+            name="sglang:unified_memory_plans_total",
+            documentation="Allocation plans by the step that served them (NO_MOVE, FLUSH_ENDS, RELAYOUT) or REFUSED.",
+            labelnames=[*labels.keys(), "step"],
+        )
+        self.unified_memory_unpinned_network_reliefs_total = Counter(
+            name="sglang:unified_memory_unpinned_network_reliefs_total",
+            documentation="Allocation plans that could not keep rows of in-flight network transfers in place.",
+            labelnames=labels.keys(),
+        )
+        self.unified_memory_takes_total = Counter(
+            name="sglang:unified_memory_takes_total",
+            documentation="Planned page takes of the unified-memory allocator.",
+            labelnames=labels.keys(),
+        )
+        self.unified_memory_take_seconds_total = Counter(
+            name="sglang:unified_memory_take_seconds_total",
+            documentation="Host time of planned page takes (planning, layout and take, up to kernel launch), in seconds.",
+            labelnames=labels.keys(),
+        )
+        # Last cumulative value pushed per counter series: the allocator keeps
+        # totals, a Prometheus counter takes increments.
+        self._unified_memory_totals: Dict[tuple, float] = {}
 
         # =================================================================
         # Weight update
@@ -1489,6 +1573,70 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labels["priority"] = str(priority)
                 gauge.labels(**labels).set(value)
 
+    def _log_total(self, counter, total: float, **extra: str) -> None:
+        # Push the increase of a cumulative total since its last push; the
+        # series exists from the first sample, at zero, so rates start there.
+        labels = {**self.labels, **extra}
+        series = counter.labels(**labels)
+        key = (counter, *sorted(labels.items()))
+        delta = total - self._unified_memory_totals.get(key, 0)
+        self._unified_memory_totals[key] = total
+        if delta > 0:
+            series.inc(delta)
+
+    def _log_unified_memory(self, stats: ChainStats) -> None:
+        for sub_pool, band in stats.bands.items():
+            labels = {**self.labels, "sub_pool": sub_pool}
+            self.unified_memory_live_pages.labels(**labels).set(band.live_pages)
+            self.unified_memory_hole_pages.labels(**labels).set(band.hole_pages)
+            self.unified_memory_pending_pages.labels(**labels).set(band.pending_pages)
+            c = band.counters
+            for mode, passes, moves in (
+                ("urgent", c.urgent_compactions, c.urgent_compaction_moves),
+                (
+                    "opportunistic",
+                    c.opportunistic_compactions,
+                    c.opportunistic_compaction_moves,
+                ),
+            ):
+                self._log_total(
+                    self.unified_memory_compactions_total,
+                    passes,
+                    sub_pool=sub_pool,
+                    mode=mode,
+                )
+                self._log_total(
+                    self.unified_memory_compaction_moved_pages_total,
+                    moves,
+                    sub_pool=sub_pool,
+                    mode=mode,
+                )
+            self._log_total(
+                self.unified_memory_float_relocations_total,
+                c.float_relocations,
+                sub_pool=sub_pool,
+            )
+            self._log_total(
+                self.unified_memory_float_relocated_pages_total,
+                c.float_relocated_pages,
+                sub_pool=sub_pool,
+            )
+        self._log_gauge(self.unified_memory_gap_bytes, stats.gap_bytes)
+        self._log_gauge(self.unified_memory_largest_gap_bytes, stats.largest_gap_bytes)
+        counters = stats.counters
+        for step in PLAN_OUTCOMES:
+            self._log_total(
+                self.unified_memory_plans_total,
+                counters.plans.get(step, 0),
+                step=step,
+            )
+        self._log_total(
+            self.unified_memory_unpinned_network_reliefs_total,
+            counters.unpinned_network_reliefs,
+        )
+        self._log_total(self.unified_memory_takes_total, counters.takes)
+        self._log_total(self.unified_memory_take_seconds_total, counters.take_seconds)
+
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
 
@@ -1741,6 +1889,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.mamba_available_tokens, stats.mamba_available_tokens)
         self._log_gauge(self.mamba_evictable_tokens, stats.mamba_evictable_tokens)
         self._log_gauge(self.mamba_used_tokens, stats.mamba_used_tokens)
+        if stats.unified_memory is not None:
+            self._log_unified_memory(stats.unified_memory)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)

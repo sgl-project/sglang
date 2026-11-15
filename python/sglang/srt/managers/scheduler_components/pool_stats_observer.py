@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ReqKvInfo
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.kv.alloc.stats import ChainStats
     from sglang.srt.mem_cache.kv.storage import KVStorage, SubPoolUsage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 
@@ -96,6 +97,9 @@ class PoolStats:
     hisparse_device_token_usage: Optional[float] = None
     hisparse_host_tokens: Optional[int] = None
     hisparse_host_token_usage: Optional[float] = None
+
+    # Unified memory's layout and allocator work; None for static pools.
+    unified_memory: Optional[ChainStats] = None
 
     def window(self, name: str) -> Optional[WindowPoolStats]:
         return next((w for w in self.windows if w.name == name), None)
@@ -193,6 +197,7 @@ class PoolStats:
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
         stats.kv_used_tokens = self.full_num_used
+        stats.unified_memory = self.unified_memory
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -267,6 +272,7 @@ class SchedulerPoolStatsObserver:
             pool_stats.mamba_available_size = mamba_stats.mamba_available_size
             pool_stats.mamba_evictable_size = mamba_stats.mamba_evictable_size
 
+        pool_stats.unified_memory = self.storage.memory_stats()
         return pool_stats
 
     def _get_token_info(self, full: SubPoolUsage) -> PoolStats:
